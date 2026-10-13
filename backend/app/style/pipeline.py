@@ -55,16 +55,10 @@ DIGEST_MARK_FIELDS = ("novel",) + MARK_FIELDS
 
 
 def _inspect_one(text: str) -> tuple[str, list[dict]]:
-    """对单本语料体检 + 清洗，返回 (清洗后文本, 体检结论)。
-
-    三层清洗：
-    1. SEO 水印（find_repeated_watermarks / strip_watermarks）
-    2. 完本感言 + 跨书简介（strip_finale_and_cross_novel）
-    3. 清洗报告合并返回，供人复核
-    """
-    from app.corpus_health import strip_finale_and_cross_novel
-
+    """对单本语料体检 + 清洗，返回 (清洗后文本, 体检结论)。"""
     hits = find_repeated_watermarks(text)
+    if not hits:
+        return text, []
     rows = []
     for h in hits[:MAX_MARK_ROWS]:
         rows.append({
@@ -78,20 +72,7 @@ def _inspect_one(text: str) -> tuple[str, list[dict]]:
             "nested_variants": h["nested_variants"][:8],
             "samples": h["samples"][:MAX_SAMPLES_PER_MARK],
         })
-    cleaned = strip_watermarks(text, hits) if hits else text
-    # 完本感言 + 跨书简介清洗（无论有没有水印都要做）
-    cleaned, finale_report = strip_finale_and_cross_novel(cleaned)
-    if finale_report["hits"]:
-        rows.append({
-            "text": "完本感言/跨书简介",
-            "count": len(finale_report["hits"]),
-            "final": finale_report["removed"],
-            "final_ratio": 1.0,
-            "para_end_ratio": 0.0,
-            "nested_variants": [],
-            "samples": finale_report["hits"][:MAX_SAMPLES_PER_MARK],
-        })
-    return cleaned, rows
+    return strip_watermarks(text, hits), rows
 
 
 def build_reference_profile(

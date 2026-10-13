@@ -108,21 +108,8 @@ function openProject(id: number) {
           <span v-if="p.style" class="tag accent">{{ p.style }}</span>
           <span v-if="p.status" class="tag">{{ p.status }}</span>
         </div>
-        <!-- 助手是项目级页面：从项目列表一键直达该项目的助手工作台 -->
-        <button class="btn sm" @click.stop="router.push(`/projects/${p.id}/assistant`)">
-          助手 →
-        </button>
         <span class="faint" style="font-size: var(--fs-xs)">进入 →</span>
       </div>
     </div>
   </section>
 </template>
-
-<style scoped>
-/* .btn.sm 不在全局 base.css 里（各视图按需自含），与其它视图保持一致。 */
-.btn.sm {
-  font-size: var(--fs-xs);
-  padding: 5px 10px;
-  flex: none;
-}
-</style>

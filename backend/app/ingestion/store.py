@@ -1,35 +1,15 @@
-"""入库：解析 → 清洗 → 切分 → 填 embedding → 写 raw_novels + novel_chunks。
-
-清洗阶段（第 8 步接入）：解析之前先剔除盗版站注入的 SEO 水印，并把清洗报告
-持久化到 `RawNovel.clean_report`。此前 `corpus_health` 只在拟合文体档案时被调用，
-导入链路完全不清洗 —— 脏文本直接进 `novel_chunks` 污染检索召回。详见
-`app/ingestion/clean.py`。
-"""
+"""入库：解析 → 切分 → 填 embedding → 写 raw_novels + novel_chunks。"""
 
 import json
 
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.corpus_health import scan_watermarks, strip_watermarks
 from app.db import IS_SQLITE
 from app.embeddings.provider import get_embedding_provider
 from app.ingestion.chunk import chunk_text
-from app.ingestion.clean import build_clean_report
 from app.ingestion.parse_txt import parse_txt
 from app.models import NovelChunk, RawNovel
-
-#: 入库时文本级确定性扫描的**抽样**分片数上限。
-#:
-#: 为什么抽样、为什么放这里（第 10 步的接入点选择）：
-#: - 入库要快、要可离线复现，**绝不**在入库里调模型（错字/断字的语义复核由
-#:   用户在助手页按需触发 `POST /api/assistant/clean-corpus`）；
-#: - 但「这份语料大概有多少待复核的可疑点」这个数，入库时顺手算出来对用户有用
-#:   （否则要等用户主动跑清洗才知道脏不脏）；
-#: - 一本 500 万字小说有上千分片，全量扫会拖慢导入，故**抽样**前 N 片做计数，
-#:   并在报告里**显式标注 sampled=true**（不静默少算、不假装全量）。
-#: 取 200：约当 20 万字样本，低频字/重复字的频率已稳定，耗时可控。
-TEXT_CLEAN_SAMPLE_CHUNKS = 200
 
 
 def _emb_value(vec: list[float] | None):
@@ -54,10 +34,6 @@ def ingest_text(
     攒几千个待写对象会触发 MemoryError（SQLAlchemy identity map 持有全部
     ORM 实例直到 commit），故按批提交；SQLAlchemy flush 后对象已转为
     persistent，expire 掉引用即可释放。
-
-    清洗（第 8 步）：在解析之前先剔除水印，保证**入库的分片就是干净的**；
-    清洗报告（含检出串、次数、删字数、原文样本）写入 `novel.clean_report`，
-    可通过 API 读到。清洗是确定性的，同一输入两次结果逐字节相同。
     """
     novel = RawNovel(
         title=title, platform=platform, source_url=source_url, status="imported"
@@ -65,42 +41,13 @@ def ingest_text(
     db.add(novel)
     db.flush()
 
-    # —— 清洗阶段：检出 → 剔除 → 留痕（报告进 raw_novels.clean_report）——
-    # scan_watermarks 同时给出 flagged 与 rejected（含拒绝原因），后者也写进报告，
-    # 让「考虑过但没删」的候选可见（避免静默丢候选）。
-    scan = scan_watermarks(text)
-    hits = scan["flagged"]
-    cleaned_text = strip_watermarks(text, hits)
-    novel.clean_report = build_clean_report(
-        text, cleaned_text, hits,
-        rejected=scan["rejected"], thresholds=scan["thresholds"],
-    )
-
-    if chapter_meta is not None:
-        # 章元数据路径：body 已由上游解析，这里用**同一批**检出串清洗各章 body，
-        # 保证与文本解析路径的清洗口径一致（正文里其余内容一律不动）。
-        chapters = [
-            {**ch, "body": strip_watermarks(ch.get("body", "") or "", hits)}
-            for ch in chapter_meta
-        ]
-    else:
-        chapters = parse_txt(content=cleaned_text)
+    chapters = chapter_meta or parse_txt(content=text)
     pieces: list[tuple[int | None, int, str]] = []
     for ch in chapters:
         for i, piece in enumerate(
             chunk_text(ch["body"], settings.chunk_size, settings.chunk_overlap)
         ):
             pieces.append((ch.get("chapter_no"), i, piece))
-
-    # —— 文本级确定性扫描（第 10 步）：只计数、不调模型、不改正文 ——
-    # 把「本语料待复核的可疑点数量」写进清洗报告，供用户在助手页按需触发
-    # clean-corpus 做语义复核。抽样（见常量说明），并显式标注是否抽样。
-    from app.agents.text_clean import summarize as _text_clean_summarize
-
-    text_scan = _text_clean_summarize(
-        [p[2] for p in pieces], sample_cap=TEXT_CLEAN_SAMPLE_CHUNKS
-    )
-    novel.clean_report = {**(novel.clean_report or {}), "text_clean": text_scan}
 
     # 批量 embedding（一次请求多段，省 token/延迟）
     embeddings: list[list[float] | None] = [None] * len(pieces)
@@ -133,6 +80,4 @@ def ingest_text(
         "title": title,
         "chapters": len(chapters),
         "chunks": len(pieces),
-        # 清洗报告随导入结果一并回显（上传响应 / load_corpus 打印都用它）。
-        "clean_report": novel.clean_report,
     }

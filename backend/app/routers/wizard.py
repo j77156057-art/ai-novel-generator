@@ -18,6 +18,7 @@ from app.kg.build import build_graph_from_text
 from app.llm.provider import get_llm_provider
 from app.models import Generation, NovelChunk, Project
 from app.schemas import (
+    ProtagonistsIn,
     ExpertQuestionOut,
     PlotBibleOut,
     PremiseProposalOut,
@@ -47,6 +48,22 @@ _STYLE_HINT = {
 
 class ExpertAnswersIn(StrictRequest):
     answers: dict[str, str] | None = None  # question -> answer
+
+
+@router.post("/{project_id}/characters")
+def save_characters(
+    project_id: int, body: ProtagonistsIn, db: Session = Depends(get_db)
+) -> dict:
+    """保存用户锁定角色与关系，保留剧情圣经其它字段。"""
+    proj = _require_project(db, project_id)
+    bible = dict(proj.plot_bible or {})
+    bible["characters"] = [c.model_dump() for c in body.characters]
+    if body.relationships is not None:
+        bible["relationships"] = [r.model_dump() for r in body.relationships]
+    proj.plot_bible = bible
+    db.commit()
+    db.refresh(proj)
+    return {"characters": bible["characters"], "relationships": bible.get("relationships") or []}
 
 
 def _require_project(db: Session, project_id: int) -> Project:
@@ -121,31 +138,25 @@ def _safe_parse(text: str, default: dict) -> dict:
         return default
 
 
-def _coerce_string_list(data: dict | None, key: str, limit: int) -> list[str]:
-    """从模型 JSON 中抽取干净的字符串列表，兼容两类常见偏差：
-
-    - 标准：  {"key": ["a", "b", "c"]}
-    - 偏差：  {"key": [{"方案1": "a"}, {"方案2": "b"}]}  ← 模型把每条包成对象
-
-    统一落为「元素即文本」的字符串数组，避免把 dict 直接 str() 成 {'方案1': '...'} 的脏输出。
-    """
-    items = (data or {}).get(key)
-    if items is None:
-        return []
-    if not isinstance(items, list):
-        items = [items]
-    out: list[str] = []
-    for it in items:
-        if isinstance(it, str):
-            out.append(it)
-        elif isinstance(it, dict):
-            vals = [v for v in it.values() if isinstance(v, str) and v.strip()]
-            out.append(vals[0] if vals else json.dumps(it, ensure_ascii=False))
-        elif it is not None:
-            s = str(it)
-            if s.strip():
-                out.append(s)
-    return [x for x in out if x.strip()][:limit]
+def _pacing_block(proj: Project) -> str:
+    target = proj.target_total_chars
+    length = max(1, int(proj.generation_length or 3000))
+    if not target:
+        return "整本目标字数：未指定；不强求分段规划。"
+    segments = max(1, (target + length - 1) // length)
+    daily = int(segments * 0.15)
+    conflict = int(segments * 0.2)
+    if target < length:
+        warning = "警告：目标不足 1 段长，建议目标至少达到单段长度；仍按试水段生成。"
+    else:
+        warning = ""
+    return (
+        f"整本目标字数：{target} 字；按每段 {length} 字约 {segments} 段。\n"
+        f"节拍分配：约 {daily} 段写日常/补世界观/换幕，约 {conflict} 段做冲突升级/转折，其余段推进主线。\n"
+        "在 JSON 的 pacing 数组内，按段给出 segment、conflict、character_state、daily；"
+        "节拍内容合计不超过 800 字。\n"
+        f"{warning}"
+    )
 
 
 @router.post("/{project_id}/propose-premise", response_model=PremiseProposalOut)
@@ -158,9 +169,7 @@ def propose_premise(project_id: int, db: Session = Depends(get_db)) -> dict:
     sys_p = (
         "你是网文策划编辑。根据用户给的类型与风格平台调性，构思 3 个「小说大概内容」方案。"
         "每个方案是一段 100–180 字的故事设定，必须包含：主角处境、核心冲突、开篇钩子。"
-        "只输出 JSON，且 proposals 必须是【字符串数组】，每个元素就是方案文本本身，"
-        "不要包成 {\"方案1\": \"...\"} 这样的对象。格式示例："
-        "{\"proposals\": [\"方案文本1\", \"方案文本2\", \"方案文本3\"]}，不要多余解释。"
+        "只输出 JSON，格式：{\"proposals\": [\"方案1\", \"方案2\", \"方案3\"]}，不要多余解释。"
     )
     user_p = _genre_style_text(proj)
     try:
@@ -168,7 +177,10 @@ def propose_premise(project_id: int, db: Session = Depends(get_db)) -> dict:
     except Exception:  # noqa: BLE001 - 真实模型调用失败（如免费档 429 限流）：降级本地模板
         return _offline_proposals(proj, degraded=True)
     data = _safe_parse(txt, {"proposals": []})
-    return {"proposals": _coerce_string_list(data, "proposals", 5)}
+    proposals = data.get("proposals") or []
+    if not isinstance(proposals, list):
+        proposals = [str(proposals)]
+    return {"proposals": [str(p) for p in proposals if str(p).strip()][:5]}
 
 
 @router.post("/{project_id}/expert-questions", response_model=ExpertQuestionOut)
@@ -180,8 +192,7 @@ def expert_questions(project_id: int, db: Session = Depends(get_db)) -> dict:
     sys_p = (
         "你是 wayfinder 创作教练。根据用户给出的类型、风格平台调性、以及（可选的）大概内容，"
         "提出 5–7 个关键追问，帮助用户把剧情想透。问题要具体、可答、能逼出人物动机与核心冲突。"
-        "只输出 JSON，且 questions 必须是【字符串数组】，每个元素就是问题文本本身，"
-        "不要包成对象。格式示例：{\"questions\": [\"问题1\", \"问题2\", ...]}，不要多余解释。"
+        "只输出 JSON：{\"questions\": [\"问题1\", ...]}，不要多余解释。"
     )
     user_p = _genre_style_text(proj)
     if proj.premise:
@@ -191,7 +202,10 @@ def expert_questions(project_id: int, db: Session = Depends(get_db)) -> dict:
     except Exception:  # noqa: BLE001 - 同上：限流等异常时降级本地追问清单
         return _offline_questions(degraded=True)
     data = _safe_parse(txt, {"questions": []})
-    return {"questions": _coerce_string_list(data, "questions", 8)}
+    questions = data.get("questions") or []
+    if not isinstance(questions, list):
+        questions = [str(questions)]
+    return {"questions": [str(q) for q in questions if str(q).strip()][:8]}
 
 
 @router.post("/{project_id}/build-bible", response_model=PlotBibleOut)
@@ -211,17 +225,24 @@ def build_bible(
                 "你是网文主编。综合用户给的类型、风格平台调性、大概内容（与可选的追问答案）、"
                 "以及参考语料的风格样本，为这部小说构思一份「剧情圣经」。\n"
                 "严格输出 JSON：\n"
-                "{\"synopsis\": 完整剧情梗概(300字内), "
-                "\"characters\": [{\"name\":角色名,\"role\":身份设定,\"motivation\":核心动机}], "
+                "{\"synopsis\": 完整剧情梗概, "
+                "\"characters\": [{\"name\":角色名,\"role\":身份设定,\"motivation\":核心动机,\"arc_state\":当前人物弧线状态}], "
                 "\"relationships\": [{\"a\":角色,\"b\":角色,\"relation\":关系描述}], "
                 "\"direction\": 后续走向概述, "
                 "\"conflicts\": [冲突1, 冲突2], "
-                "\"foreshadowing\": [伏笔1, 伏笔2]}\n"
-                "要求：角色名用中文；关系要具体；foreshadowing 是『暂不打烊的悬念』，不要在此兑现。"
+                "\"foreshadowing\": [伏笔1, 伏笔2], "
+                "\"pacing\": [{\"segment\":段号,\"conflict\":核心冲突,\"character_state\":角色状态,\"daily\":是否含日常}]}\n"
+                "要求：角色名用中文；关系要具体；foreshadowing 是『暂不打烊的悬念』，不要在此兑现。\n"
+                + _pacing_block(proj)
             )
             user_p = _genre_style_text(proj)
             if proj.premise:
                 user_p += f"\n大概内容：{proj.premise}"
+            locked = (proj.plot_bible or {}).get("characters") or []
+            if locked:
+                user_p += "\n—— 用户锁定角色（必须原名使用，不得改名） ——\n" + json.dumps(
+                    locked, ensure_ascii=False
+                )
             if answers:
                 qa = "\n".join(f"Q：{k}\nA：{v}" for k, v in answers.items())
                 user_p += f"\n—— 创作者问答 ——\n{qa}"
@@ -234,6 +255,12 @@ def build_bible(
             bible["note"] = (
                 "模型调用受限（如免费档限流），已使用本地模板剧情圣经；可稍后重试获取模型版。"
             )
+
+    # 用户锁定的角色是高于模型构思的输入，离线与降级路径也必须保留。
+    locked = (proj.plot_bible or {}).get("characters") or []
+    if locked:
+        bible["characters"] = locked
+        bible["relationships"] = (proj.plot_bible or {}).get("relationships") or []
 
     # 落库：剧情圣经存进 project.plot_bible
     proj.plot_bible = bible
@@ -284,6 +311,13 @@ def _offline_bible(proj: Project, answers: dict[str, str]) -> dict:
     premise = (proj.premise or "").strip() or "（未填写，凭类型与风格自由构思）"
     g = proj.genre or "都市"
     s = proj.style or "番茄"
+    pacing: list[dict] = []
+    if proj.target_total_chars:
+        n = max(1, (proj.target_total_chars + (proj.generation_length or 3000) - 1) // (proj.generation_length or 3000))
+        pacing = [
+            {"segment": i, "conflict": "日常与世界观铺垫" if i % 7 == 0 else "主线推进", "character_state": "继续承受当前选择", "daily": i % 7 == 0}
+            for i in range(1, min(n, 120) + 1)
+        ]
     return {
         "synopsis": f"【{g}·{s}】{premise}",
         "characters": [
@@ -297,6 +331,7 @@ def _offline_bible(proj: Project, answers: dict[str, str]) -> dict:
             "开篇那通不该响起的信号，会在中段以另一种形式回响",
             "配角一句看似随意的话，实则是结局的伏笔",
         ],
+        "pacing": pacing,
     }
 
 

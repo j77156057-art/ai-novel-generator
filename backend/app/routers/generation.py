@@ -22,7 +22,7 @@ from app.generation import (
     generate_loop,
     generate_next_segment,
 )
-from app.generation.engine import _style_info, _style_narrative, _style_profile, _next_segment_no, current_node_prompt
+from app.generation.engine import _style_info, _style_profile, build_plan
 from app.generation.prompts import build_system_prompt, build_user_prompt
 from app.models import Generation, Project
 from app.schemas import StrictRequest
@@ -194,22 +194,17 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
     """只组装上下文与提示词，不调用 LLM——生成前漂移预检与人工审阅。"""
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
-    ctx = build_context(db, proj, novel_ids=novel_ids)
+    ctx = build_plan(db, proj, novel_ids=novel_ids)
     profile = _style_profile(db, proj)
     system = build_system_prompt(
-        proj.title, ctx["reminders"], _style_info(proj), proj.plot_bible,
-        profile, _style_narrative(db, proj),
+        proj.title, ctx["reminders"], _style_info(proj), proj.plot_bible, profile, proj.premise
     )
-    from app.llm.provider import get_llm_provider
     user = build_user_prompt(
         ctx["prior_summaries"], ctx["rag_context"], proj.outline,
         proj.generation_length or 3000, proj.plot_bible, proj.premise,
         prior_blocks=ctx["prior_blocks"],
-        style_exemplars=ctx.get("style_exemplars"),
-        rag_has_forbidden=ctx.get("rag_has_forbidden", False),
-        node_prompt=current_node_prompt(
-            proj, _next_segment_no(db, body.project_id) - 1, get_llm_provider(), db=db
-        ),
+        target_total_chars=proj.target_total_chars,
+        segment_count=ctx["segment_count"],
     )
     return {
         "reminders": ctx["reminders"],
@@ -220,7 +215,6 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         "prior_blocks": ctx["prior_blocks"],
         "prior_report": ctx["prior_report"],
         "rag_context": ctx["rag_context"],
-        "style_exemplars": ctx["style_exemplars"],
         "system_prompt": system,
         "user_prompt": user,
         # 文风档案的预检摘要。这里刻意**不回传整份档案**（含 20 个特征的分布，
@@ -231,6 +225,9 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         # 必须显式说明 `item_owner_conflict` 默认沉默 —— 否则界面看上去像四条都在跑，
         # 用户会以为「没报错=没问题」，而实际是那条规则根本没参与。
         "sentinel": _sentinel_digest(proj),
+        "upcoming_characters": ctx["upcoming_characters"],
+        "target_total_chars": proj.target_total_chars,
+        "segment_count": ctx["segment_count"],
     }
 
 

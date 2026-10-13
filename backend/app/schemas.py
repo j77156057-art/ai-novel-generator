@@ -1,7 +1,8 @@
 from datetime import datetime
 from typing import Any, Optional
+from pydantic import Field
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class StrictRequest(BaseModel):
@@ -26,9 +27,6 @@ class NovelOut(BaseModel):
     platform: Optional[str]
     genre: Optional[str]
     status: Optional[str]
-    # 导入时的语料清洗报告（第 8 步）。用户要能看到「洗掉了什么」：
-    # 检出串列表 / 各串次数 / 剔除总字数 / 清洗前后字数 / 原文样本。
-    clean_report: Optional[dict] = None
 
     model_config = {"from_attributes": True}
 
@@ -48,10 +46,6 @@ class UploadResult(BaseModel):
     title: Optional[str]
     chapters: int
     chunks: int
-    # 导入时的清洗报告（第 8 步）：上传响应里随即回显，用户立刻能看到洗掉了什么。
-    clean_report: Optional[dict] = None
-    # 实际检出的文件编码（utf-8-sig / utf-8 / gb18030）；seed 等内部路径可为空。
-    detected_encoding: Optional[str] = None
 
 
 class SearchHit(BaseModel):
@@ -78,6 +72,7 @@ class ProjectCreate(StrictRequest):
     premise: Optional[str] = None
     reference_novel_ids: Optional[list[int]] = None
     generation_length: int = 3000
+    target_total_chars: Optional[int] = Field(default=None, ge=1)
 
 
 class ProjectPatch(StrictRequest):
@@ -91,11 +86,9 @@ class ProjectPatch(StrictRequest):
     premise: Optional[str] = None
     reference_novel_ids: Optional[list[int]] = None
     generation_length: Optional[int] = None
+    target_total_chars: Optional[int] = Field(default=None, ge=1)
     plot_bible: Optional[dict] = None
     status: Optional[str] = None
-    # 叙事蒸馏档位（full/balanced/fast）。校验在 router 层做（要回 400 而不是 422），
-    # 见 app.style.narrative.resolve_tier。
-    narrative_tier: Optional[str] = None
 
 
 class ProjectOut(BaseModel):
@@ -114,12 +107,8 @@ class ProjectOut(BaseModel):
     reference_novel_ids: Optional[list[int]] = None
     plot_bible: Optional[dict] = None
     generation_length: int = 3000
+    target_total_chars: Optional[int] = None
     segment_count: int = 0
-    # 叙事蒸馏档位（项目级偏好，空=默认完整档）
-    narrative_tier: Optional[str] = None
-    # 已落库文风档案（蒸馏库「应用」写入的单槽缓存，生成链路直接读它）。
-    # 列表也带它：项目数不多、单条档案体量可控，且前端要据此反映「已应用」状态。
-    style_narrative: Optional[dict] = None
 
     model_config = {"from_attributes": True}
 
@@ -131,7 +120,48 @@ class PlotBibleOut(BaseModel):
     conflicts: list[str] = []  # 剧情冲突
     foreshadowing: list[str] = []  # 伏笔
     synopsis: Optional[str] = None  # 完整剧情梗概（quick/expert 构思结果）
+    pacing: list[dict] = Field(default_factory=list)  # 按段节拍计划
     note: Optional[str] = None  # 降级提示（如模型限流时返回本地模板并说明）
+
+
+class CharacterIn(StrictRequest):
+    name: str = Field(min_length=1, max_length=80)
+    role: str = Field(min_length=1, max_length=40)
+    motivation: Optional[str] = Field(default=None, max_length=200)
+    arc_state: Optional[str] = Field(default=None, max_length=200)
+    status: Optional[str] = Field(default="active", max_length=32)
+
+    @field_validator("name", "role")
+    @classmethod
+    def reject_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("角色名字和作用不能为空")
+        return value
+
+
+class RelationshipIn(StrictRequest):
+    a: str = Field(min_length=1, max_length=80)
+    b: str = Field(min_length=1, max_length=80)
+    relation: str = Field(min_length=1, max_length=120)
+
+
+class ProtagonistsIn(StrictRequest):
+    characters: list[CharacterIn] = Field(min_length=1, max_length=5)
+    relationships: Optional[list[RelationshipIn]] = Field(default=None, max_length=20)
+
+    @field_validator("relationships")
+    @classmethod
+    def relationships_use_declared_characters(cls, relationships, info):
+        names = {c.name for c in (info.data.get("characters") or [])}
+        for relation in relationships or []:
+            if relation.a not in names or relation.b not in names:
+                raise ValueError("人物关系必须引用已填写的角色")
+        return relationships
+
+
+class ConfirmedUpcomingIn(StrictRequest):
+    confirmed: list[CharacterIn] = Field(default_factory=list, max_length=20)
 
 
 class PremiseProposalOut(BaseModel):

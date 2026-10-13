@@ -3,19 +3,11 @@
 接口约定（与 embeddings/provider.py 同构）：
 - chat(system, user, constraints=None) -> str  续写/对话
 - summarize(text) -> str                       生成段级总结，供链式注入
-- get_llm_provider() / get_assistant_provider() / get_distiller_provider()
-                                               三轨工厂，按 role 隔离
+- get_llm_provider()                           工厂，未配 key 自动降级本地
 
 constraints 仅本地兜底使用：把 M3.3 注入的角色/未填坑回显进确定性续写，
 让离线验证能断言「约束确实进入了生成环」。DashScope 实现忽略该参数。
-
-ADR-2026-10-12 第 2 步：Writer 单例（_PROVIDER）行为**完全不变**；新增 Assistant 单例
-（_ASSISTANT_PROVIDER）与 Distiller 单例（_DISTILLER_PROVIDER）独立持有，
-ProviderRegistry 在此之上做 role→provider 路由 + 双锁并发安全 + 失效重载。
-任何改动都不得让某个角色的异常回落到另一个角色的缓存。
 """
-
-from __future__ import annotations
 
 import json
 import logging
@@ -23,7 +15,6 @@ import time
 import urllib.request
 
 from app.config import settings
-from app.llm.reasoning import ReasoningFilter, strip_reasoning
 
 logger = logging.getLogger("llm.provider")
 
@@ -159,37 +150,18 @@ class OpenAICompatibleChatProvider(LLMProvider):
 
     子类只需给出 api_key / base_url / model。extra_body 可追加厂商特有字段
     （如 OpenRouter 关闭 reasoning）。
-
-    ADR-2026-10-12 增加 max_tokens / timeout / stream_timeout 三个字段，默认值与
-    b58c763 的硬编码值**完全一致**（max_tokens=None 即「不写入请求体」；
-    timeout=120 即 chat 路径 120 秒；stream_timeout=180 即流式续写 180 秒——
-    长文首字到达前的整个连接窗口必须留够，否则会被截断）。
-    任何调用方未显式传这三个参数时，Writer 行为**绝对不变**。
     """
 
     label = "LLM"
 
     def __init__(self, api_key: str, base_url: str, model: str, extra_body: dict | None = None,
-                 models: list[str] | None = None,
-                 max_tokens: int | None = None, timeout: int = 120,
-                 stream_timeout: int = 180) -> None:
+                 models: list[str] | None = None) -> None:
         if not api_key:
             raise ValueError(f"{self.label} 需要 API key")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.extra_body = extra_body or {}
-        # None = 不在请求体里加 max_tokens（保留 Writer 原行为，调用方需明确给值才注入）
-        self.max_tokens = max_tokens
-        # 最近一次调用的 finish_reason（'length' = 被 max_tokens 截断）。
-        # 仅供诊断/测试；provider 是单例，多线程下可能互相覆盖，但用途就是打日志。
-        self.last_finish_reason: str | None = None
-        # chat 路径默认 120s = b58c763 硬编码值；Assistant 可独立调小（诊断必须快速失败）
-        self.timeout = timeout
-        # stream_chat 路径默认 180s = b58c763 硬编码值；**不能**与 chat 共用默认 120s，
-        # 否则长文流式续写会从 180s 截到 120s（QA 报告 3.1 节已记）。Assistant 不走流式
-        # 但 build_assistant_provider 仍显式传 stream_timeout=60 保持防御性。
-        self.stream_timeout = stream_timeout
         # 候选模型链：去重保序，默认模型置首；仅首个之后的模型用于限流时切换
         chain = [model] + [m for m in (models or []) if m and m != model]
         self._models = chain
@@ -205,8 +177,6 @@ class OpenAICompatibleChatProvider(LLMProvider):
             "top_p": 0.9,
             **self.extra_body,
         }
-        if self.max_tokens is not None:
-            payload_base["max_tokens"] = self.max_tokens
         last_exc: Exception | None = None
         for model in self._model_chain():
             payload = {**payload_base, "model": model}
@@ -216,15 +186,9 @@ class OpenAICompatibleChatProvider(LLMProvider):
                 req.add_header("Authorization", f"Bearer {self.api_key}")
                 req.add_header("Content-Type", "application/json")
                 try:
-                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    with urllib.request.urlopen(req, timeout=120) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
-                    choice = data["choices"][0]
-                    self._note_finish_reason(
-                        choice.get("finish_reason"), self.label, model, self.max_tokens
-                    )
-                    return strip_reasoning(
-                        choice["message"].get("content") or ""
-                    ).strip()
+                    return (data["choices"][0]["message"].get("content") or "").strip()
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
                     # 429/403（限流/无权限）：换下一个模型；网络抖动：同模型短退避重试
@@ -240,41 +204,6 @@ class OpenAICompatibleChatProvider(LLMProvider):
                         break
                     time.sleep(_backoff(attempt))
         raise RuntimeError(f"{self.label} chat 调用失败: {last_exc}") from last_exc
-
-    def _note_finish_reason(
-        self,
-        finish_reason: str | None,
-        label: str,
-        model: str,
-        max_tokens: int | None,
-    ) -> None:
-        """记录模型的 ``finish_reason``；被 token 上限截断时告警。
-
-        ## 为什么加这个
-
-        实测（2026-10-14）：``max_tokens=400`` 时模型返回
-        ``finish_reason="length"``，输出 619 字且**停在半句**
-        （「李阳没有理会男子的质问，」）。而当时 ``provider.py`` 里
-        ``finish_reason`` 出现 **0 次** —— 系统完全不知情，半截文字会被
-        当成完整段落直接落库，故事从断句处继续，用户看不出来。
-
-        注意「段长不足」和「被截断」是两件事：实测 ``max_tokens=2048``
-        时 ``finish_reason="stop"``、只用了 1038/2048 token，说明模型
-        常常是**自己**提前收手，那不是截断。所以本方法只在真的撞上上限
-        时告警，不去猜测段长为何偏短。
-
-        本方法只**告警 + 留痕**，不改返回内容：把截断段落直接拒掉会让
-        长文生成在正常路径上突然失败，比截断更难用。是否要在引擎层
-        拒绝/自动续写，那是另一个决定。
-        """
-        self.last_finish_reason = finish_reason
-        if finish_reason == "length":
-            logger.warning(
-                "%s 模型 %s 撞上 max_tokens=%s 被**拦腰截断**（finish_reason=length）；"
-                "这段正文是半截的，后续剧情会从断句处接上。若要更长，"
-                "调高 config/providers.yaml 的 writer.max_tokens。",
-                label, model, max_tokens,
-            )
 
     def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
         user = _apply_constraints(user, constraints)
@@ -301,27 +230,19 @@ class OpenAICompatibleChatProvider(LLMProvider):
             "stream": True,
             **self.extra_body,
         }
-        if self.max_tokens is not None:
-            payload_base["max_tokens"] = self.max_tokens
         last_exc: Exception | None = None
         for model in self._model_chain():
             payload = {**payload_base, "model": model}
             body = json.dumps(payload).encode("utf-8")
             for attempt in range(_RETRIES_PER_MODEL):
                 yielded = False
-                finish_reason: str | None = None
                 try:
                     req = urllib.request.Request(
                         f"{self.base_url}/chat/completions", data=body, method="POST"
                     )
                     req.add_header("Authorization", f"Bearer {self.api_key}")
                     req.add_header("Content-Type", "application/json")
-                    with urllib.request.urlopen(req, timeout=self.stream_timeout) as resp:
-                        # 推理块逐 token 到达，不能逐块简单替换——开标签会被
-                        # token 边界切断（"<thi" + "nk>"）。过滤器对"可能是开
-                        # 标签前缀"的尾巴持有不发，故不会漏出推理内容。
-                        # 每次尝试新建：重试必须从干净状态重来。
-                        rfilter = ReasoningFilter()
+                    with urllib.request.urlopen(req, timeout=180) as resp:
                         for raw in resp:
                             line = raw.decode("utf-8", "replace").strip()
                             if not line.startswith("data:"):
@@ -333,27 +254,11 @@ class OpenAICompatibleChatProvider(LLMProvider):
                                 obj = json.loads(data)
                             except Exception:  # noqa: BLE001 - 跳过不完整/心跳帧
                                 continue
-                            choice0 = obj.get("choices", [{}])[0]
-                            if choice0.get("finish_reason"):
-                                finish_reason = choice0["finish_reason"]
-                            delta = choice0.get("delta", {})
+                            delta = obj.get("choices", [{}])[0].get("delta", {})
                             piece = delta.get("content") or ""
                             if piece:
-                                safe = rfilter.feed(piece)
-                                if safe:
-                                    yielded = True
-                                    yield safe
-                        tail = rfilter.flush()
-                        if tail:
-                            yielded = True
-                            yield tail
-                        if rfilter.saw_reasoning:
-                            logger.info(
-                                "%s 模型 %s 的流里含推理块，已剥离", self.label, model
-                            )
-                        self._note_finish_reason(
-                            finish_reason, self.label, model, self.max_tokens
-                        )
+                                yielded = True
+                                yield piece
                     return
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
@@ -404,10 +309,8 @@ class OpenAICompatibleChatProvider(LLMProvider):
 class DashScopeChatProvider(OpenAICompatibleChatProvider):
     label = "DashScope"
 
-    def __init__(self, api_key: str, base_url: str, model: str, **kwargs) -> None:
-        # **kwargs 透传 max_tokens / timeout（ADR-2026-10-12 第 2 步）；
-        # 未传时 Writer 行为不变。
-        super().__init__(api_key, base_url, model, **kwargs)
+    def __init__(self, api_key: str, base_url: str, model: str) -> None:
+        super().__init__(api_key, base_url, model)
 
 
 class OpenRouterChatProvider(OpenAICompatibleChatProvider):
@@ -430,12 +333,12 @@ class OpenRouterChatProvider(OpenAICompatibleChatProvider):
     label = "OpenRouter"
 
     def __init__(self, api_key: str, base_url: str, model: str, reasoning: bool = False,
-                 models: list[str] | None = None, **kwargs) -> None:
+                 models: list[str] | None = None) -> None:
         extra: dict = {}
         if not reasoning:
             # 显式关闭推理：不返回思维链，降低延迟与 token 消耗
             extra["reasoning"] = {"enabled": False}
-        super().__init__(api_key, base_url, model, extra_body=extra, models=models, **kwargs)
+        super().__init__(api_key, base_url, model, extra_body=extra, models=models)
 
 
 class ZhipuChatProvider(OpenAICompatibleChatProvider):
@@ -474,26 +377,12 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
     _ADAPTIVE_THINKING_MODELS = ("MiniMax-M3.1-Flash-Preview",)
 
     def __init__(self, api_key: str, base_url: str, model: str,
-                 models: list[str] | None = None, **kwargs) -> None:
+                 models: list[str] | None = None) -> None:
         extra: dict = {}
         if not model.startswith(self._ADAPTIVE_THINKING_MODELS):
             # 老模型（M3/M2.x）会吐思维链，能关则关；关不掉由 _strip_thinking 兜底
             extra["thinking"] = {"type": "disabled"}
-        super().__init__(api_key, base_url, model, extra_body=extra, models=models, **kwargs)
-
-
-class GenericOpenAIChatProvider(OpenAICompatibleChatProvider):
-    """通用 OpenAI 兼容接口（渠道名 "openai"）。
-
-    不绑定任何厂商：只要端点实现了 `POST {base_url}/chat/completions` +
-    `Authorization: Bearer <key>` 就能接（OpenAI 官方 / 自建 one-api /
-    vLLM / LM Studio / LocalAI / 第三方中转站…）。
-
-    与父类的唯一差别是 label（界面上要显示成「通用 OpenAI」而不是泛泛的
-    "LLM"）——协议层完全复用，因此本渠道**不新增任何依赖**（仍是 stdlib urllib）。
-    """
-
-    label = "OpenAI"
+        super().__init__(api_key, base_url, model, extra_body=extra, models=models)
 
 
 class LocalFallbackLLMProvider(LLMProvider):
@@ -526,18 +415,10 @@ class LocalFallbackLLMProvider(LLMProvider):
         )
 
 
-# ====================================================================
-# Writer 单例（b58c763 行为完全保留）
-# ====================================================================
-
 _PROVIDER: LLMProvider | None = None
 
 
 def get_llm_provider() -> LLMProvider:
-    """Writer provider 单例：b58c763 时已有的唯一获取入口，签名/行为完全保留。
-
-    新代码请走 ProviderRegistry.get('writer') 而不是直接调本函数。
-    """
     global _PROVIDER
     if _PROVIDER is not None:
         return _PROVIDER
@@ -569,30 +450,6 @@ def get_llm_provider() -> LLMProvider:
             settings.minimax_model,
             models=settings.minimax_model_list,
         )
-    # ------------------------------------------------------------------
-    # 通用 OpenAI 兼容渠道（第 8 步新增，判据与上面 5 个分支同形）。
-    #
-    # **仅当 llm_provider == "openai" 时命中**；其余渠道（zhipu / siliconflow /
-    # minimax / openrouter / dashscope / 其它任意值）这个判据为假，继续走各自
-    # 的原有分支，**行为逐字节不变**——上面 5 个分支一行未改。
-    #
-    # 为什么必须补这一支：Writer 角色在「模型设置」页选了「通用 OpenAI 接口」
-    # 后，PUT 会把 provider 镜像成 llm_provider="openai"（b58c763 的 Writer
-    # 单例只读 legacy 字段）。若本函数不认这个渠道，就会静默落进下面的
-    # LocalFallback 兜底——UI 显示「已生效」而正文其实是模板生成的，
-    # 正是「配了但一直在用离线模板」的静默失效。
-    #
-    # 端点：显式 llm_base_url 优先，否则回落该渠道的默认地址
-    # （settings.openai_base_url，默认官方 https://api.openai.com/v1）。
-    # 模型链：读该渠道的 CSV（settings.openai_models），与 zhipu 等分支同口径。
-    # ------------------------------------------------------------------
-    elif settings.llm_provider == "openai" and settings.openai_api_key:
-        _PROVIDER = GenericOpenAIChatProvider(
-            settings.openai_api_key,
-            settings.llm_base_url or settings.openai_base_url,
-            settings.openai_model,
-            models=settings.openai_model_list,
-        )
     elif settings.llm_provider == "dashscope" and settings.dashscope_api_key:
         base = settings.llm_base_url or settings.dashscope_base_url
         _PROVIDER = DashScopeChatProvider(
@@ -604,228 +461,43 @@ def get_llm_provider() -> LLMProvider:
     return _PROVIDER
 
 
-def reset_provider_cache() -> None:
-    """清掉 Writer provider 单例缓存：下次 get_llm_provider() 按最新 settings 重建。
+# —— 运行时配置热切换（前端「模型设置」页驱动） ——
 
-    仅影响 Writer；Assistant 单例由 reset_assistant_provider_cache() 管理，互不干扰。
-    """
+def reset_provider_cache() -> None:
+    """清掉 provider 单例缓存：下次 get_llm_provider() 按最新 settings 重建。"""
     global _PROVIDER
     _PROVIDER = None
 
 
 def apply_runtime_config(overrides: dict[str, str | None]) -> None:
-    """把持久化/前端传入的配置覆盖到 settings 并重置对应 role 的 provider 缓存（热切换）。
+    """把持久化/前端传入的配置覆盖到 settings 并重置 provider 缓存（热切换）。
 
-    overrides 的键为 settings 字段名（如 llm_provider / zhipu_api_key /
-    assistant_model / distiller_model）；值为 None 的项跳过。
-    - 涉及 assistant_* 字段：额外重置 Assistant 缓存；
-    - 涉及 distiller_* 字段：额外重置 Distiller 缓存；
-    - 涉及其它字段（含 writer_* / llm_provider / zhipu_api_key / openrouter_* 等）：
-      走与 b58c763 一致的行为——重置 Writer 单例缓存（保持向后兼容）。
-    - 同一调用里几类都改：三个角色各自重置，互不影响。
+    overrides 的键为 settings 字段名（如 llm_provider / zhipu_api_key / zhipu_model）；
+    值为 None 的项跳过。调用后下一次 LLM 调用即用新配置。
     """
-    has_assistant = False
-    has_distiller = False
     for field, value in overrides.items():
         if value is None:
             continue
         if hasattr(settings, field):
             setattr(settings, field, value)
-            if field.startswith("assistant_"):
-                has_assistant = True
-            elif field.startswith("distiller_"):
-                has_distiller = True
     reset_provider_cache()
-    if has_assistant:
-        reset_assistant_provider_cache()
-    if has_distiller:
-        reset_distiller_provider_cache()
 
 
-def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
-                   max_tokens: int | None = None, timeout: int = 120,
-                   stream_timeout: int = 180) -> LLMProvider:
-    """按渠道名直接构造 provider 实例（测试端点用，不走缓存/单例）。
-
-    max_tokens / timeout / stream_timeout 是 ADR-2026-10-12 新增字段：
-    - Assistant 工厂会显式传 timeout=60 / stream_timeout=60；
-    - 其它调用方（settings.py 的连通性测试）不传 → 默认 None / 120 / 180 =
-      与 b58c763 行为一致（stream_timeout=180 是关键，不能与 chat 共用 120）。
-    """
+def build_provider(provider: str, api_key: str, model: str, base_url: str = "") -> LLMProvider:
+    """按渠道名直接构造 provider 实例（测试端点用，不走缓存/单例）。"""
     if provider == "openrouter":
         url = base_url or settings.openrouter_base_url
-        return OpenRouterChatProvider(api_key, url, model, models=[model],
-                                       max_tokens=max_tokens, timeout=timeout,
-                                       stream_timeout=stream_timeout)
+        return OpenRouterChatProvider(api_key, url, model, models=[model])
     if provider == "zhipu":
         url = base_url or settings.zhipu_base_url
-        return ZhipuChatProvider(api_key, url, model, models=[model],
-                                  max_tokens=max_tokens, timeout=timeout,
-                                  stream_timeout=stream_timeout)
+        return ZhipuChatProvider(api_key, url, model, models=[model])
     if provider == "siliconflow":
         url = base_url or settings.siliconflow_base_url
-        return SiliconFlowChatProvider(api_key, url, model, models=[model],
-                                        max_tokens=max_tokens, timeout=timeout,
-                                        stream_timeout=stream_timeout)
+        return SiliconFlowChatProvider(api_key, url, model, models=[model])
     if provider == "minimax":
         url = base_url or settings.minimax_base_url
-        return MiniMaxChatProvider(api_key, url, model, models=[model],
-                                    max_tokens=max_tokens, timeout=timeout,
-                                    stream_timeout=stream_timeout)
+        return MiniMaxChatProvider(api_key, url, model, models=[model])
     if provider == "dashscope":
         url = base_url or settings.dashscope_base_url
-        return DashScopeChatProvider(api_key, url, model,
-                                      max_tokens=max_tokens, timeout=timeout,
-                                      stream_timeout=stream_timeout)
-    if provider == "openai":
-        # 通用 OpenAI 兼容渠道：任何实现了 /chat/completions + Bearer 鉴权的端点
-        # （官方 / one-api / vLLM / LM Studio / 中转站…）。端点优先取调用方给的
-        # base_url，否则回落 settings.openai_base_url（默认官方地址）。
-        # 注意：**必须**在下面的 LocalFallback 兜底 return 之前——
-        # 未知 provider 名会静默降级成本地兜底，那会让「渠道名拼错」表现为
-        # 「配了但一直在用离线模板」，是极难排查的静默失效。
-        url = base_url or settings.openai_base_url
-        return GenericOpenAIChatProvider(api_key, url, model, models=[model],
-                                         max_tokens=max_tokens, timeout=timeout,
-                                         stream_timeout=stream_timeout)
+        return DashScopeChatProvider(api_key, url, model)
     return LocalFallbackLLMProvider()
-
-
-# ====================================================================
-# Assistant 单例（ADR-2026-10-12 新增，独立于 _PROVIDER）
-# ====================================================================
-
-
-def _default_model_for(provider: str) -> str:
-    """模型兜底：assistant_model / distiller_model 留空时用（两角色共用）。
-
-    这张表必须与 `routers/settings.py` 的 `PROVIDER_META[*]["default_models"]`
-    以及 `config.py` 的 `*_models` CSV 保持**三处一致**——下拉里能选的模型
-    若不在运行时切换链上（或反过来），界面与生成链路就会对不上。
-    """
-    return {
-        "openrouter": "apodex/apodex-1.1-mini:free",
-        "zhipu": "glm-4-flash",
-        "siliconflow": "Qwen/Qwen2.5-7B-Instruct",
-        "minimax": "MiniMax-M3.1-Flash-Preview",
-        "dashscope": "qwen-plus",
-        "openai": "gpt-4o-mini",
-    }.get(provider, "")
-
-
-def build_role_provider(role: str, stream_timeout: int = 60) -> LLMProvider:
-    """按 `<role>.*` 字段独立构造一个 provider 实例（与 writer 完全隔离）。
-
-    这是 `build_assistant_provider()` 与 `build_distiller_provider()` 的共用
-    实现——两角色同构（都走 `settings.get_provider_config(role)` 的渠道回退），
-    只有默认 stream_timeout 不同（蒸馏是长任务，窗口给得更宽）。
-
-    6 字段全部从 `settings.get_provider_config(role)` 取，**绝不读** llm_provider /
-    *_api_key 等 legacy 字段（渠道回退在 config 那一层完成，不是绕过隔离）。
-
-    异常与降级：
-    - provider 留空 / provider='local' → 直接返回 LocalFallbackLLMProvider()（无 key 也跑）；
-    - api_key 空 → 同样降级 LocalFallback（避免发请求时 401 拖慢诊断路径）；
-    - model 留空 → 按 provider 走渠道默认（zhipu→glm-4-flash 等）；
-    - max_tokens / timeout 走 settings.<role>_*；负值/0 视为未设。
-
-    失败兜底**不动** Writer 单例：若本函数抛错，_PROVIDER 全程未被读写。
-    """
-    cfg = settings.get_provider_config(role)
-    provider = str(cfg.get("provider") or "").strip()
-    if not provider or provider == "local":
-        return LocalFallbackLLMProvider()
-    api_key = str(cfg.get("api_key") or "").strip()
-    if not api_key:
-        return LocalFallbackLLMProvider()
-    base_url = str(cfg.get("base_url") or "").strip()
-    model = str(cfg.get("model") or "").strip() or _default_model_for(provider)
-    # max_tokens / timeout 仅取正整数；负值/0/None 都不注入（保留默认）。
-    kwargs: dict = {}
-    mt = cfg.get("max_tokens")
-    if isinstance(mt, int) and mt > 0:
-        kwargs["max_tokens"] = mt
-    to = cfg.get("timeout")
-    if isinstance(to, int) and to > 0:
-        kwargs["timeout"] = to
-    # stream_timeout 暂时不分配置项（这两个角色都不走流式）但显式传值，
-    # 防御未来子类把默认改成别的值。
-    kwargs["stream_timeout"] = stream_timeout
-    return build_provider(provider, api_key, model, base_url, **kwargs)
-
-
-def build_assistant_provider() -> LLMProvider:
-    """按 assistant.* 字段独立构造一个 provider 实例（与 writer 完全隔离）。
-
-    Assistant 端的所有检索/诊断调用都走本入口对应的单例（`get_assistant_provider()`）。
-    stream_timeout=60 与 timeout 配对：诊断路径必须快速失败，不允许长等。
-    """
-    return build_role_provider("assistant", stream_timeout=60)
-
-
-_ASSISTANT_PROVIDER: LLMProvider | None = None
-
-
-def get_assistant_provider() -> LLMProvider:
-    """Assistant provider 单例：与 _PROVIDER 互不影响。
-
-    Assistant 端的所有检索/诊断调用都走本入口（不直接调 build_assistant_provider()，
-    以避免每次都新建连接 / 重新解析配置）。
-    """
-    global _ASSISTANT_PROVIDER
-    if _ASSISTANT_PROVIDER is not None:
-        return _ASSISTANT_PROVIDER
-    _ASSISTANT_PROVIDER = build_assistant_provider()
-    return _ASSISTANT_PROVIDER
-
-
-def reset_assistant_provider_cache() -> None:
-    """清掉 Assistant 单例缓存：下次 get_assistant_provider() 按最新 settings 重建。
-
-    完全不动 _PROVIDER；不同 role 互不串扰。
-    """
-    global _ASSISTANT_PROVIDER
-    _ASSISTANT_PROVIDER = None
-
-
-# ====================================================================
-# Distiller 单例（文风档案抽取专用，第三条轨道）
-# ====================================================================
-
-
-def build_distiller_provider() -> LLMProvider:
-    """按 distiller.* 字段独立构造一个 provider 实例（第三轨，与前两轨隔离）。
-
-    用途是**文风档案抽取**：把参考语料压成可注入的文风特征。它与
-    `app.style.narrative` 的「蒸馏档位」（full/balanced/fast，决定抽多细）
-    不是一回事——本函数只决定「用哪个模型抽」。
-
-    蒸馏是长任务（一次读几十段语料），所以默认 stream_timeout 给到 300s，
-    远大于 Assistant 的 60s；timeout 默认由 providers.yaml 给 180s。
-    """
-    return build_role_provider("distiller", stream_timeout=300)
-
-
-_DISTILLER_PROVIDER: LLMProvider | None = None
-
-
-def get_distiller_provider() -> LLMProvider:
-    """Distiller provider 单例：与 _PROVIDER / _ASSISTANT_PROVIDER 互不影响。
-
-    蒸馏链路统一走本入口（不直接调 build_distiller_provider()），
-    以避免每次调用都新建连接 / 重新解析配置。
-    """
-    global _DISTILLER_PROVIDER
-    if _DISTILLER_PROVIDER is not None:
-        return _DISTILLER_PROVIDER
-    _DISTILLER_PROVIDER = build_distiller_provider()
-    return _DISTILLER_PROVIDER
-
-
-def reset_distiller_provider_cache() -> None:
-    """清掉 Distiller 单例缓存：下次 get_distiller_provider() 按最新 settings 重建。
-
-    完全不动 _PROVIDER / _ASSISTANT_PROVIDER；不同 role 互不串扰。
-    """
-    global _DISTILLER_PROVIDER
-    _DISTILLER_PROVIDER = None

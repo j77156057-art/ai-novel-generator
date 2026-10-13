@@ -1,20 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "@/api/client";
 import type {
   AlertsResponse,
-  DistillJob,
   GeneratePlan,
   Graph,
   LlmConfig,
-  NarrativeTier,
   NovelOut,
   PlotBible,
   ProjectOut,
-  StyleDistillSummary,
 } from "@/api/types";
-import DistillProgress from "@/components/DistillProgress.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -33,8 +29,9 @@ const STEPS = [
   "类型",
   "风格",
   "大概内容",
+  "主角与配角",
   "构思剧情",
-  "生成控制台",
+  "总字数与生成",
   "知识图谱",
 ] as const;
 const step = ref(1);
@@ -56,6 +53,15 @@ const questionNote = ref<string | null>(null);
 const answers = reactive<Record<string, string>>({});
 const buildingBible = ref(false);
 const bible = ref<PlotBible | null>(null);
+
+type CharacterDraft = { name: string; role: string; motivation: string };
+const characterDrafts = ref<CharacterDraft[]>([{ name: "", role: "", motivation: "" }]);
+const relationshipDrafts = ref<{ a: string; b: string; relation: string }[]>([]);
+const targetTotalWan = ref<number | null>(null);
+const savingCharacters = ref(false);
+const upcomingConfirmed = ref<{ name: string; role?: string; motivation?: string }[]>([]);
+const upcomingOpen = ref(false);
+const upcomingLoading = ref(false);
 
 // 生成前的「让模型出方案」回调后回填
 function pickProposal(text: string) {
@@ -152,7 +158,13 @@ async function loadProject() {
     selectedRefs.value = (project.value.reference_novel_ids as number[]) || [];
     premiseDraft.value = project.value.premise || "";
     generationLength.value = project.value.generation_length || 3000;
+    targetTotalWan.value = project.value.target_total_chars ? project.value.target_total_chars / 10000 : null;
     bible.value = (project.value.plot_bible as PlotBible) || null;
+    const existing = bible.value?.characters || [];
+    characterDrafts.value = existing.length
+      ? existing.map((c) => ({ name: c.name || "", role: c.role || "", motivation: c.motivation || "" }))
+      : [{ name: "", role: "", motivation: "" }];
+    relationshipDrafts.value = (bible.value?.relationships || []).map((r) => ({ a: r.a || "", b: r.b || "", relation: r.relation || "" }));
   } catch (err) {
     loadError.value = err instanceof Error ? err.message : String(err);
   }
@@ -230,7 +242,8 @@ const inactiveRules = computed(() => {
 function inferStep(): number {
   const p = project.value;
   if (!p) return 1;
-  if (generations.value.length > 0 || p.plot_bible) return 6;
+  if (generations.value.length > 0) return 7;
+  if (p.plot_bible) return 6;
   if (p.premise) return 5;
   if (p.style) return 4;
   if (p.genre) return 3;
@@ -249,402 +262,15 @@ function goStep(n: number) {
   maxStep.value = Math.max(maxStep.value, n);
 }
 
-// —— 文风蒸馏档位（完整 / 平衡 / 快速）——
-// 档位清单**从后端取**（GET /projects/narrative-tiers），不在前端硬编码三档文案：
-// 档位定义（采样/维度/清洗强度）的单一事实来源是后端 TIER_REGISTRY，
-// 前端另抄一份必然随档位调整而漂移。
-const tiers = ref<NarrativeTier[]>([]);
-const tierDefault = ref("full");
-const tiersErr = ref<string | null>(null);
-const selectedTier = ref<string>("");
-
-/** 档位清单拉取失败时的兜底文案，不静默假装有清单。 */
-async function loadTiers() {
-  try {
-    const r = await api.listNarrativeTiers();
-    tiers.value = r.tiers || [];
-    tierDefault.value = r.default || "full";
-    tiersErr.value = null;
-  } catch (err) {
-    tiers.value = [];
-    tiersErr.value = err instanceof Error ? err.message : String(err);
-  }
-}
-
-/**
- * 耗时/成本提示**一律取后端 `cost_hint`**，前端不维护第二份耗时表。
- *
- * 之前这里按 key 硬编码过一份耗时表，现已删除：耗时是**会随语料/模型/机器
- * 变化**的实测值，存两份必然漂移——后端更新了、前端还挂着旧数字，用户看到的
- * 承诺就过期了。后端新增档位忘了补提示会响亮失败（KeyError + 测试钉住），
- * 所以这个字段可靠。
- */
-
-/** 伪角色清洗强度 → 人话。强度分三档，别让用户去猜 "partial" 是几成。 */
-const CLEANING_LABEL: Record<string, string> = {
-  full: "伪角色全量清洗",
-  partial: "伪角色部分清洗",
-  none: "不做伪角色清洗",
-};
-
-/**
- * 采样方式 → 人话。两个分支都要覆盖：percentage 档是「按语料量百分比」，
- * fixed_chapters 档是「固定 N 章」——写死一种会让另一档显示成空。
- */
-function samplingText(t: NarrativeTier): string {
-  if (t.sampling_mode === "percentage") {
-    const pct = t.sample_ratio != null ? Math.round(t.sample_ratio * 1000) / 10 : null;
-    return pct != null ? `按语料量 ${pct}% 采样` : "按语料量百分比采样";
-  }
-  if (t.sampling_mode === "fixed_chapters") {
-    return t.fixed_chapters != null ? `固定 ${t.fixed_chapters} 章` : "固定章数采样";
-  }
-  return `采样方式 ${t.sampling_mode}`;
-}
-
-/**
- * 档位 → 「文字标签 + 色标」双编码（沿用 assistantDisplay.ts 的做法）。
- *
- * 色标只做**冗余**提示，不独自承载语义：色弱/单色打印/截图转灰度时，
- * 「最慢·最全 / 居中 / 最快」这行字仍然把三档区分得清清楚楚。
- * 强度标签按清单里的**次序**推导（后端已按完整→平衡→快速排好），
- * 而不是按 key 硬编码，所以后端增删档位时标签不会指错。
- */
-function tierMeta(t: NarrativeTier, index: number, total: number) {
-  if (total <= 1) return { label: "唯一档位", tag: "accent" };
-  if (index === 0) return { label: "最完整 · 也最慢", tag: "accent" };
-  if (index === total - 1) return { label: "最快 · 适合冒烟", tag: "info" };
-  return { label: "居中 · 试跑用", tag: "warn" };
-}
-
-const tierCards = computed(() =>
-  tiers.value.map((t, i) => ({
-    tier: t,
-    meta: tierMeta(t, i, tiers.value.length),
-    sampling: samplingText(t),
-    cleaning: CLEANING_LABEL[t.fake_character_cleaning] ?? `伪角色清洗 ${t.fake_character_cleaning}`,
-    nameNorm: t.normalize_character_names ? "角色名语料自证归一化" : "角色名不归一化",
-    cost: t.cost_hint || "",
-    isDefault: t.key === tierDefault.value,
-  })),
-);
-
-/** 当前生效档位：已落库的 > 用户刚点的 > 后端默认档。 */
-const effectiveTier = computed(
-  () => selectedTier.value || project.value?.narrative_tier || tierDefault.value,
-);
-
-// ====================================================================
-// 文风蒸馏后台任务（可观测进度）
-// ====================================================================
-//
-// 蒸馏在 833 章语料上跑完整档实测 42 分钟，所以它必须是**后台任务**：
-// 提交即返回 job_id，真正的蒸馏跑在服务端，前端按 1.5s 轮询进度。
-// 好处是离开页面/刷新/切步骤都不丢 —— 进度存在服务端的 distill_runs 表里。
-const distillJob = ref<DistillJob | null>(null);
-const distillSubmitting = ref(false);
-/** 提交阶段的可见错误（PATCH 失败 / 蒸馏接口报错）。 */
-const distillErr = ref<string | null>(null);
-/** 提交阶段的可见提示（「已提交」/「未选语料不蒸馏」）。 */
-const distillNotice = ref<string | null>(null);
-/** 用户对已完成/失败横幅的手动收起；跑起来会自动重新展开。 */
-const distillDismissed = ref(false);
-/**
- * 强制重新蒸馏开关：勾选后提交会带 force=true，绕过「项目缓存 / 蒸馏库」复用，
- * 真正重新调用模型。默认不勾 —— 命中缓存秒级返回才是预期行为，不该被当成 bug。
- */
-const forceRedistill = ref(false);
-/** 轮询定时器句柄；组件卸载时必须清掉，否则会在已销毁的组件上写 ref。 */
-let distillTimer: ReturnType<typeof setInterval> | null = null;
-
-// ── 文风蒸馏库（跨项目复用）状态 ──
-const styleDistills = ref<StyleDistillSummary[]>([]);
-const styleDistillsLoading = ref(false);
-/** 正在被「应用」到本项目的库条目 id（按钮禁用 + 文案用）。 */
-const styleDistillApplying = ref<number | null>(null);
-const styleDistillMsg = ref<string | null>(null);
-const styleDistillErr = ref<string | null>(null);
-
-const POLL_MS = 1500;
-
-/**
- * 进工作台时，多久之内**刚结束**的任务值得回填展示（毫秒）。
- *
- * 超出窗口的历史任务不再自动弹出：一条上周的旧报错每次进工作台都要先关掉，
- * 那是噪声不是信息。真正想看历史的人走任务列表。
- */
-const RESUME_RESULT_WINDOW_MS = 3 * 60 * 1000;
-
-/** pending / running 都算「还在跑」。 */
-const distillActive = computed(
-  () =>
-    distillJob.value?.status === "pending" ||
-    distillJob.value?.status === "running",
-);
-
-/** 任务档位的可读名（完整 / 平衡 / 快速）；查不到就退化成档位 key。 */
-const distillTierName = computed(() => {
-  const key = distillJob.value?.tier;
-  if (!key) return null;
-  return tiers.value.find((t) => t.key === key)?.name ?? key;
-});
-
-/**
- * 跨步骤常驻横幅是否显示：跑起来时强制显示，跑完之后等用户手动收起。
- *
- * 「跨步骤常驻」是硬需求：蒸馏期间允许用户继续下一步，若进度条只挂在
- * 步骤①里，一跳步就再也看不到——等于又回到「不知道开始没有」。
- */
-const showDistillBanner = computed(
-  () => !!distillJob.value && (distillActive.value || !distillDismissed.value),
-);
-
-function stopDistillPolling() {
-  if (distillTimer !== null) {
-    clearInterval(distillTimer);
-    distillTimer = null;
-  }
-}
-
-function startDistillPolling(jobId: number) {
-  stopDistillPolling();
-  distillTimer = setInterval(() => {
-    void pollDistill(jobId);
-  }, POLL_MS);
-}
-
-async function pollDistill(jobId: number) {
-  try {
-    const job = await api.getDistillJob(projectId, jobId);
-    distillJob.value = job;
-    if (job.status !== "pending" && job.status !== "running") {
-      stopDistillPolling(); // 终态：停表，不再空转
-    }
-  } catch (err) {
-    // 轮询失败**不**打断主流程、也不弹窗：下一 tick 会再试。
-    // 真正的结论由服务端任务状态兜底（它不会永远停在 running，见后端注释）。
-    console.warn("蒸馏进度轮询失败，下个周期重试：", err);
-  }
-}
-
-/**
- * 进工作台时恢复上一次还没跑完的蒸馏。
- *
- * 取不到（老后端没这几个端点 / 网络问题）时静默降级为「无进度条」，
- * 绝不用假数据假装有一条在跑的任务。
- */
-async function resumeDistillJob() {
-  try {
-    const r = await api.listDistillJobs(projectId, 1);
-    const last = r.items?.[0];
-    if (!last) return;
-    if (last.status === "pending" || last.status === "running") {
-      distillJob.value = last;
-      distillDismissed.value = false;
-      startDistillPolling(last.id);
-      return;
-    }
-    // 已终态：**只回填这次会话内刚结束的**。给三分钟窗口，是为了让上一步
-    // 点了蒸馏就跳走的用户回来能看到结论；超过这个窗口的历史任务不再弹出来
-    // ——否则每次进工作台都要先关掉一条上周的旧报错，那是噪声不是信息。
-    const finished = last.finished_at ? Date.parse(last.finished_at) : NaN;
-    const fresh =
-      !Number.isNaN(finished) && Date.now() - finished < RESUME_RESULT_WINDOW_MS;
-    if (fresh) {
-      distillJob.value = last;
-      distillDismissed.value = false;
-    }
-  } catch {
-    /* 静默：服务端尚未升级到蒸馏端点 */
-  }
-}
-
+// —— 步骤 1：参考语料 ——
 function toggleRef(id: number) {
   const i = selectedRefs.value.indexOf(id);
   if (i >= 0) selectedRefs.value.splice(i, 1);
   else selectedRefs.value.push(id);
 }
-
-/**
- * 选语料 + 选档位一起落库。
- *
- * 合成一次 PATCH：这两个是同一步的产物，分两次提交会让「语料存了、档位没存」
- * 这种中间态真实发生（第二次失败时尤其明显）。
- */
 async function saveRefs() {
-  const body: Record<string, unknown> = { reference_novel_ids: selectedRefs.value };
-  // 只在清单真的拿到了、且选中的 key 确实在清单里时才写档位。
-  // 否则宁可不写——写进去一个未知 key 会让后端 build-narrative 直接 400。
-  const known = tiers.value.some((t) => t.key === effectiveTier.value);
-  if (known) body.narrative_tier = effectiveTier.value;
-  await patch(body);
+  await patch({ reference_novel_ids: selectedRefs.value });
   kgSourceOptions.value = buildSourceOptions();
-}
-
-// ── 文风蒸馏库（跨项目复用）──
-
-/** 加载蒸馏库列表（active 态），供「应用」面板展示。 */
-async function loadStyleDistills() {
-  styleDistillsLoading.value = true;
-  styleDistillErr.value = null;
-  try {
-    const r = await api.listStyleDistills("active");
-    styleDistills.value = r.items;
-  } catch (err) {
-    // 蒸馏库是增强项：加载失败不该阻断主流程，静默降级即可。
-    styleDistillErr.value = err instanceof Error ? err.message : String(err);
-    styleDistills.value = [];
-  } finally {
-    styleDistillsLoading.value = false;
-  }
-}
-
-/** 把蒸馏库某条目应用到本项目（复制其 style_narrative 进项目缓存）。 */
-async function applyStyleDistill(id: number) {
-  styleDistillApplying.value = id;
-  styleDistillMsg.value = null;
-  styleDistillErr.value = null;
-  try {
-    const updated = await api.applyStyleDistill(projectId, id);
-    // 把应用结果直接写回本地项目态，让界面立刻反映「本项目已有文风档案」。
-    if (project.value && updated) {
-      project.value.style_narrative = updated.style_narrative ?? null;
-      if (updated.narrative_tier != null) {
-        project.value.narrative_tier = updated.narrative_tier;
-      }
-    }
-    styleDistillMsg.value =
-      "已应用该文风档案到本项目：生成时直接套用，无需重新蒸馏。";
-    // 应用成功后清掉强制开关——本次「应用」已把文风档案落进项目缓存，
-    // 再点「保存并开始蒸馏」若仍带着 force=true 会无谓地重新烧一遍 LLM。
-    forceRedistill.value = false;
-    await loadStyleDistills();
-  } catch (err) {
-    styleDistillErr.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    styleDistillApplying.value = null;
-  }
-}
-
-/** 归档一条蒸馏库条目（不再被复用，但保留供查阅）。 */
-async function archiveStyleDistill(id: number) {
-  styleDistillApplying.value = id;
-  styleDistillErr.value = null;
-  try {
-    await api.archiveStyleDistill(id);
-    await loadStyleDistills();
-  } catch (err) {
-    styleDistillErr.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    styleDistillApplying.value = null;
-  }
-}
-
-/**
- * 保存语料 + 档位，然后**提交后台蒸馏**。
- *
- * 这里与旧版的差别是修掉一个真实的竞态：旧版写的是
- * `saveRefs(); goStep(2)` —— `saveRefs()` 返回的 Promise 没人 await，
- * PATCH 还在飞就已经跳到步骤②，PATCH 失败更是变成 unhandled rejection、
- * 界面零提示。于是用户看到的就是「点了没生效就下一步了」。
- *
- * 现在：await 到底 + try/catch 出可见错误态 + 成功后立刻渲染进度条。
- * **不自动跳步** —— 先让人看见「已提交，后台运行中」，跳步交给用户决定。
- */
-async function startDistillAndStay() {
-  if (distillSubmitting.value) return;
-  distillSubmitting.value = true;
-  distillErr.value = null;
-  distillNotice.value = null;
-  try {
-    await saveRefs();
-    const started = await submitDistill(forceRedistill.value);
-    // 未选语料（自由生成）时没有可蒸馏的东西 —— 保持旧版语义：直接往下走；
-    // 真的发起了蒸馏才留下这一步，让人先看见「已提交、后台运行中」。
-    if (!started) goStep(2);
-  } catch (err) {
-    distillErr.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    distillSubmitting.value = false;
-  }
-}
-
-/**
- * 跳过（自由生成）：**明确不发起蒸馏**。
- *
- * 自由生成没有参考语料，蒸馏也无从下手（后端会 400）。这里同时把
- * 「未选语料 → 不蒸馏」这件事写进文案，让用户清楚两个按钮的区别不只是跳步。
- */
-async function skipRefs() {
-  if (distillSubmitting.value) return;
-  distillSubmitting.value = true;
-  distillErr.value = null;
-  distillNotice.value = null;
-  try {
-    selectedRefs.value = [];
-    await saveRefs();
-    stopDistillPolling();
-    distillJob.value = null;
-    goStep(2);
-  } catch (err) {
-    distillErr.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    distillSubmitting.value = false;
-  }
-}
-
-/**
- * 提交一次后台蒸馏。
- *
- * @returns true = 真的发起了任务；false = 条件不满足（未选语料），已给出说明。
- */
-async function submitDistill(force = false): Promise<boolean> {
-  if (!selectedRefs.value.length) {
-    distillNotice.value = "未选参考语料 → 本次为自由生成，不发起蒸馏。";
-    stopDistillPolling();
-    distillJob.value = null;
-    return false;
-  }
-  const r = await api.startDistill(projectId, effectiveTier.value || null, force);
-  // 一旦真正发起了任务，立刻清掉强制开关：后台运行已在跑，复选框的使命结束。
-  // 否则运行期间再点一次「保存并开始蒸馏」会带着 force=true 又起一条强制任务，
-  // 等于把同一份语料烧两遍 LLM。下一轮若还想强制重算，用户重新勾即可。
-  forceRedistill.value = false;
-  // 立刻造一个乐观快照：**点下去就有反馈**，不等第一个轮询 tick 回来。
-  // 少了这一步，用户点击后会有 1.5s 的「什么都没发生」窗口。
-  const cacheNote =
-    r.cache_source === "library"
-      ? "✓ 已复用蒸馏库里已有的文风档案（同语料+同档位），本次未重新调用模型，秒级返回。"
-      : "✓ 已复用本项目已缓存的文风档案（上次蒸馏结果），本次未重新调用模型，秒级返回。";
-  distillJob.value = {
-    id: r.job_id,
-    project_id: projectId,
-    tier: r.tier ?? effectiveTier.value ?? null,
-    status: r.status,
-    stage: r.reused
-      ? "已在运行中，已切到该任务的进度"
-      : r.from_cache
-        ? "命中缓存，将直接复用"
-        : "已提交，等待后台开始",
-    progress_current: 0,
-    progress_total: 0,
-    n_chapters: null,
-    rule_count: null,
-    rejected: null,
-    error: null,
-    created_at: null,
-    started_at: null,
-    finished_at: null,
-  };
-  distillDismissed.value = false;
-  distillNotice.value = r.reused
-    ? "该档位的蒸馏已在运行中，已切到那条任务的进度。"
-    : r.from_cache
-      ? `${cacheNote} 如需重新提炼，请勾选「强制重新蒸馏」后再点一次。`
-      : "已提交，蒸馏后台运行中 —— 可继续下一步，进度不会丢。";
-  startDistillPolling(r.job_id);
-  void pollDistill(r.job_id); // 立刻拉一次，不等第一个 tick
-  return true;
 }
 
 async function nextFromGenre() {
@@ -701,12 +327,53 @@ async function buildBible() {
     const b = await api.buildBible(projectId, ans);
     bible.value = b;
     await patch({ plot_bible: b, status: "planned" });
-    goStep(6);
+    goStep(7);
   } catch (err) {
     alert(err instanceof Error ? err.message : String(err));
   } finally {
     buildingBible.value = false;
   }
+}
+
+function addCharacter() {
+  if (characterDrafts.value.length < 5) characterDrafts.value.push({ name: "", role: "", motivation: "" });
+}
+function removeCharacter(i: number) {
+  if (characterDrafts.value.length > 1) characterDrafts.value.splice(i, 1);
+}
+function addRelationship() {
+  relationshipDrafts.value.push({ a: "", b: "", relation: "" });
+}
+async function saveCharactersAndContinue() {
+  const chars = characterDrafts.value.map((c) => ({ ...c, name: c.name.trim(), role: c.role.trim(), motivation: c.motivation.trim() }));
+  if (!chars.length || chars.some((c) => !c.name || !c.role)) { alert("每个角色都必须填写名字和作用"); return; }
+  savingCharacters.value = true;
+  try {
+    const r = await api.saveCharacters(projectId, { characters: chars, relationships: relationshipDrafts.value });
+    await patch({ plot_bible: { ...(project.value?.plot_bible || {}), characters: r.characters, relationships: r.relationships } });
+    goStep(6);
+  } catch (err) { alert(err instanceof Error ? err.message : String(err)); }
+  finally { savingCharacters.value = false; }
+}
+
+async function saveGenerationSettings() {
+  await patch({ generation_length: generationLength.value, target_total_chars: targetTotalWan.value ? Math.round(targetTotalWan.value * 10000) : null });
+}
+
+async function ensureUpcoming() {
+  upcomingLoading.value = true;
+  try {
+    await saveGenerationSettings();
+    const p = await api.generatePlan(projectId);
+    upcomingConfirmed.value = (p.upcoming_characters || []).map((c) => ({ ...c }));
+    upcomingOpen.value = true;
+  } catch (err) { alert(err instanceof Error ? err.message : String(err)); }
+  finally { upcomingLoading.value = false; }
+}
+async function confirmAndGenerate() {
+  await api.confirmUpcoming(projectId, upcomingConfirmed.value);
+  upcomingOpen.value = false;
+  await runGenerate();
 }
 
 // —— 步骤 6：生成（流式） ——
@@ -1122,7 +789,7 @@ async function loadGraph() {
 }
 
 onMounted(async () => {
-  await Promise.all([loadProject(), loadNovels(), loadTiers()]);
+  await Promise.all([loadProject(), loadNovels()]);
   kgSourceOptions.value = buildSourceOptions();
   await loadGenerations();
   restoreStep(); // 续接上次进度，不再每次回到步骤①
@@ -1134,10 +801,6 @@ onMounted(async () => {
   if (generations.value.length) void loadPlan();
   // 哨兵告警：进工作台就拉，理由同上 —— 硬冲突要「还没读到那一段就看得见」
   void loadAlerts();
-  // 蒸馏进度恢复：离开页面再回来不能丢进度（后台任务在服务端照跑）。
-  void resumeDistillJob();
-  // 蒸馏库列表：进工作台就拉，应用面板才有东西可选。
-  void loadStyleDistills();
   // 模型徽标：失败静默（不影响主流程）
   try {
     llmConfig.value = await api.getLlmConfig();
@@ -1145,9 +808,6 @@ onMounted(async () => {
     /* 忽略：徽标缺失不阻塞工作台 */
   }
 });
-
-// 轮询定时器必须在组件销毁时清掉，否则会对着已卸载的组件继续写 ref。
-onUnmounted(stopDistillPolling);
 </script>
 
 <template>
@@ -1189,10 +849,6 @@ onUnmounted(stopDistillPolling);
       <button class="btn" :class="completed ? '' : 'primary'" @click="toggleComplete">
         {{ completed ? "重新开启创作" : "保存并标记完成" }}
       </button>
-      <!-- 助手已独立成页（/projects/:id/assistant）：这里只留入口，七步向导一行不动 -->
-      <button class="btn" @click="router.push(`/projects/${projectId}/assistant`)">
-        打开助手工作台 →
-      </button>
     </div>
   </header>
 
@@ -1209,28 +865,6 @@ onUnmounted(stopDistillPolling);
       @click="goStep(i + 1)"
     >
       <span class="num">{{ i + 1 }}</span>{{ s }}
-      <!-- 步骤①上的蒸馏徽标：跨步骤常驻横幅之外，这里再冗余一份。
-           文字在前（"蒸馏中"），色点只做冗余强化 → 灰度/色弱下照样读得出。 -->
-      <span v-if="i === 0 && distillActive" class="step-distill">
-        <span class="step-dot" aria-hidden="true"></span>蒸馏中
-      </span>
-    </button>
-  </div>
-
-  <!-- 蒸馏进度（跨步骤常驻）：蒸馏期间允许用户继续下一步，
-       所以进度条不能只挂在步骤①里 —— 一跳步就看不见，等于白做。 -->
-  <div v-if="showDistillBanner && distillJob" class="distill-banner">
-    <DistillProgress
-      :job="distillJob"
-      :tier-name="distillTierName"
-      :compact="step !== 1"
-    />
-    <button
-      v-if="!distillActive"
-      class="link-btn distill-dismiss"
-      @click="distillDismissed = true"
-    >
-      收起
     </button>
   </div>
 
@@ -1255,142 +889,8 @@ onUnmounted(stopDistillPolling);
       </button>
     </div>
     <div class="row" style="margin-top: var(--gap)">
-      <button class="btn primary" :disabled="distillSubmitting" @click="startDistillAndStay">
-        {{ distillSubmitting ? "正在提交…" : "保存并开始蒸馏" }}
-      </button>
-      <!-- 语义明确：跳过 = **不发起**蒸馏，直接自由生成。文案写明，不只是换了个跳转。 -->
-      <button class="btn" :disabled="distillSubmitting" @click="skipRefs">
-        跳过（自由生成，不蒸馏）
-      </button>
-      <button class="btn ghost" @click="goStep(2)">
-        下一步 →<span v-if="distillActive">（蒸馏后台继续）</span>
-      </button>
-    </div>
-
-    <!-- 提交结果必须**可见**：旧版 `saveRefs(); goStep(2)` 既不 await 也不 catch，
-         PATCH 失败时界面毫无反应，这正是「点了也不知道开始没有」的根源。 -->
-    <div v-if="distillErr" class="notice err distill-inline">
-      保存或提交蒸馏失败：{{ distillErr }}
-    </div>
-    <div v-else-if="distillNotice" class="notice info distill-inline">
-      {{ distillNotice }}
-    </div>
-
-    <!-- 蒸馏进度（步骤①内嵌完整版）：与跨步骤常驻横幅共用同一份 job 状态 -->
-    <DistillProgress
-      v-if="distillJob"
-      :job="distillJob"
-      :tier-name="distillTierName"
-      class="distill-inline"
-    />
-
-    <!-- ============ 蒸馏档位（与选语料同一步落库） ============ -->
-    <div class="tier-block">
-      <div class="card-title" style="font-size: var(--fs-md)">
-        蒸馏档位<span class="hint">完整档最准，但最贵</span>
-      </div>
-      <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
-        档位决定蒸馏时<strong>读多少语料、提炼多少维度</strong>。默认「完整」最准，
-        但它是<strong>耗时最长</strong>的一档；只是先看看管线通不通，就选「快速」。
-        各档的成本差异见卡片下方。
-      </p>
-
-      <div v-if="tiersErr" class="empty">
-        档位清单加载失败（{{ tiersErr }}），本次将沿用项目已存的档位。
-      </div>
-
-      <div v-else class="tier-list">
-        <button
-          v-for="c in tierCards"
-          :key="c.tier.key"
-          class="tier"
-          :class="{ on: effectiveTier === c.tier.key }"
-          :aria-pressed="effectiveTier === c.tier.key"
-          @click="selectedTier = c.tier.key"
-        >
-          <!-- 文字标签 + 色标双编码：色弱/灰度下靠这行字区分档位，不靠颜色单打独斗 -->
-          <span class="tier-head">
-            <span class="tier-name">{{ c.tier.name }}</span>
-            <span class="tag" :class="c.meta.tag">{{ c.meta.label }}</span>
-            <span v-if="c.isDefault" class="tag">默认</span>
-          </span>
-
-          <!-- 「什么时候用这一档」——后端 description 原文，不在前端重写 -->
-          <span class="tier-desc">{{ c.tier.description }}</span>
-
-          <span class="tier-facts">
-            <span class="tier-fact">{{ c.sampling }}</span>
-            <span class="tier-fact">{{ c.tier.dimension_count }} 个维度</span>
-            <span class="tier-fact">{{ c.nameNorm }}</span>
-            <span class="tier-fact">{{ c.cleaning }}</span>
-          </span>
-
-          <span v-if="c.cost" class="tier-cost">{{ c.cost }}</span>
-
-          <span class="tier-key mono faint">{{ c.tier.key }}</span>
-        </button>
-      </div>
-
-      <!-- 强制重新蒸馏：默认不勾。命中缓存秒级复用是预期行为，不该被当成 bug；
-           只有用户明确要求重算时才传 force=true，真正重新调模型并走真实进度。 -->
-      <div class="row force-redistill" style="margin-top: var(--gap); align-items: center; gap: 12px">
-        <label class="checkbox">
-          <input type="checkbox" v-model="forceRedistill" />
-          强制重新蒸馏（忽略已缓存的文风档案，重新调用模型）
-        </label>
-        <button
-          v-if="forceRedistill"
-          class="btn sm ghost"
-          type="button"
-          @click="forceRedistill = false"
-        >取消强制</button>
-      </div>
-      <p v-if="forceRedistill" class="notice warn distill-inline">
-        已开启强制重算：本次会真正重新调用模型蒸馏，耗时与费用按所选档位正常发生。
-      </p>
-    </div>
-
-    <!-- ============ 文风蒸馏库（跨项目复用） ============ -->
-    <div class="library-block">
-      <div class="card-title" style="font-size: var(--fs-md)">
-        文风蒸馏库<span class="hint">蒸馏一次 · 全局共享 · 其它项目直接复用</span>
-      </div>
-      <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
-        已经蒸馏过的文风档案会存到这里，<strong>全局共享</strong>：任何项目都能应用，
-        不限创建它的项目。给别的项目选了<strong>同样的语料与档位</strong>，
-        点「应用」即可秒级套用，不必再跑一遍分钟级蒸馏。每条都标明了<strong>蒸馏程度</strong>（完整/平衡/快速）。
-      </p>
-
-      <div v-if="styleDistillsLoading" class="faint">正在加载蒸馏库…</div>
-      <div v-else-if="!styleDistills.length" class="empty">
-        蒸馏库还是空的。在步骤①点「保存并开始蒸馏」一次（真跑一遍），结果就会进库、之后可复用。
-      </div>
-      <ul v-else class="lib-list">
-        <li v-for="d in styleDistills" :key="d.id" class="lib-item">
-          <div class="lib-meta">
-            <span class="tag" :class="d.tier">{{ d.tier_name || d.tier }}</span>
-            <span class="faint mono">#{{ d.id }}</span>
-            <span class="faint">语料 {{ (d.source_ids || []).join("、") || "—" }}</span>
-            <span class="faint">蒸馏程度：{{ d.tier_name || d.tier }}档 · {{ d.n_chapters ?? 0 }} 章 · {{ d.rule_count ?? 0 }} 条规则</span>
-          </div>
-          <div class="lib-actions">
-            <button
-              class="btn sm"
-              :disabled="styleDistillApplying === d.id"
-              @click="applyStyleDistill(d.id)"
-            >{{ styleDistillApplying === d.id ? "应用中…" : "应用到本项目" }}</button>
-            <button
-              v-if="d.status === 'active'"
-              class="btn sm ghost"
-              :disabled="styleDistillApplying === d.id"
-              @click="archiveStyleDistill(d.id)"
-            >归档</button>
-          </div>
-        </li>
-      </ul>
-
-      <div v-if="styleDistillMsg" class="notice info distill-inline">{{ styleDistillMsg }}</div>
-      <div v-if="styleDistillErr" class="notice err distill-inline">{{ styleDistillErr }}</div>
+      <button class="btn primary" @click="saveRefs(); goStep(2)">保存并下一步 →</button>
+      <button class="btn" @click="selectedRefs = []; saveRefs(); goStep(2)">跳过（自由生成）</button>
     </div>
   </section>
 
@@ -1476,13 +976,46 @@ onUnmounted(stopDistillPolling);
       <button class="btn" :disabled="proposing" @click="runPropose">
         {{ proposing ? "生成中…" : "让模型出方案" }}
       </button>
-      <button class="btn primary" @click="savePremise(); goStep(5)">保存并构思 →</button>
+      <button class="btn primary" @click="savePremise(); goStep(5)">保存并设置角色 →</button>
     </div>
   </section>
 
-  <!-- ============ 步骤 5：构思剧情 ============ -->
+  <!-- ============ 步骤 5：角色输入 ============ -->
   <section v-else-if="step === 5" class="card">
-    <div class="card-title">⑤ 构思剧情圣经</div>
+    <div class="card-title">⑤ 主角与关键配角</div>
+    <div class="list">
+      <div v-for="(c, i) in characterDrafts" :key="i" class="list-item" style="align-items: flex-start">
+        <div class="field" style="flex: 1; min-width: 140px">
+          <label>名字 *</label><input class="input" v-model="c.name" maxlength="80" placeholder="例如：林深" />
+        </div>
+        <div class="field" style="flex: 1; min-width: 140px">
+          <label>作用 *</label><input class="input" v-model="c.role" maxlength="40" placeholder="男主 / 导师 / 反派" />
+        </div>
+        <div class="field" style="flex: 2; min-width: 180px">
+          <label>核心动机</label><input class="input" v-model="c.motivation" maxlength="200" placeholder="找回失踪的妹妹" />
+        </div>
+        <button class="btn sm" :disabled="characterDrafts.length <= 1" @click="removeCharacter(i)" title="删除角色">删除</button>
+      </div>
+    </div>
+    <button class="btn" :disabled="characterDrafts.length >= 5" @click="addCharacter">添加角色</button>
+    <div class="block" style="margin-top: var(--gap)">
+      <div class="card-title" style="font-size: var(--fs-sm)">人物关系</div>
+      <div v-for="(r, i) in relationshipDrafts" :key="i" class="row" style="margin: 8px 0; flex-wrap: wrap">
+        <select class="input" v-model="r.a"><option value="">选择角色</option><option v-for="c in characterDrafts" :key="c.name" :value="c.name">{{ c.name || "未命名" }}</option></select>
+        <select class="input" v-model="r.b"><option value="">选择角色</option><option v-for="c in characterDrafts" :key="c.name" :value="c.name">{{ c.name || "未命名" }}</option></select>
+        <input class="input" v-model="r.relation" placeholder="关系描述" />
+      </div>
+      <button class="btn sm" @click="addRelationship">添加关系</button>
+    </div>
+    <div class="row" style="margin-top: var(--gap)">
+      <button class="btn ghost" @click="goStep(4)">← 上一步</button>
+      <button class="btn primary" :disabled="savingCharacters" @click="saveCharactersAndContinue">{{ savingCharacters ? "保存中…" : "保存并构思 →" }}</button>
+    </div>
+  </section>
+
+  <!-- ============ 步骤 6：构思剧情 ============ -->
+  <section v-else-if="step === 6" class="card">
+    <div class="card-title">⑥ 构思剧情圣经</div>
     <div class="field" style="margin-bottom: var(--gap)">
       <label>构思方式</label>
       <div class="chips">
@@ -1560,14 +1093,18 @@ onUnmounted(stopDistillPolling);
     </div>
 
     <div class="row" style="margin-top: var(--gap)">
-      <button class="btn ghost" @click="goStep(4)">← 上一步</button>
+      <button class="btn ghost" @click="goStep(5)">← 上一步</button>
     </div>
   </section>
 
-  <!-- ============ 步骤 6：生成控制台 ============ -->
-  <section v-else-if="step === 6" class="card">
-    <div class="card-title">⑥ 生成控制台</div>
+  <!-- ============ 步骤 7：总字数与生成 ============ -->
+  <section v-else-if="step === 7" class="card">
+    <div class="card-title">⑦ 总字数与生成控制台</div>
     <div class="row" style="align-items: flex-start">
+      <div class="field" style="width: 200px">
+        <label>整本目标（万字，可留空）</label>
+        <input class="input" type="number" min="0.1" step="1" v-model.number="targetTotalWan" placeholder="不设目标" @change="saveGenerationSettings" />
+      </div>
       <div class="field" style="width: 200px">
         <label>单次生成字数（长文单段，避免多段压缩）</label>
         <input class="input" type="number" min="500" step="500" v-model.number="generationLength" />
@@ -1592,9 +1129,9 @@ onUnmounted(stopDistillPolling);
       </div>
     </div>
     <div class="row" style="margin-top: var(--gap)">
-      <button class="btn ghost" @click="goStep(5)">← 上一步</button>
-      <button class="btn primary" :disabled="streaming" @click="runGenerate">
-        {{ streaming ? "续写中…" : `生成 ${chaptersPerGen} 段` }}
+      <button class="btn ghost" @click="goStep(6)">← 上一步</button>
+      <button class="btn primary" :disabled="streaming || upcomingLoading" @click="ensureUpcoming">
+        {{ upcomingLoading ? "读取角色…" : `确认角色并生成 ${chaptersPerGen} 段` }}
       </button>
       <button class="btn" :disabled="!generations.length" @click="runExport">导出 txt</button>
     </div>
@@ -1950,14 +1487,14 @@ onUnmounted(stopDistillPolling);
     </div>
 
     <div class="row" style="margin-top: var(--gap)">
-      <button class="btn" @click="goStep(7)">下一步：看知识图谱 →</button>
+      <button class="btn" @click="goStep(8)">下一步：看知识图谱 →</button>
     </div>
   </section>
 
-  <!-- ============ 步骤 7：知识图谱（生成后） ============ -->
+  <!-- ============ 步骤 8：知识图谱（生成后） ============ -->
   <section v-else class="card">
     <div class="card-title">
-      ⑦ 知识图谱（生成后才出现）
+      ⑧ 知识图谱（生成后才出现）
       <button class="btn" :disabled="buildingKg" @click="buildGeneratedKg">
         {{ buildingKg ? "建图中…" : "建/重建「我的小说」图谱" }}
       </button>
@@ -1981,6 +1518,9 @@ onUnmounted(stopDistillPolling);
           <div v-for="c in characters" :key="c.id" class="list-item">
             <strong>{{ c.props?.name }}</strong>
             <span class="faint mono" style="font-size: var(--fs-xs)">提及 {{ c.props?.mentions }} · 第 {{ c.props?.first_chapter }}–{{ c.props?.last_chapter }} 章</span>
+            <span v-if="c.props?.role" class="tag info">{{ c.props.role }}</span>
+            <span v-if="c.props?.arc_state" class="tag">弧线：{{ c.props.arc_state }}</span>
+            <span v-if="c.props?.motivation" class="faint">动机：{{ c.props.motivation }}</span>
           </div>
           <div v-if="!characters.length" class="empty">无角色节点</div>
         </div>
@@ -2001,9 +1541,27 @@ onUnmounted(stopDistillPolling);
     </div>
 
     <div class="row" style="margin-top: var(--gap)">
-      <button class="btn ghost" @click="goStep(6)">← 返回生成</button>
+      <button class="btn ghost" @click="goStep(7)">← 返回生成</button>
     </div>
   </section>
+
+  <div v-if="upcomingOpen" class="modal-backdrop" @click.self="upcomingOpen = false">
+    <div class="modal card">
+      <div class="card-title">确认即将出场角色</div>
+      <p class="muted">这是生成前的最后一道名单确认。可删除系统推测角色，也可修正名字和作用。</p>
+      <div v-if="!upcomingConfirmed.length" class="empty">暂无候选角色，将按剧情圣经继续。</div>
+      <div v-for="(c, i) in upcomingConfirmed" :key="i" class="row" style="margin: 8px 0; flex-wrap: wrap">
+        <input class="input" v-model="c.name" placeholder="名字" />
+        <input class="input" v-model="c.role" placeholder="作用" />
+        <input class="input" v-model="c.motivation" placeholder="动机" />
+        <button class="btn sm" @click="upcomingConfirmed.splice(i, 1)">删除</button>
+      </div>
+      <div class="row" style="margin-top: var(--gap)">
+        <button class="btn" @click="upcomingOpen = false">返回修改</button>
+        <button class="btn primary" :disabled="streaming" @click="confirmAndGenerate">确认并生成</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
@@ -2045,24 +1603,6 @@ onUnmounted(stopDistillPolling);
 }
 .link-btn:hover {
   text-decoration: underline;
-}
-/* 强制重蒸馏勾选项：与 .row 同高、可点击、文字不换行 */
-.checkbox {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: var(--fs-sm);
-  cursor: pointer;
-  user-select: none;
-}
-.checkbox input {
-  width: 16px;
-  height: 16px;
-  cursor: pointer;
-  accent-color: var(--accent, #c0392b);
-}
-.force-redistill {
-  flex-wrap: wrap;
 }
 .stepper {
   display: flex;
@@ -2111,104 +1651,6 @@ onUnmounted(stopDistillPolling);
   background: var(--accent-soft);
   color: var(--accent-ink);
 }
-/* ---------- 蒸馏进度（跨步骤常驻） ---------- */
-/* 步骤①上的小徽标：蒸馏在后台跑时，用户跳到别的步骤也能一眼看到
-   「还在跑」。**文字在前**（"蒸馏中"），圆点只是冗余强化 —— 灰度/色弱下
-   照样读得出来，不靠颜色单打独斗。 */
-.step-distill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: 2px;
-  font-size: var(--fs-xs);
-  font-weight: 700;
-  color: var(--accent-ink);
-  background: var(--accent-soft);
-  border: var(--border-w) solid var(--accent-line);
-  border-radius: var(--radius-full);
-  padding: 0 7px;
-}
-.step.active .step-distill {
-  color: var(--accent-fg);
-  background: rgba(255, 255, 255, 0.25);
-  border-color: rgba(255, 255, 255, 0.4);
-}
-.step-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-  animation: distill-pulse 1.1s ease-in-out infinite;
-}
-@keyframes distill-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.25;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .step-dot {
-    animation: none;
-  }
-}
-.distill-banner {
-  position: relative;
-  margin-bottom: var(--gap);
-}
-.distill-dismiss {
-  position: absolute;
-  top: 8px;
-  right: 12px;
-  font-size: var(--fs-xs);
-}
-.distill-inline {
-  margin-top: var(--gap);
-}
-/* ---------- 文风蒸馏库（跨项目复用） ---------- */
-.library-block {
-  margin-top: calc(var(--gap) * 1.5);
-  padding-top: var(--gap);
-  border-top: var(--border-w) solid var(--border);
-}
-.lib-list {
-  list-style: none;
-  margin: var(--gap) 0 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.lib-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 10px 12px;
-  border: var(--border-w) solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg);
-}
-.lib-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: var(--fs-sm);
-}
-.lib-actions {
-  display: flex;
-  gap: 8px;
-  flex-shrink: 0;
-}
-/* 复用 distill 的小号按钮观感，避免再定义一套 .btn.sm 样式 */
-.btn.sm {
-  padding: 6px 12px;
-  font-size: var(--fs-sm);
-}
 .chips {
   display: flex;
   gap: 8px;
@@ -2236,75 +1678,6 @@ onUnmounted(stopDistillPolling);
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-fg);
-}
-/* ---------- 蒸馏档位选择 ---------- */
-/* 卡片式而非 chip 式：三档要并排比较的是「什么时候用」和「要等多久」，
-   一行 pill 装不下这些说明文字。 */
-.tier-block {
-  margin-top: var(--gap);
-  padding-top: var(--gap);
-  border-top: var(--border-w) solid var(--border);
-}
-.tier-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 10px;
-}
-.tier {
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  padding: 12px 14px;
-  border-radius: var(--radius-md);
-  border: var(--border-w) solid var(--border-strong);
-  background: var(--bg);
-  color: var(--fg);
-}
-.tier:hover {
-  border-color: var(--accent);
-}
-.tier.on {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-}
-.tier-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.tier-name {
-  font-size: var(--fs-sm);
-  font-weight: 700;
-}
-.tier-desc {
-  font-size: var(--fs-xs);
-  line-height: 1.5;
-  color: var(--fg-muted);
-}
-.tier-facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-.tier-fact {
-  font-size: var(--fs-xs);
-  color: var(--fg-muted);
-  background: var(--bg-sunken);
-  border: var(--border-w) solid var(--border);
-  border-radius: var(--radius-full);
-  padding: 1px 8px;
-}
-.tier-cost {
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  color: var(--fg-muted);
-}
-.tier-key {
-  font-size: var(--fs-xs);
 }
 .proposals {
   margin-top: 16px;
@@ -2413,6 +1786,20 @@ onUnmounted(stopDistillPolling);
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: var(--gap);
+}
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 45%);
+}
+.modal {
+  width: min(760px, 100%);
+  max-height: 86vh;
+  overflow: auto;
 }
 /* ---------- 前情预检 ---------- */
 /* 分层配色按**优先级**编码：越不会被裁的层用越重的色。

@@ -65,6 +65,10 @@ def get_character(db, project_id: int, name: str) -> dict | None:
     return {
         "name": name,
         "mentions": (node.props or {}).get("mentions"),
+        "role": (node.props or {}).get("role") or "",
+        "motivation": (node.props or {}).get("motivation") or "",
+        "arc_state": (node.props or {}).get("arc_state") or "未设定",
+        "status": (node.props or {}).get("status") or "active",
         "first_chapter": node.first_chapter,
         "last_chapter": node.last_chapter,
         "appearances": list(range(node.first_chapter or 0, (node.last_chapter or 0) + 1)),
@@ -142,6 +146,10 @@ def get_reminders(db, project_id: int, source: str = "generated",
                 "mentions": (c.props or {}).get("mentions"),
                 "first_chapter": c.first_chapter,
                 "last_chapter": c.last_chapter,
+                "role": (c.props or {}).get("role") or "",
+                "motivation": (c.props or {}).get("motivation") or "",
+                "arc_state": (c.props or {}).get("arc_state") or "未设定",
+                "status": (c.props or {}).get("status") or "active",
             }
             for c in chars
         ],

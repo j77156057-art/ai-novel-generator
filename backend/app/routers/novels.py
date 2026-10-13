@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.ingestion.encoding import EncodingDetectionError, decode_text
 from app.ingestion.seed import run_seed
 from app.ingestion.store import ingest_text
 from app.models import NovelChunk, RawNovel
@@ -24,17 +23,11 @@ def upload(file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
             status_code=413,
             detail=f"文件过大（上限 {settings.upload_max_bytes} 字节）",
         )
-    # 不再硬编码 utf-8：GBK / GB18030 的国内网文 txt 会被自动识别并正确解码。
-    # 全部候选都失败时 decode_text 抛 EncodingDetectionError，这里转成 400 +
-    # 具体原因（含文件名与各候选失败原因），不做静默兜底。
     try:
-        text, detected = decode_text(data, filename=file.filename)
-    except EncodingDetectionError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    result = ingest_text(db, text, title=file.filename, platform="upload")
-    # 把检出编码一并回显，便于追溯「这本是按什么编码读的」。
-    result["detected_encoding"] = detected
-    return result
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="仅支持 UTF-8 编码的 .txt")
+    return ingest_text(db, text, title=file.filename, platform="upload")
 
 
 @router.post("/seed", response_model=list[UploadResult])

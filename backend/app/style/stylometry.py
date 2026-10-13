@@ -436,9 +436,8 @@ def style_distance(text: str, profile: dict) -> dict:
     """一段文本相对档案的距离，并给出**对照留出集的分位**。
 
     `percentile` 的含义：在参考语料**人写的**留出单元里，有多大比例的距离
-    ≤ 本段。distance 越大 percentile 越大：100% = 比所有人类样本都更偏离；
-    0% = 比所有人类样本都更接近。**这个分位才是可判读的结论**，
-    `mean_abs_z` 本身没有绝对含义。
+    ≤ 本段。100% = 比所有人类样本都更像本语料的正常文体；0% = 比所有人类样本
+    都更偏离。**这个分位才是可判读的结论**，`mean_abs_z` 本身没有绝对含义。
     """
     vec = features(text)
     z = z_scores(vec, profile)
@@ -446,10 +445,8 @@ def style_distance(text: str, profile: dict) -> dict:
     total = statistics.fmean(list(abs_z.values())) if abs_z else 0.0
 
     ranked = sorted(abs_z.items(), key=lambda kv: kv[1], reverse=True)
-    holdout = profile.get("holdout") or {}
-    hold = holdout.get("mean_abs_z") or {}
-    # `unit_mean_abs_z` 是 `holdout` 的平级字段（见 `fit_profile`），不在 `mean_abs_z` 里面
-    dist = holdout.get("unit_mean_abs_z") or []
+    hold = (profile.get("holdout") or {}).get("mean_abs_z") or {}
+    dist = hold.get("unit_mean_abs_z") or []
     percentile: float | None = None
     if dist:
         below = sum(1 for d in dist if d <= total)

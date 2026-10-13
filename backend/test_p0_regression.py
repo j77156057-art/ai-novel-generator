@@ -439,11 +439,9 @@ def main() -> int:
         SimpleNamespace(chapter_no=2, text="朱木兰上殿。"),
     ]
     got = set(RuleBasedExtractor().extract(chunks).characters)
-    # fix-extractor 3 字名末字校验后「朱木兰」是合法名（兰∈_NAME_CHARS），
-    # 切片「朱木」仍应被剔除。断言改为：伪切片不出现，真名允许出现。
     check(
         "切片剔除不看覆盖者强弱（长名弱也照样删切片，不把伪名放回图谱）",
-        "朱木" not in got,
+        "朱木" not in got and "朱木兰" not in got,
         f"实得 {sorted(got)}",
     )
 

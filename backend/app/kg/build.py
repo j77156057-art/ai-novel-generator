@@ -11,7 +11,26 @@
 from sqlalchemy import select
 
 from app.kg.extractor import RuleBasedExtractor, resolve_plotholes
-from app.models import KgEdge, KgNode, NovelChunk, RawNovel
+from app.models import KgEdge, KgNode, NovelChunk, Project, RawNovel
+
+
+def _character_props(db, project_id: int, name: str, extracted, include_declared: bool = True) -> dict:
+    """把用户圣经中的角色语义字段透传到图谱，抽取结果仍是计数事实。"""
+    project = db.get(Project, project_id) if include_declared else None
+    bible = (project.plot_bible or {}) if project else {}
+    declared = next(
+        (c for c in (bible.get("characters") or []) if isinstance(c, dict) and c.get("name") == name),
+        {},
+    )
+    return {
+        "name": name,
+        "mentions": extracted.mentions,
+        "speaking": extracted.speaking,
+        "role": declared.get("role") or "",
+        "motivation": declared.get("motivation") or "",
+        "arc_state": declared.get("arc_state") or "未设定",
+        "status": declared.get("status") or "active",
+    }
 
 
 def _clear_graph_by_source(db, project_id: int, source: str) -> None:
@@ -42,7 +61,7 @@ def _write_result(db, project_id: int, result, source: str) -> dict:
         node = KgNode(
             project_id=project_id,
             type="character",
-            props={"name": name, "mentions": c.mentions, "speaking": c.speaking},
+            props=_character_props(db, project_id, name, c, include_declared=source == "generated"),
             first_chapter=min(c.chapters) if c.chapters else None,
             last_chapter=max(c.chapters) if c.chapters else None,
             source=source,
@@ -238,7 +257,7 @@ def merge_result_into_graph(
             node = KgNode(
                 project_id=project_id,
                 type="character",
-                props={"name": name, "mentions": c.mentions, "speaking": c.speaking},
+                props=_character_props(db, project_id, name, c, include_declared=source == "generated"),
                 first_chapter=segment_no,
                 last_chapter=segment_no,
                 source=source,
@@ -250,6 +269,10 @@ def merge_result_into_graph(
             props = dict(node.props or {})
             props["mentions"] = (props.get("mentions") or 0) + c.mentions
             props["speaking"] = (props.get("speaking") or 0) + c.speaking
+            enriched = _character_props(db, project_id, name, c, include_declared=source == "generated")
+            for key in ("role", "motivation", "arc_state", "status"):
+                if enriched.get(key) and enriched[key] != "未设定":
+                    props[key] = enriched[key]
             node.props = props
             node.first_chapter = min(
                 [x for x in (node.first_chapter, segment_no) if x is not None] or [segment_no]
