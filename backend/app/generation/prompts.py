@@ -186,10 +186,7 @@ def build_system_prompt(
         "- 允许留白：信息不必解释完，场景不必交代清，段落可以以一个动作或物件收住。\n"
         "- 贴近真实节奏：长短句交错，不要每段都同样长度、不要句句工整。\n\n"
         "【续写纪律】只输出正文；保持与上一段的连贯；不要重复已写过的内容；"
-        "每一轮都是「连载的一节」，不是一篇独立完整的短篇小说——"
-        "结尾必须停在某个仍未解决的冲突、悬念或动作中途（为下一节留钩子），"
-        "不得在本次续写里收束主线、给出结局，也不要写「从此……／自此……」式的收尾；"
-        "每轮控制在指定字数内。"
+        "不要擅自完结故事；每轮控制在指定字数内。"
     )
 
 
@@ -203,7 +200,6 @@ def build_user_prompt(
     prior_blocks: list[str] | None = None,
     style_exemplars: list[dict] | None = None,
     rag_has_forbidden: bool = False,
-    node_prompt: str | None = None,
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -220,11 +216,6 @@ def build_user_prompt(
     注意：续写文风由 system 提示的【风格】（类型 + 风格平台调性）统一控制，
     这里不再携带 mode——mode 只表示「构思方式」（是否走 wayfinder 追问），属构思阶段语义，
     若在续写指令里再表达一次文风，会与风格平台冲突（如「番茄快节奏」vs「expert 细节丰盈」）。
-
-    `node_prompt`（时间线，见 timeline.py）：传了它就走「按剧情点分段投喂」——
-    **不注入整条【大纲】，也不注入 plot_bible 的 synopsis/direction**（那会把结局走向
-    一次给全，导致第一章就讲完）。改注入当前剧情点的写作目标。
-    没传则走原逻辑（向后兼容，旧项目/无时间线项目不受影响）。
     """
     if prior_blocks:
         prior = "\n".join(prior_blocks)
@@ -243,16 +234,8 @@ def build_user_prompt(
             outline_text = str(outline)
 
     # —— 动态剧情指引（来自剧情圣经，随构思更新；不污染静态系统层）——
-    # 时间线模式（传了 node_prompt）下，**剔除整个 plot_bible**——它里边的
-    # synopsis/direction/relationships/foreshadowing/conflicts 任意一项都可能
-    # 携带整条故事走向（"与顾辰逸相知相守""父亲是董事长""感情升温"等），模型
-    # 拿到就会把后续剧情提前写进第一段，正是节点粒度问题的根因。
-    # 当前剧情点的具体指引已经在 node_prompt 里（entry/exit/emotion/beats），
-    # plot_bible 在时间线模式下的价值由 §7.3 节点规划阶段吸收——不需要再
-    # 在生成 prompt 里二次注入。
-    # 保留理由（向后兼容）：非时间线模式仍按原逻辑注所有 plot_bible 字段。
     bible_lines: list[str] = []
-    if plot_bible and not node_prompt:
+    if plot_bible:
         synopsis = plot_bible.get("synopsis")
         direction = plot_bible.get("direction")
         conflicts = plot_bible.get("conflicts") or []
@@ -277,24 +260,9 @@ def build_user_prompt(
             bible_lines.append("持续伏笔（继续埋或隐晦呼应）：" + "；".join(str(f) for f in fores))
     bible_block = "\n".join(bible_lines) if bible_lines else "（暂无剧情圣经，凭前情与风格续写）"
 
-    # —— 首段 vs 续写，指令不同 ——
-    # 首段：模型没有被「前情」约束，极易把整篇弧光一次性写完（用户实测第一段就完结）。
-    # 必须正向要求「只铺陈设悬、不许收尾」，而不是只说「不要完结」。
-    # 续写段：明确要求结尾停在未解决处，为下节留钩子，避免每段都自洽收束。
-    is_opening = not prior_blocks and not prior_summaries
-    if is_opening:
-        directive = (
-            f"这是整篇的**开头**。请从建立人物与情境写起，抛出一个推动故事的冲突或事件，"
-            f"节奏舒展地写约 {max_chars} 字；**本节只负责铺陈与设悬，不要收尾、不要给出结局、"
-            f"不要写『从此……』式的收束**，把更大的冲突留到后面展开。"
-            f"风格与节奏以系统提示中的【风格】与【文风要求】为准。"
-        )
-    else:
-        directive = (
-            f"请续写约 {max_chars} 字，并在本节结尾停在某个仍未解决的冲突 / 悬念 / 动作中途，"
-            f"为下一节留钩子——不要在此收束主线或给出结局。"
-            f"风格与节奏以系统提示中的【风格】与【文风要求】为准。"
-        )
+    directive = (
+        f"请续写约 {max_chars} 字，风格与节奏以系统提示中的【风格】与【文风要求】为准。"
+    )
 
     blocks = [
         "【前情提要】",
@@ -303,10 +271,7 @@ def build_user_prompt(
         "【剧情圣经·动态指引】",
         bible_block,
     ]
-    # premise：用户给的故事大概，**时间线模式下剔除**（同 plot_bible 一样
-    # 携带整条故事走向，与 node_prompt 职责重复）。非时间线模式保留作
-    # "基调锚点"。
-    if premise and not node_prompt:
+    if premise:
         blocks += ["", "【小说大概内容（用户给定，作为基调锚点）】", premise]
     rag_header = "【检索上下文（参考风格素材，可化用不可照抄）】"
     if rag_has_forbidden:
@@ -328,10 +293,7 @@ def build_user_prompt(
             "【风格样例（参考语料原文，学习其语气/节奏/段落编排/人物口吻，不要复用其内容）】",
             "\n\n".join(exemplar_lines),
         ]
-    if node_prompt:
-        # 时间线模式：只投喂当前剧情点，不投喂整条【大纲】
-        blocks += ["", "【当前剧情进度（按点推进，不要越过本点）】", node_prompt]
-    elif outline_text:
+    if outline_text:
         blocks += ["", "【大纲】", outline_text]
     blocks += ["", "【续写指令】", directive]
     return "\n".join(blocks)

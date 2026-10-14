@@ -3,8 +3,12 @@ import { computed } from "vue";
 import { useRoute } from "vue-router";
 import { router } from "./router";
 import { ACTIVE_THEME } from "./theme";
+import ModelSettingsDialog from "./components/ModelSettingsDialog.vue";
+import { useModelSettingsDialog } from "./composables/useModelSettings";
 
 const route = useRoute();
+// 解构出的顶层 ref 在模板里自动解包；弹窗本体只在 App 挂一份。
+const { open: modelSettingsOpen, openDialog, closeDialog } = useModelSettingsDialog();
 
 const links = [
   { to: "/corpus", label: "语料库", idx: "01" },
@@ -15,12 +19,12 @@ const links = [
 
 /**
  * 助手工作台是项目级页面（/projects/:id/assistant）：
- * 正处在某个项目路由上就直达该项目的助手页；否则走顶层 /assistant，
- * 由它自动挑一个项目把对话上下文补上，而不是先弹项目列表。
+ * 正处在某个项目路由上就直达该项目的助手页，否则先回项目列表选一个——
+ * 顶部导航没有「当前项目」上下文，不能凭空指一个 projectId。
  */
 const assistantTo = computed(() => {
   const id = route.params.id;
-  return typeof id === "string" && /^\d+$/.test(id) ? `/projects/${id}/assistant` : "/assistant";
+  return typeof id === "string" && /^\d+$/.test(id) ? `/projects/${id}/assistant` : "/projects";
 });
 
 const crumb = computed(() => route.meta.title ?? "");
@@ -37,9 +41,10 @@ const crumb = computed(() => route.meta.title ?? "");
         <router-link :to="assistantTo">
           <span class="idx">05</span>助手工作台
         </router-link>
-        <!-- 模型设置只有一个入口：路由页 /settings（生成 / 助手 / 蒸馏三个角色
-             都在那一个页面里分开配）。此前还有个「06 双模型设置」弹窗，
-             与本页功能重叠，已退役。 -->
+        <!-- 双模型设置是弹窗不是路由：生成 / 助手两个角色分开配，从任意页面都能开 -->
+        <button type="button" class="nav-btn" @click="openDialog">
+          <span class="idx">06</span>双模型设置
+        </button>
       </nav>
       <div class="sidebar-foot">
         M1–M4 · wayfinder<br />theme: {{ ACTIVE_THEME }}
@@ -48,5 +53,36 @@ const crumb = computed(() => route.meta.title ?? "");
     <main class="main">
       <router-view :key="route.fullPath" />
     </main>
+    <ModelSettingsDialog :open="modelSettingsOpen" @close="closeDialog" />
   </div>
 </template>
+
+<style scoped>
+/* 导航里的弹窗触发按钮：视觉与 router-link 保持一致（base.css 的 .nav a 样式
+   只命中 a 元素，button 需要在这里补齐，避免出现两种导航长相）。 */
+.nav .nav-btn {
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: 9px 12px;
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: var(--border-w) solid transparent;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+}
+.nav .nav-btn:hover {
+  background: var(--bg-sunken);
+  color: var(--fg);
+}
+.nav .nav-btn .idx {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-faint);
+  width: 18px;
+}
+</style>

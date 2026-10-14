@@ -107,23 +107,9 @@ def _require_novels(db: Session, novel_ids: list[int] | None) -> list[int] | Non
 
     静默跳过不存在的 id 会让「审了 3 本中的 1 本」看起来像「审了 3 本
     都没问题」——审核类端点最怕的就是这种漏审。
-
-    **空列表 → 422**（不是「审全部」）：`[]` 与 `None` 语义必须分开。
-    旧实现让 `[]` 一路传到 `run_corpus_audit` 的 `if novel_ids:` —— 空列表是
-    falsy，于是 `[]` 与 `None` 撞进同一条分支，把「一本都没选」执行成「广播
-    审全库」（真库 7941 分片）。这是静默的范围放大，与本模块 fail-loud 的
-    取向相反，故在入口直接拒掉。
     """
     if novel_ids is None:
         return None
-    if not novel_ids:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "novel_ids 不能为空：要么不传该字段（审全部语料），"
-                "要么至少给一个语料 id"
-            ),
-        )
     missing = [nid for nid in novel_ids if db.get(RawNovel, nid) is None]
     if missing:
         raise HTTPException(status_code=404, detail=f"语料不存在：{missing}")

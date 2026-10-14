@@ -65,28 +65,6 @@ class Project(Base):
     # 失效逻辑、验收方法都不同。独立缓存键：source_ids + narrative_version。
     # 空表示「自由生成」（未选参考语料）或尚未提炼。
     style_narrative = Column(JSON, nullable=True)
-    # 叙事蒸馏档位（full / balanced / fast，见 app.style.narrative.TIER_REGISTRY）。
-    # 项目级偏好：用户选「快速档试跑」后落在这里，后续 build-narrative 与生成链路
-    # 都按它来，不必每次重新选。空 = 未选 = 完整档（默认档）。
-    # **独立于 style_narrative**：后者是产出缓存（本档算出来的东西），本字段是
-    # 「用哪一档算」的意图。产出里已经记了 tier，但那是结果不是偏好——用户改档
-    # 之后要靠本字段才知道下次该按哪档重算。
-    narrative_tier = Column(String(16), nullable=True)
-    # 时间线状态存档（§11.3）：替代进程内「已写段数重放 advance」恢复。
-    # JSON：{version, nodes, done, current_node, current_beat, branch_used, seg_counts, current_main_idx}
-    # 节点内容（title/entry/exit/beats/emotion）首次 §7.3 调 LLM 填实后落库，
-    # 之后段间推进只更新 done/current_*/seg_counts，不再调 LLM。
-    # 空表示「未启用时间线」或「尚未首次规划」——首次生成时回退到重放恢复+落库。
-    # version 用于将来 schema 演进时旧数据可识别并降级。
-    plot_timeline = Column(JSON, nullable=True)
-    # 节奏参数档（v2.4 高潮密度蒸馏）：
-    # JSON：{version, source_ids, chapter_emotions, avg_node_segments, branch_ratio, distilled_at}
-    # avg_node_segments 从语料章节情绪蒸馏：高潮章占比反推"平均每几段一个主干节点"，
-    # 取代首轮默认 5。branch_ratio 已落到 style_narrative，重复存是为了 plot_timeline
-    # 首次规划时不用去 style_narrative 找。
-    # 缓存指纹只有 source_ids + version（与 style_narrative 同模式）。
-    # 空表示「未蒸馏」——首次生成时回退到默认 5。
-    plot_rhythm = Column(JSON, nullable=True)
 
 
 class RawNovel(Base):
@@ -105,10 +83,6 @@ class RawNovel(Base):
     status = Column(String(16), default="imported")
     # 该语料自身的文体档案（含语料体检结论）。按语料缓存，避免每次生成重算。
     style_profile = Column(JSON, nullable=True)
-    # 导入时的语料清洗报告（第 8 步）：检出串 + 次数 + 删字数 + 原文样本 +
-    # 清洗前后字数。有损清洗的**留痕**，供人复核「洗掉了什么」。经 API 可读。
-    # 未检出任何水印时仍写入一份 cleaned=False 的报告（区分「天然干净」与「漏检」）。
-    clean_report = Column(JSON, nullable=True)
 
 
 class NovelChunk(Base):
@@ -286,12 +260,10 @@ class EditProposal(Base):
     1. **Assistant 不写**：本表的写入只发生在「用户调POST /api/assistant/proposals」
        与诊断/审批端点里；`app.agents.registry` 的白名单不含任何写工具，
        写工具名命中 `FORBIDDEN_PREFIXES` 一律 PermissionError。
-    2. **patch 只能描述四类目标的修改**：`generations.text` /
-       `projects.plot_bible` / 提示词运行时覆写（`prompt_overrides` 表）/
-       参考语料分片正文（`novel_chunks.text`，第 10 步的 `corpus_text_edit`）。
-       明确**不**支持删除 Project / 删除 Generation / 删除 NovelChunk /
-       改 AppSetting（LLM key）—— 校验在 `app.agents.proposals.validate_patch`，
-       越界直接 ValueError。
+    2. **patch 只能描述三类目标的修改**：`generations.text` /
+       `projects.plot_bible` / 提示词运行时覆写（`prompt_overrides` 表）。
+       明确**不**支持删除 Project / 删除 Generation / 改 AppSetting（LLM key）——
+       校验在 `app.agents.proposals.validate_patch`，越界直接 ValueError。
     3. **目标漂移即 stale**：`scope_json.base_content_hash` 记录提案创建那一刻
        目标的 sha256；apply 前重算，不一致 → 置 `stale` 并 409，绝不静默重算或覆盖。
 
@@ -305,10 +277,9 @@ class EditProposal(Base):
     run_id = Column(Integer, ForeignKey("agent_runs.id"), nullable=False)
     # —— 第 4 步新增：归属项目（既有行可能为空，故nullable）——
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
-    # 提案类型：text_edit | prompt_edit | fact_resolution | corpus_text_edit
-    #（与 target_kind 一一对应）。
+    # 提案类型：text_edit | prompt_edit | fact_resolution（与 target_kind 一一对应）。
     type = Column(String(32), nullable=True)
-    # 修改目标类别：generation_text | project_plot_bible | prompt_override | novel_chunk_text。
+    # 修改目标类别：generation_text | project_plot_bible | prompt_override。
     target_kind = Column(String(32), nullable=True)
     scope_json = Column(JSON, nullable=True)  # 影响范围 + 目标基线哈希 base_content_hash
     # —— 既有字段（保留）——
@@ -346,8 +317,7 @@ class Version(Base):
       `after` 即该版本生效后的目标内容；restore 读的就是它。
     - `content_hash`：`after` 的 sha256（`hashlib.sha256` over canonical JSON）——
       既做幂等去重，也做 apply 前的漂移比对。
-    - `kind`：`text | prompt | bible | mixed | corpus_text`，与 EditProposal.target_kind
-      的落点一致（`corpus_text` = 参考语料分片正文，与生成正文 `text` 分开）。
+    - `kind`：`text | prompt | bible | mixed`，与 EditProposal.type 一致。
     - `proposal_id`：旧字段（NOT NULL），指向直接产生本版本的提案；
       `source_proposal_id` 是它的语义别名，回滚版本指向被恢复的那条提案。
     """
@@ -401,138 +371,3 @@ class PromptOverride(Base):
     # 多次降级后有多条 active=False）。唯一性由应用层在写事务里保证 ——
     # 见 prompt_overrides.set_active_override()：先降旧、再插新，同一事务内
     # 「至多一条 active」恒成立（读-改-写全程持有该行的写锁）。
-
-
-class DistillRun(Base):
-    """一次「文风蒸馏」的后台任务行（进度条的单一事实来源）。
-
-    ## 为什么必须有这张表
-
-    蒸馏是**分钟级**长任务（833 章语料跑完整档实测 42 分钟，见
-    `app.style.narrative` 的档位注释）。HTTP 请求挂不了这么久，所以蒸馏被拆成
-    「登记任务 → 后台跑 → 前端轮询」三步，而**进度必须落在 DB 里**：
-
-    - 进程内的全局变量在 uvicorn reload / 多 worker 下会丢；
-    - 用户离开页面再回来（甚至换个标签页）仍要能看到「还在跑、跑到哪了」。
-
-    ## 状态机（唯一合法流转）
-
-        pending ──后台线程取走──> running ──成功──> success
-                                     └──任何异常──> failed
-
-    `pending` 是**登记态**：`POST /distill` 只写这一行就返回，前端拿到的 job_id
-    立刻可轮询。后台线程（`app.style.jobs.run_distill_job`）把它置 running 后开工。
-
-    **绝不允许任务停在 running**：任何异常都落到 `failed` + `error`，否则前端
-    进度条会永远转下去——比直接报错更难排查（见 jobs.run_distill_job 的 finally）。
-
-    ## 进度语义
-
-    `progress_current / progress_total` 的单位是**块（chunk）**，即蒸馏时切给
-    LLM 的语料分片数（一本语料切成若干块，每块一次 provider.chat）。
-    `progress_total == 0` 表示「总数还没探明」——前端此时渲染不确定态，
-    绝不拿 0 当分母算出 0% 或 NaN。
-
-    `stage` 是**人话阶段名**（如「语料 2/3：提炼第 5/12 块」），直接显示给用户。
-
-    ## 摘要字段为什么在这里冗余一份
-
-    `n_chapters / rule_count / rejected` 是从产出的 `style_narrative` 里抄出来的
-    摘要。任务结束后前端只轮询这一行就能给出结论，不必再去解析整份档案 JSON
-    （那份 JSON 有几万字符，不该每次轮询都传）。
-    """
-
-    __tablename__ = "distill_runs"
-
-    id = Column(Integer, primary_key=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
-    # 本次蒸馏用的档位（full / balanced / fast）。**落库而非留空**：
-    # 项目上的 narrative_tier 是「下次该用哪档」的偏好，会被用户改掉；
-    # 这一行记的是「这次实际按哪档算的」，历史任务不该随偏好变化而变化。
-    tier = Column(String(16), nullable=True)
-    # pending | running | success | failed
-    status = Column(String(16), nullable=False, default="pending")
-    # 人话阶段名（如「语料 2/3：提炼第 5/12 块」），直接显示给用户
-    stage = Column(String(255), nullable=True)
-    progress_current = Column(Integer, nullable=False, default=0)
-    progress_total = Column(Integer, nullable=False, default=0)  # 0 = 总数未探明
-    # —— 成功后回填的摘要（失败时保持 NULL，不伪造）——
-    n_chapters = Column(Integer, nullable=True)  # 实际采样章节数
-    rule_count = Column(Integer, nullable=True)  # 提炼出的规则条数
-    rejected = Column(Integer, nullable=True)  # 因证据不通过被拒的规则数
-    error = Column(Text, nullable=True)  # failed 时的原因（type: message）
-    created_at = Column(DateTime, default=_utcnow, nullable=False)
-    started_at = Column(DateTime, nullable=True)
-    finished_at = Column(DateTime, nullable=True)
-
-
-class StyleDistill(Base):
-    """**可复用的文风蒸馏档案库**（用户原话：「已经蒸馏完的应该可以保存到库里面，下次可以直接用」）。
-
-    ## 它和 `distill_runs` 的关系
-
-    `distill_runs` 是**一次蒸馏任务的执行记录**（进度条来源，跑完即归档，可能被
-    `reap_stale_runs` 标 failed）。但任务本身的产物——那份几万字符的叙事档案——
-    只存在发起项目的 `Project.style_narrative` 里，**换个项目就摸不着了**。本表就是
-    把产物从「项目私有」提升为「全局复用」的媒介：第一次蒸馏成功就写一行，之后任何
-    项目只要**语料集合 + 档位 + 语料正文**三者一致，就能直接命中这行、免掉一次 42 分钟的 LLM。
-
-    ## 复用的判据（为什么是这四个字段）
-
-    复用键 = `(source_ids_hash, tier, tier_signature, content_hash)`：
-
-    - `source_ids_hash`：参考语料 novel_id 集合的稳定哈希（顺序归一）。
-    - `tier` + `tier_signature`：档位 key + 档位配置哈希（维度白名单/采样章数/清洗强度）。
-      换档必须重算，否则会静默拿到旧档结果（本项目已踩过两次的同类坑）。
-    - `content_hash`：**语料实际正文**的 sha256。这一步是 defect-C 回归修复的关键——
-      两个项目若只因 `source_ids` 相同就命中，那么「同一本语料被重新导入/清洗后正文变了」
-      也会误命中，产出 stale 档案且不报错。content_hash 让库只在**正文真的没变**时才命中。
-
-    这四列上加唯一约束 `(source_ids_hash, tier, tier_signature, content_hash, status)`，
-    保证同一份输入在 `active` 态下至多一行——库里不会出现「两个一模一样的档案」让前端
-    选择困难，也保证第二个项目复用时只会 FIND 到已有行、不会又写一份。
-
-    ## 库 ≠ 项目缓存
-
-    `Project.style_narrative` 仍是**生成链路**用的单槽缓存（每次生成直接读它，稳定不击穿
-    提示词缓存）。本表是跨项目共享层；`project_narrative` 命中本表后，会把档案**复制**进
-    该项目的 `style_narrative`，二者从此各自独立——改了项目缓存不会污染库，归档库行也不影响
-    已应用的项目。
-
-    ## status
-
-    - `active`：可被复用（默认）。
-    - `archived`：用户主动归档，不再出现在「可复用」列表里，但保留供历史查阅；
-      归档后同输入再蒸馏会新建一行（而非悄悄覆盖）。
-    """
-
-    __tablename__ = "style_distills"
-
-    id = Column(Integer, primary_key=True)
-    # 参考语料 novel_id 列表（与 `Project.reference_novel_ids` 同口径，排序归一）。
-    source_ids = Column(JSON, nullable=False)
-    # source_ids 的稳定哈希（排序后 join）。既用于复用查找，也避免对 JSON 列建联合索引的麻烦。
-    source_ids_hash = Column(String(64), nullable=False, index=True)
-    # 档位 key（full / balanced / fast）。
-    tier = Column(String(16), nullable=False, index=True)
-    # 档位配置哈希（维度白名单/采样章数/清洗强度）。见 app.style.narrative._tier_signature。
-    tier_signature = Column(String(64), nullable=False)
-    # 语料正文 sha256（见 app.style.narrative.corpus_content_hash）。defect-C 回归修复点。
-    content_hash = Column(String(64), nullable=False, index=True)
-    # 提炼时的 NARRATIVE_VERSION，归档版本漂移时便于识别旧档。
-    narrative_version = Column(Integer, nullable=False, default=1)
-    # active | archived（见类注释）。
-    status = Column(String(16), nullable=False, default="active", index=True)
-    # 完整叙事档案 JSON（几万字符）。列表接口**不**回传它，只在详情/应用时回传。
-    style_narrative = Column(JSON, nullable=True)
-    # 摘要（与 distill_runs 同口径，列表即可见，不必解析整份 JSON）：
-    n_chapters = Column(Integer, nullable=True)
-    rule_count = Column(Integer, nullable=True)
-    rejected = Column(Integer, nullable=True)
-    # 首次蒸馏出这份档案的项目（来源追溯）。可空：极端情况下库也可由管理操作预置。
-    created_by_project_id = Column(
-        Integer, ForeignKey("projects.id"), nullable=True
-    )
-    created_at = Column(DateTime, default=_utcnow, nullable=False)
-    # 最近一次被应用到某个项目的时间（命中复用也算）。可空 = 仅入库未被用过。
-    applied_at = Column(DateTime, nullable=True)

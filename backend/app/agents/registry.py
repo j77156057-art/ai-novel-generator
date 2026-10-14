@@ -5,21 +5,13 @@
 - 角色锁定：Assistant 仅能引用 `read_only=True` 的工具；任何 `write_*` / `commit_*`
   工具被 Assistant 调用 → 注册表立即抛 `PermissionError`，**不**进入任何缓存。
 - 工具实现 = 复用既有只读检索/查询入口（`hybrid_search` / `get_character` /
-  `get_reminders` / Generation 选择查询 / Fact 选择查询 / plot_bible 读取 /
-  `audit` 三类审核规则 / `log_audit` 日志规则），不复制 SQL、不引入平行
-  ORM 路径、不复制第二套判据。
+  `get_reminders` / Generation 选择查询 / Fact 选择查询 / plot_bible 读取），
+  不复制 SQL、不引入平行 ORM 路径。
 - 注册表是**进程级单例**，但**只**持有 ToolSpec（name / read_only / callable），
   不持有 db session。db session 由 router 通过 Depends(get_db) 注入，
   工具 callable 拿到的就是 router 已校验的 session。
 - 失败隔离：invoke_tool(name, ...) 内部抛异常时**不**污染注册表；下一次的同 name
   调用照常重试（与 ProviderRegistry 的失败不入缓存同语义）。
-
-助手页瘦身后新增的 4 个只读工具（`audit_corpus` / `audit_kg` /
-`audit_generation` / `analyze_logs`）让 agent **自主**调用诊断、日志分析与
-三类审核，而不再依赖前端页签。它们在业务数据上全部只读——只写助手自己的
-AgentRun + Evidence 两张审计表——所以进白名单是安全的。写操作（提案 / 调动
-生成）**不在**本表：它们走 `app.agents.pending_actions` 产出待确认卡片，
-由用户点确认后调既有端点执行。
 
 不在本表范围：
 - LangGraph 节点 / Deep Agents 编排：本轮禁用（见 ADR §3「Deep Agents 暂缓」）。
@@ -54,12 +46,6 @@ FORBIDDEN_PREFIXES: tuple[str, ...] = (
 # 默认白名单：search_novel_chunks / read_generation_segments /
 # get_character_profile / get_plot_timeline / get_fact_ledger / get_reminders /
 # summarize_bible —— 与 task spec 一致。
-#
-# 助手页瘦身后新增 4 个（audit_corpus / audit_kg / audit_generation /
-# analyze_logs）：诊断、日志分析、三类审核从「前端页签」改为「agent 自主
-# 调度」。它们在业务数据上全部只读——审核/日志分析只写助手自己的
-# AgentRun + Evidence 两张审计表，不碰 Generation / Fact / KgNode /
-# NovelChunk / RawNovel——因此可以安全进白名单，让 agent 自己判断何时需要。
 ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
     "search_novel_chunks",
     "read_generation_segments",
@@ -68,10 +54,6 @@ ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
     "get_fact_ledger",
     "get_reminders",
     "summarize_bible",
-    "audit_corpus",
-    "audit_kg",
-    "audit_generation",
-    "analyze_logs",
 )
 
 
@@ -377,175 +359,6 @@ def _impl_summarize_bible(*, db: Any, project_id: int) -> dict:
     }
 
 
-# ====================================================================
-# 审核 / 日志分析：让 agent 自主调度（助手页瘦身后新增的 4 个只读工具）
-# ====================================================================
-#
-# 复用优先，一个字都不复制判据：
-# - 三类审核 → `app.agents.audit` 的 5 / 4 / 6 条规则（与
-#   `POST /api/assistant/audit-*` 三个端点**同一个函数**）；
-# - 日志分析 → `app.agents.log_audit.run_log_audit_rules`（与
-#   `POST /api/assistant/analyze-logs` 同一个函数）。
-#
-# 复制出来的第二套判据一定会和第一套漂移：语料审核曾挖出 P1「空 novel_ids
-# 静默广播全库」、KG 审核曾挖出「短路名搭长名便车误报共现」——这两个坑都
-# 是在**端点侧**修的，若工具侧另写一份，它们会原样复现。
-
-
-def _issues_to_dicts(report: Any) -> list[dict[str, Any]]:
-    """DiagnosticReport → 九字段 issue dict 列表（与 diagnose 响应同构）。"""
-    return [issue.to_dict() for issue in getattr(report, "issues", [])]
-
-
-def _report_to_tool_result(
-    report: Any, stats: dict[str, Any], extra: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    """规则报告 → 工具返回值（统一 `issues` / `count` / `rules_evaluated`）。
-
-    三个审核工具 + 日志分析共用，保证 agent 拿到四份**结构同构**的结果：
-    agent 的提示词里只需要写一套读法（「找 `issues[]`，每条有 rule/severity/
-    suggestion」），而不是四套。
-    """
-    issues = _issues_to_dicts(report)
-    result: dict[str, Any] = {
-        "issues": issues,
-        "count": len(issues),
-        # findings 是 issues 的兼容别名：与 diagnose / analyze-logs 响应同构，
-        # 前端一份渲染逻辑复用多处（直接删掉会静默变成空列表）。
-        "findings": issues,
-        "rules_evaluated": list(getattr(report, "rules_evaluated", [])),
-        "stats": dict(stats or {}),
-    }
-    if extra:
-        result.update(extra)
-    return result
-
-
-def _impl_audit_corpus(*, db: Any, project_id: int,
-                       novel_ids: list[int] | None = None) -> dict[str, Any]:
-    """语料审核（只读）：复用 `app.agents.audit.run_corpus_audit` 的 5 条规则。
-
-    `novel_ids` 语义与 `POST /api/assistant/audit-corpus` 完全一致：
-    - `None` → 全库语料（语料是全局的，不属于任何项目；project_id 只是
-      审计锚点）；
-    - 非空列表 → 只审这些；
-    - **`[]` → 报 422，绝不广播全库**。
-
-    最后一条是硬要求，不是保守取舍。历史 bug：`[]` 是 falsy，旧的
-    `if novel_ids:` 让 `[]` 与 `None` 撞进同一分支，把「一本都没选」执行成
-    「审全库」（真库 7941 分片时用户完全看不出来）。端点侧的
-    `_require_novels` 已经拒了 `[]`，这里**独立地再拒一次**：工具可以被
-    router 之外的路径直接调用，不能依赖调用方已经校验过。
-    """
-    from fastapi import HTTPException
-
-    from app.agents.audit import run_corpus_audit
-
-    if novel_ids is not None and not novel_ids:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "novel_ids 不能为空：要么不传该参数（审全部语料），"
-                "要么至少给一个语料 id"
-            ),
-        )
-    # 去重保序：同一个 id 传两遍不该让规则跑两遍
-    scoped = list(dict.fromkeys(novel_ids)) if novel_ids is not None else None
-    report, stats = run_corpus_audit(db, novel_ids=scoped)
-    return _report_to_tool_result(
-        report,
-        stats,
-        extra={"novel_ids": scoped},
-    )
-
-
-def _impl_audit_kg(*, db: Any, project_id: int) -> dict[str, Any]:
-    """知识图谱审核（只读，按项目）：复用 `run_kg_audit` 的 4 条规则。
-
-    只审 generated 图——参考语料图（`novel:{id}`）的卫生由 `audit_corpus`
-    负责，两边不重叠。同一处问题在两个工具重复出现，agent 会当成两处毛病
-    报给用户。
-
-    project 不存在时**不**静默返回空 issues：那读起来就是「图谱很干净」。
-    抛 404，与 `_require_project` 的口径一致。
-    """
-    from fastapi import HTTPException
-
-    from app.agents.audit import run_kg_audit
-    from app.models import Project
-
-    project = db.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project 不存在")
-    report, stats = run_kg_audit(db, project)
-    return _report_to_tool_result(report, stats)
-
-
-def _impl_audit_generation(*, db: Any, project_id: int) -> dict[str, Any]:
-    """生成物审核（只读，按项目）：复用 `run_generation_audit` 的 6 条规则。
-
-    零段落 / 空正文 / 段长离群 / AI 腔 / plot_bible 角色名单双向不一致。
-    「像 AI」是风格判断，规则只给可量化信号，最终话语权在人。
-    """
-    from fastapi import HTTPException
-
-    from app.agents.audit import run_generation_audit
-    from app.models import Project
-
-    project = db.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project 不存在")
-    report, stats = run_generation_audit(db, project)
-    return _report_to_tool_result(report, stats)
-
-
-def _impl_analyze_logs(*, db: Any, project_id: int, status: str | None = None,
-                       limit: int = 100) -> dict[str, Any]:
-    """日志分析（只读）：复用 `run_log_audit_rules` 的 5 条规则。
-
-    ## 为什么必须复用 router 的两个校验函数
-
-    `status` / `limit` 在本工具里**直接调**
-    `app.routers.assistant._validate_run_status` / `_validate_runs_limit`，
-    而不是各写一份。同一个参数在两个入口给出不同结论，是本项目已经踩过的
-    真实 bug（QA8 挖出 P2）：
-
-    | limit | `GET /runs` | 原 `/analyze-logs` |
-    |---|---|---|
-    | `-1` | 400 | 200，且 SQLite `LIMIT -1` = 取全表 |
-    | 非法 status | 400 | 200 + runs_analyzed=0（读起来像「没调用记录」） |
-
-    静默失效比报错难查得多——「limit=-1 取全表」在生产上表现为一次慢查询，
-    而不是一次明确的 400。工具侧再复制一份校验，等于把这个坑重新挖一遍。
-
-    **延迟 import 是为了打断循环依赖**：`app.routers.assistant` 在模块顶层
-    `from app.agents import invoke_tool`，而本模块是 `app.agents` 的一部分。
-    函数体内 import 与既有 `_impl_*` 同一套做法（它们也都延迟 import
-    `app.models` / `app.retrieval.search`）。
-
-    抛出的 `HTTPException` 会原样冒泡到调用方：`assistant_qa` 的工具循环
-    只对 `PermissionError` 转 403，其余异常记进 `tool_results[name]["error"]`
-    ——参数非法时**明确报错**，不会被当成「没查到日志」静默通过。
-    """
-    from app.agents.log_audit import run_log_audit_rules
-    from app.routers.assistant import _validate_runs_limit, _validate_run_status
-
-    # 先校验后取数：非法输入不该先跑一遍 SQL 再失败。
-    status = _validate_run_status(status)
-    limit = _validate_runs_limit(limit)
-
-    report, runs = run_log_audit_rules(db, project_id, status=status, limit=limit)
-    return _report_to_tool_result(
-        report,
-        dict(report.tool_results),
-        extra={
-            "runs_analyzed": len(runs),
-            "status_filter": status,
-            "limit": limit,
-        },
-    )
-
-
 _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="search_novel_chunks",
@@ -588,48 +401,6 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         description="读取 project.plot_bible / premise / outline，不做总结（命名沿用 task spec）。",
         read_only=True,
         callable=_impl_summarize_bible,
-    ),
-    ToolSpec(
-        name="audit_corpus",
-        description=(
-            "语料审核（只读）：复用 app.agents.audit 的 5 条规则——空/超短分片、"
-            "重复分片、疑似注入串（水印）、缺 style_profile、未建 embedding。"
-            "novel_ids 不传=全库语料，给列表=只审这些（空列表会被拒，不广播）。"
-            "需要判断语料质量时调用。"
-        ),
-        read_only=True,
-        callable=_impl_audit_corpus,
-    ),
-    ToolSpec(
-        name="audit_kg",
-        description=(
-            "知识图谱审核（只读，按项目）：复用 app.agents.audit 的 4 条规则——"
-            "孤儿节点、角色名冲突（与 diagnose 同口径）、已死角色挂未填坑、"
-            "稳定共现但无边。怀疑图谱关系有遗漏或角色名混乱时调用。"
-        ),
-        read_only=True,
-        callable=_impl_audit_kg,
-    ),
-    ToolSpec(
-        name="audit_generation",
-        description=(
-            "生成物审核（只读，按项目）：复用 app.agents.audit 的 6 条规则——"
-            "零段落、空正文、段长离群、AI 腔打分离群、plot_bible 角色名单"
-            "双向不一致。用户问「这段写得怎么样 / 正文有没有问题」时调用。"
-        ),
-        read_only=True,
-        callable=_impl_audit_generation,
-    ),
-    ToolSpec(
-        name="analyze_logs",
-        description=(
-            "助手自身调用日志分析（只读）：复用 app.agents.log_audit 的 5 条规则——"
-            "失败率异常、registry 越权拦截、本地兜底降级、空 evidence、耗时离群。"
-            "status ∈ running/success/failed（非法值报错），limit ∈ [1,500]。"
-            "用户问「助手最近是不是不正常 / 为什么变慢了」时调用。"
-        ),
-        read_only=True,
-        callable=_impl_analyze_logs,
     ),
 )
 

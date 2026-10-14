@@ -5,7 +5,6 @@ import os
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.ingestion.encoding import read_text_file
 from app.ingestion.store import ingest_text
 from app.models import RawNovel
 
@@ -23,7 +22,8 @@ def run_seed(db: Session, seed_dir: str | None = None) -> list[dict]:
         src = f"seed://{fn}"
         if db.query(RawNovel).filter_by(source_url=src).first():
             continue
-        text, _detected = read_text_file(path)
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
         results.append(
             ingest_text(db, text, title=fn, platform="seed", source_url=src)
         )

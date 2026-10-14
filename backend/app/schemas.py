@@ -26,9 +26,6 @@ class NovelOut(BaseModel):
     platform: Optional[str]
     genre: Optional[str]
     status: Optional[str]
-    # 导入时的语料清洗报告（第 8 步）。用户要能看到「洗掉了什么」：
-    # 检出串列表 / 各串次数 / 剔除总字数 / 清洗前后字数 / 原文样本。
-    clean_report: Optional[dict] = None
 
     model_config = {"from_attributes": True}
 
@@ -48,10 +45,6 @@ class UploadResult(BaseModel):
     title: Optional[str]
     chapters: int
     chunks: int
-    # 导入时的清洗报告（第 8 步）：上传响应里随即回显，用户立刻能看到洗掉了什么。
-    clean_report: Optional[dict] = None
-    # 实际检出的文件编码（utf-8-sig / utf-8 / gb18030）；seed 等内部路径可为空。
-    detected_encoding: Optional[str] = None
 
 
 class SearchHit(BaseModel):
@@ -93,9 +86,6 @@ class ProjectPatch(StrictRequest):
     generation_length: Optional[int] = None
     plot_bible: Optional[dict] = None
     status: Optional[str] = None
-    # 叙事蒸馏档位（full/balanced/fast）。校验在 router 层做（要回 400 而不是 422），
-    # 见 app.style.narrative.resolve_tier。
-    narrative_tier: Optional[str] = None
 
 
 class ProjectOut(BaseModel):
@@ -115,11 +105,6 @@ class ProjectOut(BaseModel):
     plot_bible: Optional[dict] = None
     generation_length: int = 3000
     segment_count: int = 0
-    # 叙事蒸馏档位（项目级偏好，空=默认完整档）
-    narrative_tier: Optional[str] = None
-    # 已落库文风档案（蒸馏库「应用」写入的单槽缓存，生成链路直接读它）。
-    # 列表也带它：项目数不多、单条档案体量可控，且前端要据此反映「已应用」状态。
-    style_narrative: Optional[dict] = None
 
     model_config = {"from_attributes": True}
 

@@ -38,7 +38,6 @@ from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.llm.provider import LocalFallbackLLMProvider  # noqa: E402
 from app.llm.registry import (  # noqa: E402
     ASSISTANT_ROLE,
-    DISTILLER_ROLE,
     WRITER_ROLE,
     get_provider_registry,
     reset_provider_registry,
@@ -64,11 +63,7 @@ _SNAPSHOT_FIELDS: tuple[str, ...] = (
     "openrouter_api_key", "openrouter_base_url", "openrouter_model", "openrouter_models",
     "siliconflow_api_key", "siliconflow_base_url", "siliconflow_model", "siliconflow_models",
     "minimax_api_key", "minimax_base_url", "minimax_model", "minimax_models",
-    "dashscope_api_key", "dashscope_base_url", "dashscope_models",
-    # 第 8 步新增：distiller 六字段 + 通用 OpenAI 渠道字段
-    "distiller_provider", "distiller_api_key", "distiller_base_url",
-    "distiller_model", "distiller_max_tokens", "distiller_timeout",
-    "openai_api_key", "openai_base_url", "openai_model", "openai_models",
+    "dashscope_api_key", "dashscope_base_url",
 )
 
 
@@ -78,7 +73,6 @@ def _clean_state():
     reset_provider_registry()
     llm_provider_mod.reset_provider_cache()
     llm_provider_mod.reset_assistant_provider_cache()
-    llm_provider_mod.reset_distiller_provider_cache()
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     snap = {f: getattr(settings, f) for f in _SNAPSHOT_FIELDS}
@@ -91,7 +85,6 @@ def _clean_state():
     reset_provider_registry()
     llm_provider_mod.reset_provider_cache()
     llm_provider_mod.reset_assistant_provider_cache()
-    llm_provider_mod.reset_distiller_provider_cache()
 
 
 @pytest.fixture
@@ -316,14 +309,7 @@ def test_put_writer_role_still_reports_singleton_values_on_get(db_session):
 
     block = _get(db_session)["writer"]
     assert block["timeout"] == 120
-    # 不硬编码具体数字：这条断言的是「GET 如实展示单例配置的
-    # 真实值」，不是「Writer 的 max_tokens 恰好是 2048」。原先写死 2048，结果
-    # 2026-10-14 调到 4096（给 3000 字目标留余量）后就超结果炸了。
-    # 数字口径的守卫另有一道：tests/test_finish_reason_truncation.py::
-    # test_writer_max_tokens_leaves_headroom 保证不会被调得低于 3000。
-    from app.config import _PROVIDERS_YAML
-    assert block["max_tokens"] == _PROVIDERS_YAML["writer"]["max_tokens"]
-    assert block["timeout"] == _PROVIDERS_YAML["writer"]["timeout"]
+    assert block["max_tokens"] == 2048  # Writer 默认（yaml 未覆写时）
 
 
 # ====================================================================
@@ -554,257 +540,3 @@ def test_get_llm_over_http_returns_both_roles(db_session):
         body = resp.json()
         assert body["writer"]["provider"]
         assert body["assistant"]["provider"]
-
-
-# ====================================================================
-# (g) 第 8 步：第三个角色 distiller（文风档案抽取用）
-# ====================================================================
-
-
-def test_get_returns_distiller_block_with_nine_fields(db_session):
-    """GET 出参新增 `distiller` 角色对象，九字段齐全（与另两个角色同形）。"""
-    out = _get(db_session)
-    assert "distiller" in out, "GET 出参缺 distiller 角色对象"
-    block = out["distiller"]
-    for field in ("provider", "model", "api_key_masked", "has_key",
-                  "base_url", "max_tokens", "timeout", "is_fallback", "label"):
-        assert field in block, f"distiller 对象缺字段 {field}"
-    assert isinstance(block["has_key"], bool)
-    assert isinstance(block["is_fallback"], bool)
-
-
-def test_distiller_default_timeout_is_longer_than_assistant(db_session):
-    """蒸馏是长任务：默认 timeout 必须明显大于 Assistant（否则必然超时）。"""
-    cfg = settings.get_provider_config("distiller")
-    cfg_a = settings.get_provider_config("assistant")
-    assert cfg["timeout"] > cfg_a["timeout"], (
-        "distiller 默认 timeout 不大于 assistant —— 长任务会用诊断的超时跑，必然超时"
-    )
-
-
-def test_put_distiller_role_persists_distiller_keys_and_never_mirrors_legacy(db_session):
-    """role=distiller → 写 `distiller.*` 键，**绝不**写 legacy（隔离底线同 Assistant）。"""
-    _put(db_session, provider="zhipu", role="distiller",
-         api_key="distiller-key-1", model="glm-4-flash")
-
-    assert db_session.get(AppSetting, "distiller.provider").value == "zhipu"
-    assert db_session.get(AppSetting, "distiller.api_key").value == "distiller-key-1"
-    assert db_session.get(AppSetting, "distiller.model").value == "glm-4-flash"
-    for legacy_key in ("llm.provider", "llm.zhipu_api_key", "llm.model"):
-        assert db_session.get(AppSetting, legacy_key) is None, (
-            f"distiller 配置镜像到了 legacy 键 {legacy_key}——第三条轨道不许改写 Writer 字段"
-        )
-    assert settings.distiller_provider == "zhipu"
-    assert settings.distiller_api_key == "distiller-key-1"
-
-
-def test_put_distiller_accepts_limits_but_rejects_chain(db_session):
-    """distiller 与 assistant 同侧：可改 max_tokens/timeout，不接受 models 链。"""
-    from fastapi import HTTPException
-
-    _put(db_session, provider="zhipu", role="distiller",
-         api_key="k", max_tokens=4096, timeout=300)
-    assert db_session.get(AppSetting, "distiller.max_tokens").value == "4096"
-    assert db_session.get(AppSetting, "distiller.timeout").value == "300"
-    assert settings.distiller_max_tokens == 4096
-    assert settings.distiller_timeout == 300
-
-    with pytest.raises(HTTPException) as exc:
-        _put(db_session, provider="zhipu", role="distiller",
-             api_key="k", models=["glm-4-flash", "glm-z1-flash"])
-    assert exc.value.status_code == 400
-
-
-def test_put_distiller_invalidates_only_distiller_cache(db_session):
-    """改 distiller 只重置本角色单例：writer / assistant 单例原样不动。"""
-    settings.llm_provider = "zhipu"
-    settings.zhipu_api_key = "writer-channel-key"
-    settings.assistant_provider = "zhipu"
-    settings.assistant_api_key = "assistant-keep-key"
-    settings.distiller_provider = "zhipu"
-    settings.distiller_api_key = "distiller-old-key"
-    llm_provider_mod.reset_provider_cache()
-    llm_provider_mod.reset_assistant_provider_cache()
-    llm_provider_mod.reset_distiller_provider_cache()
-    reset_provider_registry()
-
-    writer_before = llm_provider_mod.get_llm_provider()
-    assistant_before = llm_provider_mod.get_assistant_provider()
-    distiller_before = llm_provider_mod.get_distiller_provider()
-
-    _put(db_session, provider="zhipu", role="distiller", api_key="distiller-new-key")
-
-    assert llm_provider_mod.get_llm_provider() is writer_before
-    assert llm_provider_mod.get_assistant_provider() is assistant_before
-    rebuilt = llm_provider_mod.get_distiller_provider()
-    assert rebuilt is not distiller_before
-    assert rebuilt.api_key == "distiller-new-key"
-
-
-def test_distiller_provider_is_wired_into_registry(db_session):
-    """registry.get('distiller') 能取到单例（蒸馏链路接线的唯一前提）。"""
-    settings.distiller_provider = "zhipu"
-    settings.distiller_api_key = "distiller-registry-key"
-    settings.distiller_model = "glm-4-flash"
-    llm_provider_mod.reset_distiller_provider_cache()
-    reset_provider_registry()
-
-    provider = get_provider_registry().get(DISTILLER_ROLE)
-    assert not isinstance(provider, LocalFallbackLLMProvider), (
-        "distiller 单例降级成本地兜底 —— 蒸馏链路会静默拿不到真实模型"
-    )
-    assert provider.api_key == "distiller-registry-key"
-
-
-# ====================================================================
-# (h) 第 8 步：通用 OpenAI 兼容渠道
-# ====================================================================
-
-
-def test_openai_channel_builds_provider_with_custom_base_url(db_session):
-    """渠道 'openai' 走 OpenAI 协议实现，端点优先取传入的 base_url。"""
-    from app.llm.provider import GenericOpenAIChatProvider
-
-    settings.openai_base_url = "https://official.example.com/v1"
-    custom = llm_provider_mod.build_provider(
-        "openai", "sk-test", "gpt-4o-mini", "https://my-gateway.example.com/v1"
-    )
-    assert isinstance(custom, GenericOpenAIChatProvider)
-    assert custom.base_url == "https://my-gateway.example.com/v1"
-
-    # 不传端点 → 回落该渠道的默认地址（不是空串，否则请求会打到相对路径）
-    fallback = llm_provider_mod.build_provider("openai", "sk-test", "gpt-4o-mini")
-    assert fallback.base_url == "https://official.example.com/v1"
-
-
-def test_put_openai_role_persists_base_url(db_session):
-    """PUT role=distiller + provider=openai：端点与 key 都按角色落库。"""
-    out = _put(db_session, provider="openai", role="distiller",
-               api_key="sk-openai", model="gpt-4o-mini",
-               base_url="https://my-gateway.example.com/v1")
-
-    assert db_session.get(AppSetting, "distiller.base_url").value == "https://my-gateway.example.com/v1"
-    assert settings.distiller_base_url == "https://my-gateway.example.com/v1"
-    assert out["distiller"]["provider"] == "openai"
-    assert out["distiller"]["base_url"] == "https://my-gateway.example.com/v1"
-
-
-def test_openai_channel_is_accepted_over_http(db_session):
-    """HTTP 层：provider=openai + role=distiller 不被 400/422 拒。"""
-    with TestClient(fastapi_app) as client:
-        resp = client.put("/api/settings/llm", json={
-            "provider": "openai", "role": "distiller", "api_key": "sk-x",
-            "model": "gpt-4o-mini", "base_url": "https://my-gateway.example.com/v1",
-            "timeout": 240,
-        })
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["distiller"]["provider"] == "openai"
-
-
-def _writer_singleton_after(**overrides) -> object:
-    """按给定 settings 覆盖重建 Writer 单例（每次都先清缓存）。"""
-    for field, value in overrides.items():
-        setattr(settings, field, value)
-    llm_provider_mod.reset_provider_cache()
-    reset_provider_registry()
-    return llm_provider_mod.get_llm_provider()
-
-
-def test_writer_singleton_supports_openai_channel(db_session):
-    """Writer 单例认得 'openai' 渠道：否则生成会静默降级成本地兜底模板。
-
-    这条是需求闭环的守门测试——「通用 OpenAI 接口」若在 Writer 单例里没有
-    分支，UI 显示已生效而正文其实是模板生成的（静默失效，极难排查）。
-    """
-    from app.llm.provider import GenericOpenAIChatProvider
-
-    settings.llm_base_url = ""
-    provider = _writer_singleton_after(
-        llm_provider="openai",
-        openai_api_key="sk-writer-openai",
-        openai_base_url="https://my-gateway.example.com/v1",
-        openai_model="gpt-4o-mini",
-        openai_models="gpt-4o-mini,gpt-4o",
-    )
-    assert isinstance(provider, GenericOpenAIChatProvider), (
-        "Writer 单例不认 openai 渠道 → 生成会降级 LocalFallback（需求半残）"
-    )
-    assert not isinstance(provider, LocalFallbackLLMProvider)
-    assert provider.base_url == "https://my-gateway.example.com/v1"
-    assert provider.model == "gpt-4o-mini"
-    # 模型链与其余渠道同口径：读该渠道的 CSV（限流时按序切换）
-    assert provider._models == ["gpt-4o-mini", "gpt-4o"]
-
-    # 显式 llm_base_url 优先（与 dashscope 分支 `llm_base_url or dashscope_base_url` 同形）
-    overridden = _writer_singleton_after(llm_base_url="https://override.example.com/v1")
-    assert isinstance(overridden, GenericOpenAIChatProvider)
-    assert overridden.base_url == "https://override.example.com/v1"
-
-
-def test_writer_singleton_non_openai_channels_are_untouched(db_session):
-    """新分支对既有渠道零影响：判据为假 → 走原有分支（行为逐字节不变）。"""
-    from app.llm.provider import DashScopeChatProvider, ZhipuChatProvider
-
-    settings.llm_base_url = ""
-
-    zhipu = _writer_singleton_after(
-        llm_provider="zhipu", zhipu_api_key="zk", zhipu_model="glm-4-flash",
-    )
-    assert isinstance(zhipu, ZhipuChatProvider)
-
-    dashscope = _writer_singleton_after(
-        llm_provider="dashscope", dashscope_api_key="dk", llm_model="qwen-plus",
-    )
-    assert isinstance(dashscope, DashScopeChatProvider)
-
-    # 未知渠道 / openai 但没配 key：仍走 LocalFallback 兜底（与既有分支同判据形态）
-    unknown = _writer_singleton_after(llm_provider="totally-unknown")
-    assert isinstance(unknown, LocalFallbackLLMProvider)
-    no_key = _writer_singleton_after(llm_provider="openai", openai_api_key="")
-    assert isinstance(no_key, LocalFallbackLLMProvider)
-
-
-# ====================================================================
-# (i) 模型清单三处一致（下拉 / 运行时切换链 / 兜底模型不能漂移）
-# ====================================================================
-
-
-def test_model_lists_are_consistent_across_three_sources(db_session):
-    """PROVIDER_META.default_models == config 的 *_models CSV == _default_model_for 首项。
-
-    三处不一致的后果很具体：下拉里能选的模型不在运行时切换链上（或反过来），
-    界面显示与真实生成链路对不上。
-    """
-    from app.llm.provider import _default_model_for
-
-    models_field = settings_router._MODELS_FIELD
-    for provider, meta in settings_router.PROVIDER_META.items():
-        if provider == "local":
-            # 本地兜底没有「渠道模型链」的概念：不参与本一致性校验
-            continue
-        defaults = meta["default_models"]
-        assert defaults, f"{provider} 的 default_models 不能为空"
-        # 1) 兜底模型 = 下拉首项
-        assert _default_model_for(provider) == defaults[0], (
-            f"{provider}: _default_model_for 与 default_models 首项不一致"
-        )
-        # 2) 运行时切换链 CSV = 下拉清单（有 CSV 的渠道）
-        if provider in models_field:
-            csv_list = getattr(settings, f"{provider}_model_list")
-            assert csv_list == defaults, (
-                f"{provider}: config 的 {models_field[provider]} 与 PROVIDER_META 不一致"
-                f"（{csv_list} != {defaults}）"
-            )
-
-
-def test_default_model_field_points_at_an_existing_settings_field(db_session):
-    """_MODEL_FIELD / _KEY_FIELD 指向的 settings 字段必须真实存在（否则热生效静默失效）。"""
-    for mapping_name, mapping in (
-        ("_KEY_FIELD", settings_router._KEY_FIELD),
-        ("_MODEL_FIELD", settings_router._MODEL_FIELD),
-        ("_MODELS_FIELD", settings_router._MODELS_FIELD),
-    ):
-        for provider, field in mapping.items():
-            assert hasattr(settings, field), (
-                f"{mapping_name}[{provider!r}] 指向的 settings 字段 {field!r} 不存在"
-            )

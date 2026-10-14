@@ -1,111 +1,115 @@
 <script setup lang="ts">
-/**
- * 模型设置（/settings）——**唯一**的模型配置入口。
- *
- * 2026-10-14 合并：此前侧边栏「04 模型设置」（本路由页，旧版单模型表单）
- * 与「06 双模型设置」（全局弹窗）并存、功能重叠，且弹窗里才是真正能分角色
- * 配置的那套。合并后弹窗退役，本页直接渲染三个 RoleModelPanel
- * （生成 / 助手 / 蒸馏），旧版不带 role 的 legacy 保存表单整段删除。
- *
- * 三个角色的表单状态**各自独立**（RoleModelPanel 每实例一份 reactive），
- * 保存 A 绝不改动 B / C，也不清掉它们未保存的编辑。
- */
-import { onMounted, reactive } from "vue";
-import { ApiError, api } from "@/api/client";
-import RoleModelPanel from "@/components/RoleModelPanel.vue";
-import { useLlmConfig } from "@/composables/useLlmConfig";
-import type {
-  LlmRole,
-  LlmRoleSavePayload,
-  LlmRoleTestPayload,
-  LlmTestResult,
-} from "@/api/types";
-import { LLM_ROLES, roleMeta } from "@/utils/llmRoles";
+import { computed, onMounted, ref } from "vue";
+import { api } from "@/api/client";
+import { useModelSettingsDialog } from "@/composables/useModelSettings";
+import type { LlmConfig, LlmTestResult } from "@/api/types";
 
-const { config, loading, error, rolesReady, missingRoles, load, roleConfig } = useLlmConfig();
+const { openDialog } = useModelSettingsDialog();
 
-interface RoleNotice {
-  kind: "ok" | "err" | "warn";
-  text: string;
-}
+const config = ref<LlmConfig | null>(null);
+const loading = ref(false);
+const saving = ref(false);
+const testing = ref(false);
 
-/**
- * 每个角色独立的异步忙态 / 提示 / 测试结果（保存 A 不打扰 B / C 的提示）。
- * 用 LLM_ROLES 构造，不手写三个键的字典。
- */
-function emptyRoleMap<T>(make: () => T): Record<LlmRole, T> {
-  return Object.fromEntries(LLM_ROLES.map((r) => [r, make()])) as Record<LlmRole, T>;
-}
+// 表单状态
+const provider = ref("zhipu");
+const apiKey = ref(""); // 空 = 保留已保存的 key
+const showKey = ref(false);
+const model = ref("");
+const chainText = ref(""); // 高级：限流切换链，逗号分隔
 
-const busy = reactive<Record<LlmRole, "save" | "test" | null>>(
-  emptyRoleMap<"save" | "test" | null>(() => null),
-);
-const notices = reactive<Record<LlmRole, RoleNotice | null>>(
-  emptyRoleMap<RoleNotice | null>(() => null),
-);
-const testResults = reactive<Record<LlmRole, LlmTestResult | null>>(
-  emptyRoleMap<LlmTestResult | null>(() => null),
-);
+const notice = ref<{ kind: "ok" | "err" | "warn"; text: string } | null>(null);
+const testResult = ref<LlmTestResult | null>(null);
 
-/** 旧后端（StrictRequest extra=forbid）遇到 role / max_tokens / timeout 会 422。 */
-function roleUnsupported(err: unknown): boolean {
-  return err instanceof ApiError && err.status === 422;
-}
+const providerKeys = computed(() => Object.keys(config.value?.providers ?? {}));
+const meta = computed(() => config.value?.providers[provider.value] ?? null);
+const keyStatus = computed(() => config.value?.keys[provider.value] ?? null);
+const effective = computed(() => config.value?.effective ?? null);
 
-async function onSave(payload: LlmRoleSavePayload): Promise<void> {
-  const role = payload.role;
-  busy[role] = "save";
-  notices[role] = null;
+const modelOptions = computed(() => {
+  const opts = new Set<string>(meta.value?.default_models ?? []);
+  if (model.value) opts.add(model.value);
+  for (const m of chainText.value.split(",")) if (m.trim()) opts.add(m.trim());
+  return [...opts];
+});
+
+async function refresh() {
+  loading.value = true;
   try {
+    config.value = await api.getLlmConfig();
+    syncFormFromConfig();
+  } catch (err) {
+    notice.value = { kind: "err", text: err instanceof Error ? err.message : String(err) };
+  } finally {
+    loading.value = false;
+  }
+}
+
+function syncFormFromConfig() {
+  const c = config.value;
+  if (!c) return;
+  provider.value = c.provider;
+  model.value = c.model;
+  // GET 不返回已存切换链，用该渠道默认链填充（用户可在高级区改）
+  chainText.value = (c.providers[provider.value]?.default_models ?? []).join(", ");
+  apiKey.value = "";
+  testResult.value = null;
+}
+
+function switchProvider(p: string) {
+  provider.value = p;
+  apiKey.value = "";
+  testResult.value = null;
+  notice.value = null;
+  const m = config.value?.providers[p];
+  model.value = m?.default_models?.[0] ?? "";
+  chainText.value = (m?.default_models ?? []).join(", ");
+}
+
+async function save() {
+  saving.value = true;
+  notice.value = null;
+  try {
+    const models = chainText.value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     config.value = await api.saveLlmConfig({
-      provider: payload.provider,
-      api_key: payload.api_key,
-      model: payload.model,
-      models: payload.models ?? null,
-      role: payload.role,
-      base_url: payload.base_url ?? null,
-      max_tokens: payload.max_tokens ?? null,
-      timeout: payload.timeout ?? null,
+      provider: provider.value,
+      api_key: apiKey.value.trim() || null,
+      model: model.value.trim() || null,
+      models: models.length ? models : null,
     });
-    notices[role] = { kind: "ok", text: roleMeta(role).savedText };
-  } catch (err) {
-    const text = err instanceof Error ? err.message : String(err);
-    notices[role] = {
-      kind: "err",
-      text: roleUnsupported(err)
-        ? `保存失败：当前后端暂不支持分角色参数（HTTP 422：${text}）。`
-        : `保存失败：${text}`,
+    apiKey.value = "";
+    notice.value = {
+      kind: "ok",
+      text: `已保存并切换：${config.value.effective.label} · ${config.value.effective.model}`
+        + (config.value.effective.is_fallback ? "（当前为本地兜底：key 为空或无效）" : ""),
     };
+  } catch (err) {
+    notice.value = { kind: "err", text: err instanceof Error ? err.message : String(err) };
   } finally {
-    busy[role] = null;
+    saving.value = false;
   }
 }
 
-async function onTest(payload: LlmRoleTestPayload): Promise<void> {
-  const role = payload.role;
-  busy[role] = "test";
-  testResults[role] = null;
+async function test() {
+  testing.value = true;
+  testResult.value = null;
   try {
-    testResults[role] = await api.testLlmConfig({
-      provider: payload.provider,
-      api_key: payload.api_key,
-      model: payload.model,
-      role: payload.role,
+    testResult.value = await api.testLlmConfig({
+      provider: provider.value,
+      api_key: apiKey.value.trim() || null,
+      model: model.value.trim() || null,
     });
   } catch (err) {
-    const text = err instanceof Error ? err.message : String(err);
-    testResults[role] = {
-      ok: false,
-      error: roleUnsupported(err)
-        ? `当前后端暂不支持分角色测试（HTTP 422：${text}）。`
-        : text,
-    };
+    testResult.value = { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
-    busy[role] = null;
+    testing.value = false;
   }
 }
 
-onMounted(load);
+onMounted(refresh);
 </script>
 
 <template>
@@ -113,65 +117,136 @@ onMounted(load);
     <div class="eyebrow">04 · 设置</div>
     <h1>模型设置</h1>
     <p>
-      三个角色分开配：生成模型写正文、助手模型做问答与诊断、蒸馏模型抽文风档案。
-      各自的渠道 / key / 模型互不影响，分别保存、分别测试。key 只存在本机数据库
-      （.gitignore 保护），页面不显示明文。
+      选一个免费大模型渠道、填入 API key，保存后立即生效。key 只存在本机数据库（.gitignore 保护），
+      页面不显示明文；限流时自动在切换链里换下一个模型。
     </p>
   </header>
 
-  <!-- 后端未就绪：如实标注「下面回显的是同一份单模型生效值」，不伪造三份配置 -->
-  <div v-if="!rolesReady && config" class="notice warn" style="margin-bottom: var(--gap-lg); line-height: 1.8">
-    <strong>后端未就绪：</strong>
-    GET /api/settings/llm 尚未返回全部 <span class="mono">writer</span> /
-    <span class="mono">assistant</span> / <span class="mono">distiller</span>
-    分角色配置（缺：{{ missingRoles.join("、") }}）。缺的那个面板回显的是
-    <strong>当前同一份单模型生效值</strong>（不是该角色的真实配置）；
-    分别保存需要后端支持 <span class="mono">role</span> 参数——旧后端会以 422 拒绝。
+  <!-- 双模型已拆成独立弹窗：本页保留旧版单模型配置（兼容旧后端），新配置走弹窗 -->
+  <div class="notice info" style="margin-bottom: var(--gap-lg); line-height: 1.8">
+    <strong>生成模型</strong>与<strong>助手模型</strong>已拆分为两个独立配置（分开保存、分开测试）：
+    <button class="btn sm" style="margin-left: 8px" @click="openDialog">打开双模型设置</button>
   </div>
-  <div v-if="error" class="notice err">配置加载失败：{{ error }}</div>
+
   <div v-if="loading" class="empty"><span class="spinner" /> 加载中…</div>
 
-  <!-- 当前生效状态（legacy 单模型视图：Writer 单例的真实标签） -->
-  <div v-if="config" class="notice info effective-banner">
-    当前生成链路生效：<strong>{{ config.effective.label }}</strong> ·
-    <span class="mono">{{ config.effective.model }}</span>
-    <span v-if="config.effective.is_fallback" class="tag warn" style="margin-left: 8px">
-      本地兜底
-    </span>
-  </div>
+  <template v-else-if="config">
+    <!-- 当前生效状态 -->
+    <div class="notice info" style="margin-bottom: var(--gap-lg)">
+      当前生效：<strong>{{ effective?.label }}</strong> · <span class="mono">{{ effective?.model }}</span>
+      <span v-if="effective?.is_fallback" class="tag warn" style="margin-left: 8px">本地兜底</span>
+    </div>
 
-  <div v-if="config" class="panels">
-    <RoleModelPanel
-      v-for="role in LLM_ROLES"
-      :key="role"
-      :role="role"
-      :title="roleMeta(role).title"
-      :purpose="roleMeta(role).purpose"
-      :config="roleConfig(role)"
-      :providers="config.providers ?? {}"
-      :busy="busy[role]"
-      :notice="notices[role]"
-      :test-result="testResults[role]"
-      @save="onSave"
-      @test="onTest"
-    />
-  </div>
+    <!-- 渠道选择 -->
+    <section class="card">
+      <div class="card-title">① 选择渠道</div>
+      <div class="chips">
+        <button
+          v-for="(m, key) in config.providers"
+          :key="key"
+          class="chip"
+          :class="{ on: provider === key }"
+          @click="switchProvider(key)"
+        >
+          {{ m.label }}
+        </button>
+      </div>
+      <p class="muted" style="font-size: var(--fs-sm); margin-top: 10px">
+        {{ meta?.free_note }}
+      </p>
+    </section>
+
+    <!-- API Key -->
+    <section class="card" v-if="provider !== 'local'">
+      <div class="card-title">② API Key</div>
+      <p class="muted" style="font-size: var(--fs-sm); margin-bottom: 10px">
+        获取方式：{{ meta?.key_hint }}
+        <template v-if="keyStatus?.has">
+          ；已保存 <span class="mono">{{ keyStatus.masked }}</span>（留空保存 = 不改变已有 key）
+        </template>
+      </p>
+      <div class="key-row">
+        <input
+          class="input"
+          :type="showKey ? 'text' : 'password'"
+          v-model="apiKey"
+          :placeholder="keyStatus?.has ? '已保存，输入新 key 可替换' : '粘贴 API key'"
+          autocomplete="off"
+        />
+        <button class="btn ghost" @click="showKey = !showKey">
+          {{ showKey ? "隐藏" : "显示" }}
+        </button>
+      </div>
+    </section>
+
+    <!-- 模型选择 -->
+    <section class="card">
+      <div class="card-title">③ 模型</div>
+      <div class="field">
+        <label>默认模型</label>
+        <input
+          class="input"
+          v-model="model"
+          list="model-options"
+          :placeholder="meta?.default_models?.[0] ?? '模型 id'"
+        />
+        <datalist id="model-options">
+          <option v-for="m in modelOptions" :key="m" :value="m" />
+        </datalist>
+      </div>
+      <details class="advanced">
+        <summary>高级：限流切换链（逗号分隔，按序切换）</summary>
+        <textarea class="input" v-model="chainText" rows="2" />
+      </details>
+    </section>
+
+    <!-- 操作 -->
+    <div class="row" style="margin-bottom: var(--gap-lg)">
+      <button class="btn" :disabled="testing" @click="test">
+        {{ testing ? "测试中…" : "测试连通性" }}
+      </button>
+      <button class="btn primary" :disabled="saving" @click="save">
+        {{ saving ? "保存中…" : "保存并应用" }}
+      </button>
+    </div>
+
+    <div v-if="testResult" :class="['notice', testResult.ok ? 'ok' : 'err']">
+      <template v-if="testResult.ok">
+        连通正常 · 模型 <span class="mono">{{ testResult.model }}</span> ·
+        延迟 {{ testResult.latency_ms }}ms · 回复：「{{ testResult.reply }}」
+      </template>
+      <template v-else>连通失败：{{ testResult.error }}</template>
+    </div>
+    <div v-if="notice" :class="['notice', notice.kind]" style="margin-top: 12px">
+      {{ notice.text }}
+    </div>
+  </template>
 </template>
 
 <style scoped>
-.effective-banner {
-  margin-bottom: var(--gap-lg);
+.key-row {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
 }
-.panels {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-  gap: var(--gap);
-  align-items: start;
-  margin-bottom: var(--gap-lg);
+.key-row .input {
+  flex: 1;
 }
-@media (max-width: 960px) {
-  .panels {
-    grid-template-columns: 1fr;
-  }
+.btn.sm {
+  font-size: var(--fs-xs);
+  padding: 5px 10px;
+}
+.advanced {
+  margin-top: 12px;
+  font-size: var(--fs-sm);
+}
+.advanced summary {
+  cursor: pointer;
+  color: var(--accent-ink);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.advanced summary:hover {
+  color: var(--accent);
 }
 </style>

@@ -29,27 +29,11 @@ L3 深读只覆盖代表性章节（20~30 章），剩下的是重复模式。�
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import re
-from datetime import datetime, timezone
-
-from dataclasses import dataclass
-from typing import Any, Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-
-#: 进度回调签名：`(阶段人话文本, 已完成数, 总数)`。
-#:
-#: 只用于**上报**蒸馏进度（后台任务的进度条），不参与任何蒸馏决策。
-#: 不传时整个蒸馏链路一行不改、行为与加进度之前逐字节一致 —— 生成路径
-#: (`project_narrative_safe`) 走的就是不传的那条路。
-#:
-#: `总数` 允许为 0，含义是「还没探明」：蒸馏要等语料加载、采样之后才知道
-#: 一共有多少块。前端据此渲染不确定态，绝不拿 0 当分母。
-ProgressCallback = Callable[[str, int, int], None]
 
 #: 叙事档案的形状修订号。**任何会改变档案字段的改动都必须把它 +1。**
 #:
@@ -60,6 +44,12 @@ NARRATIVE_VERSION = 7
 #: 采样比例：从全文章节中采样的百分比。
 #: 603 章 × 15% = 90 章，分 4~5 块。平衡覆盖面与 LLM 调用成本。
 SAMPLE_RATIO = 0.15
+
+#: 采样的字数下限：短篇/短语料若按比例采样会砍掉过多对白，
+#: 导致角色声音维度失效（实测：10 章语料只提得出 1 个角色声音）。
+#: 采样结果若低于此字数，则扩容到达到下限；若全量仍不足，则全取。
+#: 30 万字 ≈ 100+ 章网文，足够覆盖角色对白与场景多样性。
+MIN_SAMPLE_CHARS = 300_000
 
 #: 每块最少章节数（太少提炼不出模式）
 MIN_CHAPTERS_PER_CHUNK = 5
@@ -107,215 +97,6 @@ FORBIDDEN_DIMENSIONS = [
     "禁用段尾拔高",    # 如「他知道」「她明白」+ 总结句
     "禁用解释性对白",  # 如对话交代世界观/设定
 ]
-
-
-# ====================================================================
-# 蒸馏档位（tier）
-# ====================================================================
-#
-# ## 为什么要有档位
-#
-# 完整档是最贵的一档：按语料量百分比采样（全章数的 15%）、全维度、还要做
-# 角色名归一化这种重活。docs 里唯一一次计时是 833 章语料跑 42 分钟——量级在
-# 「几十分钟」这个级别，用户不可能每次都等这个。试跑、冒烟、短篇根本不需要
-# 角色名归一化。于是把蒸馏能力分档，让用户按场景选：生产用完整档、试跑用平衡档、
-# 冒烟用快速档。
-#
-# 档位差异只落在**四个可实现的轴**上（采样策略 / 维度子集 / 角色名归一化 /
-# 伪角色清洗强度），每一条都对应 docs/style-distillation-tiers.md 里实测到的
-# 能力跃迁，不是随手编的标签。
-#
-# ## 档位只影响蒸馏，不影响其它
-#
-# Writer 生成路径、audit 规则、log_audit 规则一概不读 tier——本模块之外的任何
-# 代码都不得引入 tier 分支。
-
-
-#: 第一档（完整）：生产用。百分比采样 + 全维度 + 语料自证的角色名归一化。
-TIER_FULL = "full"
-#: 第二档（平衡）：试跑/中篇。固定 30 章 + 全维度，不做角色名归一化。
-TIER_BALANCED = "balanced"
-#: 第三档（快速）：冒烟/短篇。固定 30 章 + 精简维度，清洗全关。
-TIER_FAST = "fast"
-
-#: 默认档位。**必须是完整档**——不传 tier 时行为与引入档位之前逐字节一致
-#: （SAMPLE_RATIO=0.15 / 全维度 / 开归一化），不破坏已验证过的产出。
-DEFAULT_TIER = TIER_FULL
-
-
-#: 各档的**相对**耗时档位提示。
-#:
-#: ## 为什么三档都不给「约 N 分钟」
-#:
-#: docs/style-distillation-tiers.md 全文只有**一处**计时（第 81 行）：
-#!
-#:     语料 2《大奉打更人》833 章 → 采样 764 章 → 耗时 42 分钟
-#:
-#: 也就是说：唯一有实测支撑的耗时是**语料 2（833 章）**的 42 分钟。
-#! 语料 1（603 章）那段**从头到尾没有任何计时记录**，「64 分钟」在 docs 里
-#! 零命中（grep 到的 64 都是 764 / 2644 / 421 这类别的数字）。
-#:
-#: 曾一度把完整档写成「实测 603 章语料约 64 分钟」——那是把 brief 里的二手
-#: 分钟数配上 docs 里语料 1 的章数拼出来的组合，仓库里查不到出处，而且
-#: **603 章 64 分钟比 833 章 42 分钟还慢**，与docs 唯一的计时直接矛盾。
-#! 界面上的耗时提示是给用户的时间承诺，不能挂在一个自相矛盾的数上。
-#:
-#: 相对档位（最高/中等/最低）是从**配置事实**推导的（采样量 + 维度数 +
-#: 角色声音调用次数），不会撒谎。将来有了某一档某一语料的真实计时，
-#: 再往这里补「约 N 分钟（语料 X，N 章，实测）」并注明出处。
-#:
-#: 键是档位 key，新增档位时必须在这里补一项，否则 `to_public_dict` 会抛 KeyError
-#: ——宁可响亮地失败，也不要静默给错提示。
-_COST_HINTS: dict[str, str] = {
-    TIER_FULL: "最高（完整蒸馏：按语料量百分比采样、全维度、含角色名归一化）",
-    TIER_BALANCED: "中等（固定 30 章，维度齐全，省掉角色名归一化）",
-    TIER_FAST: "最低（固定 30 章 + 精简维度，只验证管线）",
-}
-
-
-@dataclass(frozen=True)
-class NarrativeTier:
-    """一个蒸馏档位的完整配置。
-
-    刻意做成**显式注册表**而不是散落的 if/else 常量：档位是要展示给用户选的
-    （前端拿 name + description 直接渲染），也是要被测试逐项断言的
-    （"三档真的不同" 不能只比对标签）。散落的 if/else 没法列举、没法渲染。
-    """
-
-    key: str
-    name: str
-    description: str
-    #: "percentage" → 按 `sample_ratio` 采样；"fixed_chapters" → 固定 `fixed_chapters` 章
-    sampling_mode: str
-    #: sampling_mode == "percentage" 时生效
-    sample_ratio: float | None = None
-    #: sampling_mode == "fixed_chapters" 时生效
-    fixed_chapters: int | None = None
-    #: 本档要提炼的维度白名单（**子集**，不是全集——全集就是"没做子集"）
-    dimensions: tuple[str, ...] = ()
-    #: 是否启用「语料词频自证」的角色名归一化（小落→安小落、宫爵→南宫爵）
-    normalize_character_names: bool = False
-    #: 伪角色清洗强度："full"（虚词黑名单 + 频率自证）/ "partial"（仅黑名单）/ "none"
-    fake_character_cleaning: str = "none"
-    #: 角色声音提取方式："targeted"（主要角色逐个 + 配角分批）/ "single_batch"（单批浅层）
-    voice_mode: str = "targeted"
-
-    @property
-    def dimension_count(self) -> int:
-        """本档维度数（测试断言用，避免各处硬编码数字）。"""
-        return len(self.dimensions)
-
-    def fingerprint_payload(self) -> dict[str, Any]:
-        """进入指纹的**有效配置**——改任一项都必须让旧缓存失效。"""
-        return {
-            "tier": self.key,
-            "sampling_mode": self.sampling_mode,
-            "sample_ratio": self.sample_ratio,
-            "fixed_chapters": self.fixed_chapters,
-            "dimensions": list(self.dimensions),
-            "normalize_character_names": self.normalize_character_names,
-            "fake_character_cleaning": self.fake_character_cleaning,
-            "voice_mode": self.voice_mode,
-        }
-
-    def to_public_dict(self) -> dict[str, Any]:
-        """给 API / 前端展示用的形状（不含内部实现细节）。"""
-        return {
-            "key": self.key,
-            "name": self.name,
-            "description": self.description,
-            "sampling_mode": self.sampling_mode,
-            "sample_ratio": self.sample_ratio,
-            "fixed_chapters": self.fixed_chapters,
-            "dimension_count": self.dimension_count,
-            "dimensions": list(self.dimensions),
-            "normalize_character_names": self.normalize_character_names,
-            "fake_character_cleaning": self.fake_character_cleaning,
-            # 相对耗时档位（非实测分钟数，理由见 _COST_HINTS 注释）
-            "cost_hint": _COST_HINTS[self.key],
-        }
-
-
-#: 快速档砍掉的三个维度。都是 v5 才引入的「增量能力」，对应 docs 里 v3 档的
-#: 实测维度数 11（14 − 3）。砍这三个 = 每块少 3 次 LLM 调用。
-_FAST_TIER_DROP_DIMENSIONS = ("节拍序列", "高频场景模板", "潜台词模式")
-
-
-TIER_REGISTRY: dict[str, NarrativeTier] = {
-    TIER_FULL: NarrativeTier(
-        key=TIER_FULL,
-        name="完整",
-        description="生产用。按语料量百分比采样，全维度，含语料自证的角色名归一化与全量伪角色清洗。最准也最慢。",
-        sampling_mode="percentage",
-        sample_ratio=SAMPLE_RATIO,
-        dimensions=tuple(NARRATIVE_DIMENSIONS),
-        normalize_character_names=True,
-        fake_character_cleaning="full",
-        voice_mode="targeted",
-    ),
-    TIER_BALANCED: NarrativeTier(
-        key=TIER_BALANCED,
-        name="平衡",
-        description="试跑 / 中篇用。固定 30 章，维度与完整档齐，不做角色名归一化（简称可能有噪声）。",
-        sampling_mode="fixed_chapters",
-        fixed_chapters=30,
-        dimensions=tuple(NARRATIVE_DIMENSIONS),
-        normalize_character_names=False,
-        fake_character_cleaning="partial",
-        voice_mode="targeted",
-    ),
-    TIER_FAST: NarrativeTier(
-        key=TIER_FAST,
-        name="快速",
-        description="冒烟 / 短篇用。固定 30 章，精简维度，角色名不归一化也不清洗。只验证管线通不通。",
-        sampling_mode="fixed_chapters",
-        fixed_chapters=30,
-        dimensions=tuple(
-            d for d in NARRATIVE_DIMENSIONS if d not in _FAST_TIER_DROP_DIMENSIONS
-        ),
-        normalize_character_names=False,
-        fake_character_cleaning="none",
-        voice_mode="single_batch",
-    ),
-}
-
-
-def resolve_tier(tier: str | None) -> NarrativeTier:
-    """把用户传的档位 key 解析成配置对象。
-
-    Args:
-        tier: 档位 key；None / 空串 → 默认档（完整档）。
-
-    Returns:
-        对应的 NarrativeTier。
-
-    Raises:
-        ValueError: 未知档位 key。**不静默回落默认档**——用户选了「快速」却
-            悄悄跑成完整档，是本项目已经踩过两次的同类坑（静默返回错结果）。
-    """
-    if not tier:
-        return TIER_REGISTRY[DEFAULT_TIER]
-    key = str(tier).strip().lower()
-    if key not in TIER_REGISTRY:
-        valid = "、".join(sorted(TIER_REGISTRY))
-        raise ValueError(f"未知蒸馏档位 {tier!r}，可选：{valid}")
-    return TIER_REGISTRY[key]
-
-
-def list_tiers() -> list[dict[str, Any]]:
-    """按「完整 → 平衡 → 快速」的顺序列出全部档位（前端选档用）。"""
-    order = [TIER_FULL, TIER_BALANCED, TIER_FAST]
-    return [TIER_REGISTRY[k].to_public_dict() for k in order if k in TIER_REGISTRY]
-
-
-def _tier_signature(tier: NarrativeTier) -> str:
-    """档位配置的稳定短哈希。
-
-    进指纹用：改了某档的维度白名单 / 采样章数 / 清洗强度，旧缓存必须失效
-    （配置变了却复用旧结果 = 又一次静默返回旧结果）。
-    """
-    blob = json.dumps(tier.fingerprint_payload(), sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
 
 def _load_novel_chapters(db: Session, novel_id: int) -> list[tuple[int, str]]:
@@ -550,7 +331,18 @@ def _sample_chapters_v6(
     """
     if not chapters:
         return []
-    target = max(10, int(len(chapters) * ratio))
+    total_chars = sum(len(t) for _, t in chapters if t)
+
+    # 短篇保护：若全语料字数就不足下限，直接全取（没有砍的空间）。
+    if total_chars <= MIN_SAMPLE_CHARS:
+        return list(chapters)
+
+    # 目标章节数：按比例取，但保证采样字数不低于下限。
+    # 平均章长估算需要多少章才够 MIN_SAMPLE_CHARS。
+    avg_ch = total_chars / max(len(chapters), 1)
+    ratio_target = int(len(chapters) * ratio)
+    chars_target = int(MIN_SAMPLE_CHARS / max(avg_ch, 1))
+    target = max(10, ratio_target, chars_target)
     if len(chapters) <= target:
         return list(chapters)
 
@@ -594,39 +386,6 @@ def _sample_chapters_v6(
 
     # 按章节号排序返回
     return sorted(picked, key=lambda x: x[0])
-
-
-def _sample_chapters_fixed(
-    chapters: list[tuple[int, str]], n_chapters: int
-) -> list[tuple[int, str]]:
-    """固定章数采样：均匀取 n_chapters 章，优先取后2/3（避开早期稚嫩期）。
-
-    平衡档 / 快速档用这个（docs 记载v3/v5 时代就是固定 30 章）。
-    与 `_sample_chapters_v6` 的区别：**不做**对话密度排序、**不做**场景均衡——
-    那是完整档才付得起的成本。
-    """
-    if not chapters:
-        return []
-    target = max(1, int(n_chapters))
-    if len(chapters) <= target:
-        return list(chapters)
-    # 取后 2/3（避开早期稚嫩期），再均匀采样
-    start = len(chapters) // 3
-    pool = chapters[start:]
-    if len(pool) <= target:
-        return list(pool)
-    step = len(pool) / target
-    picks = sorted({min(int(i * step), len(pool) - 1) for i in range(target)})
-    return [pool[i] for i in picks]
-
-
-def sample_chapters_for_tier(
-    chapters: list[tuple[int, str]], tier: NarrativeTier
-) -> list[tuple[int, str]]:
-    """按档位配置采样章节——档位在采样轴上的唯一入口。"""
-    if tier.sampling_mode == "percentage":
-        return _sample_chapters_v6(chapters, ratio=tier.sample_ratio or SAMPLE_RATIO)
-    return _sample_chapters_fixed(chapters, tier.fixed_chapters or 30)
 
 
 #: 占位符：LLM 直接照抄 prompt 示例（「角色A」「具体角色名」）
@@ -756,8 +515,7 @@ def _extend_name_candidates(
 
 
 def _build_character_name_index(
-    db, project, nid: int, corpus_text: str = "", min_mentions: int = 10,
-    cleaning: str = "full",
+    db, project, nid: int, corpus_text: str = "", min_mentions: int = 10
 ) -> tuple[list[tuple[str, int]], dict[str, str]]:
     """构建规范角色名索引，返回 (canonical, alias)。
 
@@ -767,14 +525,6 @@ def _build_character_name_index(
     图谱的 character 节点很脏：513 个里既有「时间/任何/相信」这类高频虚词，
     也有「小落/安小/南宫/宫爵」这类分词截断。不清洗的话，角色声音提取会把
     提名额全浪费在伪角色上，LLM 输出的简称也无法归并到全名。
-
-    Args:
-        cleaning: 清洗强度，对应档位配置。
-            - ``"full"``：虚词黑名单 + 频率自证（`_resolve_name_artifacts` /
-              `_extend_name_candidates`）。完整档用。
-            - ``"partial"``：只过虚词黑名单，不做频率自证。平衡档用——
-              简称仍有噪声，但不会把名额浪费在「时间/相信」上。
-            - ``"none"``：不清洗，只按提及次数排序取前N。快速档用。
     """
     try:
         from app.models import KgNode
@@ -798,19 +548,10 @@ def _build_character_name_index(
         raw.append((name, props.get("mentions") or 0, props.get("speaking") is True))
 
     # 候选：会说话的角色（有对白才能提炼声音）∪ 高提及角色（未被标记但戏份重）
-    candidates = [
+    pool = [
         (n, m) for n, m, speaking in raw
-        if (speaking or m >= 200) and m >= min_mentions
+        if (speaking or m >= 200) and m >= min_mentions and not _is_fake_character(n)
     ]
-
-    if cleaning == "none":
-        # 快速档：不清洗。伪角色会进候选，靠后续 MAX_VOICE_CHARACTERS 截断兜底。
-        return sorted(candidates, key=lambda p: -p[1]), {}
-
-    pool = [(n, m) for n, m in candidates if not _is_fake_character(n)]
-    if cleaning == "partial":
-        # 平衡档：只过虚词黑名单，不做频率自证（不做子串归一/后缀扩展）。
-        return sorted(pool, key=lambda p: -p[1]), {}
 
     resolved = _resolve_name_artifacts(pool, corpus_text)
     # 后缀扩展：图谱里只有「莫泽/何萱/南尊/唐甜/郑楚」，语料里其实名是「莫泽修/…」
@@ -874,7 +615,6 @@ def _dedup_character_voices(
     voices: list[dict],
     canonical: list[tuple[str, int]] | None = None,
     alias: dict[str, str] | None = None,
-    clean_fake: bool = True,
 ) -> list[dict]:
     """角色声音去重 + 角色名归一化。
 
@@ -882,13 +622,6 @@ def _dedup_character_voices(
     1. 占位符/伪角色（角色A、时间、相信）→ 丢弃
     2. 同一角色的不同称呼（安小落/小落、南宫爵/宫爵）→ 合并到规范全名
        （alias 给语料自证的截断映射，canonical 给规范名列表）
-
-    Args:
-        clean_fake: 是否过滤伪角色/占位符。快速档（伪角色清洗强度 = none）
-            传False —— 该档本就接受伪角色混入，省掉这层过滤的收益
-            （规则更少）与成本不成正比，但也**不会**把「角色A」这种
-            prompt 示例照抄当成真角色。
-            canonical/alias 传空时，本函数退化为「只按同名字段合并」。
     """
     # 第一轮：过滤占位符 + 简称归一化
     valid = []
@@ -898,12 +631,9 @@ def _dedup_character_voices(
         if "：" not in rule:
             continue
         char_name = rule.split("：")[0].strip()
-        if clean_fake:
-            normalized = _normalize_character_name(char_name, canonical, alias)
-            if normalized is None:
-                continue
-        else:
-            normalized = char_name
+        normalized = _normalize_character_name(char_name, canonical, alias)
+        if normalized is None:
+            continue
         # 替换归一化后的名字
         v = dict(v)
         v["rule"] = normalized + "：" + rule.split("：", 1)[1]
@@ -1141,50 +871,9 @@ def _find_voice_for_char(parsed: dict, char_name: str) -> dict | None:
     return None
 
 
-def _extract_character_voices_single_batch(
-    provider, nid: int, chapters: list[tuple[int, str]], char_names: list[str]
-) -> list[dict]:
-    """快速档的角色声音提取：全部角色挤在**一次** LLM 调用里。
-
-    对应 docs 里 v3 档的「单批浅层」：只求有个粗略的说话风格印象，不做
-    逐角色的专属章节检索。这是快速档省下大量调用的关键（完整档约 11 次调用，
-    这里1 次）。
-    """
-    if not char_names or not chapters:
-        return []
-    merged_text: list[str] = []
-    for char_name in char_names:
-        char_chapters = _find_character_chapters(chapters, char_name, max_chapters=2)
-        merged_text.extend(text for _, text in char_chapters)
-    voice_text = "\n\n".join(merged_text)[:8000]
-    if not voice_text:
-        return []
-    try:
-        system, user = _build_character_voice_prompt(voice_text, char_names, f"语料{nid}")
-        parsed = _parse_extract_result(provider.chat(system, user))
-        if not isinstance(parsed, dict):
-            return []
-        results: list[dict] = []
-        for char_name in char_names:
-            voice = _find_voice_for_char(parsed, char_name)
-            if not isinstance(voice, dict):
-                continue
-            rule = _build_voice_rule(char_name, voice)
-            if rule:
-                results.append({"rule": rule, "novel_id": nid, "chapter_no": 0})
-        return results
-    except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).warning(
-            "角色声音单批提取失败 novel_id=%s: %s", nid, exc
-        )
-        return []
-
-
 def _extract_character_voices(
     provider, db, project, nid: int, chapters: list[tuple[int, str]],
     char_names: list[str] | None = None,
-    voice_mode: str = "targeted",
-    cleaning: str = "full",
 ) -> list[dict]:
     """混合方案：主要角色逐个提取，配角分批提取。
 
@@ -1195,25 +884,9 @@ def _extract_character_voices(
     char_names 由 _build_character_name_index 清洗后给出（已剔除伪角色与
     分词截断的简称）——直接用图谱原始顺序会把提名额浪费在「时间/任何/冷声」
     这类伪角色上，且提取出的简称无法归并到全名。
-
-    Args:
-        voice_mode: "targeted"（完整/平衡档，逐个 + 分批）或
-            "single_batch"（快速档，一次调用搞定，对应 docs 的 v3「单批浅层」）。
-        cleaning: 传给 _build_character_name_index 的清洗强度。
     """
-    if voice_mode == "single_batch":
-        if char_names is None:
-            canonical, _ = _build_character_name_index(
-                db, project, nid, cleaning=cleaning
-            )
-            char_names = [n for n, _ in canonical]
-        char_names = [n for n in char_names if n and len(n) >= 2][:MAX_VOICE_CHARACTERS]
-        return _extract_character_voices_single_batch(
-            provider, nid, chapters, char_names
-        )
-
     if char_names is None:
-        char_names, _ = _build_character_name_index(db, project, nid, cleaning=cleaning)
+        char_names, _ = _build_character_name_index(db, project, nid)
         char_names = [n for n, _ in char_names]
     char_names = [
         n for n in char_names if n and len(n) >= 2
@@ -1328,78 +1001,20 @@ def _build_drift_prompt(chunks_info: list[tuple[str, str]], chunk_label: str) ->
     return system, user
 
 
-def resolve_distill_provider():
-    """蒸馏链路用哪个 provider：**优先 distiller 角色**，没配则回落 Writer。
-
-    ## 为什么优先 distiller
-
-    用户在「模型设置」里给蒸馏单独配了一个角色（第三条轨道），意图是
-    「提炼文风用一个更便宜/更适合长文的模型，生成用另一个」。但蒸馏链路之前
-    取的是 Writer 的 `get_llm_provider()` —— 那个 distiller 角色配了等于没配，
-    界面上的「蒸馏模型」是个摆设。这里把它接上。
-
-    ## 为什么必须有回落（老用户行为零变化）
-
-    `build_distiller_provider()` 在**两种**情况下会返回 `LocalFallbackLLMProvider`：
-    没填 provider、或没填 api_key。而从未配过 distiller 的用户就落在这两种里。
-    这时若直接用兜底模型去蒸馏，产出会从「用户配的 Writer 模型」退化成
-    本地模板 —— 一个**静默的质量倒退**（不报错，只是结果变差）。
-
-    所以判定条件是「解析出来的是不是 LocalFallback」：是 → 说明用户压根没配
-    distiller，沿用改动前的 `get_llm_provider()`，行为逐字节不变；
-    不是 → 说明用户真的配了，用它。
-
-    ## 为什么不在模块顶层 import
-
-    `app.llm` 依赖 `app.config`，而 config 会在 settings 变更时热重建；
-    函数内 import 保证每次调用都拿到最新的工厂，也避免 `app.style` 与
-    `app.llm` 之间出现顶层循环导入。
-    """
-    from app.llm import get_distiller_provider
-    from app.llm.provider import LocalFallbackLLMProvider, get_llm_provider
-
-    try:
-        candidate = get_distiller_provider()
-    except Exception as exc:  # noqa: BLE001 —— 配置异常不该让蒸馏链路整个炸掉
-        logging.getLogger(__name__).warning(
-            "distiller provider 解析失败，回落 Writer provider：%s: %s",
-            type(exc).__name__, exc,
-        )
-        candidate = None
-
-    # LocalFallback = 没配 distiller（见 docstring），此时绝不能"用了个兜底模型"，
-    # 而是要走改动前的那条路。
-    if candidate is not None and not isinstance(candidate, LocalFallbackLLMProvider):
-        return candidate
-    return get_llm_provider()
-
-
 def extract_narrative_profile(
     db: Session,
     project,
     novel_ids: list[int],
     provider=None,
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
-    tier: str | NarrativeTier | None = None,
-    progress: ProgressCallback | None = None,
 ) -> dict:
     """从参考语料提炼叙事档案。
-
-    Args:
-        tier: 档位 key（"full"/"balanced"/"fast"）或 NarrativeTier 对象。
-            None →默认完整档（与引入档位之前行为逐字节一致）。
-        progress: 可选的进度回调 `progress(stage, current, total)`，用于后台
-            蒸馏任务的进度条。**None 时行为与加进度之前完全一致**——采样、
-            维度、provider 选择、返回结构一项都不变。
-            单位是「块（chunk）」：一本语料切成若干块，每块一次 `provider.chat`，
-            这就是用户能感知到的天然粒度。
 
     返回结构（可直接 JSON 落库到 `Project.style_narrative`）：
     {
       "version": 1,
       "source_ids": [...],
       "narrative_version": 1,
-      "tier": "full",
       "n_chapters": 30,
       "rules": {
         "人物描写手法": [
@@ -1410,87 +1025,35 @@ def extract_narrative_profile(
       },
       "rejected": 3,  # 因证据不通过被拒的规则数
     }
-
-    Raises:
-        ValueError: tier 是未知档位 key（不静默回落默认档）。
     """
-    if provider is None:
-        provider = resolve_distill_provider()
+    from app.llm.provider import get_llm_provider
 
-    cfg = tier if isinstance(tier, NarrativeTier) else resolve_tier(tier)
-    # 本档要提炼的维度（白名单子集）。全维度档下它就等于 NARRATIVE_DIMENSIONS。
-    tier_dims = [d for d in NARRATIVE_DIMENSIONS if d in cfg.dimensions]
-    has_dim = set(tier_dims)
+    if provider is None:
+        provider = get_llm_provider()
 
     all_rules: dict[str, list[dict]] = {
-        dim: [] for dim in tier_dims + ["文风漂移分析"]
+        dim: [] for dim in NARRATIVE_DIMENSIONS + ["文风漂移分析"]
     }
     all_forbidden: dict[str, list[str]] = {dim: [] for dim in FORBIDDEN_DIMENSIONS}
     rejected = 0
     total_chapters = 0
 
-    # —— 进度上报的累计量（只在 progress 非 None 时有意义）——
-    # blocks_done：已完成块数（跨语料累计）；
-    # blocks_seen / books_seen：已探明的块数与语料数，用来估剩余语料的块数。
-    total_books = len(novel_ids)
-    blocks_done = 0
-    blocks_seen = 0
-    books_seen = 0
-    est_total = 0
-
-    if progress is not None:
-        progress("正在准备参考语料", 0, 0)
-
-    for book_idx, nid in enumerate(novel_ids, start=1):
+    for nid in novel_ids:
         chapters = _load_novel_chapters(db, nid)
         if not chapters:
             continue
 
-        # 按档位采样：完整档走百分比 + 对话密集优先 + 场景均衡；
-        # 平衡/快速档走固定章数均匀采样。
-        sampled = sample_chapters_for_tier(chapters, cfg)
+        # v6：按百分比采样 + 对话密集优先 + 场景均衡
+        sampled = _sample_chapters_v6(chapters, ratio=SAMPLE_RATIO)
         total_chapters += len(sampled)
 
         # 分块：每块约 20 章（180 章 / 3 块 = 60 章/块，但限制块大小防止 prompt 过长）
         chunk_size = max(MIN_CHAPTERS_PER_CHUNK, min(len(sampled) // 3, 20))
-        chunk_starts = list(range(0, len(sampled), chunk_size))
-        n_chunks = len(chunk_starts)
-
-        # 估算总块数：已探明语料的**平均块数** × 剩余未探明语料数。
-        # 为什么是估算而不是精确值：精确值要先把每本语料都加载+采样一遍，
-        # 那等于把最贵的一步做两次。估算法的性质是——跑到最后一本时剩余项
-        # 归零，est_total 自动收敛成精确值，进度条不会停在 97%。
-        # 下限兜底 `blocks_done + n_chunks`：后一本语料若比已探明的平均值厚重，
-        # 估算值会小于实际会跑的块数，进度百分比就会越过 100%。这里保证
-        # 「当前已跑 ≤ 总数」这条不变量成立，前端不必再做防御。
-        books_seen += 1
-        blocks_seen += n_chunks
-        avg_chunks = blocks_seen / books_seen if books_seen else float(n_chunks)
-        est_total = max(
-            int(round(blocks_done + n_chunks + (total_books - book_idx) * avg_chunks)),
-            blocks_done + n_chunks,
-        )
-
-        if progress is not None:
-            progress(
-                f"语料 {book_idx}/{total_books}：已采样 {len(sampled)} 章，"
-                f"切 {n_chunks} 块",
-                blocks_done,
-                est_total,
-            )
-
-        for ci, i in enumerate(chunk_starts):
+        for i in range(0, len(sampled), chunk_size):
             chunk = sampled[i : i + chunk_size]
             chunk_text = "\n\n".join(text for _, text in chunk if text)
             if not chunk_text:
                 continue
-
-            if progress is not None:
-                progress(
-                    f"语料 {book_idx}/{total_books}：提炼第 {ci + 1}/{n_chunks} 块",
-                    blocks_done + ci + 1,
-                    est_total,
-                )
 
             chapter_range = f"{chunk[0][0]}-{chunk[-1][0]}"
             system, user = _build_extract_prompt(chunk_text, f"语料{nid} 第{chapter_range}章")
@@ -1507,7 +1070,7 @@ def extract_narrative_profile(
             if not isinstance(parsed, dict):
                 continue
 
-            for dim in tier_dims:
+            for dim in NARRATIVE_DIMENSIONS:
                 items = parsed.get(dim)
                 if not isinstance(items, list):
                     continue
@@ -1551,120 +1114,86 @@ def extract_narrative_profile(
                     )
 
             # —— v6：节拍序列提取（每块都提取，提炼不同类型的冲突节拍）——
-            # 快速档不含该维度 → 整个调用块跳过（每块省 1 次 LLM 调用）
-            if "节拍序列" in has_dim:
-                try:
-                    b_system, b_user = _build_beat_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
-                    b_raw = provider.chat(b_system, b_user)
-                    b_parsed = _parse_extract_result(b_raw)
-                    if isinstance(b_parsed, dict):
-                        beats = b_parsed.get("节拍序列") or []
-                        for beat in beats:
-                            if isinstance(beat, dict) and beat.get("步骤") and beat.get("写法"):
-                                rule = f"{beat['步骤']}：{beat['写法']}"
-                                if not _is_verbatim_copy(rule, chunk_text):
-                                    all_rules["节拍序列"].append({
-                                        "rule": rule,
-                                        "novel_id": nid,
-                                        "chapter_no": chunk[0][0],
-                                    })
-                except Exception as exc:  # noqa: BLE001
-                    logging.getLogger(__name__).warning("节拍序列提取失败: %s", exc)
-
-            # —— v5：高频场景模板提取（只对第一块）——
-            if "高频场景模板" in has_dim:
-                try:
-                    s_system, s_user = _build_scene_template_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
-                    s_raw = provider.chat(s_system, s_user)
-                    s_parsed = _parse_extract_result(s_raw)
-                    if isinstance(s_parsed, dict):
-                        scenes = s_parsed.get("场景模板") or []
-                        for scene in scenes:
-                            if isinstance(scene, dict) and scene.get("场景"):
-                                rule = (
-                                    f"{scene['场景']}：环境={scene.get('环境','')} "
-                                    f"站位={scene.get('站位','')} "
-                                    f"动作链={scene.get('动作链','')} "
-                                    f"基调={scene.get('基调','')}"
-                                )
-                                all_rules["高频场景模板"].append({
+            try:
+                b_system, b_user = _build_beat_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
+                b_raw = provider.chat(b_system, b_user)
+                b_parsed = _parse_extract_result(b_raw)
+                if isinstance(b_parsed, dict):
+                    beats = b_parsed.get("节拍序列") or []
+                    for beat in beats:
+                        if isinstance(beat, dict) and beat.get("步骤") and beat.get("写法"):
+                            rule = f"{beat['步骤']}：{beat['写法']}"
+                            if not _is_verbatim_copy(rule, chunk_text):
+                                all_rules["节拍序列"].append({
                                     "rule": rule,
                                     "novel_id": nid,
                                     "chapter_no": chunk[0][0],
                                 })
-                except Exception as exc:  # noqa: BLE001
-                    logging.getLogger(__name__).warning("场景模板提取失败: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning("节拍序列提取失败: %s", exc)
+
+            # —— v5：高频场景模板提取（只对第一块）——
+            try:
+                s_system, s_user = _build_scene_template_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
+                s_raw = provider.chat(s_system, s_user)
+                s_parsed = _parse_extract_result(s_raw)
+                if isinstance(s_parsed, dict):
+                    scenes = s_parsed.get("场景模板") or []
+                    for scene in scenes:
+                        if isinstance(scene, dict) and scene.get("场景"):
+                            rule = (
+                                f"{scene['场景']}：环境={scene.get('环境','')} "
+                                f"站位={scene.get('站位','')} "
+                                f"动作链={scene.get('动作链','')} "
+                                f"基调={scene.get('基调','')}"
+                            )
+                            all_rules["高频场景模板"].append({
+                                "rule": rule,
+                                "novel_id": nid,
+                                "chapter_no": chunk[0][0],
+                            })
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning("场景模板提取失败: %s", exc)
 
             # —— v5：潜台词模式提取（只对第一块）——
-            if "潜台词模式" in has_dim:
-                try:
-                    st_system, st_user = _build_subtext_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
-                    st_raw = provider.chat(st_system, st_user)
-                    st_parsed = _parse_extract_result(st_raw)
-                    if isinstance(st_parsed, dict):
-                        patterns = st_parsed.get("潜台词模式") or []
-                        for pat in patterns:
-                            if isinstance(pat, dict) and pat.get("模式") and pat.get("写法"):
-                                rule = f"{pat['模式']}：{pat['写法']}"
-                                if not _is_verbatim_copy(rule, chunk_text):
-                                    all_rules["潜台词模式"].append({
-                                        "rule": rule,
-                                        "novel_id": nid,
-                                        "chapter_no": chunk[0][0],
-                                    })
-                except Exception as exc:  # noqa: BLE001
-                    logging.getLogger(__name__).warning("潜台词提取失败: %s", exc)
-
-        # 本语料的块已全部跑完：把块数计入累计，供下一本语料接着报进度。
-        blocks_done += n_chunks
+            try:
+                st_system, st_user = _build_subtext_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
+                st_raw = provider.chat(st_system, st_user)
+                st_parsed = _parse_extract_result(st_raw)
+                if isinstance(st_parsed, dict):
+                    patterns = st_parsed.get("潜台词模式") or []
+                    for pat in patterns:
+                        if isinstance(pat, dict) and pat.get("模式") and pat.get("写法"):
+                            rule = f"{pat['模式']}：{pat['写法']}"
+                            if not _is_verbatim_copy(rule, chunk_text):
+                                all_rules["潜台词模式"].append({
+                                    "rule": rule,
+                                    "novel_id": nid,
+                                    "chapter_no": chunk[0][0],
+                                })
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning("潜台词提取失败: %s", exc)
 
         # —— v5：角色声音提取（针对性：每个角色检索出场最多的章节）——
-        if progress is not None:
-            progress(
-                f"语料 {book_idx}/{total_books}：提取角色声音",
-                blocks_done,
-                est_total,
-            )
         try:
             # v6.6：从图谱取规范角色名 + 语料自证的简称映射。
             # 图谱的 character 节点含大量高频虚词（时间/任何/相信）与分词截断
-            # （小落/安小/宫爵/南宫），清洗后才能当作规范名。
-            #
-            # 清洗强度与是否归一化**由档位决定**：
-            # - 完整档：全量清洗（黑名单 + 语料词频自证）+ 归一化简称
-            # - 平衡档：仅黑名单，不归一化（简称保留原样）
-            # - 快速档：不清洗，也不归一化
+            # （小落/安小/宫爵/南宫），必须用语料词频清洗后才能当作规范名。
+            corpus_text = "\n".join(t for _, t in chapters if t)
             canonical, alias = _build_character_name_index(
-                db, project, nid, corpus_text="", cleaning=cfg.fake_character_cleaning
+                db, project, nid, corpus_text
             )
-            if cfg.fake_character_cleaning == "full":
-                # 只有完整档需要语料全文做频率自证（重活：拼全文 + O(n²) 包含判定）。
-                corpus_text = "\n".join(t for _, t in chapters if t)
-                canonical, alias = _build_character_name_index(
-                    db, project, nid, corpus_text, cleaning="full"
-                )
-            # 未开启归一化的档位：canonical/alias 一律传空，让
-            # _dedup_character_voices 退化为「只做同名合并，不做简称归并」。
-            norm_canonical = canonical if cfg.normalize_character_names else []
-            norm_alias = alias if cfg.normalize_character_names else {}
-            clean_fake = cfg.fake_character_cleaning != "none"
-
             voice_results = _extract_character_voices(
                 provider, db, project, nid, chapters,
                 char_names=[n for n, _ in canonical],
-                voice_mode=cfg.voice_mode,
-                cleaning=cfg.fake_character_cleaning,
             )
             # 去重 + 角色名归一化（小落→安小落、宫爵→南宫爵、过滤角色A/时间）
-            voice_results = _dedup_character_voices(
-                voice_results, norm_canonical, norm_alias, clean_fake=clean_fake
-            )
+            voice_results = _dedup_character_voices(voice_results, canonical, alias)
             all_rules[CHARACTER_VOICE_DIMENSION].extend(voice_results)
-            # 对整个角色声音词典做最终去重：批量路径（维度循环）
+            # 对整个角色声音词典做最终去重：批量路径（NARRATIVE_DIMENSIONS 循环）
             # 也会产出「小落：...」这类简称记录，必须在这里再归一化一次才能合并
             all_rules[CHARACTER_VOICE_DIMENSION] = _dedup_character_voices(
-                all_rules[CHARACTER_VOICE_DIMENSION], norm_canonical, norm_alias,
-                clean_fake=clean_fake,
+                all_rules[CHARACTER_VOICE_DIMENSION], canonical, alias
             )
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning(
@@ -1672,12 +1201,6 @@ def extract_narrative_profile(
             )
 
         # —— v3：文风漂移分析（第三轮，对比早晚期）——
-        if progress is not None:
-            progress(
-                f"语料 {book_idx}/{total_books}：文风漂移分析",
-                blocks_done,
-                est_total,
-            )
         try:
             if len(chapters) >= 20:
                 early = chapters[:5]
@@ -1737,16 +1260,10 @@ def extract_narrative_profile(
                 "文风漂移分析失败 novel_id=%s: %s", nid, exc
             )
 
-    if progress is not None:
-        progress("正在汇总提炼出的规则", blocks_done, max(blocks_done, 1))
-
     return {
         "version": NARRATIVE_VERSION,
         "source_ids": sorted(int(i) for i in novel_ids),
         "narrative_version": NARRATIVE_VERSION,
-        "tier": cfg.key,
-        "tier_name": cfg.name,
-        "tier_dimensions": tier_dims,
         "n_chapters": total_chapters,
         "rules": all_rules,
         "forbidden": all_forbidden,
@@ -1754,157 +1271,12 @@ def extract_narrative_profile(
     }
 
 
-def narrative_fingerprint(
-    source_ids: list[int], tier: str | NarrativeTier | None = None
-) -> dict:
-    """叙事档案的失效判据：语料集合 + 提炼版本号 + **档位**。
-
-    ## 为什么档位必须在指纹里（本项目已踩过两次的同类坑）
-
-    之前指纹只按 `source_ids` + `narrative_version` 算。用户从完整档切到快速档时，
-    指纹**没变** → `project_narrative` 认为缓存有效 → 直接返回完整档的旧结果。
-    用户「选了快速档」却拿到完整档产出，**且没有任何报错**——最难查的那类 bug。
-
-    所以指纹里除了档位 key，还带档位**配置的哈希**（`_tier_signature`）：
-    改了某档的维度白名单 / 采样章数 / 清洗强度，旧缓存同样会失效。
-
-    Args:
-        source_ids: 参考语料 novel_id 列表。
-        tier: 档位 key 或配置对象；None → 默认完整档。
-    """
-    cfg = tier if isinstance(tier, NarrativeTier) else resolve_tier(tier)
+def narrative_fingerprint(source_ids: list[int]) -> dict:
+    """叙事档案的失效判据：语料集合 + 提炼版本号。"""
     return {
         "source_ids": sorted(int(i) for i in source_ids),
         "narrative_version": NARRATIVE_VERSION,
-        "tier": cfg.key,
-        "tier_signature": _tier_signature(cfg),
     }
-
-
-def _source_ids_hash(source_ids: list[int]) -> str:
-    """参考语料集合的稳定哈希（顺序归一），用于蒸馏库的复用查找键。"""
-    import hashlib
-
-    return hashlib.sha256(
-        ",".join(str(i) for i in sorted(int(x) for x in source_ids)).encode("utf-8")
-    ).hexdigest()
-
-
-def corpus_content_hash(source_ids: list[int], db: Session) -> str:
-    """语料**正文内容**的稳定 sha256 —— 蒸馏库复用判据的最后一块拼图。
-
-    ## 为什么需要它（defect-C 回归修复）
-
-    蒸馏库若只按 `source_ids` 复用，会有个隐蔽 bug：同一本语料被重新导入 / 清洗后
-    **正文变了**，但 novel_id 没变，于是复用查找仍会命中旧档案 → 产出 stale 文风、
-    且**没有任何报错**。把正文内容也揉进哈希，正文没变才命中，正文变了就当未命中
-    → 重新蒸馏，这正是 defect-C 要防的静默退化。
-
-    ## 归一方式
-
-    按 novel_id 升序遍历；每本按 (chapter_no, idx) 升序取 chunk text，逐段 strip 后
-    拼成大字符串再 sha256。段间加分隔符，避免「甲乙」与「甲+乙」撞哈希；首尾空白差异
-    不影响结果。
-    """
-    import hashlib
-
-    h = hashlib.sha256()
-    for nid in sorted(int(i) for i in source_ids):
-        chapters = _load_novel_chapters(db, nid)
-        for _, text in chapters:
-            h.update((text or "").strip().encode("utf-8"))
-            h.update(b"\x1f")
-    return h.hexdigest()
-
-
-def find_style_distill(
-    db: Session,
-    source_ids: list[int],
-    tier_key: str,
-    tier_signature: str,
-    content_hash: str,
-) -> "StyleDistillType | None":
-    """在蒸馏库里找一条**可复用**的档案（active 态，四键全中）。
-
-    命中即代表「同样语料 + 同样档位 + 同样正文」曾经蒸馏过，可以直接复用，
-    省掉一次分钟级 LLM。未命中（None）才需要真正提炼。
-    """
-    from app.models import StyleDistill
-
-    return db.scalar(
-        select(StyleDistill).where(
-            StyleDistill.source_ids_hash == _source_ids_hash(source_ids),
-            StyleDistill.tier == tier_key,
-            StyleDistill.tier_signature == tier_signature,
-            StyleDistill.content_hash == content_hash,
-            StyleDistill.status == "active",
-        )
-    )
-
-
-def _persist_style_distill(
-    db: Session,
-    project,
-    source_ids: list[int],
-    cfg: "NarrativeTier",
-    content_hash: str,
-    profile: dict,
-) -> None:
-    """把一次蒸馏产物写进「蒸馏库」。
-
-    幂等 upsert：**同输入（source_ids + tier + tier_signature + content_hash）在 active
-    态下至多一行**。先按四键查已有 active 行：
-
-    - 有 → 原地更新 `style_narrative` 与各摘要字段（force 重蒸馏时就是「覆盖旧档」，
-      不会又长出一行重复档案）；
-    - 无 → 插入新行。
-
-    这样「第二个项目复用同款语料」时只会 FIND 到已有行、不会重复落库，满足
-    「相同输入 → 1 条 active 行」的不变量。
-
-    注意：本函数**只**负责写库，不碰 `project.style_narrative`——那是调用方的职责
-    （`project_narrative` 负责把档案同时落到项目缓存与库里）。
-    """
-    from app.models import StyleDistill
-
-    sid_hash = _source_ids_hash(source_ids)
-    existing = db.scalar(
-        select(StyleDistill).where(
-            StyleDistill.source_ids_hash == sid_hash,
-            StyleDistill.tier == cfg.key,
-            StyleDistill.tier_signature == _tier_signature(cfg),
-            StyleDistill.content_hash == content_hash,
-            StyleDistill.status == "active",
-        )
-    )
-    rules = profile.get("rules") or {}
-    rule_count = sum(len(v) for v in rules.values() if isinstance(v, list))
-    if existing is not None:
-        existing.style_narrative = profile
-        existing.n_chapters = profile.get("n_chapters")
-        existing.rule_count = rule_count
-        existing.rejected = profile.get("rejected")
-        existing.narrative_version = int(profile.get("narrative_version", NARRATIVE_VERSION))
-        existing.applied_at = datetime.now(timezone.utc)
-        return
-
-    row = StyleDistill(
-        source_ids=sorted(int(i) for i in source_ids),
-        source_ids_hash=sid_hash,
-        tier=cfg.key,
-        tier_signature=_tier_signature(cfg),
-        content_hash=content_hash,
-        narrative_version=int(profile.get("narrative_version", NARRATIVE_VERSION)),
-        status="active",
-        style_narrative=profile,
-        n_chapters=profile.get("n_chapters"),
-        rule_count=rule_count,
-        rejected=profile.get("rejected"),
-        created_by_project_id=getattr(project, "id", None),
-        created_at=datetime.now(timezone.utc),
-        applied_at=datetime.now(timezone.utc),
-    )
-    db.add(row)
 
 
 def project_narrative(
@@ -1913,78 +1285,24 @@ def project_narrative(
     *,
     force: bool = False,
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
-    tier: str | NarrativeTier | None = None,
-    progress: ProgressCallback | None = None,
 ) -> dict | None:
     """取项目当前该用的叙事档案；没有参考语料则返回 None。
 
     已存且指纹一致就直接返回——与 `style_profile` 同理，叙事档案进的是静态 system 块，
     每次生成都变会击穿提示词缓存。
-
-    档位缺省时读`project.narrative_tier`（项目级偏好，已落库）；
-    那个字段也为空则用默认完整档。
-
-    Args:
-        progress: 可选的进度回调，原样透传给 `extract_narrative_profile`
-            （后台蒸馏任务的进度条用）。None 时行为与加进度之前完全一致。
-
-    Raises:
-        ValueError: tier / project.narrative_tier 是未知档位 key。
     """
     ids = [int(i) for i in (project.reference_novel_ids or [])]
     if not ids:
         return None
 
-    cfg_tier = tier
-    if cfg_tier is None:
-        cfg_tier = getattr(project, "narrative_tier", None)
-    cfg = cfg_tier if isinstance(cfg_tier, NarrativeTier) else resolve_tier(cfg_tier)
-
-    want = narrative_fingerprint(ids, cfg)
+    want = narrative_fingerprint(ids)
     cached = project.style_narrative or {}
-    profile = None
-    content_hash = None
-
     if not force and isinstance(cached, dict) and cached.get("fingerprint") == want:
-        # 命中项目缓存：一次 LLM 都不会调，进度条直接 100%，并把「没重算」写进 stage。
-        if progress is not None:
-            progress("命中缓存，本次无需重新蒸馏", 1, 1)
-        profile = cached
-        # 仍把这份已完成的档案落进全局蒸馏库（幂等 upsert）——
-        # 否则「项目私有缓存命中」永远不会让蒸馏库出现这一行，用户就看不到「蒸馏完成的库」。
-        content_hash = corpus_content_hash(ids, db)
-    else:
-        # ── 蒸馏库复用（跨项目共享层）── 同语料+同档位+同正文 已蒸馏过 → 直接复用。
-        # force 时跳过（force = 用户明确要求重算，不复用任何缓存/库）。
-        if not force:
-            content_hash = corpus_content_hash(ids, db)
-            existing = find_style_distill(
-                db, ids, cfg.key, want["tier_signature"], content_hash
-            )
-            if existing is not None and isinstance(existing.style_narrative, dict):
-                reused = dict(existing.style_narrative)
-                reused["fingerprint"] = want
-                project.style_narrative = reused
-                existing.applied_at = datetime.now(timezone.utc)
-                db.commit()
-                if progress is not None:
-                    progress("命中蒸馏库，直接复用", 1, 1)
-                profile = reused
-                # 命中的库行已存在，下面统一 upsert 仅刷新 applied_at，无副作用。
-        if profile is None:
-            # 没命中任何缓存/库（或 force 强制重算）→ 真实提取。
-            profile = extract_narrative_profile(
-                db, project, ids, max_chapters=max_chapters, tier=cfg, progress=progress
-            )
-            profile["fingerprint"] = want
-            project.style_narrative = profile
+        return cached
 
-    # —— 统一收尾：任何一次「完成的蒸馏」都把产物落进全局蒸馏库（幂等 upsert）——
-    # 「蒸馏完成的加一个库」的核心：无论命中项目缓存、命中蒸馏库、还是真实提取，
-    # 只要本次产出了可用档案，全局库里就有它，标着档位，任何项目可直接复用。
-    if content_hash is None:
-        content_hash = corpus_content_hash(ids, db)
-    _persist_style_distill(db, project, ids, cfg, content_hash, profile)
+    profile = extract_narrative_profile(db, project, ids, max_chapters=max_chapters)
+    profile["fingerprint"] = want
+    project.style_narrative = profile
     db.commit()
     return profile
 
@@ -1995,18 +1313,12 @@ def project_narrative_safe(
     *,
     force: bool = False,
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
-    tier: str | NarrativeTier | None = None,
-    progress: ProgressCallback | None = None,
 ) -> dict | None:
     """生成链路上的安全包装。与 `style_profile_safe` 同理：失败只能降级为「不注入」，
     绝不能让整次生成失败。
-
-    `progress` 只是透传（生成链路默认不传，即 None）：加这个参数**不改**生成路径
-    的任何行为，纯粹为了让后台蒸馏任务能复用同一个函数并拿到进度。
     """
     try:
-        return project_narrative(db, project, force=force, max_chapters=max_chapters,
-                                 tier=tier, progress=progress)
+        return project_narrative(db, project, force=force, max_chapters=max_chapters)
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
             "叙事档案不可用，本次生成跳过叙事档案块：%s: %s", type(exc).__name__, exc

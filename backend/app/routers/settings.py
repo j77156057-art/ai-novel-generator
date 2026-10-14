@@ -1,33 +1,26 @@
 """模型设置路由：前端「模型设置」页驱动——选渠道 / 填 key / 选模型 / 测连通。
 
-## 三角色视图（第 7 步新增 writer / assistant，第 8 步新增 distiller）
+## 双角色视图（第 7 步新增）
 
 `GET /api/settings/llm` 在保留全部原有顶层字段（`provider` / `model` /
-`keys` / `providers` / `effective`——旧前端不能坏）之外，新增 `writer`、
-`assistant`、`distiller` 三个角色对象，各含：
+`keys` / `providers` / `effective`——旧前端不能坏）之外，新增 `writer` 与
+`assistant` 两个角色对象，各含：
 
     {provider, model, api_key_masked, has_key, base_url,
      max_tokens, timeout, is_fallback, label}
 
-这是前端「模型设置」页的数据基础：三个角色各选各的渠道 / key / 模型，
-互不覆盖。
-
-- `writer`    ：正文生成（续写 / 重生成 / 出方案）。
-- `assistant` ：助手（只读问答、结构化诊断、提案与版本审核）。
-- `distiller` ：文风档案抽取。**注意**：它与 `NarrativeTier` 的「蒸馏档位」
-  （full / balanced / fast，采样与计算档位，定义在 app/style/narrative.py）
-  不是一回事——档位决定「抽多细」，本角色决定「用哪个模型抽」。
+这是前端「模型选择窗口」的数据基础：Writer 与 Assistant 各选各的渠道 /
+key / 模型，互不覆盖。
 
 ## PUT 的两种模式
 
 - **legacy 模式**（请求体不带 `role`）：行为与第 6 步**完全一致**——
   写 `llm.*` 键、覆盖 settings、`apply_runtime_config` 热生效。
-- **角色模式**（`role="writer" | "assistant" | "distiller"`）：写
-  `writer.*` / `assistant.*` / `distiller.*` 键（key 形如
-  `writer.provider` / `distiller.api_key`），覆盖 settings 的对应
-  `*_` 字段，并**只重置该角色**的 provider 缓存
-  （`ProviderRegistry.invalidate(role)`）——改 Assistant 配置不会连带
-  重建 Writer 单例，反之亦然。
+- **角色模式**（`role="writer" | "assistant"`）：写 `writer.*` /
+  `assistant.*` 键（key 形如 `writer.provider` / `assistant.api_key`），
+  覆盖 settings 的 `writer_*` / `assistant_*` 字段，并**只重置该角色**的
+  provider 缓存（`ProviderRegistry.invalidate(role)`）——改 Assistant
+  配置不会连带重建 Writer 单例，反之亦然。
 
 `role="writer"` 会额外把配置**镜像**到 legacy 字段（`llm.provider` /
 渠道 `*_api_key` / `llm.model` …）：Writer 单例（b58c763 路径）只读
@@ -63,12 +56,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import get_db
 from app.llm.provider import apply_runtime_config, build_provider, get_llm_provider
-from app.llm.registry import (
-    ASSISTANT_ROLE,
-    DISTILLER_ROLE,
-    WRITER_ROLE,
-    get_provider_registry,
-)
+from app.llm.registry import ASSISTANT_ROLE, WRITER_ROLE, get_provider_registry
 from app.models import AppSetting
 from app.schemas import StrictRequest
 
@@ -80,54 +68,34 @@ PROVIDER_META: dict[str, dict] = {
         "label": "智谱 GLM",
         "key_hint": "open.bigmodel.cn → 头像 → API Keys（形如 xxxxx.xxxxx）",
         "free_note": "GLM-4-Flash 永久免费不限 token；注册送 2000 万 token",
-        "default_models": ["glm-4-flash", "glm-z1-flash", "glm-4.6", "glm-4.5-air"],
+        "default_models": ["glm-4-flash", "glm-z1-flash"],
     },
     "siliconflow": {
         "label": "硅基流动",
         "key_hint": "cloud.siliconflow.cn → API Keys（形如 sk-...）",
         "free_note": "新用户送 2000 万 token；Qwen2.5-7B / GLM-4-9b 等轻量模型免费",
-        "default_models": [
-            "Qwen/Qwen2.5-7B-Instruct",
-            "THUDM/glm-4-9b-chat",
-            "Qwen/Qwen3-8B",
-            "Qwen/Qwen2.5-72B-Instruct",
-        ],
+        "default_models": ["Qwen/Qwen2.5-7B-Instruct", "THUDM/glm-4-9b-chat"],
     },
     "minimax": {
         "label": "MiniMax",
         "key_hint": "platform.minimaxi.com → 账号管理 → 接口 Keys（形如 sk-cp-...，仅国内站可用）",
         "free_note": "实测唯一干净可用：M3.1-Flash-Preview（推理独立字段，正文不混思维链）；M3/M2.x 会把思维链混进正文",
-        "default_models": ["MiniMax-M3.1-Flash-Preview", "MiniMax-Text-01"],
+        "default_models": ["MiniMax-M3.1-Flash-Preview"],
     },
     "openrouter": {
         "label": "OpenRouter",
         "key_hint": "openrouter.ai → Keys（形如 sk-or-v1-...）",
         "free_note": "免费档账号级 50 次/日限额（所有 :free 模型共享）",
-        # 这四款是 2026-10-12 实测后选定的（见 config.py 的注释），
-        # 未实测的 :free 模型不列入——切换链上放一个会 403/429 的模型等于白跑一轮。
         "default_models": [
             "apodex/apodex-1.1-mini:free",
             "nvidia/nemotron-3-super-120b-a12b:free",
-            "nvidia/nemotron-3.5-lightning:free",
-            "nvidia/nemotron-3-ultra-550b-a55b:free",
         ],
     },
     "dashscope": {
         "label": "阿里百炼 DashScope",
         "key_hint": "bailian.console.aliyun.com → API-KEY（形如 sk-...）",
         "free_note": "新用户各模型 100 万 token 免费额度",
-        "default_models": ["qwen-plus", "qwen-max", "qwen-turbo", "qwen-flash"],
-    },
-    "openai": {
-        "label": "通用 OpenAI 接口",
-        # 这个渠道没有厂商默认值可依赖：端点就是配置本身，必须给完整地址。
-        "key_hint": "填**完整 Base URL**（形如 https://your-host/v1，不要只填域名）；key 填该端点的 Bearer key",
-        "free_note": (
-            "任何实现了 /chat/completions + Bearer 鉴权的端点都能接：OpenAI 官方、"
-            "自建 one-api / vLLM / LM Studio / LocalAI、第三方中转站。"
-            "留空 Base URL 则回落官方 https://api.openai.com/v1"
-        ),
-        "default_models": ["gpt-4o-mini", "gpt-4o"],
+        "default_models": ["qwen-plus"],
     },
     "local": {
         "label": "本地兜底（无需 key）",
@@ -144,7 +112,6 @@ _KEY_FIELD = {
     "siliconflow": "siliconflow_api_key",
     "minimax": "minimax_api_key",
     "dashscope": "dashscope_api_key",
-    "openai": "openai_api_key",
 }
 _MODEL_FIELD = {
     "openrouter": "openrouter_model",
@@ -152,19 +119,13 @@ _MODEL_FIELD = {
     "siliconflow": "siliconflow_model",
     "minimax": "minimax_model",
     "dashscope": "llm_model",
-    "openai": "openai_model",
 }
 _MODELS_FIELD = {
     "openrouter": "openrouter_models",
     "zhipu": "zhipu_models",
     "siliconflow": "siliconflow_models",
     "minimax": "minimax_models",
-    "dashscope": "dashscope_models",
-    "openai": "openai_models",
 }
-
-#: 需要用户填自定义 base_url 的渠道（没有厂商默认地址可回落 / 端点即配置）。
-_CUSTOM_URL_PROVIDERS: frozenset[str] = frozenset({"openai"})
 
 _DB_KEY_PROVIDER = "llm.provider"
 _DB_KEY_MODEL = "llm.model"
@@ -182,11 +143,7 @@ _ROLE_FIELDS: tuple[str, ...] = (
 _ROLE_INT_FIELDS: frozenset[str] = frozenset({"max_tokens", "timeout"})
 
 #: 合法 role 集合（与 `app.llm.registry._VALID_ROLES` 同源，避免两处漂移）。
-_ROLES: tuple[str, ...] = (WRITER_ROLE, ASSISTANT_ROLE, DISTILLER_ROLE)
-
-#: 走「渠道 legacy 回退」的角色 = 除 Writer 之外的全部角色。
-#: Writer 有自己的 legacy 单例路径（`_legacy_effective_config`），不在此列。
-_CHANNEL_FALLBACK_ROLES: frozenset[str] = frozenset({ASSISTANT_ROLE, DISTILLER_ROLE})
+_ROLES: tuple[str, ...] = (WRITER_ROLE, ASSISTANT_ROLE)
 
 
 def _mask(key: str) -> str:
@@ -225,14 +182,14 @@ def _resolve_role_config(role: str) -> dict[str, Any]:
 
     优先级：显式 role 配置 > providers.yaml 默认 > 渠道 legacy 回退。
 
-    - `assistant` / `distiller`：直接委托 `settings.get_provider_config(role)`——
+    - `assistant`：直接委托 `settings.get_provider_config('assistant')`——
       第 2/3 档（含 dc39bbb 的渠道回退）已在那个函数里实现，此处不重复。
     - `writer`：`writer_provider` 非空 → 显式角色配置（第 1 档）；
       为空 → legacy 生效配置（Writer 单例的实际口径，见
       `_legacy_effective_config`）。
     """
-    if role in _CHANNEL_FALLBACK_ROLES:
-        return dict(settings.get_provider_config(role))
+    if role == ASSISTANT_ROLE:
+        return dict(settings.get_provider_config(ASSISTANT_ROLE))
     if role == WRITER_ROLE:
         if (settings.writer_provider or "").strip():
             return {
@@ -250,15 +207,14 @@ def _resolve_role_config(role: str) -> dict[str, Any]:
 def _active_role_provider(role: str) -> Any:
     """取该角色**当前生效**的 provider 单例（权威事实，不是配置推断）。
 
-    writer    → `get_llm_provider()`（b58c763 原单例，生成链路实际用的就是它）；
-    assistant → `ProviderRegistry.get('assistant')`（与 Writer 物理隔离）；
-    distiller → `ProviderRegistry.get('distiller')`（第三条轨道）。
-    三个工厂按设计都不抛错（缺 key 降级 LocalFallback），但仍兜一层：
-    单例万一取不到，GET 也不能 500——降级为「配置视图 + is_fallback 未知」。
+    writer → `get_llm_provider()`（b58c763 原单例，生成链路实际用的就是它）；
+    assistant → `ProviderRegistry.get('assistant')`（与 Writer 物理隔离）。
+    两个工厂按设计都不抛错（缺 key 降级 LocalFallback），但仍兜一层：
+    单例万一取到，GET 也不能 500——降级为「配置视图 + is_fallback 未知」。
     """
     if role == WRITER_ROLE:
         return get_llm_provider()
-    return get_provider_registry().get(role)
+    return get_provider_registry().get(ASSISTANT_ROLE)
 
 
 def _role_block(role: str) -> dict[str, Any]:
@@ -345,11 +301,9 @@ def _current(db: Session) -> dict:
         "keys": keys_status,
         "providers": PROVIDER_META,
         "effective": effective,
-        # 第 7 步：分角色视图（前端「模型设置」页的数据基础）。
-        # 三个角色各一块，键名与前端 LlmConfig 的字段一一对应。
+        # 第 7 步：双角色视图（前端模型选择窗口的数据基础）
         "writer": _role_block(WRITER_ROLE),
         "assistant": _role_block(ASSISTANT_ROLE),
-        "distiller": _role_block(DISTILLER_ROLE),
     }
 
 
@@ -369,11 +323,11 @@ class LlmConfigIn(StrictRequest):
     provider: str
     api_key: str | None = None  # 空 = 不改该角色 key
     model: str | None = None
-    models: list[str] | None = None  # 候选链（限流切换用；非 writer 角色不接受）
+    models: list[str] | None = None  # 候选链（限流切换用；assistant 角色不接受）
     base_url: str | None = None
     max_tokens: int | None = None
     timeout: int | None = None
-    role: Literal["writer", "assistant", "distiller"] | None = None
+    role: Literal["writer", "assistant"] | None = None
 
 
 @router.get("/llm")
@@ -439,34 +393,25 @@ def _put_legacy(body: LlmConfigIn, provider: str, db: Session) -> dict:
 
 
 def _put_role(body: LlmConfigIn, provider: str, role: str, db: Session) -> dict:
-    """角色模式：写 `writer.*` / `assistant.*` / `distiller.*` 键 + 只重置该角色缓存。
+    """角色模式：写 `writer.*` / `assistant.*` 键 + 只重置该角色缓存。
 
     与 legacy 模式的三个关键差异（都是有意的）：
 
-    1. **持久化键按角色命名**（`writer.provider` / `assistant.api_key` /
-       `distiller.timeout`）——三个角色各存各的，不再共享 `llm.*` 单槽；
+    1. **持久化键按角色命名**（`writer.provider` / `assistant.api_key`）——
+       两个角色各存各的，不再共享 `llm.*` 单槽；
     2. **热生效只重置该角色**：`ProviderRegistry.invalidate(role)` 内部
        对 writer 调 `reset_provider_cache()`、对 assistant 调
-       `reset_assistant_provider_cache()`、对 distiller 调
-       `reset_distiller_provider_cache()`，其余角色的单例原样不动；
+       `reset_assistant_provider_cache()`，另一个角色的单例原样不动；
     3. **writer 额外镜像 legacy 字段**：Writer 单例（b58c763 路径）只读
        `llm_provider` / 渠道 `*_api_key` 等 legacy 字段，不镜像则角色
        配置「落而不生效」——UI 显示已改、生成链路照旧的静默失效。
-       其余角色绝不镜像 legacy（隔离的底线：Assistant / Distiller 的配置
-       变化不得以任何形式改写 Writer 的字段）。
-
-    字段守卫（fail-loud，与前端 RoleModelPanel 的能力开关一一对应）：
-    - `models`              ：仅 writer 接受（限流切换链），其余角色带 → 400；
-    - `max_tokens`/`timeout`：writer 带 → 400（基线固定）；
-      assistant / distiller 接受——蒸馏是长任务，timeout 必须能调大。
+       Assistant 绝不镜像 legacy（双轨隔离的底线：Assistant 的配置变化
+       不得以任何形式改写 Writer 的字段）。
     """
     if body.models is not None and role != WRITER_ROLE:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"{role} 角色是单模型配置，不接受 models 候选链"
-                "（限流切换链仅 Writer 路径有）"
-            ),
+            detail="assistant 角色是单模型配置，不接受 models 候选链（限流切换链仅 Writer 路径有）",
         )
     if role == WRITER_ROLE and (body.max_tokens is not None or body.timeout is not None):
         raise HTTPException(
@@ -494,31 +439,28 @@ def _put_role(body: LlmConfigIn, provider: str, role: str, db: Session) -> dict:
         api_key = body.api_key.strip()
         _set(db, f"{role}.api_key", api_key)
         overrides[f"{role}_api_key"] = api_key
-    # base_url：Assistant / Distiller 允许显式清空（"" = 回渠道默认，
-    # build_provider 对空 base_url 会取 settings 的渠道默认值，安全）；
-    # Writer 只覆盖非空——清空渠道 base_url 会让 Writer 单例拿到空 URL
-    # （legacy 路径没有「回默认」的读取逻辑，只有 dashscope 有
-    # `llm_base_url or dashscope_base_url` 一层回退）。
+    # base_url：Assistant 允许显式清空（"" = 回渠道默认，build_provider 对空
+    # base_url 会取 settings 的渠道默认值，安全）；Writer 只覆盖非空——清空
+    # 渠道 base_url 会让 Writer 单例拿到空 URL（legacy 路径没有「回默认」
+    # 的读取逻辑，只有 dashscope 有 `llm_base_url or dashscope_base_url`
+    # 一层回退）。
     #
     # 这里**只写一次** `{role}.base_url`：清空分支若另起一次 `_set`，同一事务
     # 里会出现两个同 key 的 pending AppSetting——`db.get` 看不到未 flush 的
     # 行，于是第二条走 INSERT，撞 UNIQUE 直接 500（实测踩过）。
     if body.base_url is not None:
-        if role != WRITER_ROLE or body.base_url.strip():
+        if role == ASSISTANT_ROLE or body.base_url.strip():
             base_url = body.base_url.strip()
             _set(db, f"{role}.base_url", base_url)
             overrides[f"{role}_base_url"] = base_url
 
-    if role != WRITER_ROLE:
-        # Assistant / Distiller：max_tokens / timeout 都允许改。
-        # 蒸馏是长任务（一次读几十段语料），timeout 尤其要给得开——
-        # 所以这里**不做**「只有 assistant 能改」的二元判断。
+    if role == ASSISTANT_ROLE:
         if body.max_tokens is not None:
-            _set(db, f"{role}.max_tokens", str(body.max_tokens))
-            overrides[f"{role}_max_tokens"] = body.max_tokens
+            _set(db, "assistant.max_tokens", str(body.max_tokens))
+            overrides["assistant_max_tokens"] = body.max_tokens
         if body.timeout is not None:
-            _set(db, f"{role}.timeout", str(body.timeout))
-            overrides[f"{role}_timeout"] = body.timeout
+            _set(db, "assistant.timeout", str(body.timeout))
+            overrides["assistant_timeout"] = body.timeout
     else:
         # ---- Writer：镜像到 legacy 字段，让 b58c763 单例真正热生效 ----
         _set(db, _DB_KEY_PROVIDER, provider)
@@ -590,7 +532,7 @@ class LlmTestIn(StrictRequest):
     provider: str
     api_key: str | None = None
     model: str | None = None
-    role: Literal["writer", "assistant", "distiller"] | None = None
+    role: Literal["writer", "assistant"] | None = None
 
 
 def _local_test(model: str, role: str | None) -> dict:
@@ -688,8 +630,8 @@ def load_persisted_llm_config(db: Session) -> None:
 
     应用顺序（后者覆盖前者，优先级从高到低）：
 
-    1. **角色键**（`writer.*` / `assistant.*` / `distiller.*`）——角色 UI
-       写入的显式角色配置，是最新的用户意图；
+    1. **角色键**（`writer.*` / `assistant.*`）——第 7 步角色 UI 写入的
+       显式角色配置，是最新的用户意图；
     2. **legacy 键**（`llm.*`）——第 6 步及更早的写入，保持既有行为。
 
     `writer.*` 键会额外镜像到 legacy 字段（与 `_put_role` 同一套映射）：

@@ -1,13 +1,7 @@
-"""文本解析 + 自动分章（编码不再硬编码 utf-8，改由 `encoding.decode_text` 探测）。
-
-从 `path` 读取时走编码探测，能正确读入 GBK / GB18030 的国内网文 txt；
-调用方若已持有 `content`（字符串），则直接用，不再做编码处理。
-"""
+"""UTF-8 文本解析 + 自动分章（MVP：仅 UTF-8，不做编码探测）。"""
 
 import re
 from typing import Optional
-
-from app.ingestion.encoding import read_text_file
 
 # 章/回/節/节/卷/部/篇 都作章节标记。
 # 早期只认「章」，导致公版书（红楼梦、聊斋等「第X回」）一章都切不出来，
@@ -60,8 +54,8 @@ def parse_txt(path: str | None = None, content: str | None = None) -> list[dict]
     if content is None:
         if path is None:
             raise ValueError("parse_txt 需要 path 或 content")
-        # 编码探测：gb18030 兜底，覆盖 GBK/GB2312 等国内网文常见编码。
-        content, _detected = read_text_file(path)
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
 
     chapters: list[dict] = []
     cur_no = 0

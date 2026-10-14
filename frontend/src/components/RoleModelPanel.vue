@@ -3,16 +3,13 @@
  * 单个模型角色的配置面板（RoleModelPanel）。
  *
  * 设计约束（来自产品需求）：
- *   1. 三个面板（writer / assistant / distiller）**不许共用同一份表单状态**——
- *      本组件以三个独立实例使用，每个实例自带一份 reactive 表单，
+ *   1. 两个面板（writer / assistant）**不许共用同一份表单状态**——
+ *      本组件以两个独立实例使用，每个实例自带一份 reactive 表单，
  *      改 A 不可能影响 B 的未保存值。
  *   2. 本组件只持有表单与展示状态；保存 / 测试的 API 调用与错误映射
- *      上抛给父级（模型设置页），结果以 props 回流。
+ *      上抛给父级 ModelSettingsDialog（单点处理），结果以 props 回流。
  *   3. key 输入框默认脱敏（type=password），可切换显示；留空 = 不改变已存 key。
  *   4. 降级状态（is_fallback）用「文字 + 色标」双编码，不只靠颜色。
- *   5. 角色能力（能否改候选链 / 能否改 max_tokens 与 timeout）由
- *      `utils/llmRoles.ts` 的映射表决定，**不在本组件里写
- *      `role === "writer" ? … : …`** —— 那种二元判断加第三个角色时必漏。
  */
 import { computed, reactive, ref, useId, watch } from "vue";
 import type {
@@ -23,7 +20,6 @@ import type {
   LlmRoleTestPayload,
   LlmTestResult,
 } from "@/api/types";
-import { needsBaseUrl, roleMeta } from "@/utils/llmRoles";
 
 interface RoleNotice {
   kind: "ok" | "err" | "warn";
@@ -32,10 +28,10 @@ interface RoleNotice {
 
 const props = defineProps<{
   role: LlmRole;
-  /** 面板标题，如「生成模型（Writer）」。缺省用角色元数据里的标题。 */
-  title?: string;
-  /** 这个角色干什么用的一句话说明。缺省用角色元数据里的说明。 */
-  purpose?: string;
+  /** 面板标题，如「生成模型（Writer）」。 */
+  title: string;
+  /** 这个角色干什么用的一句话说明。 */
+  purpose: string;
   /** 当前生效配置（null = 还没取到）。 */
   config: LlmRoleConfig | null;
   providers: Record<string, LlmProviderMeta>;
@@ -51,16 +47,8 @@ const emit = defineEmits<{
   test: [payload: LlmRoleTestPayload];
 }>();
 
-// 每个实例独立的 useId：同屏三个面板，label/for 与 datalist id 不能撞。
+// 每个实例独立的 useId：同屏两个面板，label/for 与 datalist id 不能撞。
 const uid = useId();
-
-/** 本角色的能力开关与文案（单一事实来源在 utils/llmRoles.ts）。 */
-const meta = computed(() => roleMeta(props.role));
-const supportsChain = computed(() => meta.value.supportsChain);
-const supportsLimits = computed(() => meta.value.supportsLimits);
-const saveLabel = computed(() => meta.value.saveLabel);
-const heading = computed(() => props.title ?? meta.value.title);
-const purposeText = computed(() => props.purpose ?? meta.value.purpose);
 
 // ==================================================================
 // 表单状态（每实例一份，绝不共享）
@@ -73,8 +61,6 @@ interface RoleFormState {
   model: string;
   /** 候选模型链，逗号分隔（限流时按序切换）。 */
   chainText: string;
-  /** 自定义端点（仅「通用 OpenAI 接口」等无厂商默认地址的渠道可见）。 */
-  baseUrl: string;
   maxTokens: string;
   timeout: string;
   showKey: boolean;
@@ -86,7 +72,6 @@ function createForm(): RoleFormState {
     apiKey: "",
     model: "",
     chainText: "",
-    baseUrl: "",
     maxTokens: "",
     timeout: "",
     showKey: false,
@@ -109,7 +94,6 @@ function applyConfig(c: LlmRoleConfig | null): void {
   form.provider = c.provider || "local";
   form.apiKey = "";
   form.model = c.model ?? "";
-  form.baseUrl = c.base_url ?? "";
   form.maxTokens = c.max_tokens != null ? String(c.max_tokens) : "";
   form.timeout = c.timeout != null ? String(c.timeout) : "";
   // GET 不返回已存切换链：用该渠道默认链填充（与旧版模型设置页一致，
@@ -137,7 +121,6 @@ function sameRole(c: LlmRoleConfig): boolean {
   return (
     s.provider === c.provider &&
     s.model === c.model &&
-    s.base_url === c.base_url &&
     s.max_tokens === c.max_tokens &&
     s.timeout === c.timeout &&
     s.has_key === c.has_key &&
@@ -158,9 +141,6 @@ function switchProvider(p: string): void {
   form.apiKey = "";
   form.model = props.providers[p]?.default_models?.[0] ?? "";
   form.chainText = (props.providers[p]?.default_models ?? []).join(", ");
-  // 端点也不跨渠道复用：换回需要自定义端点的渠道时让用户重新填，
-  // 否则会拿着 A 渠道的地址去打 B 渠道（表现为莫名其妙的 404）。
-  form.baseUrl = "";
   localError.value = null;
 }
 
@@ -171,8 +151,13 @@ function splitChain(text: string): string[] {
     .filter(Boolean);
 }
 
-/** 当前渠道是否要求自定义端点（通用 OpenAI 接口）。 */
-const showBaseUrl = computed(() => needsBaseUrl(form.provider));
+/**
+ * 按角色区分能力（与后端 PUT 的角色限制逐条对应，fail-loud 对齐）：
+ *   - writer：候选模型链可改；max_tokens / timeout 由生成基线固定，只读；
+ *   - assistant：max_tokens / timeout 可改；候选链不适用（单模型配置）。
+ */
+const supportsChain = computed(() => props.role === "writer");
+const supportsLimits = computed(() => props.role === "assistant");
 
 /** 解析非负整数输入：空 → null（不改）；非法 → undefined（调用方报错）。 */
 function parseCount(raw: string): number | null | undefined {
@@ -208,9 +193,12 @@ const dirty = computed(() => {
     if (form.maxTokens.trim() !== (s?.max_tokens != null ? String(s.max_tokens) : "")) return true;
     if (form.timeout.trim() !== (s?.timeout != null ? String(s.timeout) : "")) return true;
   }
-  if (showBaseUrl.value && form.baseUrl.trim() !== (s?.base_url ?? "")) return true;
   return false;
 });
+
+const saveLabel = computed(() =>
+  props.role === "writer" ? "保存生成模型" : "保存助手模型",
+);
 
 function submitSave(): void {
   localError.value = null;
@@ -220,11 +208,6 @@ function submitSave(): void {
     api_key: form.apiKey.trim() || null,
     model: form.model.trim() || null,
   };
-  // base_url 只给「需要自定义端点」的渠道带：其余渠道带上去后端虽然不报错，
-  // 但会覆盖掉该渠道的默认地址（留空即覆盖成空 = 静默失效）。
-  if (showBaseUrl.value) {
-    payload.base_url = form.baseUrl.trim() || null;
-  }
   if (supportsChain.value) {
     const chain = splitChain(form.chainText);
     payload.models = chain.length ? chain : null;
@@ -258,11 +241,11 @@ function submitTest(): void {
 </script>
 
 <template>
-  <section class="role-panel" :class="role" :aria-label="heading">
+  <section class="role-panel" :class="role" :aria-label="title">
     <header class="role-head">
       <div class="role-head-text">
-        <h3 class="role-title">{{ heading }}</h3>
-        <p class="role-purpose">{{ purposeText }}</p>
+        <h3 class="role-title">{{ title }}</h3>
+        <p class="role-purpose">{{ purpose }}</p>
       </div>
       <span v-if="dirty" class="tag warn">有未保存修改</span>
     </header>
@@ -276,9 +259,6 @@ function submitTest(): void {
         <span class="mono effective-line">{{ config.label }} · {{ config.model }}</span>
         <span class="faint effective-line">
           max_tokens {{ config.max_tokens ?? "—" }} · timeout {{ config.timeout ?? "—" }}s
-        </span>
-        <span v-if="config.base_url" class="faint effective-line">
-          端点 <span class="mono">{{ config.base_url }}</span>
         </span>
       </template>
       <span v-else class="faint">尚未取到该角色配置。</span>
@@ -303,24 +283,6 @@ function submitTest(): void {
       <p class="faint provider-note">{{ providers[form.provider]?.free_note ?? "" }}</p>
     </div>
 
-    <!-- 自定义端点：只有「通用 OpenAI 接口」这类无厂商默认地址的渠道需要 -->
-    <div v-if="showBaseUrl" class="field">
-      <label :for="`${uid}-baseurl`">
-        Base URL 端点<span class="faint">（留空 = 用后端该渠道的默认地址）</span>
-      </label>
-      <input
-        :id="`${uid}-baseurl`"
-        class="input"
-        v-model="form.baseUrl"
-        autocomplete="off"
-        spellcheck="false"
-        placeholder="https://your-host/v1"
-      />
-      <p class="faint chain-note">
-        获取方式：{{ providers[form.provider]?.key_hint ?? "" }}
-      </p>
-    </div>
-
     <!-- API key（脱敏显示，可切换；空 = 不改） -->
     <div v-if="form.provider !== 'local'" class="field">
       <label :for="`${uid}-key`">API key（留空 = 不改变已存 key）</label>
@@ -340,9 +302,6 @@ function submitTest(): void {
       <span v-if="config?.has_key" class="faint key-saved">
         当前已保存（脱敏）：<span class="mono">{{ config.api_key_masked }}</span>
       </span>
-      <p v-if="!showBaseUrl" class="faint chain-note">
-        获取方式：{{ providers[form.provider]?.key_hint ?? "" }}
-      </p>
     </div>
 
     <!-- 模型 ID -->
@@ -360,7 +319,7 @@ function submitTest(): void {
       </datalist>
     </div>
 
-    <!-- 候选模型链：仅 Writer 有（限流切换）；助手 / 蒸馏是单模型配置 -->
+    <!-- 候选模型链：仅 Writer 有（限流切换）；助手是单模型配置 -->
     <details v-if="supportsChain" class="advanced">
       <summary>高级：候选模型链（逗号分隔，限流时按序切换）</summary>
       <textarea class="input" v-model="form.chainText" rows="2"></textarea>
@@ -368,12 +327,12 @@ function submitTest(): void {
     <div v-else class="chain-locked">
       <span class="blk-head">候选模型链</span>
       <p class="faint chain-note">
-        {{ meta.short }}是<strong>单模型配置</strong>，没有限流切换链
-        （后端不接受该字段）——同一个任务只用一个模型跑到底，避免两次问出两个答案。
+        助手角色是<strong>单模型配置</strong>，没有限流切换链（后端不接受该字段）——
+        问答 / 诊断 / 审核只用一个模型跑到底，避免同一问题两次问出两个答案。
       </p>
     </div>
 
-    <!-- max_tokens / timeout：助手 / 蒸馏可改；Writer 两项由生成基线固定（只读展示） -->
+    <!-- max_tokens / timeout：仅助手可改；Writer 两项由生成基线固定（只读展示） -->
     <div class="grid-2">
       <div class="field">
         <label :for="`${uid}-maxtok`">max_tokens{{ supportsLimits ? "（留空 = 不改变）" : "" }}</label>
@@ -403,9 +362,6 @@ function submitTest(): void {
         <input v-else :id="`${uid}-timeout`" class="input" :value="form.timeout" disabled />
         <span v-if="!supportsLimits" class="faint limit-note">
           基线值（chat 120s / stream 180s），只读。
-        </span>
-        <span v-else-if="role === 'distiller'" class="faint limit-note">
-          蒸馏是长任务：语料越多越慢，建议 ≥180s。
         </span>
       </div>
     </div>
@@ -448,15 +404,12 @@ function submitTest(): void {
   gap: 14px;
   min-width: 0;
 }
-/* 三个角色用不同的左侧色带 + 标题文案双编码，一眼看出「这是三件事」 */
+/* 两个角色用不同的左侧色带 + 标题文案双编码，一眼看出「这是两件事」 */
 .role-panel.writer {
   border-left: 4px solid var(--accent);
 }
 .role-panel.assistant {
   border-left: 4px solid var(--info);
-}
-.role-panel.distiller {
-  border-left: 4px solid var(--warn, #b7791f);
 }
 .role-head {
   display: flex;

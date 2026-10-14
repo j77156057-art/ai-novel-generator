@@ -6,7 +6,6 @@ import type {
   AssistantActionRequest,
   AssistantAnalyzeLogsRequest,
   AssistantApplyResult,
-  AssistantAuditCorpusRequest,
   AssistantAuditRequest,
   AssistantAuditResponse,
   AssistantDiagnoseRequest,
@@ -31,9 +30,6 @@ import type {
   AssistantVersionListResponse,
   CharacterDetail,
   ChunkOut,
-  DistillJob,
-  DistillJobListResponse,
-  DistillStartResponse,
   ExpertQuestions,
   GenerateLoopResult,
   GeneratePlan,
@@ -45,16 +41,12 @@ import type {
   LlmTestIn,
   LlmTestResult,
   NovelOut,
-  NarrativeTiersResponse,
   PlotBible,
   PremiseProposal,
   ProjectCreate,
   ProjectOut,
   ProjectPatch,
   Reminders,
-  StyleDistillApplyRequest,
-  StyleDistillDetail,
-  StyleDistillListResponse,
   SearchHit,
   UploadResult,
 } from "./types";
@@ -141,29 +133,6 @@ function jsonInit(method: string, body?: unknown): RequestInit {
   };
 }
 
-/**
- * 把服务端下发的 endpoint 归一成 client 内部的 path（去掉 /api 前缀）。
- *
- * 两道安全闸门，缺一不可：
- *   1. 只接受**站内相对路径**。绝对 URL（http://…）或协议相对 URL（//host）
- *      一律拒绝 —— 否则一张待确认卡片就能把请求发到任意外部地址。
- *   2. 只接受 /assistant/ 前缀的端点。写操作只可能落在助手自己的命名空间下，
- *      越界说明服务端（或被注入的模型输出）出了错，宁可 400 也不要盲发。
- */
-function assistantEndpointPath(endpoint: string): string {
-  const raw = typeof endpoint === "string" ? endpoint.trim() : "";
-  if (!raw) throw new ApiError(400, "待确认卡片缺少 endpoint，拒绝盲发请求。");
-  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith("//")) {
-    throw new ApiError(400, `待确认卡片的 endpoint 不是站内相对路径，拒绝发送：${raw}`);
-  }
-  const path = raw.startsWith("/") ? raw : `/${raw}`;
-  const stripped = path.startsWith(`${BASE}/`) ? path.slice(BASE.length) : path;
-  if (!stripped.startsWith("/assistant/")) {
-    throw new ApiError(400, `待确认卡片的 endpoint 不在 /assistant/ 下，拒绝发送：${raw}`);
-  }
-  return stripped;
-}
-
 // ---------- 语料 ----------
 export const api = {
   listNovels: () => request<NovelOut[]>("/novels"),
@@ -193,75 +162,6 @@ export const api = {
 
   patchProject: (projectId: number, body: ProjectPatch) =>
     request<ProjectOut>(`/projects/${projectId}`, jsonInit("PATCH", body)),
-
-  /**
-   * 文风蒸馏档位清单（完整 / 平衡 / 快速）。
-   *
-   * 静态元数据，不碰 DB，所以单独一个端点而不是挂在某个项目下。
-   * 选档 UI 全部字段都来自这里 —— 前端不硬编码档位文案，后端加一档就自动出现。
-   */
-  listNarrativeTiers: () =>
-    request<NarrativeTiersResponse>("/projects/narrative-tiers"),
-
-  // ---------- 文风蒸馏（后台任务 + 进度条） ----------
-
-  /**
-   * 提交一次文风蒸馏。**立即返回** job_id，蒸馏在服务端后台跑。
-   *
-   * 不用 `buildNarrative` 之类的同步端点：完整档在 833 章语料上实测 42 分钟，
-   * 同步请求必然超时；而且同步端点一断线就没进度了，谈不上「离开页面继续跑」。
-   */
-  startDistill: (projectId: number, tier?: string | null, force = false) =>
-    request<DistillStartResponse>(
-      `/projects/${projectId}/distill`,
-      jsonInit("POST", { tier: tier ?? null, force }),
-    ),
-
-  /**
-   * 该项目最近的蒸馏任务（id 降序）。
-   *
-   * 进工作台时用它恢复：若最近一条还在 pending/running，就接着轮询，
-   * 用户于是看到「上次那锅还在熬、熬到第几块」，而不是一片空白。
-   */
-  listDistillJobs: (projectId: number, limit = 5) =>
-    request<DistillJobListResponse>(
-      `/projects/${projectId}/distill/jobs?limit=${encodeURIComponent(String(limit))}`,
-    ),
-
-  /** 单条蒸馏任务状态（进度条轮询的就是它）。 */
-  getDistillJob: (projectId: number, jobId: number) =>
-    request<DistillJob>(`/projects/${projectId}/distill/jobs/${jobId}`),
-
-  // ---------- 文风蒸馏库（跨项目复用） ----------
-
-  /**
-   * 列出蒸馏库里可复用的文风档案（默认 active）。列表**不含** style_narrative 全文。
-   *
-   * 复用入口：项目 A 蒸馏完入库，项目 B 在这里看到 A 的档案，点「应用」即可，
-   * 省掉 B 自己的 42 分钟 LLM。
-   */
-  listStyleDistills: (status: "active" | "archived" | "all" = "active", limit = 50) =>
-    request<StyleDistillListResponse>(
-      `/projects/style-distills?status=${encodeURIComponent(status)}&limit=${encodeURIComponent(String(limit))}`,
-    ),
-
-  /** 单条蒸馏库条目详情（含 style_narrative 全文）。 */
-  getStyleDistill: (distillId: number) =>
-    request<StyleDistillDetail>(`/projects/style-distills/${distillId}`),
-
-  /** 归档一条蒸馏库条目（不再被复用，但保留供查阅）。 */
-  archiveStyleDistill: (distillId: number) =>
-    request<StyleDistillListResponse["items"][number]>(
-      `/projects/style-distills/${distillId}/archive`,
-      jsonInit("POST"),
-    ),
-
-  /** 把蒸馏库某条目应用到本项目（复制其 style_narrative 进项目缓存）。 */
-  applyStyleDistill: (projectId: number, distillId: number) =>
-    request<ProjectOut>(`/projects/${projectId}/style-distills/apply`, {
-      ...jsonInit("POST"),
-      body: JSON.stringify({ distill_id: distillId } satisfies StyleDistillApplyRequest),
-    }),
 
   buildKg: (projectId: number, novelId?: number | null) =>
     request<{ characters: number; plotholes: number; relationships: number }>(
@@ -585,9 +485,11 @@ export const api = {
       `/assistant/prompts/versions?project_id=${projectId}`,
     ),
 
-  // ---------- Assistant 运行日志 / 审核 / 调动生成（后端已合入） ----------
+  // ---------- Assistant 运行日志 / 审核 / 调动生成 ----------
+  // 后端并行开发中，尚未就绪：这些方法按契约接好（类型见 types.ts 末段），
+  // 但 UI 当前不调用——端点合入前不发送请求，也不用假数据冒充响应。
 
-  /** GET /api/assistant/runs?project_id=&status=&limit=（助手自己的运行日志，只读）。 */
+  /** GET /api/assistant/runs?project_id=&status=&limit=（助手自己的运行日志）。 */
   assistantRuns: (projectId: number, status?: string | null, limit = 50) =>
     request<AssistantRunListResponse>(
       `/assistant/runs?project_id=${projectId}` +
@@ -595,57 +497,30 @@ export const api = {
         `&limit=${limit}`,
     ),
 
-  /**
-   * GET /api/assistant/runs/{run_id}（单条日志详情，含该 run 的全部 Evidence）。
-   * projectId 可选：带了后端会做跨项目校验（不匹配 → 404）。
-   */
-  assistantRunDetail: (runId: number, projectId?: number | null) =>
-    request<AssistantRunDetailResponse>(
-      `/assistant/runs/${runId}${projectId ? `?project_id=${projectId}` : ""}`,
-    ),
+  /** GET /api/assistant/runs/{run_id}（单条日志详情，含 evidence）。 */
+  assistantRunDetail: (runId: number) =>
+    request<AssistantRunDetailResponse>(`/assistant/runs/${runId}`),
 
-  /** POST /api/assistant/analyze-logs（日志分析，只读，统一 issues 结构）。 */
+  /** POST /api/assistant/analyze-logs（日志分析，返回统一 issues 结构）。 */
   assistantAnalyzeLogs: (body: AssistantAnalyzeLogsRequest) =>
     request<AssistantAuditResponse>("/assistant/analyze-logs", jsonInit("POST", body)),
 
-  /** POST /api/assistant/audit-corpus（参考语料审核，只读，统一 issues）。 */
-  assistantAuditCorpus: (body: AssistantAuditCorpusRequest) =>
+  /** POST /api/assistant/audit-corpus（参考语料审核，统一 issues）。 */
+  assistantAuditCorpus: (body: AssistantAuditRequest) =>
     request<AssistantAuditResponse>("/assistant/audit-corpus", jsonInit("POST", body)),
 
-  /** POST /api/assistant/audit-kg（知识图谱审核，只读，统一 issues）。 */
+  /** POST /api/assistant/audit-kg（知识图谱审核，统一 issues）。 */
   assistantAuditKg: (body: AssistantAuditRequest) =>
     request<AssistantAuditResponse>("/assistant/audit-kg", jsonInit("POST", body)),
 
-  /** POST /api/assistant/audit-generation（生成质量审核，只读，统一 issues）。 */
+  /** POST /api/assistant/audit-generation（生成质量审核，统一 issues）。 */
   assistantAuditGeneration: (body: AssistantAuditRequest) =>
     request<AssistantAuditResponse>("/assistant/audit-generation", jsonInit("POST", body)),
 
-  /**
-   * POST /api/assistant/invoke-generation（助手按用户显式指令调动 Writer 生成）。
-   * instruction 必填非空；segment_no 仅 regenerate_segment 需要。
-   */
+  /** POST /api/assistant/invoke-generation（助手按用户显式指令调动 Writer 生成）。 */
   assistantInvokeGeneration: (body: AssistantInvokeGenerationRequest) =>
     request<AssistantInvokeGenerationResponse>(
       "/assistant/invoke-generation",
       jsonInit("POST", body),
     ),
-
-  /**
-   * 执行一张待确认卡片。
-   *
-   * **前端不构造任何请求体**：endpoint / method / body 三者全部由服务端在
-   * `pending_actions[]` 里下发，这里原样回传。理由是前后端各拼一半必然
-   * 漂移 —— 服务端加一个必填字段而前端没跟上，表现为运行期 422，且很难
-   * 定位是「契约改了」还是「前端拼错了」。
-   *
-   * 端点合法性由 `assistantEndpointPath` 把关（站内相对路径 + /assistant/ 前缀）。
-   */
-  assistantRunPendingAction: (
-    endpoint: string,
-    method: string,
-    body: Record<string, unknown>,
-  ) => request<Record<string, unknown>>(
-    assistantEndpointPath(endpoint),
-    jsonInit(method.toUpperCase(), body),
-  ),
 };

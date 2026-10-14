@@ -16,20 +16,6 @@
 - 顶层保留 `answer` / `evidence[]` / `confidence` / `agent_run_id` / `version_id`；
 - `findings` 是 `issues` 的兼容别名（第 2 步的调用方按 findings 读）。
 
-/qa 响应新增 `pending_actions`（助手页瘦身后）：
-- `list[dict]`，**缺省 `[]`** —— 既有响应契约不变，前端为空时完全不渲染该区域；
-- 每项是一张待确认卡片的完整描述（`kind` / `title` / `detail` / `endpoint` /
-  `method` / `body`），服务端把请求体拼好，前端点确认后原样回传；
-- 本端点只**提出**，不执行任何写操作；执行仍走既有的提案创建端点与
-  调动生成端点（见 `app.routers.assistant_proposals` /
-  `app.routers.assistant_generation`），本文件不新增任何写入路径；
-- 字段契约与 kind→端点映射住在 `app.agents.pending_actions`，**不**在本文件。
-  原因：本文件受两处源码级静态断言约束
-  （`test_assistant_readonly.py::test_assistant_router_has_no_write_path`、
-  `test_assistant_diagnose.py::test_router_exposes_no_write_endpoints`），
-  任何提案/版本端点的路径子串都不得出现在这里——端点表若写在本文件，
-  会直接把这两条既有回归打红。
-
 不变量：
 - Assistant provider 走 `get_provider_registry().get('assistant')` —— Writer 单例
   **绝不能**被 Assistant 故障污染（失败时只回退到"只读检索关闭、诊断走本地规则"）。
@@ -68,7 +54,7 @@ from app.agents.log_audit import (
     run_to_dict,
 )
 from app.db import get_db
-from app.models import AgentRun, Evidence, Generation, Project
+from app.models import AgentRun, Evidence, Project
 from app.routers.assistant_shared import (
     _build_evidence_row,
     _chat_with_assistant,
@@ -261,11 +247,7 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
     run.model = model_label or "(local_fallback)"
     db.commit()
 
-    # 5) 待确认卡片：用户话里带明确生成指令时提出一张，**不执行**
-    #    （执行由用户点确认后前端调既有端点，见 app.agents.pending_actions）
-    pending_actions = _collect_pending_actions(db=db, project=project, query=body.query)
-
-    # 6) 出参（每次都包含 answer / evidence[] / confidence / agent_run_id）
+    # 5) 出参（每次都包含 answer / evidence[] / confidence / agent_run_id）
     return {
         "answer": answer,
         "evidence": evidence_rows_to_dicts(evidence_rows),
@@ -273,54 +255,7 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
         "agent_run_id": run_id,
         "tool_results": tool_results,
         "version_id": body.version_id,
-        "pending_actions": pending_actions,
     }
-
-
-def _collect_pending_actions(
-    *, db: Session, project: Project, query: str
-) -> list[dict[str, Any]]:
-    """从用户 query 里收集「待用户确认」的写操作卡片。
-
-    本函数只**提出**，绝不执行——助手页瘦身后，前端在对话流里渲染卡片，
-    用户点确认才发请求。提案的创建 / 生成动作都走既有端点与既有状态机，
-    这里不新增任何写入路径。
-
-    判定规则在 `app.agents.pending_actions.propose_invoke_generation`
-    （确定性关键词，不调模型）；本函数只负责注入它需要的 `has_segment`
-    回调并做错误隔离：
-
-    - `has_segment` 查的是本项目的段。**跨项目的段号提卡 = 提一张必然
-      404 的卡**，等于骗用户点一次必然失败的按钮，所以只按 project_id 查。
-    - 判定过程抛错（库读不到等）→ 记 warning 并返回空列表。提卡是增强，
-      不该让一次问答整体 500；且空列表对前端是「不渲染该区域」，与既有
-      契约一致。
-    """
-    from app.agents.pending_actions import propose_invoke_generation
-
-    def _has_segment(segment_no: int) -> bool:
-        return (
-            db.scalars(
-                select(Generation.id)
-                .where(
-                    Generation.project_id == project.id,
-                    Generation.segment_no == segment_no,
-                )
-                .limit(1)
-            ).first()
-            is not None
-        )
-
-    try:
-        action = propose_invoke_generation(
-            project_id=project.id,
-            query=query,
-            has_segment=_has_segment,
-        )
-    except Exception as exc:  # noqa: BLE001 - 提卡失败不应拖垮问答
-        logger.warning("assistant/qa 构造待确认卡片失败：%s", exc)
-        return []
-    return [action] if action else []
 
 
 # ====================================================================
@@ -613,14 +548,6 @@ def assistant_analyze_logs(
     故不设 403 分支——没有写工具可越权。
     """
     project = _require_project(db, body.project_id)
-    # status / limit 与 `GET /runs` 共用同一套校验，**在开 AgentRun 之前**跑：
-    # 非法输入不该留下审计行（否则日志里会出现一条「参数错了但查过」的记录，
-    # 反而污染被分析的历史）。
-    # 修复前本端点缺这两个校验：status 拼错 → 200 且 runs_analyzed=0（静默空跑，
-    # 读起来像「这段时间没有调用记录」）；limit=-1 → SQLite `LIMIT -1` = 无上限，
-    # 直接取全表。同一参数在 /runs 400、在这里 200，属该补的一致性。
-    _validate_run_status(body.status)
-    _validate_runs_limit(body.limit)
     started_at = _now_utc()
     request_hash = _request_hash(body)
 

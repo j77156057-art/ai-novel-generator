@@ -22,7 +22,6 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import Base
-from app.ingestion.encoding import read_text_file
 from app.ingestion.store import ingest_text
 from app.models import NovelChunk, RawNovel
 
@@ -45,14 +44,15 @@ def _engine():
 
 
 def _read_text(path: str) -> str:
-    """网文 txt 多为 GBK/GB18030 —— 统一走 `encoding.decode_text`（带可读性校验）。
-
-    旧实现「试解码成功即收工」有隐患：错误编码也可能『解得出』但全是乱码。
-    现在交由 `decode_text` 做中文可读性校验，并把检出编码打出来备查。
-    """
-    text, detected = read_text_file(path)
-    print(f"[enc] {os.path.basename(path)} → {detected}")
-    return text
+    """网文 txt 多为 GBK/GB18030，先按 utf-8 试，失败回退 gb18030。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    for enc in ("utf-8", "gb18030", "gbk"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="ignore")
 
 
 def _cap_by_chapters(text: str, cap: int) -> str:

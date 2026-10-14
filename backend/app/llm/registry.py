@@ -1,6 +1,6 @@
 """Provider 双轨隔离注册表（ADR-2026-10-12 第 2 步 / 第 5 步第 1 步）。
 
-- 单例；按 role（writer / assistant / distiller）维度缓存 LLMProvider。
+- 单例；按 role（writer / assistant）维度缓存 LLMProvider。
 - 并发安全：async 路径走 asyncio.Lock（FastAPI 端点专用）；
   sync 路径走 threading.Lock（pytest / 同步工具用）。
   两锁各自维护，互不感知；任何时刻只有一个 role 在被构造或重建。
@@ -9,14 +9,12 @@
 - 失效：invalidate(role) 单 role；invalidate() 清空全部。
   Writer 失效**不会**清掉 _PROVIDER 单例本身（Writer 单例由
   app.llm.provider.reset_provider_cache() 管理，此处只清自己的角色缓存）；
-  同理 Assistant 失效不动 _ASSISTANT_PROVIDER、Distiller 失效不动
-  _DISTILLER_PROVIDER。
+  同理 Assistant 失效不动 _ASSISTANT_PROVIDER。
 
 用法：
     from app.llm.registry import get_provider_registry
     writer_p   = get_provider_registry().get("writer")
     assistant  = await get_provider_registry().aget("assistant")
-    distiller  = get_provider_registry().get("distiller")
 """
 
 from __future__ import annotations
@@ -33,14 +31,8 @@ from app.llm import provider as _provider_mod
 
 WRITER_ROLE = "writer"
 ASSISTANT_ROLE = "assistant"
-#: 蒸馏模型：文风档案抽取专用角色。与 NarrativeTier 的「蒸馏档位」
-#: （full / balanced / fast，采样与计算档位）不是一回事——那个在 app/style/narrative.py。
-DISTILLER_ROLE = "distiller"
 
-_VALID_ROLES = frozenset({WRITER_ROLE, ASSISTANT_ROLE, DISTILLER_ROLE})
-
-#: 报错文案里列举的合法角色（三处 raise 共用一处定义，避免漏改）。
-_ROLE_HINT = f"{WRITER_ROLE!r} / {ASSISTANT_ROLE!r} / {DISTILLER_ROLE!r}"
+_VALID_ROLES = frozenset({WRITER_ROLE, ASSISTANT_ROLE})
 
 
 class ProviderRegistry:
@@ -68,10 +60,9 @@ class ProviderRegistry:
             # 助理侧单例入口（与 _PROVIDER 互不影响，由 reset_assistant_provider_cache 控制）。
             # 单例语义写在 app.llm.provider 里，避免在 Registry 中复制构造逻辑。
             return _provider_mod.get_assistant_provider()
-        if role == DISTILLER_ROLE:
-            # 蒸馏侧单例入口（独立第三轨，由 reset_distiller_provider_cache 控制）。
-            return _provider_mod.get_distiller_provider()
-        raise ValueError(f"未知 role: {role!r}（应为 {_ROLE_HINT}）")
+        raise ValueError(
+            f"未知 role: {role!r}（应为 {WRITER_ROLE!r} 或 {ASSISTANT_ROLE!r}）"
+        )
 
     # --------------------------------------------------------------
     # sync 接口
@@ -83,7 +74,9 @@ class ProviderRegistry:
         异常原样往上冒。后续 get(role) 同输入会再次尝试构造（不会一直报错）。
         """
         if role not in _VALID_ROLES:
-            raise ValueError(f"未知 role: {role!r}（应为 {_ROLE_HINT}）")
+            raise ValueError(
+                f"未知 role: {role!r}（应为 {WRITER_ROLE!r} 或 {ASSISTANT_ROLE!r}）"
+            )
         with self._sync_lock:
             cached = self._cache.get(role)
             if cached is not None:
@@ -97,32 +90,30 @@ class ProviderRegistry:
         """失效指定 role（或全部）。
 
         语义：
-        - role=None      ：清空所有 cache + 触发三个角色双侧单例 reset
-                           （让下次 get(role) 真正重建底层连接/句柄）；
-        - role='writer'   ：清掉 role 自己的缓存 + 调 reset_provider_cache()
-                           让 _PROVIDER 单例回到 None；
+        - role=None   ：清空所有 cache + 触发 Writer / Assistant 双侧单例 reset
+                        （让下次 get(role) 真正重建底层连接/句柄）；
+        - role='writer'：清掉 role 自己的缓存 + 调 reset_provider_cache()
+                        让 _PROVIDER 单例回到 None；
         - role='assistant'：清掉 role 自己的缓存 + 调 reset_assistant_provider_cache()
-                           让 _ASSISTANT_PROVIDER 单例回到 None；
-        - role='distiller'：清掉 role 自己的缓存 + 调 reset_distiller_provider_cache()
-                           让 _DISTILLER_PROVIDER 单例回到 None。
+                        让 _ASSISTANT_PROVIDER 单例回到 None。
         """
         with self._sync_lock:
             if role is None:
+                roles_cleared = list(self._cache.keys())
                 self._cache.clear()
-                # 动态查属性：测试 monkeypatch 这几个 reset 函数也能在此处即时生效
+                # 动态查属性：测试 monkeypatch 这两个 reset 函数也能在此处即时生效
                 _provider_mod.reset_provider_cache()
                 _provider_mod.reset_assistant_provider_cache()
-                _provider_mod.reset_distiller_provider_cache()
                 return
             if role not in _VALID_ROLES:
-                raise ValueError(f"未知 role: {role!r}（应为 {_ROLE_HINT}）")
+                raise ValueError(
+                    f"未知 role: {role!r}（应为 {WRITER_ROLE!r} 或 {ASSISTANT_ROLE!r}）"
+                )
             self._cache.pop(role, None)
             if role == WRITER_ROLE:
                 _provider_mod.reset_provider_cache()
             elif role == ASSISTANT_ROLE:
                 _provider_mod.reset_assistant_provider_cache()
-            elif role == DISTILLER_ROLE:
-                _provider_mod.reset_distiller_provider_cache()
 
     def roles_cached(self) -> list[str]:
         """返回当前已缓存的 role 列表（测试 / 状态面板用；不暴露实例句柄）。"""
@@ -140,7 +131,9 @@ class ProviderRegistry:
         不发 HTTP），并发路径下不会让两个 writer 同时被构造两次。
         """
         if role not in _VALID_ROLES:
-            raise ValueError(f"未知 role: {role!r}（应为 {_ROLE_HINT}）")
+            raise ValueError(
+                f"未知 role: {role!r}（应为 {WRITER_ROLE!r} 或 {ASSISTANT_ROLE!r}）"
+            )
         if self._async_lock is None:
             self._async_lock = asyncio.Lock()
         async with self._async_lock:
@@ -176,10 +169,9 @@ def get_provider_registry() -> ProviderRegistry:
 def reset_provider_registry() -> None:
     """丢弃全局 registry 单例；下次 get_provider_registry() 重建。
 
-    不会触碰 _PROVIDER / _ASSISTANT_PROVIDER / _DISTILLER_PROVIDER
-    （这三个由自己的 reset_*_cache 管）。
-    想要全清：先 reset_provider_registry()，再 reset_provider_cache()、
-    reset_assistant_provider_cache() 与 reset_distiller_provider_cache()。
+    不会触碰 _PROVIDER / _ASSISTANT_PROVIDER（这俩由自己的 reset_*_cache 管）。
+    想要全清：先 reset_provider_registry()，再 reset_provider_cache() 与
+    reset_assistant_provider_cache()。
     """
     global _registry
     _registry = None

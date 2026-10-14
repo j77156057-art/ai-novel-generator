@@ -34,46 +34,6 @@ export interface SearchHit {
   text: string;
 }
 
-/**
- * 一个文风蒸馏档位（GET /api/projects/narrative-tiers 的单档形状）。
- *
- * 字段与后端 `NarrativeTier.to_public_dict()` 逐一对应。**不要在前端硬编码
- * 三档的文案**：档位定义（采样方式/维度数/角色名归一化/伪角色清洗强度）的
- * 单一事实来源在后端 `app.style.narrative.TIER_REGISTRY`，前端另抄一份必然漂移。
- */
-export interface NarrativeTier {
-  key: string;
-  /** 可读名（完整 / 平衡 / 快速）。 */
-  name: string;
-  /** 一句话说明，含「什么时候用这一档」。 */
-  description: string;
-  /** "percentage" → 按 sample_ratio 采样；"fixed_chapters" → 固定 fixed_chapters 章。 */
-  sampling_mode: string;
-  sample_ratio: number | null;
-  fixed_chapters: number | null;
-  dimension_count: number;
-  dimensions: string[];
-  /** 是否启用「语料词频自证」的角色名归一化。 */
-  normalize_character_names: boolean;
-  /** 伪角色清洗强度："full" / "partial" / "none"。 */
-  fake_character_cleaning: string;
-  /**
-   * 耗时/成本提示，**由后端给**（_COST_HINTS）。
-   *
-   * 是相对档位（最高/中等/最低）而非编造的分钟数：docs 里只有部分语料被实测计时，
-   * 给没测过的档位写具体分钟数 = 拿未验证的数字当承诺。后端新增档位时忘记补
-   * `_COST_HINTS` 会响亮失败，所以这个字段总是存在。
-   */
-  cost_hint: string;
-}
-
-export interface NarrativeTiersResponse {
-  /** 服务端默认档（当前是完整档）。 */
-  default: string;
-  /** 按「耗时从重到轻」排序：完整 → 平衡 → 快速。 */
-  tiers: NarrativeTier[];
-}
-
 export interface ProjectCreate {
   title: string;
   target_length?: number;
@@ -98,8 +58,6 @@ export interface ProjectPatch {
   generation_length?: number;
   plot_bible?: Record<string, unknown> | null;
   status?: string | null;
-  /** 文风蒸馏档位（full / balanced / fast）。空 = 用服务端默认档。 */
-  narrative_tier?: string | null;
 }
 
 export interface PlotBible {
@@ -129,10 +87,6 @@ export interface ProjectOut {
   plot_bible: PlotBible | null;
   generation_length: number;
   segment_count: number;
-  /** 项目已落库的蒸馏档位；null = 尚未选过（后端按默认档跑）。 */
-  narrative_tier: string | null;
-  /** 已落库文风档案（蒸馏库「应用」写入的单槽缓存）；null = 尚未蒸馏/应用。 */
-  style_narrative?: Record<string, unknown> | null;
 }
 
 export interface KgNode {
@@ -201,14 +155,8 @@ export interface ExpertQuestions {
 
 // ---------- 模型设置（LLM 渠道） ----------
 
-/**
- * 模型角色：生成（Writer）/ 助手（Assistant）/ 蒸馏（Distiller）三者严格分开，
- * 不共用一份配置。
- *
- * ⚠️ 此处的 distiller 指「文风档案抽取」用的 LLM 角色，与 `NarrativeTier`
- * 的三档「蒸馏档位」（full/balanced/fast，采样/计算档位）不是一回事。
- */
-export type LlmRole = "writer" | "assistant" | "distiller";
+/** 模型角色：生成（Writer）与助手（Assistant）严格分开，不共用一份配置。 */
+export type LlmRole = "writer" | "assistant";
 
 export interface LlmProviderMeta {
   label: string;
@@ -242,7 +190,6 @@ export interface LlmConfig {
    */
   writer?: LlmRoleConfig | null;
   assistant?: LlmRoleConfig | null;
-  distiller?: LlmRoleConfig | null;
 }
 
 export interface LlmConfigIn {
@@ -269,7 +216,7 @@ export interface LlmTestIn {
 }
 
 /**
- * 前端「分角色保存」载荷（RoleModelPanel → LlmSettings 视图 → api）。
+ * 前端「分角色保存」载荷（RoleModelPanel → ModelSettingsDialog → api）。
  *
  * 按角色只带该角色接受的字段（后端按角色 fail-loud，多带 = 400）：
  *   - writer：带 models（限流切换链）；**不带** max_tokens / timeout
@@ -284,11 +231,6 @@ export interface LlmRoleSavePayload {
   /** 空 = 不改变该角色已存 key（脱敏输入框的约定）。 */
   api_key: string | null;
   model: string | null;
-  /**
-   * 自定义端点：仅「通用 OpenAI 接口」渠道需要（覆盖该渠道默认 base_url）。
-   * 其余渠道留空/null = 用后端该渠道的默认地址。
-   */
-  base_url?: string | null;
   /** 仅 writer：候选模型链（限流切换用）。 */
   models?: string[] | null;
   /** 仅 assistant：助手模型的 max_tokens / timeout。 */
@@ -594,39 +536,6 @@ export interface AssistantRestoreRequest {
   note?: string | null;
 }
 
-// ==================================================================
-// 待确认卡片（对话流内的写操作闸门）
-// ------------------------------------------------------------------
-// agent 需要写操作时不能自己动手，只能在回答里附一张「待确认卡片」，
-// 由用户点确认后才真正执行。这组类型是**服务端下发的契约**，前端只
-// 渲染 + 原样回传，绝不自己拼请求体 —— 否则前后端各拼一半必然漂移
-// （服务端加一个必填字段，前端就会漏传，且漂移表现为运行期 422）。
-// ==================================================================
-
-/** 卡片类型：新建提案 / 调动生成。 */
-export type AssistantPendingActionKind = "proposal" | "invoke_generation";
-
-/**
- * 一张待确认卡片。
- *
- * 五个字段缺一不可：`title` 给用户看，`detail` 给人读，`endpoint` +
- * `method` + `body` 给机器执行 —— 确认按钮按下时三者原样回传，
- * 前端不参与请求构造。
- */
-export interface AssistantPendingAction {
-  kind: AssistantPendingActionKind;
-  /** 一句话说明要做什么（用户「一眼看出」的唯一依据）。 */
-  title: string;
-  /** 渲染用详情；字段形状由服务端定义，前端按键值对渲染，未知键也照显。 */
-  detail: Record<string, unknown>;
-  /** 确认后实际调用的端点（如 "/api/assistant/proposals"）。 */
-  endpoint: string;
-  /** HTTP 方法（当前只有 "POST"）。 */
-  method: string;
-  /** 完整请求体，原样回传。 */
-  body: Record<string, unknown>;
-}
-
 // ---------- 响应体 ----------
 
 export interface AssistantQaResponse {
@@ -636,17 +545,6 @@ export interface AssistantQaResponse {
   agent_run_id: number;
   tool_results: Record<string, unknown>;
   version_id: number | null;
-  /**
-   * agent 自主调度诊断 / 日志分析 / 三类审核后产出的结构化 issues。
-   * 旧后端不返回这一组字段 → undefined → 界面整段不渲染（不留空态）。
-   */
-  issues?: AssistantIssue[];
-  /** issues 的兼容别名（与 diagnose 同构）。 */
-  findings?: AssistantIssue[];
-  /** 本次实际执行过的规则名。 */
-  rules_evaluated?: string[];
-  /** 待用户确认的写操作卡片；旧后端不返回 → [] → 整段不渲染。 */
-  pending_actions?: AssistantPendingAction[];
 }
 
 export interface AssistantDiagnoseResponse extends AssistantQaResponse {
@@ -797,261 +695,84 @@ export interface AssistantPromptVersionsResponse {
 }
 
 // ==================================================================
-// Assistant 运行日志 / 审核 / 调动生成（后端已合入，第 7 步交付 2/3/4）
+// Assistant 运行日志 / 审核 / 调动生成（后端并行开发中，尚未就绪）
 // ------------------------------------------------------------------
-// 与 backend/app/routers/assistant.py（runs/analyze-logs）、
-// assistant_audit.py（audit-*）、assistant_generation.py
-// （invoke-generation）的 pydantic 模型逐字段对齐。
+// 以下类型是**契约镜像**：另一位工程师正在并行实现这些端点，字段形状
+// 以后端实现为准。前端只接好了 api client 方法与类型（见 client.ts），
+// UI 不接入、不发送请求、不展示模拟数据——端点就绪后直接接线。
 // ==================================================================
 
-/** GET /api/assistant/runs 列表项（run_history_to_dicts 出参）。 */
+/** GET /api/assistant/runs 的一条助手运行日志。 */
 export interface AssistantRun {
   id: number;
   project_id: number;
-  /** 这些端点都以助手身份调用，固定 "assistant"。 */
-  role: string;
-  /** running | success | failed（后端 _RUN_STATUSES）。 */
+  /** 触发能力：qa / diagnose / analyze-logs / audit-corpus / audit-kg / audit-generation … */
+  kind: string;
+  /** 后端枚举未定，前端按字符串展示并兜底，不假设取值集合。 */
   status: string;
-  /** 该次调用实际使用的模型；本地兜底时 "(local_fallback)"。 */
-  model: string;
-  note: string | null;
-  started_at: string | null;
-  finished_at: string | null;
-  /** 毫秒；未结束的 run 为 null。 */
-  duration_ms: number | null;
-  request_hash: string | null;
-  evidence_count: number;
+  query?: string | null;
+  scope?: string | null;
+  summary?: string | null;
+  error?: string | null;
+  issue_count?: number | null;
+  created_at: string | null;
+  finished_at?: string | null;
 }
 
 export interface AssistantRunListResponse {
-  runs: AssistantRun[];
+  project_id: number;
   count: number;
-  by_status: { running: number; success: number; failed: number };
-  status_filter: string | null;
-  limit: number;
+  runs: AssistantRun[];
 }
 
-/** GET /api/assistant/runs/{run_id}：单条详情 + 该 run 的全部 Evidence。 */
+/** GET /api/assistant/runs/{run_id}：单条日志详情（含 evidence / issues）。 */
 export interface AssistantRunDetailResponse {
   run: AssistantRun;
-  evidence: AssistantEvidence[];
+  evidence?: AssistantEvidence[];
+  issues?: AssistantIssue[];
+  answer?: string | null;
 }
 
-/** POST /api/assistant/analyze-logs 请求体（只读；scope/version_id 占位）。 */
-export interface AssistantAnalyzeLogsRequest {
-  project_id: number;
-  query?: string | null;
-  scope?: string | null;
-  version_id?: number | null;
-  /** 分析范围过滤；缺省全部（running 的历史也纳入统计口径）。 */
-  status?: string | null;
-  /** 取数上限（后端合法区间 [1, 500]）。 */
-  limit?: number;
-}
-
-/** 三类审核的 kind（audit-corpus / audit-kg / audit-generation）。 */
+/** 三类审核 + 日志分析的统一 issues 出参（与 diagnose 的 issues 同结构）。 */
 export type AssistantAuditKind = "corpus" | "kg" | "generation";
 
-/** POST /api/assistant/audit-corpus 请求体（只读）。 */
-export interface AssistantAuditCorpusRequest {
+export interface AssistantAuditResponse {
   project_id: number;
-  /** 缺省 = 全库语料；显式列表 = 只审这些（不存在的 id → 404）。 */
-  novel_ids?: number[] | null;
-  query?: string | null;
-  version_id?: number | null;
+  kind: string;
+  issues: AssistantIssue[];
+  evidence?: AssistantEvidence[];
+  answer?: string | null;
+  confidence?: number | null;
+  agent_run_id?: number | null;
+  note?: string | null;
 }
 
-/** POST /api/assistant/audit-kg / audit-generation 请求体（只读）。 */
+/** POST /api/assistant/analyze-logs 请求体。 */
+export interface AssistantAnalyzeLogsRequest {
+  project_id: number;
+  limit?: number | null;
+  status?: string | null;
+}
+
+/** POST /api/assistant/audit-{corpus,kg,generation} 请求体。 */
 export interface AssistantAuditRequest {
   project_id: number;
-  query?: string | null;
-  version_id?: number | null;
 }
 
 /**
- * 审核 / 日志分析的统一出参：issues 与 diagnose 的九字段结构同构
- * （findings 是后端保留的兼容别名，同内容），前端一份渲染两处复用。
- */
-export interface AssistantAuditResponse {
-  answer: string;
-  issues: AssistantIssue[];
-  findings: AssistantIssue[];
-  evidence: AssistantEvidence[];
-  confidence: number;
-  agent_run_id: number;
-  tool_results: Record<string, unknown>;
-  rules_evaluated: string[];
-  version_id: number | null;
-  /** 仅 analyze-logs：本次分析覆盖的历史 run 条数。 */
-  runs_analyzed?: number;
-}
-
-/** invoke-generation 的两种动作（Literal，传别的值 → 422）。 */
-export type AssistantGenerationAction = "generate_next" | "regenerate_segment";
-
-/**
- * POST /api/assistant/invoke-generation 请求体。
- *
- * `instruction` 是产品约束的协议落点：用户显式指令原文，非空——
- * 没有它后端直接 422。「生成」在 API 层因此是一次可追溯的用户动作。
- * `segment_no` 仅 regenerate_segment 必填；generate_next 带了反而 422。
+ * POST /api/assistant/invoke-generation 请求体：
+ * 助手按用户**显式指令**调动 Writer 生成（指令必须由人填写）。
  */
 export interface AssistantInvokeGenerationRequest {
   project_id: number;
-  action: AssistantGenerationAction;
-  segment_no?: number | null;
-  /** 缺省用 project.generation_length（与 /api/generate 同口径）。 */
-  max_chars?: number | null;
   instruction: string;
+  max_chars?: number | null;
 }
 
-/** POST /api/assistant/invoke-generation 响应。 */
 export interface AssistantInvokeGenerationResponse {
-  answer: string;
-  agent_run_id: number;
-  action: AssistantGenerationAction;
-  /** Writer 实际使用的模型（本地兜底时 "(local_fallback)"）。 */
-  writer_model: string;
-  /** 与 GET /api/generations/{pid} 同形状，可复用渲染。 */
-  segment: GenerationOut;
-  chars: number;
-  /** generate_next 另带；regenerate 只带 summary / summary_tree。 */
-  summary?: string;
-  kg_update?: Record<string, unknown>;
-  summary_tree?: Record<string, unknown>;
-  debug?: {
-    system_prompt: string;
-    user_prompt: string;
-    constraints: Record<string, unknown>;
-    rag_context: string[];
-  };
-}
-
-// ---------- 文风蒸馏后台任务（进度条） ----------
-
-/**
- * 蒸馏任务的四种状态。
- *
- * 流转：`pending → running → success | failed`。**没有任何其它组合**——
- * 后台任务要么给结论，要么给失败原因，绝不永远停在 running（那是「进度条
- * 一直转但不报错」，比报错更难排查）。
- */
-export type DistillStatus = "pending" | "running" | "success" | "failed";
-
-/**
- * 一次文风蒸馏任务的状态快照（GET .../distill/jobs/{job_id} 的响应）。
- *
- * 字段与后端 `app.style.jobs.distill_run_to_dict()` 逐一对应。
- *
- * ## 进度为什么在这里而不在响应体里 Streaming
- *
- * 833 章语料跑完整档实测 42 分钟，蒸馏必须能**离开页面继续跑**：关标签页、
- * 刷新、切步骤都不该丢进度。所以进度落在 DB（`distill_runs` 表），前端轮询，
- * 而不是挂在某条 HTTP 连接的 SSE 上——那条连接一断就什么都没了。
- */
-export interface DistillJob {
-  id: number;
   project_id: number;
-  /** 本次实际使用的档位 key（full/balanced/fast）。 */
-  tier: string | null;
-  status: DistillStatus;
-  /** 人话阶段名，如「语料 2/3：提炼第 5/12 块」，直接显示给用户。 */
-  stage: string | null;
-  /** 已完成块数。 */
-  progress_current: number;
-  /** 总块数。**0 表示总数还没探明**，此时必须渲染不确定态，不能拿 0 当分母。 */
-  progress_total: number;
-  /** 成功后回填的摘要：实际采样章节数 / 规则条数 / 被拒规则数。失败时保持 null。 */
-  n_chapters: number | null;
-  rule_count: number | null;
-  rejected: number | null;
-  /** failed 时的原因；其它状态为 null。 */
-  error: string | null;
-  created_at: string | null;
-  started_at: string | null;
-  finished_at: string | null;
-}
-
-/** POST /api/projects/{id}/distill 的响应。 */
-export interface DistillStartResponse {
-  job_id: number;
-  status: DistillStatus;
-  tier: string | null;
-  /**
-   * true = 复用了该项目正在跑的同档位任务，没有新起一条。
-   *
-   * 后端做并发防重：连点两次「开始蒸馏」不该烧两遍 LLM。有了这个标志，
-   * 界面可以如实说「已在运行中，已切到那条进度」，而不是假装新开了一个。
-   */
-  reused: boolean;
-  /**
-   * true = 本次蒸馏会直接复用「项目已存档案」或「蒸馏库」，不重新调用模型、
-   * 秒级返回。前端据此如实提示「已复用缓存、未重新蒸馏」，避免「一秒蒸馏完却没解释」。
-   * 仅在不 force 时可能为 true。
-   */
-  from_cache?: boolean;
-  /**
-   * 缓存来源：`"project"` = 复用本项目已缓存的文风档案；
-   * `"library"` = 复用跨项目蒸馏库里的同语料+同档位条目。force 时为 undefined。
-   */
-  cache_source?: "project" | "library" | null;
-}
-
-/** GET /api/projects/{id}/distill/jobs 的响应（id 降序）。 */
-export interface DistillJobListResponse {
-  items: DistillJob[];
-}
-
-// ---------- 文风蒸馏库（跨项目复用） ----------
-
-/**
- * 蒸馏库条目的两种状态。
- *
- * - `active`：可复用（默认，出现在「可复用」列表）。
- * - `archived`：用户主动归档，不再被复用，但保留供历史查阅。
- */
-export type StyleDistillStatus = "active" | "archived";
-
-/**
- * 蒸馏库条目的摘要（GET /api/projects/style-distills 列表项）。
- *
- * 与后端 `_sd_summary()` 逐一对应。**不含** style_narrative 全文与 rules——
- * 那份 JSON 有几万字符，列表场景用不到。
- */
-export interface StyleDistillSummary {
-  id: number;
-  /** 参考语料 novel_id 列表（与项目 reference_novel_ids 同口径）。 */
-  source_ids: number[] | null;
-  tier: string;
-  /** 蒸馏程度的可读名：完整 / 平衡 / 快速（由后端按 tier key 解析）。 */
-  tier_name?: string | null;
-  tier_signature: string;
-  content_hash: string;
-  narrative_version: number;
-  status: StyleDistillStatus;
-  n_chapters: number | null;
-  rule_count: number | null;
-  rejected: number | null;
-  created_by_project_id: number | null;
-  created_at: string | null;
-  applied_at: string | null;
-}
-
-/**
- * 蒸馏库条目详情（GET /api/projects/style-distills/{id}）。
- *
- * 在摘要基础上多了 `style_narrative` 全文——应用/查看时才需要。
- */
-export interface StyleDistillDetail extends StyleDistillSummary {
-  style_narrative: Record<string, unknown> | null;
-}
-
-/** GET /api/projects/style-distills 的响应。 */
-export interface StyleDistillListResponse {
-  items: StyleDistillSummary[];
-}
-
-/** POST /api/projects/{id}/style-distills/apply 的请求体。 */
-export interface StyleDistillApplyRequest {
-  distill_id: number;
+  instruction: string;
+  generation?: GenerationOut | null;
+  note?: string | null;
+  agent_run_id?: number | null;
 }

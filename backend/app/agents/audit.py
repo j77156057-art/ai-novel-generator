@@ -52,7 +52,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any
 
 from sqlalchemy import func, select
 
@@ -171,7 +171,7 @@ def rule_corpus_empty_or_short_chunks(
                 kind="chunk",
                 source=_novel_source(novel_id),
                 ref_id=str(c.id),
-                snippet=_truncate(c.text or "") or "(空)",
+                snippet=_truncate(c.text or "(空)"),
                 score=0.5,
             )
             for c in bad[:MAX_EVIDENCE_PER_ISSUE]
@@ -288,7 +288,7 @@ def rule_corpus_injection_strings(
                 kind="chunk",
                 source=_novel_source(novel_id),
                 ref_id=f"watermark:{m['text']}",
-                snippet=f"{m['text']} × {m['count']}（紧跟『。』率 {m['final_ratio']:.0%}）",
+                snippet=f"{m['text']} × {m['count']}（句末率 {m['final_ratio']:.0%}）",
                 score=0.6,
             )
             for m in marks[:MAX_EVIDENCE_PER_ISSUE]
@@ -303,8 +303,7 @@ def rule_corpus_injection_strings(
                 claim=(
                     f"novel_id={novel_id}（《{novels[novel_id].title or '未命名'}》）检出 "
                     f"{len(marks)} 个高频句末串，最典型：「{top['text']}」出现 "
-                    f"{top['count']} 次、{top['final_ratio']:.0%} 紧跟句末句号『。』"
-                    f"（口径见 corpus_health：只看『。』，不用任意句末标点并集）。"
+                    f"{top['count']} 次、{top['final_ratio']:.0%} 紧跟句末标点。"
                     f"样本：{top.get('samples', [])[:1]}。"
                 ),
                 suggestion=(
@@ -382,7 +381,7 @@ def rule_corpus_chunks_without_embedding(
                 kind="chunk",
                 source=_novel_source(novel_id),
                 ref_id=str(c.id),
-                snippet=_truncate(c.text or "") or "(空)",
+                snippet=_truncate(c.text or "(空)"),
                 score=0.5,
             )
             for c in missing[:MAX_EVIDENCE_PER_ISSUE]
@@ -425,11 +424,7 @@ def run_corpus_audit(
     对得上。
     """
     q = select(RawNovel)
-    # `is not None` 而非裸 `if novel_ids:`：空列表必须与 None 分开。
-    # `[]` 是 falsy，旧写法会把「一本都没选」执行成「审全库」（静默范围放大）。
-    # 路由层现在已对 `[]` 报 422，这里是第二道闸门——库函数被直接调用时
-    # 也不该广播。空列表走到 `in_([])` 会得到空集，语义即「审 0 本」。
-    if novel_ids is not None:
+    if novel_ids:
         q = q.where(RawNovel.id.in_(novel_ids))
     novels = {n.id: n for n in db.scalars(q).all()}
 
@@ -640,39 +635,6 @@ def rule_kg_dead_character_open_holes(
     return issues
 
 
-def _match_present_names(text: str, names_sorted: Sequence[str]) -> list[str]:
-    """长名优先匹配，**命中即挖空**，避免短名搭长名的便车。
-
-    旧写法是 `[n for n in names_sorted if n in text]`：虽然先按长度降序排过，
-    但对每个名字都独立做子串判断、不挖掉已匹配区间，于是「冷轩月」出现时
-    「冷轩」同样算命中——注释声称的「长名优先」并未生效，会报出实际没出现
-    过的角色对（实测：节点 冷轩 + 冷轩月、段里只有「冷轩月」→ 误报
-    `pair:冷轩月|冷轩`，而「冷轩」从未独立出现）。
-
-    这里给每个字符加一个 consumed 标记：按长度降序扫，某名字的命中区间若
-    与已吃掉区间有重叠就跳过，否则整段标记为已消费。这样只有真正独立出现
-    的名字才算命中，同时保持返回顺序为长度降序（与旧实现的顺序语义一致，
-    便于 pair 键稳定）。
-    """
-    consumed = bytearray(len(text))
-    present: list[str] = []
-    for name in names_sorted:  # 长名在前
-        hit = False
-        start = 0
-        while True:
-            i = text.find(name, start)
-            if i < 0:
-                break
-            end = i + len(name)
-            if not any(consumed[i:end]):
-                consumed[i:end] = b"\x01" * len(name)
-                hit = True
-            start = i + 1
-        if hit:
-            present.append(name)
-    return present
-
-
 def rule_kg_cooccurrence_without_edge(
     db: Any, project_id: int, taken: set[str]
 ) -> list[DiagnosticIssue]:
@@ -711,16 +673,14 @@ def rule_kg_cooccurrence_without_edge(
     if not gens:
         return []
 
-    # 共现计数：长名优先匹配，命中即挖空（见 _match_present_names）。
-    # 不能写成 `[n for n in names_sorted if n in text]`——那样短名会搭长名的便车，
-    # 报出实际没出现过的角色对。
+    # 共现计数：长名优先匹配，避免「张三」抢先命中「张三丰」的段
     names_sorted = sorted(name_to_id, key=len, reverse=True)
     pair_segments: dict[tuple[str, str], list[int]] = {}
     for g in gens:
         text = g.text or ""
         if not text:
             continue
-        present = _match_present_names(text, names_sorted)
+        present = [n for n in names_sorted if n in text]
         for i in range(len(present)):
             for j in range(i + 1, len(present)):
                 pair = (present[i], present[j])

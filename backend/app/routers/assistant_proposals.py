@@ -14,8 +14,7 @@
 | GET | `/api/assistant/proposals/{id}` | 详情（含 diff、基线指纹、证据） | ❌ |
 | POST | `/api/assistant/proposals/{id}/approve` | pending → approved | ❌ |
 | POST | `/api/assistant/proposals/{id}/reject` | pending → rejected | ❌ |
-| POST | `/api/assistant/proposals/{id}/apply` | approved → applied | ✅ **单条唯一入口** |
-| POST | `/api/assistant/proposals/apply-selected` | 显式枚举的批量 approved → applied（整批同成同败） | ✅ 受控批量 |
+| POST | `/api/assistant/proposals/{id}/apply` | approved → applied | ✅ **唯一入口** |
 | POST | `/api/assistant/versions/{id}/restore` | 从快照恢复（生成新 Version） | ✅ |
 | GET | `/api/assistant/versions` | 版本历史 | ❌ |
 | GET | `/api/assistant/versions/diff` | 两个版本的内容 diff | ❌ |
@@ -88,10 +87,8 @@ class CreateProposalRequest(StrictRequest):
     """
 
     project_id: int
-    type: Literal["text_edit", "prompt_edit", "fact_resolution", "corpus_text_edit"]
-    target_kind: Literal[
-        "generation_text", "project_plot_bible", "prompt_override", "novel_chunk_text",
-    ]
+    type: Literal["text_edit", "prompt_edit", "fact_resolution"]
+    target_kind: Literal["generation_text", "project_plot_bible", "prompt_override"]
     target_id: str
     after_text: str
     reason: str = ""
@@ -127,20 +124,6 @@ class RestoreVersionRequest(StrictRequest):
     action: Literal["restore"]
     actor: str | None = None
     note: str | None = None
-
-
-class ApplySelectedRequest(StrictRequest):
-    """POST /api/assistant/proposals/apply-selected 请求体（第 10 步，受控批量应用）。
-
-    **必须显式枚举** proposal id —— `proposal_ids` 是必填的整数列表，不接受
-    任何通配符 / 隐式范围：`all` / `status` / `project_id` 之类字段会被
-    `StrictRequest`（extra=forbid）直接 422。空列表同样 422（不把「没给 id」
-    当成「全给」）。条数上限在端点里按 `MAX_BULK_APPLY` 校验。
-    """
-
-    action: Literal["apply"]
-    proposal_ids: list[int]
-    actor: str | None = None
 
 
 # ====================================================================
@@ -179,8 +162,6 @@ def _raise_http(exc: Exception) -> None:
         ) from exc
     if isinstance(exc, proposal_lib.TargetMissing):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if isinstance(exc, proposal_lib.BulkApplyConflict):
-        raise HTTPException(status_code=409, detail=exc.report) from exc
     if isinstance(exc, proposal_lib.ProposalError):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     raise HTTPException(status_code=500, detail=f"提案操作失败: {exc}") from exc
@@ -484,68 +465,6 @@ def apply_proposal(
         _raise_http(exc)
     db.refresh(proposal)
     result["proposal"] = proposal_lib.proposal_to_dict(proposal)
-    return result
-
-
-# ====================================================================
-# POST /api/assistant/proposals/apply-selected —— 受控批量应用（第 10 步）
-# ====================================================================
-
-
-@router.post("/proposals/apply-selected")
-def apply_selected_proposals(
-    body: ApplySelectedRequest, db: Session = Depends(get_db)
-) -> dict:
-    """受控批量应用：**显式枚举**的若干 `approved` 提案，整批同成同败。
-
-    「一本 500 万字小说可能上千处修正、逐条点不现实」的解法 —— 但每一道能
-    被滥用的口子都封死：
-
-    - **必须显式枚举**：`proposal_ids` 必填、非空；通配符字段（`all` / `status` /
-      `project_id` …）因 `StrictRequest` 一律 422；
-    - **上限封顶**：条数 > `MAX_BULK_APPLY` → 422，不支持一次放行一大批；
-    - **每条单独漂移校验**：任一目标漂移 → **整批不写**，并逐条报告「哪条 stale」；
-    - **整批同一事务**：任一步失败 → 全回滚，不留半批次、不留半版本；
-    - **每条仍写 Version**：整批可逐条回滚，与单条 apply 同一条快照通道。
-
-    它不是新的写入旁路：内部走的仍是 `proposal_lib.apply_selected`（复用单条
-    apply 的核心 `_apply_one_no_commit`），状态机与漂移检测与 `/apply` 完全一致。
-    """
-    if body.action != "apply":
-        raise HTTPException(
-            status_code=422,
-            detail=f"action 必须是 'apply'，收到 {body.action!r}",
-        )
-    ids = list(dict.fromkeys(body.proposal_ids))
-    if not ids:
-        raise HTTPException(
-            status_code=422,
-            detail="proposal_ids 不能为空；批量应用必须**显式枚举**要应用的提案 id",
-        )
-    if len(ids) > proposal_lib.MAX_BULK_APPLY:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"单批最多 {proposal_lib.MAX_BULK_APPLY} 条，收到 {len(ids)} 条；"
-                "请分批显式枚举（不支持通配符 / 隐式范围）"
-            ),
-        )
-
-    proposals = []
-    missing = []
-    for pid in ids:
-        row = db.get(EditProposal, pid)
-        if row is None:
-            missing.append(pid)
-        else:
-            proposals.append(row)
-    if missing:
-        raise HTTPException(status_code=404, detail=f"提案不存在：{missing}")
-
-    result = proposal_lib.apply_selected(db, proposals=proposals, actor=body.actor)
-    if not result.get("ok"):
-        raise HTTPException(status_code=409, detail=result)
-    result["proposal_ids"] = ids
     return result
 
 

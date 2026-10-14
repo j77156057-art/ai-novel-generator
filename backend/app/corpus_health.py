@@ -64,37 +64,6 @@
 注意：**不能**按「计数降序 + `in` 判被包含」去嵌套。短串计数可能**高于**长串
 （实测 `动乾坤` 3756 > `武动乾坤` 3750；合成用例里 420 > 400），那样判的是
 `长串 in 短串`，恒为假，等于没去嵌套。
-
-## P0 修复：判据实现必须与标定口径一致（刻度标点 + 被粘连）
-
-上面表格标定的是「紧跟**『。』**的比例」：水印 99.9% vs 正常短语 ≤36%。
-但修复前 `find_repeated_watermarks` 的实现把 `after` 取成了「**任意**句末标点
-（`。！？`）的并集」再求和 —— 正常**问句**以『？』结尾，会被并集计入分子。
-现代网文充斥对白问句，于是正常短语越过了阈值被当成水印删掉。实测：
-
-| 串 | 次数 | 旧口径（任意句末） | 『。』比例 | 结果 |
-|---|---|---|---|---|
-| `武动乾坤`（斗破，水印） | 40,500 | 1.000 | **1.000** | 应删 |
-| `怎么办` | 142 | 0.901 | **0.000** | **误删 128 处** |
-| `没事吧` | 107 | 0.972 | **0.000** | **误删 104 处** |
-| `怎么了` | 86 | 0.930 | 0.012 | **误删 80 处** |
-
-共 936 字正常对白被删（`'接下来该怎么办？'` / `'炎儿，没事吧？'` / `'薰儿，怎么了？'`）。
-这正是本文档开头警告过的「不能用『前为汉字、后为标点』当判据」的同一类错误。
-
-**修复（两处）**：
-
-1. **刻度标点**：比例只看 `DEFAULT_TERMINATOR`（默认『。』）**自己的计数**除以
-   `cnt`，不做句末标点并集。这样 `没事吧` 的『。』比例 ≈ 0 < 0.9 → 被拒。
-2. **被粘连（必要条件）**：真水印被程序粘在**任意**前导字上，`nesting_breadth`
-   = 不同前导字的**种类数**很大；用于挡掉纯巧合的子窗口（如阶梯里 `动乾坤`
-   的 breadth=1）。
-
-**关于 breadth 阈值的诚实说明**：breadth **不是**一个能单独区分「自然短语 vs
-水印」的信号 —— 实测自然高频短语也能粘在很多前导字上（`缓缓`=363、`顿时`=296、
-`的目光`=277；斗破语料）。真正的判别力来自**刻度标点比例**（自然短语『。』比例
-实测 0.0–0.375，全部 < 0.9）。因此 `DEFAULT_MIN_NESTING_BREADTH` 刻意取**低**
-（见常量注释）：它只负责把「只跟在极少数字后」的退化窗口排除，宁可漏报也不误删。
 """
 from __future__ import annotations
 
@@ -103,28 +72,13 @@ from collections import Counter
 
 _CJK = r"[\u4e00-\u9fff]"
 _CJK_RUN = re.compile(_CJK + "+")
-#: 句末标点（用于统计与删除位置判定）
+#: 句末标点（水印几乎只会被插在这些标点之前）
 _SENT_FINAL = "。！？"
 
 #: 候选串长度。太短会撞上大量常用词，太长会漏掉 3 字水印。
 DEFAULT_LENGTHS = (3, 4, 5, 6)
 DEFAULT_MIN_COUNT = 60
 DEFAULT_MIN_FINAL_RATIO = 0.9
-
-#: 判据的**刻度标点**：比例只看紧跟这一个标点的情况（不做「任意句末标点」并集）。
-#: 标定表测的就是「紧跟『。』的比例」——水印 99.9% vs 正常短语 ≤36%。
-#: 用并集会把问句（以『？』收尾）计入分子 → 正常对白被误删（见模块文档 P0 节）。
-DEFAULT_TERMINATOR = "。"
-
-#: 「被粘连」必要条件的阈值：不同前导字的**种类数**下限。
-#:
-#: 取值依据（斗破实测，见模块文档 P0 节）：
-#: - 真水印 `武动乾坤` breadth = **1781**（被粘在任意前导字上）；
-#: - 阶梯里纯巧合的子窗口 `动乾坤` breadth = **1**（永远跟在 `武` 后）—— 要挡的就是这类。
-#: 取 8：远低于真水印（1781），只排除「仅跟在极少数字后」的退化窗口。
-#: **刻意取低**：breadth 不是判别主力（自然短语也有高 breadth，`缓缓`=363），
-#: 主判据是刻度标点比例；这里守「宁可漏报，不可误删」。
-DEFAULT_MIN_NESTING_BREADTH = 8
 
 #: 去嵌套阈值：同组内计数低于「组内最高计数 × 该比例」的成员，判为**偶然的前缀延伸**。
 #:
@@ -135,38 +89,26 @@ DEFAULT_MIN_NESTING_BREADTH = 8
 NEST_KEEP_RATIO = 0.5
 
 
-def scan_watermarks(
+def find_repeated_watermarks(
     text: str,
     *,
     lengths: tuple[int, ...] = DEFAULT_LENGTHS,
     min_count: int = DEFAULT_MIN_COUNT,
     min_final_ratio: float = DEFAULT_MIN_FINAL_RATIO,
-    min_nesting_breadth: int = DEFAULT_MIN_NESTING_BREADTH,
-    terminator: str = DEFAULT_TERMINATOR,
-) -> dict:
-    """水印体检的**完整**结果：``{"flagged", "rejected", "thresholds"}``。
+) -> list[dict]:
+    """返回可疑水印串，按出现次数降序。
 
-    与 `find_repeated_watermarks` 同一套实现，只是额外返回
-    **被拒候选 + 拒绝原因** —— 有损清洗必须能看出「检测器考虑过什么、为什么没删」，
-    而不是只给一个最终名单。`rejected` 只记**真正有歧义的**候选：
-    「（旧口径）任意句末标点比例达标，但刻度标点比例不足」这类**误删风险**候选
-    （如 `没事吧`），以及「刻度标点比例达标但未被粘连」的退化窗口。
-    这样数量很小、可人工复核，而不是把全部高频短语都倒出来。
+    每一项形如::
 
-    判据（与模块文档标定一致）：
-      - `final` = 紧跟**刻度标点 `terminator`（默认『。』）** 的次数；
-      - `final_ratio` = final / count，须 >= `min_final_ratio`；
-      - `nesting_breadth` = 不同前导字的种类数，须 >= `min_nesting_breadth`。
+        {"text": "武动乾坤", "count": 3750, "final": 3747,
+         "final_ratio": 0.9992, "final_char": "。",
+         "para_end_ratio": 1.0, "samples": ["...格格不入武动乾坤。", ...]}
+
+    `samples` 是**原始上下文**：判据可能出错，所以每条结论都必须能被人直接复核，
+    而不是只给一个分数。
     """
-    thresholds = {
-        "lengths": list(lengths),
-        "min_count": min_count,
-        "min_final_ratio": min_final_ratio,
-        "min_nesting_breadth": min_nesting_breadth,
-        "terminator": terminator,
-    }
     if not text or len(text) < min_count:
-        return {"flagged": [], "rejected": [], "thresholds": thresholds}
+        return []
 
     # 候选：只在**连续汉字串内部**枚举定长 n-gram。跨标点的 n-gram 不可能是全汉字，
     # 所以这样枚举与原意等价，但对 38 万字语料快一到两个数量级。
@@ -179,7 +121,6 @@ def scan_watermarks(
 
     n_text = len(text)
     flagged: list[dict] = []
-    rejected: list[dict] = []
     for s, approx in cand.items():
         if approx < min_count:
             continue
@@ -191,47 +132,11 @@ def scan_watermarks(
         after = Counter(
             text[e] for _, e in occ if e < n_text and text[e] in _SENT_FINAL
         )
-        if not after:
-            continue
-        # 标定口径：只看**刻度标点**自己的计数，不做「任意句末标点」并集。
-        final = after.get(terminator, 0)
+        final = sum(after.values())
         ratio = final / cnt
-        # 旧口径（任意句末标点并集）只用于诊断「被拒原因」，不参与判定。
-        dominant, dominant_n = after.most_common(1)[0]
-        pooled_ratio = dominant_n / cnt
-        # 「被粘连」广度：不同前导字的种类数。
-        leads = {text[st - 1] for st, _ in occ if st > 0}
-        breadth = len(leads)
-        samples = [text[max(0, st - 16): en + 6].replace("\n", "\\n")
-                   for st, en in occ[:3]]
-
-        base = {
-            "text": s,
-            "count": cnt,
-            "final": final,
-            "final_ratio": round(ratio, 4),
-            "pooled_ratio": round(pooled_ratio, 4),
-            "final_char": dominant,
-            "terminator": terminator,
-            "nesting_breadth": breadth,
-            "samples": samples,
-        }
-
-        if ratio < min_final_ratio:
-            # 只有「以其它句末标点（如问号）结尾」时才够阈值 → 典型误删风险候选。
-            if pooled_ratio >= min_final_ratio:
-                rejected.append({**base, "reason": (
-                    f"紧跟『{terminator}』比例 {ratio:.3f} < {min_final_ratio}；"
-                    f"仅以『{dominant}』结尾时达 {pooled_ratio:.3f}"
-                    f"（问句误判风险，拒删）"
-                )})
+        if ratio < min_final_ratio or not after:
             continue
-        if breadth < min_nesting_breadth:
-            rejected.append({**base, "reason": (
-                f"前导字广度 {breadth} < {min_nesting_breadth}"
-                f"（未表现为被粘到任意前导字）"
-            )})
-            continue
+        final_char, _ = after.most_common(1)[0]
 
         # 段尾比例（走到段末/文末的比例）：仅作**佐证**，不参与筛选 ——
         # 换行格式一变它就不稳，把它当判据会让检测器对语料格式过敏。
@@ -245,45 +150,20 @@ def scan_watermarks(
             if j >= n_text or text[j] == "\n":
                 para_end += 1
 
-        flagged.append({**base, "para_end_ratio": round(para_end / cnt, 4)})
+        samples = [text[max(0, st - 16): en + 6].replace("\n", "\\n")
+                   for st, en in occ[:3]]
+        flagged.append({
+            "text": s,
+            "count": cnt,
+            "final": final,
+            "final_ratio": round(ratio, 4),
+            "final_char": final_char,
+            "para_end_ratio": round(para_end / cnt, 4),
+            "samples": samples,
+        })
 
     # 去嵌套：见 `_dedupe_nested` 的说明。
-    flagged = _dedupe_nested(flagged)
-    rejected = _dedupe_nested(rejected)
-    rejected.sort(key=lambda d: -d["count"])
-    return {"flagged": flagged, "rejected": rejected, "thresholds": thresholds}
-
-
-def find_repeated_watermarks(
-    text: str,
-    *,
-    lengths: tuple[int, ...] = DEFAULT_LENGTHS,
-    min_count: int = DEFAULT_MIN_COUNT,
-    min_final_ratio: float = DEFAULT_MIN_FINAL_RATIO,
-    min_nesting_breadth: int = DEFAULT_MIN_NESTING_BREADTH,
-) -> list[dict]:
-    """返回可疑水印串，按出现次数降序（`scan_watermarks` 的 flagged 部分）。
-
-    每一项形如::
-
-        {"text": "武动乾坤", "count": 40500, "final": 40498,
-         "final_ratio": 0.99995, "pooled_ratio": 1.0, "final_char": "。",
-         "terminator": "。", "nesting_breadth": 1781,
-         "para_end_ratio": 1.0, "samples": ["...格格不入武动乾坤。", ...]}
-
-    `final` / `final_ratio` 是**紧跟刻度标点（『。』）**的次数与比例（不是任意句末
-    标点的并集）—— 与模块文档的标定口径一致。`samples` 是**原始上下文**：判据可能
-    出错，所以每条结论都必须能被人直接复核，而不是只给一个分数。
-
-    需要「被拒候选 + 原因」时用 `scan_watermarks`。
-    """
-    return scan_watermarks(
-        text,
-        lengths=lengths,
-        min_count=min_count,
-        min_final_ratio=min_final_ratio,
-        min_nesting_breadth=min_nesting_breadth,
-    )["flagged"]
+    return _dedupe_nested(flagged)
 
 
 def _dedupe_nested(

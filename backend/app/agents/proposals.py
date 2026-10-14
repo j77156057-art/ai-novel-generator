@@ -41,40 +41,21 @@
 
 ## patch 的能力边界（硬约束 4）
 
-`EditProposal.patch_json` **只能**描述对以下四处的修改：
+`EditProposal.patch_json` **只能**描述对以下三处的修改：
 
-| target_kind | 落点 | type | 说明 |
-|---|---|---|---|
-| `generation_text` | `generations.text` | `text_edit` | 段落正文 |
-| `project_plot_bible` | `projects.plot_bible` | `fact_resolution` | 剧情圣经（权威层） |
-| `prompt_override` | `prompt_overrides.override_text` | `prompt_edit` | 提示词**运行时覆写表** |
-| `novel_chunk_text` | `novel_chunks.text` | `corpus_text_edit` | 参考语料分片正文（第 10 步） |
+| target_kind | 落点 | 说明 |
+|---|---|---|
+| `generation_text` | `generations.text` | 段落正文 |
+| `project_plot_bible` | `projects.plot_bible` | 剧情圣经（权威层） |
+| `prompt_override` | `prompt_overrides.override_text` | 提示词**运行时覆写表** |
 
-明确**不**提供：删除 Project、删除 Generation、删除 NovelChunk、修改
-AppSetting（LLM key）。这些能力即使将来也不走提案审批 —— LLM key 是运维配置，
-不是创作产物。`validate_patch()` 用白名单 + 黑名单双重把关：出现未知键、出现
-delete 类op、出现黑名单目标名，一律`ValueError`（router 转 422）。
+明确**不**提供：删除 Project、删除 Generation、修改 AppSetting（LLM key）。
+这三类能力即使将来也不走提案审批 —— LLM key 是运维配置，不是创作产物。
+`validate_patch()` 用白名单 + 黑名单双重把关：出现未知键、出现 delete 类op、
+出现黑名单目标名，一律`ValueError`（router 转 422）。
 
 改提示词**只**写运行时覆写表，`backend/app/generation/prompts.py` 源文件
 一个字节都不动（b58c763 基线）。
-
-## `corpus_text_edit`（第 10 步）：语料正文的第一条受审写入通道
-
-错字 / 断字 / 残句的修正（`app.agents.text_clean` 检出、`clean-corpus` 复核）
-**绝不静默改文本** —— 它们产出 `corpus_text_edit` 提案（`target_id` = chunk_id），
-再走同一条 `approve → apply` 通道落库。三点设计约束：
-
-1. **`novel_chunk_text` 仅接受 `corpus_text_edit`**（一一映射不变）；
-2. **漂移判据用 chunk 当前内容的 sha256**（`base_content_hash`，服务端算）——
-   提案创建后 chunk 被别处改过 → apply 时 409 stale，不静默覆盖；
-3. **改文本即失效向量**：`write_target` 落库时把该分片 `embedding` 置空
-   （文本变了、旧向量就是错的），检索对该分片退化为 BM25，由
-   `audit.chunks_without_embedding` 提示补跑。这是 `write_target` **唯一**
-   会碰到第二列的例外，理由写在 `write_target` 内。
-
-批量可用性（一本 500 万字小说可能上千处修正）走 `apply_selected`：
-请求体必须**显式枚举** proposal id、**上限封顶**、每条单独漂移校验、
-整批同一事务（任一失败全回滚）。没有通配符入口。
 """
 
 from __future__ import annotations
@@ -92,28 +73,20 @@ from typing import Any, Callable, Iterable
 
 #: 提案类型。每一类**恰好**对应一个 target_kind —— 一一映射是刻意的：
 #: 多对多会让「这个提案到底改哪儿」变成需要读代码才能回答的问题。
-PROPOSAL_TYPES: tuple[str, ...] = (
-    "text_edit",
-    "prompt_edit",
-    "fact_resolution",
-    "corpus_text_edit",
-)
+PROPOSAL_TYPES: tuple[str, ...] = ("text_edit", "prompt_edit", "fact_resolution")
 
 #: 提案类型 → target_kind 的唯一映射。
 TYPE_TO_TARGET_KIND: dict[str, str] = {
     "text_edit": "generation_text",
     "prompt_edit": "prompt_override",
     "fact_resolution": "project_plot_bible",
-    "corpus_text_edit": "novel_chunk_text",
 }
 
 #: 合法的 target_kind 全集（= set(TYPE_TO_TARGET_KIND.values())）。
 TARGET_KINDS: tuple[str, ...] = tuple(TYPE_TO_TARGET_KIND.values())
 
-#: Version.kind 取值域。第 10 步新增 `corpus_text`：语料分片正文的版本
-#: 与生成正文（`text`）**分开**，否则 `/versions?kind=text` 会把参考语料的
-#: 清洗版本和用户自己的创作正文混在一起。
-VERSION_KINDS: tuple[str, ...] = ("text", "prompt", "bible", "mixed", "corpus_text")
+#: Version.kind 取值域。
+VERSION_KINDS: tuple[str, ...] = ("text", "prompt", "bible", "mixed")
 
 #: 风险等级。
 RISK_LEVELS: tuple[str, ...] = ("low", "medium", "high")
@@ -196,19 +169,6 @@ MAX_TEXT_LEN = 200_000
 #: 单份快照允许的最大字符数（防爆库；正文段落远小于此）。
 MAX_SNAPSHOT_LEN = 400_000
 
-#: 受控批量应用的单批上限（proposal 条数）。
-#:
-#: 取值依据：
-#: 1. **事务边界**：整批在同一事务内，每条都要读目标 + 算哈希 + 写业务表 +
-#:    写 Version 快照。50 条让单事务的写放大有界（50 行 Version + 50 行状态），
-#:    不会因一本 500 万字语料的上千处修正把单个事务撑爆或长锁；
-#: 2. **人审单位**：清洗产出的 proposal 是给人逐条/成组核对的，50 约等于
-#:    「一屏能过一遍」的规模；超过就应分几次确认，避免「一键放行一大批」；
-#: 3. 与 `clean-corpus` 单次提案上限（同取 50）对齐，清洗→审核→应用的
-#:    每批规模一致，心智负担统一。
-#: 需要更多时**分批调用**即可（显式枚举下一批 id），不支持通配符。
-MAX_BULK_APPLY = 50
-
 
 # ====================================================================
 # 异常类型（router 按类型映射 HTTP 状态码）
@@ -253,18 +213,6 @@ class TargetDrifted(ProposalError):
 
 class TargetMissing(ProposalError):
     """目标行不存在 / 与提案的project 不匹配 → 404。"""
-
-
-class BulkApplyConflict(ProposalError):
-    """受控批量应用：整批未写入（含 stale / 状态不符）→ router 转 409。
-
-    `report` 保留**逐条**的失败原因，让调用方（和用户）能一眼看出「哪条 stale」，
-    而不是只收到一句「批量失败」。整批语义：只要有一条不满足，**一条都不写**。
-    """
-
-    def __init__(self, report: dict[str, Any]) -> None:
-        self.report = report
-        super().__init__(report.get("reason") or "批量应用失败，整批未写入")
 
 
 # ====================================================================
@@ -431,18 +379,6 @@ def validate_patch(
                 "fact_resolution 的 target_id 必须是 'plot_bible'"
             )
         normalized["fields"] = ["plot_bible"]
-    elif target_kind == "novel_chunk_text":
-        fields = normalized.get("fields", ["text"])
-        if list(fields) != ["text"]:
-            raise PatchRejected(
-                f"corpus_text_edit 只能改 fields=['text']，收到 {fields!r}"
-            )
-        if not str(target_id).strip().isdigit():
-            raise PatchRejected(
-                f"corpus_text_edit 的 target_id 必须是 novel_chunks.id（整数），"
-                f"收到 {target_id!r}"
-            )
-        normalized["fields"] = ["text"]
     else:  # prompt_override
         allowed_keys = tuple(prompt_keys or ())
         prompt_key = normalized.get("prompt_key") or str(target_id).strip()
@@ -543,19 +479,6 @@ def read_target(db: Any, project_id: int, target_kind: str,
         return TargetState(target_kind, key, content, content_hash(content),
                            row is not None)
 
-    if target_kind == "novel_chunk_text":
-        from app.models import NovelChunk
-
-        # 语料是**全局**的（raw_novels 不属于任何项目），分片没有 project_id。
-        # 因此这里不校验归属，只按 chunk id 取：project_id 在 corpus_text_edit
-        # 里只是 AgentRun 的审计锚点，不是访问控制维度。
-        chunk = db.get(NovelChunk, int(target_id))
-        if chunk is None:
-            raise TargetMissing(f"novel_chunks.id={target_id} 不存在")
-        content = canonical_text(chunk.text or "")
-        return TargetState(target_kind, str(target_id), content,
-                           content_hash(content), True)
-
     raise PatchRejected(f"未知 target_kind={target_kind!r}")
 
 
@@ -596,21 +519,6 @@ def write_target(db: Any, project_id: int, target_kind: str, target_id: str,
         )
         return
 
-    if target_kind == "novel_chunk_text":
-        from app.models import NovelChunk
-
-        chunk = db.get(NovelChunk, int(target_id))
-        if chunk is None:
-            raise TargetMissing(f"novel_chunks.id={target_id} 不存在")
-        chunk.text = new_content
-        # —— 唯一会碰第二列的一处，理由如下 ——
-        # 分片的 embedding 是**旧文本**的向量。文本改了还留着旧向量，检索会
-        # 拿"对不上的向量"召回这个分片 —— 这是静默错配，比"暂时没有向量"危险
-        # 得多。故置空，让该分片的向量路退化为 BM25（确定的正确行为），由
-        # audit 的 `chunks_without_embedding` 提示补跑 embedding。
-        chunk.embedding = None
-        return
-
     raise PatchRejected(f"未知 target_kind={target_kind!r}")
 
 
@@ -642,11 +550,6 @@ def _coerce_after_content(proposal_type: str, after_text: str | None) -> str:
     if proposal_type == "prompt_edit" and not text.strip():
         raise PatchRejected("prompt_edit 的 after_text 不能为空（空串语义是「回到代码默认」，"
                             "那应该用删除覆写的独立流程，不在提案通道里表达）")
-    if proposal_type == "corpus_text_edit" and not text.strip():
-        raise PatchRejected(
-            "corpus_text_edit 的 after_text 不能为空 —— 本通道**只改正文、不删分片**；"
-            "如需移除整个分片，请在语料管理里删除（那是另一条独立流程）"
-        )
     return text
 
 
@@ -764,7 +667,6 @@ def _legacy_target_table(target_kind: str) -> str:
         "generation_text": "generations",
         "project_plot_bible": "projects",
         "prompt_override": "prompt_overrides",
-        "novel_chunk_text": "novel_chunks",
     }[target_kind]
 
 
@@ -774,14 +676,11 @@ def _default_risk(proposal_type: str) -> str:
     理由：`fact_resolution` 直接改剧情圣经（后续所有段落的约束来源），
     `text_edit` 改已生成正文（用户可能已基于它做了后续决策），
     两者出错的影响面都超出「再加一句话」；
-    `corpus_text_edit` 改参考语料分片正文，会改变后续检索召回与文风拟合的
-    输入 —— 面比提示词大，故取 medium（不动剧情走向，可回滚）；
     `prompt_edit` 只是追加一段提示块，最坏结果是文风漂移，可一键回滚。
     """
     return {
         "fact_resolution": "high",
         "text_edit": "medium",
-        "corpus_text_edit": "medium",
         "prompt_edit": "low",
     }[proposal_type]
 
@@ -795,9 +694,6 @@ def _describe_impact(target_kind: str, target_id: str) -> str:
                               "后续生成的角色锁定 / 伏笔约束会随之变化",
         "prompt_override": f"改写提示词运行时覆写键 {target_id!r}；"
                            f"只影响后续生成的 system/user 附加块，代码默认提示不变",
-        "novel_chunk_text": f"仅改写参考语料分片 novel_chunks.id={target_id} 的正文；"
-                            f"该分片旧向量失效（置空，检索退化为 BM25，补跑 embedding 后恢复）；"
-                            f"不影响生成正文与其它分片",
     }[target_kind]
 
 
@@ -849,7 +745,6 @@ def _version_kind_for(target_kind: str) -> str:
         "generation_text": "text",
         "project_plot_bible": "bible",
         "prompt_override": "prompt",
-        "novel_chunk_text": "corpus_text",
     }[target_kind]
 
 
@@ -876,114 +771,6 @@ def _build_snapshot(
         "reason": reason or "",
         "evidence": list(evidence or []),
         "source_proposal_id": source_proposal_id,
-    }
-
-
-def _expected_base_hash(proposal: Any) -> str:
-    """读提案的漂移基线（`scope_json.base_content_hash`），归一成 str。
-
-    None 与空串都归一成空串 —— 两者都意味着「没有基线」，由校验分支 fail loud 接住。
-    """
-    scope = proposal.scope_json if isinstance(proposal.scope_json, dict) else {}
-    raw = scope.get("base_content_hash")
-    return "" if raw is None else str(raw)
-
-
-def _apply_one_no_commit(
-    db: Any,
-    *,
-    proposal: Any,
-    actor: str | None,
-    version_writer: Callable[..., Any],
-    prechecked: TargetState | None = None,
-) -> dict[str, Any]:
-    """应用单条提案的**核心**：漂移校验 + 写业务表 + 写 Version + 置 applied。
-
-    **不** commit、**不** rollback —— 事务边界由调用方掌握。单条 apply 与
-    受控批量 apply 共用本函数，保证「怎么写」只有一份实现、不会两处跑偏。
-
-    失败语义：
-    - 状态机非法 → `InvalidTransition`；
-    - 缺基线 → `ProposalError`（fail loud，见下）；
-    - 目标漂移 → 置 `stale` 并抛 `TargetDrifted`（**stale 落库由调用方负责**）；
-    - after 与当前内容一致 → `PatchRejected`。
-
-    `prechecked`：调用方已读到的目标状态（批量场景先做一遍只读预检时传入），
-    避免同一次批量里对同一目标重复 SELECT。
-    """
-    validate_action(proposal.status, "apply")
-    if prechecked is not None:
-        current = prechecked
-    else:
-        current = read_target(
-            db, int(proposal.project_id), str(proposal.target_kind),
-            str(proposal.target_id),
-        )
-
-    expected_hash = _expected_base_hash(proposal)
-    # 缺基线 → fail loud，**不**当成「无需检测」跳过。
-    #
-    # 旧写法是 `if expected_hash and current.hash != expected_hash:` ——
-    # falsy 的 expected_hash（空串 / None）会让整个漂移分支短路，等于把
-    # 「目标漂移即拒绝」这条不变量的开关交给了请求体。base_content_hash
-    # 由 build_proposal 无条件写入，它缺失只有一种解释：提案构造有 bug
-    # （或被污染），此时正确的动作是拒绝应用并让人来查，而不是放行。
-    if not expected_hash.strip():
-        raise ProposalError(
-            f"提案 {getattr(proposal, 'id', '<unsaved>')} 缺少 "
-            "scope_json.base_content_hash（漂移检测基线缺失）；"
-            "拒绝应用——没有基线的补丁可能覆盖他人的并发修改。"
-        )
-    if current.hash != expected_hash:
-        proposal.status = "stale"
-        raise TargetDrifted(expected_hash, current.hash)
-
-    project_id = int(proposal.project_id)
-    target_kind = str(proposal.target_kind)
-    target_id = str(proposal.target_id)
-    after_content = _coerce_after_content(str(proposal.type), proposal.after_text)
-    if content_hash(after_content) == current.hash:
-        raise PatchRejected(
-            "提案的 after 与目标当前内容一致（可能已被其它改动达成）——拒绝重复应用"
-        )
-
-    snapshot = _build_snapshot(
-        target_kind=target_kind,
-        target_id=target_id,
-        proposal_type=str(proposal.type),
-        before=current,
-        after_content=after_content,
-        reason=proposal.reason,
-        evidence=proposal.evidence_json if isinstance(proposal.evidence_json, list) else [],
-        source_proposal_id=proposal.id,
-    )
-
-    # 写业务表 → 写 Version → 改状态（事务由调用方收口 submit/commit）。
-    write_target(db, project_id, target_kind, target_id, after_content)
-    db.flush()
-    version = version_writer(
-        db,
-        proposal_id=proposal.id,
-        project_id=project_id,
-        kind=_version_kind_for(target_kind),
-        snapshot=snapshot,
-        content_hash_value=snapshot["after_hash"],
-        created_by=actor or proposal.approved_by,
-        source_proposal_id=proposal.id,
-        is_restore=False,
-    )
-    proposal.status = "applied"
-    proposal.version_id = version.id
-    proposal.applied_at = _now_utc()
-    return {
-        "proposal_id": proposal.id,
-        "version_id": version.id,
-        "kind": version.kind,
-        "content_hash": version.content_hash,
-        "target_kind": target_kind,
-        "target_id": target_id,
-        "status": proposal.status,
-        "applied_at": proposal.applied_at.isoformat() if proposal.applied_at else None,
     }
 
 
@@ -1014,158 +801,91 @@ def apply_proposal(
     测试 monkeypatch `insert_version_row` 将完全不起作用，回滚测试就会
     变成「测了个寂寞」。
     """
+    validate_action(proposal.status, "apply")
     writer = version_writer if version_writer is not None else insert_version_row
-    try:
-        result = _apply_one_no_commit(
-            db, proposal=proposal, actor=actor, version_writer=writer
+
+    project_id = int(proposal.project_id)
+    target_kind = str(proposal.target_kind)
+    target_id = str(proposal.target_id)
+    scope = proposal.scope_json if isinstance(proposal.scope_json, dict) else {}
+    # 保留 None 与空串的区分意义不大 —— 两者都意味着「没有基线」，
+    # 统一归一成 str 后由下面的 fail-loud 分支接住。
+    raw_hash = scope.get("base_content_hash")
+    expected_hash = "" if raw_hash is None else str(raw_hash)
+
+    # —— 2) 漂移检查 ——
+    current = read_target(db, project_id, target_kind, target_id)
+
+    # 缺基线 → fail loud，**不**当成「无需检测」跳过。
+    #
+    # 旧写法是 `if expected_hash and current.hash != expected_hash:` ——
+    # falsy 的 expected_hash（空串 / None）会让整个漂移分支短路，等于把
+    # 「目标漂移即拒绝」这条不变量的开关交给了请求体。base_content_hash
+    # 由 build_proposal 无条件写入，它缺失只有一种解释：提案构造有 bug
+    # （或被污染），此时正确的动作是拒绝应用并让人来查，而不是放行。
+    if not expected_hash.strip():
+        raise ProposalError(
+            f"提案 {getattr(proposal, 'id', '<unsaved>')} 缺少 "
+            "scope_json.base_content_hash（漂移检测基线缺失）；"
+            "拒绝应用——没有基线的补丁可能覆盖他人的并发修改。"
         )
-        db.commit()
-    except TargetDrifted:
-        # 目标漂移：只把「提案过期」这一事实落库（业务表未被触碰），再冒泡。
-        # 「过期」必须留痕 —— 它不能随 apply 失败一起回滚。
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
-        raise
-    except Exception:
-        db.rollback()
-        raise
-    return result
+    if current.hash != expected_hash:
+        proposal.status = "stale"
+        db.commit()  # 只提交「过期」这一事实，业务表未被触碰
+        raise TargetDrifted(expected_hash, current.hash)
 
+    after_content = _coerce_after_content(
+        str(proposal.type), proposal.after_text
+    )
+    if content_hash(after_content) == current.hash:
+        raise PatchRejected(
+            "提案的 after 与目标当前内容一致（可能已被其它改动达成）——拒绝重复应用"
+        )
 
-def _preflight_selected(
-    db: Any, proposals: list[Any]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """受控批量应用的**只读**预检：逐条判断能否应用。
+    snapshot = _build_snapshot(
+        target_kind=target_kind,
+        target_id=target_id,
+        proposal_type=str(proposal.type),
+        before=current,
+        after_content=after_content,
+        reason=proposal.reason,
+        evidence=proposal.evidence_json if isinstance(proposal.evidence_json, list) else [],
+        source_proposal_id=proposal.id,
+    )
 
-    返回 `(stale, blocked)`：
-
-    - `stale`：目标漂移（基线 ≠ 当前）；
-    - `blocked`：状态不是 `approved` / 缺基线 / 目标行不存在。
-
-    纯 SELECT，不写任何表 —— 「整批要么都成要么都不成」要求先把不能应用的原因
-    全部找出来，再决定动不动手。
-    """
-    stale: list[dict[str, Any]] = []
-    blocked: list[dict[str, Any]] = []
-    for p in proposals:
-        pid = getattr(p, "id", None)
-        if p.status != "approved":
-            blocked.append({
-                "proposal_id": pid, "status": p.status,
-                "reason": f"状态 {p.status!r} 不是 approved",
-            })
-            continue
-        expected = _expected_base_hash(p)
-        if not expected.strip():
-            blocked.append({
-                "proposal_id": pid, "status": p.status,
-                "reason": "缺 scope_json.base_content_hash（漂移检测基线缺失）",
-            })
-            continue
-        try:
-            current = read_target(
-                db, int(p.project_id), str(p.target_kind), str(p.target_id)
-            )
-        except TargetMissing as exc:
-            blocked.append({"proposal_id": pid, "status": p.status, "reason": str(exc)})
-            continue
-        if current.hash != expected:
-            stale.append({
-                "proposal_id": pid,
-                "expected_hash": expected,
-                "current_hash": current.hash,
-            })
-    return stale, blocked
-
-
-def apply_selected(
-    db: Any,
-    *,
-    proposals: list[Any],
-    actor: str | None = None,
-    version_writer: Callable[..., Any] | None = None,
-) -> dict[str, Any]:
-    """受控批量应用：显式枚举的若干 `approved` 提案，**整批同成同败**。
-
-    这是「一本 500 万字小说可能上千处修正、逐条点不现实」的解法，但能力被
-    硬约束封死 —— 它**只**接受调用方已经加载好的一组提案对象（路由器负责
-    「请求体显式枚举 id + 上限校验 + 拒绝通配符」），本函数：
-
-    1. **阶段 1（只读预检）**：逐条查漂移与状态。只要有 stale / blocked →
-       **一条业务表都不写**，只把 stale 标记落库（「过期」这一事实要留痕），
-       返回带逐条原因的失败报告；
-    2. **阶段 2（单事务写入）**：全部可应用时，在**一个事务**内逐条
-       `_apply_one_no_commit`，最后一次性 commit。任一步抛错 → `db.rollback()`，
-       整批回滚，**不留半批次**（也不留半版本）；
-    3. 写入期若检出漂移（预检与写入之间的 TOCTOU）→ 同样整批回滚，重新标记
-       stale 并报告。
-
-    每条应用都写 Version（与单条 apply 同一条快照通道），故整批可逐条回滚。
-
-    返回 `{ok, applied[], stale[], blocked[], reason}`；`ok=False` 表示整批未写入。
-    """
-    from app.models import EditProposal
-
-    writer = version_writer if version_writer is not None else insert_version_row
-    if not proposals:
-        return {"ok": True, "applied": [], "stale": [], "blocked": [], "reason": ""}
-
-    # —— 阶段 1：只读预检 ——
-    stale, blocked = _preflight_selected(db, proposals)
-    if stale or blocked:
-        for item in stale:
-            row = db.get(EditProposal, item["proposal_id"])
-            if row is not None:
-                row.status = "stale"
-        db.commit()
-        return {
-            "ok": False,
-            "applied": [],
-            "stale": stale,
-            "blocked": blocked,
-            "reason": (
-                f"{len(stale)} 条目标已漂移、{len(blocked)} 条状态不符；"
-                "整批未写入（请基于最新内容重新生成对应提案）"
-            ),
-        }
-
-    # —— 阶段 2：单事务内逐条应用 ——
-    applied: list[dict[str, Any]] = []
     try:
-        for p in proposals:
-            applied.append(_apply_one_no_commit(
-                db, proposal=p, actor=actor, version_writer=writer
-            ))
+        # —— 3) 写业务表 → 写 Version → 改状态，全部在一个事务里——
+        write_target(db, project_id, target_kind, target_id, after_content)
+        db.flush()
+        version = writer(
+            db,
+            proposal_id=proposal.id,
+            project_id=project_id,
+            kind=_version_kind_for(target_kind),
+            snapshot=snapshot,
+            content_hash_value=snapshot["after_hash"],
+            created_by=actor or proposal.approved_by,
+            source_proposal_id=proposal.id,
+            is_restore=False,
+        )
+        proposal.status = "applied"
+        proposal.version_id = version.id
+        proposal.applied_at = _now_utc()
         db.commit()
-    except TargetDrifted:
-        # TOCTOU：预检与写入之间目标被改。整批回滚，重新标记 stale 并报告。
-        db.rollback()
-        cur_stale, cur_blocked = _preflight_selected(db, proposals)
-        if not cur_stale:
-            cur_stale = [
-                {"proposal_id": getattr(p, "id", None),
-                 "reason": "写入期目标漂移（预检后被其它改动更新）"}
-                for p in proposals
-            ]
-        for item in cur_stale:
-            row = db.get(EditProposal, item.get("proposal_id"))
-            if row is not None:
-                row.status = "stale"
-        db.commit()
-        return {
-            "ok": False,
-            "applied": [],
-            "stale": cur_stale,
-            "blocked": cur_blocked,
-            "reason": "写入期检出目标漂移，整批已回滚（业务表零写入）",
-        }
     except Exception:
         db.rollback()
         raise
 
-    return {"ok": True, "applied": applied, "stale": [], "blocked": [], "reason": ""}
+    return {
+        "proposal_id": proposal.id,
+        "version_id": version.id,
+        "kind": version.kind,
+        "content_hash": version.content_hash,
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "status": proposal.status,
+        "applied_at": proposal.applied_at.isoformat() if proposal.applied_at else None,
+    }
 
 
 def restore_version(
