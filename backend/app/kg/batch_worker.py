@@ -376,14 +376,17 @@ def _index_mentions_only(db: Session, batch: list[_QueueItem]) -> None:
 
 
 def _lookup_entity_id(db: Session, project_id: int, name: str) -> int | None:
-    """按 canonical_name 或 aliases 反查已有 entity id（跨批关系解析兜底）。
+    """按 canonical_name / aliases / 归一后别名 反查已有 entity id（跨批关系解析兜底）。
 
     本批 entities 里没有、但库里已存在的实体（前批抽过的），关系仍能建上。
     aliases 用 JSON 包含查询（SQLite json_each 兜底用 Python 侧过滤——批抽规模
     小，entity 表通常在千级以内，线性扫可接受）。
+    新增归一兜底：name 是某 entity canonical_name 剥前缀后的核心称谓（如"父亲"），
+    也能反查到该 entity（"林悠然的父亲"）。
     """
     if not name:
         return None
+    # 1) 精确匹配 canonical_name
     ent = db.scalar(
         select(KgEntity).where(
             KgEntity.project_id == project_id, KgEntity.canonical_name == name
@@ -391,15 +394,29 @@ def _lookup_entity_id(db: Session, project_id: int, name: str) -> int | None:
     )
     if ent is not None:
         return ent.id
-    # aliases 反查（Python 侧，避免 SQLite JSON 函数方言问题）
+    # 2) aliases 反查
     for e in db.scalars(select(KgEntity).where(KgEntity.project_id == project_id)):
         if name in (e.aliases or []):
+            return e.id
+    # 3) 归一反查：name 是某 entity 剥修饰词后的核心称谓（如"父亲" → "林悠然的父亲"）
+    from app.kg.entity_resolve import should_merge
+    for e in db.scalars(select(KgEntity).where(KgEntity.project_id == project_id)):
+        if should_merge(name, e.canonical_name):
             return e.id
     return None
 
 
 def _upsert_entity(db: Session, project_id: int, e: dict):
-    """entity upsert：aliases 合并，attrs 深合并。"""
+    """entity upsert：aliases 合并，attrs 深合并。
+
+    三层匹配（漏报优于误报）：
+    1. canonical_name 完全相等 → 标准 upsert
+    2. 归一等价（entity_resolve.should_merge）→ 短名并入长名，
+       短名作为别名加到长名的 aliases
+    3. 都不匹配 → 新建
+    """
+    from app.kg.entity_resolve import should_merge, merge_target
+
     ent = db.scalar(
         select(KgEntity).where(
             KgEntity.project_id == project_id,
@@ -407,6 +424,26 @@ def _upsert_entity(db: Session, project_id: int, e: dict):
             KgEntity.canonical_name == e["canonical_name"],
         )
     )
+    if ent is None:
+        # 归一匹配：遍历同 kind 的现有 entity，找"长名含本名修饰词"或反向
+        for existing in db.scalars(
+            select(KgEntity).where(
+                KgEntity.project_id == project_id, KgEntity.kind == e["kind"]
+            )
+        ):
+            if should_merge(e["canonical_name"], existing.canonical_name):
+                # 现有是长名（如"林悠然的父亲"），新来是短名（如"父亲"）→ 并入现有
+                ent = existing
+                break
+            if should_merge(existing.canonical_name, e["canonical_name"]):
+                # 现有是短名，新来是长名 → 长名是 canonical，短名做 alias
+                # 把现有的 aliases 搬过来
+                old_aliases = existing.aliases or []
+                new_aliases = list(dict.fromkeys(old_aliases + [existing.canonical_name]))
+                existing.canonical_name = e["canonical_name"]
+                existing.aliases = new_aliases[:20]
+                ent = existing
+                break
     if ent is None:
         ent = KgEntity(
             project_id=project_id, kind=e["kind"],
@@ -417,9 +454,15 @@ def _upsert_entity(db: Session, project_id: int, e: dict):
         db.add(ent)
         db.flush()  # 拿 id
         return ent
-    # 已存在：合并 aliases（去重）+ attrs 深合并（新键覆盖旧值）
+    # 已存在：合并 aliases（去重）+ attrs 深合并
     old_aliases = ent.aliases or []
-    merged = list(dict.fromkeys(old_aliases + (e.get("aliases") or [])))
+    new_aliases = e.get("aliases") or []
+    # 归一关键：把"对方原 canonical_name"也加进 aliases——
+    # 否则短名"父亲"并入长名"林悠然的父亲"后，aliases 仍是 []，
+    # 后续按"父亲"反查仍走归一路径而非 aliases 路径（效率低）
+    if e["canonical_name"] != ent.canonical_name:
+        new_aliases = list(new_aliases) + [e["canonical_name"]]
+    merged = list(dict.fromkeys(old_aliases + new_aliases))
     if merged != old_aliases:
         ent.aliases = merged[:20]
     old_attrs = ent.attrs or {}
