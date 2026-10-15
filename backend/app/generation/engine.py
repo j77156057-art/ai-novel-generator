@@ -185,6 +185,15 @@ def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -
     except Exception as exc:  # noqa: BLE001
         stats["sentinel"] = {"error": str(exc)[:100], "findings": []}
 
+    # v3.0 独立 Judge Agent：只读 v3.0 KG 表，覆盖哨兵没做的瞬移/预知/时间穿越/
+    # 伏笔超期/语言一致性。与哨兵并列（都只标红不改正文），失败同样不阻断。
+    try:
+        from app.kg.judge import judge_segment
+
+        stats["judge"] = judge_segment(db, project_id, text, segment_no)
+    except Exception as exc:  # noqa: BLE001
+        stats["judge"] = {"error": str(exc)[:100], "findings": []}
+
     return stats
 
 
