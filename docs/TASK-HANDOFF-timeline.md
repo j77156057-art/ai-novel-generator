@@ -33,6 +33,7 @@
 | eb8e526 | v2.3 流式版时间线集成（generate_next_segment_stream + regenerate_segment_stream） |
 | 6ea841f | v2.4 高潮密度蒸馏（Project.plot_rhythm + classify_chapter_emotion + distill_avg_node_segments） |
 | 6c5774c | v2.5 支线滚动触发器（KG-driven，detect_kg_signal + should_roll + plan_branch） |
+| 7b9a60f | v2.5 阶段 2/3（流式版补 v2.5 集成 + build_node_prompt 区分 main/branch） |
 
 核心设计（详见 docs/timeline-pacing-design.md）：
 - 根因：generate_next_segment 每段把整条 outline + plot_bible 的 synopsis/direction（含结局走向）一次性塞进 prompt，模型必然第一章讲完
@@ -54,7 +55,8 @@
 - 服务重启后第一次 generate-plan 不再调 plan_nodes_with_llm
   （端到端验证：探针确认未触发，current_node 立即是已推进的节点）
 
-无未提交改动。下一个断点是合并回主线（清单全部完成，v2 剩余两项已落地）。
+无未提交改动。v2.5 阶段 2/3 已合到 master（5d0b0a8）。
+下一个断点是节点粒度彻底根治（清单最后项），或等网络 push。
 
 ## 四、§11.4 端到端验证（已完成）
 
@@ -82,10 +84,6 @@
 
 ## 五、后续待办
 
-- v2.5 阶段 2：流式版（generate_next_segment_stream）补 v2.5 集成
-  ——需要先补流式版 _merge_segment_into_graph 调用（v2.3 之前就缺）
-- v2.5 阶段 3：build_node_prompt 区分 main/branch（当前支线段用
-  main 写法生成，节点切了但 prompt 措辞没区分）
 - **彻底根治节点粒度（最后攻破）**：v2.2 已是 prompt 工程极限（剔除全
   端到端验证：v2.1 真智谱下第一段不再演结局，judge 仍能识别 exit 达成。
   剩余边角：few-shot 风格样例仍会"顺手带出"未提及角色（如红楼梦薛姨妈
@@ -100,6 +98,7 @@
 
 ## 六、分支全局状态
 
-- 本 worktree：feat/timeline-pacing，HEAD 6c5774c（v2.5 提交），工作树干净
+- 本 worktree：feat/timeline-pacing，HEAD 7b9a60f（v2.5 阶段 2/3 提交），工作树干净
+- master HEAD 5d0b0a8（已合 v2.5 阶段 2/3）
 - 另一 worktree worktrees/style-distill（feat/style-distillation）：风格蒸馏，独立，别动
 - 主线 master 有其他 agent 的大量未提交改动（config/llm/generation/schemas/frontend），本分支从干净 5bb5701 切的，别去主线 worktree 操作
