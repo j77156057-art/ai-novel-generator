@@ -185,12 +185,20 @@ def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -
     except Exception as exc:  # noqa: BLE001
         stats["sentinel"] = {"error": str(exc)[:100], "findings": []}
 
-    # v3.0 独立 Judge Agent：只读 v3.0 KG 表，覆盖哨兵没做的瞬移/预知/时间穿越/
-    # 伏笔超期/语言一致性。与哨兵并列（都只标红不改正文），失败同样不阻断。
+    # v3.0 独立 Judge Agent：只读 v3.0 KG 表，覆盖哨兵没做的瞬移/预知/秘密外泄/
+    # 时间穿越/伏笔超期/语言一致性。与哨兵并列（都只标红不改正文），失败同样不阻断。
     try:
-        from app.kg.judge import judge_segment
+        from app.kg.judge import judge_segment, save_judge_findings
 
-        stats["judge"] = judge_segment(db, project_id, text, segment_no)
+        judge_res = judge_segment(db, project_id, text, segment_no)
+        # findings 必须落库（与哨兵同纪律）：只放单次响应里的告警，用户没盯着
+        # 就永远丢了，事后无法复核。落库失败不阻断生成。
+        try:
+            save_judge_findings(db, project_id, judge_res.get("findings", []),
+                                segment_no=segment_no)
+        except Exception:  # noqa: BLE001
+            pass
+        stats["judge"] = judge_res
     except Exception as exc:  # noqa: BLE001
         stats["judge"] = {"error": str(exc)[:100], "findings": []}
 

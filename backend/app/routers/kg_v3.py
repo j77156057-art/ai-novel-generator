@@ -179,3 +179,126 @@ def list_exemptions(project_id: int, db: Session = Depends(get_db)) -> dict:
         {"rule": r.props.get("rule"), "entity": r.props.get("entity"),
          "note": r.props.get("note")} for r in rows
     ]}
+
+
+@router.delete("/exemptions")
+def revoke_exemption(
+    project_id: int,
+    rule: str = Query(..., description="要撤销的告警规则名"),
+    entity: str = Query("", description="要撤销的实体名（可为空串）"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """撤销作者豁免：删掉对应 Fact(type=exemption)，Judge 恢复报告该告警。
+
+    加错的豁免（规则名拼错/后悔了）必须有出口——永久静音比误报更糟。
+    """
+    _require_project(db, project_id)
+    from app.models import Fact
+
+    rows = db.scalars(select(Fact).where(
+        Fact.project_id == project_id, Fact.type == "exemption"
+    )).all()
+    removed = 0
+    for r in rows:
+        p = r.props or {}
+        if (p.get("rule") or "") == rule and (p.get("entity") or "") == entity:
+            db.delete(r)
+            removed += 1
+    db.commit()
+    return {"revoked": removed, "rule": rule, "entity": entity}
+
+
+@router.get("/judge/findings")
+def list_judge_findings(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """Judge 告警历史（落库的，按段号倒序）。只读，不触发重新判定。
+
+    与哨兵 /alerts 同形状：items + by_severity + rules 清单——
+    只看告警列表会以为「没告警=没问题」，实际有规则可能沉默。
+    """
+    _require_project(db, project_id)
+    from app.kg.judge import RULES, load_judge_findings
+
+    items = load_judge_findings(db, project_id)
+    # 已豁免的 (rule, entity) 单独标出——历史清单里能看到「这条曾被豁免」
+    from app.models import Fact
+
+    exempt_rows = db.scalars(select(Fact).where(
+        Fact.project_id == project_id, Fact.type == "exemption"
+    )).all()
+    exempt = {(r.props.get("rule") or "", r.props.get("entity") or "") for r in exempt_rows}
+    for it in items:
+        it["exempted"] = (it["rule"], it["entity"]) in exempt
+    return {
+        "items": items,
+        "count": len(items),
+        "by_severity": {
+            s: sum(1 for i in items if i["severity"] == s) for s in ("err", "warn")
+        },
+        "rules": {name: {"severity": sev, "desc": desc} for name, (sev, desc) in RULES.items()},
+    }
+
+
+@router.get("/characters")
+def list_characters(
+    project_id: int,
+    limit: int = Query(200, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> dict:
+    """项目角色清单（人物情报页的左列）。mention 降序。"""
+    _require_project(db, project_id)
+    from app.models import KgEntity
+
+    rows = db.scalars(
+        select(KgEntity)
+        .where(KgEntity.project_id == project_id, KgEntity.kind == "character")
+        .order_by(KgEntity.mention_count.desc())
+        .limit(limit)
+    ).all()
+    return {"characters": [
+        {
+            "id": r.id, "name": r.canonical_name,
+            "mention_count": r.mention_count or 0,
+            "has_secrets": bool((r.attrs or {}).get("secrets")),
+        }
+        for r in rows
+    ]}
+
+
+@router.get("/relations")
+def list_relations(
+    project_id: int,
+    limit: int = Query(300, ge=1, le=1000),
+    db: Session = Depends(get_db),
+) -> dict:
+    """关系清单（关系图/列表数据源）。strength 降序。
+
+    边带两端实体名与 kind（画图不用二次查）；自环边（from==to）丢弃。
+    """
+    _require_project(db, project_id)
+    from app.models import KgEntity, KgRelation
+
+    rows = db.scalars(
+        select(KgRelation)
+        .where(KgRelation.project_id == project_id)
+        .order_by(KgRelation.strength.desc())
+        .limit(limit)
+    ).all()
+    ents: dict[int, KgEntity] = {}
+    out = []
+    for r in rows:
+        if r.from_id == r.to_id:
+            continue
+        a = ents.get(r.from_id) or db.get(KgEntity, r.from_id)
+        b = ents.get(r.to_id) or db.get(KgEntity, r.to_id)
+        if a is not None:
+            ents[r.from_id] = a
+        if b is not None:
+            ents[r.to_id] = b
+        if a is None or b is None:
+            continue
+        out.append({
+            "from": a.canonical_name, "to": b.canonical_name,
+            "from_kind": a.kind, "to_kind": b.kind,
+            "rel_type": r.rel_type, "strength": r.strength,
+        })
+    return {"relations": out}

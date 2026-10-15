@@ -437,6 +437,72 @@ def _load_exemptions(db, project_id: int) -> set[tuple[str, str]]:
         return set()
 
 
+#: Judge 告警的 Fact 类型。**必须落库**（与哨兵 T_ALERT 同理）：只放在单次
+#: 生成响应里的告警，用户当时没看就永远丢了，也就无法复核「上次那条是不是误报」。
+#: 所有事实消费方都按显式类型过滤，新类型不会漏进提示词或提醒。
+T_JUDGE_ALERT = "kg_judge"
+
+
+def save_judge_findings(db, project_id: int, findings: list[dict], *,
+                        segment_no: int) -> int:
+    """把本段 Judge findings 落进事实表（哨兵 save_findings 同款语义）。
+
+    findings 是 judge_segment 返回的已序列化 dict 列表。
+    先清后写：同段重跑（重新生成）时旧告警被替换，不累积陈旧条目——
+    「段落改好了、旧告警还挂着」比没有告警更糟。
+    key = `{rule}:{entity}:{segment_no}:{idx}`：同段同规则同实体各条分开
+    （idx 是 finding 在本段的序号），重跑时整段替换。
+    """
+    from app.models import Fact
+
+    old = db.scalars(select(Fact).where(
+        Fact.project_id == project_id, Fact.type == T_JUDGE_ALERT
+    )).all()
+    for row in old:
+        # 只清本段的：其它段的告警是历史记录
+        if row.last_segment == segment_no:
+            db.delete(row)
+    n = 0
+    for idx, f in enumerate(findings):
+        rule = f.get("rule") or ""
+        entity = f.get("entity") or ""
+        db.add(Fact(
+            project_id=project_id, type=T_JUDGE_ALERT,
+            key=f"{rule}:{entity}:{segment_no}:{idx}",
+            props={
+                "rule": rule, "entity": entity,
+                "severity": f.get("severity") or "warn",
+                "message": f.get("message") or "",
+                "evidence": f.get("evidence") or [],
+                "segment_no": segment_no,
+            },
+            source="judge_v3", confidence="high",
+            first_segment=segment_no, last_segment=segment_no,
+        ))
+        n += 1
+    db.commit()
+    return n
+
+
+def load_judge_findings(db, project_id: int) -> list[dict]:
+    """读回落库的 Judge 告警（按段号倒序——最近的先看）。"""
+    from app.models import Fact
+
+    rows = db.scalars(select(Fact).where(
+        Fact.project_id == project_id, Fact.type == T_JUDGE_ALERT
+    )).all()
+    out = [{
+        "rule": (r.props or {}).get("rule") or "",
+        "severity": (r.props or {}).get("severity") or "warn",
+        "segment_no": r.last_segment,
+        "entity": (r.props or {}).get("entity") or "",
+        "message": (r.props or {}).get("message") or "",
+        "evidence": (r.props or {}).get("evidence") or [],
+    } for r in rows]
+    out.sort(key=lambda d: (d["segment_no"] or 0), reverse=True)
+    return out
+
+
 def judge_segment(db, project_id: int, text: str, segment_no: int,
                   current_chapter: int | None = None) -> dict:
     """审计一段：跑全部规则，返回 {findings, rules}。
