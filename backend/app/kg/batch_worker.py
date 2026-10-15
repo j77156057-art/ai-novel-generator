@@ -218,7 +218,11 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             rel.strength = r.get("strength", 0.5)
 
     # —— 3. events 追加（sequence 项目内连续）——
+    # seq_map：LLM 给的批内 sequence → 落库后的实际 event.id。
+    # event_links / entity_knowledge 用 sequence 引用事件（LLM 不知道自增 id），
+    # 必须 flush 拿到 id 后才能解析——两段式落库。
     base_seq = _next_event_sequence(db, project_id)
+    seq_map: dict[int, int] = {}
     for i, ev in enumerate(result.get("events", [])):
         subject_id = name_to_id.get(ev.get("subject") or "") or _lookup_entity_id(db, project_id, ev.get("subject") or "")
         object_id = name_to_id.get(ev.get("object") or "") or _lookup_entity_id(db, project_id, ev.get("object") or "")
@@ -238,6 +242,61 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         )
         db.add(event)
         stats.events_added += 1
+    db.flush()  # 拿 event.id 建 sequence→id 映射
+    # 重新查本批 events（flush 后 id 已分配），按 sequence 排序对齐 LLM 的批内序号
+    db_events = db.scalars(
+        select(KgEvent).where(
+            KgEvent.project_id == project_id,
+            KgEvent.sequence >= base_seq,
+        ).order_by(KgEvent.sequence)
+    ).all()
+    for pos, ev in enumerate(result.get("events", [])):
+        llm_seq = ev.get("sequence")
+        if llm_seq is not None and pos < len(db_events):
+            seq_map[llm_seq] = db_events[pos].id
+
+    # —— 3.5 event_links（用 sequence→id 映射解析事件引用）——
+    for lk in result.get("event_links", []):
+        from_eid = seq_map.get(lk.get("from_sequence"))
+        to_eid = seq_map.get(lk.get("to_sequence"))
+        if from_eid is None or to_eid is None:
+            continue
+        existing = db.scalar(
+            select(KgEventLink).where(
+                KgEventLink.project_id == project_id,
+                KgEventLink.from_event_id == from_eid,
+                KgEventLink.to_event_id == to_eid,
+                KgEventLink.link_type == lk.get("link_type"),
+            )
+        )
+        if existing is None:
+            db.add(KgEventLink(
+                project_id=project_id, from_event_id=from_eid, to_event_id=to_eid,
+                link_type=lk.get("link_type"),
+            ))
+            stats.event_links_added += 1
+
+    # —— 3.6 entity_knowledge（人物情报，learned_at 用 sequence 解析）——
+    for k in result.get("entity_knowledge", []):
+        char_id = name_to_id.get(k.get("character") or "") or _lookup_entity_id(db, project_id, k.get("character") or "")
+        known_id = name_to_id.get(k.get("knows") or "") or _lookup_entity_id(db, project_id, k.get("knows") or "")
+        if char_id is None or known_id is None or char_id == known_id:
+            continue
+        learned_event_id = seq_map.get(k.get("learned_at_sequence"))
+        existing = db.scalar(
+            select(KgEntityKnowledge).where(
+                KgEntityKnowledge.project_id == project_id,
+                KgEntityKnowledge.entity_id == char_id,
+                KgEntityKnowledge.known_entity_id == known_id,
+                KgEntityKnowledge.learned_at_event_id == learned_event_id,
+            )
+        )
+        if existing is None:
+            db.add(KgEntityKnowledge(
+                project_id=project_id, entity_id=char_id, known_entity_id=known_id,
+                known_kind=k.get("known_kind", "entity"), learned_at_event_id=learned_event_id,
+            ))
+            stats.entity_knowledge_added += 1
 
     # —— 4. state_changes ——
     for s in result.get("state_changes", []):

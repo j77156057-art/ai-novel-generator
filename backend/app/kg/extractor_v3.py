@@ -22,6 +22,8 @@ _FIELD_ALIASES = {
     "entities": ("entities", "characters", "人物", "实体"),
     "relations": ("relations", "relationships", "关系"),
     "events": ("events", "事件"),
+    "event_links": ("event_links", "eventLinks", "causality", "因果链", "事件链"),
+    "entity_knowledge": ("entity_knowledge", "entityKnowledge", "knowledge", "情报", "人物情报"),
     "state_changes": ("state_changes", "stateChanges", "character_states", "状态变化"),
     "foreshadows": ("foreshadows", "伏笔"),
 }
@@ -64,6 +66,19 @@ _FORESHADOW_ALIASES = {
     "planted_chapter": ("planted_chapter", "planted", "埋下章"),
     "planned_payoff_chapter": ("planned_payoff_chapter", "planned_payoff", "计划回收章"),
 }
+# event_link 字段别名
+_EVENT_LINK_ALIASES = {
+    "from_sequence": ("from_sequence", "from_seq", "from", "from_event", "源事件"),
+    "to_sequence": ("to_sequence", "to_seq", "to", "to_event", "目标事件"),
+    "link_type": ("link_type", "type", "关系", "link"),
+}
+# entity_knowledge 字段别名
+_KNOWLEDGE_ALIASES = {
+    "character": ("character", "entity", "角色", "name"),
+    "knows": ("knows", "known", "fact", "known_entity", "知道"),
+    "known_kind": ("known_kind", "kind", "类型"),
+    "learned_at_sequence": ("learned_at_sequence", "learned_at", "learned_at_seq", "learned_at_event", "学到于"),
+}
 
 # 合法取值域（抽取结果超域值丢弃/归一，防 LLM 幻觉）
 VALID_ENTITY_KINDS = {"character", "location", "faction", "item", "worldrule", "power_system"}
@@ -74,6 +89,8 @@ VALID_EVENT_TYPES = {
     "incident", "revelation", "foreshadow_plant", "foreshadow_payoff", "death",
     "romance_milestone", "battle", "decision", "time_marker",
 }
+VALID_EVENT_LINK_TYPES = {"caused_by", "causes", "follows", "resolves", "reverses", "parallel"}
+VALID_KNOWN_KINDS = {"entity", "event", "secret"}
 VALID_STATE_TYPES = {"location", "injury", "mood", "goal", "inventory", "alive"}
 VALID_FORESHADOW_STATUS = {"planted", "developing", "paid_off", "dropped", "expired"}
 
@@ -130,12 +147,15 @@ def normalize_extraction(raw: dict) -> dict:
     - 缺键字段按类型默认值兜底（不阻塞落库）
     """
     if not isinstance(raw, dict):
-        return {"entities": [], "relations": [], "events": [], "state_changes": [], "foreshadows": []}
+        return {"entities": [], "relations": [], "events": [], "event_links": [],
+                "entity_knowledge": [], "state_changes": [], "foreshadows": []}
 
     out = {
         "entities": [],
         "relations": [],
         "events": [],
+        "event_links": [],
+        "entity_knowledge": [],
         "state_changes": [],
         "foreshadows": [],
     }
@@ -184,6 +204,7 @@ def normalize_extraction(raw: dict) -> dict:
             et = "incident"
         summary = _as_str(_pick(ev, _EVENT_ALIASES["summary"]))
         out["events"].append({
+            "sequence": _as_int(_pick(ev, _EVENT_ALIASES["sequence"])),  # 批内序号，供 links/knowledge 引用
             "chapter": _as_int(_pick(ev, _EVENT_ALIASES["chapter"])),
             "event_type": et,
             "summary": summary[:500],
@@ -225,6 +246,41 @@ def normalize_extraction(raw: dict) -> dict:
             "planned_payoff_chapter": _as_int(_pick(f, _FORESHADOW_ALIASES["planned_payoff_chapter"])),
         })
 
+    # —— event_links（事件因果链，用批内 sequence 引用）——
+    for lk in _as_list(_pick(raw, _FIELD_ALIASES["event_links"])):
+        if not isinstance(lk, dict):
+            continue
+        from_seq = _as_int(_pick(lk, _EVENT_LINK_ALIASES["from_sequence"]))
+        to_seq = _as_int(_pick(lk, _EVENT_LINK_ALIASES["to_sequence"]))
+        lt = _as_str(_pick(lk, _EVENT_LINK_ALIASES["link_type"]))
+        if from_seq is None or to_seq is None or from_seq == to_seq:
+            continue
+        if lt not in VALID_EVENT_LINK_TYPES:
+            continue
+        out["event_links"].append({
+            "from_sequence": from_seq,
+            "to_sequence": to_seq,
+            "link_type": lt,
+        })
+
+    # —— entity_knowledge（人物情报，learned_at_sequence 引用事件）——
+    for k in _as_list(_pick(raw, _FIELD_ALIASES["entity_knowledge"])):
+        if not isinstance(k, dict):
+            continue
+        char = _as_str(_pick(k, _KNOWLEDGE_ALIASES["character"]))
+        knows = _as_str(_pick(k, _KNOWLEDGE_ALIASES["knows"]))
+        if not char or not knows or char == knows:
+            continue
+        kk = _as_str(_pick(k, _KNOWLEDGE_ALIASES["known_kind"])) or "entity"
+        if kk not in VALID_KNOWN_KINDS:
+            kk = "entity"
+        out["entity_knowledge"].append({
+            "character": char,
+            "knows": knows,
+            "known_kind": kk,
+            "learned_at_sequence": _as_int(_pick(k, _KNOWLEDGE_ALIASES["learned_at_sequence"])),
+        })
+
     return out
 
 
@@ -239,10 +295,14 @@ _EXTRACT_SYSTEM = (
     '"current_goal": "当前目标", "secrets": ["秘密"]}}],\n'
     '  "relations": [{"from": "角色名", "to": "角色名", "rel_type": '
     '"ally|enemy|mentor|subordinate|romantic|belongs_to|located_at|owns", "strength": 0.5}],\n'
-    '  "events": [{"chapter": 1, "event_type": "incident|revelation|foreshadow_plant|'
+    '  "events": [{"sequence": 1, "chapter": 1, "event_type": "incident|revelation|foreshadow_plant|'
     'foreshadow_payoff|death|romance_milestone|battle|decision|time_marker", '
     '"summary": "SVO 事件描述", "subject": "主体名", "verb": "动作", "object": "客体名", '
     '"location": "地点名", "in_story_date": "故事内时间（如贞观三年秋）"}],\n'
+    '  "event_links": [{"from_sequence": 1, "to_sequence": 2, "link_type": '
+    '"caused_by|causes|follows|resolves|reverses|parallel"}],\n'
+    '  "entity_knowledge": [{"character": "角色名", "knows": "另一角色/地点/事实名", '
+    '"known_kind": "entity|event|secret", "learned_at_sequence": 1}],\n'
     '  "state_changes": [{"character": "角色名", "state_type": '
     '"location|injury|mood|goal|inventory|alive", "new_value": "变化后的值"}],\n'
     '  "foreshadows": [{"name": "伏笔名", "status": "planted|developing|paid_off|dropped", '
@@ -252,7 +312,12 @@ _EXTRACT_SYSTEM = (
     "- 只抽文本中**确实出现**的实体，不推测、不虚构\n"
     "- character 必须有名字；location/faction/item 用其规范称呼\n"
     "- 没有的类别输出空数组 []\n"
-    "- in_story_date 只在文本有明确时间线索时填，否则留空字符串"
+    "- in_story_date 只在文本有明确时间线索时填，否则留空字符串\n"
+    "- events 的 sequence 从 1 开始连续编号（本批内），供 event_links/entity_knowledge 引用\n"
+    "- event_links 用 sequence 引用事件（不要用事件描述），描述本批事件间因果/时序关系；\n"
+    "  伏笔回收用 link_type=resolves\n"
+    "- entity_knowledge：当文本明确表现某角色**得知**了另一角色/事实（被告知/看到/发现）时抽取，\n"
+    "  learned_at_sequence 指向得知发生的事件 sequence；不臆测角色已知什么"
 )
 
 # 段落标注前缀：让 LLM 知道当前段落在故事中的位置（批抽时用）
@@ -339,6 +404,8 @@ class ExtractionStats:
     entities_new: int = 0
     relations_upserted: int = 0
     events_added: int = 0
+    event_links_added: int = 0
+    entity_knowledge_added: int = 0
     state_changes: int = 0
     foreshadows: int = 0
     errors: list = field(default_factory=list)

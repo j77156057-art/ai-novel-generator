@@ -122,6 +122,31 @@ check("非法 rel_type 丢弃", len(n2["relations"]), 1)
 check("自环 relation 丢弃", n2["relations"][0]["to"], "王五")
 check("非法 state_type 丢弃", len(n2["state_changes"]), 1)
 
+# event_links / entity_knowledge normalize（别名 + 枚举丢弃 + 自环丢弃）
+raw_links = {
+    "event_links": [
+        {"from_seq": 1, "to_seq": 2, "type": "resolves"},   # 别名 + 合法 → 留
+        {"from_seq": 1, "to_seq": 1, "link_type": "causes"},  # 自环 → 丢
+        {"from_seq": 1, "to_seq": 2, "link_type": "friend"},  # 非法枚举 → 丢
+        {"from_seq": 1, "link_type": "causes"},               # 缺 to → 丢
+    ],
+    "entity_knowledge": [
+        {"character": "林悠然", "knows": "顾辰逸", "kind": "entity", "learned_at": 1},  # 别名 → 留
+        {"character": "林悠然", "knows": "林悠然", "known_kind": "entity"},            # 自己知道自 → 丢
+        {"character": "林悠然", "knows": "顾辰逸", "known_kind": "thing"},             # 非法 known_kind → 归 entity
+    ],
+}
+nl = normalize_extraction(raw_links)
+check("event_links 归一后 1 条", len(nl["event_links"]), 1)
+check("event_links link_type", nl["event_links"][0]["link_type"], "resolves")
+check("event_links from/to", (nl["event_links"][0]["from_sequence"], nl["event_links"][0]["to_sequence"]), (1, 2))
+check("entity_knowledge 归一后 2 条", len(nl["entity_knowledge"]), 2)
+check("entity_knowledge known_kind 归 entity", nl["entity_knowledge"][1]["known_kind"], "entity")
+
+# 空骨架含新键
+check("空骨架含 event_links", normalize_extraction({})["event_links"], [])
+check("空骨架含 entity_knowledge", normalize_extraction({})["entity_knowledge"], [])
+
 # ====================================================================
 # 3. strength 截断 + 缺键兜底
 # ====================================================================
@@ -146,9 +171,9 @@ check("entity 缺 attrs 兜底", n3["entities"][0]["attrs"], {})
 # ====================================================================
 # 4. 顶层非 dict / None / 空
 # ====================================================================
-check("None 输入空骨架", normalize_extraction(None), {"entities": [], "relations": [], "events": [], "state_changes": [], "foreshadows": []})
-check("list 输入空骨架", normalize_extraction([1, 2]), {"entities": [], "relations": [], "events": [], "state_changes": [], "foreshadows": []})
-check("空 dict 空骨架", normalize_extraction({}), {"entities": [], "relations": [], "events": [], "state_changes": [], "foreshadows": []})
+check("None 输入空骨架", normalize_extraction(None), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
+check("list 输入空骨架", normalize_extraction([1, 2]), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
+check("空 dict 空骨架", normalize_extraction({}), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
 check("顶层 list 值兜底", len(normalize_extraction({"entities": "not a list"})["entities"]), 0)
 
 # ====================================================================
@@ -163,8 +188,8 @@ check("带前后垃圾解析", _parse_and_normalize(messy)["entities"][0]["canon
 think = "让我想想..." + good + "结论如上"
 check("think 块包裹解析", _parse_and_normalize(think)["entities"][0]["canonical_name"], "甲")
 
-check("空字符串兜底", _parse_and_normalize(""), {"entities": [], "relations": [], "events": [], "state_changes": [], "foreshadows": []})
-check("垃圾非 JSON 兜底", _parse_and_normalize("完全不是 JSON 的输出"), {"entities": [], "relations": [], "events": [], "state_changes": [], "foreshadows": []})
+check("空字符串兜底", _parse_and_normalize(""), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
+check("垃圾非 JSON 兜底", _parse_and_normalize("完全不是 JSON 的输出"), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
 
 # ====================================================================
 # 6. extract_segment / extract_batch（mock provider）
@@ -234,8 +259,12 @@ result = {
         {"from": "林悠然", "to": "顾辰逸", "rel_type": "romantic", "strength": 0.6},
     ],
     "events": [
-        {"chapter": 1, "event_type": "incident", "summary": "林悠然推开门", "subject": "林悠然",
+        {"sequence": 1, "chapter": 1, "event_type": "incident", "summary": "林悠然推开门", "subject": "林悠然",
          "verb": "推开门", "object": "", "location": "办公室", "in_story_date": "2024年春"},
+    ],
+    "event_links": [],  # 单事件无链，见下方多事件批
+    "entity_knowledge": [
+        {"character": "林悠然", "knows": "顾辰逸", "known_kind": "entity", "learned_at_sequence": 1},
     ],
     "state_changes": [
         {"character": "林悠然", "state_type": "location", "new_value": "办公室"},
@@ -284,6 +313,14 @@ check("state_change new_value", sts[0].new_value, "办公室")
 fss = db.scalars(select(KgForeshadow).where(KgForeshadow.project_id == 1)).all()
 check("foreshadow 行数", len(fss), 1)
 check("foreshadow status", fss[0].status, "planted")
+
+# entity_knowledge 落库（林悠然知道顾辰逸，learned_at=event1）
+from app.models import KgEntityKnowledge, KgEventLink
+check("落库 stats entity_knowledge", stats.entity_knowledge_added, 1)
+knows = db.scalars(select(KgEntityKnowledge).where(KgEntityKnowledge.project_id == 1)).all()
+check("entity_knowledge 行数", len(knows), 1)
+check("entity_knowledge known_kind", knows[0].known_kind, "entity")
+check("entity_knowledge 学到于 event1", knows[0].learned_at_event_id, evs[0].id)
 
 # mentions 反向索引
 mns = db.scalars(select(KgMention).where(KgMention.project_id == 1)).all()
@@ -341,6 +378,33 @@ bw._persist_extraction(db, 1, result3, batch)
 db.refresh(fs)
 check("foreshadow 状态不后退", fs.status, "developing")
 
+# event_links 多事件落库：新批 2 事件（seq1→seq2 caused_by）+ 解析为真实 id
+result4 = {
+    "events": [
+        {"sequence": 1, "chapter": 3, "event_type": "incident", "summary": "项目危机爆发", "subject": "林悠然"},
+        {"sequence": 2, "chapter": 4, "event_type": "revelation", "summary": "辰逸伸出援手", "subject": "顾辰逸"},
+    ],
+    "event_links": [
+        {"from_sequence": 2, "to_sequence": 1, "link_type": "resolves"},  # 辰逸援手解决危机
+    ],
+    "entity_knowledge": [
+        {"character": "林悠然", "knows": "顾辰逸", "known_kind": "entity", "learned_at_sequence": 2},
+    ],
+}
+stats4 = bw._persist_extraction(db, 1, result4, batch)
+check("event_links stats", stats4.event_links_added, 1)
+links = db.scalars(select(KgEventLink).where(KgEventLink.project_id == 1)).all()
+check("event_links 落库行数", len(links), 1)
+check("event_links link_type", links[0].link_type, "resolves")
+# link 两端应是 result4 的两个新事件（sequence 接续在 2 之后 → 3,4）
+new_evs = db.scalars(select(KgEvent).where(KgEvent.project_id == 1).order_by(KgEvent.sequence)).all()
+check("event_links from 是新事件", links[0].from_event_id, new_evs[-1].id)  # seq4 = 辰逸援手
+check("event_links to 是新事件", links[0].to_event_id, new_evs[-2].id)  # seq3 = 危机爆发
+
+# entity_knowledge 幂等：林悠然→顾辰逸 learned_at 换了新事件，应新增一行
+check("entity_knowledge 二次 stats", stats4.entity_knowledge_added, 1)
+check("entity_knowledge 累计行数", db.scalar(select(func.count()).select_from(KgEntityKnowledge).where(KgEntityKnowledge.project_id == 1)), 2)
+
 # ====================================================================
 # 9. 无 provider 降级不炸
 # ====================================================================
@@ -350,7 +414,7 @@ check("无 provider 降级不炸", True, True)
 # ====================================================================
 # 10. _next_event_sequence / _window_around 纯函数
 # ====================================================================
-check("next_event_sequence 接续", bw._next_event_sequence(db, 1), 3)
+check("next_event_sequence 接续", bw._next_event_sequence(db, 1), 5)
 win = bw._window_around("前面很多字……林悠然推开门……后面很多字", "林悠然")
 check_true("window_around 含名字", "林悠然" in win)
 check_true("window_around 长度受限", len(win) <= 60)
