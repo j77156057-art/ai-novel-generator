@@ -72,21 +72,6 @@ class Project(Base):
     # 「用哪一档算」的意图。产出里已经记了 tier，但那是结果不是偏好——用户改档
     # 之后要靠本字段才知道下次该按哪档重算。
     narrative_tier = Column(String(16), nullable=True)
-    # 时间线状态存档（§11.3）：替代进程内「已写段数重放 advance」恢复。
-    # JSON：{version, nodes, done, current_node, current_beat, branch_used, seg_counts, current_main_idx}
-    # 节点内容（title/entry/exit/beats/emotion）首次 §7.3 调 LLM 填实后落库，
-    # 之后段间推进只更新 done/current_*/seg_counts，不再调 LLM。
-    # 空表示「未启用时间线」或「尚未首次规划」——首次生成时回退到重放恢复+落库。
-    # version 用于将来 schema 演进时旧数据可识别并降级。
-    plot_timeline = Column(JSON, nullable=True)
-    # 节奏参数档（v2.4 高潮密度蒸馏）：
-    # JSON：{version, source_ids, chapter_emotions, avg_node_segments, branch_ratio, distilled_at}
-    # avg_node_segments 从语料章节情绪蒸馏：高潮章占比反推"平均每几段一个主干节点"，
-    # 取代首轮默认 5。branch_ratio 已落到 style_narrative，重复存是为了 plot_timeline
-    # 首次规划时不用去 style_narrative 找。
-    # 缓存指纹只有 source_ids + version（与 style_narrative 同模式）。
-    # 空表示「未蒸馏」——首次生成时回退到默认 5。
-    plot_rhythm = Column(JSON, nullable=True)
 
 
 class RawNovel(Base):

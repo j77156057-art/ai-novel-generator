@@ -93,15 +93,6 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # nullable：既有项目的 style_narrative 是按默认完整档算的，补 NULL 不破坏它们。
         # 漏这一项的后果与 style_narrative 相同：老库 SELECT projects.* 直接炸。
         ("projects", "narrative_tier", "VARCHAR(16)"),
-        # —— §11.3 时间线状态存档：节点+进度一体化 JSON ——
-        # 漏这一项的后果：create_all 只给**新库**建该列，已存在的库永远补不上，
-        # 任何 SELECT projects.* 都会 `no such column: projects.plot_timeline`，
-        # 时间线状态就退化回「每次重启重放」旧行为（功能不挂，但失去持久化收益）。
-        ("projects", "plot_timeline", "JSON"),
-        # —— v2.4 高潮密度蒸馏档：avg_node_segments 从语料章节情绪反推 ——
-        # 漏这一项后果与 plot_timeline 相同：老库 SELECT projects.* 直接炸。
-        # 该列 nullable：未蒸馏时为空，回退到首轮默认 avg_node_segments=5。
-        ("projects", "plot_rhythm", "JSON"),
         ("raw_novels", "style_profile", "JSON"),
         # —— 第 8 步：语料清洗报告（导入时剔除水印的留痕）——
         ("raw_novels", "clean_report", "JSON"),
