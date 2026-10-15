@@ -41,7 +41,19 @@ ec6b2b3 实体归一：X的Y 型变体分裂（42 断言）
 - **Judge** 新规则 `secret_leak`（warn）：说出 known_kind=secret 的文本秘密且无学习行 → 报。豁免：持有人自述、已学到（规范化文本比对）、<6 字短秘密、项目无 secret 行。RULES 现 6 条（test_v30_judge 的 5→6 已同步）
 - **迁移**：`kg_entity_knowledge.known_text VARCHAR(200)` 老库幂等补列（db.py migrations）
 
-## 已修复的存量 bug（顺手）
+## KG v3.0 前端工作台（2026-10-15 完成，commits 98e024d / a6ea0b6 / 修复 commit）
+
+- **后端**（98e024d）：Judge findings 落库（Fact type=kg_judge，engine 判定后自动存，
+  同段重跑先清后写）+ 4 个读侧端点：DELETE /exemptions（撤销豁免）、
+  GET /judge/findings（历史+exempted 标记+RULES）、GET /characters、GET /relations。
+  测试 test_kg_v3_frontend_api.py 41 断言
+- **前端**（a6ea0b6）：新路由 `/projects/:id/kg`（KgWorkspace.vue，零新依赖），
+  5 tabs：切片预览（参数化 + prompt 文本复制）/ 人物情报（角色清单→单角色情报+
+  自由查询）/ 事件时间线（类型过滤+因果链）/ Judge 面板（规则+历史告警+豁免/撤销）/
+  关系与节奏（环形 SVG 图+节奏条+关系曲线）。入口：ProjectWorkspace 步骤 7「KG v3 工作台 →」
+- **浏览器端到端验证过**（种子数据→8021 后端→5199 vite→5 tabs 全走通），
+  冒烟抓到并修掉 2 个 bug：① slice/prompt 端点不接 characters 参数导致渲染文本
+  永远缺状态/情报块（已修+回归断言）；② switchTab 不触发数据加载（已修惰性加载）
 
 - **db.py `_migrate_sqlite_columns` 164 行三元短路**：`conn.execute(...) if target_engine is not None else engine` 导致 `init_db()` 默认路径**从不补建** v3.0 索引（只有 load_corpus 离线路径建）。已修 + 有回归断言
 - 同函数第二段完全重复的迁移循环已删
@@ -64,7 +76,7 @@ ec6b2b3 实体归一：X的Y 型变体分裂（42 断言）
 | # | 项 | 说明 | 难度 |
 |---|---|---|---|
 | 1 | ~~known_kind=secret/event 消费路径~~ | **已完成**（写侧三类落库+读侧渲染+judge secret_leak，见上文专节） | - |
-| 2 | **前端集成** | 9 表 + 7 API 端点 + Judge findings 后端就绪但前端不可见。需要 Vue3 页面（关系图/时间线/Judge 面板/豁免管理） | 3-5 天 |
+| 2 | ~~前端集成~~ | **已完成**（KG 工作台 5 tabs，见上文专节；后续打磨可选：力导向图/移动端适配） | - |
 | 3 | **批抽 worker 可观测性** | 后台线程失败只在内存日志，无持久化状态。生产需要队列/失败重试/进度 API | 1 天 |
 | 4 | **大纲级联协议阶段 2-3** | final 文档 4 阶段协议的改纲自动级联、KG 回流大纲未实现 | 3-5 天 |
 | 5 | **真环境 nemotron 复跑对比** | OpenRouter 配额重置后，用 nemotron-3-ultra 对比智谱弱模型的抽取质量（foreshadows/knowledge 智谱全 0 行） | 半天 |

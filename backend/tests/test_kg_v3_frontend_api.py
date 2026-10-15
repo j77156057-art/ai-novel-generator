@@ -157,6 +157,22 @@ gy = KgEntity(project_id=1, kind="character", canonical_name="顾辰逸", mentio
 office = KgEntity(project_id=1, kind="location", canonical_name="办公室", mention_count=99)
 db.add_all([ly, gy, office])
 db.flush()
+from app.models import KgCharacterState, KgMention  # noqa: E402
+
+db.add(KgCharacterState(project_id=1, character_id=ly.id, segment_no=1,
+                        state_type="location", new_value="办公室"))
+db.add(KgEntityKnowledge(project_id=1, entity_id=ly.id, known_entity_id=office.id,
+                         known_kind="entity", learned_at_chapter=1))
+db.commit()
+
+# GET /slice/prompt 带 characters：渲染文本必须含状态/情报块
+# （回归：曾因端点不接 characters 参数，prompt 文本永远缺这两块——浏览器冒烟抓到）
+r = client.get("/api/projects/1/kg-v3/slice/prompt?segment_no=5&characters=林悠然")
+check("prompt 状态码", r.status_code, 200)
+check_true("prompt 含角色当前状态块", "角色当前状态" in r.json()["text"])
+check_true("prompt 含角色已知情报块", "角色已知情报" in r.json()["text"])
+check_true("prompt 含办公室情报", "办公室" in r.json()["text"])
+
 db.add_all([
     KgRelation(project_id=1, from_id=ly.id, to_id=gy.id, rel_type="romantic", strength=0.9),
     KgRelation(project_id=1, from_id=gy.id, to_id=office.id, rel_type="located_at", strength=0.4),

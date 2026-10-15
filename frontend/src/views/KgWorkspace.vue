@@ -26,6 +26,11 @@ type TabKey = (typeof TABS)[number]["key"];
 const activeTab = ref<TabKey>("slice");
 function switchTab(k: TabKey) {
   activeTab.value = k;
+  // 惰性加载：首次进入某 tab 才拉数据（切片在 onMounted 已拉）
+  if (k === "intel") loadCharacters();
+  else if (k === "events") loadEvents();
+  else if (k === "judge") loadFindings();
+  else if (k === "graph") loadGraphTab();
 }
 
 // ---------- Tab 1 切片预览 ----------
@@ -44,14 +49,17 @@ async function loadSlice() {
   sliceErr.value = null;
   try {
     const chars = sliceChars.value.trim() || null;
-    [slice.value, slicePrompt.value] = await Promise.all([
-      api.kgV3Slice(projectId, sliceSeg.value, {
-        window: sliceWindow.value,
-        maxEntities: sliceMaxEnt.value,
-        characters: chars,
-      }),
-      api.kgV3SlicePrompt(projectId, sliceSeg.value, sliceWindow.value).then((r) => r.text),
+    const opts = {
+      window: sliceWindow.value,
+      maxEntities: sliceMaxEnt.value,
+      characters: chars,
+    };
+    const [sl, pr] = await Promise.all([
+      api.kgV3Slice(projectId, sliceSeg.value, opts),
+      api.kgV3SlicePrompt(projectId, sliceSeg.value, opts),
     ]);
+    slice.value = sl;
+    slicePrompt.value = pr.text;
   } catch (e) {
     sliceErr.value = e instanceof Error ? e.message : String(e);
   } finally {

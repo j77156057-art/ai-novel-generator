@@ -670,11 +670,18 @@ export const api = {
     return request<KgV3Slice>(`/projects/${projectId}/kg-v3/slice?${p}`);
   },
 
-  /** 渲染成 prompt 文本（看 generate 实际注入什么）。 */
-  kgV3SlicePrompt: (projectId: number, segmentNo: number, window = 5) =>
-    request<{ text: string }>(
-      `/projects/${projectId}/kg-v3/slice/prompt?segment_no=${segmentNo}&window=${window}`,
-    ),
+  /** 渲染成 prompt 文本（看 generate 实际注入什么）。参数与 kgV3Slice 对齐。 */
+  kgV3SlicePrompt: (
+    projectId: number,
+    segmentNo: number,
+    opts: { window?: number; maxEntities?: number; characters?: string | null } = {},
+  ) => {
+    const p = new URLSearchParams({ segment_no: String(segmentNo) });
+    if (opts.window != null) p.set("window", String(opts.window));
+    if (opts.maxEntities != null) p.set("max_entities", String(opts.maxEntities));
+    if (opts.characters) p.set("characters", opts.characters);
+    return request<{ text: string }>(`/projects/${projectId}/kg-v3/slice/prompt?${p}`);
+  },
 
   /** 关系演变曲线（strength 历史）。 */
   kgV3RelationCurve: (projectId: number, fromName: string, toName: string) =>

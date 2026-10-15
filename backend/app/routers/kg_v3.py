@@ -47,13 +47,21 @@ def get_slice_prompt(
     project_id: int,
     segment_no: int = Query(...),
     window: int = Query(5, ge=1, le=50),
+    max_entities: int = Query(20, ge=1, le=100),
+    characters: str | None = Query(None, description="逗号分隔的角色名，缺省用本段 mention"),
     db: Session = Depends(get_db),
 ) -> dict:
-    """渲染成 prompt 文本（调试用：看 generate 实际注入什么）。"""
+    """渲染成 prompt 文本（调试用：看 generate 实际注入什么）。
+
+    参数与 /slice 完全对齐——两边参数不一致时，这里看到的和实际注入的
+    就不是同一份切片（角色状态/情报块只在 active_characters 非空时渲染）。
+    """
     _require_project(db, project_id)
     from app.kg.retrieval_v3 import slice_for_prompt, format_slice_for_prompt
 
-    sl = slice_for_prompt(db, project_id, segment_no, window=window)
+    chars = [c.strip() for c in characters.split(",")] if characters else None
+    sl = slice_for_prompt(db, project_id, segment_no, window=window,
+                          max_entities=max_entities, active_characters=chars)
     return {"text": format_slice_for_prompt(sl)}
 
 
