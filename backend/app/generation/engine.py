@@ -363,6 +363,24 @@ def _kg_slice_text(db, project: Project) -> str:
         return ""
 
 
+def _enqueue_v3_extraction(db, project: Project, segment_no: int, text: str) -> dict:
+    """段 commit 后入队 v3.0 异步批抽（extractor_v3 落 v3.0 表）。
+
+    与 v2.6 同步合并（_merge_segment_into_graph）并存：同步合并喂 reminders（本段
+    立即可见），v3.0 批抽落 9 张表（供 Judge/检索切片/读侧 API）。
+    零 LLM、零阻塞：enqueue 只进内存队列，worker 线程后台抽。失败静默兜底。
+    """
+    try:
+        from app.kg import batch_worker as bw
+
+        bw.ensure_worker()
+        chapter = _next_segment_no(db, project.id) - 1  # 本段 commit 后 = segment_no
+        bw.enqueue_segment(db, project.id, segment_no, text, chapter=chapter)
+        return {"enqueued": True, "pending": bw._queue.pending_count(project.id)}
+    except Exception as exc:  # noqa: BLE001 —— 批抽是增强，失败不阻断
+        return {"enqueued": False, "error": str(exc)[:100]}
+
+
 def _active_character_names(db, project: Project, current_seg: int) -> list[str]:
     """本段涉及的角色名（mention 反查）。空则用 plot_bible 角色名兜底。"""
     try:
@@ -827,6 +845,10 @@ def generate_next_segment(
     # 使下一次生成的 reminders 能拿到本段新出现的角色 / 新埋的伏笔。
     kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
 
+    # v3.0 异步批抽：入队 extractor_v3 落 9 张表（Judge/检索切片/读侧 API 的数据源）。
+    # 零 LLM 零阻塞，失败静默兜底。状态透传给前端（v3_extraction 键）。
+    v3_extraction = _enqueue_v3_extraction(db, project, segment_no, text)
+
     # —— v2.5：支线滚动触发 ——
     # 在 KG 合并后跑——这样能查到本段新产生的角色/钩子。
     # roll_branch 读存档 state、判断 signal、切支线、落库——失败静默兜底。
@@ -868,6 +890,7 @@ def generate_next_segment(
 
     return {
         "kg_update": kg_stats,
+        "v3_extraction": v3_extraction,
         "summary_tree": tree_stats,
         "node_judge": node_judge,
         "branch_roll": branch_info,
@@ -967,6 +990,8 @@ def generate_next_segment_stream(
     # v2.5 阶段 2：流式版补 v2.5 集成——与同步版同口径
     # 顺序：commit → judge → KG 合并 → roll_branch（KG 必须在 roll_branch 前）
     kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+    # v3.0 异步批抽：与同步版同口径入队
+    v3_extraction = _enqueue_v3_extraction(db, project, segment_no, text)
     _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
     from app.generation.branch import roll_branch as _roll_branch
     _new_state, branch_info = _roll_branch(
@@ -1005,6 +1030,7 @@ def generate_next_segment_stream(
         "rewrite_info": rewrite_info,
         "node_judge": node_judge,
         "kg_update": kg_stats,
+        "v3_extraction": v3_extraction,
         "branch_roll": branch_info,
     }
 

@@ -335,12 +335,28 @@ def check_language_mix(text: str) -> list[JudgeFinding]:
 # 主入口
 # --------------------------------------------------------------------------- #
 
+def _load_exemptions(db, project_id: int) -> set[tuple[str, str]]:
+    """加载作者豁免（Fact type=exemption，key=exempt:rule:entity）。
+
+    豁免的告警 Judge 不再报（用户已认定是故意的）。
+    """
+    from app.models import Fact
+
+    try:
+        rows = db.scalars(select(Fact).where(
+            Fact.project_id == project_id, Fact.type == "exemption"
+        )).all()
+        return {(r.props.get("rule") or "", r.props.get("entity") or "") for r in rows}
+    except Exception:  # noqa: BLE001 —— 豁免读取失败当无豁免
+        return set()
+
+
 def judge_segment(db, project_id: int, text: str, segment_no: int,
                   current_chapter: int | None = None) -> dict:
     """审计一段：跑全部规则，返回 {findings, rules}。
 
     只读 KG，不改正文、不推进状态（状态推进由 sentinel + batch_worker 负责）。
-    失败静默兜底（调用方 try）。
+    作者豁免的 (rule, entity) 不再报。失败静默兜底（调用方 try）。
     """
     findings: list[JudgeFinding] = []
     try:
@@ -363,6 +379,11 @@ def judge_segment(db, project_id: int, text: str, segment_no: int,
         findings += check_language_mix(text)
     except Exception:  # noqa: BLE001
         pass
+
+    # 作者豁免过滤：(rule, entity) 被豁免的告警不报
+    exempt = _load_exemptions(db, project_id)
+    if exempt:
+        findings = [f for f in findings if (f.rule, f.entity) not in exempt]
 
     return {
         "findings": [f.to_dict() for f in findings],
