@@ -21,6 +21,7 @@ const TABS = [
   { key: "events", label: "事件时间线" },
   { key: "judge", label: "Judge 面板" },
   { key: "graph", label: "关系与节奏" },
+  { key: "worker", label: "Worker 状态" },
 ] as const;
 type TabKey = (typeof TABS)[number]["key"];
 const activeTab = ref<TabKey>("slice");
@@ -31,6 +32,7 @@ function switchTab(k: TabKey) {
   else if (k === "events") loadEvents();
   else if (k === "judge") loadFindings();
   else if (k === "graph") loadGraphTab();
+  else if (k === "worker") loadWorker();
 }
 
 // ---------- Tab 1 切片预览 ----------
@@ -182,6 +184,73 @@ async function loadEvents() {
   } finally {
     eventsLoading.value = false;
   }
+}
+
+// ---------- Tab 6 Worker 状态 ----------
+// 视图层只关心「线程活没活/有没有积压/failed/stuck/empty」——后端 summary 已聚合，
+// 前端只负责展示 + 失败行手动重捞的二次确认。
+type WorkerRun = {
+  id: number;
+  segment_no: number | null;
+  status: string;
+  stuck: boolean;
+  empty: boolean;
+  duration_ms: number | null;
+  batch_stats: Record<string, unknown> | null;
+  error: string | null;
+  started_at: string | null;
+};
+type WorkerStatus = {
+  worker_alive: boolean;
+  pending: number;
+  summary: { success: number; failed: number; running: number; stuck: number; empty: number };
+  recent_runs: WorkerRun[];
+};
+const worker = ref<WorkerStatus | null>(null);
+const workerLoading = ref(false);
+const workerErr = ref<string | null>(null);
+const requeueBusy = ref(false);
+const workerMsg = ref<string | null>(null);
+const selectedForRequeue = ref<Set<number>>(new Set());
+
+async function loadWorker() {
+  workerLoading.value = true;
+  workerErr.value = null;
+  try {
+    worker.value = await api.kgV3WorkerStatus(projectId);
+  } catch (e) {
+    workerErr.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    workerLoading.value = false;
+  }
+}
+
+function toggleRequeuePick(id: number) {
+  const s = new Set(selectedForRequeue.value);
+  if (s.has(id)) s.delete(id);
+  else s.add(id);
+  selectedForRequeue.value = s;
+}
+
+async function requeueSelected() {
+  if (selectedForRequeue.value.size === 0) return;
+  requeueBusy.value = true;
+  try {
+    const r = await api.kgV3Requeue(projectId, [...selectedForRequeue.value]);
+    workerMsg.value = `已重捞 ${r.requeued} 条；${r.missing.length ? `缺失 ${r.missing.length} 条（段文本不存在）` : "无缺失"}`;
+    selectedForRequeue.value = new Set();
+    await loadWorker();
+  } catch (e) {
+    workerMsg.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    requeueBusy.value = false;
+  }
+}
+
+function fmtDur(ms: number | null): string {
+  if (ms == null) return "—";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
 }
 
 // ---------- Tab 4 Judge 面板 ----------
@@ -763,6 +832,102 @@ onMounted(() => {
         </div>
       </template>
       <div v-else-if="curveFrom.trim() && curveTo.trim()" class="empty" style="margin-top: 12px">这两位之间暂无关系演变记录</div>
+    </template>
+  </section>
+
+  <!-- ============ Tab 6：Worker 状态 ============ -->
+  <section v-else-if="activeTab === 'worker'" class="card">
+    <div class="card-title">
+      批抽 Worker 状态
+      <span class="hint" v-if="worker">
+        success {{ worker.summary.success }} · failed {{ worker.summary.failed }}
+        · running {{ worker.summary.running }} · stuck {{ worker.summary.stuck }} · empty {{ worker.summary.empty }}
+      </span>
+      <button class="btn" @click="loadWorker">刷新</button>
+    </div>
+
+    <div v-if="workerLoading" class="empty"><span class="spinner" /> 加载中…</div>
+    <div v-else-if="workerErr" class="notice err">{{ workerErr }}</div>
+    <template v-else-if="worker">
+      <!-- 三块状态卡：线程活没活 / 队列积压 / 失败计数 -->
+      <div class="grid-2" style="margin-bottom: var(--gap)">
+        <div>
+          <div class="card-title" style="font-size: var(--fs-md)">线程
+            <span class="tag" :class="worker.worker_alive ? 'ok' : 'err'" style="margin-left: 8px">
+              {{ worker.worker_alive ? "alive" : "dead" }}
+            </span>
+          </div>
+          <div class="faint" style="font-size: var(--fs-xs)">
+            dead ≠ 正常：worker 是 daemon 线程，进程重启后自动拉起；
+            显示 dead 通常意味着服务从未启动或进程刚退
+          </div>
+        </div>
+        <div>
+          <div class="card-title" style="font-size: var(--fs-md)">
+            内存队列积压 <span class="hint">{{ worker.pending }} 段</span>
+          </div>
+          <div class="faint" style="font-size: var(--fs-xs)">
+            进程重启即清零——持久状态看下方 recent_runs
+          </div>
+        </div>
+      </div>
+
+      <div v-if="workerMsg" class="notice info" style="margin-bottom: var(--gap)">{{ workerMsg }}</div>
+
+      <div class="row" style="margin-bottom: var(--gap)">
+        <button
+          class="btn primary"
+          :disabled="requeueBusy || selectedForRequeue.size === 0"
+          @click="requeueSelected"
+        >
+          {{ requeueBusy ? "重捞中…" : `重捞选中 (${selectedForRequeue.size})` }}
+        </button>
+        <span class="faint" style="font-size: var(--fs-xs)">
+          仅 failed/stuck 行可重捞；自动重试只覆盖网络抖动
+        </span>
+      </div>
+
+      <div v-if="!worker.recent_runs.length" class="empty">还没有 AgentRun 记录（先生成几段让批抽落库）</div>
+      <div v-else class="list">
+        <div
+          v-for="r in worker.recent_runs"
+          :key="r.id"
+          class="list-item"
+          style="align-items: flex-start"
+        >
+          <div style="flex: 1">
+            <div class="row tight" style="margin-bottom: 4px">
+              <span
+                class="tag"
+                :class="r.status === 'failed' ? 'err' : r.status === 'running' ? 'warn' : r.stuck ? 'err' : 'ok'"
+              >
+                {{ r.status }}{{ r.stuck ? " (stuck)" : "" }}
+              </span>
+              <span class="tag mono">seg {{ r.segment_no ?? "?" }}</span>
+              <span v-if="r.empty" class="tag warn">empty</span>
+              <span class="faint mono" style="font-size: var(--fs-xs)">{{ fmtDur(r.duration_ms) }}</span>
+              <span class="faint mono" style="font-size: var(--fs-xs)">
+                {{ r.started_at ? new Date(r.started_at).toLocaleString() : "" }}
+              </span>
+            </div>
+            <div v-if="r.error" class="prose" style="font-size: var(--fs-sm); color: var(--danger)">
+              {{ r.error }}
+            </div>
+            <div v-else-if="r.batch_stats" class="faint" style="font-size: var(--fs-xs)">
+              entities {{ r.batch_stats.entities_upserted ?? 0 }} ·
+              events {{ r.batch_stats.events_added ?? 0 }} ·
+              relations {{ r.batch_stats.relations_upserted ?? 0 }}
+            </div>
+          </div>
+          <input
+            v-if="r.status === 'failed' || r.stuck"
+            type="checkbox"
+            :checked="selectedForRequeue.has(r.id)"
+            @change="toggleRequeuePick(r.id)"
+            style="margin-top: 6px"
+          />
+        </div>
+      </div>
     </template>
   </section>
 

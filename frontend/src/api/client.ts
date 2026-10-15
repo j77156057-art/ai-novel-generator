@@ -743,4 +743,30 @@ export const api = {
     request<{ relations: KgV3Relation[] }>(
       `/projects/${projectId}/kg-v3/relations?limit=${limit}`,
     ),
+
+  /** 批抽 worker 状态：线程存活/队列积压/汇总计数/最近行。 */
+  kgV3WorkerStatus: (projectId: number) =>
+    request<{
+      worker_alive: boolean;
+      pending: number;
+      summary: { success: number; failed: number; running: number; stuck: number; empty: number };
+      recent_runs: {
+        id: number;
+        segment_no: number | null;
+        status: string;
+        stuck: boolean;
+        empty: boolean;
+        duration_ms: number | null;
+        batch_stats: Record<string, unknown> | null;
+        error: string | null;
+        started_at: string | null;
+      }[];
+    }>(`/projects/${projectId}/kg-v3/worker/status`),
+
+  /** 手动重捞失败的段（按 run id 列表）。 */
+  kgV3Requeue: (projectId: number, runIds: number[]) =>
+    request<{ requeued: number; missing: number[] }>(
+      `/projects/${projectId}/kg-v3/worker/requeue`,
+      jsonInit("POST", { run_ids: runIds }),
+    ),
 };
