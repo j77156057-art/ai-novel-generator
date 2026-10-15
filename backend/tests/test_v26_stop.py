@@ -49,30 +49,73 @@ def test_llm_provider_base_noop():
         check("基类 set_stop_sequences 不抛", f"raised: {e}", "no raise")
 
 
-# ── 组 2：_set_section_stop 兼容所有 provider ──
+# ── 组 2：get_section_stop_sequences 返回稳定列表 ──
 
-def test_set_section_stop_compat():
-    print("\n=== 组 2: _set_section_stop 对各种 provider 兼容 ===")
-    from app.generation.engine import _set_section_stop
-    from app.llm.provider import LocalFallbackLLMProvider
+def test_get_section_stop_sequences():
+    print("\n=== 组 2: get_section_stop_sequences 返回稳定列表 ===")
+    from app.generation.engine import get_section_stop_sequences
+    seqs = get_section_stop_sequences()
+    check("返回 list", isinstance(seqs, list), True)
+    check("非空", len(seqs) > 0, True)
+    check("含【本节完】", "【本节完】" in seqs, True)
+    # 防漂移：每次调返回值应一致
+    seqs2 = get_section_stop_sequences()
+    check("幂等", seqs, seqs2)
 
-    # 用本地 provider 验证（基类 no-op，但 _set_section_stop 内 try-except 兜底）
-    p = LocalFallbackLLMProvider()
-    try:
-        _set_section_stop(p)
-        check("LocalFallbackLLMProvider 调 _set_section_stop 不抛", True, True)
-    except Exception as e:
-        check("LocalFallbackLLMProvider 调 _set_section_stop 不抛", f"raised: {e}", "no raise")
 
-    # 假 provider 没 set_stop_sequences 方法
-    class NoStopProvider:
-        def chat(self, system, user, constraints=None): return ""
-    p2 = NoStopProvider()
-    try:
-        _set_section_stop(p2)
-        check("没 set_stop_sequences 的 provider 不抛（兜底 catch）", True, True)
-    except Exception as e:
-        check("没 set_stop_sequences 的 provider 不抛", f"raised: {e}", "no raise")
+def test_per_request_stop_no_singleton_pollution():
+    """v2.6.1：per-request stop_sequences 不污染 provider 单例。
+
+    之前的实现调 provider.set_stop_sequences() 会改单例状态，
+    下次不同请求会看到错误的 stop 列表。改用 per-request 参数后，
+    两次 chat 互相不串扰。
+    """
+    print("\n=== 组 2.1: per-request stop 不污染单例 ===")
+    from app.llm.provider import OpenAICompatibleChatProvider
+    import json as _json
+
+    captured = []
+
+    class P(OpenAICompatibleChatProvider):
+        def __init__(self):
+            self.api_key = "fake"
+            self.base_url = "http://fake"
+            self.model = "m"
+            self.extra_body = {}
+            self.max_tokens = None
+            self.timeout = 60
+            self.stream_timeout = 60
+            self._models = ["m"]
+            self._stop_sequences = None
+            self.last_finish_reason = None
+
+        def _model_chain(self):
+            return ["m"]
+
+        def _complete(self, messages, stop_sequences=None):
+            # 关键：每调 capture 一次 effective_stop
+            effective = stop_sequences if stop_sequences is not None else self._stop_sequences
+            captured.append({
+                "stop": effective,
+            })
+            return "ok"
+
+    p = P()
+
+    # 第 1 次：per-request 传 A
+    p.chat("sys", "user1", stop_sequences=["A", "B"])
+    check("第 1 次 chat effective stop=A,B", captured[-1]["stop"], ["A", "B"])
+
+    # 第 2 次：不传 stop_sequences
+    p.chat("sys", "user2")
+    check("第 2 次 chat 不传 stop → effective=None", captured[-1]["stop"], None)
+
+    # 第 3 次：再传 C
+    p.chat("sys", "user3", stop_sequences=["C"])
+    check("第 3 次 chat effective stop=C", captured[-1]["stop"], ["C"])
+
+    # 验证单例没被改
+    check("单例 _stop_sequences 始终 None", p._stop_sequences, None)
 
 
 # ── 组 3：_strip_thinking 剥离【本节完】marker ──
@@ -151,10 +194,11 @@ def test_openai_compat_stop_payload():
         def _model_chain(self):
             return ["m"]
 
-        def _complete(self, messages):
-            # mock：捕获 payload_base（通过 self._stop_sequences 间接）
+        def _complete(self, messages, stop_sequences=None):
+            # mock：捕获 effective stop
+            effective = stop_sequences if stop_sequences is not None else self._stop_sequences
             captured_payloads.append({
-                "stop": self._stop_sequences,
+                "stop": effective,
                 "model": "m",
             })
             return "ok"
@@ -174,12 +218,20 @@ def test_openai_compat_stop_payload():
     p.chat("sys", "user")
     check("set_stop_sequences([]) 后 payload 不含 stop", captured_payloads[2].get("stop"), None)
 
+    # per-request 覆盖单例值
+    p.set_stop_sequences(["singleton-val"])
+    p.chat("sys", "user", stop_sequences=["per-req"])
+    check("per-request 覆盖单例值", captured_payloads[3].get("stop"), ["per-req"])
+    # 但单例自身不变（per-request 不写回单例）
+    check("单例仍是 singleton-val（per-request 不写回）", p._stop_sequences, ["singleton-val"])
+
 
 # ── 跑全部 ──
 
 if __name__ == "__main__":
     test_llm_provider_base_noop()
-    test_set_section_stop_compat()
+    test_get_section_stop_sequences()
+    test_per_request_stop_no_singleton_pollution()
     test_strip_thinking_marker()
     test_build_user_prompt_section_signal()
     test_openai_compat_stop_payload()

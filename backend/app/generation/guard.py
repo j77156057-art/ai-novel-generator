@@ -65,8 +65,14 @@ def detect_unlisted_characters(
     if not allowed_set or not text:
         return []
 
-    # 候选：2-6 字连续中文字符串（粗启发式）
-    candidates = re.findall(r"[\u4e00-\u9fff]{2,6}", text)
+    # 候选：2-4 字连续中文字符串（人名通常 2-4 字，如"林悠然""顾辰逸""薛姨妈"）
+    # 之前 2-6 太宽，"咖啡馆见"也被报——降噪。
+    candidates = re.findall(r"[\u4e00-\u9fff]{2,4}", text)
+
+    # 启发式过滤：候选里"明显不是人名"的扔掉
+    # 1. 停用词（人名几乎不会用这些字开头/结尾）
+    # 2. 常见词（动词/名词/形容词集中的位置）
+    candidates = [c for c in candidates if _looks_like_name(c)]
 
     # 未授权：白名单外
     unlisted: set[str] = set()
@@ -76,6 +82,61 @@ def detect_unlisted_characters(
 
     # 按长度倒序（长名先报——更可能是真角色名）
     return sorted(unlisted, key=lambda s: -len(s))
+
+
+# 停用词表：人名几乎不会用这些字开头
+# 来自实际项目观察：薛姨妈/林悠然/顾辰逸/王夫人/李老板——常见姓氏+称谓
+# "咖啡""林夫人"等是噪声
+_NAME_STOPWORDS_HEAD = set(
+    "的了一是就在有我你他她它我们你"
+    "什么怎么哪里那个这个那些这些"
+    "可以能够应该必须会要"
+    "公司部门经理工作项目业务"
+    "因为所以但是虽然然后接着"
+    "咖啡花园住宅公寓办公室"
+)
+# 常见称谓后缀（出现就认定为称谓，不是人名主体）
+# 注意：不要包含 "夫"/"人"/"女" 等——它们是常见人名用字（"王夫人""林夫人""男人"）。
+# 包含 "夫" 会误伤"王夫人"等真实角色名。
+_NAME_STOPWORDS_TAIL = set(
+    "先生女士老师同学朋友"
+    "总编经理"
+)
+
+# 单字常见姓氏（人名可能以这些字开头，但不是"完整人名"）
+_COMMON_SURNAMES = set("李王张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾萧田董袁潘于蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤")
+# 单字常见人名用字
+_COMMON_GIVEN_CHARS = set("伟芳娜秀英敏静丽强磊军洋勇艳杰娟涛明超秀英霞刚平桂英建华俊宇浩然子轩")
+
+
+def _looks_like_name(s: str) -> bool:
+    """启发式：候选字符串 s 是否"可能是人名"。
+
+    接受：
+    - 含 2-3 字的中文组合
+    - 不在停用词头/尾里
+    - 不是"明显"的普通名词（无停用词头）
+
+    拒绝：
+    - 头是停用词（"的了"开头 = 助词，不可能是名字）
+    - 尾是称谓（"先生"结尾 = 称谓，不是名字主体）
+    - 全部是单字姓氏组成（"李王" = 列举姓氏）
+
+    注意：这只是启发式，必然有假阳性（接受"咖啡馆见"）+ 假阴性（漏掉"老狐狸"）。
+    终极方案是 NER。
+    """
+    if not s or len(s) < 2:
+        return False
+    head = s[0]
+    tail = s[-1]
+    if head in _NAME_STOPWORDS_HEAD:
+        return False
+    if tail in _NAME_STOPWORDS_TAIL:
+        return False
+    # 全部是常见姓氏（"李王张" = 列举，不算人名）
+    if all(c in _COMMON_SURNAMES for c in s):
+        return False
+    return True
 
 
 def collect_allowed_names(
