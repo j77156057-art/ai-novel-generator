@@ -797,6 +797,21 @@ def generate_next_segment(
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
     style_warning = _style_warning(text, _style_profile(db, project))
 
+    # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换（旁路观测）
+    # 启发式会有假阳性（普通词组也报），调用方拿到列表后可聚合展示
+    from app.generation.guard import detect_unlisted_characters, collect_allowed_names
+    _allowed = collect_allowed_names(
+        ctx_reminders=ctx.get("reminders"),
+        plot_bible=project.plot_bible,
+    )
+    unlisted = detect_unlisted_characters(text, _allowed)
+    if unlisted:
+        import logging
+        logging.getLogger(__name__).warning(
+            "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
+            len(unlisted), unlisted[:10],  # 最多打 10 个，避免日志爆
+        )
+
     return {
         "kg_update": kg_stats,
         "summary_tree": tree_stats,
@@ -811,6 +826,7 @@ def generate_next_segment(
         "constraints": ctx["constraints"],
         "rag_context": ctx["rag_context"],
         "style_warning": style_warning,
+        "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
     }
 
@@ -908,6 +924,20 @@ def generate_next_segment_stream(
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
     style_warning = _style_warning(text, _style_profile(db, project))
 
+    # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换
+    from app.generation.guard import detect_unlisted_characters, collect_allowed_names
+    _allowed = collect_allowed_names(
+        ctx_reminders=ctx.get("reminders"),
+        plot_bible=project.plot_bible,
+    )
+    unlisted = detect_unlisted_characters(text, _allowed)
+    if unlisted:
+        import logging
+        logging.getLogger(__name__).warning(
+            "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
+            len(unlisted), unlisted[:10],
+        )
+
     yield {
         "type": "done",
         "segment_no": segment_no,
@@ -916,6 +946,7 @@ def generate_next_segment_stream(
         "summary_tree": tree_stats,
         "id": gen.id,
         "style_warning": style_warning,
+        "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
         "node_judge": node_judge,
         "kg_update": kg_stats,
