@@ -570,26 +570,22 @@ def _timeline_state_for(
     return st
 
 
-def _set_section_stop(provider) -> None:
-    """v2.6：节点粒度根治——给 provider 设节末 stop token。
+def get_section_stop_sequences() -> list[str]:
+    """v2.6：节点粒度根治——返回节末 stop token 列表。
 
     stop 列表：
     - 【本节完】 — model 在节末单独一行写这个 marker，后端停在 marker 处
     - 一些副 marker 防止 model 试图"写下一节"或"写小标题"时跑远
 
-    调用方在 chat/stream_chat 之前调一次。如果 provider 不支持
-    set_stop_sequences（基类默认 no-op），就什么都不做——非致命。
+    调用方在 chat(stream_stop_sequences=...) / stream_chat(stop_sequences=...) 传这个 list。
+    用 per-request 参数而不是 provider.set_stop_sequences() —— 避免单例被跨请求污染。
     """
-    try:
-        provider.set_stop_sequences([
-            "【本节完】",
-            "## 第",
-            "\n# ",
-            "\n## ",
-        ])
-    except Exception:  # noqa: BLE001
-        # set_stop_sequences 出错也不阻断生成——只是少一道保险
-        pass
+    return [
+        "【本节完】",
+        "## 第",
+        "\n# ",
+        "\n## ",
+    ]
 
 
 def _persist_timeline_state(db, project: Project, st: TimelineState) -> None:
@@ -737,10 +733,10 @@ def generate_next_segment(
         node_prompt=node_prompt,
     )
 
-    # v2.6：节点粒度根治——设 stop token 让模型在写【本节完】时停
-    # （避免"演完整个故事"）——重写/重生成是 AI 味修复，不设 stop
-    _set_section_stop(provider)
-    text = provider.chat(system, user, constraints=ctx["constraints"])
+    # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
+    # 重写/重生成是 AI 味修复，不传 stop
+    text = provider.chat(system, user, constraints=ctx["constraints"],
+                         stop_sequences=get_section_stop_sequences())
     summary = provider.summarize(text)
 
     # AI 味检测 + 针对性重写
@@ -878,10 +874,10 @@ def generate_next_segment_stream(
         node_prompt=node_prompt,
     )
 
-    # v2.6：节点粒度根治——流式版同步设 stop token
-    _set_section_stop(provider)
+    # v2.6：节点粒度根治——流式版同步传 per-request stop token
     pieces: list[str] = []
-    for piece in provider.stream_chat(system, user, constraints=ctx["constraints"]):
+    for piece in provider.stream_chat(system, user, constraints=ctx["constraints"],
+                                       stop_sequences=get_section_stop_sequences()):
         pieces.append(piece)
         yield {"type": "chunk", "text": piece}
 
