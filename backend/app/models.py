@@ -797,3 +797,40 @@ class StyleDistill(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     # 最近一次被应用到某个项目的时间（命中复用也算）。可空 = 仅入库未被用过。
     applied_at = Column(DateTime, nullable=True)
+
+
+class KgBibleRevision(Base):
+    """plot_bible 的版本快照——只存修改后状态 + 顶层 diff。
+
+    为什么是独立表（不复用 Fact）：
+    - 8 类事实枚举（character/plothole/relationship/...）已固化；bible 修订是
+      「元数据」不是事实，加 type=kg_bible_revision 会污染提醒/检索的过滤语义
+    - bible_json 体量大（几 KB），与事实账本混存会让 list/详情序列化变慢
+    - revision_no 需要严格单增，与 (project_id, revision_no) 联合唯一——Fact
+      的 (type, key) 唯一不直接复用
+
+    老项目无 revision 行属正常（迁移不补历史快照）。
+    """
+
+    __tablename__ = "kg_bible_revisions"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    # 项目内 1,2,3,4 自增；同一项目下严格连续
+    revision_no = Column(Integer, nullable=False)
+    # 修改后的完整 bible dict（plot_bible 全字段，与 PATCH body 同形状）
+    bible_json = Column(JSON, nullable=False)
+    # 顶层 key 维度的 diff：{added: {...}, removed: {...}, changed: {key: {old, new}}}
+    # 取自本次 PATCH body 的 plot_bible vs 落库前 proj.plot_bible
+    diff_json = Column(JSON, nullable=False)
+    # 本次 PATCH 触发的 KG 冲突清单（field 名 → 列表）
+    conflicts_json = Column(JSON, nullable=True)
+    # 来源标识：'user' = 人工改 / 'kg_lift' = KG 自动回流（暂未启用，结构预留）
+    source = Column(String(16), nullable=False, default="user")
+    # 备注（人工填的"为什么改"，可空）
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "revision_no", name="uq_kg_bible_revision"),
+    )

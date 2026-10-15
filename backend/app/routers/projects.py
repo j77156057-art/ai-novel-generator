@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -431,6 +432,64 @@ def patch_project(
     db.commit()
     db.refresh(proj)
     return proj
+
+
+# --------------------------------------------------------------------------- #
+# plot_bible 级联协议（kg-cascade-protocol-design，2026-10-15）
+# --------------------------------------------------------------------------- #
+# PATCH /projects/{id} 走老路径（兼容性）；新增 POST /projects/{id}/bible/apply
+# 走新路径——写 revision + 算 diff + 扫 KG 冲突 + 覆盖 bible。前端从
+# apply 响应里直接拿到 conflicts（toast 一次性展开，不需新 tab）。
+# 理由：Pydantic 响应模型 ProjectOut 序列化对前端已稳定，新增字段会破契约。
+
+class BibleApplyRequest(BaseModel):
+    """plot_bible 改写请求（带审计与冲突扫描的新路径）。"""
+
+    bible: dict
+    note: str | None = None  # 备注（"为什么改"留痕）
+
+
+@router.post("/{project_id}/bible/apply")
+def apply_bible_revision(
+    project_id: int, body: BibleApplyRequest, db: Session = Depends(get_db)
+) -> dict:
+    """改 plot_bible（级联协议新路径）：写 revision + 算 diff + 扫 KG 冲突 + 覆盖。
+
+    与 PATCH /projects/{id} 的区别：
+    - 走新路径会**留下版本快照**（kg_bible_revisions），事后可查
+    - 改完立即扫 KG，把"bible 声明 vs KG 已有事实"的字面矛盾**一起返回**，
+      前端在 toast 里展开给用户判断（忽略 / 去豁免 / 撤回）
+    - 不自动改 KG——已 commit 段是历史事实，不能重写
+
+    老项目无 revision 行（迁移不补历史）：首次 apply 记 rev_no=1。
+    """
+    if db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.kg.bible import apply_bible_revision as _apply
+
+    try:
+        r = _apply(db, project_id, body.bible, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return r
+
+
+@router.get("/{project_id}/bible/revisions")
+def list_bible_revisions(
+    project_id: int,
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> dict:
+    """plot_bible 改写历史（按 revision_no 倒序，新的在前）。
+
+    列表不返回 bible_json 全量（按 KB 级别，列表会变慢）；要看具体某版
+    的全量 bible 走 PATCH 后端点的 proj 响应，或后端新加的 detail 端点
+    （本轮不做——审计先于回看）。"""
+    if db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.kg.bible import list_bible_revisions as _list
+
+    return {"revisions": _list(db, project_id, limit)}
 
 
 @router.post("/{project_id}/build-kg")
