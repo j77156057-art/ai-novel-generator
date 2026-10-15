@@ -47,12 +47,21 @@ def _strip_thinking(text: str) -> str:
 
     双保险：provider 已显式传 thinking disabled，但 API 若忽略该参数，
     落库/注入前情的文本仍必须是干净的正文。
+
+    v2.6：节点粒度根治——如果 stop token 漏过（OpenAI 兼容 stop 通常不会
+    返回 stop 字符串本身，但保险起见），剥离正文末尾的【本节完】marker 行。
     """
     if " <think>" in text or " </think>" in text:
         end = text.rfind(" </think>")
         if end != -1:
-            return text[end + len(" </think>"):].strip()
+            text = text[end + len(" </think>"):].strip()
         # 只有开标签没有闭标签：从开标签后全部丢弃不可靠，退化为原样返回
+    # v2.6：剥离【本节完】marker 行（如果存在）。通常 stop token 已停在此之前，
+    # 但模型偶尔可能已输出 marker 才被 stop——保险剥离避免污染落库。
+    # 模式：行首可有 0+ 空白（包含换行/空格/制表），然后是 marker，
+    # marker 后到行尾可能有空白——$ 用 \Z 而不是 $（不受多行模式影响）
+    import re
+    text = re.sub(r"(?:[^\S\n]*\n)*[^\S\n]*【本节完】[ \t]*\Z", "", text).rstrip()
     return text
 
 
@@ -561,6 +570,24 @@ def _timeline_state_for(
     return st
 
 
+def get_section_stop_sequences() -> list[str]:
+    """v2.6：节点粒度根治——返回节末 stop token 列表。
+
+    stop 列表：
+    - 【本节完】 — model 在节末单独一行写这个 marker，后端停在 marker 处
+    - 一些副 marker 防止 model 试图"写下一节"或"写小标题"时跑远
+
+    调用方在 chat(stream_stop_sequences=...) / stream_chat(stop_sequences=...) 传这个 list。
+    用 per-request 参数而不是 provider.set_stop_sequences() —— 避免单例被跨请求污染。
+    """
+    return [
+        "【本节完】",
+        "## 第",
+        "\n# ",
+        "\n## ",
+    ]
+
+
 def _persist_timeline_state(db, project: Project, st: TimelineState) -> None:
     """把 state 序列化写回 project.plot_timeline。失败也不抛（generate 主流程不挂）。"""
     try:
@@ -706,7 +733,10 @@ def generate_next_segment(
         node_prompt=node_prompt,
     )
 
-    text = provider.chat(system, user, constraints=ctx["constraints"])
+    # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
+    # 重写/重生成是 AI 味修复，不传 stop
+    text = provider.chat(system, user, constraints=ctx["constraints"],
+                         stop_sequences=get_section_stop_sequences())
     summary = provider.summarize(text)
 
     # AI 味检测 + 针对性重写
@@ -747,9 +777,12 @@ def generate_next_segment(
     # 是否为分支 kind），如果当前是分支段已写过 MIN_GAP_SEGMENTS 才允许再切。
     # 第一版简化：last_branch_written=None 总是允许切（最宽松）。
     # 后续可优化：把 last_branch_written 存到 plot_timeline 顶层。
+    # 注：roll_branch 返回 (new_state, info_dict)——新 state 用于 state 推进，
+    # info_dict 透传给前端。这里 _new_state 不需要（roll_branch 内部已落库），
+    # 取 info_dict 当作 branch_roll。
     from app.generation.branch import roll_branch as _roll_branch
     _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
-    branch_info, _ = _roll_branch(
+    _new_state, branch_info = _roll_branch(
         db, project, _load_timeline_state_for_branch(db, project, written),
         provider, _post_commit_written, last_branch_written=None,
     )
@@ -759,6 +792,21 @@ def generate_next_segment(
 
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
     style_warning = _style_warning(text, _style_profile(db, project))
+
+    # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换（旁路观测）
+    # 启发式会有假阳性（普通词组也报），调用方拿到列表后可聚合展示
+    from app.generation.guard import detect_unlisted_characters, collect_allowed_names
+    _allowed = collect_allowed_names(
+        ctx_reminders=ctx.get("reminders"),
+        plot_bible=project.plot_bible,
+    )
+    unlisted = detect_unlisted_characters(text, _allowed)
+    if unlisted:
+        import logging
+        logging.getLogger(__name__).warning(
+            "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
+            len(unlisted), unlisted[:10],  # 最多打 10 个，避免日志爆
+        )
 
     return {
         "kg_update": kg_stats,
@@ -774,6 +822,7 @@ def generate_next_segment(
         "constraints": ctx["constraints"],
         "rag_context": ctx["rag_context"],
         "style_warning": style_warning,
+        "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
     }
 
@@ -825,8 +874,10 @@ def generate_next_segment_stream(
         node_prompt=node_prompt,
     )
 
+    # v2.6：节点粒度根治——流式版同步传 per-request stop token
     pieces: list[str] = []
-    for piece in provider.stream_chat(system, user, constraints=ctx["constraints"]):
+    for piece in provider.stream_chat(system, user, constraints=ctx["constraints"],
+                                       stop_sequences=get_section_stop_sequences()):
         pieces.append(piece)
         yield {"type": "chunk", "text": piece}
 
@@ -853,10 +904,35 @@ def generate_next_segment_stream(
     gen, segment_no = _commit_segment(db, project, text, summary)
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
     node_judge = _judge_and_advance(db, project, provider, text, written)
+
+    # v2.5 阶段 2：流式版补 v2.5 集成——与同步版同口径
+    # 顺序：commit → judge → KG 合并 → roll_branch（KG 必须在 roll_branch 前）
+    kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+    _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
+    from app.generation.branch import roll_branch as _roll_branch
+    _new_state, branch_info = _roll_branch(
+        db, project, _load_timeline_state_for_branch(db, project, written),
+        provider, _post_commit_written, last_branch_written=None,
+    )
+
     tree_stats = _rollup_summary_tree(db, project, provider)
 
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
     style_warning = _style_warning(text, _style_profile(db, project))
+
+    # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换
+    from app.generation.guard import detect_unlisted_characters, collect_allowed_names
+    _allowed = collect_allowed_names(
+        ctx_reminders=ctx.get("reminders"),
+        plot_bible=project.plot_bible,
+    )
+    unlisted = detect_unlisted_characters(text, _allowed)
+    if unlisted:
+        import logging
+        logging.getLogger(__name__).warning(
+            "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
+            len(unlisted), unlisted[:10],
+        )
 
     yield {
         "type": "done",
@@ -866,8 +942,11 @@ def generate_next_segment_stream(
         "summary_tree": tree_stats,
         "id": gen.id,
         "style_warning": style_warning,
+        "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
         "node_judge": node_judge,
+        "kg_update": kg_stats,
+        "branch_roll": branch_info,
     }
 
 

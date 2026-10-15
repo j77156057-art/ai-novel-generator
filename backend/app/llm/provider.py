@@ -115,6 +115,17 @@ class LLMProvider:
         """
         yield self.chat(system, user, constraints=constraints)
 
+    def set_stop_sequences(self, sequences: list[str] | None) -> None:
+        """v2.6：设置下一次 chat/stream_chat 的 stop token 列表。
+
+        节点粒度根治（最后攻破）—— 让模型在写到 stop marker 时停，
+        避免"演完整个故事"。
+
+        默认实现：不存（子类按需重写）。调用方在 chat 之前 set 一次即可。
+        """
+        # 默认 no-op——子类重写
+        pass
+
     def summarize_rollup(self, texts: list[str], level: str) -> str:
         """层级摘要的**滚上**（L1→L2 卷摘要 / L2→L3 主线骨架）。
 
@@ -194,10 +205,25 @@ class OpenAICompatibleChatProvider(LLMProvider):
         chain = [model] + [m for m in (models or []) if m and m != model]
         self._models = chain
 
+        # v2.6：stop token 列表——下一次 chat/stream_chat 时设到 payload。
+        # None = 不传 stop（默认）。调用方在 chat 之前 set 一次。
+        # 注意：provider 是单例，多线程下 stop 可能互相覆盖；调用方要负责
+        # 同步（同 chat 调用链内 set+chat 是原子的）。
+        self._stop_sequences: list[str] | None = None
+
+    def set_stop_sequences(self, sequences: list[str] | None) -> None:
+        """v2.6：设置下一次 chat/stream_chat 的 stop token 列表。
+
+        注意：provider 是单例，多线程/多请求下 stop 可能互相覆盖。
+        建议直接用 chat(stream_stop_sequences=...) / stream_chat(stop_sequences=...)
+        参数传值（每次调用独立），不用这个 setter。
+        """
+        self._stop_sequences = list(sequences) if sequences else None
+
     def _model_chain(self) -> list[str]:
         return self._models
 
-    def _complete(self, messages: list[dict]) -> str:
+    def _complete(self, messages: list[dict], stop_sequences: list[str] | None = None) -> str:
         payload_base = {
             "messages": messages,
             # 小说续写要克制的文风：温度压到 0.7，避免"漂亮但套路"的堆料输出
@@ -207,6 +233,11 @@ class OpenAICompatibleChatProvider(LLMProvider):
         }
         if self.max_tokens is not None:
             payload_base["max_tokens"] = self.max_tokens
+        # v2.6：stop token 列表——模型遇到任一 token 时停止生成。
+        # 优先用本次调用传的 stop_sequences（per-request），回退到单例 set 的。
+        effective_stop = stop_sequences if stop_sequences is not None else self._stop_sequences
+        if effective_stop:
+            payload_base["stop"] = effective_stop
         last_exc: Exception | None = None
         for model in self._model_chain():
             payload = {**payload_base, "model": model}
@@ -276,17 +307,25 @@ class OpenAICompatibleChatProvider(LLMProvider):
                 label, model, max_tokens,
             )
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None,
+             stop_sequences: list[str] | None = None) -> str:
+        """chat 调用。
+
+        stop_sequences：v2.6 —— 本次调用独立的 stop token 列表（推荐用这个，
+        避免和 provider 单例共享的 set_stop_sequences 互相覆盖）。
+        """
         user = _apply_constraints(user, constraints)
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        return self._complete(messages)
+        return self._complete(messages, stop_sequences=stop_sequences)
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None,
+                    stop_sequences: list[str] | None = None):
         """流式续写：stream=True 逐 delta 产出，长文首字即显、不干等。
 
+        stop_sequences：v2.6 —— 本次调用独立的 stop token 列表（同 chat）。
         429/403（限流/无权限）自动换模型链上的下一个免费模型重试；
         重试仅在「尚未产出任何内容」时生效——一旦开始吐字，半途失败直接抛错
         （由 SSE 处理层转成 error 事件），避免把已产出正文与重试用正文拼接污染。
@@ -303,6 +342,10 @@ class OpenAICompatibleChatProvider(LLMProvider):
         }
         if self.max_tokens is not None:
             payload_base["max_tokens"] = self.max_tokens
+        # v2.6：stop token 列表——优先用本次调用传的（per-request），回退到单例
+        effective_stop = stop_sequences if stop_sequences is not None else self._stop_sequences
+        if effective_stop:
+            payload_base["stop"] = effective_stop
         last_exc: Exception | None = None
         for model in self._model_chain():
             payload = {**payload_base, "model": model}

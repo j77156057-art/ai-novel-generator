@@ -218,12 +218,21 @@ def build_node_prompt(node: PlotNode, beat: int, progress: int | float | dict) -
       "中段"再"结尾"，必须用更明确措辞打断这种模式
     - 显式禁止引入未提及的角色——避免模型从 outline/样例"借鉴"未到场的角色
       （如把红楼梦风格的薛姨妈带进现代言情）
+
+    v2.5 阶段 3：按 node.kind 区分
+    - main：原措辞（按当前剧情点 + 主线进度推进）
+    - branch：支线段——去主线进度、改硬约束（"写完回到父节点锚点"）
     """
     # progress 兼容：v2 之前传 dict，新版允许直接传 main_progress int/float
     if isinstance(progress, dict):
         main_pct = int(progress.get("main_progress", 0) * 100)
     else:
         main_pct = int(float(progress) * 100)
+
+    # v2.5 阶段 3：支线分支——措辞完全独立
+    if node.kind == "branch":
+        return _build_branch_node_prompt(node)
+
     lines = [f"【当前剧情点】{node.title}"]
     if node.entry_condition:
         lines.append(f"起点状态：{node.entry_condition}")
@@ -247,6 +256,44 @@ def build_node_prompt(node: PlotNode, beat: int, progress: int | float | dict) -
         "2. **不要引入当前剧情点 entry/exit 未提及的角色**——"
         "模型习惯「顺手带出」会导致角色提前出场、剧情跳节点。\n"
         "3. 不要写出故事结局或大团圆——后续节点会写。"
+    )
+    return "\n".join(lines)
+
+
+def _build_branch_node_prompt(node: PlotNode) -> str:
+    """v2.5 阶段 3：支线节点的 prompt 措辞——与 main 分离。
+
+    设计：
+    - 标题前缀 "【支线剧情点】" 明确告诉模型这是支线（不是主干）
+    - 不打"主线进度"——支线不算主线推进
+    - 硬约束改："写完即回父节点锚点"——支线段写完后下一段回到父节点
+      继续写（不是切到下一个 main 节点）
+    - 不输出 beats——支线无节拍概念
+    - 标注"支线是父节点 X 的展开"——避免模型把支线当成新主线的开端
+
+    设计取舍：
+    - 保持 entry/exit 注入（和 main 一致——让模型知道边界）
+    - 硬约束措辞紧扣"支线特性"（回父节点、别展开）——这是 main 节点
+      不需要强调的
+    """
+    lines = [f"【支线剧情点】{node.title}"]
+    if node.parent:
+        lines.append(f"（这是父节点「{node.parent}」的支线展开——不是新主线开端）")
+    if node.entry_condition:
+        lines.append(f"起点状态：{node.entry_condition}")
+    if node.exit_condition:
+        lines.append(
+            f"本段写作目标：{node.exit_condition}"
+            f"——**写到这件事完成就立即收尾**，不要再展开其他剧情"
+        )
+    if node.emotion:
+        lines.append(f"本段情绪基调：{node.emotion}")
+    lines.append(
+        "**硬约束**：\n"
+        f"1. 只写「{node.title}」这一个支线剧情点，写完写作目标即停笔，"
+        "严禁扩展到任何其他剧情——下一段会回到父节点继续。\n"
+        "2. **不要引入 entry/exit 未提及的角色**。\n"
+        "3. 不要把支线演成新主线——支线是父节点的展开，不是开端。"
     )
     return "\n".join(lines)
 

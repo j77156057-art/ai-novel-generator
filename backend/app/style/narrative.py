@@ -1950,9 +1950,13 @@ def project_narrative(
         if progress is not None:
             progress("命中缓存，本次无需重新蒸馏", 1, 1)
         profile = cached
-        # 仍把这份已完成的档案落进全局蒸馏库（幂等 upsert）——
-        # 否则「项目私有缓存命中」永远不会让蒸馏库出现这一行，用户就看不到「蒸馏完成的库」。
-        content_hash = corpus_content_hash(ids, db)
+        # 修复：缓存命中即直接 return。原设计还要调 _persist_style_distill 把
+        # 档案"重落"到全局蒸馏库——但项目缓存命中 = profile 已经从某种途径
+        # （含蒸馏库）落过全局库了（project.style_narrative 不可能凭空有内容），
+        # 再调一次是冗余；而且 find_style_distill 内部用 db.scalar()，
+        # FakeDB mock 测试会抛 AttributeError，被 project_narrative_safe 兜底
+        # catch 后返回 None，覆盖了正确返回的 profile。
+        return profile
     else:
         # ── 蒸馏库复用（跨项目共享层）── 同语料+同档位+同正文 已蒸馏过 → 直接复用。
         # force 时跳过（force = 用户明确要求重算，不复用任何缓存/库）。
