@@ -32,6 +32,14 @@ const routes = [
     meta: { title: "助手工作台", idx: "02" },
   },
   {
+    // KG v3.0 工作台：9 表读侧可视化（切片/情报/时间线/Judge/关系）。
+    // 项目级资源，与助手工作台同逻辑挂在 /projects/:id 之下。
+    path: "/projects/:id/kg",
+    name: "kg-workspace",
+    component: () => import("@/views/KgWorkspace.vue"),
+    meta: { title: "KG 工作台", idx: "02" },
+  },
+  {
     // 顶层助手入口：自动挑一个项目后 replace 到上面的项目级助手页。
     // 让「助手工作台」导航与首屏都能直达对话，不必先经项目列表。
     path: "/assistant",

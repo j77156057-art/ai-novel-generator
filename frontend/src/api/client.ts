@@ -40,6 +40,12 @@ import type {
   GenerateResult,
   GenerationOut,
   Graph,
+  KgV3Character,
+  KgV3ExemptRequest,
+  KgV3JudgeFindingsResponse,
+  KgV3EventsResponse,
+  KgV3Relation,
+  KgV3Slice,
   LlmConfig,
   LlmConfigIn,
   LlmTestIn,
@@ -648,4 +654,86 @@ export const api = {
     assistantEndpointPath(endpoint),
     jsonInit(method.toUpperCase(), body),
   ),
+
+  // ---------- KG v3.0（9 表读侧 + Judge + 豁免）----------
+
+  /** 按当前剧情点取 KG 切片（generate 注入 prompt 的同款数据）。 */
+  kgV3Slice: (
+    projectId: number,
+    segmentNo: number,
+    opts: { window?: number; maxEntities?: number; characters?: string | null } = {},
+  ) => {
+    const p = new URLSearchParams({ segment_no: String(segmentNo) });
+    if (opts.window != null) p.set("window", String(opts.window));
+    if (opts.maxEntities != null) p.set("max_entities", String(opts.maxEntities));
+    if (opts.characters) p.set("characters", opts.characters);
+    return request<KgV3Slice>(`/projects/${projectId}/kg-v3/slice?${p}`);
+  },
+
+  /** 渲染成 prompt 文本（看 generate 实际注入什么）。 */
+  kgV3SlicePrompt: (projectId: number, segmentNo: number, window = 5) =>
+    request<{ text: string }>(
+      `/projects/${projectId}/kg-v3/slice/prompt?segment_no=${segmentNo}&window=${window}`,
+    ),
+
+  /** 关系演变曲线（strength 历史）。 */
+  kgV3RelationCurve: (projectId: number, fromName: string, toName: string) =>
+    request<{ from: string; to: string; curve: { rel_type: string; chapter: number | null; strength: number; note: string | null }[] }>(
+      `/projects/${projectId}/kg-v3/relations/curve?from=${encodeURIComponent(fromName)}&to=${encodeURIComponent(toName)}`,
+    ),
+
+  /** 人物情报追踪：character 此刻是否知道 fact。 */
+  kgV3Knows: (projectId: number, character: string, fact: string) =>
+    request<{ character: string; fact: string; knows: boolean }>(
+      `/projects/${projectId}/kg-v3/knowledge?character=${encodeURIComponent(character)}&fact=${encodeURIComponent(fact)}`,
+    ),
+
+  /** 节奏分析：最近 N 段每实体的 mention 分布。 */
+  kgV3Rhythm: (projectId: number, window = 10) =>
+    request<{ segments: number[]; top_entities: { name: string; kind: string; mentions: number }[] }>(
+      `/projects/${projectId}/kg-v3/rhythm?window=${window}`,
+    ),
+
+  /** 事件列表（含因果链），sequence 升序。 */
+  kgV3Events: (projectId: number, limit = 200, eventType?: string | null) => {
+    const p = new URLSearchParams({ limit: String(limit) });
+    if (eventType) p.set("event_type", eventType);
+    return request<KgV3EventsResponse>(`/projects/${projectId}/kg-v3/events?${p}`);
+  },
+
+  /** 作者豁免：认定某告警是故意的，Judge 以后不再报。 */
+  kgV3Exempt: (projectId: number, body: KgV3ExemptRequest) =>
+    request<{ exempted: boolean; rule: string; entity: string }>(
+      `/projects/${projectId}/kg-v3/exemptions`,
+      jsonInit("POST", body),
+    ),
+
+  /** 豁免清单。 */
+  kgV3ListExemptions: (projectId: number) =>
+    request<{ exemptions: { rule: string | null; entity: string | null; note: string | null }[] }>(
+      `/projects/${projectId}/kg-v3/exemptions`,
+    ),
+
+  /** 撤销豁免：Judge 恢复报告该告警。 */
+  kgV3RevokeExemption: (projectId: number, rule: string, entity: string) =>
+    request<{ revoked: number; rule: string; entity: string }>(
+      `/projects/${projectId}/kg-v3/exemptions?rule=${encodeURIComponent(rule)}&entity=${encodeURIComponent(entity)}`,
+      { method: "DELETE" },
+    ),
+
+  /** Judge 告警历史（落库的，按段倒序，含 exempted 标记与规则清单）。 */
+  kgV3JudgeFindings: (projectId: number) =>
+    request<KgV3JudgeFindingsResponse>(`/projects/${projectId}/kg-v3/judge/findings`),
+
+  /** 项目角色清单（mention 降序）。 */
+  kgV3Characters: (projectId: number, limit = 200) =>
+    request<{ characters: KgV3Character[] }>(
+      `/projects/${projectId}/kg-v3/characters?limit=${limit}`,
+    ),
+
+  /** 关系清单（strength 降序，含两端实体名）。 */
+  kgV3Relations: (projectId: number, limit = 300) =>
+    request<{ relations: KgV3Relation[] }>(
+      `/projects/${projectId}/kg-v3/relations?limit=${limit}`,
+    ),
 };

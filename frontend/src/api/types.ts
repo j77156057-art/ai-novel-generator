@@ -1055,3 +1055,79 @@ export interface StyleDistillListResponse {
 export interface StyleDistillApplyRequest {
   distill_id: number;
 }
+
+// ============================================================
+// KG v3.0（9 表读侧 + Judge + 豁免）
+// ============================================================
+
+/** GET /kg-v3/slice 返回的切片（generate 注入 prompt 的同款数据）。 */
+export interface KgV3Slice {
+  recent_entities: { name: string; kind: string; context: string; mention_count: number }[];
+  character_states: { character: string; state_type: string; new_value: string }[];
+  active_foreshadows: {
+    name: string;
+    status: string;
+    planted_chapter: number | null;
+    planned_payoff_chapter: number | null;
+  }[];
+  known_facts: { character: string; knows: string[] }[];
+  recent_events: { summary: string; event_type: string; in_story_date: string | null }[];
+}
+
+/** GET /kg-v3/events 的事件与因果链。 */
+export interface KgV3EventsResponse {
+  events: {
+    sequence: number;
+    chapter: number | null;
+    segment_no: number | null;
+    event_type: string;
+    summary: string;
+    in_story_date: string | null;
+  }[];
+  links: { from_event_id: number; to_event_id: number; link_type: string }[];
+}
+
+/** GET /kg-v3/judge/findings 的单条告警。 */
+export interface KgV3JudgeFinding {
+  rule: string;
+  severity: "err" | "warn";
+  segment_no: number | null;
+  entity: string;
+  message: string;
+  evidence: string[];
+  exempted?: boolean;
+}
+
+/** GET /kg-v3/judge/findings 响应（与哨兵 /alerts 同形状）。 */
+export interface KgV3JudgeFindingsResponse {
+  items: KgV3JudgeFinding[];
+  count: number;
+  by_severity: { err: number; warn: number };
+  rules: Record<string, { severity: string; desc: string }>;
+}
+
+/** GET /kg-v3/characters 的单条角色。 */
+export interface KgV3Character {
+  id: number;
+  name: string;
+  mention_count: number;
+  has_secrets: boolean;
+}
+
+/** GET /kg-v3/relations 的单条关系边。 */
+export interface KgV3Relation {
+  from: string;
+  to: string;
+  from_kind: string;
+  to_kind: string;
+  rel_type: string;
+  strength: number;
+}
+
+/** POST /kg-v3/exemptions 请求体。 */
+export interface KgV3ExemptRequest {
+  finding_id: number | null;
+  rule: string;
+  entity: string;
+  note: string;
+}

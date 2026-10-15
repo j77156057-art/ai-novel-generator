@@ -1961,6 +1961,7 @@ onUnmounted(stopDistillPolling);
       <button class="btn" :disabled="buildingKg" @click="buildGeneratedKg">
         {{ buildingKg ? "建图中…" : "建/重建「我的小说」图谱" }}
       </button>
+      <router-link class="btn primary" :to="`/projects/${projectId}/kg`">KG v3 工作台 →</router-link>
     </div>
     <div v-if="kgMsg" class="notice info" style="margin-bottom: 12px">{{ kgMsg }}</div>
     <div class="row" style="margin-bottom: var(--gap)">
