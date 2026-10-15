@@ -204,6 +204,7 @@ def build_user_prompt(
     style_exemplars: list[dict] | None = None,
     rag_has_forbidden: bool = False,
     node_prompt: str | None = None,
+    kg_slice: str | None = None,
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -340,5 +341,10 @@ def build_user_prompt(
         blocks += ["", "【当前剧情进度（按点推进，不要越过本点）】", node_prompt]
     elif outline_text:
         blocks += ["", "【大纲】", outline_text]
+    if kg_slice:
+        # v3.0 KG 切片：按当前剧情点动态取的近期实体/状态/伏笔/情报/事件。
+        # 只标红不强制——是给模型的「世界观锚点」，让它别写飞。与 plot_bible 区别：
+        # plot_bible 是用户构思（含走向，时间线模式剔除），kg_slice 是已生成事实。
+        blocks += ["", "【世界观事实（已发生，续写须保持一致，不得矛盾）】", kg_slice]
     blocks += ["", "【续写指令】", directive]
     return "\n".join(blocks)

@@ -76,7 +76,7 @@ class FakeStreamingProvider:
             return self.judge_reply
         return self.reply
 
-    def stream_chat(self, system: str, user: str, constraints=None):
+    def stream_chat(self, system: str, user: str, constraints=None, stop_sequences=None):
         self.stream_calls.append((system, user, constraints))
         # 一次性 yield（模拟默认实现）
         yield self.reply

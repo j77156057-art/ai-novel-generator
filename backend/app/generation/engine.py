@@ -341,7 +341,55 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None) -> d
         "rag_has_forbidden": rag_has_forbidden,
         "novel_ids": novel_ids,
         "constraints": constraints,
+        # v3.0 KG 切片：按当前剧情点动态取的近期实体/状态/伏笔/情报/事件。
+        # 空库（未抽过）时为空串，build_user_prompt 跳过该块。
+        "kg_slice": _kg_slice_text(db, project),
     }
+
+
+def _kg_slice_text(db, project: Project) -> str:
+    """取 v3.0 KG 切片并渲染成 prompt 文本。失败返回空串（不阻断）。"""
+    try:
+        from app.kg.retrieval_v3 import slice_for_prompt, format_slice_for_prompt
+
+        current_seg = _next_segment_no(db, project.id) - 1
+        if current_seg < 1:
+            return ""
+        # active_characters：本段已写正文里的角色。首段无正文，用 plot_bible 角色名兜底。
+        active = _active_character_names(db, project, current_seg)
+        sl = slice_for_prompt(db, project.id, current_seg, active_characters=active)
+        return format_slice_for_prompt(sl)
+    except Exception:  # noqa: BLE001 —— KG 切片是增强，取不到不阻断生成
+        return ""
+
+
+def _active_character_names(db, project: Project, current_seg: int) -> list[str]:
+    """本段涉及的角色名（mention 反查）。空则用 plot_bible 角色名兜底。"""
+    try:
+        from app.models import KgMention, KgEntity
+        from sqlalchemy import select
+
+        ent_ids = {
+            m.entity_id for m in db.scalars(
+                select(KgMention).where(
+                    KgMention.project_id == project.id,
+                    KgMention.segment_no == current_seg,
+                )
+            )
+        }
+        names = []
+        for eid in ent_ids:
+            ent = db.get(KgEntity, eid)
+            if ent is not None and ent.kind == "character":
+                names.append(ent.canonical_name)
+        if names:
+            return names
+        # 兜底：plot_bible 里的角色名
+        bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+        return [c.get("name") for c in (bible.get("characters") or [])
+                if isinstance(c, dict) and c.get("name")]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _style_info(project: Project) -> dict | None:
@@ -740,6 +788,7 @@ def generate_next_segment(
         style_exemplars=ctx.get("style_exemplars"),
         rag_has_forbidden=ctx.get("rag_has_forbidden", False),
         node_prompt=node_prompt,
+        kg_slice=ctx.get("kg_slice") or None,
     )
 
     # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
@@ -881,6 +930,7 @@ def generate_next_segment_stream(
         style_exemplars=ctx.get("style_exemplars"),
         rag_has_forbidden=ctx.get("rag_has_forbidden", False),
         node_prompt=node_prompt,
+        kg_slice=ctx.get("kg_slice") or None,
     )
 
     # v2.6：节点粒度根治——流式版同步传 per-request stop token
