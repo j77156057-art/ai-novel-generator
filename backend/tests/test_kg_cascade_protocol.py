@@ -217,7 +217,42 @@ r = client.get("/api/projects/999/bible/revisions")
 check("端点 revisions: 不存在项目 404", r.status_code, 404)
 
 # ====================================================================
-# 6. 老 PATCH 路径仍工作（兼容性）
+# 6. 阶段 2-3 收尾：merged_constraint_items 的「bible 删除权威」
+# ====================================================================
+from app.generation.prompts import merged_constraint_items
+
+rem = {"character_constraints": [
+    {"name": "林悠然", "mentions": 5},
+    {"name": "顾辰逸", "mentions": 3},
+    {"name": "贾正", "mentions": 2},
+], "unresolved_plotholes": [{"question": "账本的隐藏页"}, {"question": "父亲的死因"}]}
+
+# bible 显式清册只留林悠然 → 顾辰逸/贾正 的 KG 约束被剔除（bible 删除权威）
+b1 = {"characters": [{"name": "林悠然", "role": "主角"}]}
+chars1, fores1 = merged_constraint_items(rem, b1)
+names1 = [c.get("name") if isinstance(c, dict) else str(c) for c in chars1]
+check("删除权威: 锁定名单只剩林悠然", [n for n in names1 if n], ["林悠然"])
+check_true("删除权威: 被删角色不出锁定名单", "顾辰逸" not in names1 and "贾正" not in names1)
+check_true("删除权威: 伏笔不受影响（本轮只做角色侧）", "账本的隐藏页" in fores1)
+
+# 保守边界 1：bible 无 characters 键 → 不过滤（老项目不误伤）
+chars2, _ = merged_constraint_items(rem, {"relationships": []})
+check("保守: 无 characters 键不过滤", len(chars2), 3)
+
+# 保守边界 2：bible.characters 空列表 → 不过滤（未显式宣告清册）
+chars3, _ = merged_constraint_items(rem, {"characters": []})
+check("保守: characters 空列表不过滤", len(chars3), 3)
+
+# 保守边界 3：bible=None → 不过滤
+chars4, _ = merged_constraint_items(rem, None)
+check("保守: bible=None 不过滤", len(chars4), 3)
+
+# 保守边界 4：characters 是纯字符串列表（无 name 键）也能识别清册
+chars5, _ = merged_constraint_items(rem, {"characters": ["林悠然", "顾辰逸"]})
+check("字符串清册: 只留宣告过的", len(chars5), 2)
+
+# ====================================================================
+# 7. 老 PATCH 路径仍工作（兼容性）
 # ====================================================================
 r = client.patch("/api/projects/1", json={"title": "新名字"})
 check("老 PATCH: 状态码", r.status_code, 200)

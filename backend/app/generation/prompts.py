@@ -99,11 +99,28 @@ def merged_constraint_items(
     权威顺序（评审 A 的 Q6）：plot_bible（用户构思 / bible）在前，图谱抽取在后。
     两处必须共用本函数，否则会出现「system 里列了、user 尾部那份自称完整的锁定名单里没列」
     这种自相矛盾的提示词——最高权威层被漏掉，模型会以为游离在约束之外。
+
+    **bible 删除权威**（kg-cascade-protocol 阶段 2-3）：bible.characters **显式列了**
+    名字时，未列入的 KG 角色约束整条剔除——用户在 bible 里删掉「顾辰逸」后，
+    旧抽取事实再把他说成锁定角色，会与新设定矛盾（旧段不可改，但未来段必须只认新设定）。
+    保守边界：bible 无 characters 键或空列表 = 未显式宣告清册，不过滤
+    （老项目 bible 只有 relationships/foreshadowing 时不误伤全表）。
     """
     bible_chars = (plot_bible.get("characters") or []) if plot_bible else []
     kg_chars = reminders.get("character_constraints") or []
     bible_fores = (plot_bible.get("foreshadowing") or []) if plot_bible else []
     kg_fores = [h.get("question") for h in (reminders.get("unresolved_plotholes") or [])]
+    if bible_chars and isinstance(bible_chars, list):
+        declared: set[str] = set()
+        for c in bible_chars:
+            declared.add(str((c.get("name") if isinstance(c, dict) else c) or "").strip())
+        if declared:
+            kg_chars = [
+                c for c in kg_chars
+                if not isinstance(c, dict)
+                or not str(c.get("name") or "").strip()
+                or str(c.get("name")).strip() in declared
+            ]
     return _merge_named(bible_chars, kg_chars), _merge_text(bible_fores, kg_fores)
 
 
