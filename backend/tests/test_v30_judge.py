@@ -4,7 +4,8 @@
 - teleportation 瞬移：location 状态与事件地点矛盾 + 无移动动词 → err；有移动动词 → 不报
 - unauthorized_knowledge 预知外挂：有 knowledge 记录时角色提及未学到的秘密 → err；
   无 knowledge 记录 → 不报（全项目无记录会满屏误报，保守）
-- impossible_sequences 时间穿越：sequence 递增但年份递减 → err；递增 → 不报
+- impossible_sequences 时间穿越：sequence 递增但年份递减 → err；递增 → 不报；
+  年号纪年（贞观三年→贞观元年）换算公元年后同 era 倒挂 → err；换年号 → 不报
 - foreshadow_expiry 伏笔超期：planned_payoff 过期未 paid_off → warn；已回收 → 不报
 - language_mix 语言混入：拉丁/假名串 → warn；白名单 DNA/CEO → 不报；纯中文 → 不报
 - judge_segment 集成：单规则失败不影响其他（幂等兜底）
@@ -137,14 +138,26 @@ findings_inc = check_impossible_sequences(db, 1, "", segment_no=1)
 # 只有 10→11 一对递减（20→21 递增）
 check("时间穿越：递增不新增告警", len(findings_inc), 1)
 
-# 非年份时间（贞观三年秋）不比 —— 量纲不统一，宁可漏报
+# 非年份时间（年号纪年）现在也判——era_convert 换算公元年后按同 era 比较
+# （口径 C，见 docs/kg-judge-era-dimension-design.md）
 db.add_all([
     KgEvent(project_id=1, sequence=30, event_type="incident", summary="戊", in_story_date="贞观三年秋"),
     KgEvent(project_id=1, sequence=31, event_type="incident", summary="己", in_story_date="贞观元年春"),
 ])
 db.commit()
 findings_cn = check_impossible_sequences(db, 1, "", segment_no=1)
-check("时间穿越：非年份时间不判", len(findings_cn), 1)  # 仍只有那对 2020→2018
+check("时间穿越：年号纪年倒挂报 err", len(findings_cn), 2)  # 10→11 公元年对 + 30→31 年号对
+check_true("时间穿越：年号对 rule 正确",
+           findings_cn and findings_cn[-1].rule == "impossible_sequences")
+
+# 换年号（贞观末→永徽元）是正常历史推进，不报
+db.add_all([
+    KgEvent(project_id=1, sequence=40, event_type="incident", summary="庚", in_story_date="贞观二十三年"),
+    KgEvent(project_id=1, sequence=41, event_type="incident", summary="辛", in_story_date="永徽元年"),
+])
+db.commit()
+findings_era_switch = check_impossible_sequences(db, 1, "", segment_no=1)
+check("时间穿越：换年号不新增告警", len(findings_era_switch), 2)
 
 # ====================================================================
 # 4. foreshadow_expiry 伏笔超期

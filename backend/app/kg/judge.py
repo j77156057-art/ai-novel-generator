@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import select
 
+from app.kg.era_convert import extract_era_name, parse_story_time
 from app.kg.knowledge_match import normalize_fact
 from app.models import (
     KgCharacterState, KgEntity, KgEntityKnowledge, KgEvent, KgForeshadow, KgMention,
@@ -314,11 +315,21 @@ def check_secret_leak(db, project_id: int, text: str, segment_no: int) -> list[J
 
 
 def check_impossible_sequences(db, project_id: int, text: str, segment_no: int) -> list[JudgeFinding]:
-    """时间穿越：事件 sequence 顺序与 in_story_date 矛盾。
+    """时间穿越：事件 sequence 顺序与故事内时间矛盾。
 
-    判据（保守）：同项目事件按 sequence 递增时，in_story_date 里提取的年份
-    不应递减（如 seq10=2020 年，seq11=2018 年）。只认 4 位年份，其它时间
-    表述（贞观三年秋）不比——量纲不统一，宁可漏报。
+    判据（保守）：事件按 sequence 递增时，故事内时间不应倒退。
+    支持两种时间量纲——
+      1) 公元年：'2020年3月'（正则取 4 位年份）
+      2) 年号纪年：'贞观三年秋'（era_convert 换算公元年，贞观三年=629）
+
+    量纲统一由 era_convert.parse_story_time 完成；本函数只做**相邻同 era 比较**
+    （口径 C，见 docs/kg-judge-era-dimension-design.md）：
+      - 相邻事件的 era 相同才比 year——换年号（贞观→永徽）是正常历史推进，不比
+      - 任一事件解析失败即断链，从下一个成功事件重新起比（宁漏勿错）
+      - 年号事件的 era 键是年号名；公元年事件 era=None，与年号事件互不相邻成链
+
+    同名年号（建元=西汉/东晋/南齐）由 era_convert.era_year 按起止区间消歧，
+    取不到唯一公元年 → None → 断链，不猜。
     """
     findings: list[JudgeFinding] = []
     events = db.scalars(
@@ -327,24 +338,25 @@ def check_impossible_sequences(db, project_id: int, text: str, segment_no: int) 
             KgEvent.in_story_date.isnot(None),
         ).order_by(KgEvent.sequence)
     ).all()
-    prev_year: int | None = None
-    prev_seq: int | None = None
-    prev_desc: str = ""
+    prev: tuple[str | None, int, int, str] | None = None   # (era, year, sequence, summary)
     for ev in events:
-        m = re.search(r"(19|20)\d{2}", ev.in_story_date or "")
-        if not m:
+        date = ev.in_story_date or ""
+        year = parse_story_time(date)
+        if year is None:
+            prev = None          # 解析失败 → 断链
             continue
-        year = int(m.group(0))
-        if prev_year is not None and year < prev_year:
+        era = extract_era_name(date)
+        if prev is not None and prev[0] == era and year < prev[1]:
             findings.append(JudgeFinding(
                 rule="impossible_sequences",
                 severity="err",
-                entity=f"seq{prev_seq}→{ev.sequence}",
-                message=f"事件 {prev_seq}（{prev_year}年）在事件 {ev.sequence}（{year}年）之前，"
+                entity=f"seq{prev[2]}→{ev.sequence}",
+                message=f"事件 {prev[2]}（{prev[1]}年）在事件 {ev.sequence}（{year}年）之前，"
                         f"但 sequence 顺序相反",
-                evidence=[f"seq{prev_seq}: {prev_year} ({prev_desc})", f"seq{ev.sequence}: {year} ({ev.summary})"],
+                evidence=[f"seq{prev[2]}: {prev[1]} ({prev[3]})",
+                          f"seq{ev.sequence}: {year} ({(ev.summary or '')[:40]})"],
             ))
-        prev_year, prev_seq, prev_desc = year, ev.sequence, (ev.summary or "")[:40]
+        prev = (era, year, ev.sequence, (ev.summary or "")[:40])
     return findings
 
 
