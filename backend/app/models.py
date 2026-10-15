@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -222,7 +223,12 @@ class KgEntity(Base):
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
-    __table_args__ = (UniqueConstraint("project_id", "kind", "canonical_name", name="uq_kg_entity"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "kind", "canonical_name", name="uq_kg_entity"),
+        # 检索切片/批抽扫描：WHERE project_id=? + 归一 by canonical_name
+        Index("ix_kg_entity_project_kind", "project_id", "kind"),
+        Index("ix_kg_entity_project_canonical", "project_id", "canonical_name"),
+    )
 
 
 class KgRelation(Base):
@@ -246,7 +252,10 @@ class KgRelation(Base):
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
-    __table_args__ = (UniqueConstraint("project_id", "from_id", "to_id", "rel_type", name="uq_kg_relation"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "from_id", "to_id", "rel_type", name="uq_kg_relation"),
+        Index("ix_kg_relation_project", "project_id"),
+    )
 
 
 class KgRelationEvolution(Base):
@@ -264,6 +273,11 @@ class KgRelationEvolution(Base):
     strength = Column(Float, nullable=False)
     note = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        # 关系曲线展开：按 edge_id 拉所有 evolution
+        Index("ix_kg_relation_evolution_edge", "edge_id"),
+    )
 
 
 class KgEvent(Base):
@@ -294,7 +308,12 @@ class KgEvent(Base):
     evidence_segment_ids = Column(JSON, nullable=True, default=list)
     created_at = Column(DateTime, default=_utcnow)
 
-    __table_args__ = (UniqueConstraint("project_id", "sequence", name="uq_kg_event_seq"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "sequence", name="uq_kg_event_seq"),
+        # 切片取最近 N 段事件 ORDER BY sequence DESC；批抽取 max(sequence)
+        Index("ix_kg_event_project_sequence", "project_id", "sequence"),
+        Index("ix_kg_event_project_segment", "project_id", "segment_no"),
+    )
 
 
 class KgEventLink(Base):
@@ -309,7 +328,11 @@ class KgEventLink(Base):
     link_type = Column(String(16), nullable=False)
     confidence = Column(Float, nullable=False, default=1.0)
 
-    __table_args__ = (UniqueConstraint("project_id", "from_event_id", "to_event_id", "link_type", name="uq_kg_event_link"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "from_event_id", "to_event_id", "link_type", name="uq_kg_event_link"),
+        Index("ix_kg_event_link_from", "from_event_id"),
+        Index("ix_kg_event_link_to", "to_event_id"),
+    )
 
 
 class KgCharacterState(Base):
@@ -330,6 +353,12 @@ class KgCharacterState(Base):
     new_value = Column(String(500), nullable=True)  # 变化后的值
     cause_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
     created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        # 切片按角色取最新状态（slice_for_prompt 查每角色每 state_type 最新一条）
+        Index("ix_kg_char_state_project_char", "project_id", "character_id"),
+        Index("ix_kg_char_state_project_segment", "project_id", "segment_no"),
+    )
 
 
 class KgForeshadow(Base):
@@ -355,7 +384,11 @@ class KgForeshadow(Base):
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
-    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_kg_foreshadow"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_kg_foreshadow"),
+        # 切片 active 过滤（status IN ('planted','developing')）+ Judge 超期检查
+        Index("ix_kg_foreshadow_project_status", "project_id", "status"),
+    )
 
 
 class KgEntityKnowledge(Base):
@@ -377,6 +410,7 @@ class KgEntityKnowledge(Base):
 
     __table_args__ = (
         UniqueConstraint("project_id", "entity_id", "known_entity_id", "learned_at_event_id", name="uq_kg_entity_knowledge"),
+        Index("ix_kg_entity_knowledge_project_entity", "project_id", "entity_id"),
     )
 
 
@@ -396,7 +430,11 @@ class KgMention(Base):
     context_window = Column(String(500), nullable=True)  # 提及处原文片段
     mention_kind = Column(String(16), nullable=True)  # direct|alias|reference
 
-    __table_args__ = (UniqueConstraint("project_id", "entity_id", "generation_id", name="uq_kg_mention"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "entity_id", "generation_id", name="uq_kg_mention"),
+        Index("ix_kg_mention_project_segment", "project_id", "segment_no"),
+        Index("ix_kg_mention_project_entity", "project_id", "entity_id"),
+    )
 
 
 class Generation(Base):
