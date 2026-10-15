@@ -57,6 +57,93 @@ const answers = reactive<Record<string, string>>({});
 const buildingBible = ref(false);
 const bible = ref<PlotBible | null>(null);
 
+// ===== plot_bible 级联协议编辑（kg-cascade-protocol） =====
+// 用户在 bible 卡片点「编辑」→ JSON 模态 → apply 走新端点（写 revision +
+// 扫冲突）→ 响应里的 conflicts 一次性 toast 展示。改动覆盖本地 bible ref
+// 但不重抽旧段（事实不能改写），下次生成自动用新 bible。
+const bibleEditOpen = ref(false);
+const bibleEditText = ref("");
+const bibleEditNote = ref("");
+const bibleEditBusy = ref(false);
+const bibleEditErr = ref<string | null>(null);
+const bibleEditResult = ref<{
+  revision_no: number;
+  diff_added: number;
+  diff_removed: number;
+  diff_changed: number;
+  conflicts: { kind: string; kg_key: string; kg_value: string; bible_field: string; bible_value: string }[];
+} | null>(null);
+const bibleRevisions = ref<{ revision_no: number; created_at: string | null; note: string | null; conflicts_count: number }[]>([]);
+const bibleRevisionsOpen = ref(false);
+
+function openBibleEditor() {
+  if (!bible.value) return;
+  bibleEditText.value = JSON.stringify(bible.value, null, 2);
+  bibleEditNote.value = "";
+  bibleEditErr.value = null;
+  bibleEditResult.value = null;
+  bibleEditOpen.value = true;
+}
+
+async function loadBibleRevisions() {
+  try {
+    const r = await api.listBibleRevisions(projectId);
+    bibleRevisions.value = r.revisions.map((x) => ({
+      revision_no: x.revision_no,
+      created_at: x.created_at,
+      note: x.note,
+      conflicts_count: x.conflicts_count,
+    }));
+  } catch (e) {
+    bibleRevisions.value = [];
+  }
+  bibleRevisionsOpen.value = true;
+}
+
+async function applyBibleEdit() {
+  bibleEditBusy.value = true;
+  bibleEditErr.value = null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bibleEditText.value);
+  } catch (e) {
+    bibleEditErr.value = `JSON 解析失败：${e instanceof Error ? e.message : String(e)}`;
+    bibleEditBusy.value = false;
+    return;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    bibleEditErr.value = "bible 必须是 JSON 对象（不是数组/标量）";
+    bibleEditBusy.value = false;
+    return;
+  }
+  try {
+    const r = await api.applyBible(projectId, parsed as Record<string, unknown>,
+                                    bibleEditNote.value || null);
+    // 立即覆盖本地 bible（不在 response 拿——拿 revision_no/diff/conflicts）
+    bible.value = parsed as PlotBible;
+    bibleEditResult.value = {
+      revision_no: r.revision_no,
+      diff_added: Object.keys(r.diff.added).length,
+      diff_removed: Object.keys(r.diff.removed).length,
+      diff_changed: Object.keys(r.diff.changed).length,
+      conflicts: r.conflicts,
+    };
+    // 同步 project.plot_bible（KG 工作台读它）
+    if (project.value) {
+      project.value = { ...project.value, plot_bible: parsed as PlotBible };
+    }
+    bibleEditOpen.value = false;  // 关闭编辑弹窗，toast 接管
+  } catch (e) {
+    bibleEditErr.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    bibleEditBusy.value = false;
+  }
+}
+
+function dismissBibleResult() {
+  bibleEditResult.value = null;
+}
+
 // 生成前的「让模型出方案」回调后回填
 function pickProposal(text: string) {
   premiseDraft.value = text;
@@ -1533,7 +1620,12 @@ onUnmounted(stopDistillPolling);
     </button>
 
     <div v-if="bible" class="bible">
-      <div class="card-title" style="font-size: var(--fs-md)">剧情圣经（已落库）</div>
+      <div class="card-title" style="font-size: var(--fs-md)">
+        剧情圣经（已落库）
+        <button class="btn ghost" style="font-size: var(--fs-xs)" @click="openBibleEditor">
+          编辑 (级联协议)
+        </button>
+      </div>
       <div class="bible-row"><span class="k">梗概</span><span class="v prose">{{ bible.synopsis }}</span></div>
       <div class="bible-row"><span class="k">走向</span><span class="v prose">{{ bible.direction }}</span></div>
       <div class="bible-row" v-if="bible.characters?.length">
@@ -1557,6 +1649,110 @@ onUnmounted(stopDistillPolling);
         <span class="v"><span v-for="f in bible.foreshadowing" :key="f" class="tag">{{ f }}</span></span>
       </div>
       <div v-if="bible.note" class="notice warn" style="margin-top: 12px">{{ bible.note }}</div>
+    </div>
+
+    <!-- ===== plot_bible 编辑模态（kg-cascade-protocol）===== -->
+    <div v-if="bibleEditOpen" class="bible-modal-mask" @click.self="bibleEditOpen = false">
+      <div class="bible-modal">
+        <div class="card-title">
+          编辑剧情圣经（级联协议）
+          <span class="hint">revision 写盘 + KG 冲突扫描在 apply 时触发</span>
+        </div>
+        <div class="row" style="margin-bottom: 8px">
+          <input class="input" v-model="bibleEditNote" placeholder="备注（可选）：为什么改？" style="flex: 1" />
+        </div>
+        <textarea
+          v-model="bibleEditText"
+          class="input bible-textarea"
+          rows="20"
+          spellcheck="false"
+          style="font-family: var(--font-mono); font-size: var(--fs-xs); width: 100%"
+        />
+        <div v-if="bibleEditErr" class="notice err" style="margin-top: 12px">{{ bibleEditErr }}</div>
+        <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+          <button class="btn ghost" @click="bibleEditOpen = false">取消</button>
+          <button class="btn" @click="loadBibleRevisions">查看历史 ({{ bibleRevisions.length }})</button>
+          <button class="btn primary" :disabled="bibleEditBusy" @click="applyBibleEdit">
+            {{ bibleEditBusy ? "应用中…" : "Apply" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== revision 历史侧栏 ===== -->
+    <div v-if="bibleRevisionsOpen" class="bible-modal-mask" @click.self="bibleRevisionsOpen = false">
+      <div class="bible-modal" style="max-width: 600px">
+        <div class="card-title">
+          剧情圣经 revision 历史
+          <span class="hint">新→旧，最多 20</span>
+        </div>
+        <div v-if="!bibleRevisions.length" class="empty">还没有 revision（首次 apply 后会出现）</div>
+        <div v-else class="list">
+          <div v-for="r in bibleRevisions" :key="r.revision_no" class="list-item">
+            <div style="flex: 1">
+              <div class="row tight">
+                <span class="tag mono">rev {{ r.revision_no }}</span>
+                <span v-if="r.conflicts_count > 0" class="tag warn">
+                  {{ r.conflicts_count }} conflicts
+                </span>
+                <span class="faint mono" style="font-size: var(--fs-xs)">
+                  {{ r.created_at ? new Date(r.created_at).toLocaleString() : "" }}
+                </span>
+              </div>
+              <div v-if="r.note" class="faint" style="font-size: var(--fs-xs); margin-top: 2px">
+                {{ r.note }}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== apply 后冲突 toast（一次性）===== -->
+    <div v-if="bibleEditResult" class="bible-toast" @click.self="dismissBibleResult">
+      <div class="bible-toast-card">
+        <div class="card-title">
+          圣经已应用 → revision #{{ bibleEditResult.revision_no }}
+          <button class="btn ghost" style="font-size: var(--fs-xs)" @click="dismissBibleResult">关闭</button>
+        </div>
+        <div class="row tight" style="margin-bottom: 8px">
+          <span class="tag">+{{ bibleEditResult.diff_added }} added</span>
+          <span class="tag">~{{ bibleEditResult.diff_changed }} changed</span>
+          <span class="tag warn" v-if="bibleEditResult.diff_removed > 0">-{{ bibleEditResult.diff_removed }} removed</span>
+        </div>
+        <div v-if="bibleEditResult.conflicts.length === 0" class="notice ok">
+          无 KG 冲突。下次生成会注入新 bible。
+        </div>
+        <div v-else>
+          <div class="notice warn" style="margin-bottom: var(--gap)">
+            <strong>{{ bibleEditResult.conflicts.length }} 条 KG 冲突</strong>——下面列出。
+            bible 改动已应用，KG 表里的旧 facts 不会被自动改（已写段是历史）。
+            可去 <router-link :to="`/projects/${projectId}/kg`">KG 工作台</router-link> 决定忽略/去豁免/撤回。
+          </div>
+          <div class="list">
+            <div
+              v-for="(c, i) in bibleEditResult.conflicts"
+              :key="i"
+              class="list-item"
+              style="align-items: flex-start"
+            >
+              <span class="tag warn" style="margin-top: 2px">{{ c.kind }}</span>
+              <div style="flex: 1; font-size: var(--fs-sm)">
+                <strong>{{ c.kg_key }}</strong>
+                <div class="faint">
+                  KG 现状: <span style="color: var(--fg-muted)">{{ c.kg_value }}</span>
+                </div>
+                <div class="faint">
+                  bible 新声明: <span style="color: var(--accent-ink)">{{ c.bible_value }}</span>
+                </div>
+                <div class="faint mono" style="font-size: var(--fs-xs)">
+                  字段：{{ c.bible_field }}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="row" style="margin-top: var(--gap)">
@@ -2361,6 +2557,54 @@ onUnmounted(stopDistillPolling);
 .bible-row .k {
   font-size: var(--fs-xs);
   color: var(--fg-faint);
+
+/* ===== plot_bible 编辑模态 + 冲突 toast（kg-cascade-protocol）===== */
+.bible-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(28, 26, 23, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  z-index: 100;
+  padding-top: 6vh;
+}
+.bible-modal {
+  background: var(--bg-elev);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--gap-lg);
+  width: 90%;
+  max-width: 720px;
+  max-height: 80vh;
+  overflow: auto;
+  box-shadow: var(--shadow-md);
+}
+.bible-textarea {
+  resize: vertical;
+  min-height: 320px;
+}
+.bible-toast {
+  position: fixed;
+  inset: 0;
+  background: rgba(28, 26, 23, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  z-index: 110;
+  padding-top: 6vh;
+}
+.bible-toast-card {
+  background: var(--bg-elev);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--gap-lg);
+  width: 90%;
+  max-width: 640px;
+  max-height: 80vh;
+  overflow: auto;
+  box-shadow: var(--shadow-md);
+}
   font-weight: 700;
   padding-top: 2px;
 }

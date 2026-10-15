@@ -110,6 +110,46 @@ export interface PlotBible {
   conflicts?: string[];
   foreshadowing?: string[];
   note?: string | null;
+  [key: string]: unknown;  // 实际是 free-form dict；脚本/runtime 扩展字段自由
+}
+
+// ============================================================
+// plot_bible 级联协议（kg-cascade-protocol）
+// ============================================================
+
+/** POST /projects/{id}/bible/apply 响应：revision + diff + 冲突清单。 */
+export interface KgBibleConflict {
+  kind: "character_role" | "character_goal" | "relationship_type" | "foreshadow_status";
+  kg_key: string;
+  kg_value: string;
+  bible_field: string;
+  bible_value: string;
+  severity: "warn";
+}
+
+export interface KgBibleDiff {
+  added: Record<string, unknown>;
+  removed: Record<string, unknown>;
+  changed: Record<string, { old: unknown; new: unknown }>;
+}
+
+export interface KgBibleApplyResult {
+  revision_no: number;
+  revision_id: number;
+  diff: KgBibleDiff;
+  conflicts: KgBibleConflict[];
+  conflicts_count: number;
+}
+
+export interface KgBibleRevisionListItem {
+  id: number;
+  revision_no: number;
+  diff: KgBibleDiff;
+  conflicts: KgBibleConflict[];
+  conflicts_count: number;
+  source: string;
+  note: string | null;
+  created_at: string | null;
 }
 
 export interface ProjectOut {

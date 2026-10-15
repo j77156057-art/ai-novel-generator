@@ -5,16 +5,20 @@
 - v3.0 是**异步增强**：段 commit 后只入队（轻量），worker 线程池后台跑 LLM 抽取，
   落 v3.0 的 9 张表。省 50% LLM 调用（5 段合并一次抽）+ 跨段一致性（同一角色
   跨段同一规范名）
-- 队列用 AgentRun 表（已有 role/status 机）+ 内存 deque，不新建表（精巧优先）
-
-设计要点：
-- 入队零 LLM：enqueue_segment 只写一行 AgentRun(role=kg_batch_extract)
+- 队列用 AgentRun 表（已有 role/status 机）+ 内存 deque，不新建表（精巧优先）：
+  **每段一行** AgentRun(role=kg_batch_extract)——enqueue 时随 generation 事务
+  一起落库（入队即持久化，重启后 running 行 = 丢失/卡住的段），批完成统一翻
+  success/failed，note 记批级 stats（一次 LLM 抽 5 段，stats 是批粒度，诚实反映）
 - worker 按 batch_size=5 攒批，攒满或 flush 时抽一次
-- 失败静默兜底：抽取失败不阻塞生成主链（与 v2.6 同纪律）
+- 失败静默兜底：抽取失败不阻塞生成主链（与 v2.6 同纪律）；但**必须留痕**：
+  同批立即重试 ≤RETRY_LIMIT 次仍失败 → 行标 failed（毒批不自动重入队，
+  走 POST /kg-v3/worker/requeue 手动重捞）
 - 落库幂等：entity upsert（canonical_name+kind），event 追加，foreshadow 状态机推进
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -27,12 +31,19 @@ from app.models import (
     KgCharacterState, KgForeshadow, KgEntityKnowledge, KgMention, Project,
 )
 
-# 批大小：一次抽 5 段。省 LLM 调用（5:1）+ 跨段一致性窗口
+#: 批大小：一次抽 5 段。省 LLM 调用（5:1）+ 跨段一致性窗口
 BATCH_SIZE = 5
-# 队列上限：防内存膨胀（超过则最旧段出队丢弃，生成主链不阻塞）
+#: 队列上限：防内存膨胀（超过则最旧段出队丢弃，生成主链不阻塞）
 MAX_QUEUE = 200
-# worker 线程：单线程串行（LLM 限流友好，避免并发打爆免费档）
+#: worker 线程：单线程串行（LLM 限流友好，避免并发打爆免费档）
 WORKER_THREADS = 1
+#: 同批失败后的立即重试上限。只覆盖网络抖动；持续挂是 key/配额问题，
+#: 重试解决不了——暴露成 failed 行给人看（requeue API 手动重捞）才是对的。
+RETRY_LIMIT = 2
+#: AgentRun 里 kg 批抽行的 role 标识（assistant 端点按 role 过滤，互不污染）
+ROLE_KG_EXTRACT = "kg_batch_extract"
+#: running 行超过这个分钟数视为 stuck（进程重启的残留/真卡死）
+STUCK_MINUTES = 30
 
 
 @dataclass
@@ -98,11 +109,38 @@ _worker_lock = threading.Lock()
 
 
 def enqueue_segment(db: Session, project_id: int, segment_no: int, text: str,
-                    chapter: int | None = None) -> None:
-    """段 commit 后调用：入队等待异步批抽。零 LLM、零阻塞。"""
+                    chapter: int | None = None) -> int | None:
+    """段 commit 后调用：入队等待异步批抽。零 LLM、零阻塞。
+
+    同时写一行 AgentRun(role=kg_batch_extract, status=running)——**与 generation
+    共用调用方的事务**（本函数不 commit），随段一起落库：入队即持久化。
+    request_hash = sha256("{project_id}:{segment_no}")，稳定可关联（重捞时按它
+    找回同一行）。失败静默返回 None（可观测性自身不能拖垮生成主链）。
+    返回 AgentRun id（调用方目前不用，测试/调试用）。
+    """
+    from datetime import datetime, timezone
+
     _queue.put(_QueueItem(project_id=project_id, segment_no=segment_no,
                           text=text, chapter=chapter))
     _signal_flush()
+    try:
+        payload = json.dumps({"segment_no": segment_no, "chapter": chapter},
+                             ensure_ascii=False)
+        row = AgentRun(
+            project_id=project_id, role=ROLE_KG_EXTRACT, status="running",
+            started_at=datetime.now(timezone.utc),
+            request_hash=hashlib.sha256(
+                f"{project_id}:{segment_no}".encode("utf-8")).hexdigest(),
+            note=payload,
+        )
+        db.add(row)
+        db.flush()  # 拿 id；commit 由调用方（generation 事务）负责
+        return row.id
+    except Exception:  # noqa: BLE001 —— 可观测性失败不阻断生成
+        import logging
+        logging.getLogger(__name__).warning(
+            "kg 批抽 AgentRun 写入失败（seg %s）", segment_no, exc_info=True)
+        return None
 
 
 def _signal_flush() -> None:
@@ -115,15 +153,26 @@ def flush_project(project_id: int) -> None:
     _run_batches(project_id)
 
 
+#: worker 线程引用（status API 看存活用；ensure_worker 幂等赋值）
+_worker_thread: threading.Thread | None = None
+
+
 def ensure_worker() -> None:
     """确保后台 worker 线程在跑（幂等）。"""
-    global _worker_started
+    global _worker_started, _worker_thread
     with _worker_lock:
         if _worker_started:
             return
         t = threading.Thread(target=_worker_loop, daemon=True, name="kg-v3-batch-worker")
         t.start()
+        _worker_thread = t
         _worker_started = True
+
+
+def worker_alive() -> bool:
+    """worker 线程是否活着（从未启动 = False）。"""
+    t = _worker_thread
+    return bool(t is not None and t.is_alive())
 
 
 def _worker_loop() -> None:
@@ -142,9 +191,33 @@ def _worker_loop() -> None:
 
 
 def _run_batches(project_id: int) -> None:
-    """把一个项目的当前队列抽干（每批 BATCH_SIZE 段）。"""
+    """把一个项目的当前队列抽干（每批 BATCH_SIZE 段）。
+
+    每批的 5 行 AgentRun 在批处理结束时统一翻 success/failed：
+    - 成功：finished_at + note 追加批级 stats（ExtractionStats 是一次 LLM 抽
+      整批的产物，无法拆到单段——记批级是诚实反映）
+    - 失败：同批立即重试 ≤RETRY_LIMIT 次仍挂 → status=failed（毒批不重入队）
+    整条链路吞异常：批抽是增强，绝不阻断生成主链。
+    """
+    from datetime import datetime, timezone
+
     from app.db import SessionLocal
     from app.kg.extractor_v3 import extract_batch, ExtractionStats
+
+    def _rows_for(batch: list[_QueueItem]) -> dict[int, AgentRun]:
+        """本批各段对应的 AgentRun 行（request_hash 精确匹配）。"""
+        out: dict[int, AgentRun] = {}
+        for it in batch:
+            h = hashlib.sha256(f"{project_id}:{it.segment_no}".encode("utf-8")).hexdigest()
+            row = db.scalar(select(AgentRun).where(
+                AgentRun.project_id == project_id,
+                AgentRun.role == ROLE_KG_EXTRACT,
+                AgentRun.request_hash == h,
+                AgentRun.status == "running",
+            ))
+            if row is not None:
+                out[it.segment_no] = row
+        return out
 
     while True:
         batch = _queue.take_batch(project_id)
@@ -152,16 +225,170 @@ def _run_batches(project_id: int) -> None:
             return
         db = SessionLocal()
         try:
+            rows = _rows_for(batch)
             provider = _get_provider()
             if provider is None:
                 # 无 provider：段直接落 v3.0 mention 索引（零 LLM 部分仍做）
                 _index_mentions_only(db, batch)
                 continue
             texts = [(it.segment_no, it.text, it.chapter) for it in batch]
-            result = extract_batch(provider, texts)
-            stats = _persist_extraction(db, project_id, result, batch)
+            last_exc: Exception | None = None
+            stats: ExtractionStats | None = None
+            # 探针：extract_batch 内部把 LLM 异常吞成空骨架（extract_segment 的
+            # 静默兜底），LLM 挂掉的异常永远到不了这里——会被记成「成功但 0 产出」。
+            # 每次尝试先用 1 次裸 chat 探活：provider 挂则本次尝试失败进重试；
+            # 探针过了才让整批文本进 LLM（省得挂着的 provider 白收 5 段长文）。
+            # 探针只探「连不连得上」，不探「抽不抽得出」——空骨架（可达但服从性
+            # 归零）走下面的 empty 标记，重试通常没用，暴露给人判断更诚实。
+            for _attempt in range(RETRY_LIMIT + 1):
+                try:
+                    provider.chat("连通性探针，请回复 ok", "ok")
+                    result = extract_batch(provider, texts)
+                    stats = _persist_extraction(db, project_id, result, batch)
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001 —— 重试吃掉本次异常
+                    db.rollback()
+                    last_exc = exc
+            now = datetime.now(timezone.utc)
+            if last_exc is None and stats is not None:
+                # 空骨架检测：真实小说文本几乎不可能整批 0 产出——大概率 LLM 挂了
+                empty = (stats.entities_upserted == 0 and stats.events_added == 0
+                         and stats.relations_upserted == 0)
+                note_extra: dict = {"batch_stats": stats.__dict__.copy()}
+                if empty:
+                    note_extra["empty"] = True
+                for row in rows.values():
+                    row.status = "success"
+                    row.finished_at = now
+                    row.model = "(empty)" if empty else None
+                    _merge_note(row, note_extra)
+                db.commit()
+            else:
+                err = str(last_exc)[:200] if last_exc else "unknown"
+                for row in rows.values():
+                    row.status = "failed"
+                    row.finished_at = now
+                    _merge_note(row, {"error": err})
+                db.commit()
+                import logging
+                logging.getLogger(__name__).warning(
+                    "kg v3 批抽失败（项目 %s，%s 段）：%s", project_id, len(batch), err)
         finally:
             db.close()
+
+
+def _merge_note(row: AgentRun, extra: dict) -> None:
+    """AgentRun.note 是入队时写的 JSON（segment_no/chapter）；批结束时把
+    stats/error 合并进去而不是覆盖——保留段的身份信息。"""
+    try:
+        base = json.loads(row.note) if row.note else {}
+    except (ValueError, TypeError):
+        base = {}
+    base.update(extra)
+    row.note = json.dumps(base, ensure_ascii=False)
+
+
+def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> dict:
+    """批抽 worker 状态总览（GET /kg-v3/worker/status 的数据源）。
+
+    - worker_alive：线程引用 is_alive（从未启动=False）
+    - pending：内存队列积压段数（重启即清零——持久状态看 runs）
+    - stuck：running 且 started_at 超 STUCK_MINUTES（进程重启的残留/真卡死）
+    - recent_runs：最近 N 行（新的在前），note 里的 JSON 已解析
+    """
+    from datetime import datetime, timezone
+
+    runs = db.scalars(select(AgentRun).where(
+        AgentRun.project_id == project_id,
+        AgentRun.role == ROLE_KG_EXTRACT,
+    ).order_by(AgentRun.id.desc()).limit(recent_limit)).all()
+    now = datetime.now(timezone.utc)
+    summary = {"success": 0, "failed": 0, "running": 0, "stuck": 0, "empty": 0}
+    items = []
+    for r in runs:
+        started = r.started_at
+        if started is not None and started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        finished = r.finished_at
+        if finished is not None and finished.tzinfo is None:
+            finished = finished.replace(tzinfo=timezone.utc)
+        duration_ms = (int((finished - started).total_seconds() * 1000)
+                       if started and finished else None)
+        stuck = (r.status == "running" and started is not None
+                 and (now - started).total_seconds() > STUCK_MINUTES * 60)
+        if stuck:
+            summary["stuck"] += 1
+        elif r.status in summary:
+            summary[r.status] += 1
+        try:
+            note = json.loads(r.note) if r.note else {}
+        except (ValueError, TypeError):
+            note = {"raw": r.note}
+        if note.get("empty"):
+            summary["empty"] += 1
+        items.append({
+            "id": r.id,
+            "segment_no": note.get("segment_no"),
+            "status": r.status,
+            "stuck": stuck,
+            "empty": bool(note.get("empty")),
+            "duration_ms": duration_ms,
+            "batch_stats": note.get("batch_stats"),
+            "error": note.get("error"),
+            "started_at": started.isoformat() if started else None,
+        })
+    return {
+        "worker_alive": worker_alive(),
+        "pending": _queue.pending_count(project_id),
+        "summary": summary,
+        "recent_runs": items,
+    }
+
+
+def requeue_failed(db: Session, project_id: int, run_ids: list[int]) -> dict:
+    """重捞失败的段（POST /kg-v3/worker/requeue 的数据源）。
+
+    按 run_id 找本项目的 failed 行 → 段文本从 Generation 表回读（enqueue 时
+    的文本没存，正文才是事实源）→ 重新入队 + 行重置 running。
+    文本已不存在的段报 missing（不静默丢）。
+    """
+    from datetime import datetime, timezone
+
+    requeued = 0
+    missing: list[int] = []
+    for rid in run_ids:
+        row = db.scalar(select(AgentRun).where(
+            AgentRun.id == rid,
+            AgentRun.project_id == project_id,
+            AgentRun.role == ROLE_KG_EXTRACT,
+        ))
+        if row is None or row.status != "failed":
+            continue
+        try:
+            note = json.loads(row.note) if row.note else {}
+        except (ValueError, TypeError):
+            note = {}
+        seg_no = note.get("segment_no")
+        gen = db.scalar(select(Generation).where(
+            Generation.project_id == project_id,
+            Generation.segment_no == seg_no,
+        )) if seg_no is not None else None
+        if seg_no is None or gen is None or not gen.text:
+            missing.append(rid)
+            continue
+        _queue.put(_QueueItem(project_id=project_id, segment_no=seg_no,
+                              text=gen.text, chapter=None))
+        row.status = "running"
+        row.started_at = datetime.now(timezone.utc)
+        row.finished_at = None
+        _merge_note(row, {"requeued_at": row.started_at.isoformat(),
+                          "error": None})
+        requeued += 1
+    if requeued:
+        db.commit()
+        _signal_flush()
+    return {"requeued": requeued, "missing": missing}
 
 
 def _get_provider():

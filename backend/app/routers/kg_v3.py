@@ -310,3 +310,39 @@ def list_relations(
             "rel_type": r.rel_type, "strength": r.strength,
         })
     return {"relations": out}
+
+
+# --------------------------------------------------------------------------- #
+# 批抽 worker 可观测性（AgentRun role=kg_batch_extract 的行）
+# --------------------------------------------------------------------------- #
+
+@router.get("/worker/status")
+def get_worker_status(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """批抽 worker 状态：线程存活 / 队列积压 / 汇总计数 / 最近 50 行。
+
+    没告警 ≠ 没问题：worker 线程死了服务照跑，KG 表只是停止生长——
+    这个端点就是让「停止生长」可见。
+    """
+    _require_project(db, project_id)
+    from app.kg.batch_worker import worker_status
+
+    return worker_status(db, project_id)
+
+
+class RequeueRequest(BaseModel):
+    """重捞请求体：要重跑的 AgentRun id 列表（必须是本项目 failed 行）。"""
+
+    run_ids: list[int]
+
+
+@router.post("/worker/requeue")
+def requeue_worker(project_id: int, body: RequeueRequest, db: Session = Depends(get_db)) -> dict:
+    """重捞失败的段：从 Generation 回读正文重新入队，行重置 running。
+
+    自动重试只覆盖网络抖动；持续挂（key 失效/配额耗尽）修复后由人手动重捞——
+    毒批不自动重入队。
+    """
+    _require_project(db, project_id)
+    from app.kg.batch_worker import requeue_failed
+
+    return requeue_failed(db, project_id, body.run_ids)

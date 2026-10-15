@@ -40,6 +40,8 @@ import type {
   GenerateResult,
   GenerationOut,
   Graph,
+  KgBibleApplyResult,
+  KgBibleRevisionListItem,
   KgV3Character,
   KgV3ExemptRequest,
   KgV3JudgeFindingsResponse,
@@ -199,6 +201,22 @@ export const api = {
 
   patchProject: (projectId: number, body: ProjectPatch) =>
     request<ProjectOut>(`/projects/${projectId}`, jsonInit("PATCH", body)),
+
+  /**
+   * plot_bible 级联协议新路径：写 revision + 算 diff + 扫 KG 冲突 + 覆盖。
+   * 返回的 conflicts 在前端 toast 一次性展开——不需要新 tab。
+   */
+  applyBible: (projectId: number, bible: Record<string, unknown>, note?: string | null) =>
+    request<KgBibleApplyResult>(
+      `/projects/${projectId}/bible/apply`,
+      jsonInit("POST", { bible, note: note ?? null }),
+    ),
+
+  /** plot_bible 改写历史（按 revision_no 倒序，新的在前）。 */
+  listBibleRevisions: (projectId: number, limit = 20) =>
+    request<{ revisions: KgBibleRevisionListItem[] }>(
+      `/projects/${projectId}/bible/revisions?limit=${limit}`,
+    ),
 
   /**
    * 文风蒸馏档位清单（完整 / 平衡 / 快速）。
