@@ -193,7 +193,7 @@ check("语言混入：空文本不报", len(findings), 0)
 result = judge_segment(db, 1, "陈默 draußen 还站在那里。", segment_no=2)
 check_true("集成：返回 findings 键", "findings" in result)
 check_true("集成：返回 rules 键", "rules" in result)
-check_true("集成：5 条规则登记", len(result["rules"]) == 5)
+check_true("集成：6 条规则登记", len(result["rules"]) == 6)
 # 空文本/空库不炸
 result_empty = judge_segment(db, 999, "", segment_no=1)
 check("集成：空项目空文本 findings 空", result_empty["findings"], [])

@@ -117,7 +117,9 @@ def slice_for_prompt(
             "planned_payoff_chapter": fs.planned_payoff_chapter,
         })
 
-    # —— 4. 当前角色此刻知道什么（entity_knowledge）——
+    # —— 4. 当前角色此刻知道什么（entity_knowledge，三类 known_kind 全消费）——
+    # entity → 实体名；event → 「事件：简述」（有 id 用库内 summary，降级用 known_text）；
+    # secret → 「秘密：文本」。kind 缺失的老行按 id 先实体后事件容错解析。
     known_facts: list[dict] = []
     if active_characters:
         for name in active_characters:
@@ -128,16 +130,18 @@ def slice_for_prompt(
             )
             if ent is None:
                 continue
-            knows = []
+            knows: list[str] = []
             for k in db.scalars(
                 select(KgEntityKnowledge).where(
                     KgEntityKnowledge.project_id == project_id,
                     KgEntityKnowledge.entity_id == ent.id,
                 )
             ):
-                known_ent = db.get(KgEntity, k.known_entity_id)
-                if known_ent:
-                    knows.append(known_ent.canonical_name)
+                label = _knowledge_label(db, k)
+                if label and label not in knows:
+                    knows.append(label)
+                if len(knows) >= 8:  # prompt 预算：单角色情报上限
+                    break
             if knows:
                 known_facts.append({"character": ent.canonical_name, "knows": knows})
 
@@ -163,6 +167,34 @@ def slice_for_prompt(
         "known_facts": known_facts,
         "recent_events": recent_events,
     }
+
+
+def _knowledge_label(db, k) -> str | None:
+    """一条 entity_knowledge 行 → 给 prompt 的事实标签（三类 known_kind）。
+
+    返回 None 的行不渲染（三类都解析失败的脏行）。
+    """
+    kind = (k.known_kind or "").strip()
+    if not kind:
+        # 老行容错：kind 缺失时按 id 先实体后事件解析（老库行为兼容）
+        known_ent = db.get(KgEntity, k.known_entity_id) if k.known_entity_id is not None else None
+        if known_ent is not None:
+            return known_ent.canonical_name
+        known_ev = db.get(KgEvent, k.known_entity_id) if k.known_entity_id is not None else None
+        if known_ev is not None:
+            return f"事件：{(known_ev.summary or '')[:80]}"
+        return (k.known_text or "").strip() or None
+    if kind == "entity":
+        known_ent = db.get(KgEntity, k.known_entity_id) if k.known_entity_id is not None else None
+        return known_ent.canonical_name if known_ent else None
+    if kind == "event":
+        known_ev = db.get(KgEvent, k.known_entity_id) if k.known_entity_id is not None else None
+        if known_ev is not None:
+            return f"事件：{(known_ev.summary or '')[:80]}"
+        return f"事件：{(k.known_text or '').strip()[:80]}" if k.known_text else None
+    if kind == "secret":
+        return f"秘密：{(k.known_text or '').strip()[:80]}" if k.known_text else None
+    return None
 
 
 def format_slice_for_prompt(sl: dict) -> str:
@@ -231,18 +263,62 @@ def relation_curve(db, project_id: int, from_name: str, to_name: str) -> list[di
 
 
 def can_character_know(db, project_id: int, character_name: str, fact_name: str) -> bool:
-    """人物情报追踪：character 此刻是否知道 fact（已知 → True）。"""
+    """人物情报追踪：character 此刻是否知道 fact（已知 → True）。
+
+    fact 三种形态（known_kind 三类全消费）：
+    - 实体名（"天津港"）→ 匹配 known_kind=entity 行
+    - "事件：xxx" / 事件描述 → 匹配 event 行（id→summary 或 known_text）
+    - "秘密：xxx" / 秘密文本 → 匹配 secret 行的 known_text（规范化包含）
+    """
+    from app.kg.knowledge_match import normalize_fact, event_summary_match
+
     ent = db.scalar(select(KgEntity).where(
         KgEntity.project_id == project_id, KgEntity.canonical_name == character_name))
-    fact = db.scalar(select(KgEntity).where(
-        KgEntity.project_id == project_id, KgEntity.canonical_name == fact_name))
-    if ent is None or fact is None:
+    if ent is None:
         return False
-    return db.scalar(select(func.count()).select_from(KgEntityKnowledge).where(
+    fact = (fact_name or "").strip()
+    if not fact:
+        return False
+    # 前缀归一：调用方可以直接传 slice 渲染出的 "事件：xxx" / "秘密：xxx" 标签
+    kind_hint = ""
+    body = fact
+    if fact.startswith("事件："):
+        kind_hint, body = "event", fact[3:].strip()
+    elif fact.startswith("秘密："):
+        kind_hint, body = "secret", fact[3:].strip()
+
+    q = select(KgEntityKnowledge).where(
         KgEntityKnowledge.project_id == project_id,
         KgEntityKnowledge.entity_id == ent.id,
-        KgEntityKnowledge.known_entity_id == fact.id,
-    )) > 0
+    )
+    if kind_hint:
+        q = q.where(KgEntityKnowledge.known_kind == kind_hint)
+    for k in db.scalars(q):
+        label = _knowledge_label(db, k)
+        if label is not None and label == fact:
+            return True
+        # 去掉 "事件：" / "秘密：" 前缀后的文本比对
+        core = label
+        if label and "：" in label and label.split("：", 1)[0] in ("事件", "秘密"):
+            core = label.split("：", 1)[1]
+        if core is not None and core == body:
+            return True
+        # secret 行：规范化文本包含比对（标点/空白变体）
+        if k.known_kind == "secret" and k.known_text:
+            ntext = normalize_fact(k.known_text)
+            nbody = normalize_fact(body)
+            if nbody and ntext and (nbody in ntext or ntext in nbody):
+                return True
+        # event 行：事件描述 vs 库内 summary 的保守匹配
+        if k.known_kind == "event":
+            summary = ""
+            if k.known_entity_id is not None:
+                ev = db.get(KgEvent, k.known_entity_id)
+                summary = (ev.summary or "") if ev else ""
+            target = summary or (k.known_text or "")
+            if target and event_summary_match(body, target):
+                return True
+    return False
 
 
 def rhythm_analysis(db, project_id: int, window: int = 10) -> dict:

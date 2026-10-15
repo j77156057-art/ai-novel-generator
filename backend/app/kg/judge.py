@@ -3,12 +3,13 @@
 与 v2.6 哨兵（sentinel.py）的关系：
 - 哨兵：零 LLM、基于 Fact 账本 + 规则，覆盖死人说话/死人出场/境界倒退
 - Judge（本模块）：基于 **v3.0 KG 表**（kg_entities/events/character_state/foreshadows/
-  entity_knowledge/mentions），覆盖哨兵没做的 4 类 + Step 1 质量信号：
+  entity_knowledge/mentions），覆盖哨兵没做的 4 类 + 文本级泄密 + Step 1 质量信号：
     1. 瞬移 teleportation —— 角色 location 状态与事件地点矛盾（跨段瞬移）
     2. 预知外挂 unauthorized_knowledge —— 角色引用了尚未学到的事实
-    3. 时间穿越 impossible_sequences —— 事件顺序与 in_story_date/时间锚矛盾
-    4. 伏笔超期 foreshadow_expiry —— planned_payoff 过期未回收
-    5. 语言一致性 language_mix —— 生成文本混入非中文字符（德语/日文等）
+    3. 秘密外泄 secret_leak —— 说出仍属秘密的事实文本且无学习记录（known_kind=secret 消费方）
+    4. 时间穿越 impossible_sequences —— 事件顺序与 in_story_date/时间锚矛盾
+    5. 伏笔超期 foreshadow_expiry —— planned_payoff 过期未回收
+    6. 语言一致性 language_mix —— 生成文本混入非中文字符（德语/日文等）
 
 设计纪律（继承哨兵）：
 - **只标红，绝不自动改写。** 产出带证据的告警，判断权留给人。
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import select
 
+from app.kg.knowledge_match import normalize_fact
 from app.models import (
     KgCharacterState, KgEntity, KgEntityKnowledge, KgEvent, KgForeshadow, KgMention,
 )
@@ -77,6 +79,7 @@ class JudgeFinding:
 RULES: dict[str, tuple[str, str]] = {
     "teleportation": ("err", "角色状态地点与事件地点矛盾（跨段瞬移）"),
     "unauthorized_knowledge": ("err", "角色引用了尚未学到的事实（预知外挂）"),
+    "secret_leak": ("warn", "角色说出了仍属秘密的事实文本（秘密外泄）"),
     "impossible_sequences": ("err", "事件顺序与故事内时间矛盾（时间穿越）"),
     "foreshadow_expiry": ("warn", "伏笔超过计划回收章未揭晓"),
     "language_mix": ("warn", "生成文本混入非中文字符串"),
@@ -227,6 +230,89 @@ def check_unauthorized_knowledge(db, project_id: int, text: str, segment_no: int
     return findings
 
 
+def check_secret_leak(db, project_id: int, text: str, segment_no: int) -> list[JudgeFinding]:
+    """秘密外泄：kg_entity_knowledge 里 known_kind=secret 的**文本秘密**
+    出现在本段说话内容里，但该角色从未被记录学到过这条秘密。
+
+    与 unauthorized_knowledge 的分工：
+    - 那条判「实体级预知」（已知谁、未学过）——err
+    - 这条判「文本级泄密」（秘密短句被说出且无学习行）——warn
+      （秘密文本匹配保守：含标点变体也算命中，短句 6 字以下不判——
+       过短的秘密文本极易在正常叙述里撞车，宁可漏报）
+
+    known_text 的原始出处是抽取时 LLM 记录的秘密内容；项目里没有任何
+    secret 行 → 整体不判（与 unauthorized_knowledge 同款守门）。
+    """
+    findings: list[JudgeFinding] = []
+    # 本段提到的角色（说话人候选）
+    mentioned = {
+        m.entity_id for m in db.scalars(
+            select(KgMention).where(
+                KgMention.project_id == project_id, KgMention.segment_no == segment_no
+            )
+        )
+    }
+    if not mentioned:
+        return findings
+    # 项目里所有 secret 情报行（known_entity_id=None + known_text 有值）
+    secret_rows = db.scalars(
+        select(KgEntityKnowledge).where(
+            KgEntityKnowledge.project_id == project_id,
+            KgEntityKnowledge.known_kind == "secret",
+        )
+    ).all()
+    if not secret_rows:
+        return findings
+    # 知道秘密的（holder）集合 + 每条秘密的规范化文本
+    normalized: list[tuple[KgEntityKnowledge, str]] = []
+    for row in secret_rows:
+        t = (row.known_text or "").strip()
+        if len(t) < 6:
+            continue
+        normalized.append((row, normalize_fact(t)))
+    if not normalized:
+        return findings
+    for speaker_id in mentioned:
+        speaker = db.get(KgEntity, speaker_id)
+        if speaker is None:
+            continue
+        name = speaker.canonical_name
+        idx = text.find(name)
+        if idx < 0:
+            continue
+        after = text[idx + len(name): idx + len(name) + 8]
+        if not any(sv in after for sv in _SPEAK_VERBS.split("|")):
+            continue
+        # 该角色已学到的秘密文本集合（entity_id == speaker 且 known_kind=secret）
+        known_texts: set[str] = set()
+        for k in db.scalars(
+            select(KgEntityKnowledge).where(
+                KgEntityKnowledge.project_id == project_id,
+                KgEntityKnowledge.entity_id == speaker_id,
+                KgEntityKnowledge.known_kind == "secret",
+            )
+        ):
+            if k.known_text:
+                known_texts.add(normalize_fact(k.known_text))
+        for row, ntext in normalized:
+            if row.entity_id == speaker_id:
+                continue  # 自己的秘密自己说（陈述我的秘密）不算外泄
+            if ntext in known_texts:
+                continue  # 已学到
+            if ntext and ntext in normalize_fact(text):
+                findings.append(JudgeFinding(
+                    rule="secret_leak",
+                    severity="warn",
+                    entity=speaker.canonical_name,
+                    message=f"{speaker.canonical_name} 说出了秘密「{(row.known_text or '').strip()[:40]}」，"
+                            f"但无该角色学到此秘密的记录",
+                    evidence=[f"secret@holder={row.entity_id}: {(row.known_text or '').strip()}",
+                              f"segment={segment_no}"],
+                ))
+                break  # 每说话人最多一条，避免刷屏
+    return findings
+
+
 def check_impossible_sequences(db, project_id: int, text: str, segment_no: int) -> list[JudgeFinding]:
     """时间穿越：事件 sequence 顺序与 in_story_date 矛盾。
 
@@ -365,6 +451,10 @@ def judge_segment(db, project_id: int, text: str, segment_no: int,
         pass
     try:
         findings += check_unauthorized_knowledge(db, project_id, text, segment_no)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        findings += check_secret_leak(db, project_id, text, segment_no)
     except Exception:  # noqa: BLE001
         pass
     try:

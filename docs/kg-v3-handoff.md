@@ -16,7 +16,7 @@
 - git commit 用 `git commit -F msg文件`（**不要**在 commit message 里用反引号）
 - 不要碰 `worktrees/timeline-pacing` 和 `worktrees/style-distill`（其他 agent 的）
 
-## 当前状态：v3.0 主体已完成（9 个 commit）
+## 当前状态：v3.0 主体已完成（10 个 commit）
 
 ```
 87317d1 v2.6.1（起点）
@@ -29,9 +29,23 @@ b44c7af Step 5: 检索切片 + 读侧 API（39 断言）
 d5bea1e 集成：批抽挂主链 + 7 API 端点 + 作者豁免（33 断言）
 ec6b2b3 实体归一：X的Y 型变体分裂（42 断言）
 6e6f406 表索引：9 表 14 索引，老库幂等补建
+<本次> known_kind=secret/event 消费路径：写侧三类落库 + 读侧渲染 + judge secret_leak + db.py 164 行三元短路修复
 ```
 
-**12 套件全绿**（v30_schema/extractor/retrieval/judge/integration + entity_resolve + e2e_v26 + v2.6 套件）。
+**23 套件全绿**（v30 5 件 + entity_resolve + e2e_v26 + v2.5/v2.6 全家 + knowledge_consumption 新套件 70 断言）。
+
+## known_kind=secret/event 消费路径（2026-10-15 完成）
+
+- **写侧** `batch_worker._persist_extraction` §3.6：entity→实体 id；event→按 `kg_events.summary` 保守匹配解析（`app/kg/knowledge_match.py::event_summary_match`：全等/双向包含/剥标点包含，刻意不做模糊相似——不同事件常只差一个动词），解析失败降级 `known_text` 存文本；secret→`known_entity_id=None` + `known_text`
+- **读侧** `retrieval_v3`：known_facts 渲染 `事件：xxx`/`秘密：xxx` 前缀标签（单角色上限 8 条）；`can_character_know` 接受实体名/事件描述/秘密文本三种形态
+- **Judge** 新规则 `secret_leak`（warn）：说出 known_kind=secret 的文本秘密且无学习行 → 报。豁免：持有人自述、已学到（规范化文本比对）、<6 字短秘密、项目无 secret 行。RULES 现 6 条（test_v30_judge 的 5→6 已同步）
+- **迁移**：`kg_entity_knowledge.known_text VARCHAR(200)` 老库幂等补列（db.py migrations）
+
+## 已修复的存量 bug（顺手）
+
+- **db.py `_migrate_sqlite_columns` 164 行三元短路**：`conn.execute(...) if target_engine is not None else engine` 导致 `init_db()` 默认路径**从不补建** v3.0 索引（只有 load_corpus 离线路径建）。已修 + 有回归断言
+- 同函数第二段完全重复的迁移循环已删
+- test_v25_stage23 的 FakeStreamingProvider 补 `stop_sequences` 参数（0c9ae98 加的 engine 签名，测试假件没跟上——存量测试债）
 
 ## v3.0 架构一览（已跑通）
 - 9 张表：`kg_entities / kg_relations / kg_relation_evolution / kg_events / kg_event_links / kg_character_state / kg_foreshadows / kg_entity_knowledge / kg_mentions`
@@ -49,7 +63,7 @@ ec6b2b3 实体归一：X的Y 型变体分裂（42 断言）
 
 | # | 项 | 说明 | 难度 |
 |---|---|---|---|
-| 1 | **known_kind=secret/event 消费路径** | extractor 已输出三类 known_kind，但 retrieval/judge 只消费 entity 类。secret 类（预知外挂）/ event 类（事件级情报）空跑 | 半天 |
+| 1 | ~~known_kind=secret/event 消费路径~~ | **已完成**（写侧三类落库+读侧渲染+judge secret_leak，见上文专节） | - |
 | 2 | **前端集成** | 9 表 + 7 API 端点 + Judge findings 后端就绪但前端不可见。需要 Vue3 页面（关系图/时间线/Judge 面板/豁免管理） | 3-5 天 |
 | 3 | **批抽 worker 可观测性** | 后台线程失败只在内存日志，无持久化状态。生产需要队列/失败重试/进度 API | 1 天 |
 | 4 | **大纲级联协议阶段 2-3** | final 文档 4 阶段协议的改纲自动级联、KG 回流大纲未实现 | 3-5 天 |

@@ -153,7 +153,7 @@ def test_stream_v25_integration():
                 return '{"done": false}'
             self.chat_calls.append(user[:80])
             return "流式段内容"  # v2.5 测试用更"现实"的文本：含角色+钩子
-        def stream_chat(self, system, user, constraints=None):
+        def stream_chat(self, system, user, constraints=None, stop_sequences=None, **kw):
             self.chat_calls.append(user[:80])
             # 文本含 "新配角" 触发 KG 抽取，钩子"神秘人"触发 plothole
             yield "新配角走进了公司。她看起来很神秘。神秘人到底是谁？"
@@ -217,7 +217,7 @@ def test_regenerate_does_not_call_v25():
     class FP:
         def chat(self, system, user, constraints=None):
             return "重生成段"
-        def stream_chat(self, system, user, constraints=None):
+        def stream_chat(self, system, user, constraints=None, stop_sequences=None, **kw):
             yield "重生成段"
         def summarize(self, text): return "new sum"
         def summarize_rollup(self, texts, level): return "roll"

@@ -125,6 +125,9 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # —— 第 7 步：AgentRun 增加调用性质说明列（invoke-generation 用）——
         # nullable：既有审计行（第 2/3/4 步写入的）没有这项，补 NULL 不破坏它们。
         ("agent_runs", "note", "TEXT"),
+        # —— v3.0 KG：secret/event 类情报的事实文本（known_kind 消费路径）——
+        # 漏这一项的后果与 style_narrative 相同：老库 INSERT 含 known_text 直接炸。
+        ("kg_entity_knowledge", "known_text", "VARCHAR(200)"),
         # —— Version 补齐快照指纹与归属——
         ("versions", "project_id", "INTEGER"),
         ("versions", "kind", "VARCHAR(16)"),
@@ -161,12 +164,4 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
         # 老库补建 v3.0 索引（IF NOT EXISTS 幂等，新库 create_all 已建则跳过）
         for table, idx_name, cols_sql, _note in v30_indexes:
-            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({cols_sql})")) if target_engine is not None else engine
-    with eng.begin() as conn:
-        for table, col, coltype in migrations:
-            existing = {
-                r[1]
-                for r in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
-            }
-            if col not in existing:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({cols_sql})"))

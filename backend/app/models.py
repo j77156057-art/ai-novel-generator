@@ -404,6 +404,10 @@ class KgEntityKnowledge(Base):
     entity_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
     known_entity_id = Column(Integer, nullable=True)  # 指向 entity/event/fact 之一（按 known_kind 解释）
     known_kind = Column(String(16), nullable=True)  # entity|event|secret
+    # secret/event 类的事实文本（known_entity_id 为 NULL 时的内容载体）：
+    # - secret：秘密内容短句（"父亲的死因另有隐情"）——没有对应实体，只有文本
+    # - event：事件简述（解析失败时的降级载体；解析成功则 known_entity_id 指向 kg_events.id）
+    known_text = Column(String(200), nullable=True)
     learned_at_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
     learned_at_chapter = Column(Integer, nullable=True)
     confidence = Column(Float, nullable=False, default=1.0)

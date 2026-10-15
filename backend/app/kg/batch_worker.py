@@ -277,24 +277,47 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             stats.event_links_added += 1
 
     # —— 3.6 entity_knowledge（人物情报，learned_at 用 sequence 解析）——
+    # known_kind 三类的落库策略（Novelium 情报追踪闭环的写入侧）：
+    # - entity：knows 是实体名 → 解析 entity id（原有行为）
+    # - event：knows 是事件描述 → 按 kg_events.summary 匹配解析 event id；
+    #   匹配不上降级为 known_text 存文本（不丢情报，known_entity_id=None）
+    # - secret：秘密文本没有对应实体 → known_entity_id=None + known_text 存原文
     for k in result.get("entity_knowledge", []):
         char_id = name_to_id.get(k.get("character") or "") or _lookup_entity_id(db, project_id, k.get("character") or "")
-        known_id = name_to_id.get(k.get("knows") or "") or _lookup_entity_id(db, project_id, k.get("knows") or "")
-        if char_id is None or known_id is None or char_id == known_id:
+        if char_id is None:
             continue
+        kk = k.get("known_kind") or "entity"
+        known_id: int | None = None
+        known_text: str | None = None
         learned_event_id = seq_map.get(k.get("learned_at_sequence"))
-        existing = db.scalar(
+        if kk == "entity":
+            known_id = name_to_id.get(k.get("knows") or "") or _lookup_entity_id(db, project_id, k.get("knows") or "")
+            if known_id is None or known_id == char_id:
+                continue
+        elif kk == "event":
+            known_id = _lookup_event_id(db, project_id, k.get("knows") or "")
+            if known_id is None:
+                known_text = (k.get("knows") or "")[:200]  # 降级：事件没匹配上，存文本
+        else:  # secret：秘密是自由文本，无实体可指
+            known_text = (k.get("knows") or "")[:200]
+        # 去重按 uq 同款四元组（不带 kind：entity id 与 event id 是两套自增，
+        # 数值可能撞——任何已存在行都挡插入，宁可漏一行不可整批 IntegrityError）；
+        # 文本行（known_id=None）追加 known_text 匹配，否则同一角色的第二条秘密会被误判重复
+        dup_q = (
             select(KgEntityKnowledge).where(
                 KgEntityKnowledge.project_id == project_id,
                 KgEntityKnowledge.entity_id == char_id,
-                KgEntityKnowledge.known_entity_id == known_id,
+                KgEntityKnowledge.known_entity_id == known_id,  # None → IS NULL
                 KgEntityKnowledge.learned_at_event_id == learned_event_id,
             )
         )
+        if known_id is None:
+            dup_q = dup_q.where(KgEntityKnowledge.known_text == known_text)
+        existing = db.scalar(dup_q)
         if existing is None:
             db.add(KgEntityKnowledge(
                 project_id=project_id, entity_id=char_id, known_entity_id=known_id,
-                known_kind=k.get("known_kind", "entity"), learned_at_event_id=learned_event_id,
+                known_kind=kk, known_text=known_text, learned_at_event_id=learned_event_id,
             ))
             stats.entity_knowledge_added += 1
 
@@ -403,6 +426,29 @@ def _lookup_entity_id(db: Session, project_id: int, name: str) -> int | None:
     for e in db.scalars(select(KgEntity).where(KgEntity.project_id == project_id)):
         if should_merge(name, e.canonical_name):
             return e.id
+    return None
+
+
+def _lookup_event_id(db: Session, project_id: int, summary: str) -> int | None:
+    """按事件简述反查 kg_events.id（known_kind=event 的解析）。
+
+    漏报优于误报（继承本项目纪律）：
+    1. 精确匹配 summary 全等
+    2. 双向包含（LLM 简述是库内 summary 的前缀/缩写，或反之）
+    3. 2-字关键词全覆盖：LLM 简述里每个 ≥2 字的连续中文片段都出现在库内
+       summary 里（数量随库增长，批抽规模千级事件线性扫可接受）
+    都不命中返回 None——调用方降级为 known_text 存文本，不丢情报。
+    """
+    if not summary:
+        return None
+    from app.kg.knowledge_match import event_summary_match
+
+    events = db.scalars(
+        select(KgEvent).where(KgEvent.project_id == project_id)
+    ).all()
+    for ev in events:
+        if event_summary_match(summary, ev.summary or ""):
+            return ev.id
     return None
 
 
