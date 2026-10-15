@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>方向稿 C · 现代数据工具 soft</title>
+<style>
+  :root{
+    --bg:#eef1f6; --elev:#ffffff; --sunken:#e6eaf1;
+    --fg:#1a2030; --muted:#4a5468; --faint:#8a93a6;
+    --border:#d6dde8; --border-strong:#bcc6d8;
+    --accent:#4f46e5; --accent-hover:#4338ca; --accent-fg:#fff; --accent-soft:#e6e4fb; --accent-line:#c3bff5;
+    --warn:#d97706; --warn-soft:#fbeed7; --ok:#16a34a; --ok-soft:#dcf3e3; --info:#2563eb; --info-soft:#dde8fb;
+    --sans:"Inter","Noto Sans SC","PingFang SC",system-ui,sans-serif;
+    --mono:"JetBrains Mono",ui-monospace,monospace;
+  }
+  *{box-sizing:border-box;margin:0}
+  body{background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:15px;line-height:1.6}
+  .shell{display:grid;grid-template-columns:248px 1fr;min-height:100vh}
+  aside{background:var(--elev);border-right:1px solid var(--border);padding:26px 18px;display:flex;flex-direction:column;gap:22px;position:sticky;top:0;height:100vh;box-shadow:0 1px 3px rgba(26,32,48,.05)}
+  .brand{font-size:19px;font-weight:800;display:flex;align-items:center;gap:11px;letter-spacing:-.01em}
+  .brand .logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:grid;place-items:center;color:#fff;font-weight:900;font-size:15px}
+  .nav{display:flex;flex-direction:column;gap:4px}
+  .nav a{padding:10px 13px;border-radius:12px;color:var(--muted);font-size:14px;font-weight:600;display:flex;gap:11px;align-items:center}
+  .nav a:hover{background:var(--sunken);color:var(--fg)}
+  .nav a.on{background:var(--accent-soft);color:var(--accent)}
+  .nav .idx{font-family:var(--mono);font-size:11px;color:var(--faint);width:16px}
+  .nav a.on .idx{color:var(--accent)}
+  .foot{margin-top:auto;font-family:var(--mono);font-size:11px;color:var(--faint)}
+  main{padding:34px 40px;max-width:1020px}
+  .eyebrow{font-size:12px;font-weight:700;color:var(--accent);letter-spacing:.06em}
+  h1{font-size:30px;font-weight:800;letter-spacing:-.02em;margin:4px 0 4px}
+  .sub{color:var(--muted);max-width:66ch;margin-bottom:22px}
+  .tabs{display:inline-flex;gap:4px;background:var(--sunken);padding:4px;border-radius:12px;margin-bottom:22px}
+  .tabs button{font:inherit;font-size:14px;font-weight:600;padding:8px 16px;background:none;border:none;border-radius:9px;color:var(--muted);cursor:pointer}
+  .tabs button.on{background:#fff;color:var(--fg);box-shadow:0 1px 3px rgba(26,32,48,.12)}
+  .card{background:var(--elev);border:1px solid var(--border);border-radius:18px;padding:24px;box-shadow:0 8px 24px rgba(26,32,48,.06);margin-bottom:20px}
+  .card-t{font-size:17px;font-weight:700;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}
+  .card-t .hint{font-size:11px;font-weight:500;color:var(--faint);font-family:var(--mono)}
+  .row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end}
+  .field{display:flex;flex-direction:column;gap:6px}
+  .field label{font-size:12px;color:var(--muted);font-weight:600}
+  select,.input{font:inherit;font-size:14px;padding:10px 12px;border-radius:11px;border:1px solid var(--border-strong);background:#fff;color:var(--fg)}
+  select:focus,.input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .btn{font:inherit;font-size:14px;font-weight:600;padding:10px 17px;border-radius:11px;border:1px solid var(--border-strong);background:#fff;color:var(--fg);cursor:pointer;transition:.12s}
+  .btn:hover{border-color:var(--accent);color:var(--accent)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.primary:hover{background:var(--accent-hover)}
+  .tag{display:inline-flex;font-size:12px;font-weight:600;padding:3px 11px;border-radius:999px;background:var(--sunken);color:var(--muted)}
+  .tag.accent{background:var(--accent-soft);color:var(--accent)}
+  .tag.warn{background:var(--warn-soft);color:var(--warn)}
+  .tag.ok{background:var(--ok-soft);color:var(--ok)}
+  .box{font-family:var(--mono);font-size:12px;line-height:1.7;white-space:pre-wrap;background:var(--sunken);border:1px solid var(--border);border-radius:12px;padding:13px 15px;max-height:180px;overflow:auto;color:var(--muted)}
+  .lbl{font-size:13px;font-weight:700;margin:14px 0 6px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+  .li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 13px;border-radius:12px;background:var(--sunken);margin-bottom:8px}
+  .li:last-child{margin-bottom:0}
+  .q{font-weight:600}
+  .faint{color:var(--faint);font-family:var(--mono);font-size:11px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside>
+    <div class="brand"><span class="logo">墨</span>小说生成器</div>
+    <nav class="nav">
+      <a><span class="idx">01</span>语料库</a>
+      <a><span class="idx">02</span>创作项目</a>
+      <a class="on"><span class="idx">02</span>项目工作台</a>
+    </nav>
+    <div class="foot">M1–M4 · wayfinder<br>theme: soft</div>
+  </aside>
+  <main>
+    <div class="eyebrow">02 · WORKSPACE</div>
+    <h1>夜航船</h1>
+    <p class="sub">知识图谱（M3）→ 生成前提醒（M3.3）→ 分段生成环（M4）。约束注入 system 提示防漂移，段级总结链串联前情。</p>
+    <div class="tabs"><button>知识图谱</button><button>生成前提醒</button><button class="on">生成控制台</button></div>
+
+    <div class="card">
+      <div class="card-t">生成控制台 <span class="hint">M4</span></div>
+      <div class="row">
+        <div class="field" style="flex:1;min-width:220px"><label>RAG 语料来源</label>
+          <select><option>sample_novel.txt #1</option><option>— 不检索 —</option></select></div>
+        <div class="field" style="width:110px"><label>连写段数</label><input class="input" value="2"></div>
+      </div>
+      <div class="row" style="margin-top:16px">
+        <button class="btn">生成前预览</button>
+        <button class="btn primary">续写一段</button>
+        <button class="btn">连写 2 段</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">生成前预览 · 约束核对 <span class="hint">不调 LLM</span></div>
+      <div class="row" style="margin-bottom:14px">
+        <span class="tag accent">林夜</span><span class="tag accent">苏晚</span>
+        <span class="tag warn">坑：那光是什么？</span>
+      </div>
+      <div class="lbl">system 提示（锁定角色 / 未填坑 / 风格）</div>
+      <div class="box">【角色人设约束】林夜（提及 7 次，第 1–3 章）、苏晚（提及 5 次，第 2–3 章）
+【未填悬念】那光是什么？（首现第 2 章）
+【风格】第三人称限知 · 冷峻悬疑</div>
+      <div class="lbl">user 提示（前情 / 检索 / 大纲 / 指令）</div>
+      <div class="box">【前情提要】1. 林夜在旧宅发现一束来历不明的光
+【检索上下文】……那束光又亮了一下……
+【续写指令】续写约 800 字 · quick</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">知识图谱 <span class="hint">2 角色 / 4 坑 / 1 关系</span></div>
+      <div class="grid2">
+        <div>
+          <div class="lbl">角色</div>
+          <div class="li"><strong>林夜</strong><span class="faint">1–3 章 · 7 次</span></div>
+          <div class="li"><strong>苏晚</strong><span class="faint">2–3 章 · 5 次</span></div>
+        </div>
+        <div>
+          <div class="lbl">未填坑</div>
+          <div class="li"><span class="q">那光是什么？</span><span class="tag warn">open</span></div>
+          <div class="li"><span class="q">他记不清怎么倒下的</span><span class="tag warn">open</span></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

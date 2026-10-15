@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.env
+
+# 本地/测试数据库（开发态 sqlite，勿入库）
+*.db
+*.sqlite
+*.sqlite3
+
+# 工具产物
+_m2_test.db
+
+# 开发期探针/实验脚本（commit 历史价值低，保留本地不入库）
+# 命名约定：下划线开头（M3-M5 期临时写的非生产代码），与正式模块隔离
+backend/_exp_*.py
+backend/_probe_*.py
+backend/_seed_*.py
+backend/_verify_*.js
+backend/_verify_*.mjs
+backend/demo_smoke.py
+backend/live_result.txt
+
+# 个人状态目录
+.workbuddy/
+
+# data/seed/ 下 UTF-8 解码后文件名笔误的旧版种子（保留本地不再入库）
+data/seed/【示例·网文】组建-王德财.txt
+data/seed/【示例·网文】黑市病案-无证证词.txt
