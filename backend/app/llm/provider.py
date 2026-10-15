@@ -115,6 +115,17 @@ class LLMProvider:
         """
         yield self.chat(system, user, constraints=constraints)
 
+    def set_stop_sequences(self, sequences: list[str] | None) -> None:
+        """v2.6：设置下一次 chat/stream_chat 的 stop token 列表。
+
+        节点粒度根治（最后攻破）—— 让模型在写到 stop marker 时停，
+        避免"演完整个故事"。
+
+        默认实现：不存（子类按需重写）。调用方在 chat 之前 set 一次即可。
+        """
+        # 默认 no-op——子类重写
+        pass
+
     def summarize_rollup(self, texts: list[str], level: str) -> str:
         """层级摘要的**滚上**（L1→L2 卷摘要 / L2→L3 主线骨架）。
 
@@ -194,6 +205,16 @@ class OpenAICompatibleChatProvider(LLMProvider):
         chain = [model] + [m for m in (models or []) if m and m != model]
         self._models = chain
 
+        # v2.6：stop token 列表——下一次 chat/stream_chat 时设到 payload。
+        # None = 不传 stop（默认）。调用方在 chat 之前 set 一次。
+        # 注意：provider 是单例，多线程下 stop 可能互相覆盖；调用方要负责
+        # 同步（同 chat 调用链内 set+chat 是原子的）。
+        self._stop_sequences: list[str] | None = None
+
+    def set_stop_sequences(self, sequences: list[str] | None) -> None:
+        """v2.6：设置下一次 chat/stream_chat 的 stop token 列表。"""
+        self._stop_sequences = list(sequences) if sequences else None
+
     def _model_chain(self) -> list[str]:
         return self._models
 
@@ -207,6 +228,9 @@ class OpenAICompatibleChatProvider(LLMProvider):
         }
         if self.max_tokens is not None:
             payload_base["max_tokens"] = self.max_tokens
+        # v2.6：stop token 列表——模型遇到任一 token 时停止生成
+        if self._stop_sequences:
+            payload_base["stop"] = self._stop_sequences
         last_exc: Exception | None = None
         for model in self._model_chain():
             payload = {**payload_base, "model": model}
@@ -303,6 +327,9 @@ class OpenAICompatibleChatProvider(LLMProvider):
         }
         if self.max_tokens is not None:
             payload_base["max_tokens"] = self.max_tokens
+        # v2.6：stop token 列表（流式版同步）
+        if self._stop_sequences:
+            payload_base["stop"] = self._stop_sequences
         last_exc: Exception | None = None
         for model in self._model_chain():
             payload = {**payload_base, "model": model}
