@@ -47,12 +47,21 @@ def _strip_thinking(text: str) -> str:
 
     双保险：provider 已显式传 thinking disabled，但 API 若忽略该参数，
     落库/注入前情的文本仍必须是干净的正文。
+
+    v2.6：节点粒度根治——如果 stop token 漏过（OpenAI 兼容 stop 通常不会
+    返回 stop 字符串本身，但保险起见），剥离正文末尾的【本节完】marker 行。
     """
     if " <think>" in text or " </think>" in text:
         end = text.rfind(" </think>")
         if end != -1:
-            return text[end + len(" </think>"):].strip()
+            text = text[end + len(" </think>"):].strip()
         # 只有开标签没有闭标签：从开标签后全部丢弃不可靠，退化为原样返回
+    # v2.6：剥离【本节完】marker 行（如果存在）。通常 stop token 已停在此之前，
+    # 但模型偶尔可能已输出 marker 才被 stop——保险剥离避免污染落库。
+    # 模式：行首可有 0+ 空白（包含换行/空格/制表），然后是 marker，
+    # marker 后到行尾可能有空白——$ 用 \Z 而不是 $（不受多行模式影响）
+    import re
+    text = re.sub(r"(?:[^\S\n]*\n)*[^\S\n]*【本节完】[ \t]*\Z", "", text).rstrip()
     return text
 
 
@@ -561,6 +570,28 @@ def _timeline_state_for(
     return st
 
 
+def _set_section_stop(provider) -> None:
+    """v2.6：节点粒度根治——给 provider 设节末 stop token。
+
+    stop 列表：
+    - 【本节完】 — model 在节末单独一行写这个 marker，后端停在 marker 处
+    - 一些副 marker 防止 model 试图"写下一节"或"写小标题"时跑远
+
+    调用方在 chat/stream_chat 之前调一次。如果 provider 不支持
+    set_stop_sequences（基类默认 no-op），就什么都不做——非致命。
+    """
+    try:
+        provider.set_stop_sequences([
+            "【本节完】",
+            "## 第",
+            "\n# ",
+            "\n## ",
+        ])
+    except Exception:  # noqa: BLE001
+        # set_stop_sequences 出错也不阻断生成——只是少一道保险
+        pass
+
+
 def _persist_timeline_state(db, project: Project, st: TimelineState) -> None:
     """把 state 序列化写回 project.plot_timeline。失败也不抛（generate 主流程不挂）。"""
     try:
@@ -706,6 +737,9 @@ def generate_next_segment(
         node_prompt=node_prompt,
     )
 
+    # v2.6：节点粒度根治——设 stop token 让模型在写【本节完】时停
+    # （避免"演完整个故事"）——重写/重生成是 AI 味修复，不设 stop
+    _set_section_stop(provider)
     text = provider.chat(system, user, constraints=ctx["constraints"])
     summary = provider.summarize(text)
 
@@ -828,6 +862,8 @@ def generate_next_segment_stream(
         node_prompt=node_prompt,
     )
 
+    # v2.6：节点粒度根治——流式版同步设 stop token
+    _set_section_stop(provider)
     pieces: list[str] = []
     for piece in provider.stream_chat(system, user, constraints=ctx["constraints"]):
         pieces.append(piece)
