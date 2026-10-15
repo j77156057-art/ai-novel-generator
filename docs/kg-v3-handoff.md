@@ -54,6 +54,13 @@ ec6b2b3 实体归一：X的Y 型变体分裂（42 断言）
 - **浏览器端到端验证过**（种子数据→8021 后端→5199 vite→5 tabs 全走通），
   冒烟抓到并修掉 2 个 bug：① slice/prompt 端点不接 characters 参数导致渲染文本
   永远缺状态/情报块（已修+回归断言）；② switchTab 不触发数据加载（已修惰性加载）
+- **Worker 可观测性 tab**（commit a2181c3，审计补全）：第 6 个 tab 显示
+  worker 线程 alive/dead、内存队列积压、5 项 summary（success/failed/running/
+  stuck/empty）、最近 50 行 AgentRun（含 stuck 标记）+ failed 行右侧重捞
+  checkbox + 批量重捞按钮（POST /worker/requeue）。审计发现后端 36 断言
+  测试已存在但漏掉 git add，顺带补回。**接手注意：工作树里 batch_worker.py
+  / kg_v3.py / log_audit.py / assistant.py 有未提交改动（其他 agent 并发），
+  本人 commit a2181c3 是 clean state 上的**
 
 - **db.py `_migrate_sqlite_columns` 164 行三元短路**：`conn.execute(...) if target_engine is not None else engine` 导致 `init_db()` 默认路径**从不补建** v3.0 索引（只有 load_corpus 离线路径建）。已修 + 有回归断言
 - 同函数第二段完全重复的迁移循环已删
@@ -77,7 +84,7 @@ ec6b2b3 实体归一：X的Y 型变体分裂（42 断言）
 |---|---|---|---|
 | 1 | ~~known_kind=secret/event 消费路径~~ | **已完成**（写侧三类落库+读侧渲染+judge secret_leak，见上文专节） | - |
 | 2 | ~~前端集成~~ | **已完成**（KG 工作台 5 tabs，见上文专节；后续打磨可选：力导向图/移动端适配） | - |
-| 3 | **批抽 worker 可观测性** | 后台线程失败只在内存日志，无持久化状态。生产需要队列/失败重试/进度 API | 1 天 |
+| 3 | ~~批抽 worker 可观测性~~ | **已完成**（审计发现后端 + 36 断言测试在 commit 6e6f406 之后已实现；本次只补前端 Tab 6 + 修测试期望值错；commit a2181c3） | - |
 | 4 | **大纲级联协议阶段 2-3** | final 文档 4 阶段协议的改纲自动级联、KG 回流大纲未实现 | 3-5 天 |
 | 5 | **真环境 nemotron 复跑对比** | OpenRouter 配额重置后，用 nemotron-3-ultra 对比智谱弱模型的抽取质量（foreshadows/knowledge 智谱全 0 行） | 半天 |
 | 6 | **e2e user journey 测试** | 建项目→生成→批抽→Judge→切片→豁免 全链路"用户视角"测试（目前只有单段级） | 1 天 |
