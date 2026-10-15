@@ -747,9 +747,12 @@ def generate_next_segment(
     # 是否为分支 kind），如果当前是分支段已写过 MIN_GAP_SEGMENTS 才允许再切。
     # 第一版简化：last_branch_written=None 总是允许切（最宽松）。
     # 后续可优化：把 last_branch_written 存到 plot_timeline 顶层。
+    # 注：roll_branch 返回 (new_state, info_dict)——新 state 用于 state 推进，
+    # info_dict 透传给前端。这里 _new_state 不需要（roll_branch 内部已落库），
+    # 取 info_dict 当作 branch_roll。
     from app.generation.branch import roll_branch as _roll_branch
     _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
-    branch_info, _ = _roll_branch(
+    _new_state, branch_info = _roll_branch(
         db, project, _load_timeline_state_for_branch(db, project, written),
         provider, _post_commit_written, last_branch_written=None,
     )
@@ -853,6 +856,17 @@ def generate_next_segment_stream(
     gen, segment_no = _commit_segment(db, project, text, summary)
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
     node_judge = _judge_and_advance(db, project, provider, text, written)
+
+    # v2.5 阶段 2：流式版补 v2.5 集成——与同步版同口径
+    # 顺序：commit → judge → KG 合并 → roll_branch（KG 必须在 roll_branch 前）
+    kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+    _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
+    from app.generation.branch import roll_branch as _roll_branch
+    _new_state, branch_info = _roll_branch(
+        db, project, _load_timeline_state_for_branch(db, project, written),
+        provider, _post_commit_written, last_branch_written=None,
+    )
+
     tree_stats = _rollup_summary_tree(db, project, provider)
 
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
@@ -868,6 +882,8 @@ def generate_next_segment_stream(
         "style_warning": style_warning,
         "rewrite_info": rewrite_info,
         "node_judge": node_judge,
+        "kg_update": kg_stats,
+        "branch_roll": branch_info,
     }
 
 
