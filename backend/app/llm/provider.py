@@ -108,10 +108,12 @@ class LLMProvider:
             "…" if len(text) > _FALLBACK_SUMMARY_CHARS else ""
         )
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None,
+                     stop_sequences: list[str] | None = None):
         """流式续写：默认实现把整段一次性 yield（非流式 provider 也兼容 SSE）。
 
         逐 delta 产出的子类（OpenAI 兼容）应重写此方法，降低长文首字延迟。
+        stop_sequences：与 chat 同款，per-request 透传（不依赖单例 setter）。
         """
         yield self.chat(system, user, constraints=constraints)
 
@@ -546,7 +548,13 @@ class LocalFallbackLLMProvider(LLMProvider):
     M3.3 约束确实流进了生成环；同时拼接前情/检索上下文占位，模拟真实续写结构。
     """
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None,
+             stop_sequences: list[str] | None = None) -> str:
+        """确定性模板续写。stop_sequences 接住但不处理（模板无 LLM stop 概念）——
+        仅与 OpenAICompatibleChatProvider 签名对齐，避免 engine 在 fallback 路径
+        500（v2.6.1 改 per-request 透传时漏同步此签名，已在 kg-e2e journey
+        冒烟中暴露）。
+        """
         chars = (constraints or {}).get("characters") or []
         holes = (constraints or {}).get("plotholes") or []
         char_line = "、".join(chars) if chars else "（暂无锁定角色）"
