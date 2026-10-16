@@ -90,7 +90,7 @@ e31a2a9 docs: 接手文档划掉大纲级联候选
 
 | # | 项 | 说明 | 难度 |
 |---|---|---|---|
-| 5 | **真环境 nemotron 复跑对比** | OpenRouter 配额重置后（每天 0 点），用 nemotron-3-ultra 对比智谱弱模型的抽取质量（foreshadows/knowledge 智谱全 0 行）。**先查当天剩余额度**（免费档 50 次/日），耗尽会全 429 | 半天 |
+| 5 | ✅ **智谱双版本抽取对比（原 nemotron 路径）** | nemotron 3 款全超时 + 7 款 OpenRouter free 全 404，转向 glm-4-flash（旧）vs glm-4-flash-250414（新）。N=4 实测：新版 7 类全填，event_type 多样化，in_story_date 100% 填充，knowledge/state/foreshadows 从全 0 → 8/6/4，**速度 -37%**。新版质量全面胜出。docs/kg-nemotron-compare-redirect.md | 半天 ✅ |
 
 另有打磨项（非候选）：前端关系图升级力导向 / 移动端适配 / KG 工作台数据刷新按钮
 统一（现在每 tab 各自刷新，切 tab 惰性加载只在首次）。
