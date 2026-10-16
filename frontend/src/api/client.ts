@@ -40,6 +40,7 @@ import type {
   GenerateResult,
   GenerationOut,
   Graph,
+  KgBookkeeping,
   LlmConfig,
   LlmConfigIn,
   LlmTestIn,
@@ -52,6 +53,7 @@ import type {
   ProjectOut,
   ProjectPatch,
   Reminders,
+  StreamDoneMeta,
   StyleDistillApplyRequest,
   StyleDistillDetail,
   StyleDistillListResponse,
@@ -310,7 +312,7 @@ export const api = {
     ),
 
   buildKgFromGenerations: (projectId: number) =>
-    request<{ characters: number; plotholes: number; relationships: number; chunks: number }>(
+    request<KgBookkeeping>(
       `/projects/${projectId}/build-kg-from-generations`,
       jsonInit("POST"),
     ),
@@ -336,12 +338,7 @@ export const api = {
     projectId: number,
     maxChars: number | null,
     onChunk: (text: string) => void,
-    onDone: (meta: {
-      segment_no: number;
-      chars: number;
-      summary: string;
-      id: number;
-    }) => void,
+    onDone: (meta: StreamDoneMeta) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
       fetch(`${BASE}/generate-stream`, jsonInit("POST", {
@@ -372,13 +369,7 @@ export const api = {
               try {
                 const ev = JSON.parse(payload) as
                   | { type: "chunk"; text: string }
-                  | {
-                      type: "done";
-                      segment_no: number;
-                      chars: number;
-                      summary: string;
-                      id: number;
-                    }
+                  | ({ type: "done" } & StreamDoneMeta)
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
                 else if (ev.type === "done") onDone(ev);
@@ -399,12 +390,7 @@ export const api = {
     segmentNo: number,
     maxChars: number | null,
     onChunk: (text: string) => void,
-    onDone: (meta: {
-      segment_no: number;
-      chars: number;
-      summary: string;
-      id: number;
-    }) => void,
+    onDone: (meta: StreamDoneMeta) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
       fetch(`${BASE}/regenerate-stream`, jsonInit("POST", {
@@ -436,13 +422,7 @@ export const api = {
               try {
                 const ev = JSON.parse(payload) as
                   | { type: "chunk"; text: string }
-                  | {
-                      type: "done";
-                      segment_no: number;
-                      chars: number;
-                      summary: string;
-                      id: number;
-                    }
+                  | ({ type: "done" } & StreamDoneMeta)
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
                 else if (ev.type === "done") onDone(ev);

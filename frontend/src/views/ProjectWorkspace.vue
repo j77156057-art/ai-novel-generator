@@ -7,6 +7,7 @@ import type {
   DistillJob,
   GeneratePlan,
   Graph,
+  KgBookkeeping,
   LlmConfig,
   NarrativeTier,
   NovelOut,
@@ -136,6 +137,8 @@ const kgSource = ref<string>("generated");
 const graph = ref<Graph | null>(null);
 const buildingKg = ref(false);
 const kgMsg = ref<string | null>(null);
+// 图谱提示条的色级：'' 未设（回退 info）| ok | warn | err。语义色，不写死 hex。
+const kgMsgLevel = ref<"" | "ok" | "warn" | "err">("");
 
 const characters = ref<{ id: number; props: any }[]>([]);
 const plotholes = ref<{ id: number; props: any }[]>([]);
@@ -732,9 +735,14 @@ async function runGenerate() {
           streamedText.value += text;
           followLiveBox(); // 仅在读者本就在底部时跟随，绝不强制下拉页面
         },
-        async () => {
+        async (meta) => {
           lastText.value = streamedText.value;
           batchCount.value = i + 1;
+          // 流式 done 也带 KG 簿记：complete:false（有失败段）或 rebuilt:false
+          // （建图整体没跑成）都要让用户看见，否则「簿记不全」只藏在后端。
+          if (meta.kg && (meta.kg.complete === false || meta.kg.rebuilt === false)) {
+            applyKgWarn(meta.kg);
+          }
           await loadGenerations();
           refreshPriorIfOpen(); // 每段生成完前情都变了，面板开着就同步刷新
         },
@@ -757,7 +765,11 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
       (text) => {
         regenState.value[g.id].text += text;
       },
-      async () => {
+      async (meta) => {
+        // 重生成会全量 replay：complete:false / rebuilt:false 同样要暴露。
+        if (meta.kg && (meta.kg.complete === false || meta.kg.rebuilt === false)) {
+          applyKgWarn(meta.kg);
+        }
         await loadGenerations();
         refreshPriorIfOpen(); // 重生成会重算受影响的卷摘要与主线，前情报告同步刷新
       },
@@ -1095,14 +1107,32 @@ function buildSourceOptions(): { value: string; label: string }[] {
   }
   return opts;
 }
+// KG 簿记提示：两个入口（手动建图 / 流式 done）共用同一判据与文案。
+// 判据只认 `complete`（= 无失败段），旧后端不返回该键 → `complete !== false`
+// 视为成功，绝不把「未返回」误报成失败。段号取 failed[].segment_no。
+const KG_WARN_TAIL = "未完成。请重试；若反复失败，请检查数据库是否需要迁移后重试。";
+function kgFailedNums(kg?: KgBookkeeping): string {
+  return (kg?.failed ?? []).map((f) => f.segment_no).join("、");
+}
+function applyKgOk(kg: KgBookkeeping) {
+  kgMsg.value = `生成后图谱已重建：${kg.replayed ?? 0}/${kg.segments ?? 0} 段`;
+  kgMsgLevel.value = "ok";
+}
+function applyKgWarn(kg?: KgBookkeeping) {
+  kgMsg.value = `簿记不全：${kg?.replayed ?? 0}/${kg?.segments ?? 0} 段成功，段 ${kgFailedNums(kg)} ${KG_WARN_TAIL}`;
+  kgMsgLevel.value = "warn";
+}
 async function buildGeneratedKg() {
   buildingKg.value = true;
   kgMsg.value = null;
+  kgMsgLevel.value = "";
   try {
     const r = await api.buildKgFromGenerations(projectId);
-    kgMsg.value = `生成后图谱：${r.characters} 角色 / ${r.plotholes} 坑 / ${r.relationships} 关系（${r.chunks} 段）`;
+    if (r.complete !== false) applyKgOk(r);
+    else applyKgWarn(r);
   } catch (err) {
     kgMsg.value = err instanceof Error ? err.message : String(err);
+    kgMsgLevel.value = "err";
   } finally {
     buildingKg.value = false;
   }
@@ -1118,6 +1148,7 @@ async function loadGraph() {
     ) as any;
   } catch (err) {
     kgMsg.value = err instanceof Error ? err.message : String(err);
+    kgMsgLevel.value = "err";
   }
 }
 
@@ -1962,7 +1993,7 @@ onUnmounted(stopDistillPolling);
         {{ buildingKg ? "建图中…" : "建/重建「我的小说」图谱" }}
       </button>
     </div>
-    <div v-if="kgMsg" class="notice info" style="margin-bottom: 12px">{{ kgMsg }}</div>
+    <div v-if="kgMsg" :class="['notice', kgMsgLevel || 'info']" style="margin-bottom: 12px">{{ kgMsg }}</div>
     <div class="row" style="margin-bottom: var(--gap)">
       <div class="field" style="flex: 1; min-width: 220px">
         <label>查看哪张图（各自独立，不混）</label>

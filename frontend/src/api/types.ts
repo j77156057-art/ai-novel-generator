@@ -470,6 +470,57 @@ export interface GenerateLoopResult {
 }
 
 // ==================================================================
+// KG 簿记统计（生成后建图 / 流式 done 共用的同一形状）
+// ------------------------------------------------------------------
+// 与后端 `app.kg.build.rebuild_generated_kg()` 的返回体逐字段对齐
+// （手动镜像，改后端时同步此处）。
+//
+// 背景：`POST /projects/{id}/build-kg-from-generations` 与两个流式端点
+// （`/generate-stream`、`/regenerate-stream`）的 `done` 事件都返回这一形状。
+// 旧形状 `{characters, plotholes, relationships, chunks}` 已废弃 —— 界面若
+// 照旧形状读会渲染出一串 `undefined`，所以这里只保留新形状。
+// ==================================================================
+
+/** 单段 replay 失败的记录（`failed` 数组元素）。 */
+export interface KgReplayFailure {
+  /** 未完成的段号。 */
+  segment_no: number;
+  /** 失败原因（后端可能为 null）。 */
+  reason?: string | null;
+}
+
+/**
+ * 「生成后 KG 全量重建」的簿记统计。
+ *
+ * - `rebuilt` 语义 = 操作跑过（即使有失败段也常为 true）；
+ * - `complete` 语义 = 无失败段（`= failed == []`）—— 这才是「是否簿记完整」。
+ *   界面判据用 `complete !== false`（旧后端不返回该键时视为成功，不误报）。
+ */
+export interface KgBookkeeping {
+  rebuilt?: boolean;
+  complete?: boolean;
+  segments?: number;
+  replayed?: number;
+  failed?: KgReplayFailure[];
+  source?: string;
+}
+
+/**
+ * 生成 / 重生成流 `done` 事件的负载（两流同构，抽出供 client.ts 两处复用）。
+ *
+ * `kg` 是纯新增键：既有字段语义一个都没改。挂簿记统计是为了让**流式路径**
+ * 也能被观测 —— 此前流式完全不做归档，`complete:false` 无从判断。
+ */
+export interface StreamDoneMeta {
+  segment_no: number;
+  chars: number;
+  summary: string;
+  id: number;
+  /** KG 簿记统计；旧后端不返回 → undefined → 不提示（保守，不误报）。 */
+  kg?: KgBookkeeping;
+}
+
+// ==================================================================
 // Assistant（助手面板）
 // ------------------------------------------------------------------
 // 与 `backend/app/routers/assistant.py` + `assistant_proposals.py` 的
