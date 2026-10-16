@@ -429,8 +429,156 @@ def _should_rewrite(text: str, forbidden: dict | None) -> tuple[bool, list[str]]
     return (len(reasons) > 0, reasons)
 
 
-def _rewrite_prompt(text: str, reasons: list[str], forbidden: dict | None) -> tuple[str, str]:
-    """构造针对性重写的 system/user prompt。"""
+# ── Phase 0「生成自检 · 原文对照」参数 ──────────────────────────────────
+# 只影响完整档的重写环节；快档与未命中重写路径零新增调用。
+_SELFCHECK_FINDING_LIMIT = 5      # 最多带几条历史告警的证据
+_SELFCHECK_EVIDENCE_CHARS = 200   # 单条原文片段截断长度
+_SELFCHECK_CORPUS_CALLS = 1       # 参考语料检索的**全局**调用上限
+_SELFCHECK_CORPUS_K = 3           # 单次检索最多取几条片段
+
+
+def _selfcheck_enabled(project) -> bool:
+    """生成自检开关（Phase 0 原型）。
+
+    **这里的判据是暂借 `project.narrative_tier`，语义上并不等价**：
+    narrative_tier 的本义是「蒸馏档位」（full/balanced/fast），与「是否开启生成期
+    自检」是两件事。之所以暂借，是为了 Phase 0 不新增字段、不做 schema 迁移：
+    完整档才开自检，其余档位（含 narrative_tier 为 None）行为与现在逐字节一致。
+    独立化为独立开关（新增列或项目设置项）留待后续——届时只需改本函数的判据，
+    调用方与 prompt 形状都不用动。
+    """
+    return getattr(project, "narrative_tier", None) == "full"
+
+
+def _truncate_snippet(s: str, limit: int) -> str:
+    """截断原文片段：超长补省略号，防止撑爆 prompt。"""
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "…"
+
+
+def _evidence_query(text: str, reasons: list[str], forbidden: dict | None) -> str:
+    """构造参考语料检索 query。
+
+    思路：反向禁忌词是作者明令回避的表达，拿它去语料里检索，能找到「作者遇到
+    同类场景时怎么写」；再补一段正文开头做场景锚点。取前若干个词拼成短 query。
+    """
+    parts: list[str] = []
+    for _dim, items in (forbidden or {}).items():
+        for it in items or []:
+            if it and it in text and it not in parts:
+                parts.append(it)
+    head = (text or "").strip().split("\n")[0][:40].strip()
+    if head:
+        parts.append(head)
+    return " ".join(parts[:6])[:200]
+
+
+def _gather_rewrite_evidence(db, project, text: str, reasons: list[str],
+                             forbidden: dict | None) -> tuple[list[dict], dict]:
+    """收集重写的「原文对照」证据（Phase 0），返回 (evidence, stats)。
+
+    A 路（零成本、纯本地读库）：读哨兵历史告警 `load_findings`——每条告警自带
+      `evidence`（更早段的反证原文片段）。例如「死人说话」告警的 evidence 就是
+      该角色死亡那段的原文。这是系统里现成的原料，不新增任何模型调用。
+
+    B 路（限量检索）：对参考语料做 `hybrid_search`。注意该函数每次会**加载该
+      novel 全部 chunks** 做 BM25 + 向量，大语料（实测 833 章）代价不小，所以
+      必须限量：全局最多 1 次调用、最多 3 条片段。
+
+    任一步失败 → 吞异常，返回**已收集到的部分**，绝不阻断重写（重写是补救，
+    不是生成的前提）。检索失败在 stats.retrieval_tripped 里标记，供测试断言
+    与线上观测。
+    """
+    stats = {
+        "findings_used": 0,
+        "retrieval_called": False,
+        "retrieval_hits": 0,
+        "retrieval_tripped": False,
+    }
+    evidence: list[dict] = []
+
+    # ---- A 路：历史告警（零成本）----
+    try:
+        from app.kg.sentinel import load_findings
+
+        recent = load_findings(db, project.id, source="generated")[:_SELFCHECK_FINDING_LIMIT]
+    except Exception:  # noqa: BLE001 - 告警读不出也要能重写
+        recent = []
+    # severity 优先 err（Python 排序稳定 → 同 severity 内仍按段号倒序，即最近的先看）
+    for f in sorted(recent, key=lambda d: 0 if (d.get("severity") or "") == "err" else 1):
+        note = ""
+        entity = (f.get("entity") or "").strip()
+        message = (f.get("message") or "").strip()
+        if entity or message:
+            note = f"{entity}：{message}" if entity else message
+        # 每条告警最多取 1 段片段：单条告警的 evidence 可能有多个 span，
+        # 全塞进来会让一条告警吃掉整个证据预算。
+        got = False
+        for ev in (f.get("evidence") or [])[:1]:
+            snippet = _truncate_snippet(str(ev.get("text") or ""), _SELFCHECK_EVIDENCE_CHARS)
+            if not snippet:
+                continue
+            seg = ev.get("segment_no")
+            src = f"前文第{seg}段" if seg is not None else "前文"
+            # note 与片段一起给：只给片段模型不知道这段为什么重要
+            body = f"{note}\n片段：{snippet}" if note else snippet
+            evidence.append({"source": src, "kind": "finding", "text": body})
+            got = True
+        if not got and note:
+            # 告警本身没有原文片段时，至少把「哪里不对」告诉模型
+            evidence.append({"source": "前文", "kind": "finding", "text": note})
+    stats["findings_used"] = sum(1 for e in evidence if e["kind"] == "finding")
+
+    # ---- B 路：参考语料检索（限量，全局最多 _SELFCHECK_CORPUS_CALLS 次）----
+    ids = [int(i) for i in (project.reference_novel_ids or []) if str(i).strip().isdigit()]
+    if ids and _SELFCHECK_CORPUS_CALLS > 0:
+        query = _evidence_query(text, reasons, forbidden)
+        if query:
+            tried = 0
+            for nid in ids:
+                if tried >= _SELFCHECK_CORPUS_CALLS:
+                    break
+                tried += 1
+                stats["retrieval_called"] = True
+                try:
+                    from app.retrieval.search import hybrid_search
+
+                    hits = hybrid_search(db, nid, query, k=_SELFCHECK_CORPUS_K)
+                except Exception:  # noqa: BLE001 - 检索熔断：吞掉，重写继续
+                    stats["retrieval_tripped"] = True
+                    continue
+                # 书名要给模型做来源标注，否则它分不清「前文事实」与「参考语料」
+                title = f"语料{nid}"
+                try:
+                    from app.models import RawNovel
+
+                    novel = db.get(RawNovel, nid)
+                    if novel is not None and novel.title:
+                        title = f"《{novel.title}》"
+                except Exception:  # noqa: BLE001 - 书名取不到不影响片段本身
+                    pass
+                for h in hits or []:
+                    snippet = _truncate_snippet(str(h.get("text") or ""), _SELFCHECK_EVIDENCE_CHARS)
+                    if not snippet:
+                        continue
+                    ch = h.get("chapter_no")
+                    src = f"参考语料{title}第{ch}章" if ch is not None else f"参考语料{title}"
+                    evidence.append({"source": src, "kind": "corpus", "text": snippet})
+            stats["retrieval_hits"] = sum(1 for e in evidence if e["kind"] == "corpus")
+
+    return evidence, stats
+
+
+def _rewrite_prompt(text: str, reasons: list[str], forbidden: dict | None,
+                    evidence: list[dict] | None = None) -> tuple[str, str]:
+    """构造针对性重写的 system/user prompt。
+
+    evidence：`_gather_rewrite_evidence` 产出的「原文对照」证据。
+    **为 None/空列表时 user 回退到旧形状**（问题清单 + 待改正文），
+    保证快档与无证据场景逐字节不变。
+    """
     system = (
         "你是一位资深中文网文编辑。你的任务是将一段 AI 生成的文本改写得更像真人写的网文。\n\n"
         "改写要求：\n"
@@ -451,7 +599,61 @@ def _rewrite_prompt(text: str, reasons: list[str], forbidden: dict | None) -> tu
         f"以下文本存在以下 AI 腔问题：\n{'；'.join(reasons)}\n\n"
         f"请改写：\n\n{text}"
     )
+    if evidence:
+        # 【原文对照】块：每条证据都带**来源标注**（前文第 N 段 / 参考语料《X》第 M 章），
+        # 让模型分清哪段是「你自己更早写下的事实」、哪段是「别人写的同类场景」。
+        # 「不要照抄内容」必须写明：参考语料是别人的作品，照抄会直接污染正文
+        # 并引入版权/一致性问题；前文片段照抄则会让本段变成重复叙述。
+        blocks = [
+            f"- 来源：{e.get('source') or '未知'}（{e.get('kind') or '未知'}）\n{e.get('text') or ''}"
+            for e in evidence
+        ]
+        user = (
+            f"以下文本存在以下 AI 腔问题：\n{'；'.join(reasons)}\n\n"
+            "【原文对照】以下片段仅供你对照调性与前文事实：参考语料是同类场景的写法参考，"
+            "前文片段是你自己更早写下的事实。**只学表达方式、只保证与前文不矛盾，"
+            "不要照抄内容，也不要把参考语料的情节搬进本段。**\n"
+            + "\n\n".join(blocks)
+            + "\n\n"
+            f"请改写：\n\n{text}"
+        )
     return system, user
+
+
+def _rewrite_with_evidence(db, project, provider, text: str, reasons: list[str],
+                           forbidden: dict | None) -> tuple[str | None, dict | None]:
+    """执行一次针对性重写，返回 (rewritten_text_or_None, rewrite_info)。
+
+    抽出成公共函数是为了让 `generate_next_segment` 与 `generate_next_segment_stream`
+    **两个入口的重写语义完全一致**——原先两处各写一遍，任何一边漏改都会造成
+    「流式与非流式重写结果不同」这种极难排查的不一致。
+
+    完整档（_selfcheck_enabled）才收集原文对照证据；其余档位 evidence 为空，
+    prompt 回退旧形状，零新增调用。
+
+    重写失败一律吞掉返回 (None, None) 记日志——重写是补救，不是生成的前提。
+    """
+    evidence: list[dict] = []
+    selfcheck: dict = {}
+    if _selfcheck_enabled(project):
+        evidence, selfcheck = _gather_rewrite_evidence(db, project, text, reasons, forbidden)
+    try:
+        rw_system, rw_user = _rewrite_prompt(text, reasons, forbidden, evidence)
+        rewritten = provider.chat(rw_system, rw_user)
+        rewritten = _strip_thinking(rewritten)
+        if rewritten and len(rewritten) > len(text) * 0.5:
+            info = {
+                "reasons": reasons,
+                "original_chars": len(text),
+                "rewritten_chars": len(rewritten),
+            }
+            # selfcheck 是纯新增键 —— 既有字段语义一个字都不改
+            if selfcheck:
+                info["selfcheck"] = selfcheck
+            return rewritten, info
+    except Exception as exc:  # noqa: BLE001 —— 重写失败不阻断，保留原文
+        logging.getLogger(__name__).warning("AI 味重写失败，保留原文: %s", exc)
+    return None, None
 
 
 def _style_warning(text: str, profile: dict | None) -> dict | None:
@@ -539,16 +741,12 @@ def generate_next_segment(
     rewrite_info = None
     need_rewrite, reasons = _should_rewrite(text, forbidden)
     if need_rewrite:
-        try:
-            rw_system, rw_user = _rewrite_prompt(text, reasons, forbidden)
-            rewritten = provider.chat(rw_system, rw_user)
-            rewritten = _strip_thinking(rewritten)
-            if rewritten and len(rewritten) > len(text) * 0.5:
-                rewrite_info = {"reasons": reasons, "original_chars": len(text), "rewritten_chars": len(rewritten)}
-                text = rewritten
-                summary = provider.summarize(text)
-        except Exception as exc:  # noqa: BLE001
-            logging.getLogger(__name__).warning("AI 味重写失败，保留原文: %s", exc)
+        # 重写（完整档会带原文对照证据）——流式与非流式共用同一实现，语义一致
+        rewritten, info = _rewrite_with_evidence(db, project, provider, text, reasons, forbidden)
+        if rewritten:
+            text = rewritten
+            summary = provider.summarize(text)
+            rewrite_info = info
 
     gen, segment_no = _commit_segment(db, project, text, summary)
 
@@ -635,16 +833,12 @@ def generate_next_segment_stream(
     rewrite_info = None
     need_rewrite, reasons = _should_rewrite(text, forbidden)
     if need_rewrite:
-        try:
-            rw_system, rw_user = _rewrite_prompt(text, reasons, forbidden)
-            rewritten = provider.chat(rw_system, rw_user)
-            rewritten = _strip_thinking(rewritten)
-            if rewritten and len(rewritten) > len(text) * 0.5:
-                rewrite_info = {"reasons": reasons, "original_chars": len(text), "rewritten_chars": len(rewritten)}
-                text = rewritten
-                summary = provider.summarize(text)
-        except Exception as exc:  # noqa: BLE001 —— 重写失败不阻断，保留原文
-            logging.getLogger(__name__).warning("AI 味重写失败，保留原文: %s", exc)
+        # 与 generate_next_segment 共用同一实现：流式路径的重写语义必须完全一致
+        rewritten, info = _rewrite_with_evidence(db, project, provider, text, reasons, forbidden)
+        if rewritten:
+            text = rewritten
+            summary = provider.summarize(text)
+            rewrite_info = info
 
     gen, segment_no = _commit_segment(db, project, text, summary)
     tree_stats = _rollup_summary_tree(db, project, provider)
