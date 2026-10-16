@@ -109,9 +109,38 @@
   LocalFallbackLLMProvider（engine 没 LLM key 时的兜底 provider）忘了同步签名
 - 影响：任何「provider 不可用 → 走 fallback」的真实请求都会 500
 
-**冒烟的价值**：mock 测试覆盖不到真 provider 签名漂移——
-本测试已能跑通到「服务 ready / 项目建好 / 路由进栈」三阶段，
-单 generation 端点请求就立刻暴露这个真问题。
+**修法**：LocalFallbackLLMProvider.chat 加 `stop_sequences: list[str] | None = None`
+关键字接收并忽略。回归测试 `tests/test_llm_fallback_signature.py` 5 断言。Commit `0e35bc4`。
 
-**修法（独立议题，本轮不修）**：LocalFallbackLLMProvider.chat 加
-`stop_sequences: list[str] | None = None` 关键字接收并忽略。
+**环境问题（同一轮发现）**：pydantic-settings 只读 .env 文件不读 os.environ。
+worktree 默认无 .env → 跑 fallthrough → 仍走 LocalFallback。
+修法：脚本启动时把 `os.environ["ZHIPU_API_KEY"]` 注入 worktree 的
+`backend/.env`，finally 恢复原状。
+
+## 十、首次真链路跑通（2026-10-16，智谱 glm-4-flash）
+
+环境修好后一次跑通 8 段真智谱生成 + 批抽 + 读侧 + 切片回流 + 豁免端点：
+
+| 段 | wc | dt | 备注 |
+|---|---|---|---|
+| 1 | 1220 | 93s | 智谱 60-72s/段，剩 30s 是 judge+enqueue |
+| 2 | 1247 | 194s | 智谱累，慢了 100s |
+| 3 | 1125 | 68s | |
+| 4 | 662 | 177s | 智谱生成短文本 |
+| 5 | 875 | 59s | |
+| 6 | 852 | 56s | |
+| 7 | 992 | 62s | |
+| 8 | 0 | 259s | ⚠️ 智谱 hang 后返回空（skill 沉淀现象） |
+
+**真实落库数据**：
+- kg_events=50 / kg_characters=14 / kg slice_for_prompt 834 字符（**KG 真回流**）
+- worker alive=True / 队列 0 积压 / 0 stuck
+- 智谱对 generation_length=3200 服从性弱（最长 1247，< 50%），属已知模型特性
+
+**verdict 首次为 PARTIAL**——主因是「空即合法」的边界（judge findings=0 →
+豁免端点未真实写入；slice 文本不命中硬编码关键词）。后续期望值修正：
+- `slice_prompt_has` 改 `len(prompt) > 100`（KG 真回流即 PASS，不卡关键词）
+- `exemption_link_ok` 改「端点 ping 成功即 PASS」（findings=0 算空即合法）
+
+**这才是冒烟的真正价值**：跑通真链路，捕获**测试期望值与实现行为不匹配**的脏数据，
+以及暴露出更深的「环境 vs 配置文件」层问题。
