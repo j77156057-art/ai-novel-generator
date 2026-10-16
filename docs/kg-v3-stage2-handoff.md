@@ -125,9 +125,9 @@ a6ea0b6 前端集成：KG 工作台 5 tabs
 
 | # | 项 | 说明 | 难度 |
 |---|---|---|---|
-| 5 | **真环境 nemotron 复跑对比** | OpenRouter 配额重置后，用 nemotron-3-ultra 对比智谱弱模型的抽取质量（foreshadows/knowledge 智谱全 0 行）。**先查当天剩余额度**（免费档 50 次/日），耗尽会全 429 | 半天 |
-| 6 | **e2e user journey 测试** | 建项目→生成→批抽→Judge→切片→豁免 全链路"用户视角"测试。两层：mock 回归套件 19 断言 + 真 LLM 冒烟脚本挂后台。冒烟首次跑暴露真 bug（LocalFallbackLLMProvider 缺 stop_sequences 签名），记录独立议题待修 | 1 天 |
-| 7 | **Judge 时间锚量纲转换** | impossible_sequences 只判 4 位年份，"贞观三年秋"式非年份时间不比（需朝代年号→公元年的常识库，已有 `data/seed/` 红楼梦可试水） | 2 天 |
+| 5 | **真环境 nemotron 复跑对比** | OpenRouter 配额重置后（每天 0 点），用 nemotron-3-ultra 对比智谱弱模型的抽取质量（foreshadows/knowledge 智谱全 0 行）。**先查当天剩余额度**（免费档 50 次/日），耗尽会全 429 | 半天 |
+| 6 | ✅ **e2e user journey 测试** | 建项目→生成→批抽→Judge→切片→豁免 全链路用户视角。两层：mock 回归套件 19 断言（tests/test_e2e_journey_pipeline.py）+ 真 LLM 冒烟脚本挂后台（scratch/run_journey_e2e.py）。首次真智谱 8 段跑通，kg_events=50/kg_characters=14/slice 834 字符。冒烟暴露 2 真 bug 已修：LocalFallbackLLMProvider 缺 stop_sequences 签名（commit 0e35bc4）+ pydantic-settings 不读 os.environ（脚本自修，注入 .env） | 1 天 ✅ |
+| 7 | ✅ **Judge 时间锚量纲转换** | impossible_sequences 从只认 4 位公元年扩到中文年号纪年。era_convert.py 解析层（449 年号表）+ 口径 C（相邻同 era 才比 year）。三道边界防误报（左/右/长度）。57 断言新套件 + 29→31 旧套件（test_v30_judge.py 期望值更新） | 2 天 ✅ |
 
 另有打磨项（非候选）：前端关系图升级力导向 / 移动端适配 / KG 工作台数据刷新按钮
 统一（现在每 tab 各自刷新，切 tab 惰性加载只在首次）。
