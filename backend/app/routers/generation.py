@@ -87,9 +87,14 @@ def _to_generation_out(gen: Generation) -> dict:
 def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
-    result = generate_next_segment(
-        db, proj, novel_ids=novel_ids, max_chars=body.max_chars
-    )
+    try:
+        result = generate_next_segment(
+            db, proj, novel_ids=novel_ids, max_chars=body.max_chars
+        )
+    except ValueError as exc:
+        # 档案预检失败（未蒸馏）等可操作错误：409 + 明确指引，
+        # 而不是 500 或把请求挂死在同步蒸馏上
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         **_to_generation_out(_last_generation(db, proj.id)),
         "debug": {
@@ -175,9 +180,13 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
 def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)) -> dict:
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
-    results = generate_loop(
-        db, proj, novel_ids=novel_ids, segments=body.segments, max_chars=body.max_chars
-    )
+    try:
+        results = generate_loop(
+            db, proj, novel_ids=novel_ids, segments=body.segments, max_chars=body.max_chars
+        )
+    except ValueError as exc:
+        # 档案预检失败（未蒸馏）→ 409 + 指引，不挂死、不 500
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "segments": [
             {**_to_generation_out(_generation_by_no(db, proj.id, r["segment_no"])),

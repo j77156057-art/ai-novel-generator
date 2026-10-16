@@ -11,7 +11,7 @@
 from sqlalchemy import select
 
 from app.kg.extractor import _RESOLVE_CUES, RuleBasedExtractor, resolve_plotholes
-from app.models import KgEdge, KgNode, NovelChunk, RawNovel
+from app.models import KgEdge, KgNode, NovelChunk, Project, RawNovel
 
 # 坑节点 props 里占位 cue 的值：extractor 对「直问句但无线索词」的坑写 cue="?"。
 # 拿它当检测键等于匹配所有文本，必须在结算检测里跳过。
@@ -204,6 +204,103 @@ def extract_from_text(text: str, segment_no: int = 1):
     return _extract_from_chunks(chunks), chunks
 
 
+def merge_segment_into_kg(
+    db, project_id: int, text: str, segment_no: int, source: str = "generated"
+) -> dict:
+    """把「新生成的一段」**完整**并入 KG：图谱 + 事实账本 + 别名归一 + 规则哨兵。
+
+    ## 为什么必须有这个函数（2026-10-17 live 验证复现的洞）
+
+    此前段级合并的逻辑分散：生成链路（engine._merge_segment_into_graph）做四步，
+    而本模块的公开入口 merge_graph_from_text 只做**图谱一步**——Fact 账本不
+    随之更新。任何调用方用 merge_graph_from_text，账本就与图谱状态漂移
+    （坑在图谱里 resolved 了、账本里还 open，reminders/诊断两边不一致）。
+
+    现在四步编排收归本函数，merge_graph_from_text 与生成链路都走它——
+    **只有一个段级合并入口，不存在"只更一半"的路径**。
+
+    四步共用**同一次抽取**（图谱与账本吃同一份 ExtractionResult，跑两遍纯属
+    浪费，也会让两条链路的结果漂移）：
+    1. 图谱（KgNode/KgEdge，含本段结算旧坑）——下一次生成的 reminders 能
+       拿到本段新角色/新伏笔；
+    2. 事实账本（Fact）+ 别名归一——把「宁折 / 宁折枝」这类同一人的不同写法
+       并到规范名，否则 get_reminders 会把同一人当成两个锁定角色注入提示词；
+    3. 图谱侧本段结算掉的坑，账本侧在同一次 merge 里同步 resolved；
+    4. 规则哨兵（零 LLM 硬冲突检查，只标红不改正文）——放在账本之后，
+       名字表与已认定状态都来自账本，账本先更新哨兵判定才准。
+
+    任何一步失败都绝不阻断主流程：吞异常、写 error 键、回传状态。
+
+    返回形状刻意**保持扁平兼容**：图谱统计（merged/new_characters/…）仍在顶层，
+    账本/别名/哨兵挂在 `ledger` / `aliases` / `sentinel` 三个键下——
+    `kg_update` 的既有消费方（前端与 API）读顶层字段，不受影响。
+    """
+    from app.kg.ledger import (
+        T_PLOTHOLE,
+        facts_from_extraction,
+        resolve_aliases,
+        upsert_facts,
+    )
+
+    # 1) 图谱（含本段结算旧坑：text 一并传入，ExtractionResult 不带原文）
+    try:
+        result, _ = extract_from_text(text, segment_no)
+        stats = dict(
+            merge_result_into_graph(
+                db, project_id, result, source=source, segment_no=segment_no,
+                text=text,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 —— 图谱失败不阻断主流程
+        return {"merged": False, "reason": f"图谱合并失败：{str(exc)[:100]}"}
+
+    # 2) 事实账本 + 3) 结算同步
+    try:
+        ledger_facts = facts_from_extraction(result, segment_no)
+        # 图谱侧本段结算掉的坑，账本侧必须在**同一次 merge**里同步成
+        # resolved——只改 KgNode 不改 Fact 会让 reminders/诊断两边状态漂移。
+        # patch 刻意只带 status（不带 planted_segment 等 int 字段：
+        # upsert 的累加语义会把首现段污染成 1+2=3）。
+        for h in stats.get("resolved_holes") or []:
+            fact_key = (h.get("question") or "").strip() or (h.get("key") or "").strip()
+            if not fact_key:
+                continue
+            ledger_facts.append(
+                {
+                    "type": T_PLOTHOLE,
+                    "key": fact_key,
+                    "props": {"status": "resolved"},
+                    "first_segment": h.get("first_chapter") or segment_no,
+                    "last_segment": segment_no,
+                    "confidence": "high",
+                }
+            )
+        stats["ledger"] = upsert_facts(
+            db, project_id, ledger_facts, source=source,
+        )
+        # 别名归一紧随其后：本段若引入了简称/全称两种写法，下一段就要用规范名
+        aliases = resolve_aliases(db, project_id, source=source)
+        stats["aliases"] = {
+            "auto_merged": len(aliases["auto"]),
+            "nodes_removed": aliases["nodes_removed"],
+            "review_count": aliases["review_count"],
+            "review": aliases["review"],
+        }
+    except Exception as exc:  # noqa: BLE001 —— 账本失败不阻断主流程
+        stats["ledger"] = {"error": str(exc)[:100]}
+
+    # 4) 规则哨兵：零 LLM 的硬冲突检查。**只标红，不改正文。**
+    try:
+        from app.kg.sentinel import audit_segment
+
+        proj = db.get(Project, project_id)
+        stats["sentinel"] = audit_segment(db, proj, text, segment_no)
+    except Exception as exc:  # noqa: BLE001 —— 哨兵失败不阻断主流程
+        stats["sentinel"] = {"error": str(exc)[:100], "findings": []}
+
+    return stats
+
+
 def merge_graph_from_text(
     db, project_id: int, text: str, source: str = "generated", segment_no: int = 1
 ) -> dict:
@@ -211,13 +308,15 @@ def merge_graph_from_text(
 
     这是图谱进入生成闭环的关键：旧实现中 build_graph_from_text 只在用户手动点「建图」
     时调用，且每次清空重建 —— 生成过程里图谱既不增量更新、也不被下一次生成可靠使用。
+
+    2026-10-17 起实现改为走 `merge_segment_into_kg`（四步完整合并）：
+    此前本函数只做图谱一步、Fact 账本不同步，调用方拿到的是"半份簿记"
+    （live 验证实测复现：KgNode resolved 而 Fact 仍 open）。返回形状在原
+    图谱统计之上新增 `ledger`/`aliases`/`sentinel` 三个键，顶层字段不变。
     """
     if not text or not text.strip():
         return {"merged": False, "reason": "空文本"}
-    result, _ = extract_from_text(text, segment_no)
-    # text 一并传入：增量路径的「本段结算旧坑」检测需要原文
-    # （ExtractionResult 不携带原文，只有这里拿得到）。
-    return merge_result_into_graph(db, project_id, result, source, segment_no, text=text)
+    return merge_segment_into_kg(db, project_id, text, segment_no, source=source)
 
 
 def _hole_detection_key(props: dict) -> str:

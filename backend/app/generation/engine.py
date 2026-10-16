@@ -112,82 +112,55 @@ def _rag_query(prior: list[str], project: Project) -> str:
 def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -> dict:
     """生成后把本段事实增量合并进 generated 图谱与事实账本（闭环）。
 
-    两步共用**同一次抽取**：
-    1. 图谱（KgNode/KgEdge）——下一次生成的 reminders 能拿到本段新角色/新伏笔；
-    2. 事实账本（Fact）+ 别名归一 —— 把「宁折 / 宁折枝」这类同一人的不同写法
-       并到规范名，否则 get_reminders 会把同一人当成两个锁定角色注入提示词。
-
-    任何一步失败都绝不能阻断生成主流程，因此这里吞掉异常只回传状态。
-
-    返回形状刻意**保持扁平兼容**：图谱统计（merged/new_characters/…）仍在顶层，
-    账本与别名归一挂在 `ledger` / `aliases` 两个新键下。嵌套化会破坏
-    `kg_update` 的既有消费方（前端与 API 都在读顶层 new_characters）。
+    2026-10-17：四步编排（图谱 + 账本 + 别名归一 + 哨兵）已上移至
+    `app.kg.build.merge_segment_into_kg`——此前 build.py 的公开入口
+    `merge_graph_from_text` 只做图谱一步，Fact 账本不同步（live 验证
+    实测复现：KgNode resolved 而 Fact 仍 open）。现在生成链路与公开入口
+    走同一条四步路径，不存在"只更一半"的合并。本函数保留原名，
+    调用点（generate_next_segment）不动。
     """
-    try:
-        from app.kg.build import extract_from_text, merge_result_into_graph
+    from app.kg.build import merge_segment_into_kg
 
-        result, _ = extract_from_text(text, segment_no)
-        stats = dict(
-            merge_result_into_graph(
-                db, project_id, result, source="generated", segment_no=segment_no,
-                # text 一并传入：增量路径靠原文做「本段结算旧坑」检测
-                # （缺陷 1 修复；ExtractionResult 不带原文）。
-                text=text,
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"merged": False, "reason": f"图谱合并失败：{str(exc)[:100]}"}
+    return merge_segment_into_kg(db, project_id, text, segment_no)
 
-    try:
-        from app.kg.ledger import T_PLOTHOLE, facts_from_extraction, resolve_aliases, upsert_facts
 
-        ledger_facts = facts_from_extraction(result, segment_no)
-        # 缺陷 1 与缺陷 2 的协同：图谱侧本段结算掉的坑，账本侧必须在**同一次
-        # merge** 里同步成 resolved——只改 KgNode 不改 Fact 会让 reminders/诊断
-        # 两边状态漂移。这里把 resolved_holes 转成只带 status 的 fact patch
-        # （不带 planted_segment 等 int 字段，避免 upsert 的累加语义把它污染），
-        # 靠 upsert_facts 的单调转换规则落地。
-        for h in stats.get("resolved_holes") or []:
-            fact_key = (h.get("question") or "").strip() or (h.get("key") or "").strip()
-            if not fact_key:
-                continue
-            ledger_facts.append(
-                {
-                    "type": T_PLOTHOLE,
-                    "key": fact_key,
-                    "props": {"status": "resolved"},
-                    "first_segment": h.get("first_chapter") or segment_no,
-                    "last_segment": segment_no,
-                    "confidence": "high",
-                }
-            )
-        stats["ledger"] = upsert_facts(
-            db, project_id, ledger_facts,
-            source="generated",
-        )
-        # 别名归一紧随其后：本段若引入了简称/全称两种写法，下一段就要用规范名
-        aliases = resolve_aliases(db, project_id, source="generated")
-        stats["aliases"] = {
-            "auto_merged": len(aliases["auto"]),
-            "nodes_removed": aliases["nodes_removed"],
-            "review_count": aliases["review_count"],
-            "review": aliases["review"],
-        }
-    except Exception as exc:  # noqa: BLE001
-        stats["ledger"] = {"error": str(exc)[:100]}
+def _require_distill_ready(db, project) -> None:
+    """生成前档案预检（2026-10-17，修 live 验证复现的挂起洞）。
 
-    # 规则哨兵：零 LLM 的硬冲突检查。**只标红，不改正文。**
-    # 放在账本之后：名字表与已认定状态都来自账本，账本先更新，哨兵这一段的判定才准。
-    # 失败一样不阻断生成 —— 哨兵是增强，不是生成的前提。
-    try:
-        from app.kg.sentinel import audit_segment
+    项目有参考语料、但叙事档案既不在项目缓存也不在蒸馏库时，**明确 raise**
+    而不是让生成链路走到 `_style_narrative → project_narrative → extract`：
+    那条路会**同步**触发全量蒸馏（分钟级），HTTP 请求 240s 必超时，
+    用户看到的是无限转圈、无从判断是卡死还是在跑（live 实测复现）。
 
-        proj = db.get(Project, project_id)
-        stats["sentinel"] = audit_segment(db, proj, text, segment_no)
-    except Exception as exc:  # noqa: BLE001
-        stats["sentinel"] = {"error": str(exc)[:100], "findings": []}
+    无参考语料的自由生成不受影响（project_narrative 对它返回 None，
+    本来就不蒸馏）。
 
-    return stats
+    Raises:
+        ValueError: 需要先蒸馏。消息带明确可操作的下一步（端点路径）。
+    """
+    ids = [int(i) for i in (project.reference_novel_ids or [])]
+    if not ids:
+        return
+    from app.style.narrative import (
+        corpus_content_hash,
+        find_style_distill,
+        narrative_fingerprint,
+        resolve_tier,
+    )
+
+    cfg = resolve_tier(getattr(project, "narrative_tier", None))
+    want = narrative_fingerprint(ids, cfg)
+    cached = project.style_narrative or {}
+    if isinstance(cached, dict) and cached.get("fingerprint") == want:
+        return  # 项目缓存命中
+    content_hash = corpus_content_hash(ids, db)
+    if find_style_distill(db, ids, cfg.key, want["tier_signature"], content_hash) is not None:
+        return  # 蒸馏库命中（生成链路会直接复用）
+    raise ValueError(
+        f"项目尚未蒸馏文风档案（当前档位：{cfg.name}）。请先调用 "
+        f"POST /api/projects/{project.id}/distill 完成蒸馏后再生成——"
+        "直接生成会同步触发分钟级蒸馏，请求必然超时。"
+    )
 
 
 def _commit_segment(db, project: Project, text: str, summary: str) -> tuple[Generation, int]:
@@ -525,6 +498,9 @@ def generate_next_segment(
     """
     from app.llm.provider import get_llm_provider
 
+    # 档案预检：无缓存档案时明确失败，而不是同步跑分钟级蒸馏把请求挂死
+    _require_distill_ready(db, project)
+
     if provider is None:
         provider = get_llm_provider()
 
@@ -615,6 +591,10 @@ def generate_next_segment_stream(
     区别在续写过程逐块 yield，供 SSE 转发——长文首字即显、不干等。
     """
     from app.llm.provider import get_llm_provider
+
+    # 档案预检：与 generate_next_segment 同——无缓存档案时明确失败，
+    # 不把请求挂死在同步蒸馏上（流式下作为 SSE error 事件下发）。
+    _require_distill_ready(db, project)
 
     if provider is None:
         provider = get_llm_provider()
@@ -742,6 +722,9 @@ def regenerate_segment_stream(
     （L1 重排 + L2/L3 整体重算），保证「未来」续写连贯。已落库的后段正文保留。
     """
     from app.llm.provider import get_llm_provider
+
+    # 档案预检：重生成同样不该把请求挂死在同步蒸馏上
+    _require_distill_ready(db, project)
 
     if provider is None:
         provider = get_llm_provider()
