@@ -971,6 +971,20 @@ def regenerate_segment_stream(
     target.summary = {"text": summary}
     target.chapter_range = f"段{segment_no}"
 
+    # —— 重生成的 KG 簿记（清空 + 全量 replay）——
+    # ⚠️ 顺序陷阱：rebuild_generated_kg 从 Generation 表读各段正文，新文本必须先
+    # 落库，否则 replay 读到的是**旧**文本 —— 等于没修。故此 commit 必须在 replay 前。
+    db.commit()
+    kg_stats = None
+    try:
+        from app.kg.build import rebuild_generated_kg
+
+        kg_stats = rebuild_generated_kg(db, project.id)
+    except Exception as exc:  # noqa: BLE001 —— 簿记失败绝不打断 SSE：正文已落库，
+        # done 事件必须照样发出，否则前端表现为"重生成卡住且无结果"。
+        logging.getLogger(__name__).warning("重生成 KG replay 失败，正文已落库: %s", exc)
+        kg_stats = {"rebuilt": False, "reason": f"{str(exc)[:100]}"}
+
     # 重建整棵摘要树：该段所在的卷摘要与主线骨架都基于旧内容，不能续滚
     tree_stats = rebuild_summary_tree(db, project, provider)
     db.refresh(target)
@@ -982,6 +996,9 @@ def regenerate_segment_stream(
         "summary": summary,
         "summary_tree": tree_stats,
         "id": target.id,
+        # 与流式续写路径（generate_next_segment_stream）的 done 键对齐，
+        # 让重生成也带上簿记统计，可被前端/API 观测。
+        "kg": kg_stats,
     }
 
 

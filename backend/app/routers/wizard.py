@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.config import settings
-from app.kg.build import build_graph_from_text
+from app.kg.build import rebuild_generated_kg
 from app.llm.provider import get_llm_provider
 from app.models import Generation, NovelChunk, Project
 from app.schemas import (
@@ -302,6 +302,13 @@ def _offline_bible(proj: Project, answers: dict[str, str]) -> dict:
 
 @router.post("/{project_id}/build-kg-from-generations")
 def build_kg_from_generations(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """按已生成的各段**全量重建** generated 侧 KG（图谱 + 账本 + 别名 + 哨兵）。
+
+    2026-10-17：此前走 `build_graph_from_text`，只做图谱一步（账本/别名/哨兵全不
+    更新 → 与图谱漂移），且 `_split_text_to_chunks` 落的 chapter 是**chunk 序号
+    而非段号**（段号语义丢失）。现改走 `rebuild_generated_kg`：清空 generated 侧
+    全部派生数据后按**真实段号**逐段 replay，Fact 与图谱同源、段号正确。
+    """
     proj = _require_project(db, project_id)
     gens = db.scalars(
         select(Generation)
@@ -311,5 +318,5 @@ def build_kg_from_generations(project_id: int, db: Session = Depends(get_db)) ->
     text = "\n\n".join((g.text or "") for g in gens).strip()
     if not text:
         raise HTTPException(status_code=400, detail="尚无生成文本，无法建图")
-    stats = build_graph_from_text(db, project_id, text, source="generated")
+    stats = rebuild_generated_kg(db, project_id)
     return stats

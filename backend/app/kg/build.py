@@ -8,14 +8,51 @@
 每张图按 source 幂等重建（只清该 source 的旧图再写新图），互不污染。
 """
 
+import threading
+from contextlib import contextmanager
+
 from sqlalchemy import select
 
 from app.kg.extractor import _RESOLVE_CUES, RuleBasedExtractor, resolve_plotholes
-from app.models import KgEdge, KgNode, NovelChunk, Project, RawNovel
+from app.models import Fact, Generation, KgEdge, KgNode, NovelChunk, Project, RawNovel
 
 # 坑节点 props 里占位 cue 的值：extractor 对「直问句但无线索词」的坑写 cue="?"。
 # 拿它当检测键等于匹配所有文本，必须在结算检测里跳过。
 _PLACEHOLDER_CUE = "?"
+
+# ---------------------------------------------------------------------------
+# per-project KG 写锁
+#
+# 为什么需要：重生成路径的「清空 + 全量 replay」与并发的 `merge_segment_into_kg`
+# 会在同一批 KgNode/KgEdge/Fact 上交错——一方清空、另一方写回，结果互相覆盖，
+# 留下幽灵数据或缺段。此前全仓无 KG 锁（仅 `app/llm/registry.py` 有 LLM 锁可作先例）。
+#
+# 为什么是 RLock：replay 全程持锁，而它内部要**反复调用** `merge_segment_into_kg`，
+# 后者也持同一把锁——同线程必须可重入，否则 replay 一进 merge 就自死锁。
+# 不同线程则天然串行：两种合法交错都正确（replay 先完成 → 新段 merge 增量叠加其上；
+# 或新段 merge 先完成 → replay 读取的段列表已含它）。
+#
+# dict 本身由一个全局锁守护，避免并发首次访问时创建出两把不同的锁。
+# ---------------------------------------------------------------------------
+_KG_LOCKS_GUARD = threading.Lock()
+_KG_LOCKS: dict[int, threading.RLock] = {}
+
+
+def _kg_lock_for(project_id: int) -> threading.RLock:
+    """取该项目的 KG 锁（不存在则创建，创建过程受全局锁保护）。"""
+    with _KG_LOCKS_GUARD:
+        lock = _KG_LOCKS.get(project_id)
+        if lock is None:
+            lock = threading.RLock()
+            _KG_LOCKS[project_id] = lock
+        return lock
+
+
+@contextmanager
+def _project_kg_lock(project_id: int):
+    """持该项目 KG 锁的临界区（RLock，同线程可重入）。"""
+    with _kg_lock_for(project_id):
+        yield
 
 
 def _clear_graph_by_source(db, project_id: int, source: str) -> None:
@@ -178,6 +215,12 @@ def build_graph_from_text(
 ) -> dict:
     """从**生成的小说文本**建图谱（生成后才有的知识图谱）。
 
+    ⚠️ 2026-10-17 起**不推荐用于「全量重建」**：本函数只做**图谱一步**，且
+    `_split_text_to_chunks` 落的 chapter 是 **chunk 序号而非真实段号**。任何
+    「按已生成各段重建 generated 侧」的需求都应走 `rebuild_generated_kg`——它
+    清空 + 按真实段号逐段 replay，图谱/账本/别名/哨兵四步同源、段号正确。
+    保留本函数仅为兼容性/历史调用。
+
     注意：这是「手动全量重建」（先清该 source 再重写）。**每段生成后的自动更新**应调用
     merge_graph_from_text()——它做增量 upsert，不清空已有事实。
     """
@@ -234,6 +277,23 @@ def merge_segment_into_kg(
     返回形状刻意**保持扁平兼容**：图谱统计（merged/new_characters/…）仍在顶层，
     账本/别名/哨兵挂在 `ledger` / `aliases` / `sentinel` 三个键下——
     `kg_update` 的既有消费方（前端与 API）读顶层字段，不受影响。
+
+    2026-10-17：整个变更段持 **per-project RLock**（见模块头注释）。重生成路径的
+    全量 replay 也持同一把锁，两者互相串行；同线程由 RLock 保证可重入。
+    """
+    with _project_kg_lock(project_id):
+        return _merge_segment_into_kg_locked(
+            db, project_id, text, segment_no, source=source
+        )
+
+
+def _merge_segment_into_kg_locked(
+    db, project_id: int, text: str, segment_no: int, source: str = "generated"
+) -> dict:
+    """`merge_segment_into_kg` 的实际实现（调用方已持 per-project 锁）。
+
+    与公开入口分体只为「持锁」这一件事：锁必须在整个变更段内持有。逻辑本体重命名
+    而非重缩进，是为了不夹带任何行为改动。
     """
     from app.kg.ledger import (
         T_PLOTHOLE,
@@ -317,6 +377,79 @@ def merge_graph_from_text(
     if not text or not text.strip():
         return {"merged": False, "reason": "空文本"}
     return merge_segment_into_kg(db, project_id, text, segment_no, source=source)
+
+
+def rebuild_generated_kg(
+    db, project_id: int, source: str = "generated"
+) -> dict:
+    """重生成 / 手动建图专用：清空 generated 侧全部派生数据，按段号顺序 replay。
+
+    ## 为什么是「清空 + 全量 replay」而非增量
+
+    重生成第 M 段后，该段旧正文抽出的事实会永久残留（角色 mentions/speaking 是
+    **累加值**、坑 status 与哨兵 state 是**覆盖式**、别无「段 M 贡献了多少」的
+    分段明细），无法做减法。唯一正确的做法是：清空 generated 侧全部派生数据，
+    再按段号顺序把每段重新 merge 一遍——段 M 旧版本的贡献在新一轮 replay 中被
+    源文本天然取代。详见 docs/architecture/2026-10-17-kg-regenerate-replay.md §3。
+
+    ## 清空范围
+
+    只清 `source="generated"`：图谱（`_clear_graph_by_source`）+ 事实账本
+    （`Fact`，含 `state`/`alert` 两类哨兵事实）。`novel:{id}` 参考语料图与
+    user/bible 档事实一律不动。generated 侧全部事实均为**机器派生、确定性可重算**
+    （别名归一只应用 auto 档纯函数，全仓无手动应用 review 档合并的端点），
+    故清空 + replay 不丢任何用户输入。
+
+    ## 顺序与并发
+
+    运行全程持 **per-project RLock**（与 `merge_segment_into_kg` 同一把），
+    读 generations → 清图谱 → 清账本 → 逐段 replay 都在临界区内，二者互相串行。
+    清空先图谱后账本、同一事务内提交，避免中间态被其它请求读到。
+
+    ## 失败语义
+
+    单段 `merge_segment_into_kg` 回传 `merged is False` → 记入 `failed` 但**不中止**
+    （沿用既有「簿记失败绝不阻断主流程」纪律，见 §6）。`merge_segment_into_kg`
+    内部已吞异常，故生产环境不会因单段异常中止；只有当其**自身抛出**（例如被
+    测试注入故障）时才会向上传播，由调用方（regenerate 的 try/except）兜住。
+
+    Returns
+    -------
+    dict
+        `{"rebuilt": bool, "segments": int, "replayed": int, "failed": list, "source": str}`。
+    """
+    with _project_kg_lock(project_id):
+        gens = db.scalars(
+            select(Generation)
+            .where(Generation.project_id == project_id)
+            .order_by(Generation.segment_no)
+        ).all()
+        # 清空 generated 侧全部派生数据：先图谱、再账本，同一事务提交。
+        _clear_graph_by_source(db, project_id, source)
+        db.query(Fact).filter(
+            Fact.project_id == project_id, Fact.source == source
+        ).delete()
+        db.commit()
+
+        replayed, failed = 0, []
+        for g in gens:
+            if not (g.text or "").strip():
+                continue
+            st = merge_segment_into_kg(
+                db, project_id, g.text, g.segment_no, source=source
+            )
+            replayed += 1
+            if st.get("merged") is False:
+                failed.append(
+                    {"segment_no": g.segment_no, "reason": st.get("reason")}
+                )
+        return {
+            "rebuilt": True,
+            "segments": len(gens),
+            "replayed": replayed,
+            "failed": failed,
+            "source": source,
+        }
 
 
 def _hole_detection_key(props: dict) -> str:
