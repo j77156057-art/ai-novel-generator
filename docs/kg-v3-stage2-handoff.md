@@ -126,7 +126,7 @@ a6ea0b6 前端集成：KG 工作台 5 tabs
 | # | 项 | 说明 | 难度 |
 |---|---|---|---|
 | 5 | **真环境 nemotron 复跑对比** | OpenRouter 配额重置后，用 nemotron-3-ultra 对比智谱弱模型的抽取质量（foreshadows/knowledge 智谱全 0 行）。**先查当天剩余额度**（免费档 50 次/日），耗尽会全 429 | 半天 |
-| 6 | **e2e user journey 测试** | 建项目→生成→批抽→Judge→切片→豁免 全链路"用户视角"测试（目前全是单段级 mock；真 LLM 8 段 30+ 分钟，必须后台跑+写文件，HTTP client 等会超时） | 1 天 |
+| 6 | **e2e user journey 测试** | 建项目→生成→批抽→Judge→切片→豁免 全链路"用户视角"测试。两层：mock 回归套件 19 断言 + 真 LLM 冒烟脚本挂后台。冒烟首次跑暴露真 bug（LocalFallbackLLMProvider 缺 stop_sequences 签名），记录独立议题待修 | 1 天 |
 | 7 | **Judge 时间锚量纲转换** | impossible_sequences 只判 4 位年份，"贞观三年秋"式非年份时间不比（需朝代年号→公元年的常识库，已有 `data/seed/` 红楼梦可试水） | 2 天 |
 
 另有打磨项（非候选）：前端关系图升级力导向 / 移动端适配 / KG 工作台数据刷新按钮

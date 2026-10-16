@@ -98,3 +98,20 @@
 | worker 毒批卡死 | STUCK_MINUTES=30 自动判 stuck；脚本 poll 到 stuck 就跳过断言③记 WARN |
 | 红楼梦做 reference 时 cut_units 切 0 单元（skill 已知坑） | generation_length 设 1500-3000，确认风格拟合不空 |
 | 段与前段重复/第一章就完结 | 只记录不阻塞（AI 味修复是另一议题） |
+
+## 九、首次冒烟发现（2026-10-16）
+
+冒烟脚本（`scratch/run_journey_e2e.py`）首次跑暴露真 bug：
+
+**`TypeError: LocalFallbackLLMProvider.chat() got an unexpected keyword argument 'stop_sequences'`**
+- 位置：engine.py:822 `provider.chat(sys, user, ..., stop_sequences=get_section_stop_sequences())`
+- 原因：v2.6.1 改 per-request `stop_sequences` 透传时，
+  LocalFallbackLLMProvider（engine 没 LLM key 时的兜底 provider）忘了同步签名
+- 影响：任何「provider 不可用 → 走 fallback」的真实请求都会 500
+
+**冒烟的价值**：mock 测试覆盖不到真 provider 签名漂移——
+本测试已能跑通到「服务 ready / 项目建好 / 路由进栈」三阶段，
+单 generation 端点请求就立刻暴露这个真问题。
+
+**修法（独立议题，本轮不修）**：LocalFallbackLLMProvider.chat 加
+`stop_sequences: list[str] | None = None` 关键字接收并忽略。
