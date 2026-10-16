@@ -6,6 +6,7 @@
 """
 
 import copy
+import logging
 
 from sqlalchemy import select
 
@@ -841,6 +842,21 @@ def generate_next_segment_stream(
             rewrite_info = info
 
     gen, segment_no = _commit_segment(db, project, text, summary)
+
+    # —— 图谱进入生成闭环（与 generate_next_segment 顺序对齐）——
+    # 必须放在 _commit_segment 之后、_rollup_summary_tree 之前：正文已落库才归档，
+    # 且摘要滚上失败不该牵连簿记（滚上后置，失败只影响它自己）。
+    # 复用 _merge_segment_into_graph（它已委托到 app.kg.build.merge_segment_into_kg
+    # 做图谱+账本+别名归一+哨兵四步）——**不另写一套实现**：7416114 才把四步编排
+    # 收归唯一入口，重写的结果就是又出现"只更一半"的路径。
+    kg_stats = None
+    try:
+        kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+    except Exception as exc:  # noqa: BLE001 —— 簿记异常绝不打断 SSE：正文已落库，
+        # done 事件必须照样发出，否则前端表现为"生成卡住且无结果"。
+        logging.getLogger(__name__).warning("流式 KG 簿记失败，段落已落库: %s", exc)
+        kg_stats = {"merged": False, "reason": f"KG 簿记失败：{str(exc)[:100]}"}
+
     tree_stats = _rollup_summary_tree(db, project, provider)
 
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
@@ -855,6 +871,9 @@ def generate_next_segment_stream(
         "id": gen.id,
         "style_warning": style_warning,
         "rewrite_info": rewrite_info,
+        # 纯新增键：done 的既有字段语义一个都不改。挂簿记统计是为了让
+        # 流式路径也能被观测（此前流式完全不做归档，出了问题无从判断）。
+        "kg": kg_stats,
     }
 
 
