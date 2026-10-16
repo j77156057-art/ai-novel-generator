@@ -75,8 +75,14 @@ def main() -> int:
         r = client.get(f"/api/projects/{project_id}/kg/character/林夜")
         lin = r.json()
         print("character 林夜 ->", lin)
-        if lin.get("appearances") != [1, 2, 3]:
-            failures.append(f"林夜出场应为 [1,2,3]，实际 {lin.get('appearances')}")
+        # 2026-10 KG 缺陷 3 修复：get_character 不再返回 appearances 字段
+        # （原是 list(range(first,last+1)) 伪造的连续出场列表，无消费方，已删）。
+        # 旧断言钉的是伪造值 [1,2,3]（本例角色恰好连续出场，伪造值与真实首末章
+        # 一致，看着像对的实则钉死缺陷）；改为钉真实字段 + 反向确认字段已移除。
+        if (lin.get("first_chapter"), lin.get("last_chapter")) != (1, 3):
+            failures.append(f"林夜首末章应为 (1,3)，实际 {(lin.get('first_chapter'), lin.get('last_chapter'))}")
+        if "appearances" in lin:
+            failures.append(f"get_character 不应再返回伪造的 appearances，实际 {lin.get('appearances')!r}")
 
         # 6) 生成前提醒
         # 6a) 默认 source=generated：刚建完参考语料、还没生成过任何段落，

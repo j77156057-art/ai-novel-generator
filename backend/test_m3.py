@@ -98,10 +98,16 @@ def main() -> int:
     if lin is None:
         failures.append("未查到角色 林夜")
     else:
-        if lin["appearances"] != [1, 2, 3]:
-            failures.append(f"林夜出场应为 [1,2,3]，实际 {lin['appearances']}")
+        # 2026-10 KG 缺陷 3 修复：get_character 不再返回 appearances 字段。
+        # 原字段是 list(range(first,last+1)) 伪造的连续出场列表（角色只在第 3、
+        # 50 章出场也会返回 48 章），仓库内无任何消费方，已按「无消费方就删除
+        # 伪造字段」移除。这里原先钉的是伪造值 [1,2,3]——本例角色恰好连续出场
+        # 于 1..3，伪造值与真实首末章一致，所以旧断言看着像对的，实为钉死缺陷。
+        # 改为钉真实字段 first/last_chapter（语义不变，数据来源诚实）。
         if (lin["first_chapter"], lin["last_chapter"]) != (1, 3):
             failures.append(f"林夜首末章应为 (1,3)，实际 {(lin['first_chapter'], lin['last_chapter'])}")
+        if "appearances" in lin:
+            failures.append(f"get_character 不应再返回伪造的 appearances，实际 {lin['appearances']!r}")
 
     # 3) 林夜-苏晚 关系边存在
     edge_ok = any(

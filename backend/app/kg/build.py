@@ -10,8 +10,12 @@
 
 from sqlalchemy import select
 
-from app.kg.extractor import RuleBasedExtractor, resolve_plotholes
+from app.kg.extractor import _RESOLVE_CUES, RuleBasedExtractor, resolve_plotholes
 from app.models import KgEdge, KgNode, NovelChunk, RawNovel
+
+# 坑节点 props 里占位 cue 的值：extractor 对「直问句但无线索词」的坑写 cue="?"。
+# 拿它当检测键等于匹配所有文本，必须在结算检测里跳过。
+_PLACEHOLDER_CUE = "?"
 
 
 def _clear_graph_by_source(db, project_id: int, source: str) -> None:
@@ -56,7 +60,15 @@ def _write_result(db, project_id: int, result, source: str) -> dict:
         node = KgNode(
             project_id=project_id,
             type="plothole",
-            props={"cue": ph.cue, "question": ph.question, "status": ph.status},
+            # key 一并落库：增量路径要靠它做「本段是否结算了旧坑」的检测键。
+            # 历史节点没有 key，检测时回落到 props["cue"]（两者语义同值，见
+            # _hole_detection_key 的说明）。
+            props={
+                "key": ph.key,
+                "cue": ph.cue,
+                "question": ph.question,
+                "status": ph.status,
+            },
             first_chapter=ph.first_chapter,
             last_chapter=ph.last_chapter,
             source=source,
@@ -203,19 +215,50 @@ def merge_graph_from_text(
     if not text or not text.strip():
         return {"merged": False, "reason": "空文本"}
     result, _ = extract_from_text(text, segment_no)
-    return merge_result_into_graph(db, project_id, result, source, segment_no)
+    # text 一并传入：增量路径的「本段结算旧坑」检测需要原文
+    # （ExtractionResult 不携带原文，只有这里拿得到）。
+    return merge_result_into_graph(db, project_id, result, source, segment_no, text=text)
+
+
+def _hole_detection_key(props: dict) -> str:
+    """取坑节点的「结算检测键」；取不到可用值返回空串（调用方跳过该坑）。
+
+    为什么是 key / cue 而不是 question：
+    - extractor 里 `key = cue or "疑问"`，即 key 的语义就是线索词；cue 在
+      props 里**本来就已持久化**（build 一直写 cue/question/status 三件套），
+      所以历史节点即使没有 key，用 cue 也能拿到同值的检测键；
+    - question 是整句悬念原句，模型不会在后续段落里逐字复述它，拿 question
+      做子串匹配几乎永远不命中，回落它等于「历史坑永远不能结算」，
+      正是本次要修的缺陷。
+
+    占位 cue "?"（直问句但无线索词）必须跳过：它匹配所有文本。
+    """
+    det = (props.get("key") or props.get("cue") or "").strip()
+    if not det or det == _PLACEHOLDER_CUE:
+        return ""
+    return det
 
 
 def merge_result_into_graph(
-    db, project_id: int, result, source: str = "generated", segment_no: int = 1
+    db, project_id: int, result, source: str = "generated", segment_no: int = 1,
+    text: str = "",
 ) -> dict:
     """把已抽取好的结果写进图谱（增量 upsert，不清空）。
 
     upsert 语义：
     - 角色：同名已存在 → 累加 mentions/speaking、扩展章节范围；不存在 → 新增
-    - 坑：同一 question 已存在 → 跳过（避免每段重复登记）；不存在 → 新增
+    - 坑：同一 question 已存在 → 不重复登记，但**要参与本段结算检测**（见下）；
+      不存在 → 新增
     - 关系：同 (from,to,relation) 已存在 → 跳过；否则新增
     章节号统一取 segment_no（一段 = 一章），保证 last_chapter 单调递增不回退。
+
+    本段结算（缺陷 1 修复）：增量路径里 extract_from_text 把所有 chunk 的
+    chapter_no 设成同一个 segment_no，extractor.resolve_plotholes 的
+    「末现章之后」条件永不成立，坑一旦建出来就永远是 open，已解决的悬念会
+    持续注入每一代的提示词（get_reminders 的 unresolved_plotholes 只增不减），
+    diagnosis 的 open_plothole_accumulation 也长期误报。这里补上增量路径的结算：
+    本段 text 同时含该坑的检测键与任一强解决短语（_RESOLVE_CUES）→ resolved。
+    检测键语义与 resolve_plotholes 完全一致（key + 强解决短语），不另立标准。
     """
     existing = db.scalars(
         select(KgNode).where(KgNode.project_id == project_id, KgNode.source == source)
@@ -229,7 +272,7 @@ def merge_result_into_graph(
         elif n.type == "plothole" and props.get("question"):
             hole_by_q[props["question"]] = n
 
-    n_new_char = n_upd_char = n_new_hole = n_new_rel = 0
+    n_new_char = n_upd_char = n_new_hole = n_new_rel = n_resolved_hole = 0
     name_to_node: dict[str, int] = {}
 
     for name, c in result.characters.items():
@@ -267,13 +310,54 @@ def merge_result_into_graph(
             KgNode(
                 project_id=project_id,
                 type="plothole",
-                props={"cue": ph.cue, "question": ph.question, "status": ph.status},
+                # key 与 cue/question/status 一起落库：后续段的结算检测要用 key
+                # （见 _hole_detection_key；没有 key 时回落 cue）。
+                props={
+                    "key": ph.key,
+                    "cue": ph.cue,
+                    "question": ph.question,
+                    "status": ph.status,
+                },
                 first_chapter=segment_no,
                 last_chapter=segment_no,
                 source=source,
             )
         )
         n_new_hole += 1
+
+    # —— 缺陷 1：用本段文本结算已有的 open 坑 ——
+    # 只处理「本 source 下、当前仍为 open」的坑；本段新开的坑不在此列
+    # （同章自解析不算解决，与 resolve_plotholes 的「末现章之后」语义一致）。
+    # resolved_holes 回传给调用方，让账本（Fact）侧的 status 在同一次 merge 里
+    # 同步更新——只改 KgNode 不改 Fact 会让两边状态漂移（派单明确要求协同）。
+    resolved_holes: list[dict] = []
+    if text:
+        for n in existing:
+            if n.type != "plothole":
+                continue
+            props = n.props or {}
+            if props.get("status") != "open":
+                continue
+            det = _hole_detection_key(props)
+            if not det:
+                continue
+            if det in text and any(rc in text for rc in _RESOLVE_CUES):
+                new_props = dict(props)
+                new_props["status"] = "resolved"
+                n.props = new_props
+                n.last_chapter = max(
+                    [x for x in (n.last_chapter, segment_no) if x is not None] or [segment_no]
+                )
+                resolved_holes.append(
+                    {
+                        "key": new_props.get("key") or new_props.get("cue") or "",
+                        "question": new_props.get("question") or "",
+                        "cue": new_props.get("cue") or "",
+                        "first_chapter": n.first_chapter,
+                        "last_chapter": n.last_chapter,
+                    }
+                )
+                n_resolved_hole += 1
 
     # 关系去重：同 (from,to,relation) 已存在则跳过
     node_ids = [n.id for n in existing] + list(name_to_node.values())
@@ -311,4 +395,8 @@ def merge_result_into_graph(
         "updated_characters": n_upd_char,
         "new_plotholes": n_new_hole,
         "new_relationships": n_new_rel,
+        # 本段结算掉的旧坑：计数 + 明细。明细回传给调用方（engine）同步 Fact 状态；
+        # 计数供前端/API 观测。纯新增键，既有消费方读顶层计数字段不受影响。
+        "resolved_plotholes": n_resolved_hole,
+        "resolved_holes": resolved_holes,
     }

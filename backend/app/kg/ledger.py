@@ -175,6 +175,16 @@ def upsert_facts(
                 merged = list(props.get(k) or [])
                 merged.extend(x for x in v if x not in merged)
                 props[k] = merged
+            elif k == "status" and item.get("type") == T_PLOTHOLE:
+                # 缺陷 2 修复：坑状态允许**单调前进** open→resolved，绝不回退。
+                # 字符串字段的通用规则是「k not in props 才写」，坑 fact 建成时
+                # status=open，之后任何段落都改不动它——已解决的悬念在账本侧
+                # 永远是 open。这里对 plothole 的 status 特判：
+                #   - 新值 resolved 且旧值不是 resolved → 写入（前进）；
+                #   - 旧值已是 resolved → 保持（resolved→open 的回退被挡掉）；
+                #   - 其他字符串值 → 落到下面的通用规则，不特殊放行。
+                if v == "resolved" and props.get(k) != "resolved":
+                    props[k] = "resolved"
             elif k not in props:
                 props[k] = v
         cur.props = props

@@ -129,17 +129,40 @@ def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -
         result, _ = extract_from_text(text, segment_no)
         stats = dict(
             merge_result_into_graph(
-                db, project_id, result, source="generated", segment_no=segment_no
+                db, project_id, result, source="generated", segment_no=segment_no,
+                # text 一并传入：增量路径靠原文做「本段结算旧坑」检测
+                # （缺陷 1 修复；ExtractionResult 不带原文）。
+                text=text,
             )
         )
     except Exception as exc:  # noqa: BLE001
         return {"merged": False, "reason": f"图谱合并失败：{str(exc)[:100]}"}
 
     try:
-        from app.kg.ledger import facts_from_extraction, resolve_aliases, upsert_facts
+        from app.kg.ledger import T_PLOTHOLE, facts_from_extraction, resolve_aliases, upsert_facts
 
+        ledger_facts = facts_from_extraction(result, segment_no)
+        # 缺陷 1 与缺陷 2 的协同：图谱侧本段结算掉的坑，账本侧必须在**同一次
+        # merge** 里同步成 resolved——只改 KgNode 不改 Fact 会让 reminders/诊断
+        # 两边状态漂移。这里把 resolved_holes 转成只带 status 的 fact patch
+        # （不带 planted_segment 等 int 字段，避免 upsert 的累加语义把它污染），
+        # 靠 upsert_facts 的单调转换规则落地。
+        for h in stats.get("resolved_holes") or []:
+            fact_key = (h.get("question") or "").strip() or (h.get("key") or "").strip()
+            if not fact_key:
+                continue
+            ledger_facts.append(
+                {
+                    "type": T_PLOTHOLE,
+                    "key": fact_key,
+                    "props": {"status": "resolved"},
+                    "first_segment": h.get("first_chapter") or segment_no,
+                    "last_segment": segment_no,
+                    "confidence": "high",
+                }
+            )
         stats["ledger"] = upsert_facts(
-            db, project_id, facts_from_extraction(result, segment_no),
+            db, project_id, ledger_facts,
             source="generated",
         )
         # 别名归一紧随其后：本段若引入了简称/全称两种写法，下一段就要用规范名

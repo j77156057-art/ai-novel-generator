@@ -67,7 +67,13 @@ def get_character(db, project_id: int, name: str) -> dict | None:
         "mentions": (node.props or {}).get("mentions"),
         "first_chapter": node.first_chapter,
         "last_chapter": node.last_chapter,
-        "appearances": list(range(node.first_chapter or 0, (node.last_chapter or 0) + 1)),
+        # 刻意**不返回** appearances：KgNode 只持久化 first/last_chapter，
+        # 原先的 list(range(first, last+1)) 是把「首末章」编造成「连续出场列表」——
+        # 角色只在第 3、50 章出场也会返回 48 章。已 grep 确认仓库内无任何消费方
+        # （前端仅有 types.ts 的类型声明、agent registry 原样透传 profile），
+        # 故按「无消费方就删除伪造字段」处理，而不是换个形状继续骗人。
+        # 若将来真要出场列表，得先把真实章节列表落库（props.chapters），
+        # 不能再从 first/last 反推。
         "relations": related,
     }
 
