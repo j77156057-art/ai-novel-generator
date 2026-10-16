@@ -166,7 +166,6 @@ export interface CharacterDetail {
   mentions: number | null;
   first_chapter: number | null;
   last_chapter: number | null;
-  appearances: number[];
   relations: CharacterRelation[];
 }
 
