@@ -1,0 +1,451 @@
+{
+  "title": "journey_smk",
+  "project_id": 1,
+  "stages": {
+    "b_segments": [
+      {
+        "seg": 1,
+        "wc": 1220,
+        "dt": 93.24526405334473,
+        "enqueued": null,
+        "judge_findings": 0
+      },
+      {
+        "seg": 2,
+        "wc": 1247,
+        "dt": 194.19677758216858,
+        "enqueued": null,
+        "judge_findings": 0
+      },
+      {
+        "seg": 3,
+        "wc": 1125,
+        "dt": 68.41803550720215,
+        "enqueued": null,
+        "judge_findings": 0
+      },
+      {
+        "seg": 4,
+        "wc": 662,
+        "dt": 176.80944156646729,
+        "enqueued": null,
+        "judge_findings": 0
+      },
+      {
+        "seg": 5,
+        "wc": 875,
+        "dt": 58.84948372840881,
+        "enqueued": null,
+        "judge_findings": 0
+      },
+      {
+        "seg": 6,
+        "wc": 852,
+        "dt": 56.011908292770386,
+        "enqueued": null,
+        "judge_findings": 0
+      },
+      {
+        "seg": 7,
+        "wc": 992,
+        "dt": 61.9741485118866,
+        "enqueued": null,
+        "judge_findings": 0
+      },
+      {
+        "seg": 8,
+        "wc": 0,
+        "dt": 259.43289017677307,
+        "enqueued": null,
+        "judge_findings": 0
+      }
+    ],
+    "c_worker": {
+      "worker_alive": true,
+      "pending": 0,
+      "summary": {
+        "success": 3,
+        "failed": 0,
+        "running": 5,
+        "stuck": 0,
+        "empty": 0
+      },
+      "recent_runs": [
+        {
+          "id": 8,
+          "segment_no": 8,
+          "status": "running",
+          "stuck": false,
+          "empty": false,
+          "duration_ms": null,
+          "batch_stats": null,
+          "error": null,
+          "started_at": "2026-10-16T08:47:00.476581+00:00"
+        },
+        {
+          "id": 7,
+          "segment_no": 7,
+          "status": "success",
+          "stuck": false,
+          "empty": false,
+          "duration_ms": 237829,
+          "batch_stats": {
+            "segments": 1,
+            "entities_upserted": 8,
+            "entities_new": 0,
+            "relations_upserted": 0,
+            "events_added": 18,
+            "event_links_added": 0,
+            "entity_knowledge_added": 0,
+            "state_changes": 0,
+            "foreshadows": 0,
+            "errors": []
+          },
+          "error": null,
+          "started_at": "2026-10-16T08:42:48.827213+00:00"
+        },
+        {
+          "id": 6,
+          "segment_no": 6,
+          "status": "success",
+          "stuck": false,
+          "empty": false,
+          "duration_ms": 208700,
+          "batch_stats": {
+            "segments": 1,
+            "entities_upserted": 4,
+            "entities_new": 0,
+            "relations_upserted": 4,
+            "events_added": 14,
+            "event_links_added": 0,
+            "entity_knowledge_added": 0,
+            "state_changes": 0,
+            "foreshadows": 0,
+            "errors": []
+          },
+          "error": null,
+          "started_at": "2026-10-16T08:41:46.856159+00:00"
+        },
+        {
+          "id": 5,
+          "segment_no": 5,
+          "status": "running",
+          "stuck": false,
+          "empty": false,
+          "duration_ms": null,
+          "batch_stats": null,
+          "error": null,
+          "started_at": "2026-10-16T08:40:50.844103+00:00"
+        },
+        {
+          "id": 4,
+          "segment_no": 4,
+          "status": "running",
+          "stuck": false,
+          "empty": false,
+          "duration_ms": null,
+          "batch_stats": null,
+          "error": null,
+          "started_at": "2026-10-16T08:39:51.982207+00:00"
+        },
+        {
+          "id": 3,
+          "segment_no": 3,
+          "status": "running",
+          "stuck": false,
+          "empty": false,
+          "duration_ms": null,
+          "batch_stats": null,
+          "error": null,
+          "started_at": "2026-10-16T08:36:55.181983+00:00"
+        },
+        {
+          "id": 2,
+          "segment_no": 2,
+          "status": "running",
+          "stuck": false,
+          "empty": false,
+          "duration_ms": null,
+          "batch_stats": null,
+          "error": null,
+          "started_at": "2026-10-16T08:35:46.763294+00:00"
+        },
+        {
+          "id": 1,
+          "segment_no": 1,
+          "status": "success",
+          "stuck": false,
+          "empty": false,
+          "duration_ms": 61979,
+          "batch_stats": {
+            "segments": 1,
+            "entities_upserted": 8,
+            "entities_new": 0,
+            "relations_upserted": 6,
+            "events_added": 5,
+            "event_links_added": 4,
+            "entity_knowledge_added": 0,
+            "state_changes": 0,
+            "foreshadows": 0,
+            "errors": []
+          },
+          "error": null,
+          "started_at": "2026-10-16T08:32:32.544244+00:00"
+        }
+      ]
+    },
+    "d_read": {
+      "kg": {
+        "nodes": [
+          {
+            "id": 1,
+            "type": "plothole",
+            "props": {
+              "cue": "怎么",
+              "question": "你今天怎么这么早就来了？",
+              "status": "open"
+            },
+            "first_chapter": 1,
+            "last_chapter": 1
+          },
+          {
+            "id": 2,
+            "type": "plothole",
+            "props": {
+              "cue": "?",
+              "question": "问道：“你是谁？",
+              "status": "open"
+            },
+            "first_chapter": 1,
+            "last_chapter": 1
+          },
+          {
+            "id": 3,
+            "type": "plothole",
+            "props": {
+              "cue": "什么",
+              "question": "您需要什么？",
+              "status": "open"
+            },
+            "first_chapter": 1,
+            "last_chapter": 1
+          },
+          {
+            "id": 4,
+            "type": "character",
+            "props": {
+              "name": "沈默",
+              "mentions": 98,
+              "speaking": 3
+            },
+            "first_chapter": 2,
+            "last_chapter": 5
+          },
+          {
+            "id": 5,
+            "type": "plothole",
+            "props": {
+              "cue": "怎么",
+              "question": "“那我们该怎么办？",
+              "status": "open"
+            },
+            "first_chapter": 2,
+            "last_chapter": 2
+          },
+          {
+            "id": 6,
+            "type": "plothole",
+            "props": {
+              "cue": "?",
+              "question": "“你到底是谁？",
+              "status": "open"
+            },
+            "first_chapter": 2,
+            "last_chapter": 2
+          },
+          {
+            "id": 7,
+            "type": "plothole",
+            "props": {
+              "cue": "什么",
+              "question": "“您需要什么？",
+              "status": "open"
+            },
+            "first_chapter": 2,
+            "last_chapter": 2
+          },
+          {
+            "id": 8,
+            "type": "character",
+            "props": {
+              "name": "苏晴",
+              "mentions": 62,
+              "speaking": 3
+            },
+            "first_chapter": 3,
+            "last_chapter": 6
+          },
+          {
+            "id": 9,
+            "type": "plothole",
+            "props": {
+              "cue": "什么",
+              "question": "“你究竟想做什么？",
+              "status": "open"
+            },
+            "first_chapter": 3,
+            "last_chapter": 3
+          },
+          {
+            "id": 10,
+            "type": "plothole",
+            "props": {
+              "cue": "究竟",
+              "question": "“你究竟是谁？",
+              "status": "open"
+            },
+            "first_chapter": 3,
+            "last_chapter": 3
+          },
+          {
+            "id": 11,
+            "type": "plothole",
+            "props": {
+              "cue": "?",
+              "question": "“你认识他？",
+              "status": "open"
+            },
+            "first_chapter": 4,
+            "last_chapter": 4
+          },
+          {
+            "id": 12,
+            "type": "plothole",
+            "props": {
+              "cue": "怎么",
+              "question": "“你怎么这么早？",
+              "status": "open"
+            },
+            "first_chapter": 4,
+            "last_chapter": 4
+          },
+          {
+            "id": 13,
+            "type": "plothole",
+            "props": {
+              "cue": "究竟",
+              "question": "无声地询问：“你究竟是谁？",
+              "status": "open"
+            },
+            "first_chapter": 4,
+            "last_chapter": 4
+          },
+          {
+            "id": 14,
+            "type": "plothole",
+            "props": {
+              "cue": "?",
+              "question": "“你是谁？",
+              "status": "open"
+            },
+            "first_chapter": 5,
+            "last_chapter": 5
+          },
+          {
+            "id": 15,
+            "type": "plothole",
+            "props": {
+              "cue": "怎么",
+              "question": "“我们该怎么办？",
+              "status": "open"
+            },
+            "first_chapter": 5,
+            "last_chapter": 5
+          },
+          {
+            "id": 16,
+            "type": "plothole",
+            "props": {
+              "cue": "怎么",
+              "question": "“怎么办？",
+              "status": "open"
+            },
+            "first_chapter": 6,
+            "last_chapter": 6
+          },
+          {
+            "id": 17,
+            "type": "plothole",
+            "props": {
+              "cue": "什么",
+              "question": "“你们在干什么？",
+              "status": "open"
+            },
+            "first_chapter": 6,
+            "last_chapter": 6
+          },
+          {
+            "id": 18,
+            "type": "plothole",
+            "props": {
+              "cue": "什么",
+              "question": "“你们在忙什么？",
+              "status": "open"
+            },
+            "first_chapter": 7,
+            "last_chapter": 7
+          },
+          {
+            "id": 19,
+            "type": "plothole",
+            "props": {
+              "cue": "为何",
+              "question": "他不知道男子为何突然发问。",
+              "status": "open"
+            },
+            "first_chapter": 7,
+            "last_chapter": 7
+          },
+          {
+            "id": 20,
+            "type": "plothole",
+            "props": {
+              "cue": "真相",
+              "question": "她不知道是否应该说出真相。",
+              "status": "open"
+            },
+            "first_chapter": 7,
+            "last_chapter": 7
+          },
+          {
+            "id": 21,
+            "type": "plothole",
+            "props": {
+              "cue": "怎么",
+              "question": "“我们……怎么办？",
+              "status": "open"
+            },
+            "first_chapter": 7,
+            "last_chapter": 7
+          }
+        ],
+        "edges": []
+      },
+      "events_n": 50,
+      "characters_n": 14,
+      "slice_prompt_len": 834,
+      "slice_prompt_has": false,
+      "judge_findings_n": 0
+    },
+    "e_exempt": {
+      "skipped": "no findings"
+    }
+  },
+  "judgement": {
+    "all_segments_generated": true,
+    "queue_drained": true,
+    "slice_prompt_has_kg_facts": false,
+    "exemption_written": false
+  },
+  "verdict": "PARTIAL"
+}
