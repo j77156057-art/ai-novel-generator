@@ -39,8 +39,9 @@ import type {
   GeneratePlan,
   GenerateResult,
   GenerationOut,
+  GenerateStreamDoneMeta,
   Graph,
-  KgBookkeeping,
+  KgRebuildResult,
   LlmConfig,
   LlmConfigIn,
   LlmTestIn,
@@ -52,8 +53,8 @@ import type {
   ProjectCreate,
   ProjectOut,
   ProjectPatch,
+  RegenerateStreamDoneMeta,
   Reminders,
-  StreamDoneMeta,
   StyleDistillApplyRequest,
   StyleDistillDetail,
   StyleDistillListResponse,
@@ -312,7 +313,7 @@ export const api = {
     ),
 
   buildKgFromGenerations: (projectId: number) =>
-    request<KgBookkeeping>(
+    request<KgRebuildResult>(
       `/projects/${projectId}/build-kg-from-generations`,
       jsonInit("POST"),
     ),
@@ -338,7 +339,7 @@ export const api = {
     projectId: number,
     maxChars: number | null,
     onChunk: (text: string) => void,
-    onDone: (meta: StreamDoneMeta) => void,
+    onDone: (meta: GenerateStreamDoneMeta) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
       fetch(`${BASE}/generate-stream`, jsonInit("POST", {
@@ -369,7 +370,7 @@ export const api = {
               try {
                 const ev = JSON.parse(payload) as
                   | { type: "chunk"; text: string }
-                  | ({ type: "done" } & StreamDoneMeta)
+                  | ({ type: "done" } & GenerateStreamDoneMeta)
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
                 else if (ev.type === "done") onDone(ev);
@@ -390,7 +391,7 @@ export const api = {
     segmentNo: number,
     maxChars: number | null,
     onChunk: (text: string) => void,
-    onDone: (meta: StreamDoneMeta) => void,
+    onDone: (meta: RegenerateStreamDoneMeta) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
       fetch(`${BASE}/regenerate-stream`, jsonInit("POST", {
@@ -422,7 +423,7 @@ export const api = {
               try {
                 const ev = JSON.parse(payload) as
                   | { type: "chunk"; text: string }
-                  | ({ type: "done" } & StreamDoneMeta)
+                  | ({ type: "done" } & RegenerateStreamDoneMeta)
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
                 else if (ev.type === "done") onDone(ev);

@@ -7,7 +7,9 @@ import type {
   DistillJob,
   GeneratePlan,
   Graph,
-  KgBookkeeping,
+  KgMergeResult,
+  KgRebuildResult,
+  KgStatus,
   LlmConfig,
   NarrativeTier,
   NovelOut,
@@ -1114,38 +1116,57 @@ function buildSourceOptions(): { value: string; label: string }[] {
 //  - 第 7 步：`kgMsg` / `kgMsgLevel` —— 只管「手动建图」与「图加载报错」。
 //  - 第 6 步：`genKgMsg` / `genKgLevel` —— 只管「生成 / 重生成」流式 done 的簿记。
 //    必须就地渲染（与生成按钮同屏）：把失败藏到第 7 步 = 藏在交互后面。
-// 判据（两组共用）：
-//  - `rebuilt === false` → 整体重建抛异常，文案走「簿记重建失败」（含 reason，可缺）。
-//  - `complete === false` → 有失败段，文案走「簿记不全」（含段号列表）。
-// `complete !== false`（旧后端不返回该键）视为成功，绝不误报。
+//
+// ⚠️ 两个流的 `done.kg` **不是同一形状**，判据必须两种都认（否则生成路径静默漏报）：
+//  - `/generate-stream` → merge 形状：`merged === false`（图谱步整体失败）/
+//    `partial === true`（账本-哨兵步只走了一半，`merged` 仍可能为 true）；
+//  - `/regenerate-stream` → rebuild 形状：`rebuilt === false`（整体重建抛异常）/
+//    `complete === false`（有失败段）。
+// 优先级：`rebuilt === false` > `complete === false`，`merged === false` > `partial === true`。
+// 两种形状的键**互斥**（merge 无 rebuilt/complete，rebuild 无 merged/partial），
+// 故按字段判据读取即可；`complete !== false`（旧后端不返回该键）视为成功，绝不误报。
 const KG_WARN_TAIL = "未完成。请重试；若反复失败，请检查数据库是否需要迁移后重试。";
-function kgFailedNums(kg?: KgBookkeeping): string {
+function kgFailedNums(kg?: KgRebuildResult): string {
   return (kg?.failed ?? []).map((f) => f.segment_no).join("、");
 }
-function kgIncompleteText(kg?: KgBookkeeping): string {
+function kgIncompleteText(kg?: KgRebuildResult): string {
   return `簿记不全：${kg?.replayed ?? 0}/${kg?.segments ?? 0} 段成功，段 ${kgFailedNums(kg)} ${KG_WARN_TAIL}`;
 }
 function kgRebuildFailText(reason?: string | null): string {
   return `簿记重建失败：本段正文已保存，但图谱/账本未更新${reason ? `（${reason}）` : ""}。请重试。`;
 }
-function applyKgOk(kg: KgBookkeeping) {
+function kgMergeFailText(reason?: string | null): string {
+  return `簿记失败：本段正文已保存，但图谱未更新${reason ? `（${reason}）` : ""}。请重试。`;
+}
+function kgPartialText(segmentNo?: number): string {
+  const where = typeof segmentNo === "number" ? `段 ${segmentNo} 的` : "";
+  return `簿记不全：${where}图谱/账本/哨兵只完成了部分步骤。请重试。`;
+}
+function applyKgOk(kg: KgRebuildResult) {
   kgMsg.value = `生成后图谱已重建：${kg.replayed ?? 0}/${kg.segments ?? 0} 段`;
   kgMsgLevel.value = "ok";
 }
-function applyKgWarn(kg?: KgBookkeeping) {
+function applyKgWarn(kg?: KgRebuildResult) {
   kgMsg.value = kgIncompleteText(kg);
   kgMsgLevel.value = "warn";
 }
-/** 第 6 步的流式 done 簿记：只在「有问题」时落一条 warn，成功后清空（不刷屏）。 */
-function applyGenKg(kg?: KgBookkeeping) {
+/** 第 6 步的流式 done 簿记：只在「有问题」时落一条 warn（成功/无 kg 时不动，不刷屏）。 */
+function applyGenKg(kg?: KgStatus) {
   if (!kg) return;
-  if (kg.rebuilt === false) {
-    genKgMsg.value = kgRebuildFailText(kg.reason);
-    genKgLevel.value = "warn";
-  } else if (kg.complete === false) {
-    genKgMsg.value = kgIncompleteText(kg);
-    genKgLevel.value = "warn";
+  const r = kg as KgRebuildResult;
+  const m = kg as KgMergeResult;
+  if (r.rebuilt === false) {
+    genKgMsg.value = kgRebuildFailText(r.reason);
+  } else if (r.complete === false) {
+    genKgMsg.value = kgIncompleteText(r);
+  } else if (m.merged === false) {
+    genKgMsg.value = kgMergeFailText(m.reason);
+  } else if (m.partial === true) {
+    genKgMsg.value = kgPartialText(m.segment_no);
+  } else {
+    return; // 正常：不落提示
   }
+  genKgLevel.value = "warn";
 }
 async function buildGeneratedKg() {
   buildingKg.value = true;
@@ -1153,7 +1174,12 @@ async function buildGeneratedKg() {
   kgMsgLevel.value = "";
   try {
     const r = await api.buildKgFromGenerations(projectId);
-    if (r.complete !== false) applyKgOk(r);
+    if (r.rebuilt === false) {
+      // 兜底分支：整体重建抛异常（不带 segments/replayed/failed），不能渲染成
+      // 「生成后图谱已重建：0/0 段」这种「看起来成功」的假象。
+      kgMsg.value = kgRebuildFailText(r.reason);
+      kgMsgLevel.value = "warn";
+    } else if (r.complete !== false) applyKgOk(r);
     else applyKgWarn(r);
   } catch (err) {
     kgMsg.value = err instanceof Error ? err.message : String(err);

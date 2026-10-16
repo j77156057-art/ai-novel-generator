@@ -470,18 +470,22 @@ export interface GenerateLoopResult {
 }
 
 // ==================================================================
-// KG 簿记统计（生成后建图 / 流式 done 共用的同一形状）
+// KG 簿记统计（⚠️ 两种形状，别混为一谈）
 // ------------------------------------------------------------------
-// 与后端 `app.kg.build.rebuild_generated_kg()` 的返回体逐字段对齐
-// （手动镜像，改后端时同步此处）。
+// 与后端 `app.kg.build` 逐字段对齐（手动镜像，改后端时同步此处）。
 //
-// 背景：`POST /projects/{id}/build-kg-from-generations` 与两个流式端点
-// （`/generate-stream`、`/regenerate-stream`）的 `done` 事件都返回这一形状。
-// 旧形状 `{characters, plotholes, relationships, chunks}` 已废弃 —— 界面若
-// 照旧形状读会渲染出一串 `undefined`，所以这里只保留新形状。
+// ⚠️ 两个流式端点的 `done.kg` **不是同一形状**：
+//  - `/regenerate-stream` 与 `POST /projects/{id}/build-kg-from-generations`
+//    → `rebuild_generated_kg()` → `KgRebuildResult`（rebuilt/complete/…）；
+//  - `/generate-stream` → `merge_segment_into_kg()`（经 engine `_merge_segment_into_graph`）
+//    → `KgMergeResult`（merged/partial/ledger/aliases/sentinel/…），**没有**
+//    rebuilt/complete。
+//
+// 旧形状 `{characters, plotholes, relationships, chunks}` 已废弃 —— 界面若照旧
+// 形状读会渲染出一串 `undefined`。
 // ==================================================================
 
-/** 单段 replay 失败的记录（`failed` 数组元素）。 */
+/** 单段 replay 失败的记录（`KgRebuildResult.failed` 数组元素）。 */
 export interface KgReplayFailure {
   /** 未完成的段号。 */
   segment_no: number;
@@ -490,40 +494,89 @@ export interface KgReplayFailure {
 }
 
 /**
- * 「生成后 KG 全量重建」的簿记统计。
+ * 「生成后 KG 全量重建」的簿记统计（`rebuild_generated_kg`）。
  *
- * - `rebuilt` 语义 = 操作跑过（即使有失败段也常为 true）；
+ * 来源：`POST /build-kg-from-generations`，以及 `/regenerate-stream` 的 `done.kg`。
+ *
+ * - `rebuilt` 语义 = 操作跑过（即使有失败段也常为 true）；**`rebuilt === false`
+ *   只在整体重建抛异常时出现**（引擎兜底分支），此时不带 segments/replayed/failed，
+ *   界面必须走「簿记重建失败」文案，不能套「N/M 段成功」那套（会渲染成
+ *   `0/0 段成功，段  未完成` 的残句）。
  * - `complete` 语义 = 无失败段（`= failed == []`）—— 这才是「是否簿记完整」。
  *   界面判据用 `complete !== false`（旧后端不返回该键时视为成功，不误报）。
  */
-export interface KgBookkeeping {
+export interface KgRebuildResult {
   rebuilt?: boolean;
   complete?: boolean;
   segments?: number;
   replayed?: number;
   failed?: KgReplayFailure[];
   source?: string;
-  /**
-   * 仅当整体重建**抛异常**时出现（引擎兜底分支回传 `{"rebuilt": false, "reason": ...}`），
-   * 此时不带 segments/replayed/failed —— 界面必须走「簿记重建失败」文案，不能套
-   * 「N/M 段成功」那套（会渲染成 `0/0 段成功，段  未完成` 的残句）。
-   */
+  /** 仅当整体重建抛异常时出现（引擎兜底分支 `{"rebuilt": false, "reason": ...}`）。 */
   reason?: string | null;
 }
 
 /**
- * 生成 / 重生成流 `done` 事件的负载（两流同构，抽出供 client.ts 两处复用）。
+ * 「单段并入 KG」的簿记统计（`merge_segment_into_kg`）。
+ *
+ * 来源：`/generate-stream` 的 `done.kg`。**没有** rebuilt/complete —— 别拿
+ * rebuild 那套判据套到它身上（会静默漏报）。两种失败信号：
+ * - 图谱步（步骤 1）整体失败 → `merged === false`（附带 `reason`）；
+ * - 账本/结算/哨兵步（步骤 2/3/4）失败 → 顶层 `merged` 仍为 true，但 `partial === true`。
+ */
+export interface KgMergeResult {
+  merged?: boolean;
+  /** true = 四步只走了一半（步骤 2/3/4 有失败），`merged` 仍可能为 true。 */
+  partial?: boolean;
+  /** 仅当图谱步整体失败（`merged === false`）时出现。 */
+  reason?: string | null;
+  project_id?: number;
+  segment_no?: number;
+  source?: string;
+  new_characters?: number;
+  updated_characters?: number;
+  new_plotholes?: number;
+  new_relationships?: number;
+  resolved_plotholes?: number;
+  resolved_holes?: unknown[];
+  /** 账本步统计；失败时为 `{error: "..."}`。 */
+  ledger?: Record<string, unknown> | null;
+  /** 别名归一步统计；失败时键缺失。 */
+  aliases?: Record<string, unknown> | null;
+  /** 规则哨兵统计；失败时为 `{error: "...", findings: []}`。 */
+  sentinel?: Record<string, unknown> | null;
+}
+
+/** 流式 `done.kg` 的两种形状联合（判据函数按字段互斥读取）。 */
+export type KgStatus = KgMergeResult | KgRebuildResult;
+
+/**
+ * `/generate-stream` 的 `done` 事件负载（`kg` = merge 形状）。
  *
  * `kg` 是纯新增键：既有字段语义一个都没改。挂簿记统计是为了让**流式路径**
- * 也能被观测 —— 此前流式完全不做归档，`complete:false` 无从判断。
+ * 也能被观测 —— 此前流式完全不做归档，出了问题是「图谱没建」还是「建了一半」
+ * 无从判断。
  */
-export interface StreamDoneMeta {
+export interface GenerateStreamDoneMeta {
   segment_no: number;
   chars: number;
   summary: string;
   id: number;
-  /** KG 簿记统计；旧后端不返回 → undefined → 不提示（保守，不误报）。 */
-  kg?: KgBookkeeping;
+  /** KG 合并统计（merge 形状）；旧后端不返回 → undefined → 不提示（保守，不误报）。 */
+  kg?: KgMergeResult;
+}
+
+/**
+ * `/regenerate-stream` 的 `done` 事件负载（`kg` = rebuild 形状，与
+ * `/build-kg-from-generations` 同形）。
+ */
+export interface RegenerateStreamDoneMeta {
+  segment_no: number;
+  chars: number;
+  summary: string;
+  id: number;
+  /** KG 全量重建统计（rebuild 形状）；旧后端不返回 → undefined → 不提示。 */
+  kg?: KgRebuildResult;
 }
 
 // ==================================================================
