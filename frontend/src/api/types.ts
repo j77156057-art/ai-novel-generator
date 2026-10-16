@@ -503,6 +503,12 @@ export interface KgBookkeeping {
   replayed?: number;
   failed?: KgReplayFailure[];
   source?: string;
+  /**
+   * 仅当整体重建**抛异常**时出现（引擎兜底分支回传 `{"rebuilt": false, "reason": ...}`），
+   * 此时不带 segments/replayed/failed —— 界面必须走「簿记重建失败」文案，不能套
+   * 「N/M 段成功」那套（会渲染成 `0/0 段成功，段  未完成` 的残句）。
+   */
+  reason?: string | null;
 }
 
 /**

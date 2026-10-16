@@ -139,6 +139,10 @@ const buildingKg = ref(false);
 const kgMsg = ref<string | null>(null);
 // 图谱提示条的色级：'' 未设（回退 info）| ok | warn | err。语义色，不写死 hex。
 const kgMsgLevel = ref<"" | "ok" | "warn" | "err">("");
+// 第 6 步（生成 / 重生成）专用的簿记提示：与第 7 步 kgMsg 分开，
+// 否则第 7 步的图加载报错会串到第 6 步，反之亦然。
+const genKgMsg = ref<string | null>(null);
+const genKgLevel = ref<"" | "ok" | "warn" | "err">("");
 
 const characters = ref<{ id: number; props: any }[]>([]);
 const plotholes = ref<{ id: number; props: any }[]>([]);
@@ -726,6 +730,8 @@ async function runGenerate() {
   streamedText.value = "";
   lastText.value = "";
   batchCount.value = 0;
+  genKgMsg.value = null; // 新一轮开始：清掉上一轮的簿记提示，只反映本轮结果
+  genKgLevel.value = "";
   try {
     for (let i = 0; i < chaptersPerGen.value; i++) {
       await api.generateStream(
@@ -738,11 +744,8 @@ async function runGenerate() {
         async (meta) => {
           lastText.value = streamedText.value;
           batchCount.value = i + 1;
-          // 流式 done 也带 KG 簿记：complete:false（有失败段）或 rebuilt:false
-          // （建图整体没跑成）都要让用户看见，否则「簿记不全」只藏在后端。
-          if (meta.kg && (meta.kg.complete === false || meta.kg.rebuilt === false)) {
-            applyKgWarn(meta.kg);
-          }
+          // 流式 done 带 KG 簿记：就地（第 6 步）暴露，别藏到第 7 步。
+          applyGenKg(meta.kg);
           await loadGenerations();
           refreshPriorIfOpen(); // 每段生成完前情都变了，面板开着就同步刷新
         },
@@ -757,6 +760,8 @@ async function runGenerate() {
 
 async function runRegenerate(g: { id: number; segment_no: number }) {
   regenState.value[g.id] = { text: "", loading: true };
+  genKgMsg.value = null; // 同上：本轮重生成的簿记结果覆盖上一轮提示
+  genKgLevel.value = "";
   try {
     await api.regenerateStream(
       projectId,
@@ -766,10 +771,8 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
         regenState.value[g.id].text += text;
       },
       async (meta) => {
-        // 重生成会全量 replay：complete:false / rebuilt:false 同样要暴露。
-        if (meta.kg && (meta.kg.complete === false || meta.kg.rebuilt === false)) {
-          applyKgWarn(meta.kg);
-        }
+        // 重生成会全量 replay：簿记结果就地（第 6 步）暴露。
+        applyGenKg(meta.kg);
         await loadGenerations();
         refreshPriorIfOpen(); // 重生成会重算受影响的卷摘要与主线，前情报告同步刷新
       },
@@ -1107,20 +1110,42 @@ function buildSourceOptions(): { value: string; label: string }[] {
   }
   return opts;
 }
-// KG 簿记提示：两个入口（手动建图 / 流式 done）共用同一判据与文案。
-// 判据只认 `complete`（= 无失败段），旧后端不返回该键 → `complete !== false`
-// 视为成功，绝不把「未返回」误报成失败。段号取 failed[].segment_no。
+// KG 簿记提示：**两组状态，绝不串屏**。
+//  - 第 7 步：`kgMsg` / `kgMsgLevel` —— 只管「手动建图」与「图加载报错」。
+//  - 第 6 步：`genKgMsg` / `genKgLevel` —— 只管「生成 / 重生成」流式 done 的簿记。
+//    必须就地渲染（与生成按钮同屏）：把失败藏到第 7 步 = 藏在交互后面。
+// 判据（两组共用）：
+//  - `rebuilt === false` → 整体重建抛异常，文案走「簿记重建失败」（含 reason，可缺）。
+//  - `complete === false` → 有失败段，文案走「簿记不全」（含段号列表）。
+// `complete !== false`（旧后端不返回该键）视为成功，绝不误报。
 const KG_WARN_TAIL = "未完成。请重试；若反复失败，请检查数据库是否需要迁移后重试。";
 function kgFailedNums(kg?: KgBookkeeping): string {
   return (kg?.failed ?? []).map((f) => f.segment_no).join("、");
+}
+function kgIncompleteText(kg?: KgBookkeeping): string {
+  return `簿记不全：${kg?.replayed ?? 0}/${kg?.segments ?? 0} 段成功，段 ${kgFailedNums(kg)} ${KG_WARN_TAIL}`;
+}
+function kgRebuildFailText(reason?: string | null): string {
+  return `簿记重建失败：本段正文已保存，但图谱/账本未更新${reason ? `（${reason}）` : ""}。请重试。`;
 }
 function applyKgOk(kg: KgBookkeeping) {
   kgMsg.value = `生成后图谱已重建：${kg.replayed ?? 0}/${kg.segments ?? 0} 段`;
   kgMsgLevel.value = "ok";
 }
 function applyKgWarn(kg?: KgBookkeeping) {
-  kgMsg.value = `簿记不全：${kg?.replayed ?? 0}/${kg?.segments ?? 0} 段成功，段 ${kgFailedNums(kg)} ${KG_WARN_TAIL}`;
+  kgMsg.value = kgIncompleteText(kg);
   kgMsgLevel.value = "warn";
+}
+/** 第 6 步的流式 done 簿记：只在「有问题」时落一条 warn，成功后清空（不刷屏）。 */
+function applyGenKg(kg?: KgBookkeeping) {
+  if (!kg) return;
+  if (kg.rebuilt === false) {
+    genKgMsg.value = kgRebuildFailText(kg.reason);
+    genKgLevel.value = "warn";
+  } else if (kg.complete === false) {
+    genKgMsg.value = kgIncompleteText(kg);
+    genKgLevel.value = "warn";
+  }
 }
 async function buildGeneratedKg() {
   buildingKg.value = true;
@@ -1629,6 +1654,13 @@ onUnmounted(stopDistillPolling);
       </button>
       <button class="btn" :disabled="!generations.length" @click="runExport">导出 txt</button>
     </div>
+
+    <!-- 生成 / 重生成的 KG 簿记结果：就地在动作发生的那一步暴露，不留到第 7 步 -->
+    <div
+      v-if="genKgMsg"
+      :class="['notice', genKgLevel || 'info']"
+      style="margin-top: var(--gap)"
+    >{{ genKgMsg }}</div>
 
     <!-- ---------- 前情预检：真正下发的那份前情长什么样 ---------- -->
     <div class="prior" :class="priorHealth">
