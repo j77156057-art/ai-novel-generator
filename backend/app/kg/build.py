@@ -273,10 +273,17 @@ def merge_segment_into_kg(
        名字表与已认定状态都来自账本，账本先更新哨兵判定才准。
 
     任何一步失败都绝不阻断主流程：吞异常、写 error 键、回传状态。
+    且**失败步各自 `db.rollback()`**——否则该步未提交的半成品会被后续步骤（尤其
+    第 4 步哨兵结尾的 `db.commit()`）静默持久化（实测复现的泄漏源）。
 
     返回形状刻意**保持扁平兼容**：图谱统计（merged/new_characters/…）仍在顶层，
     账本/别名/哨兵挂在 `ledger` / `aliases` / `sentinel` 三个键下——
     `kg_update` 的既有消费方（前端与 API）读顶层字段，不受影响。
+
+    失败信号（两种，`rebuild_generated_kg` 都计入 `failed`）：
+    - 图谱步（步骤 1）失败 → `{"merged": False, "reason": ...}`（整体失败）；
+    - 账本/结算/哨兵步（步骤 2/3/4）失败 → 顶层 `merged` 仍为 True，但新增
+      `partial: True` 标记「四步只走了一半」。
 
     2026-10-17：整个变更段持 **per-project RLock**（见模块头注释）。重生成路径的
     全量 replay 也持同一把锁，两者互相串行；同线程由 RLock 保证可重入。
@@ -312,6 +319,10 @@ def _merge_segment_into_kg_locked(
             )
         )
     except Exception as exc:  # noqa: BLE001 —— 图谱失败不阻断主流程
+        # 必须 rollback：merge_result_into_graph 可能已 db.add/flush 了本段的部分
+        # 节点/边但**尚未提交**；不回滚的话，这些半成品会被后续步骤（尤其第 4 步
+        # 哨兵结尾的 db.commit()）静默持久化。
+        db.rollback()
         return {"merged": False, "reason": f"图谱合并失败：{str(exc)[:100]}"}
 
     # 2) 事实账本 + 3) 结算同步
@@ -347,7 +358,13 @@ def _merge_segment_into_kg_locked(
             "review": aliases["review"],
         }
     except Exception as exc:  # noqa: BLE001 —— 账本失败不阻断主流程
+        # rollback 清掉本步（upsert_facts / resolve_aliases）留下的未提交行 —— 否则
+        # 会被第 4 步哨兵的 db.commit() 静默持久化（实测复现的泄漏源）。
+        db.rollback()
         stats["ledger"] = {"error": str(exc)[:100]}
+        # 纯新增键：标识「本段四步只走了一半」。消费方（rebuild / 诊断）靠它把
+        # 半成品段与整段成功区分开，避免「缺料当成品」。
+        stats["partial"] = True
 
     # 4) 规则哨兵：零 LLM 的硬冲突检查。**只标红，不改正文。**
     try:
@@ -356,7 +373,10 @@ def _merge_segment_into_kg_locked(
         proj = db.get(Project, project_id)
         stats["sentinel"] = audit_segment(db, proj, text, segment_no)
     except Exception as exc:  # noqa: BLE001 —— 哨兵失败不阻断主流程
+        # 同上：哨兵步可能已写了部分 state/alert 行，回滚避免半成品残留。
+        db.rollback()
         stats["sentinel"] = {"error": str(exc)[:100], "findings": []}
+        stats["partial"] = True
 
     return stats
 
@@ -408,15 +428,29 @@ def rebuild_generated_kg(
 
     ## 失败语义
 
-    单段 `merge_segment_into_kg` 回传 `merged is False` → 记入 `failed` 但**不中止**
-    （沿用既有「簿记失败绝不阻断主流程」纪律，见 §6）。`merge_segment_into_kg`
-    内部已吞异常，故生产环境不会因单段异常中止；只有当其**自身抛出**（例如被
-    测试注入故障）时才会向上传播，由调用方（regenerate 的 try/except）兜住。
+    单段失败的判据是 `merged is False`（图谱步失败，`merge_segment_into_kg` 回传）
+    **或** `partial is True`（账本/哨兵步失败，四步只走了一半）→ 记入 `failed` 但
+    **不中止**（沿用既有「簿记失败绝不阻断主流程」纪律，见 §6）。所谓「失败绝不静默」：
+
+    - 失败步各自 `db.rollback()`，不留半成品（见 `_merge_segment_into_kg_locked`）；
+    - 失败段同时记入 `failed`，并由返回体的 `complete`（`= failed == []`）整体暴露。
+
+    `merge_segment_into_kg` 内部已吞异常，故生产环境不会因单段异常中止；只有当其
+    **自身抛出**（例如被测试注入故障）时才会向上传播，由调用方（regenerate 的
+    try/except）兜住并置 `rebuilt: False`。
+
+    ## 为什么不整体回滚（all-or-nothing）
+
+    见 docs/architecture/2026-10-17-kg-regenerate-replay.md §8.1：真做整体回滚的
+    两条路（穿透六个写入函数的事务纪律 / 影子 source 后 swap）代价都远超收益，
+    故本函数只保证「失败不静默、不泄漏半成品」，不做事务级原子性。
 
     Returns
     -------
     dict
-        `{"rebuilt": bool, "segments": int, "replayed": int, "failed": list, "source": str}`。
+        `{"rebuilt": bool, "segments": int, "replayed": int, "failed": list,
+        "complete": bool, "source": str}`。
+        `rebuilt` 语义**不变**（= 操作跑过）；`complete` 是新增键（= 无失败段）。
     """
     with _project_kg_lock(project_id):
         gens = db.scalars(
@@ -439,15 +473,21 @@ def rebuild_generated_kg(
                 db, project_id, g.text, g.segment_no, source=source
             )
             replayed += 1
-            if st.get("merged") is False:
+            if st.get("merged") is False or st.get("partial"):
                 failed.append(
-                    {"segment_no": g.segment_no, "reason": st.get("reason")}
+                    {
+                        "segment_no": g.segment_no,
+                        "reason": st.get("reason") or "本段四步未走完（partial）",
+                    }
                 )
         return {
             "rebuilt": True,
             "segments": len(gens),
             "replayed": replayed,
             "failed": failed,
+            # 新增键：整体是否完整重建（无失败段）。rebuilt 语义不变（= 操作跑过），
+            # 保留它以不破坏既有消费方（如 T6 判 rebuilt:False）。
+            "complete": not failed,
             "source": source,
         }
 

@@ -427,3 +427,138 @@ def test_regenerate_kg_failure_does_not_break_stream(db_session, monkeypatch):
         )
     ).one()
     assert gen.text == SEG2_NEW, f"新正文未照常落库，实际 {gen.text!r}"
+
+
+# ---------------------------------------------------------------------------
+# R1–R4：§8.1 失败语义 —— 失败步必须 rollback（不留半成品）+ partial 标记
+#
+# 缺陷：`_merge_segment_into_kg_locked` 三处 except 只吞异常、不 rollback。
+# 而第 4 步 `audit_segment` 结尾有 `db.commit()`（sentinel.py）—— 于是「前一步失败
+# 留下的 pending 行」会被哨兵步的 commit **静默持久化**。这条路径在每段生成链路
+# （非流式 + 流式）同样存在，不限于 rebuild。
+# ---------------------------------------------------------------------------
+
+
+def _add_generation(db, project, segment_no: int, text: str) -> None:
+    """只落 Generation 行（不预先 merge）——供「让 rebuild 自己 replay」的用例。"""
+    db.add(
+        Generation(
+            project_id=project.id, segment_no=segment_no, text=text,
+            summary={"text": f"段{segment_no}摘要"},
+        )
+    )
+    db.commit()
+
+
+def test_ledger_failure_does_not_leak_pending_rows(db_session, monkeypatch):
+    """R1（核心回归）：账本步失败留下 pending 行 → 哨兵步 commit 后库里必须没有它。
+
+    修复前：三处 except 缺 db.rollback → 泄漏行被哨兵步的 db.commit() 静默持久化 → 红。
+    """
+    import app.kg.ledger as ledger
+
+    proj = _make_project(db_session)
+
+    def _leaky_upsert(db, project_id, facts, source="generated"):
+        # 先留下一条 pending 行，再抛异常（模拟「写了一半就炸」）
+        db.add(
+            Fact(
+                project_id=project_id, type="character", key="泄漏行", props={},
+                aliases=[], source=source, confidence="high",
+                first_segment=1, last_segment=1,
+            )
+        )
+        db.flush()
+        raise RuntimeError("账本步炸了")
+
+    monkeypatch.setattr(ledger, "upsert_facts", _leaky_upsert)
+
+    st = merge_segment_into_kg(db_session, proj.id, SEG1, 1, source="generated")
+    assert st.get("merged") is not False, f"图谱步应成功，实际 {st}"
+
+    # 哨兵步结尾会 db.commit() —— 若账本步未 rollback，泄漏行会被它持久化
+    db_session.expire_all()
+    leaked = db_session.scalars(
+        select(Fact).where(Fact.project_id == proj.id, Fact.key == "泄漏行")
+    ).all()
+    assert not leaked, (
+        "账本步失败留下的 pending 行被哨兵步的 commit 静默持久化（缺 db.rollback）——"
+        "生成链路同样受影响"
+    )
+
+
+def test_partial_step_flags_segment_and_rebuild_complete_false(db_session, monkeypatch):
+    """R2：账本步（resolve_aliases）抛异常 → 本段 stats 带 partial:True；
+    rebuild 计入 failed 且 complete is False（rebuilt 语义不变）。"""
+    import app.kg.ledger as ledger
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("别名归一炸了")
+
+    monkeypatch.setattr(ledger, "resolve_aliases", _boom)
+
+    proj = _make_project(db_session)
+    _add_generation(db_session, proj, 1, SEG1)
+    _add_generation(db_session, proj, 2, SEG2_OLD)
+
+    st = merge_segment_into_kg(db_session, proj.id, SEG3, 3, source="generated")
+    assert st.get("partial") is True, f"账本步失败应标 partial:True，实际 {st}"
+    assert st.get("merged") is not False, f"图谱步应已成功，实际 {st}"
+
+    stats = rebuild_generated_kg(db_session, proj.id, source="generated")
+    assert stats["rebuilt"] is True, "rebuilt 语义不变（= 操作跑过）"
+    assert stats["complete"] is False, f"有失败段时 complete 应 False，实际 {stats}"
+    assert stats["failed"], "失败段必须记入 failed（否则缺段被当成功）"
+    assert {f["segment_no"] for f in stats["failed"]} == {1, 2}, (
+        f"失败段号集合不符，实际 {stats['failed']}"
+    )
+
+
+def test_rebuild_complete_true_when_all_segments_succeed(db_session):
+    """R3：全段成功 → complete is True、failed == []。"""
+    proj = _make_project(db_session)
+    _add_generation(db_session, proj, 1, SEG1)
+    _add_generation(db_session, proj, 2, SEG2_OLD)
+
+    stats = rebuild_generated_kg(db_session, proj.id, source="generated")
+
+    assert stats["rebuilt"] is True
+    assert stats["complete"] is True, f"全成功应 complete:True，实际 {stats}"
+    assert stats["failed"] == [], f"全成功 failed 应为空，实际 {stats}"
+
+
+def test_graph_failure_leaves_no_residual(db_session, monkeypatch):
+    """R4：图谱步失败 → merged is False，且 Session 无 pending/dirty 残留。
+
+    修复前：图谱步 except 未 rollback → 泄漏的 KgNode 留在会话里 → 红。
+    """
+    import app.kg.build as build_mod
+
+    proj = _make_project(db_session)
+
+    def _leaky_graph(db, project_id, result, **kwargs):
+        db.add(
+            KgNode(
+                project_id=project_id, type="character", props={"name": "幽灵"},
+                first_chapter=1, last_chapter=1, source="generated",
+            )
+        )
+        db.flush()
+        raise RuntimeError("图谱步炸了")
+
+    monkeypatch.setattr(build_mod, "merge_result_into_graph", _leaky_graph)
+
+    st = merge_segment_into_kg(db_session, proj.id, SEG1, 1, source="generated")
+    assert st.get("merged") is False, f"图谱步失败应 merged:False，实际 {st}"
+
+    # 不得有 pending / dirty 对象残留
+    assert not db_session.new, f"存在未清理的 pending 对象：{list(db_session.new)}"
+    assert not db_session.dirty, f"存在未清理的 dirty 对象：{list(db_session.dirty)}"
+
+    db_session.expire_all()
+    ghosts = db_session.scalars(
+        select(KgNode).where(
+            KgNode.project_id == proj.id, KgNode.source == "generated"
+        )
+    ).all()
+    assert not ghosts, f"图谱步失败留下幽灵节点：{[g.props for g in ghosts]}"
