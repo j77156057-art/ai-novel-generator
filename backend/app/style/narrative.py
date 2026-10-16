@@ -1428,6 +1428,13 @@ def extract_narrative_profile(
     all_forbidden: dict[str, list[str]] = {dim: [] for dim in FORBIDDEN_DIMENSIONS}
     rejected = 0
     total_chapters = 0
+    # —— 失败块统计（P1-2 修复：LLM 全挂不许静默 success）——
+    # chunks_attempted：真正发起了主提炼调用的块数（空块不计）；
+    # failed_chunks：其中 chat 抛错或返回不可解析 JSON 的块数。
+    # 附加维度（禁忌/节拍/场景/潜台词/角色声音/漂移）的失败不计入——
+    # 它们是增强，单独失败不该判整次蒸馏失败（与原行为一致，仍只记日志）。
+    chunks_attempted = 0
+    failed_chunks = 0
 
     # —— 进度上报的累计量（只在 progress 非 None 时有意义）——
     # blocks_done：已完成块数（跨语料累计）；
@@ -1495,16 +1502,23 @@ def extract_narrative_profile(
             chapter_range = f"{chunk[0][0]}-{chunk[-1][0]}"
             system, user = _build_extract_prompt(chunk_text, f"语料{nid} 第{chapter_range}章")
 
+            chunks_attempted += 1
             try:
                 raw = provider.chat(system, user)
             except Exception as exc:  # noqa: BLE001 —— 单块失败不阻断其余块
+                failed_chunks += 1
                 logging.getLogger(__name__).warning(
                     "叙事提炼失败 novel_id=%s chunk=%s: %s", nid, chapter_range, exc
                 )
                 continue
 
             parsed = _parse_extract_result(raw)
-            if not isinstance(parsed, dict):
+            # 不可用输出 = 调用失败：`_parse_extract_result` 对垃圾输入返回 {}
+            # （空 dict 也过 isinstance 检查），或返回不含任何预期维度键的 dict。
+            # 不计失败的话，「LLM 全程返回兜底文案」会静默 success + 0 规则。
+            expected_dims = set(tier_dims) | set(FORBIDDEN_DIMENSIONS)
+            if not isinstance(parsed, dict) or not (set(parsed) & expected_dims):
+                failed_chunks += 1
                 continue
 
             for dim in tier_dims:
@@ -1740,6 +1754,20 @@ def extract_narrative_profile(
     if progress is not None:
         progress("正在汇总提炼出的规则", blocks_done, max(blocks_done, 1))
 
+    # —— 静默空结果护栏（P1-2 修复）——
+    # 语料为空 / 所有块全部调用失败，都不许以「成功」收场：
+    # 二者的表现都是「蒸馏完成但 0 条规则」，用户无从分辨是语料问题、
+    # key 问题还是限流，比直接失败难排查得多。
+    if total_chapters == 0:
+        raise ValueError(
+            "参考语料没有可蒸馏的章节（语料为空或尚未导入完成），未产出任何规则"
+        )
+    if chunks_attempted and failed_chunks == chunks_attempted:
+        raise ValueError(
+            f"蒸馏失败：{failed_chunks} 个语料块全部调用模型失败"
+            "（API key 无效 / 已限流 / 网络不通？），未产出任何规则"
+        )
+
     return {
         "version": NARRATIVE_VERSION,
         "source_ids": sorted(int(i) for i in novel_ids),
@@ -1751,6 +1779,8 @@ def extract_narrative_profile(
         "rules": all_rules,
         "forbidden": all_forbidden,
         "rejected": rejected,
+        # 部分块失败时 >0：任务仍算成功，但前端/日志能看见「有块被跳过」
+        "failed_chunks": failed_chunks,
     }
 
 
@@ -1915,6 +1945,8 @@ def project_narrative(
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
     tier: str | NarrativeTier | None = None,
     progress: ProgressCallback | None = None,
+    persist_library: bool = True,
+    content_hash: str | None = None,
 ) -> dict | None:
     """取项目当前该用的叙事档案；没有参考语料则返回 None。
 
@@ -1927,6 +1959,14 @@ def project_narrative(
     Args:
         progress: 可选的进度回调，原样透传给 `extract_narrative_profile`
             （后台蒸馏任务的进度条用）。None 时行为与加进度之前完全一致。
+        persist_library: 是否把产物落进全局蒸馏库（幂等 upsert）。
+            **False = 生成路径专用**：命中项目缓存时纯读返回——不算
+            `corpus_content_hash`（全语料加载+sha256）、不写库。生成链路
+            每次请求会调 3 次（engine.build_context + generate_next_segment
+            ×2），缓存命中还算哈希+写库是纯浪费，还给 SQLite 平添写锁竞争。
+        content_hash: 调用方已算好的 `corpus_content_hash`（如
+            `start_distill` 的缓存预测里算过一次）。传了就不重算——
+            同一条提交链路里「预测算一次 + 后台再算一次」是重复劳动。
 
     Raises:
         ValueError: tier / project.narrative_tier 是未知档位 key。
@@ -1943,21 +1983,26 @@ def project_narrative(
     want = narrative_fingerprint(ids, cfg)
     cached = project.style_narrative or {}
     profile = None
-    content_hash = None
 
     if not force and isinstance(cached, dict) and cached.get("fingerprint") == want:
         # 命中项目缓存：一次 LLM 都不会调，进度条直接 100%，并把「没重算」写进 stage。
         if progress is not None:
             progress("命中缓存，本次无需重新蒸馏", 1, 1)
+        if not persist_library:
+            # 生成路径：纯读。不算 content_hash（全量加载语料+sha256）、
+            # 不碰蒸馏库——档案没变，重复落库除了刷新 applied_at 没有任何意义。
+            return cached
         profile = cached
         # 仍把这份已完成的档案落进全局蒸馏库（幂等 upsert）——
         # 否则「项目私有缓存命中」永远不会让蒸馏库出现这一行，用户就看不到「蒸馏完成的库」。
-        content_hash = corpus_content_hash(ids, db)
+        if content_hash is None:
+            content_hash = corpus_content_hash(ids, db)
     else:
         # ── 蒸馏库复用（跨项目共享层）── 同语料+同档位+同正文 已蒸馏过 → 直接复用。
         # force 时跳过（force = 用户明确要求重算，不复用任何缓存/库）。
         if not force:
-            content_hash = corpus_content_hash(ids, db)
+            if content_hash is None:
+                content_hash = corpus_content_hash(ids, db)
             existing = find_style_distill(
                 db, ids, cfg.key, want["tier_signature"], content_hash
             )
@@ -1978,14 +2023,19 @@ def project_narrative(
             )
             profile["fingerprint"] = want
             project.style_narrative = profile
+            if not persist_library:
+                # 生成路径也要把新档案落进项目缓存（否则下次生成又全量重跑），
+                # 只是不写全局库。
+                db.commit()
 
     # —— 统一收尾：任何一次「完成的蒸馏」都把产物落进全局蒸馏库（幂等 upsert）——
     # 「蒸馏完成的加一个库」的核心：无论命中项目缓存、命中蒸馏库、还是真实提取，
     # 只要本次产出了可用档案，全局库里就有它，标着档位，任何项目可直接复用。
-    if content_hash is None:
-        content_hash = corpus_content_hash(ids, db)
-    _persist_style_distill(db, project, ids, cfg, content_hash, profile)
-    db.commit()
+    if persist_library:
+        if content_hash is None:
+            content_hash = corpus_content_hash(ids, db)
+        _persist_style_distill(db, project, ids, cfg, content_hash, profile)
+        db.commit()
     return profile
 
 
@@ -1997,16 +2047,21 @@ def project_narrative_safe(
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
     tier: str | NarrativeTier | None = None,
     progress: ProgressCallback | None = None,
+    persist_library: bool = True,
+    content_hash: str | None = None,
 ) -> dict | None:
     """生成链路上的安全包装。与 `style_profile_safe` 同理：失败只能降级为「不注入」，
     绝不能让整次生成失败。
 
     `progress` 只是透传（生成链路默认不传，即 None）：加这个参数**不改**生成路径
     的任何行为，纯粹为了让后台蒸馏任务能复用同一个函数并拿到进度。
+    `persist_library` / `content_hash` 同理透传给 `project_narrative`。
     """
     try:
         return project_narrative(db, project, force=force, max_chapters=max_chapters,
-                                 tier=tier, progress=progress)
+                                 tier=tier, progress=progress,
+                                 persist_library=persist_library,
+                                 content_hash=content_hash)
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
             "叙事档案不可用，本次生成跳过叙事档案块：%s: %s", type(exc).__name__, exc

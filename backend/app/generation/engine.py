@@ -329,10 +329,15 @@ def _style_narrative(db, project: Project) -> dict | None:
 
     与 `_style_profile` 同理：叙事档案进的是静态 system 块，每次生成都变会击穿缓存。
     取不到就返回 None —— 叙事档案是增强，不是生成的前提。
+
+    `persist_library=False`（P1-1 修复）：生成链路每次请求会调本函数 3 次
+    （build_context + generate_next_segment/stream 各 2 次），命中缓存时
+    只读返回即可——不算 corpus_content_hash（全量加载语料+sha256）、
+    不写蒸馏库。落库是蒸馏提交路径（POST /distill）的职责。
     """
     from app.style.narrative import project_narrative_safe
 
-    return project_narrative_safe(db, project)
+    return project_narrative_safe(db, project, persist_library=False)
 
 
 def _style_profile(db, project: Project) -> dict | None:

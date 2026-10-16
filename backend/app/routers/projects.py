@@ -123,12 +123,16 @@ def start_distill(
     前端拿 job_id 轮询 `GET .../distill/jobs/{job_id}` 看进度。这样即便用户
     关掉页面、刷新、切到别的步骤，蒸馏也不中断、进度也不丢。
 
-    并发防重：项目上已有 pending/running 的**同档位**任务且不 force 时，
-    直接复用那条（返回它的 job_id，`reused: True`），不重复烧一遍 LLM。
+    并发防重：项目上已有 pending/running 任务且不 force 时，直接复用那条
+    （返回它的 job_id，`reused: True`），不重复烧一遍 LLM。**不分档位**——
+    两个后台线程共写同一 `project.style_narrative` 会互相覆盖（后完成的
+    盖掉先完成的，可能旧档盖新档）且争抢 SQLite 写锁；想换档位重算，
+    等当前任务终态后再提交（或对旧任务无感知时直接重提，force 另算）。
 
     缓存命中预测：不 force 时若本次会直接复用「项目已存档案」或「蒸馏库」，
     返回 `from_cache: True` 与 `cache_source`（"project" / "library"）。
     前端据此如实提示「秒级复用、未重新调用模型」，避免「一秒蒸馏完却没解释」。
+    预测时算出的 `content_hash` 会传给后台任务，同一条链路不重复全量加语料。
     """
     proj = db.get(Project, project_id)
     if proj is None:
@@ -152,8 +156,11 @@ def start_distill(
     # 在登记任务之前就判断：本次蒸馏会不会直接复用「项目已存档案」或「蒸馏库」，
     # 把这件事如实回给前端。否则前端只会看到 reused:False → 误以为「已提交后台运行中」，
     # 实际后台 0.3s 就 replay 完缓存，用户感知就是「一秒蒸馏完了却没解释」。
+    # 预测里算出的 content_hash 顺手传给后台任务（P2-2）：同一条提交链路
+    # 「预测算一次 + 后台再算一次」全量加载语料是重复劳动。
     from_cache = False
     cache_source = None
+    content_hash = None
     if not body.force:
         ids = [int(i) for i in (proj.reference_novel_ids or [])]
         if ids:
@@ -178,9 +185,11 @@ def start_distill(
                     cache_source = "library"
 
     if not body.force:
-        # 同档位才复用：换档位的指纹不同，必须重算，复用会静默拿旧档结果。
+        # 并发防重：项目上已有未终态任务就直接复用它的 job_id（不分档位）。
+        # 同档位才复用是旧契约——换档位放行会让两个后台线程共写
+        # project.style_narrative 互相覆盖 + 写锁竞争（P2-1 修复）。
         active = find_active_run(db, project_id)
-        if active is not None and active.tier == cfg.key:
+        if active is not None:
             return {
                 "job_id": active.id,
                 "status": active.status,
@@ -192,7 +201,7 @@ def start_distill(
 
     run = create_distill_run(db, project_id, cfg.key)
     background_tasks.add_task(
-        run_distill_job, run.id, project_id, cfg.key, body.force
+        run_distill_job, run.id, project_id, cfg.key, body.force, content_hash
     )
     return {
         "job_id": run.id,

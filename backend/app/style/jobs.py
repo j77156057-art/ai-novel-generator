@@ -238,7 +238,8 @@ def reap_stale_runs(db: Session) -> int:
 
 
 def run_distill_job(
-    job_id: int, project_id: int, tier: str, force: bool = False
+    job_id: int, project_id: int, tier: str, force: bool = False,
+    content_hash: str | None = None,
 ) -> None:
     """后台蒸馏的执行体（跑在 FastAPI BackgroundTasks 的线程池里）。
 
@@ -247,6 +248,9 @@ def run_distill_job(
         project_id: 目标项目。
         tier: **已归一化**的档位 key（调用方负责 `resolve_tier` 校验）。
         force: True 时忽略指纹缓存，同档位也重算一遍。
+        content_hash: 调用方（`start_distill` 的缓存预测）已算好的
+            `corpus_content_hash`。None 时由 `project_narrative` 自行计算——
+            同一条提交链路里重复全量加载语料算哈希是纯浪费。
 
     成功：写 `status=success` + 摘要字段（n_chapters / rule_count / rejected）。
     失败：写 `status=failed` + `error`。**任何路径都会写 finished_at**——
@@ -277,14 +281,26 @@ def run_distill_job(
 
         progress = _make_progress_writer(job_id, db)
         profile = project_narrative(
-            db, project, force=force, tier=tier, progress=progress
+            db, project, force=force, tier=tier, progress=progress,
+            content_hash=content_hash,
         )
         if not isinstance(profile, dict):
             raise ValueError("蒸馏未产出档案（可能是档位不合法或语料为空）")
 
         rules = profile.get("rules") or {}
+        # 部分块失败（LLM 超时/限流被跳过）：任务算成功，但如实写进 stage——
+        # 「蒸馏完成」和「蒸馏完成（有块被跳过）」对用户是两件事。
+        failed_chunks = int(profile.get("failed_chunks") or 0)
+        if failed_chunks:
+            logger.warning(
+                "蒸馏任务部分块失败 job_id=%s project_id=%s failed_chunks=%s",
+                job_id, project_id, failed_chunks,
+            )
         run.status = STATUS_SUCCESS
-        run.stage = "蒸馏完成"
+        run.stage = (
+            "蒸馏完成" if not failed_chunks
+            else f"蒸馏完成（{failed_chunks} 个语料块调用失败，已跳过）"
+        )
         run.n_chapters = profile.get("n_chapters")
         run.rejected = profile.get("rejected")
         run.rule_count = sum(

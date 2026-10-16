@@ -72,8 +72,11 @@ def _clean_db():
 class CountingProvider:
     """数调用次数的假 provider——绝不在测试里真调 LLM。
 
-    返回的 JSON 刻意做成「什么都匹配不上」的形态，让所有规则都被证据验证
-    拦掉（rejected 路径）。我们要量的是**调用次数**，不是规则内容。
+    返回的 JSON 带**合法维度键**但证据刻意不通过（原文里根本没有那句话），
+    让所有规则都被证据验证拦掉（rejected 路径）。我们要量的是**调用次数**，
+    不是规则内容。维度键必须合法：失败块护栏（2026-10-16 P1-2 修复）会把
+    「不含任何预期维度键」的返回当成不可用输出计失败——用无关键 JSON 会让
+    整组测试被那道护栏误伤。
     """
 
     def __init__(self) -> None:
@@ -83,7 +86,7 @@ class CountingProvider:
     def chat(self, system: str, user: str) -> str:
         self.calls += 1
         self.prompts.append((system, user))
-        return '{"占位": ["占位规则（证据：原文里根本没有这句话）"]}'
+        return '{"人物描写手法": ["占位规则（证据：原文里根本没有这句话）"]}'
 
 
 def _make_corpus(db, n_chapters: int = 120) -> int:

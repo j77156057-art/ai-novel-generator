@@ -363,10 +363,7 @@ def test_unknown_body_field_is_rejected(db_session, stub_llm):
 
 
 def test_start_distill_reuses_active_run_of_same_tier(db_session, stub_llm):
-    """并发防重：已在跑的同档位任务被复用，不重复烧 LLM。
-
-    换档位则必须新起 —— 指纹里含 tier，复用会静默返回上一档的结果。
-    """
+    """并发防重：已在跑的任务被复用，不重复烧 LLM（同档位场景）。"""
     nid = _make_corpus(db_session)
     proj = _make_project(db_session, nid, tier=TIER_FAST)
 
@@ -380,6 +377,30 @@ def test_start_distill_reuses_active_run_of_same_tier(db_session, stub_llm):
     ).json()
     assert body["job_id"] == active.id
     assert body["reused"] is True
+    assert stub_llm.calls == 0, "复用路径不该触发新的蒸馏"
+
+
+def test_start_distill_reuses_active_run_regardless_of_tier(db_session, stub_llm):
+    """并发防重**不分档位**（P2-1 修复）：已有未终态任务时换档位也复用。
+
+    旧契约是「同档位才复用、换档位新起」——那会让两个后台线程共写同一
+    project.style_narrative：后完成的覆盖先完成的（可能旧档盖新档），
+    且争抢 SQLite 写锁。想换档位重算，等当前任务终态后再提交。
+    """
+    nid = _make_corpus(db_session)
+    proj = _make_project(db_session, nid, tier=TIER_FAST)
+
+    from app.style.jobs import create_distill_run
+
+    active = create_distill_run(db_session, proj.id, TIER_FAST)
+
+    client = TestClient(fastapi_app)
+    body = client.post(
+        f"/api/projects/{proj.id}/distill", json={"tier": "full"}
+    ).json()
+    assert body["job_id"] == active.id, "换档位也该复用未终态任务，不能双线程齐跑"
+    assert body["reused"] is True
+    assert body["tier"] == TIER_FAST, "复用的是原任务的档位，回参必须如实"
     assert stub_llm.calls == 0, "复用路径不该触发新的蒸馏"
 
 
@@ -446,7 +467,9 @@ def test_api_shape_matches_frontend_distill_job_contract(db_session):
 class MarkerProvider:
     """带标记的假 provider——用来断言「到底调的是哪一个」。
 
-    不真打 LLM，只记 `MARK` 便于断言；`chat` 返回空 JSON 让提炼安静跑完。
+    不真打 LLM，只记 `MARK` 便于断言。`chat` 返回一条**合法且证据能过**的
+    规则（不是空 JSON）：空 JSON 不含任何预期维度键，会被失败块护栏当成
+    「不可用输出」计失败——那会让本组「选provider」的测试被无关护栏绊倒。
     """
 
     MARK = "marker"
@@ -457,7 +480,7 @@ class MarkerProvider:
 
     def chat(self, system: str, user: str) -> str:
         self.calls += 1
-        return "{}"
+        return '{"人物描写手法": ["出场先写环境再写人（证据：医院里她抬起头）"]}'
 
 
 def test_distill_uses_distiller_provider_when_configured(monkeypatch):
