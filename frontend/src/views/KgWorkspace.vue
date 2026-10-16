@@ -22,9 +22,12 @@ const TABS = [
   { key: "judge", label: "Judge 面板" },
   { key: "graph", label: "关系与节奏" },
   { key: "worker", label: "Worker 状态" },
+  { key: "style", label: "Style 审计" },
 ] as const;
 type TabKey = (typeof TABS)[number]["key"];
-const activeTab = ref<TabKey>("slice");
+// vue-tsc 5.x 推断 ref<TabKey>(literal) 会把 T 缩到字面量类型，下方 v-if 改用 (activeTab as string) === "style" 绕过。
+// 保留 `as TabKey` 双重断言确保 ref 真正按 union 处理。
+const activeTab = ref<TabKey>("slice" as TabKey);
 function switchTab(k: TabKey) {
   activeTab.value = k;
   // 惰性加载：首次进入某 tab 才拉数据（切片在 onMounted 已拉）
@@ -33,6 +36,7 @@ function switchTab(k: TabKey) {
   else if (k === "judge") loadFindings();
   else if (k === "graph") loadGraphTab();
   else if (k === "worker") loadWorker();
+  else if (k === "style") loadStyleWarnings();
 }
 
 // ---------- Tab 1 切片预览 ----------
@@ -447,6 +451,32 @@ function sevTag(sev: string): string {
 onMounted(() => {
   loadSlice();
 });
+
+// ---------- Tab 7 Style 审计（v2.1） ----------
+import type { KgV3StyleWarning } from "@/api/types";
+const styleWarnings = ref<KgV3StyleWarning[]>([]);
+const styleTruncated = ref(false);
+const styleTotal = ref(0);
+const styleLoading = ref(false);
+const styleErr = ref<string | null>(null);
+async function loadStyleWarnings() {
+  styleLoading.value = true;
+  styleErr.value = null;
+  try {
+    const r = await api.kgV3StyleWarnings(projectId);
+    styleWarnings.value = r.warnings;
+    styleTruncated.value = r.truncated;
+    styleTotal.value = r.total;
+  } catch (e) {
+    styleErr.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    styleLoading.value = false;
+  }
+}
+function fmtPct(p: number | null | undefined): string {
+  if (p === null || p === undefined) return "—";
+  return p.toFixed(1) + "th";
+}
 </script>
 
 <template>
@@ -528,7 +558,44 @@ onMounted(() => {
               <div style="flex: 1">{{ f.name }}</div>
               <span class="tag warn">{{ f.status }}</span>
               <span class="faint mono" style="font-size: var(--fs-xs)">
-                埋@{{ f.planted_chapter ?? "?" }}<template v-if="f.planned_payoff_chapter"> → 计划{{ f.planned_payoff_chapter }}</template>
+                埋@{{ f.planted_chapter ?? "?" }}<template v-if="f.planned_payoff_chapter"> → 计划{{ f.planned_payoff_chapter }}
+
+  <!-- ============ Tab 7：Style 审计（v2.1） ============ -->
+  <section v-if="(activeTab as string) === 'style'" class="card">
+    <h2>文风告警（v2.1）</h2>
+    <p style="color: var(--muted-foreground); font-size: 0.9em">
+      percentile ≥ 97.5（留出集分位）触发告警；engine 落库，段级历史。
+    </p>
+    <div v-if="styleLoading" class="empty">加载中…</div>
+    <div v-else-if="styleErr" class="empty error">{{ styleErr }}</div>
+    <div v-else-if="styleWarnings.length === 0" class="empty">
+      暂无告警——所有生成段 percentile 都在 97.5 分位以内。
+    </div>
+    <div v-else>
+      <div style="display: flex; gap: 16px; margin: 8px 0 16px; font-size: 0.9em">
+        <span><b>{{ styleTotal }}</b> 条告警</span>
+        <span v-if="styleTruncated" style="color: #b00">已截断（&gt;500 保留最新 500）</span>
+      </div>
+      <table class="prior-table">
+        <thead>
+          <tr><th>段号</th><th>时间</th><th>percentile</th><th>mean_abs_z</th><th>最偏特征</th><th>消息</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="w in styleWarnings" :key="w.segment_no + '_' + w.generated_at">
+            <td>{{ w.segment_no }}</td>
+            <td style="font-family: monospace; font-size: 0.85em">{{ w.generated_at }}</td>
+            <td>{{ fmtPct(w.percentile) }}</td>
+            <td>{{ w.mean_abs_z?.toFixed(2) ?? "—" }}</td>
+            <td>
+              <span v-for="f in w.worst_features" :key="f" class="chip" style="margin-right: 4px">{{ f }}</span>
+            </td>
+            <td style="font-size: 0.85em">{{ w.warn_message ?? "—" }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</template>
               </span>
             </div>
             <div v-if="!slice.active_foreshadows.length" class="empty">无未回收伏笔</div>

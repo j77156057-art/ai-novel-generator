@@ -1171,3 +1171,18 @@ export interface KgV3ExemptRequest {
   entity: string;
   note: string;
 }
+
+/** v2.1：GET /kg-v3/style-warnings 响应（落库告警历史）。 */
+export interface KgV3StyleWarning {
+  segment_no: number;
+  generated_at: string;
+  percentile: number | null;
+  mean_abs_z: number | null;
+  worst_features: string[];
+  warn_message: string | null;
+}
+export interface KgV3StyleWarningsResponse {
+  warnings: KgV3StyleWarning[];
+  total: number;
+  truncated: boolean;
+}

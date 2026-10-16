@@ -461,6 +461,8 @@ def _style_profile(db, project: Project) -> dict | None:
 #: 这里用高分位（97.5）判"异常偏离"——与离线验收同一条线，不搞两套口径。
 #: 具体值由 `verify_stylometry.py` 在真实语料上扫 `unit_mean_abs_z` 分布后定，不拍脑袋。
 STYLE_WARN_PERCENTILE = 97.5
+#: 每 N 段自动异步触发 audit_kg（防主链 LLM 拖慢，fire-and-forget 模式）
+AUTO_AUDIT_INTERVAL = 10
 
 #: AI 腔模式库：常见的中文 AI 写作套路。生成后检测这些模式，
 #: 命中则触发针对性重写。与 system prompt 的【文风要求：忌 AI 腔】互补——
@@ -585,6 +587,33 @@ def _style_warning(text: str, profile: dict | None) -> dict | None:
         ),
     }
 
+
+
+
+def _schedule_async_audit_kg(db, project_id: int) -> None:
+    """每 N 段异步触发 audit_kg agent（fire-and-forget，不阻塞 generate）。
+
+    audit_kg 是 LLM 密集工具，**不能**在主链同步等结果。
+    用 daemon thread 启动，结果落 AgentRun 表 + 助手页可见。
+    """
+    import logging
+    import threading
+    from app.db import SessionLocal
+    from app.agents.registry import _impl_audit_kg  # 内部入口，避免走 LLM 路由
+
+    def _run():
+        try:
+            s = SessionLocal()
+            try:
+                _impl_audit_kg(db=s, project_id=project_id)
+            finally:
+                s.close()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "auto audit_kg 失败 (project %s)", project_id, exc_info=True)
+
+    t = threading.Thread(target=_run, daemon=True, name=f"audit-kg-{project_id}")
+    t.start()
 
 def _timeline_state_for(
     project: Project, written_segments: int, provider=None, db=None
@@ -880,6 +909,18 @@ def generate_next_segment(
 
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
     style_warning = _style_warning(text, _style_profile(db, project))
+    # v2.1：style_warning 落库（段级历史，>500 截断）
+    if style_warning:
+        try:
+            from app.style import append_style_warning
+            append_style_warning(db, project, segment_no, style_warning)
+        except Exception:  # noqa: BLE001 —— 落库失败绝不能阻断生成主流程
+            import logging
+            logging.getLogger(__name__).warning(
+                "style_warning 落库失败 (seg %s): %s", segment_no, style_warning, exc_info=True)
+    # v2.1：每 AUTO_AUDIT_INTERVAL 段异步触发 audit_kg（不阻塞 generate）
+    if segment_no and segment_no % AUTO_AUDIT_INTERVAL == 0:
+        _schedule_async_audit_kg(db, project_id)
 
     # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换（旁路观测）
     # 启发式会有假阳性（普通词组也报），调用方拿到列表后可聚合展示

@@ -45,6 +45,7 @@ import type {
   KgV3Character,
   KgV3ExemptRequest,
   KgV3JudgeFindingsResponse,
+  KgV3StyleWarningsResponse,
   KgV3EventsResponse,
   KgV3Relation,
   KgV3Slice,
@@ -749,6 +750,10 @@ export const api = {
   /** Judge 告警历史（落库的，按段倒序，含 exempted 标记与规则清单）。 */
   kgV3JudgeFindings: (projectId: number) =>
     request<KgV3JudgeFindingsResponse>(`/projects/${projectId}/kg-v3/judge/findings`),
+
+  /** v2.1：文风告警历史（engine 落库 style_narrative.style_warnings，按段倒序）。 */
+  kgV3StyleWarnings: (projectId: number) =>
+    request<KgV3StyleWarningsResponse>(`/projects/${projectId}/kg-v3/style-warnings`),
 
   /** 项目角色清单（mention 降序）。 */
   kgV3Characters: (projectId: number, limit = 200) =>

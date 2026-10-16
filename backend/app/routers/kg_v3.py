@@ -329,6 +329,25 @@ def get_worker_status(project_id: int, db: Session = Depends(get_db)) -> dict:
     return worker_status(db, project_id)
 
 
+@router.get("/style-warnings")
+def get_style_warnings(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """v2.1：文风告警历史（按 segment_no 倒序）。
+
+    数据源：`projects.style_narrative.style_warnings[]`（engine 落库）。
+    返回：{warnings, truncated, total}
+    - `truncated=True` 表示已超过 500 条被截断（见 warning_store._MAX_HISTORY）
+    """
+    _require_project(db, project_id)
+    from app.style import get_style_warnings as _read, is_truncated as _trunc
+    project = db.get(Project, project_id)
+    history = _read(project)
+    return {
+        "warnings": history,
+        "total": len(history),
+        "truncated": _trunc(project),
+    }
+
+
 class RequeueRequest(BaseModel):
     """重捞请求体：要重跑的 AgentRun id 列表（必须是本项目 failed 行）。"""
 
