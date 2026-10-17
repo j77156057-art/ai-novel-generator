@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.corpus_health import find_repeated_watermarks, strip_watermarks
-from app.style.stylometry import PROFILE_VERSION, fit_profile
+from app.style.stylometry import PROFILE_VERSION, fit_profile, fit_profile_v2
 
 #: 每本语料最多留几条水印结论、每条留几个原文样本（防止档案 JSON 膨胀）
 MAX_MARK_ROWS = 5
@@ -124,7 +124,8 @@ def build_reference_profile(
             "marks": rows,
         }
 
-    profile = fit_profile(cleaned, unit_chars=unit_chars, label=label)
+    # 方案 B「对数粒度 profile」：fit 3 套 bucket（base/2 + base + base*2）
+    profile = fit_profile_v2(cleaned, unit_chars=unit_chars, label=label)
     profile["clean"] = bool(clean)
     profile["corpus_health"] = health
     profile["source_chars"] = sum(len(c) for c in cleaned)

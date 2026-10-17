@@ -516,10 +516,18 @@ def describe(profile: dict, *, max_features: int | None = None) -> str:
     确定性意味着：同一份档案永远产出同一段文本，不随段号/时间变化，
     因此放进静态 system 块不会破坏 prompt 缓存。
     """
+    # 方案 B 兼容：v2 profile 是 buckets 嵌套，主档用 medium bucket.feat
     feat = profile.get("feat") or {}
+    if not feat and profile.get("version") == 2:
+        medium = (profile.get("buckets") or {}).get("medium") or {}
+        feat = medium.get("feat") or {}
     if not feat:
         return ""
-    unit = int(profile.get("unit_chars") or 0)
+    unit = int(
+        (profile.get("_meta") or {}).get("base_unit_chars")
+        or profile.get("unit_chars")
+        or 0
+    )
 
     def st(k: str) -> dict:
         return feat.get(k) or {}
@@ -558,9 +566,16 @@ def describe(profile: dict, *, max_features: int | None = None) -> str:
 
 
 def feature_table(profile: dict) -> list[dict]:
-    """特征清单（面板/报告用）：均值、区间、留出波动、是否代理指标。"""
+    """特征清单（面板/报告用）：均值、区间、留出波动、是否代理指标。
+
+    v2 兼容：bucket 嵌套时取 medium bucket 的 feat + holdout。
+    """
     feat = profile.get("feat") or {}
     hold = ((profile.get("holdout") or {}).get("feat_abs_z") or {})
+    if not feat and profile.get("version") == 2:
+        medium = (profile.get("buckets") or {}).get("medium") or {}
+        feat = medium.get("feat") or {}
+        hold = ((medium.get("holdout") or {}).get("feat_abs_z") or {})
     rows = []
     for k in FEATURES:
         st = feat.get(k) or {}
