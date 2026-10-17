@@ -16,9 +16,11 @@
 
 助手页瘦身后新增的 4 个只读工具（`audit_corpus` / `audit_kg` /
 `audit_generation` / `analyze_logs`）让 agent **自主**调用诊断、日志分析与
-三类审核，而不再依赖前端页签。它们在业务数据上全部只读——只写助手自己的
-AgentRun + Evidence 两张审计表——所以进白名单是安全的。写操作（提案 / 调动
-生成）**不在**本表：它们走 `app.agents.pending_actions` 产出待确认卡片，
+三类审核，而不再依赖前端页签。这些工具的 **callable 本身全部纯只读**，直接复用
+audit / log_audit 的规则函数；「AgentRun + Evidence 两张审计表」的写入发生在
+**router / 编排层**（`app.routers.assistant` 跑完工具后落盘），**不**在工具
+callable 内部——所以工具在业务数据上是纯只读，进白名单是安全的。写操作（提案 /
+调动生成）**不在**本表：它们走 `app.agents.pending_actions` 产出待确认卡片，
 由用户点确认后调既有端点执行。
 
 不在本表范围：
@@ -57,9 +59,12 @@ FORBIDDEN_PREFIXES: tuple[str, ...] = (
 #
 # 助手页瘦身后新增 4 个（audit_corpus / audit_kg / audit_generation /
 # analyze_logs）：诊断、日志分析、三类审核从「前端页签」改为「agent 自主
-# 调度」。它们在业务数据上全部只读——审核/日志分析只写助手自己的
-# AgentRun + Evidence 两张审计表，不碰 Generation / Fact / KgNode /
-# NovelChunk / RawNovel——因此可以安全进白名单，让 agent 自己判断何时需要。
+# 调度」。这些工具的 **callable 本身全部纯只读**——它们直接复用 audit / log_audit
+# 模块的规则函数，只读出违规项、不写任何业务数据。关于「AgentRun + Evidence
+# 两张审计表」的写入：那**不是**发生在这些工具 callable 内部（callable 不碰
+# 任何写路径），而是发生在 router / 编排层（app.routers.assistant 在跑完工具后
+# 落盘 AgentRun 与 Evidence）。因此这些工具可以安全进白名单，让 agent 自己判断
+# 何时需要；白名单同时也被 register() 当作运行时允许清单（见 §4.2① 的校验）。
 ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
     "search_novel_chunks",
     "read_generation_segments",
@@ -127,7 +132,12 @@ class AssistantToolRegistry:
           1. spec.read_only is False（不论 name 是什么——读工具白名单是硬约束）；
           2. spec.name 以 FORBIDDEN_PREFIXES 任一前缀开头（黑名单前缀；
              防 write_* 用 alias 注册成 read_only=True 蒙混）；
-          3. spec.name 已在 _tools 中 → 重名也算错误（避免运行时调用的歧义）。
+          3. spec.name 已在 _tools 中 → 重名也算错误（避免运行时调用的歧义）；
+          4. spec.name 不在 ALLOWED_READ_ONLY_TOOLS 中 → fail-closed 白名单校验。
+             这是 §4.2① 的核心修复：之前 ALLOWED_READ_ONLY_TOOLS 只在文档里
+             列着、运行时从不读取，等于「信任注册」——任何新加的只读工具只要
+             没命中黑名单前缀就能注册进来。现在它变成真正的运行时允许清单：
+             未在清单里的工具一律拒绝，新增只读工具必须**先**进白名单。
         """
         if spec.read_only is False:
             raise PermissionError(
@@ -142,6 +152,13 @@ class AssistantToolRegistry:
                 )
         if spec.name in self._tools:
             raise ValueError(f"工具 {spec.name!r} 已存在，禁止覆盖")
+        # §4.2① 运行时真白名单校验：未在 ALLOWED_READ_ONLY_TOOLS 里的工具一律
+        # 拒绝（fail-closed），杜绝「注册即信任」绕过白名单的漏洞。
+        if spec.name not in ALLOWED_READ_ONLY_TOOLS:
+            raise PermissionError(
+                f"工具 {spec.name!r} 不在只读白名单 ALLOWED_READ_ONLY_TOOLS 中；"
+                "新增只读工具须先加入白名单"
+            )
         self._tools[spec.name] = spec
 
     def register_many(self, specs: Iterable[ToolSpec]) -> None:
