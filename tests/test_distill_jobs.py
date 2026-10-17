@@ -15,9 +15,18 @@
 
 ## 假 provider
 
-与 `tests/test_style_tier.py` 同款：绝不真调 LLM。`extract_narrative_profile`
-是在函数体内部 `from app.llm.provider import get_llm_provider`，所以 monkey-
-patch `app.llm.provider.get_llm_provider` 即可生效。
+`StubProvider` 证据句真的出现在语料里（否则被 `_validate_evidence` 拦掉变成
+rejected），所以可以断言「成功路径真的产出了规则」，而不是只断言「没崩」。
+
+**两个角色都要打桩**（ Writer **和** Distiller ）：
+- Writer 走函数体内 `from app.llm.provider import get_llm_provider`，
+  patch `app.llm.provider.get_llm_provider`；
+- Distiller 走 `resolve_distill_provider()` 里的函数体内
+  `from app.llm import get_distiller_provider`，patch 必须落在 **`app.llm`**
+  这个模块对象上（patch `app.llm.provider.get_distiller_provider` 无效）。
+
+只 patch Writer 是不够的——见 `stub_llm` fixture 的注释：那会让蒸馏真的去打
+真实 Zhipu，把本组用例变成一个环境依赖型 flaky。
 """
 from __future__ import annotations
 
@@ -97,9 +106,47 @@ class BoomProvider:
 
 @pytest.fixture
 def stub_llm(monkeypatch):
-    """把 `get_llm_provider` 换成 StubProvider，并返回同一个实例以便计数。"""
+    """把 Writer 与 Distiller **两个**角色都换成 StubProvider，返回同一实例以便计数。
+
+    ## 为什么必须连 distiller 一起 patch（本组用例曾是个环境依赖型 flaky）
+
+    `extract_narrative_profile` 在 `provider is None` 时调用
+    `resolve_distill_provider()`（narrative.py:1418），而它的规则是
+    「解析出的 distiller 只要**不是** `LocalFallbackLLMProvider` → **就用它**，
+    否则才回落 Writer」（narrative.py:1331）。
+
+    `backend/config/providers.yaml` 默认给 distiller 配了 `provider: "zhipu"` /
+    `model: glm-4-flash` / `max_tokens: 2048`，本机又有真实 api_key，所以解析出来
+    的是**真实 `ZhipuChatProvider`**——只 patch `get_llm_provider`（Writer）
+    根本拦不住蒸馏链路：蒸馏会真的去打 glm-4-flash。
+
+    后果是一条非线性、跨进程的失败链：
+      真实 LLM 被 max_tokens 截断（finish_reason=length）
+        → 该块 JSON 不可解析 → failed_chunks=1
+        → stage 变成「蒸馏完成（1 个语料块调用失败，已跳过）」
+        → `assert done.stage == "蒸馏完成"` 红。
+    网络通不通、模型抽不抽风决定红绿：**这是外部依赖，不是被测代码的行为**。
+
+    ## patch 落点为什么是 `app.llm`
+
+    `resolve_distill_provider()` 是在**函数体内** `from app.llm import
+    get_distiller_provider`（刻意延迟导入，避免 app.style 与 app.llm 顶层循环
+    导入），所以每次调用读的都是 `app.llm` 这个模块对象的属性——patch 落在
+    `app.llm` 上才生效；落在源头 `app.llm.provider.get_distiller_provider` 上，
+    会因为 `from ... import` 已经把名字绑定进 `app.llm` 命名空间而完全失效。
+
+    ## 与「provider 选型」那组测试的关系
+
+    下一节「蒸馏 provider：配了 distiller 就用它」那组用例**故意**不依赖本
+    fixture，各自 monkeypatch 自己要验证的 distiller/writer 语义（配了就用 /
+    没配就回落 / 解析炸也回落），本 fixture 的默认值不会波及它们。
+    """
+    import app.llm as llm_mod
+
     stub = StubProvider()
     monkeypatch.setattr(llm_provider_mod, "get_llm_provider", lambda: stub)
+    # 关键：distiller 角色也要给同一个 stub，否则蒸馏会静默绕开打桩去调真实 Zhipu
+    monkeypatch.setattr(llm_mod, "get_distiller_provider", lambda: stub)
     return stub
 
 
@@ -457,6 +504,40 @@ def test_api_shape_matches_frontend_distill_job_contract(db_session):
     assert shape["n_chapters"] is None
     assert shape["rule_count"] is None
     assert shape["rejected"] is None
+
+
+# —— distiller 角色隔离的回归锁（与下一节「provider 选型」配套的护栏）——
+
+
+def test_stub_llm_isolates_distiller_role_not_just_writer(db_session, stub_llm):
+    """护栏：`stub_llm` 必须连 **distiller** 一起隔离，蒸馏不许泄漏到真实 LLM。
+
+    这是本组环境依赖型 flaky 的根因回归锁。`stub_llm` 早期只 patch 了 Writer
+    （`get_llm_provider`），而 `resolve_distill_provider()` 在本机解析出的是真实
+    `ZhipuChatProvider` 于是直接用它蒸馏——用例红绿取决于 glm-4-flash 有没有
+    被 max_tokens 截断，与被测代码无关。
+
+    这里把「两点承诺」钉死，任一条破了，本组用例就重新变回 flaky：
+      1. `resolve_distill_provider()` 在 `stub_llm` 生效时必须就是那个 stub；
+      2. 走一遍真实提炼，调用**确实落在 stub 上**（calls > 0），且
+         `failed_chunks == 0` —— 有失败块的话，`stage` 会退化成「蒸馏完成
+         （N 个语料块调用失败，已跳过）」，后面的 `stage == "蒸馏完成"` 断言
+         就会再次变成看运气。
+    """
+    from app.style.narrative import resolve_distill_provider
+
+    # 1. provider 选型层面：给的必须是 stub（不是 LocalFallback → 不会回落 Writer）
+    assert resolve_distill_provider() is stub_llm
+
+    # 2. 端到端层面：真跑一次，调用必须落在 stub 上且没有失败块
+    nid = _make_corpus(db_session, 20)
+    proj = _make_project(db_session, nid, tier=TIER_FAST)
+    profile = extract_narrative_profile(db_session, proj, [nid], tier=TIER_FAST)
+
+    assert stub_llm.calls > 0, "stub 一次都没被调用 —— 蒸馏显然去了别处"
+    assert profile.get("failed_chunks") == 0, "有块调用失败，stage 会退化、用例重新 flaky"
+    rules = profile.get("rules") or {}
+    assert sum(len(v) for v in rules.values() if isinstance(v, list)) > 0
 
 
 # ====================================================================
