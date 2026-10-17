@@ -489,7 +489,14 @@ def style_distance(text: str, profile: dict) -> dict:
     选最匹配的 bucket 算 distance，解决「粒度不对齐时距离系统性偏大」的
     老 bug。详见 docs/style_log_buckets_design.md。
     """
-    vec = features(text)
+    base_unit = int(
+        (profile.get("_meta") or {}).get("base_unit_chars")
+        or profile.get("unit_chars")
+        or 0
+    )
+    # 方案 C「长度归一化」：vec 用 text 选中的 bucket 的 unit_chars 算
+    # —— text 走 long bucket → 用 6000 缩（scale=0.81）→ z 更小
+    # v1 path 用 base_unit 兜底（profile.feat 是 base unit 切的）
     base_unit = int(
         (profile.get("_meta") or {}).get("base_unit_chars")
         or profile.get("unit_chars")
@@ -502,10 +509,13 @@ def style_distance(text: str, profile: dict) -> dict:
         if bucket is None:
             # 极端：v2 但 buckets 都空 —— 退回 medium bucket 结构
             bucket = {"unit_chars": base_unit, "feat": {}, "holdout": {}}
+        # 方案 C：vec 用 bucket.unit_chars 算（fit 时也是用这值算 feat）
+        vec = features(text, unit_chars=int(bucket.get("unit_chars") or base_unit or 3000))
     else:
-        # v1 路径：直接用 profile.feat / profile.holdout
+        # v1 path
         bucket_name = "v1"
         bucket = profile
+        vec = features(text, unit_chars=base_unit if base_unit > 0 else 3000)
 
     z = z_scores(vec, bucket)
     abs_z = {k: abs(v) for k, v in z.items()}
@@ -761,7 +771,7 @@ def _fit_single_bucket(
     if not holdout and len(train) > 2:
         train, holdout = train[:-1], train[-1:]
 
-    train_vecs = [features(u) for u in train]
+    train_vecs = [features(u, unit_chars=unit_chars) for u in train]
     feat: dict[str, dict[str, float]] = {}
     for k in FEATURES:
         feat[k] = _summarize([v[k] for v in train_vecs])
@@ -777,13 +787,13 @@ def _fit_single_bucket(
     }
 
     if holdout:
-        d = [metric_mean_abs_z(features(u), bucket) for u in holdout]
+        d = [metric_mean_abs_z(features(u, unit_chars=unit_chars), bucket) for u in holdout]
         bucket["holdout"] = {
             "mean_abs_z": _summarize(d),
             "unit_mean_abs_z": [round(x, 4) for x in d],
         }
         feat_holdout: dict[str, dict[str, float]] = {}
-        hvecs = [features(u) for u in holdout]
+        hvecs = [features(u, unit_chars=unit_chars) for u in holdout]
         for k in FEATURES:
             zs = [
                 abs((v[k] - feat[k]["mean"]) / feat[k]["std"])
