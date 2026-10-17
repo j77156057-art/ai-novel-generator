@@ -93,13 +93,16 @@ class Settings(BaseSettings):
         "nvidia/nemotron-3-ultra-550b-a55b:free"
     )
 
-    # 智谱 GLM（open.bigmodel.cn）：GLM-4-Flash 永久免费、不限 token，中文写作强，国内低延迟
+    # 智谱 GLM（open.bigmodel.cn）：GLM-4-Flash 系列免费不限 token，中文写作强，国内低延迟。
+    # 默认升级到 glm-4-flash-250414（2025-04 快照）：7 类抽取全填，event_type 多样化，
+    # in_story_date 100% 填充，knowledge/state/foreshadows 从 0 提升到 8/6/4，速度 -37%。
+    # 依据：docs/kg-nemotron-compare-redirect.md N=4 实测 + docs/journey_glm_versions_compare.json。
     zhipu_api_key: str = ""
     zhipu_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
-    zhipu_model: str = "glm-4-flash"
-    # 候选链：默认 glm-4-flash（免费不限量，写作主力）→ glm-z1-flash（带推理，慢但稳）
+    zhipu_model: str = "glm-4-flash-250414"
+    # 候选链：250414（默认，最优抽取）→ 旧 glm-4-flash（回退）→ glm-z1-flash（带推理）
     # → glm-4.6 / glm-4.5-air（付费档，长文与复杂结构更好）。链尾两款不免费，仅作末位兜底。
-    zhipu_models: str = "glm-4-flash,glm-z1-flash,glm-4.6,glm-4.5-air"
+    zhipu_models: str = "glm-4-flash-250414,glm-4-flash,glm-z1-flash,glm-4.6,glm-4.5-air"
 
     # 硅基流动 SiliconFlow（api.siliconflow.cn）：国产开源模型最全，新用户送 2000 万 token
     siliconflow_api_key: str = ""
