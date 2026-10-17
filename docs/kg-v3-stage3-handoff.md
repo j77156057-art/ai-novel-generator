@@ -110,6 +110,24 @@ v2.6 smoke 暴露智谱撞 max_tokens=2048 截断。**根因**：provider.py lin
 
 **v2.11 v3 端到端**（带 OR key + 30 章 reference）卡 8 分钟未到 B 段——`upload` HTTP 200 但 body 不含 `id` 字段（KeyError），smoke 持续等响应才看「卡住」。**这条路长度超出单次 background 540s 限制**，需更细化分段跑。
 
+### 3.4 v2.12 端到端真链路跑通（修 A + 根因发现）
+
+**v2.11 v3 KeyError 根因（probe_upload.py 0.3s 200 OK 验证）**：
+- `/api/novels/upload` 真实返字段是 `novel_id`（不是 `id`）—— v2.11 v3 用 `["id"]` 取键 KeyError
+- `/api/generate` 期望 `{"project_id": N}`（不带 `segment_no`）—— v2.11 v3 422 Unprocessable Content
+
+**v2.12 真链路结果**（30 章大奉 reference + nemotron-3-super + 完整 engine）：
+- 段 1: 900s urllib timeout（实际跑 15+ 分钟仍没回）
+- 段 2: **wc=2841 dt=138s**（nemotron 真写 2841 字 / 138 秒）
+- **percentile 仍 100/100**——**换模型不是根除**
+- worst_features: **省略号密度/段均句数/比喻密度/逗号密度**（与智谱相似但**无**「四字格密度」—— nemotron 不爱四字格堆叠）
+
+**v2.12 关键发现**：
+- nemotron 段 2 138s 写 2841 字 ≈ 智谱 78s 写 4747 字 —— nemotron **更慢但字数更稳**
+- 段 1 15+ 分钟不返回 —— **nemotron 30 章 + KG v3 完整 engine 太慢**，单段需 10-15 分钟
+- **percentile 100% = 不是模型问题，是 reference 与 generation 之间的「文风结构差异」**——即使换 nemotron 也仍触发
+- 真正根除路径：① 50+ 章 reference，② 调高 `style_warnings` 阈值从 97.5，③ 接受持续报警
+
 ## 4. 测试约定与当前绿数
 
 - 独立脚本：`cd backend && env -u PYTHONPATH -u VIRTUAL_ENV "<venv python>" tests/test_xxx.py`
