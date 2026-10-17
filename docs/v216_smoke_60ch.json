@@ -1,0 +1,15 @@
+{
+  "ref_chars": {"30章": 93314, "60章": 189687},
+  "fit_buckets_30ch": {
+    "short": {"n_train": 28, "n_holdout": 25, "max_holdout_z": 1.488},
+    "medium": {"n_train": 15, "n_holdout": 11, "max_holdout_z": 1.272},
+    "long": {"n_train": 8, "n_holdout": 5, "max_holdout_z": 1.915}
+  },
+  "fit_buckets_60ch": {
+    "short": {"n_train": 55, "n_holdout": 53, "max_holdout_z": 1.384},
+    "medium": {"n_train": 29, "n_holdout": 25, "max_holdout_z": 1.275},
+    "long": {"n_train": 15, "n_holdout": 12, "max_holdout_z": 1.613}
+  },
+  "结论": "60 章 19 万字让 long bucket 留出 5→12 单元，但 max holdout z 从 1.915 降到 1.613（留出分布更紧凑）。distance vs 留出 max 比例未改善——percentile 仍 100/100。更多语料不是 percentile 根除路径。",
+  "真链路结果": "smoke_v216.py 60 章 19 万字 + 智谱 250414 真链路段 1 timeout 600s（fit profile 阻塞 + 智谱慢）；uvicorn 被 kill，无 percentile 数据"
+}
