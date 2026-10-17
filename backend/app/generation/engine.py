@@ -548,7 +548,7 @@ def _detect_ai_flavor(text: str) -> dict:
 def _should_rewrite(text: str, forbidden: dict | None) -> tuple[bool, list[str]]:
     """判断是否需要重写。命中 AI 腔模式或反向禁忌时返回 True。
 
-    阈值：AI 腔模式命中 ≥ 5 次，或反向禁忌命中 ≥ 3 次。
+    阈值：AI 腔模式命中 ≥ 5 次，或反向禁忌命中 ≥ 2 次。
     """
     reasons = []
     flavor = _detect_ai_flavor(text)

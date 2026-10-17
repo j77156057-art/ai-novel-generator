@@ -2,7 +2,7 @@
 
 - 日期：2026-10-17
 - 分支：`feat/resume-push-2026-10`（本地 HEAD `63119b6`；远程已推送锚点 `4eaddf0`）
-- 状态：**评估项已大部分落地并经独立验证；仅 ③ 重生成缺 AI 腔重写待用户拍板（见 §4.2 / §6）**
+- 状态：**评估项已全部落地并经独立验证；③ 重生成 AI 腔检测+告警（方案 b）已落地（见 §4.2）**
 - 前提基线：Phase 0 已交付（`ea85d6b`，重写环节加原文对照，仅完整档）
 - 证据口径：本文标注 `文件:行号` 的结论，凡标【亲验】者由主理人独立复跑确认，非采信单一来源。
 
@@ -131,16 +131,17 @@
 |---|---|---|---|
 | `ALLOWED_READ_ONLY_TOOLS`（`registry.py:63`）运行时未被读取（R5） | 🟢 已修 | `c67f2ac` | `register()` 新增 fail-closed 校验：不在白名单的工具抛 `PermissionError`（见 R5 与 `tests/test_registry_whitelist.py` T1/T2/T3） |
 | `registry.py` docstring 称 audit 工具「写审计两表」与实现不符 | 🟢 已订正 | `c67f2ac` | `:54-62` 注释改为：audit 工具 callable 纯读，写入在路由层（`routers/assistant.py`） |
-| `regenerate_segment_stream` 不经 AI 腔重写（无 `_should_rewrite`） | 🟡 待拍板（见 §6 ③） | — | 设计项，未实现 |
+| `regenerate_segment_stream` 不经 AI 腔自动重写，但已加零成本 AI 腔检测+告警（方案 b，复用 `_should_rewrite` 纯计数） | 🟢 已落地 | `73719c9`（实现）+ `3360e73`（QA 对抗） | regen done 带 `rewrite_info` 告警信号（`alert:true`、不重写）；自动重写留作方案 c opt-in |
 | `frontend/src/api/types.ts` done 类型字段少于后端实际下发 | 🟢 已对齐 | `63119b6` | `GenerateStreamDoneMeta` 补 `summary_tree`/`style_warning`/`rewrite_info`；`RegenerateStreamDoneMeta` 补 `summary_tree` |
 
-**③ 重生成缺 AI 腔重写（设计项，未实现）**：
+**③ 重生成缺 AI 腔重写——已落地方案 b（零成本检测+告警）**：
 
 - 现状：`_should_rewrite`（`engine.py:548`）是**纯启发式、零 LLM 调用**（`_detect_ai_flavor` + 反向禁忌计数）；真正重写的 `_rewrite_with_evidence` → `_gather_rewrite_evidence` 的 **B 路会调 `hybrid_search` 全量加载整本语料**（`engine.py:621-623`）——正是 §8.1 刚从 regenerate 砍掉的代价。故「镜像续写重写」会 undo §8.1，必须单独拍板。
-- 三选项（建议先走 (b)）：
+- 决策（用户拍板选 b）：
   - **(a) 完整镜像续写重写**：否决——会 undo §8.1 的语料加载节省，得不偿失。
-  - **(b) 只检测 + 告警（零成本）**：regen done 携带 `rewrite_info`（已具备 `63119b6` 的字段位）提示「本段可能残留 AI 腔，未自动修」，让重生成「说实话」。**建议先立。**
-  - **(c) 检测 + 轻量重写**：只走 A 路哨兵历史告警、不加载语料、多一次 chat。**作为后续 opt-in**，若用户要自动修再立。
+  - **(b) 只检测 + 告警（零成本）**：🟢 **已落地**（`73719c9` 实现 + `3360e73` 独立 QA 对抗验证）。regen done 携带 `rewrite_info` 告警信号（`alert:true`、`rewritten_chars:null`、附 `reasons`），提示「本段可能残留 AI 腔，未自动修」，让重生成「说实话」。复用 `63119b6` 已开通的前端 `RegenerateStreamDoneMeta.rewrite_info` 字段位。
+  - **(c) 检测 + 轻量重写**：只走 A 路哨兵历史告警、不加载语料、多一次 chat。**仍作为后续 opt-in**，若用户要自动修再立。
+- 独立 QA 攻击验证（9 条，全通过）核心不变量：命中/干净/禁忌告警三场景均 `chat_call_count==0`（regen 不调 `chat`，排除方案 c 误触发）、落库文本与 stub 原始文本逐字节相等（无任何重写）、阈值边界 5 命中告警 / 4 不告警、反向禁忌 2 命中告警 / 1 不告警、`rewrite_info` 可 JSON 序列化。
 
 ---
 
@@ -151,9 +152,9 @@
 1. 🟢 **§4.1 口径差已修**（`b1e13d1`）——重生成纳入叙事文风块。
 2. 🟢 **方案 C（Phase 0.5）已落地**（`4592119`）——新增 `_rag_query_targeted`（`engine.py:165`）改造 `build_context`（`:401`），配套 `tests/test_rag_query_targeted.py`（11 条 + 变异取证 M1–M9），全量门禁已含。
 3. 🟢 **§4.2 四项口径差已修三项**（`c67f2ac` R5 运行时白名单真校验 + docstring 订正；`63119b6` 前端 done 类型对齐）。
-4. 🟡 **③ 重生成缺 AI 腔重写**：设计项，走 §6 三选项，建议先立 (b)。
+4. 🟢 **③ 重生成 AI 腔检测+告警（方案 b）已落地**：`73719c9` 实现 + `3360e73` 独立 QA 对抗验证；自动重写留作方案 c opt-in。
 
-**待用户拍板**：仅剩 ③（a/b/c 见 §6）。
+**待用户拍板**：无——③ 已按方案 b 落地，评估项全部结清。
 
 ---
 
