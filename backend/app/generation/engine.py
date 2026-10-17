@@ -218,6 +218,36 @@ def _rag_query_targeted(reminders: dict, prior: list[str], project: Project) -> 
     return query[:_C_QUERY]
 
 
+def _constraints_from(reminders: dict, project: Project) -> dict:
+    """组装**真正下发进 prompt** 的那份锁定名单（角色名 + 未填伏笔）。
+
+    constraints 是真正下发进 prompt 的那份（provider 会把它追加到 user 末尾做近因
+    提醒，见 `llm/provider._apply_constraints`），因此它必须与 system 提示里的
+    【角色人设约束】/【未填伏笔】用**同一个合并口径**，否则会出现「system 里列了、
+    尾部自称完整的锁定名单却没列」的自相矛盾提示词，而漏掉的恰是最高权威层
+    plot_bible（用户构思）。口径统一在 `prompts.merged_constraint_items`。
+
+    抽成本函数（2026-10-17）是为了让重生成路径**不必**为这一个键跑一整轮
+    `build_context`：那条路会为 RAG 与风格样例各加载一遍全部 `NovelChunk`，
+    而重生成的 user prompt 明确不带 RAG 素材（见 `_build_generation_prompts`），
+    加载结果全部丢弃。
+
+    Args:
+        reminders: `get_reminders(db, project.id, source="generated")` 的返回值。
+        project: 项目，只用它的 `plot_bible`（最高权威层）。
+
+    Returns:
+        `{"characters": [角色名...], "plotholes": [伏笔问题...]}`。
+    """
+    chars, fores = merged_constraint_items(reminders, project.plot_bible)
+    return {
+        "characters": [
+            c.get("name") for c in chars if isinstance(c, dict) and c.get("name")
+        ],
+        "plotholes": [f for f in fores if f],
+    }
+
+
 def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -> dict:
     """生成后把本段事实增量合并进 generated 图谱与事实账本（闭环）。
 
@@ -394,18 +424,9 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None) -> d
         db, project, novel_ids, exclude_texts=set(rag_context)
     ) if novel_ids else []
 
-    # constraints 是**真正下发进 prompt** 的那份（provider 会把它追加到 user 末尾做
-    # 近因提醒，见 llm/provider._apply_constraints），因此它必须与 system 提示里的
-    # 【角色人设约束】/【未填伏笔】用**同一个合并口径**，否则会出现「system 里列了、
-    # 尾部自称完整的锁定名单却没列」的自相矛盾提示词，而漏掉的恰是最高权威层
-    # plot_bible（用户构思）。口径统一在 prompts.merged_constraint_items。
-    chars, fores = merged_constraint_items(reminders, project.plot_bible)
-    constraints = {
-        "characters": [
-            c.get("name") for c in chars if isinstance(c, dict) and c.get("name")
-        ],
-        "plotholes": [f for f in fores if f],
-    }
+    # constraints = 真正下发进 prompt 的锁定名单（口径与 system 提示同源，
+    # 详见 _constraints_from 的 docstring）。
+    constraints = _constraints_from(reminders, project)
 
     return {
         "reminders": reminders,
@@ -997,6 +1018,7 @@ def _build_generation_prompts(
     novel_ids: list[int] | None = None,
     max_chars: int | None = None,
     provider=None,
+    reminders: dict | None = None,
 ):
     """组装提示词；`before_segment` 给定时的前情**只取该段之前**（重生成用）。
 
@@ -1004,9 +1026,20 @@ def _build_generation_prompts(
     （`summary_tree.tree_before`），再交给同一套 compose_prior——
     这样重生成与正常续写的**前情口径完全一致**（同样的分层、同样的预算），
     避免出现「正常续写有主线骨架、重生成没有」这种隐性不一致。
+
+    `reminders`（2026-10-17）：调用方已加载的提醒包。重生成路径用它同时喂
+    system 提示与尾部的 constraints ——**同一个对象**，不只是省一次查询，更是
+    防止两次查询之间发生并发写入，导致「system 列了一套锁定名单、尾部
+    constraints 列了另一套」的自相矛盾提示词。为 None 时本函数自行加载。
+
+    `novel_ids` 目前**未被使用**：重生成有意不带 RAG 素材（见下方 `[]` 实参），
+    保留参数以维持调用方契约。
     """
     if max_chars is None:
         max_chars = project.generation_length or 3000
+
+    if reminders is None:
+        reminders = get_reminders(db, project.id, source="generated")
 
     tree = _summary_tree(project)
     if before_segment is not None:
@@ -1018,7 +1051,7 @@ def _build_generation_prompts(
         tree, budget_chars=budget_for_generation(project.generation_length)
     )
     system = build_system_prompt(
-        project.title, get_reminders(db, project.id, source="generated"),
+        project.title, reminders,
         _style_info(project), project.plot_bible, _style_profile(db, project),
         _style_narrative(db, project),
     )
@@ -1047,6 +1080,9 @@ def regenerate_segment_stream(
     语义：只替换指定 segment_no 的 text/summary，不改动其他段的 text；
     后续段的「上下文」严格说应基于新摘要，但为不引发级联重写，仅重建摘要树
     （L1 重排 + L2/L3 整体重算），保证「未来」续写连贯。已落库的后段正文保留。
+
+    `novel_ids` 目前**未被使用**——重生成有意不带 RAG 素材（见
+    `_build_generation_prompts` 的 `[]` 实参），保留参数以维持调用方契约。
     """
     from app.llm.provider import get_llm_provider
 
@@ -1065,13 +1101,20 @@ def regenerate_segment_stream(
     if target is None:
         raise ValueError(f"段 {segment_no} 不存在，无法重新生成")
 
+    # 提醒包**只加载一次**，同一个对象同时喂 system 提示与尾部 constraints：
+    # 除了省一次查询，更是防止两次查询之间发生并发写入，导致「system 列了一套
+    # 锁定名单、尾部 constraints 列了另一套」的自相矛盾提示词。
+    reminders = get_reminders(db, project.id, source="generated")
+
     # 前情 = 只取该段之前的树（截断时若 L3 混入了被替换内容，会自动丢弃并重建）
     system, user, max_chars = _build_generation_prompts(
         db, project, before_segment=segment_no, novel_ids=novel_ids,
-        max_chars=max_chars, provider=provider,
+        max_chars=max_chars, provider=provider, reminders=reminders,
     )
-    # constraints 与正常续写同源（角色/伏笔的锁定名单不能因重生成而变），只算一次
-    constraints = build_context(db, project, novel_ids=novel_ids)["constraints"]
+    # constraints 与正常续写同源（角色/伏笔的锁定名单不能因重生成而变）。
+    # 只组装这一个 dict，**不跑 build_context**：那条路会为 RAG 与风格样例各加载
+    # 一遍全部 NovelChunk，而重生成的 user prompt 不带 RAG 素材，结果全部丢弃。
+    constraints = _constraints_from(reminders, project)
 
     pieces: list[str] = []
     for piece in provider.stream_chat(system, user, constraints=constraints):
