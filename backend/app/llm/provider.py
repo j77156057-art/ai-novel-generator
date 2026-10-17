@@ -598,6 +598,7 @@ def get_llm_provider() -> LLMProvider:
             settings.openrouter_base_url,
             settings.openrouter_model,
             models=settings.openrouter_model_list,
+            max_tokens=settings.writer_max_tokens,
         )
     elif settings.llm_provider == "zhipu" and settings.zhipu_api_key:
         _PROVIDER = ZhipuChatProvider(
@@ -605,6 +606,7 @@ def get_llm_provider() -> LLMProvider:
             settings.zhipu_base_url,
             settings.zhipu_model,
             models=settings.zhipu_model_list,
+            max_tokens=settings.writer_max_tokens,
         )
     elif settings.llm_provider == "siliconflow" and settings.siliconflow_api_key:
         _PROVIDER = SiliconFlowChatProvider(
@@ -612,6 +614,7 @@ def get_llm_provider() -> LLMProvider:
             settings.siliconflow_base_url,
             settings.siliconflow_model,
             models=settings.siliconflow_model_list,
+            max_tokens=settings.writer_max_tokens,
         )
     elif settings.llm_provider == "minimax" and settings.minimax_api_key:
         _PROVIDER = MiniMaxChatProvider(
@@ -619,6 +622,7 @@ def get_llm_provider() -> LLMProvider:
             settings.minimax_base_url,
             settings.minimax_model,
             models=settings.minimax_model_list,
+            max_tokens=settings.writer_max_tokens,
         )
     # ------------------------------------------------------------------
     # 通用 OpenAI 兼容渠道（第 8 步新增，判据与上面 5 个分支同形）。
@@ -643,11 +647,13 @@ def get_llm_provider() -> LLMProvider:
             settings.llm_base_url or settings.openai_base_url,
             settings.openai_model,
             models=settings.openai_model_list,
+            max_tokens=settings.writer_max_tokens,
         )
     elif settings.llm_provider == "dashscope" and settings.dashscope_api_key:
         base = settings.llm_base_url or settings.dashscope_base_url
         _PROVIDER = DashScopeChatProvider(
-            settings.dashscope_api_key, base, settings.llm_model
+            settings.dashscope_api_key, base, settings.llm_model,
+            max_tokens=settings.writer_max_tokens,
         )
     else:
         # 未配置 key 或显式 local：降级本地兜底，保证离线可跑
