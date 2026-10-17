@@ -907,6 +907,7 @@ def _build_generation_prompts(
     system = build_system_prompt(
         project.title, get_reminders(db, project.id, source="generated"),
         _style_info(project), project.plot_bible, _style_profile(db, project),
+        _style_narrative(db, project),
     )
     user = build_user_prompt(
         l1_chain(tree),
