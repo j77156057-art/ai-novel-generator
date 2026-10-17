@@ -225,6 +225,9 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         "prior_blocks": ctx["prior_blocks"],
         "prior_report": ctx["prior_report"],
         "rag_context": ctx["rag_context"],
+        # Phase 0.5：回传这次检索实际用的查询词（目标侧 + 衔接侧）。
+        # 零成本（串本就在内存里），让「新查询词 vs 上一段摘要」的 A/B 不必跑生成。
+        "rag_query": ctx.get("rag_query", ""),
         "style_exemplars": ctx["style_exemplars"],
         "system_prompt": system,
         "user_prompt": user,

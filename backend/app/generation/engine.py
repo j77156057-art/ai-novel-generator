@@ -110,6 +110,114 @@ def _rag_query(prior: list[str], project: Project) -> str:
     return " ".join(p for p in parts if p)
 
 
+# ─── Phase 0.5：定向检索查询词（2026-10-17）────────────────────────────────
+#
+# 缺陷：`_rag_query` 拿 `prior[-1]` 当检索词——那是**刚写完那段**的摘要，描述的不是
+# 「接下来要写什么」；首段则退化成「书名 + 大纲首项」（大纲是整篇的，不按段对齐）。
+# 修法：查询词 = 「目标侧（未填伏笔 + 角色名，build_context 已加载，零额外 IO）」
+#       + 「衔接侧（prior[-1] 尾部窗口）」；两者皆空则**逐字节**回到旧行为。
+#
+# 三个常数**先实测后定值**，实测口径：只读打开 backend/novel_dev.db
+# （sqlite uri mode=ro，不进测试、不入库的临时脚本）。
+
+#: 开关：置 False 即逐字节恢复改动前行为（设计文档 §3.2 / §9 回滚手段）。
+_RAG_QUERY_TARGETED = True
+
+#: 目标侧**单项**截断上限（字符）。
+#: 实测：`source='generated'` 且 `props.status='open'` 的伏笔 question 长度
+#: 6 / 8 / 8 / 11 / 14 —— 中位 8、最长 14；角色名 2~3 字符。
+#: 取 40 = 实测最长值的 2.86 倍（真实数据永不触及），同时等于设计文档 §3.1
+#: 「上界情景」用的「每条伏笔 40 字符」口径：单条病态长句不能吃光整个查询词。
+_C_ITEM = 40
+
+#: 衔接侧（`prior[-1]` 尾部窗口）保留的字符数。
+#: 实测（只读 backend/novel_dev.db）：`_prior_summaries` **实际返回的串长**为
+#: 24 / 29 / 38 / 44 / 46 字符（n=5，中位 38、最长 46；走扁平 `projects.summary`
+#: 兜底的旧项目，其项串与 summary_tree 的 L1 项同源同长度）。
+#: 故 200 在本库**永不触发**——它的作用不是「压真实分布」，而是对超出 L1 惯例
+#: 长度的**病态摘要**兜底，并给「目标侧 + 衔接侧」的总预算划一条可算的上界。
+#:
+#: 订正（QA round 2）：本注释与 e43830e 的提交正文原写「旧查询词实测 141~278，
+#: 中位 230、最长 278」「200 收窄 28%」——那是**误量**：量的对象是
+#: `generations.summary` 的 **JSON 列字符串长度**（CJK 被 `\uXXXX` 转义成每字
+#: 6 字符，外加 `{"text": ...}` 信封），不是 `_prior_summaries` 返回的串长度。
+#: 真实分布是上面的 24~46，据此的「收窄 28%」不成立，已删除该论断。
+_C_TAIL = 200
+
+#: 查询词总长上限（字符）。
+#: 预算算式（逐项写出，便于核对）：伏笔 3×_C_ITEM = 120；项间分隔 2；
+#: ⇒ target = 122；target 与 tail 之间 1 个空格；tail = _C_TAIL = 200；
+#: ⇒ 122 + 1 + 200 = 323 ≤ 360，余 37 字符，可再容纳约 12 个 2~3 字角色名
+#: （每个占「名 + 1 个空格」）。
+#: 另一侧依据：把最坏情景压到 360。该情景的**精确口径**是
+#: 「50 条 40 字伏笔 + 20 个 6 字角色名」⇒ target = 50*40 + 20*6 + (50+20-1) = 2189；
+#: 再加 1 个分隔符与**已按 `_C_TAIL` 收窄到 200** 的尾巴 ⇒ 2189 + 1 + 200 = 2390，
+#: 即「已收窄、尚未做总长截断」时约 2390 字符（不是把 2000 字原始前情整条算进去的
+#: 4190——那是不截断、也不收窄尾巴的另一种口径）。
+#: `app/tokenize.py:19` 对 CJK **逐字切分**，故查询词长度 ≈ BM25 查询项数。
+#: 与旧行为的关系：旧实现**无封顶**（实测 `_prior_summaries` 最长 46 字符），
+#: 所以本上限的价值不是「更省」，而是「确定」——把长度从「随摘要长度漂移」
+#: 变成可算的常数。订正：原记「不超过旧最坏值 278 的 1.3 倍」的基准 278 是
+#: JSON 信封长度，错误，该论断已删除。
+_C_QUERY = 360
+
+
+def _rag_query_targeted(reminders: dict, prior: list[str], project: Project) -> str:
+    """Phase 0.5：把检索词从「上一段摘要」改为「本段目标 + 衔接侧」。
+
+    优先级（目标侧在前，因为「接下来该收的线」比「刚写完什么」更贴近本段）：
+
+    1. 目标侧：`reminders.unresolved_plotholes[*].question`（未填伏笔）→
+       `reminders.character_constraints[*].name`（角色约束），每项压空白后截 `_C_ITEM`；
+    2. 衔接侧：`prior[-1]` 的尾部 `_C_TAIL` 字符；
+    3. **回退**：目标侧与衔接侧**皆空** → 逐字节返回 `_rag_query(prior, project)`。
+       这只覆盖「无目标信号**且**无前情」（自由生成 / 首段无前情）一种情形。
+       反过来的情形——**目标侧为空但有前情**——走的是第 2 步：查询词 = `prior[-1]`
+       的尾部窗口。那是设计内的**收窄**，与旧行为**不同**（旧的会原样返回整条
+       `prior[-1]`），不要把它读成"没目标信号就和以前一样"。
+    4. 总长压到 `_C_QUERY`。
+
+    **预算悬崖（既定后果，不是 bug）**：实现是
+    `query = (target + " " + tail).strip()[: _C_QUERY]`，故 `len(target)` 逼近
+    `_C_QUERY` 时衔接侧会被整段截掉——`len(target) == _C_QUERY - 1` 时只剩 1 个
+    分隔空格；`len(target) >= _C_QUERY` 时连空格都不剩。也就是说「衔接侧总在」
+    **不成立**：目标侧优先，且目标侧可以吃掉整个预算（50 条实测 14 字伏笔
+    = 50*14+49 = 749 > 360，必然触发）。改常数时请同时看
+    `tests/test_rag_query_targeted.py::test_t4c_query_budget_cliff_drops_tail`。
+
+    成本不变：`reminders` 与 `prior` 都已在 `build_context` 里算好，本函数只做
+    字符串拼接；`hybrid_search` 仍每本语料 1 次（`retrieval/search.py` 的检索耗时
+    与查询词长度无关，只与语料规模有关）。
+    """
+    if not _RAG_QUERY_TARGETED:
+        return _rag_query(prior, project)
+
+    box = reminders or {}
+    items: list[str] = []
+    for hole in box.get("unresolved_plotholes") or []:
+        if isinstance(hole, dict):
+            # 压空白：`question` 里的换行会让日志/预览按行断裂，且对逐字分词无意义
+            text = " ".join(str(hole.get("question") or "").split())
+            if text:
+                items.append(text[:_C_ITEM])
+    for char in box.get("character_constraints") or []:
+        if isinstance(char, dict):
+            text = " ".join(str(char.get("name") or "").split())
+            if text:
+                items.append(text[:_C_ITEM])
+    target = " ".join(items)
+
+    # `str[:n]` 在串本身短于 n 时原样返回，无需先比长度
+    tail = prior[-1][-_C_TAIL:] if prior and prior[-1] else ""
+
+    if not target and not tail:
+        return _rag_query(prior, project)
+
+    # 两者只有一个非空时，中间的单个空格由 strip 去掉，不做分支判断
+    query = (target + " " + tail).strip()
+    return query[:_C_QUERY]
+
+
 def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -> dict:
     """生成后把本段事实增量合并进 generated 图谱与事实账本（闭环）。
 
@@ -256,11 +364,14 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None) -> d
         novel_ids = list(project.reference_novel_ids or [])
 
     rag_context: list[str] = []
+    # Phase 0.5：查询词由「本段目标 + 衔接侧」拼成（见 _rag_query_targeted）。
+    # 未选语料时不检索、也不报非空查询词——可观测字段必须与真实检索一致。
+    rag_query = ""
     if novel_ids:
-        query = _rag_query(prior, project)
+        rag_query = _rag_query_targeted(reminders, prior, project)
         for nid in novel_ids:
             try:
-                hits = hybrid_search(db, nid, query, k=4)
+                hits = hybrid_search(db, nid, rag_query, k=4)
                 rag_context.extend(h["text"] for h in hits)
             except Exception:  # noqa: BLE001 - 单本检索失败不阻断其余语料续写
                 continue
@@ -304,6 +415,8 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None) -> d
         "prior_blocks": prior_blocks,
         "prior_report": prior_report,
         "rag_context": rag_context,
+        # Phase 0.5 可观测：这次到底拿什么词去检索（供 plan 预览与人工 A/B 对照）
+        "rag_query": rag_query,
         "style_exemplars": style_exemplars,
         "rag_has_forbidden": rag_has_forbidden,
         "novel_ids": novel_ids,
