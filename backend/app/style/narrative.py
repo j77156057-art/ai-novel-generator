@@ -61,6 +61,12 @@ NARRATIVE_VERSION = 7
 #: 603 章 × 15% = 90 章，分 4~5 块。平衡覆盖面与 LLM 调用成本。
 SAMPLE_RATIO = 0.15
 
+#: 采样的字数下限：短篇/短语料若按比例采样会砍掉过多对白，
+#: 导致角色声音维度失效（实测：10 章语料只提得出 1 个角色声音）。
+#: 采样结果若低于此字数，则扩容到达到下限；若全量仍不足，则全取。
+#: 30 万字 ≈ 100+ 章网文，足够覆盖角色对白与场景多样性。
+MIN_SAMPLE_CHARS = 300_000
+
 #: 每块最少章节数（太少提炼不出模式）
 MIN_CHAPTERS_PER_CHUNK = 5
 
@@ -550,7 +556,18 @@ def _sample_chapters_v6(
     """
     if not chapters:
         return []
-    target = max(10, int(len(chapters) * ratio))
+    total_chars = sum(len(t) for _, t in chapters if t)
+
+    # 短篇保护：若全语料字数就不足下限，直接全取（没有砍的空间）。
+    if total_chars <= MIN_SAMPLE_CHARS:
+        return list(chapters)
+
+    # 目标章节数：按比例取，但保证采样字数不低于下限。
+    # 平均章长估算需要多少章才够 MIN_SAMPLE_CHARS。
+    avg_ch = total_chars / max(len(chapters), 1)
+    ratio_target = int(len(chapters) * ratio)
+    chars_target = int(MIN_SAMPLE_CHARS / max(avg_ch, 1))
+    target = max(10, ratio_target, chars_target)
     if len(chapters) <= target:
         return list(chapters)
 
