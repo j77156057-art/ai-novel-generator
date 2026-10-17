@@ -595,9 +595,15 @@ export interface RegenerateStreamDoneMeta {
   /**
    * 叙事归档树（后端 `done` 实际发射的 `summary_tree`，dict）。
    * 旧后端不返回 → undefined → 不提示（保守，不误报）。
-   * 注意：regen 路径不发射 `style_warning` / `rewrite_info`（已与 engine.py:1154 核对）。
+   * 注意：regen 路径不发射 `style_warning`（未做文风距离计算）；`rewrite_info` 仅作 AI 腔告警信号（命中时 `alert:true`、不重写），见 `engine.py` 的 `regenerate_segment_stream`。
    */
   summary_tree?: Record<string, unknown>;
+  /**
+   * 零成本 AI 腔告警（后端 `done` 实际发射的 `rewrite_info`，dict | None）。
+   * regen 路径只检测 + 告警、不做自动重写：命中时 `alert:true` 且 `rewritten_chars:null`。
+   * 旧后端不返回 → undefined → 不提示（保守，不误报）。
+   */
+  rewrite_info?: Record<string, unknown> | null;
 }
 
 // ==================================================================

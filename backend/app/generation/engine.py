@@ -1124,6 +1124,22 @@ def regenerate_segment_stream(
     text = _strip_thinking("".join(pieces))
     summary = provider.summarize(text)
 
+    # —— 零成本 AI 腔检测 + 告警（方案 b，见 docs/architecture/2026-10-17-phase1-writer-tool-calling-assessment.md §4.2 ③）——
+    # 复用 _should_rewrite 的纯计数判据（与续写路径口径一致，零 LLM 调用、不加载语料）。
+    # 命中即带 rewrite_info 告警信号，提示「本段可能残留 AI 腔，未自动修」。
+    # 故意不做自动重写：重写 B 路会全量加载语料（undo §8.1 的节省），留作后续 opt-in（方案 c）。
+    _regen_narrative = _style_narrative(db, project)
+    _regen_forbidden = (_regen_narrative or {}).get("forbidden") or {}
+    rewrite_info = None
+    _need_rewrite, _reasons = _should_rewrite(text, _regen_forbidden)
+    if _need_rewrite:
+        rewrite_info = {
+            "alert": True,
+            "reasons": _reasons,
+            "original_chars": len(text),
+            "rewritten_chars": None,
+        }
+
     target.text = text
     target.summary = {"text": summary}
     target.chapter_range = f"段{segment_no}"
@@ -1152,6 +1168,7 @@ def regenerate_segment_stream(
         "chars": len(text),
         "summary": summary,
         "summary_tree": tree_stats,
+        "rewrite_info": rewrite_info,
         "id": target.id,
         # 与流式续写路径（generate_next_segment_stream）的 done 键对齐，
         # 让重生成也带上簿记统计，可被前端/API 观测。
