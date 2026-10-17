@@ -1,0 +1,40 @@
+{
+  "warnings": [
+    {
+      "segment_no": 2,
+      "generated_at": "2026-10-17T23:30:12.846479+00:00",
+      "percentile": 100.0,
+      "mean_abs_z": 1.195,
+      "worst_features": [
+        "问号密度",
+        "比喻密度",
+        "句长CV",
+        "句号密度",
+        "短句占比"
+      ],
+      "warn_message": "本段文风偏离档案（percentile 100.0，高于阈值 99.5）。最偏的特征：问号密度、比喻密度、句长CV。建议重写或手动调整。",
+      "bucket": "medium",
+      "scale_ratio": 0.89,
+      "chars": 2662
+    },
+    {
+      "segment_no": 1,
+      "generated_at": "2026-10-17T23:29:36.981586+00:00",
+      "percentile": 100.0,
+      "mean_abs_z": 1.27,
+      "worst_features": [
+        "句长CV",
+        "短句占比",
+        "句号密度",
+        "句长均值",
+        "对白段占比"
+      ],
+      "warn_message": "本段文风偏离档案（percentile 100.0，高于阈值 99.5）。最偏的特征：句长CV、短句占比、句号密度。建议重写或手动调整。",
+      "bucket": "medium",
+      "scale_ratio": 0.83,
+      "chars": 2491
+    }
+  ],
+  "total": 2,
+  "truncated": false
+}
