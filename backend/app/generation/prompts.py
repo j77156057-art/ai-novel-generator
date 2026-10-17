@@ -251,6 +251,11 @@ def build_user_prompt(
     else:
         prior = "（首段，无前情）"
 
+    # v2.7：智谱弱模型「写约 N 字」是软性，常 1300-1500 字就停
+    # （v2.7 smoke 实测段 1 wc=1359 / 目标 3000 = 45%）。
+    # directive 模板里写「写不少于 min_chars」是硬性下限，让模型倾向写够才出 stop marker。
+    min_chars = int(max_chars * 0.8)
+
     rag = "\n---\n".join(rag_context) if rag_context else "（无检索上下文，凭风格自由发挥）"
 
     outline_text = ""
@@ -303,7 +308,7 @@ def build_user_prompt(
     if is_opening:
         directive = (
             f"这是整篇的**开头**。请从建立人物与情境写起，抛出一个推动故事的冲突或事件，"
-            f"节奏舒展地写约 {max_chars} 字；**本节只负责铺陈与设悬，不要收尾、不要给出结局、"
+            f"节奏舒展地写不少于 {min_chars} 字（建议 {max_chars} 字）；**本节只负责铺陈与设悬，不要收尾、不要给出结局、"
             f"不要写『从此……』式的收束**，把更大的冲突留到后面展开。"
             f"风格与节奏以系统提示中的【风格】与【文风要求】为准。"
             # v2.6：节点粒度根治——告诉模型在节末写 stop marker，
@@ -313,7 +318,7 @@ def build_user_prompt(
         )
     else:
         directive = (
-            f"请续写约 {max_chars} 字，并在本节结尾停在某个仍未解决的冲突 / 悬念 / 动作中途，"
+            f"请续写不少于 {min_chars} 字（建议 {max_chars} 字），并在本节结尾停在某个仍未解决的冲突 / 悬念 / 动作中途，"
             f"为下一节留钩子——不要在此收束主线或给出结局。"
             f"风格与节奏以系统提示中的【风格】与【文风要求】为准。"
             # v2.6：节点粒度根治——同上
