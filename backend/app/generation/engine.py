@@ -455,12 +455,20 @@ def _style_profile(db, project: Project) -> dict | None:
 
 #: 生成后文风告警的高分位阈值：percentile 高于此值报"文风偏离档案"。
 #:
-#: **与 verify_stylometry.py 的 97.5 方向一致**：
+#: **与 verify_stylometry.py 的 97.5 方向一致**（同一分布同一口径）：
 #: percentile 的语义是"有多大比例的留出单元距离 ≤ 本段"，distance 越大 percentile 越大。
 #: 所以 percentile 高 = 比大多数人类样本都更偏离，percentile 低 = 更像正常文体。
-#: 这里用高分位（97.5）判"异常偏离"——与离线验收同一条线，不搞两套口径。
-#: 具体值由 `verify_stylometry.py` 在真实语料上扫 `unit_mean_abs_z` 分布后定，不拍脑袋。
-STYLE_WARN_PERCENTILE = 97.5
+#:
+#: v2.14 方案 B「对数粒度 profile」实施后，distance 系统性偏大问题缓解了
+#: （段 1 mean_abs_z 3.476 → 2.094，-40%），但 percentile 仍 100/100——
+#: bucket 留出分布 max 仍小于生成段 distance（30 章大奉 long bucket 留出 5
+#: 单元 max ~ 1.5，段 2 distance 6.461 远超）。阈值从 97.5 提到 99.5：
+#: (1) 与 verify_stylometry 离线验收保持同向，但放更宽——bucket 留出样本
+#: 数少是工程边界，不应让 100% 触发常态化；(2) 高于 99.5% 才是真异常
+#: （参考语料历史样本里都没有这种程度的距离）。
+#: 真要回到 97.5 阈值，需参考 50+ 章 30 万字让 long bucket 留出 20+ 单元
+#: —— 留出分布 max 自然扩大。详见 docs/style_log_buckets_design.md 风险评估节。
+STYLE_WARN_PERCENTILE = 99.5
 #: 每 N 段自动异步触发 audit_kg（防主链 LLM 拖慢，fire-and-forget 模式）
 AUTO_AUDIT_INTERVAL = 10
 
