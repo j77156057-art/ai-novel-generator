@@ -585,6 +585,11 @@ def _style_warning(text: str, profile: dict | None) -> dict | None:
             f"最偏的特征：{'、'.join(k for k, _ in (d.get('worst') or [])[:3]) or '未知'}。"
             "建议重写或手动调整。"
         ),
+        # 方案 B「对数粒度 profile」：把 bucket / scale_ratio / chars 一起给前端
+        # Style 审计 subtab 可显式展示「本段走 long bucket / scale_ratio 2.0x」
+        "bucket": d.get("bucket"),
+        "scale_ratio": d.get("scale_ratio"),
+        "chars": d.get("chars"),
     }
 
 

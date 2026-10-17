@@ -477,6 +477,24 @@ function fmtPct(p: number | null | undefined): string {
   if (p === null || p === undefined) return "—";
   return p.toFixed(1) + "th";
 }
+
+/** v2.14 方案 B：bucket chip 颜色——让用户一眼看出本段走哪档。 */
+function bucketChipStyle(bucket: string): Record<string, string> {
+  const colorMap: Record<string, string> = {
+    short: "#67c23a",   // 绿——段短对齐
+    medium: "#909399",  // 灰——主档
+    long: "#e6a23c",    // 橙——段长
+    v1: "#c0c4cc",      // 淡灰——v1 path（fallback）
+  };
+  const bg = colorMap[bucket] || "#909399";
+  return {
+    background: bg,
+    color: "#fff",
+    padding: "2px 8px",
+    borderRadius: "10px",
+    fontSize: "0.85em",
+  };
+}
 </script>
 
 <template>
@@ -578,7 +596,7 @@ function fmtPct(p: number | null | undefined): string {
       </div>
       <table class="prior-table">
         <thead>
-          <tr><th>段号</th><th>时间</th><th>percentile</th><th>mean_abs_z</th><th>最偏特征</th><th>消息</th></tr>
+          <tr><th>段号</th><th>时间</th><th>percentile</th><th>mean_abs_z</th><th>bucket</th><th>scale</th><th>字数</th><th>最偏特征</th><th>消息</th></tr>
         </thead>
         <tbody>
           <tr v-for="w in styleWarnings" :key="w.segment_no + '_' + w.generated_at">
@@ -586,6 +604,13 @@ function fmtPct(p: number | null | undefined): string {
             <td style="font-family: monospace; font-size: 0.85em">{{ w.generated_at }}</td>
             <td>{{ fmtPct(w.percentile) }}</td>
             <td>{{ w.mean_abs_z?.toFixed(2) ?? "—" }}</td>
+            <td>
+              <span v-if="w.bucket" class="chip"
+                    :style="bucketChipStyle(w.bucket)">{{ w.bucket }}</span>
+              <span v-else>—</span>
+            </td>
+            <td>{{ w.scale_ratio != null ? w.scale_ratio + 'x' : '—' }}</td>
+            <td>{{ w.chars ?? '—' }}</td>
             <td>
               <span v-for="f in w.worst_features" :key="f" class="chip" style="margin-right: 4px">{{ f }}</span>
             </td>

@@ -1180,6 +1180,12 @@ export interface KgV3StyleWarning {
   mean_abs_z: number | null;
   worst_features: string[];
   warn_message: string | null;
+  /** v2.14 方案 B：方案 B「对数粒度 profile」选了哪个 bucket（"short"/"medium"/"long"/"v1"）。 */
+  bucket?: string | null;
+  /** v2.14：text 长度相对 base_unit_chars 的比值（粒度对齐信号）。 */
+  scale_ratio?: number | null;
+  /** v2.14：生成段字符数。 */
+  chars?: number | null;
 }
 export interface KgV3StyleWarningsResponse {
   warnings: KgV3StyleWarning[];

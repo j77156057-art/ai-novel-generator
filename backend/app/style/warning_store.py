@@ -58,6 +58,12 @@ def append_style_warning(
         "mean_abs_z": warn.get("mean_abs_z"),
         "worst_features": [k for k, _ in (warn.get("worst") or [])[:5]],
         "warn_message": warn.get("message"),
+        # 方案 B「对数粒度 profile」：落 bucket + scale_ratio + chars 给前端展示
+        # 段 1 short 段 2 long 是粒度对齐改善的关键信号，前端可在 Style 审计 subtab
+        # 显式标出"本段走 long bucket"——用户能直观看到 bucket 切分在跑。
+        "bucket": warn.get("bucket"),
+        "scale_ratio": warn.get("scale_ratio"),
+        "chars": warn.get("chars"),
     })
 
     if len(history) > _MAX_HISTORY:
