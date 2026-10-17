@@ -34,7 +34,7 @@ PROFILE_MAX_JSON_BYTES = 32_768
 #: 特征集，管不到「档案长什么样」。于是给档案加字段时，已经落库的老项目指纹
 #: 依然匹配 → 永远沿用缺字段的旧档案，前端拿到的摘要也就永远少一块。
 #: 实测踩过：加了 `marks[].final` 之后，预检响应里 `final` 一直是 KeyError。
-PIPELINE_SCHEMA = 2
+PIPELINE_SCHEMA = "log_buckets_v1"
 
 #: `corpus_health[*].marks[]` 的字段清单 —— 档案里存什么、预检响应下发什么，
 #: 以这一处为准。预检接口按这份清单逐字段挑，避免 `**m` 展开时被多余字段带出去。
