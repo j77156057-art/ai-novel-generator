@@ -734,6 +734,7 @@ async function runGenerate() {
   batchCount.value = 0;
   genKgMsg.value = null; // 新一轮开始：清掉上一轮的簿记提示，只反映本轮结果
   genKgLevel.value = "";
+  genQuality.value = []; // 质量回执同样按轮算：多段续写时累积，不跨轮堆叠
   try {
     for (let i = 0; i < chaptersPerGen.value; i++) {
       await api.generateStream(
@@ -748,6 +749,9 @@ async function runGenerate() {
           batchCount.value = i + 1;
           // 流式 done 带 KG 簿记：就地（第 6 步）暴露，别藏到第 7 步。
           applyGenKg(meta.kg);
+          // 续写路径两个信号：已重写留痕（①）与文风偏离告警（③）。
+          applyRewriteInfo(meta.rewrite_info, meta.segment_no);
+          applyStyleWarning(meta.style_warning, meta.segment_no);
           await loadGenerations();
           refreshPriorIfOpen(); // 每段生成完前情都变了，面板开着就同步刷新
         },
@@ -764,6 +768,7 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
   regenState.value[g.id] = { text: "", loading: true };
   genKgMsg.value = null; // 同上：本轮重生成的簿记结果覆盖上一轮提示
   genKgLevel.value = "";
+  genQuality.value = []; // 同上：一次性动作，回执只反映这一次
   try {
     await api.regenerateStream(
       projectId,
@@ -775,6 +780,8 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
       async (meta) => {
         // 重生成会全量 replay：簿记结果就地（第 6 步）暴露。
         applyGenKg(meta.kg);
+        // regen 只管 AI 腔告警（形态②）：它不重算文风距离，后端也不发 style_warning。
+        applyRewriteInfo(meta.rewrite_info, meta.segment_no);
         await loadGenerations();
         refreshPriorIfOpen(); // 重生成会重算受影响的卷摘要与主线，前情报告同步刷新
       },
@@ -1167,6 +1174,168 @@ function applyGenKg(kg?: KgStatus) {
     return; // 正常：不落提示
   }
   genKgLevel.value = "warn";
+}
+
+// ===========================================================================
+// 生成 / 重生成的质量告警
+// ---------------------------------------------------------------------------
+// 后端 `done` 里这三个信号已经下发了，但界面上一处都没渲染过 —— 用户看到的是
+// 「安静地生成完了」，而不知道系统刚做了什么、或有什么该他决定。这里把最后一
+// 公里补上，三条语义刻意分开说，不合并成一句泛泛的「质量提示」：
+//
+//   ① 续写 done.rewrite_info.rewritten_chars 非 null
+//      → 命中 AI 腔 / 反向禁忌，且**已被自动重写**（info 级：事情已经处理完了，
+//        用户需要的是「知道发生过」，不是「快去处理」）。
+//   ② 重生成 done.rewrite_info.alert === true 且 rewritten_chars === null
+//      → 检测到嫌疑、**没有**重写（warn 级：是否动手留给用户决定）。
+//   ③ 续写 done.style_warning 非 null
+//      → 文风偏离参考档案（warn 级，文案直接用后端写好的 message，
+//        那是后端已算好 percentile / worst 特征后拼的可读句，前端不重复造）。
+//
+// 两条 done 形状不同：regen 路径**不发** style_warning，故 regen 只走 ②；
+// 反过来 generate 路径不会带 `alert:true` 却不重写（重写失败时后端返回 None）。
+// 旧后端不返回这些键 → undefined / null → 一条都不显示，保守、不误报。
+// ===========================================================================
+
+interface QualityNotice {
+  /**
+   * 同轮去重键：同一段重复生成时覆盖旧的，不让列表堆叠成一面墙。
+   * 形如 `rw-3` / `sw-3`（前缀 + 段号）。
+   */
+  key: string;
+  level: "info" | "warn";
+  /** 短标题（文字先于颜色传达状态：灰度 / 色弱下也读得出）。 */
+  title: string;
+  body: string;
+  /** 量化事实：段号、字数、percentile。次要信息，随标题同一行弱化排布。 */
+  facts: string[];
+  /** 折叠区标题；details 为空时不渲染详情区（不摆空抽屉）。 */
+  detailLabel: string;
+  details: string[];
+}
+
+/** 本轮生成 / 重生成落下的质量回执；每轮开头清空，只反映这一轮的结果。 */
+const genQuality = ref<QualityNotice[]>([]);
+
+/** 未知形状的安全读取：类型不符一律回退默认值，绝不把 `undefined` 渲染给用户。 */
+function pickList(
+  raw: Record<string, unknown> | null | undefined,
+  key: string,
+): string[] {
+  const v = raw?.[key];
+  if (!Array.isArray(v)) return [];
+  return v.filter((x): x is string => typeof x === "string" && x.trim() !== "");
+}
+function pickNum(
+  raw: Record<string, unknown> | null | undefined,
+  key: string,
+): number | null {
+  const v = raw?.[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+function pickText(
+  raw: Record<string, unknown> | null | undefined,
+  key: string,
+): string {
+  const v = raw?.[key];
+  return typeof v === "string" && v.trim() !== "" ? v : "";
+}
+
+/** 后端 `worst` 是 `[[特征名, z 值], ...]`；形状不符的条目直接跳过，不下结论。 */
+function styleWorstToList(raw: Record<string, unknown>): string[] {
+  const worst = raw["worst"];
+  const out: string[] = [];
+  if (!Array.isArray(worst)) return out;
+  for (const item of worst) {
+    if (!Array.isArray(item) || item.length < 2) continue;
+    const name = item[0];
+    const val = item[1];
+    if (typeof name !== "string" || name.trim() === "") continue;
+    const num =
+      typeof val === "number" && Number.isFinite(val) ? val.toFixed(2) : "";
+    out.push(num ? `${name} · z ${num}` : name);
+  }
+  return out;
+}
+
+/** 写入一条回执：同 key 覆盖而非追加（重复重生成同一段不该越堆越高）。 */
+function pushQuality(notice: QualityNotice): void {
+  const idx = genQuality.value.findIndex((x) => x.key === notice.key);
+  if (idx >= 0) genQuality.value[idx] = notice;
+  else genQuality.value.push(notice);
+}
+
+/**
+ * 续写与重生成共用 `rewrite_info` 这个键，但语义靠 `rewritten_chars` / `alert`
+ * 两个字段区分 —— 必须分头判，不能只看「有没有这个字段」。
+ */
+function applyRewriteInfo(
+  rewriteInfo: Record<string, unknown> | null | undefined,
+  segmentNo: number,
+): void {
+  if (!rewriteInfo) return; // 旧后端不返回 / 未命中 → 什么都不说
+  const seg = `第 ${segmentNo} 段`;
+  const reasons = pickList(rewriteInfo, "reasons");
+  const original = pickNum(rewriteInfo, "original_chars");
+  const rewritten = pickNum(rewriteInfo, "rewritten_chars");
+  const alert = rewriteInfo["alert"] === true;
+
+  if (rewritten !== null) {
+    // 形态①：已经重写过了 —— 只留痕，不催用户做事
+    const facts = [seg];
+    if (original !== null) facts.push(`原文 ${original} 字`);
+    facts.push(`改写后 ${rewritten} 字`);
+    pushQuality({
+      key: `rw-${segmentNo}`,
+      level: "info",
+      title: "已自动重写",
+      body: "本段检出 AI 腔 / 反向禁忌写法，已自动改写后再入库 —— 上面展示的就是改写后的正文。",
+      facts,
+      detailLabel: "命中的改写依据",
+      details: reasons,
+    });
+    return;
+  }
+  if (alert) {
+    // 形态②：只告警不重写（regen 路径）—— 要不要处理，交回给用户
+    const facts = [seg];
+    if (original !== null) facts.push(`原文 ${original} 字`);
+    pushQuality({
+      key: `rw-${segmentNo}`,
+      level: "warn",
+      title: "AI 腔告警",
+      body: "本段可能残留 AI 腔 / 反向禁忌写法，本次没有自动改写。可以手动润色，或再「重新生成」一次。",
+      facts,
+      detailLabel: "命中的告警依据",
+      details: reasons,
+    });
+  }
+  // alert 缺失 / 为 false 且没重写 → 后端没让我们说任何话：静默。
+}
+
+/** 文风偏离档案：文案优先用后端 message（它已含 percentile 与最偏特征）。 */
+function applyStyleWarning(
+  styleWarning: Record<string, unknown> | null | undefined,
+  segmentNo: number,
+): void {
+  if (!styleWarning) return; // 旧后端不返回 / 未超阈值 → 静默
+  const facts = [`第 ${segmentNo} 段`];
+  const pct = pickNum(styleWarning, "percentile");
+  const z = pickNum(styleWarning, "mean_abs_z");
+  if (pct !== null) facts.push(`percentile ${pct}`);
+  if (z !== null) facts.push(`mean|z| ${z.toFixed(2)}`);
+  pushQuality({
+    key: `sw-${segmentNo}`,
+    level: "warn",
+    title: "文风偏离",
+    // 后端给的 message 才是准的那份；没有时只说结论，不臆造任何数字。
+    body:
+      pickText(styleWarning, "message") ||
+      "本段文风偏离参考语料档案，建议人工复核或重写这一段。",
+    facts,
+    detailLabel: "偏离最远的几个特征",
+    details: styleWorstToList(styleWarning),
+  });
 }
 async function buildGeneratedKg() {
   buildingKg.value = true;
@@ -1687,6 +1856,32 @@ onUnmounted(stopDistillPolling);
       :class="['notice', genKgLevel || 'info']"
       style="margin-top: var(--gap)"
     >{{ genKgMsg }}</div>
+
+    <!-- 生成 / 重生成的质量回执：后端早就下发了，这里才第一次露面。
+         三种信号各占一条、各自分级，不合并——「已替你改过」和「该你决定了」
+         是两件事，压成一句用户只会忽略。
+         放在这里而不是塞进正文卡片：它是**动作的结果**，要紧挨着触发它的那排按钮；
+         丢到段落列表里则要滚很远才看得见，等于没说。 -->
+    <div v-if="genQuality.length" class="list quality-list">
+      <div
+        v-for="q in genQuality"
+        :key="q.key"
+        class="notice quality-item"
+        :class="q.level"
+      >
+        <div class="quality-head">
+          <b class="quality-title">{{ q.title }}</b>
+          <span v-for="f in q.facts" :key="f" class="quality-fact mono">{{ f }}</span>
+        </div>
+        <div class="quality-body">{{ q.body }}</div>
+        <details v-if="q.details.length" class="quality-detail">
+          <summary>{{ q.detailLabel }}（{{ q.details.length }}）</summary>
+          <ul>
+            <li v-for="d in q.details" :key="d" class="mono">{{ d }}</li>
+          </ul>
+        </details>
+      </div>
+    </div>
 
     <!-- ---------- 前情预检：真正下发的那份前情长什么样 ---------- -->
     <div class="prior" :class="priorHealth">
@@ -2744,6 +2939,59 @@ onUnmounted(stopDistillPolling);
   background: var(--bg-sunken, rgba(0, 0, 0, 0.03));
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+
+/* ---------- 生成质量回执 ---------- */
+/* 一条回执 = 一行「标题 + 事实」 + 一句结论 + 可选折叠依据。
+   不新增任何颜色：色级复用 .notice 的 info / warn（既有语义 token），
+   这里只加排版。标题用文字而非图标传达状态，灰度/色弱下照样读得出来。
+   注意：折叠区文字一律继承 notice 的前景色，**不用 .faint / opacity** ——
+   它们在 --warn-soft、--info-soft 这种浅底上达不到 AA 对比度。 */
+.quality-list {
+  margin-top: var(--gap);
+  gap: 8px;
+}
+.quality-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.quality-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.quality-title {
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: inherit;
+}
+.quality-fact {
+  font-size: var(--fs-xs);
+  color: inherit;
+}
+.quality-body {
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  color: inherit;
+}
+.quality-detail > summary {
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: inherit;
+  list-style-position: outside;
+}
+.quality-detail > summary:hover {
+  text-decoration: underline dotted;
+}
+.quality-detail ul {
+  margin: 6px 0 0;
+  padding-left: 20px;
+  font-size: var(--fs-xs);
+  line-height: 1.7;
+  color: inherit;
 }
 
 @media (max-width: 720px) {
