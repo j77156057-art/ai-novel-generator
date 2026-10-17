@@ -128,6 +128,38 @@ FEATURE_NOTES: dict[str, str] = {
 #: 代理指标——不是直接测量，只是结构性近似，判读时必须知道这一点
 PROXY_FEATURES = frozenset({"四字格密度", "短串占比"})
 
+#: 方案 C「features 长度归一化」——非密度类特征分组。
+#: 这 11 个特征是「按字/句/段/run 统计」的值，在 1000 字 vs 6000 字段上
+#: 统计波动大（CV/占比类尤其敏感），导致 z-score 系统性偏大。
+#: 方案 C 对它们乘 exp(-|log(len/unit_chars)| * 0.3) 双向收敛，让跨长度可比。
+NON_DENSITY_FEATURES = frozenset({
+    "句长均值", "句长CV", "句长p90",
+    "短句占比", "长句占比",
+    "段长CV", "段均句数",
+    "对白字占比", "对白段占比",
+    "短串占比", "段尾升华率",
+})
+
+#: 密度类特征（per1k 已归一化）——不变
+DENSITY_FEATURES = frozenset(FEATURES) - NON_DENSITY_FEATURES
+
+
+def _length_scale_factor(text_chars: int, unit_chars: int) -> float:
+    """按 log 长度比例缩放 features，让跨长度可比（方案 C）。
+
+    1x → 1.0（基准）
+    2x → 0.7（长文统计更稳定，缩 0.7 让短长文在同一长度基准下比较）
+    0.5x → 1.3（短文统计波动大，扩 1.3 拉回基准）
+    0.01x → 趋近 0（极端短文不缩放）
+
+    unit_chars <= 0 退化返 1.0（不缩放）。
+    """
+    if unit_chars is None or unit_chars <= 0 or text_chars <= 0:
+        return 1.0
+    ratio = text_chars / unit_chars
+    import math as _math
+    return _math.exp(-abs(_math.log(ratio)) * 0.3)
+
 
 # --------------------------------------------------------------------------- #
 # 切分与计数
@@ -203,8 +235,16 @@ def _cv(values: Sequence[float]) -> float:
 # 特征向量
 # --------------------------------------------------------------------------- #
 
-def features(text: str) -> dict[str, float]:
-    """一段文本的文体特征向量。全部是可机检的计数与比值。"""
+def features(text: str, *, unit_chars: int = 3000) -> dict[str, float]:
+    """一段文本的文体特征向量。全部是可机检的计数与比值。
+
+    方案 C「长度归一化」(v2.15+)：对 11 个非密度类特征（按字/句/段/run 统计）
+    乘 exp(-|log(len/unit_chars)| * 0.3) 双向收敛，让跨长度可比——治本
+    percentile 100% 触发。12 个密度类特征（per1k 已归一）不变。
+
+    unit_chars 默认 3000（与 generation_length 对齐）。unit_chars <= 0
+    时 scale=1.0（不缩放），保证旧调用兼容。
+    """
     text = text or ""
     n = len(text)
     paras = paragraphs(text)
@@ -258,6 +298,11 @@ def features(text: str) -> dict[str, float]:
         "短串占比": sum(1 for r in runs if r <= 3) / n_runs,
         "虚词密度": sum(text.count(w) for w in _FUNC_WORDS) * per1k,
     }
+    # 方案 C：11 个非密度特征按 log 长度缩放
+    scale = _length_scale_factor(n, unit_chars)
+    for k in NON_DENSITY_FEATURES:
+        if k in vec:
+            vec[k] = vec[k] * scale
     return {k: float(vec[k]) for k in FEATURES}
 
 

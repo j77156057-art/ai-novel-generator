@@ -69,12 +69,12 @@ def test_b_length_scale_factor():
           abs(_length_scale_factor(3000, 3000) - 1.0) < 0.01,
           detail=f"got {_length_scale_factor(3000, 3000)}")
     # 2x 长度
-    check("B2: 2x 长度时 scale ≈ 0.7",
-          abs(_length_scale_factor(6000, 3000) - 0.7) < 0.05,
+    check("B2: 2x 长度时 scale ≈ 0.81 (双向收敛)",
+          abs(_length_scale_factor(6000, 3000) - 0.81) < 0.05,
           detail=f"got {_length_scale_factor(6000, 3000)}")
-    # 0.5x 长度
-    check("B3: 0.5x 长度时 scale ≈ 1.3",
-          abs(_length_scale_factor(1500, 3000) - 1.3) < 0.05,
+    # 0.5x 长度（双向收敛：2x 跟 0.5x 收敛到同一值）
+    check("B3: 0.5x 长度时 scale ≈ 0.81 (对称收敛)",
+          abs(_length_scale_factor(1500, 3000) - 0.81) < 0.05,
           detail=f"got {_length_scale_factor(1500, 3000)}")
     # unit_chars=0 退化
     try:
