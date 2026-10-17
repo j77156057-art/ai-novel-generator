@@ -1,8 +1,8 @@
 # Phase 1「生成中受控工具调用」——方案与风险盘点
 
 - 日期：2026-10-17
-- 分支：`feat/resume-push-2026-10`（HEAD `c1809a8`）
-- 状态：**评估中，未动任何代码 / 未动任何 ref**
+- 分支：`feat/resume-push-2026-10`（本地 HEAD `63119b6`；远程已推送锚点 `4eaddf0`）
+- 状态：**评估项已大部分落地并经独立验证；仅 ③ 重生成缺 AI 腔重写待用户拍板（见 §4.2 / §6）**
 - 前提基线：Phase 0 已交付（`ea85d6b`，重写环节加原文对照，仅完整档）
 - 证据口径：本文标注 `文件:行号` 的结论，凡标【亲验】者由主理人独立复跑确认，非采信单一来源。
 
@@ -116,7 +116,9 @@
 
 ## 4. 顺带发现（不在 Phase 1 范围，建议单独立项）
 
-### 4.1 【疑似真 bug】重生成路径的 system 提示缺「叙事文风」块
+### 4.1 🟢 已解决（commit `b1e13d1`）：重生成路径的 system 提示缺「叙事文风」块
+
+> **✅ 已修复**：由提交 `b1e13d1`（「重生成路径纳入叙事档案」）落地——`_build_generation_prompts`（`engine.py:1056`）现与续写入口一致传入 `_style_narrative(db, project)`，经 `_narrative_block`（`prompts.py:177`）渲染。本文在祖先 `c1809a8` 撰写时的结论对当前 HEAD 已过期，保留作历史记录。
 
 - `generate_next_segment`（`engine.py:720-723`）调 `build_system_prompt` 传 **6 个参数**，含 `_style_narrative(db, project)`；
 - `_build_generation_prompts`（`engine.py:907-910`，供 `regenerate_segment_stream` 用）只传 **5 个参数**，**缺 `_style_narrative`**。
@@ -125,29 +127,42 @@
 
 ### 4.2 其他口径差
 
-- `ALLOWED_READ_ONLY_TOOLS`（`registry.py:63`）运行时未被读取（见 R5）。
-- `registry.py:17-22`/`:54-62` docstring 关于 audit 工具「写审计两表」的描述与实现不符（写入在路由层）。
-- `regenerate_segment_stream` 不经 AI 腔重写（无 `_should_rewrite`），与「三条入口重写语义一致」的既有承诺不同源。
-- `frontend/src/api/types.ts:560-580` 的 done 类型字段少于后端实际下发（`style_warning`/`rewrite_info`/`summary_tree`）。
+| 项 | 状态 | 落地提交 | 说明 |
+|---|---|---|---|
+| `ALLOWED_READ_ONLY_TOOLS`（`registry.py:63`）运行时未被读取（R5） | 🟢 已修 | `c67f2ac` | `register()` 新增 fail-closed 校验：不在白名单的工具抛 `PermissionError`（见 R5 与 `tests/test_registry_whitelist.py` T1/T2/T3） |
+| `registry.py` docstring 称 audit 工具「写审计两表」与实现不符 | 🟢 已订正 | `c67f2ac` | `:54-62` 注释改为：audit 工具 callable 纯读，写入在路由层（`routers/assistant.py`） |
+| `regenerate_segment_stream` 不经 AI 腔重写（无 `_should_rewrite`） | 🟡 待拍板（见 §6 ③） | — | 设计项，未实现 |
+| `frontend/src/api/types.ts` done 类型字段少于后端实际下发 | 🟢 已对齐 | `63119b6` | `GenerateStreamDoneMeta` 补 `summary_tree`/`style_warning`/`rewrite_info`；`RegenerateStreamDoneMeta` 补 `summary_tree` |
+
+**③ 重生成缺 AI 腔重写（设计项，未实现）**：
+
+- 现状：`_should_rewrite`（`engine.py:548`）是**纯启发式、零 LLM 调用**（`_detect_ai_flavor` + 反向禁忌计数）；真正重写的 `_rewrite_with_evidence` → `_gather_rewrite_evidence` 的 **B 路会调 `hybrid_search` 全量加载整本语料**（`engine.py:621-623`）——正是 §8.1 刚从 regenerate 砍掉的代价。故「镜像续写重写」会 undo §8.1，必须单独拍板。
+- 三选项（建议先走 (b)）：
+  - **(a) 完整镜像续写重写**：否决——会 undo §8.1 的语料加载节省，得不偿失。
+  - **(b) 只检测 + 告警（零成本）**：regen done 携带 `rewrite_info`（已具备 `63119b6` 的字段位）提示「本段可能残留 AI 腔，未自动修」，让重生成「说实话」。**建议先立。**
+  - **(c) 检测 + 轻量重写**：只走 A 路哨兵历史告警、不加载语料、多一次 chat。**作为后续 opt-in**，若用户要自动修再立。
 
 ---
 
 ## 5. 建议与待裁决
 
-**建议顺序**（风险从低到高、收益从确定到不确定）：
+**建议顺序**（均已落地，留存为执行记录）：
 
-1. **先修 §4.1 的口径差**——小、真、可测，且是「用户点重新生成就吃亏」的真实损失。走「先红后绿 + 独立 QA」常规流程。
-2. **再做方案 C（Phase 0.5）**——不引入循环与协议，修掉「RAG query 与本节目标错位」这个最实在的缺口，确定性资产零风险。
-3. **Phase 1（方案 A 或 B）视前两步的效果再决定**。若要做，前置条件是：①先测出 `hybrid_search` 的真实单次耗时基准；②先把 §1.6 的确定性资产改造方案定下来。
+1. 🟢 **§4.1 口径差已修**（`b1e13d1`）——重生成纳入叙事文风块。
+2. 🟢 **方案 C（Phase 0.5）已落地**（`4592119`）——新增 `_rag_query_targeted`（`engine.py:165`）改造 `build_context`（`:401`），配套 `tests/test_rag_query_targeted.py`（11 条 + 变异取证 M1–M9），全量门禁已含。
+3. 🟢 **§4.2 四项口径差已修三项**（`c67f2ac` R5 运行时白名单真校验 + docstring 订正；`63119b6` 前端 done 类型对齐）。
+4. 🟡 **③ 重生成缺 AI 腔重写**：设计项，走 §6 三选项，建议先立 (b)。
 
-**待用户拍板**：
-
-- (a) 只做第 1 步（修口径差）+ 出方案 C 的详细设计，**不动功能代码**；
-- (b) 第 1 步 + 第 2 步一起立（走完整 SOP：设计 → 实现 → 独立 QA）；
-- (c) 直接立项 Phase 1（需先选 A 还是 B）；
-- (d) 全部搁置。
+**待用户拍板**：仅剩 ③（a/b/c 见 §6）。
 
 ---
+
+## 6. 门禁核实留档（R5 验证过程，重要）
+
+- 初版 R5 提交将回归测试落在 `backend/tests/test_registry_whitelist.py`，但 `pytest.ini` 的 `testpaths = ../tests` 只收集**根 `tests/`**——该目录（含同处此地的 `test_finale_clean.py` / `test_narrative_extract.py` / `test_style_warning.py` / `test_style_exemplar.py` / `test_name_normalize_probe.py` 共 5 个旧测试文件）**从未被门禁执行**，属「死测试」技术债。
+- 后果：首轮「绿门禁」与独立 QA 的「SAFE TO MERGE」都建立在**未实际运行 T1/T2/T3** 之上，R5 当时**并未被门禁验证**。
+- 修正：将 `test_registry_whitelist.py` 迁至根 `tests/`（与 `pytest.ini` 既定「单源真源在根 tests/」一致），并 fold 进 `c67f2ac`；重跑全量门禁确认该测试**真正被执行且通过**。
+- 建议：另立项清理 `backend/tests/` 下其余死测试（或显式确认其退役），避免再次出现「绿门禁但测试没跑」的假阳性。
 
 ## 附：本文结论的独立复验清单
 
@@ -159,4 +174,4 @@
 | `hybrid_search` 每次全量加载 chunks | 读 `search.py:44-63` | 确认【亲验】 |
 | Assistant 的「循环」是写死的三元组 | 读 `assistant.py:185-231` | 确认【亲验】 |
 | 重生成 system 提示缺 `_style_narrative` | 对比读 `engine.py:714-735` 与 `:900-919` | 确认【亲验】 |
-| `ALLOWED_READ_ONLY_TOOLS` 运行时未被读取 | grep 全仓引用点 | 仅 re-export 与测试引用【亲验】 |
+| `ALLOWED_READ_ONLY_TOOLS` 运行时未被读取 | grep 全仓引用点 | 原结论：仅 re-export 与测试引用【亲验】；**已在 `c67f2ac` 改为 `register()` 运行时真校验（fail-closed）** |
