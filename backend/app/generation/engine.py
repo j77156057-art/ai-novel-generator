@@ -10,6 +10,7 @@ import logging
 
 from sqlalchemy import select
 
+from app.agents.prompt_overrides import PromptKey, resolve_prompt_block
 from app.generation.prompts import (
     build_system_prompt,
     build_user_prompt,
@@ -533,16 +534,64 @@ AI_FLAVOR_PATTERNS = [
 ]
 
 
+#: 命中片段的上下文字数：命中处前后各保留这么多字原文，方便人/模型读懂
+#: 「当时是怎么用的」——只有模式和次数时只能说「仿佛×3」，给不出例句。
+_FLAVOR_SNIPPET_CONTEXT = 15
+
+
+def _flavor_snippet(text: str, start: int, end: int) -> str:
+    """取命中区间 `[start, end)` 前后各 `_FLAVOR_SNIPPET_CONTEXT` 字的原文片段。
+
+    触到文本边界的那一侧不补省略号（原文确实就这么长），被截断的一侧补
+    「…」，表明片段是窗口而非全文。
+    """
+    lo = max(0, start - _FLAVOR_SNIPPET_CONTEXT)
+    hi = min(len(text), end + _FLAVOR_SNIPPET_CONTEXT)
+    snippet = text[lo:hi]
+    if lo > 0:
+        snippet = "…" + snippet
+    if hi < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
 def _detect_ai_flavor(text: str) -> dict:
-    """检测文本中的 AI 腔模式，返回 {pattern: count} 和总数。"""
-    hits = {}
+    """检测文本中的 AI 腔模式，返回命中明细。
+
+    返回结构（`hits` / `total` 与旧版同语义，新增字段纯增量，`_should_rewrite`
+    等既有调用方不受影响）：
+
+    - `hits`：`{pattern: 次数}`；
+    - `total`：全部命中次数之和；
+    - `occurrences`：`{pattern: [{"offset": 命中起始下标, "snippet": 原文片段}]}`，
+      每个命中的 pattern 各带一份位置清单，供「总结本次具体哪里犯了 AI 腔」取例句。
+
+    **子串去重（长模式优先）**：`AI_FLAVOR_PATTERNS` 同时含「毫无疑问」与
+    「毫无疑问地」，旧实现逐模式 `text.count()`，同一处「毫无疑问地」会被两个
+    模式各计一次，`total` 虚高。现按长度降序扫描，每个命中区间占用对应字符，
+    落在已占用区间内的后续命中不再计数——同一处文本只归最长的模式。
+    """
+    claimed: set[int] = set()  # 已被某次命中占用的字符下标
+    hits: dict[str, int] = {}
+    occurrences: dict[str, list[dict]] = {}
     total = 0
-    for p in AI_FLAVOR_PATTERNS:
-        c = text.count(p)
-        if c > 0:
-            hits[p] = c
-            total += c
-    return {"hits": hits, "total": total}
+    # 长模式优先：更具体的模式（「毫无疑问地」）先占位，短模式（「毫无疑问」）
+    # 落在已占区间内的部分自动跳过。sorted 稳定，等长模式保持库内原顺序。
+    for pattern in sorted(AI_FLAVOR_PATTERNS, key=len, reverse=True):
+        start = text.find(pattern)
+        while start != -1:
+            end = start + len(pattern)
+            # 同一模式内部按「不重叠」计数（与 str.count 语义一致）：命中后按
+            # 模式长度前进，不逐字滑动。
+            if all(i not in claimed for i in range(start, end)):
+                claimed.update(range(start, end))
+                hits[pattern] = hits.get(pattern, 0) + 1
+                total += 1
+                occurrences.setdefault(pattern, []).append(
+                    {"offset": start, "snippet": _flavor_snippet(text, start, end)}
+                )
+            start = text.find(pattern, start + len(pattern))
+    return {"hits": hits, "total": total, "occurrences": occurrences}
 
 
 def _should_rewrite(text: str, forbidden: dict | None) -> tuple[bool, list[str]]:
@@ -820,6 +869,30 @@ def _style_warning(text: str, profile: dict | None) -> dict | None:
     }
 
 
+def _prompt_overrides(db, project_id: int) -> dict[str, str]:
+    """读取该项目三个提示词覆写槽位的生效文本（未设置 = 空串）。
+
+    三个槽位的语义以 `app.agents.prompt_overrides.PromptKey` 为准
+    （style_suffix / constraint_note / directive_suffix），本函数只负责
+    「读出来交给提示词组装」，不改写任何语义。
+
+    读不到（库缺表、查询异常等）时按「未设置」处理并告警——覆写是增强，
+    绝不能阻断生成主流程；老项目没有覆写行时走同一条空串路径，行为不变。
+    """
+    overrides: dict[str, str] = {}
+    for key in (PromptKey.STYLE, PromptKey.CONSTRAINT, PromptKey.DIRECTIVE):
+        try:
+            text, _source = resolve_prompt_block(db, project_id, key)
+        except Exception as exc:  # noqa: BLE001 —— 覆写读取失败降级为「未设置」
+            logging.getLogger(__name__).warning(
+                "提示词覆写读取失败，按未设置处理（project_id=%s, key=%s）: %s",
+                project_id, key, exc,
+            )
+            text = ""
+        overrides[key] = text or ""
+    return overrides
+
+
 def generate_next_segment(
     db,
     project: Project,
@@ -851,9 +924,12 @@ def generate_next_segment(
     _rollup_summary_tree(db, project, provider)
 
     ctx = build_context(db, project, novel_ids)
+    overrides = _prompt_overrides(db, project.id)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
         _style_profile(db, project), _style_narrative(db, project),
+        style_suffix=overrides[PromptKey.STYLE],
+        constraint_note=overrides[PromptKey.CONSTRAINT],
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -865,6 +941,7 @@ def generate_next_segment(
         prior_blocks=ctx["prior_blocks"],
         style_exemplars=ctx.get("style_exemplars"),
         rag_has_forbidden=ctx.get("rag_has_forbidden", False),
+        directive_suffix=overrides[PromptKey.DIRECTIVE],
     )
 
     text = provider.chat(system, user, constraints=ctx["constraints"])
@@ -938,9 +1015,12 @@ def generate_next_segment_stream(
     _rollup_summary_tree(db, project, provider)
 
     ctx = build_context(db, project, novel_ids)
+    overrides = _prompt_overrides(db, project.id)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
         _style_profile(db, project), _style_narrative(db, project),
+        style_suffix=overrides[PromptKey.STYLE],
+        constraint_note=overrides[PromptKey.CONSTRAINT],
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -952,6 +1032,7 @@ def generate_next_segment_stream(
         prior_blocks=ctx["prior_blocks"],
         style_exemplars=ctx.get("style_exemplars"),
         rag_has_forbidden=ctx.get("rag_has_forbidden", False),
+        directive_suffix=overrides[PromptKey.DIRECTIVE],
     )
 
     pieces: list[str] = []
@@ -1041,6 +1122,8 @@ def _build_generation_prompts(
     if reminders is None:
         reminders = get_reminders(db, project.id, source="generated")
 
+    overrides = _prompt_overrides(db, project.id)
+
     tree = _summary_tree(project)
     if before_segment is not None:
         tree = tree_before(tree, before_segment)
@@ -1054,6 +1137,8 @@ def _build_generation_prompts(
         project.title, reminders,
         _style_info(project), project.plot_bible, _style_profile(db, project),
         _style_narrative(db, project),
+        style_suffix=overrides[PromptKey.STYLE],
+        constraint_note=overrides[PromptKey.CONSTRAINT],
     )
     user = build_user_prompt(
         l1_chain(tree),
@@ -1063,6 +1148,7 @@ def _build_generation_prompts(
         project.plot_bible,
         project.premise,
         prior_blocks=blocks,
+        directive_suffix=overrides[PromptKey.DIRECTIVE],
     )
     return system, user, max_chars
 

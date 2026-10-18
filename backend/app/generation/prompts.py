@@ -123,6 +123,33 @@ def _narrative_block(style_narrative: dict | None) -> str:
     return body + "\n"
 
 
+#: 提示词覆写（runtime override）块标题。三个标题与
+#: `app.agents.prompt_overrides.PromptKey` 的三个槽位一一对应，**落点语义沿用
+#: 该文件 :40-66 的既有定义，不自创**：
+#: - style_suffix     → 【风格】区（风格维度 / 文风档案 / 叙事档案）之后；
+#: - constraint_note  → 【续写纪律】之后；
+#: - directive_suffix → 【续写指令】之后。
+#: 标题显式标注「作者助理微调 / 非参考语料规则」：覆写来自助理 agent 的自动
+#: 微调，不是参考作者的行为规则——不能让模型把覆写误读成【文风档案】那种
+#: 从参考语料实测出来的规则。
+_OVERRIDE_STYLE_HEADER = "风格补充（作者助理微调，非参考语料规则）"
+_OVERRIDE_CONSTRAINT_HEADER = "续写纪律补充（作者助理微调）"
+_OVERRIDE_DIRECTIVE_HEADER = "续写指令补充（作者助理微调）"
+
+
+def _override_section(header: str, text: str | None) -> str:
+    """渲染一条提示词覆写块；空文本返回 `""`（拼接结果逐字节不变）。
+
+    `resolve_prompt_block()` 未读到覆写时返回空串，此时本函数必须不产生
+    任何字符——这是「老项目零影响」的唯一兼容底线。纯空白同样按未设置处理，
+    避免库里误存空白行时拼出只有标题的空块。
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    return f"【{header}】\n{body}\n"
+
+
 def build_system_prompt(
     project_title: str,
     reminders: dict,
@@ -130,6 +157,9 @@ def build_system_prompt(
     plot_bible: dict | None = None,
     style_profile: dict | None = None,
     style_narrative: dict | None = None,
+    *,
+    style_suffix: str | None = None,
+    constraint_note: str | None = None,
 ) -> str:
     """静态系统提示——整轮生成保持不变，置于最前，保证提示词缓存命中率。
 
@@ -140,6 +170,12 @@ def build_system_prompt(
     渲染成静态块；自由生成（未选参考语料）时为 None，该块整段不出现。
     `style_narrative` 由 `app.style.narrative.project_narrative` 产出（按指纹缓存），
     是 LLM 提炼的 L2/L3 叙事规则，同样为 None 时不出现。
+
+    `style_suffix` / `constraint_note` 是提示词运行时覆写（见
+    `app.agents.prompt_overrides.resolve_prompt_block`），由 engine 侧读库后
+    传入——本函数保持纯函数、不接 db。为空（未设置覆写）时输出与旧版**逐字节
+    相同**；非空时分别拼在【风格】区之后与【续写纪律】之后，块标题标明来源
+    是「作者助理微调」，防止模型误以为是参考作者的规则。
     """
     # —— 合并而非遮蔽 ——
     # 旧实现「有 plot_bible 就只取 bible」会让生成后抽取的事实（KG reminders）被静默丢弃：
@@ -175,6 +211,7 @@ def build_system_prompt(
         "（以上维度是倾向参考，不要直接翻译成类型套路或标签化文风。）\n"
         f"{_profile_block(style_profile)}\n"
         f"{_narrative_block(style_narrative)}"
+        f"{_override_section(_OVERRIDE_STYLE_HEADER, style_suffix)}"
         "【文风要求：真人小说感，忌 AI 腔】\n"
         "- 禁止金句化台词：人物不许说出格言式总结或口号（如「不被遗忘本身就是最贵的代价」）；"
         "台词要像真人说话，可有停顿、改口、答非所问、言外之意。\n"
@@ -190,6 +227,7 @@ def build_system_prompt(
         "结尾必须停在某个仍未解决的冲突、悬念或动作中途（为下一节留钩子），"
         "不得在本次续写里收束主线、给出结局，也不要写「从此……／自此……」式的收尾；"
         "每轮控制在指定字数内。"
+        f"{_override_section(_OVERRIDE_CONSTRAINT_HEADER, constraint_note)}"
     )
 
 
@@ -203,6 +241,8 @@ def build_user_prompt(
     prior_blocks: list[str] | None = None,
     style_exemplars: list[dict] | None = None,
     rag_has_forbidden: bool = False,
+    *,
+    directive_suffix: str | None = None,
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -219,6 +259,9 @@ def build_user_prompt(
     注意：续写文风由 system 提示的【风格】（类型 + 风格平台调性）统一控制，
     这里不再携带 mode——mode 只表示「构思方式」（是否走 wayfinder 追问），属构思阶段语义，
     若在续写指令里再表达一次文风，会与风格平台冲突（如「番茄快节奏」vs「expert 细节丰盈」）。
+
+    `directive_suffix` 是【续写指令】之后的运行时覆写（见
+    `app.agents.prompt_overrides`）；为空（未设置覆写）时输出与旧版逐字节相同。
     """
     if prior_blocks:
         prior = "\n".join(prior_blocks)
@@ -314,4 +357,7 @@ def build_user_prompt(
     if outline_text:
         blocks += ["", "【大纲】", outline_text]
     blocks += ["", "【续写指令】", directive]
+    directive_extra = _override_section(_OVERRIDE_DIRECTIVE_HEADER, directive_suffix)
+    if directive_extra:
+        blocks += ["", directive_extra.rstrip("\n")]
     return "\n".join(blocks)
