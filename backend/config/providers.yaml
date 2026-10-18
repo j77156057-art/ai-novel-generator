@@ -29,7 +29,8 @@ writer:
   # （provider.py 里出现 0 次），半截文字会被当完整段落直接落库。
   # 4096 ≈ 6800 字，对 3000 字目标有 2 倍以上余量。
   # 若把 project.generation_length 调到 6000 以上，请同步上调这里。
-  max_tokens: 4096
+  # v2.19: 拉到 8192 (≈13600 字) 让智谱/Nemotron 真能写 6000+ 字段不再截断
+  max_tokens: 8192
   timeout: 120
 
 assistant:
