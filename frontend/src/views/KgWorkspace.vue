@@ -578,16 +578,19 @@ function bucketChipStyle(bucket: string): Record<string, string> {
               <span class="faint mono" style="font-size: var(--fs-xs)">
                 埋@{{ f.planted_chapter ?? "?" }}<template v-if="f.planned_payoff_chapter"> → 计划{{ f.planned_payoff_chapter }}
 
-  <!-- ============ Tab 7：Style 审计（v2.1） ============ -->
+  <!-- ============ Tab 7：Style 审计（v2.1 + v2.19 bucket chip + v2.20 max_tokens） ============ -->
   <section v-if="(activeTab as string) === 'style'" class="card">
     <h2>文风告警（v2.1）</h2>
     <p style="color: var(--muted-foreground); font-size: 0.9em">
-      percentile ≥ 97.5（留出集分位）触发告警；engine 落库，段级历史。
+      percentile ≥ 99.5（留出集分位）触发告警（v2.15 从 97.5 提到 99.5——
+      bucket 留出样本数少是工程边界，100% 触发常态化不构成真异常）。
+      段 1 mean_abs_z ≈ 1.27 与 medium bucket 留出 max 几乎齐平——
+      percentile = UI 标尺，bucket chip + scale + 字数更直观。
     </p>
     <div v-if="styleLoading" class="empty">加载中…</div>
     <div v-else-if="styleErr" class="empty error">{{ styleErr }}</div>
     <div v-else-if="styleWarnings.length === 0" class="empty">
-      暂无告警——所有生成段 percentile 都在 97.5 分位以内。
+      暂无告警——所有生成段 percentile 都在 99.5 分位以内。
     </div>
     <div v-else>
       <div style="display: flex; gap: 16px; margin: 8px 0 16px; font-size: 0.9em">
