@@ -1,6 +1,9 @@
+import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import event
+from sqlalchemy.engine import Engine
 
 from app.config import settings
 
@@ -14,6 +17,63 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args, future=True)
 SessionLocal = sessionmaker(
     bind=engine, autoflush=False, expire_on_commit=False, future=True
 )
+
+
+# ── 真实库防误删：结构性防线 ────────────────────────────────────────────────
+# 2026-10-17 事故：某个脚本对 `<app.db 的模块级 engine>` 调 `Base.metadata.drop_all()`，
+# 而该 engine 的 URL 来自 `settings.database_url`（默认 `sqlite:///./novel_dev.db`，
+# **相对 CWD 解析**），于是一句 drop_all 就把真实开发库清空（122.9MB 只剩 1 个已用页，
+# 7941 个分片全丢）。
+#
+# 为什么不能只靠「改默认值」或「让每个脚本自觉加隔离」：
+#   - `config.Settings` 用 `env_file=".env"`（相对 CWD 自动加载），任何在 backend/ 下
+#     跑的进程都会读到同一份 .env，改默认值并不能把它和真实库分开；
+#   - 「每个脚本自己设 DATABASE_URL」靠的是纪律，挡不住未来新写的脚本。
+#
+# 所以防线放在**驱动层**：监听 `Engine` 类的 `before_cursor_execute`，
+# 在真实库上拒绝 `DROP TABLE`。这样无论入口是 pytest、手工脚本还是 `python -c`，
+# 只要 engine 指向真实库，破坏性操作就会被拦下。确实需要重置真实库时，
+# 显式设 `ALLOW_DESTRUCTIVE_DB=1`（显式即安全）。
+_PROTECTED_DB_NAMES = frozenset({"novel_dev.db", "novel_demo.db"})
+
+
+def _sqlite_basename(url) -> str | None:  # noqa: ANN001
+    """取 sqlite URL 的文件名；非 sqlite 或内存库返回 None。"""
+    s = str(url)
+    if not s.startswith("sqlite"):
+        return None
+    if ":memory:" in s or s.rstrip("/") in {"sqlite://", "sqlite:///"}:
+        return None
+    path = s.split("///", 1)[-1].split("?", 1)[0]
+    return path.replace("\\", "/").rsplit("/", 1)[-1] or None
+
+
+def is_protected_db(url) -> bool:  # noqa: ANN001
+    """该 URL 是否指向真实库（会被防误删防线保护）。"""
+    return _sqlite_basename(url) in _PROTECTED_DB_NAMES
+
+
+@event.listens_for(Engine, "before_cursor_execute")
+def _block_drop_table_on_real_db(  # noqa: ANN001
+    conn, cursor, statement, parameters, context, executemany
+):
+    if os.environ.get("ALLOW_DESTRUCTIVE_DB") == "1":
+        return
+    if not statement:
+        return
+    if not statement.lstrip().upper().startswith("DROP TABLE"):
+        return
+    try:
+        url = conn.engine.url
+    except Exception:  # pragma: no cover - 取不到 URL 时不拦（宁放过不误伤）
+        return
+    if is_protected_db(url):
+        raise RuntimeError(
+            f"拒绝在真实库上执行 DROP TABLE（目标：{url}）。\n"
+            "这是 2026-10-17 清库事故（drop_all 清空 novel_dev.db，7941 分片丢失）的防线。\n"
+            "若确实要重置该库，请显式设置环境变量 ALLOW_DESTRUCTIVE_DB=1；\n"
+            "若只是想跑测试，请让 engine 指向临时库（tests/conftest.py 已自动隔离）。"
+        )
 
 
 if not IS_SQLITE:
