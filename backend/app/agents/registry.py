@@ -32,8 +32,11 @@ callable 内部——所以工具在业务数据上是纯只读，进白名单�
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
+
+logger = logging.getLogger("agent.registry")
 
 
 # ====================================================================
@@ -77,6 +80,11 @@ ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
     "audit_kg",
     "audit_generation",
     "analyze_logs",
+    # AI 腔记忆库查询（只读）：助手问「这个 AI 腔问题以前是怎么治的」走这里。
+    # 命中即复用历史微调方法、未命中才现场规划——规划与沉淀的写操作发生在
+    # 生成闭环（assistant_generation → ai_flavor_memory.resolve_tuning）这条
+    # 既有的自动写入路径上，工具表只提供读入口（项目红线：不注册写工具）。
+    "query_ai_flavor_memory",
 )
 
 
@@ -563,6 +571,61 @@ def _impl_analyze_logs(*, db: Any, project_id: int, status: str | None = None,
     )
 
 
+def _impl_query_ai_flavor_memory(*, db: Any, project_id: int,
+                                 patterns: list[str] | None = None,
+                                 include_global: bool = True,
+                                 limit: int = 12) -> dict:
+    """查 AI 腔记忆库（只读）：给定模式名列表 → 历史命中与微调方法；省略 → 在册记忆。
+
+    ## 两种用法（由 `patterns` 是否给出决定）
+
+    - **给了 patterns**：调 `ai_flavor_memory.match_memories` 逐个比对，返回
+      `{"matched": [...], "unmatched": [...]}`。matched 里每条带
+      `solution` / `times_reused` / `recurrences` / `flagged_ineffective`——
+      助手据此判断「这个问题历史上出现过、沉淀的微调方法还靠不靠谱」：
+      命中即可直接复用该微调方法，无需重新规划；未命中（unmatched）表示
+      这是新问题，需要现场规划并沉淀。
+    - **省略 patterns**：调 `ai_flavor_memory.load_memories` 返回该项目的
+      在册记忆列表（合并 global + 本项目、按严重度/命中次数排序、受条数
+      与字符预算双重裁剪），形状为 `{"memories": [...], "count": n}`。
+
+    ## 为什么是只读的
+
+    本工具只做 SELECT 侧的读取与比对：不写库、不调 LLM、不碰任何业务表。
+    「命中→复用、未命中→规划并沉淀」的写操作发生在生成闭环
+    （`app.routers.assistant_generation._run_ai_flavor_feedback` →
+    `ai_flavor_memory.resolve_tuning`）这条既有的自动写入路径上，由闭环
+    自己的事务与护栏负责——工具表不提供任何写入口（项目红线）。
+
+    失败降级：记忆库读取异常时记 warning 并返回带 `error` 键的空结果，
+    不让一次工具调用炸掉助手主流程（与 router 侧「单工具失败不拖垮整次
+    调用」同款语义；带 `error` 键而非静默空列表，避免「库坏了」被读成
+    「没有记忆」——静默失效比报错难查得多）。
+    """
+    from app.agents import ai_flavor_memory
+
+    try:
+        if patterns is not None:
+            result = ai_flavor_memory.match_memories(
+                db, project_id, patterns, include_global=include_global
+            )
+            return {
+                "matched": list(result.get("matched") or []),
+                "unmatched": list(result.get("unmatched") or []),
+            }
+        items = ai_flavor_memory.load_memories(
+            db, project_id, limit=limit, exclude_flagged=False
+        )
+        return {"memories": list(items), "count": len(items)}
+    except Exception as exc:  # noqa: BLE001 - 工具失败不得炸掉助手主流程
+        logger.warning(
+            "query_ai_flavor_memory 读取失败"
+            "（project=%s, patterns=%r）：%s",
+            project_id, patterns, exc,
+        )
+        return {"matched": [], "unmatched": [], "error": str(exc)}
+
+
 _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="search_novel_chunks",
@@ -647,6 +710,17 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         ),
         read_only=True,
         callable=_impl_analyze_logs,
+    ),
+    ToolSpec(
+        name="query_ai_flavor_memory",
+        description=(
+            "查 AI 腔记忆库：给定模式名列表（省略则取该项目的在册记忆），返回每个问题"
+            "历史上是否出现过、累计命中多少次、以及当年沉淀下来的微调方法（solution）与"
+            "复用/复发统计。命中即可直接复用该微调方法，无需重新规划；未命中表示这是新问题，"
+            "需要现场规划并沉淀。"
+        ),
+        read_only=True,
+        callable=_impl_query_ai_flavor_memory,
     ),
 )
 

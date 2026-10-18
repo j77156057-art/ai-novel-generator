@@ -37,10 +37,13 @@
 ## 生成后的 AI 腔反馈闭环（旁路，不动上面三条约束）
 
 两个分支生成成功并提交后，都会调用 `_run_ai_flavor_feedback()`：由
-**Assistant**（本端点，主 agent）检查 Writer（sub agent）刚产出的文本、
-把本次 AI 腔问题总结写进 `ai_flavor_memories`、并微调
-`prompt_overrides` 的 constraint_note 槽位——微调对象是「下次给 Writer
-的输入」，不是重写本次文本（检查者与生成者必须分离）。闭环零 LLM、
+**Assistant**（本端点，主 agent）检查 Writer（sub agent）刚产出的文本，
+把本次 AI 腔问题交给 `ai_flavor_memory.resolve_tuning()` 按实际问题
+解析——历史上沉淀过微调方法的模式直接**复用**，没沉淀过的**现场规划**
+并写入 `ai_flavor_memories`；再读回合并后的记忆（排除已知无效的）、
+渲染成覆写微调 `prompt_overrides` 的 constraint_note 槽位——微调对象是
+「下次给 Writer 的输入」，不是重写本次文本（检查者与生成者必须分离）。
+闭环检测零 LLM、解析模板优先（仅冷门模式惰性取 Assistant provider）、
 自带事务与异常兜底：任一步失败只记日志，已落库的正文与已成功的响应
 都不受影响（正文落库与闭环成功是两个独立的事实）。
 
@@ -53,7 +56,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import model_validator
@@ -210,10 +213,14 @@ def _record_generation_evidence(
 # Writer 自检自改是本末倒置。
 #
 # 三条硬约束（全部有测试守着）：
-# 1. **闭环是旁路**：检测 / 记忆 / 微调任一步抛异常，都吞掉并记日志，
+# 1. **闭环是旁路**：检测 / 解析 / 微调任一步抛异常，都吞掉并记日志，
 #    绝不让 /invoke-generation 失败——正文早已落库，闭环只是附加动作；
-# 2. **零 LLM、零语料**：只用 engine 的纯本地检测（`_should_rewrite` /
-#    `_detect_ai_flavor`）+ DB 读写，不调 provider.chat、不 hybrid_search；
+# 2. **检测零 LLM、解析模板优先**：检测步只用 engine 的纯本地检测
+#    （`_should_rewrite` / `_detect_ai_flavor`）+ DB 读写，不调
+#    provider.chat、不 hybrid_search；解析步（resolve_tuning）对现有
+#    模式模板优先，仅模板覆盖不到的冷门模式才惰性取 Assistant
+#    provider——取 provider 的动作被推迟到真正被消费时（零成本纪律，
+#    见 `_LazyLLMHandle`）；
 # 3. **不改本次文本**：闭环只读 text，不碰 Generation / target.text。
 
 
@@ -256,19 +263,10 @@ _FLAVOR_OVERRIDE_HEADER = (
 #: 是闭环自动写的，还是人工提案批的。
 _FLAVOR_OVERRIDE_CREATED_BY = "assistant_ai_flavor_feedback"
 
-
-def _severity_for_count(count: int) -> str:
-    """单模式本段命中次数 → 严重度档位（high | mid | low）。
-
-    分档线见 `_SEVERITY_HIGH_HITS` / `_SEVERITY_MID_HITS` 注释：档位语义
-    与 `ai_flavor_memory.SEVERITY_RANK` 对齐——high 在 load_memories 排序
-    里最优先，提示词预算紧张时也必须先提醒「明显破坏文风」的问题。
-    """
-    if count >= _SEVERITY_HIGH_HITS:
-        return "high"
-    if count >= _SEVERITY_MID_HITS:
-        return "mid"
-    return "low"
+#: 注：单模式严重度分档（旧 `_severity_for_count`）已随「解析调优」改造
+#: 移入 `ai_flavor_memory.resolve_tuning`——严重度是记忆行/方案库的属性，
+#: 由持有方案库的那一侧按同一口径定档；闭环只负责把「本段命中次数」作为
+#: evidence 交进去。两处各写一套分档线必漂移（本项目历史教训）。
 
 
 def _pattern_examples(
@@ -327,8 +325,13 @@ def _render_flavor_constraint(db: Session, project_id: int) -> str:
     这里按 `MAX_OVERRIDE_LEN` 再截断（治标）兜底历史超长行——截断而不是
     让 `set_active_override` 的长度闸抛错：异常会令闭环整体回滚，该项目
     自动微调从此永久静默罢工（QA F2）。
+
+    `exclude_flagged=True`：被有效性反馈标记为「疑似无效」的记忆不进提示词
+    （判定与打标在 `ai_flavor_memory` 侧）——已知不靠谱的建议继续渲染只会
+    污染 Writer 的输入；标记的语义是「这条建议试过还会犯」，不是「这个
+    问题没发生过」，记账连续性不受影响。
     """
-    items = ai_flavor_memory.load_memories(db, project_id)
+    items = ai_flavor_memory.load_memories(db, project_id, exclude_flagged=True)
     block = ai_flavor_memory.render_memory_block(items)
     if not block:
         return ""
@@ -343,6 +346,81 @@ def _render_flavor_constraint(db: Session, project_id: int) -> str:
     return text
 
 
+def _lazy_llm() -> Any | None:
+    """惰性取 Assistant provider；取不到（未配置 key 等）返回 None。
+
+    为什么惰性（零成本纪律）：`resolve_tuning` 对现有模式全部模板优先，
+    只有模板覆盖不到的冷门模式才需要真 provider。若在调 resolve_tuning
+    **之前**就取 provider，等于每次闭环都为几乎不会用到的 LLM 付一次
+    构造/鉴权成本。取不到时返回 None 而非抛错：模板路径不依赖 provider，
+    冷门路径由 resolve_tuning 自行决定降级——闭环是旁路，不该因为
+    「LLM 没配」而整体罢工。
+    """
+    try:
+        from app.llm.provider import get_assistant_provider
+
+        return get_assistant_provider()
+    except Exception as exc:  # noqa: BLE001 - 取不到 LLM 不该炸掉闭环
+        logger.info(
+            "AI 腔反馈闭环：Assistant provider 不可用，"
+            "冷门模式将走纯模板降级：%s", exc,
+        )
+        return None
+
+
+class _LazyLLMHandle:
+    """惰性 LLM 句柄：resolve_tuning 无论把它当**可调用**还是当 **provider
+    实例**消费都成立，且取 provider 的时刻被推迟到真正被消费的那一刻。
+
+    为什么需要这个句柄（零成本纪律）：闭环对 LLM 的要求是「冷门模式才用」——
+    现有模式全有模板，resolve_tuning 内部模板优先。若在调用 resolve_tuning
+    之前就取 provider，等于每次闭环都为几乎不会用到的 LLM 付一次构造/鉴权
+    成本。本句柄把 `_lazy_llm()` 的调用包上一层，对两种消费方式都惰性：
+
+    - 当可调用：`handle()` → 真实 provider 或 None（取不到不炸，交回
+      resolve_tuning 决定降级）；
+    - 当 provider 实例：`handle.chat(...)` 等任意属性/方法 → 惰性取到后
+      原样转调；取不到则抛 RuntimeError，让 resolve_tuning 的模板兜底
+      逻辑接住（闭环外层还有异常隔离，不会影响生成主流程）。
+
+    句柄内缓存首次解析结果：同一轮闭环里多次消费只取一次 provider。
+    （契约的 `llm` 参数类型标注为 `Any`，两种消费方式都覆盖是刻意的——
+    按实际读到的契要走，这里不猜。）
+    """
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        self._factory = factory
+        self._resolved = False
+        self._provider: Any = None
+
+    def _resolve(self) -> Any:
+        """首次消费时才真取 provider；之后复用缓存（同轮闭环只取一次）。"""
+        if not self._resolved:
+            self._provider = self._factory()
+            self._resolved = True
+        return self._provider
+
+    def __call__(self) -> Any:
+        """可调用消费方式：返回真实 provider 或 None。"""
+        return self._resolve()
+
+    def __getattr__(self, name: str) -> Any:
+        """provider 实例消费方式：惰性取到后原样转调（chat / model / …）。
+
+        `_` 开头的名字直接拒绝：防止初始化期（实例属性尚未就绪）走进
+        无限递归。provider 取不到时抛 RuntimeError 而非 AttributeError——
+        这是「LLM 不可用」的事实，不该被 `hasattr` 静默吞成「没有 chat」。
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        provider = self._resolve()
+        if provider is None:
+            raise RuntimeError(
+                f"Assistant provider 不可用（惰性获取失败），无法代理 {name!r}"
+            )
+        return getattr(provider, name)
+
+
 def _run_ai_flavor_feedback(
     db: Session,
     project: Project,
@@ -350,7 +428,7 @@ def _run_ai_flavor_feedback(
     segment_no: int | None,
     instruction: str,
 ) -> dict | None:
-    """AI 腔反馈闭环：检查本次产出 → 总结 → 写记忆 → 微调下次生成的输入。
+    """AI 腔反馈闭环：检查本次产出 → 总结 → 解析调优 → 微调下次生成的输入。
 
     挂载点：`assistant_invoke_generation` 两个分支的主流程 `db.commit()`
     之后、`return` 之前（正文已落库，闭环是旁路）。
@@ -361,16 +439,18 @@ def _run_ai_flavor_feedback(
        线的轻微命中只告警不记账（见常量注释里与告警线 5 的关系）；
     2. **总结**：`_summarize_flavor_hits` 归纳「本次哪里犯了 AI 腔」
        （模式×次数 + 例句）；
-    3. **写记忆**：每个命中的模式调一次 `upsert_memory`（issue_key=模式名，
-       hits_delta=1——hit_count 记的是「多少次检查命中过它」，本段密度写在
-       summary 与 severity 里），同一模式跨段累加一行，不插新行；
-    4. **微调**：`_render_flavor_constraint` 读回合并后的记忆渲染成约束，
-       经 `set_active_override` 写入 constraint_note 槽位（「同 key 先降旧
-       再插新」的既有不变量由此保留，不直接 db.add 绕开它）；内容与当前
-       生效覆写逐字节相同时跳过，不在历史表里堆无意义的新行。当前生效
-       覆写若来自人工/提案（`created_by` 不是本闭环的标识），跳过写入
-       保留人工决策（治理口径见 `prompt_overrides` 模块注释）——记忆仍
-       正常写，记账与微调互不影响；
+    3. **解析调优**：`resolve_tuning` 按 evidence（模式 × 本段次数 + 例句）
+       决定每个模式「复用老方案 / 重规划 / 新规划」——历史上沉淀过微调
+       方法的模式直接复用（solution 一字不差、times_reused 累加），没
+       沉淀过的现场规划并落库；模板优先，仅冷门模式惰性取 Assistant
+       provider（见 `_LazyLLMHandle`）；
+    4. **微调**：`_render_flavor_constraint` 读回合并后的记忆（排除已知
+       无效的）渲染成约束，经 `set_active_override` 写入 constraint_note
+       槽位（「同 key 先降旧再插新」的既有不变量由此保留，不直接
+       db.add 绕开它）；内容与当前生效覆写逐字节相同时跳过，不在历史表里
+       堆无意义的新行。当前生效覆写若来自人工/提案（`created_by` 不是本
+       闭环的标识），跳过写入保留人工决策（治理口径见 `prompt_overrides`
+       模块注释）——记忆仍正常写，记账与微调互不影响；
 
     事务与兜底：闭环自带事务边界（主流程提交后才开始），任一步抛异常 →
     `db.rollback()` 丢掉本循环的半截写入 + `logger.warning`，**绝不影响**
@@ -378,6 +458,11 @@ def _run_ai_flavor_feedback(
 
     Returns:
         走完闭环（含未达阈值提前返回）时的摘要 dict；异常时返回 None。
+        摘要键：`total` / `summary` / `alerted` / `override_written` /
+        `reused` / `replanned` / `planned`——后三个让调用方看得见「这次
+        是复用了老方案（reused）还是重规划/新规划了（replanned/planned）」；
+        两个生成分支共用本函数构造返回值，同键同形状（两处各写一遍必漂移
+        是这个项目的历史教训）。
     """
     try:
         # forbidden 传 None：本闭环只记账 AI 腔模式；反向禁忌是另一本账，
@@ -397,24 +482,31 @@ def _run_ai_flavor_feedback(
         occurrences: dict[str, list[dict]] = flavor.get("occurrences") or {}
         summary = _summarize_flavor_hits(total, hits, occurrences)
 
-        # 写记忆：按命中次数降序（同次数按模式名），确定性顺序便于对账
+        # 解析调优：把本次检测结果整理成 evidence，交给 resolve_tuning 决定
+        # 每个模式「复用老方案 / 老方案不灵重规划 / 全新规划」——取代旧的
+        # 「逐模式无脑 upsert 问题行 + 渲染时全量记忆一锅端」：该复用的复用，
+        # 该规划的才规划。evidence 按命中次数降序（同次数按模式名），确定性
+        # 顺序便于对账；examples 走 _pattern_examples（截到
+        # _EXAMPLES_PER_PATTERN 条并补 segment_no，与记忆行 examples 列的
+        # 既有口径一致，不是裸 occurrences）。
+        evidence: dict[str, dict[str, Any]] = {}
         for pattern, count in sorted(hits.items(), key=lambda kv: (-kv[1], kv[0])):
-            ai_flavor_memory.upsert_memory(
-                db,
-                scope="project",
-                project_id=project.id,
-                issue_key=pattern,
-                summary=(
-                    f"{pattern} 式 AI 腔：本段命中 {count} 次"
-                    f"（全段共 {total} 次）"
-                ),
-                hits_delta=1,
-                examples=_pattern_examples(
+            evidence[pattern] = {
+                "count": count,
+                "examples": _pattern_examples(
                     occurrences.get(pattern) or [], segment_no
                 ),
-                segment_no=segment_no,
-                severity=_severity_for_count(count),
-            )
+            }
+
+        # 惰性 LLM：句柄被 resolve_tuning 消费时才取 assistant provider
+        # （见 _LazyLLMHandle）。现有模式全有模板、模板优先，实际不会触发
+        # LLM——这就是为什么值得惰性：不为几乎不会用的模型付构造/鉴权成本。
+        tuning = ai_flavor_memory.resolve_tuning(
+            db, project.id, evidence, llm=_LazyLLMHandle(_lazy_llm)
+        )
+        reused: list[dict] = list(tuning.get("reused") or [])
+        replanned: list[dict] = list(tuning.get("replanned") or [])
+        planned: list[dict] = list(tuning.get("planned") or [])
 
         # 微调：读回合并后的记忆（含本次刚写的）渲染成约束写进槽位
         override_text = _render_flavor_constraint(db, project.id)
@@ -454,6 +546,13 @@ def _run_ai_flavor_feedback(
             "summary": summary,
             "alerted": alerted,
             "override_written": override_written,
+            # 解析结果摘要：让调用方看得见「这次是复用了老方案（reused）/
+            # 重规划了不灵的旧方案（replanned）/ 规划了新方案（planned）」。
+            # 两个生成分支共用本函数构造返回值，同键同形状——两处各写一遍
+            # 必漂移是这个项目的历史教训。
+            "reused": reused,
+            "replanned": replanned,
+            "planned": planned,
         }
     except Exception as exc:  # noqa: BLE001 —— 闭环是旁路，失败绝不能影响已成功的生成
         try:
