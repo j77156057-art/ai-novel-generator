@@ -51,13 +51,13 @@ class StubProvider:
     def __init__(self, text: str = SEG_TEXT) -> None:
         self.text = text
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
         return self.text
 
     def summarize(self, text: str) -> str:
         return "测试摘要"
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
         yield self.text
 
 
@@ -245,7 +245,7 @@ def test_rewrite_failure_does_not_crash_generation(db_session):
     class BoomOnRewriteProvider(StubProvider):
         """生成正常返回（带 AI 腔以触发重写），重写那次抛错。"""
 
-        def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+        def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
             if "你是一位资深中文网文编辑" in system:
                 raise RuntimeError("重写时模型炸了")
             return ai_text

@@ -1,0 +1,40 @@
+{
+  "warnings": [
+    {
+      "segment_no": 2,
+      "generated_at": "2026-10-17T15:25:30.241891+00:00",
+      "percentile": 100.0,
+      "mean_abs_z": 3.093,
+      "worst_features": [
+        "段尾升华率",
+        "长句占比",
+        "句长均值",
+        "段长CV",
+        "句长p90"
+      ],
+      "warn_message": "本段文风偏离档案（percentile 100.0，高于阈值 99.5）。最偏的特征：段尾升华率、长句占比、句长均值。建议重写或手动调整。",
+      "bucket": "medium",
+      "scale_ratio": 0.76,
+      "chars": 2268
+    },
+    {
+      "segment_no": 1,
+      "generated_at": "2026-10-17T15:24:41.304707+00:00",
+      "percentile": 100.0,
+      "mean_abs_z": 3.708,
+      "worst_features": [
+        "段尾升华率",
+        "句号密度",
+        "段均句数",
+        "句长p90",
+        "比喻密度"
+      ],
+      "warn_message": "本段文风偏离档案（percentile 100.0，高于阈值 99.5）。最偏的特征：段尾升华率、句号密度、段均句数。建议重写或手动调整。",
+      "bucket": "short",
+      "scale_ratio": 0.48,
+      "chars": 1440
+    }
+  ],
+  "total": 2,
+  "truncated": false
+}

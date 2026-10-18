@@ -99,11 +99,28 @@ def merged_constraint_items(
     权威顺序（评审 A 的 Q6）：plot_bible（用户构思 / bible）在前，图谱抽取在后。
     两处必须共用本函数，否则会出现「system 里列了、user 尾部那份自称完整的锁定名单里没列」
     这种自相矛盾的提示词——最高权威层被漏掉，模型会以为游离在约束之外。
+
+    **bible 删除权威**（kg-cascade-protocol 阶段 2-3）：bible.characters **显式列了**
+    名字时，未列入的 KG 角色约束整条剔除——用户在 bible 里删掉「顾辰逸」后，
+    旧抽取事实再把他说成锁定角色，会与新设定矛盾（旧段不可改，但未来段必须只认新设定）。
+    保守边界：bible 无 characters 键或空列表 = 未显式宣告清册，不过滤
+    （老项目 bible 只有 relationships/foreshadowing 时不误伤全表）。
     """
     bible_chars = (plot_bible.get("characters") or []) if plot_bible else []
     kg_chars = reminders.get("character_constraints") or []
     bible_fores = (plot_bible.get("foreshadowing") or []) if plot_bible else []
     kg_fores = [h.get("question") for h in (reminders.get("unresolved_plotholes") or [])]
+    if bible_chars and isinstance(bible_chars, list):
+        declared: set[str] = set()
+        for c in bible_chars:
+            declared.add(str((c.get("name") if isinstance(c, dict) else c) or "").strip())
+        if declared:
+            kg_chars = [
+                c for c in kg_chars
+                if not isinstance(c, dict)
+                or not str(c.get("name") or "").strip()
+                or str(c.get("name")).strip() in declared
+            ]
     return _merge_named(bible_chars, kg_chars), _merge_text(bible_fores, kg_fores)
 
 
@@ -221,6 +238,10 @@ def build_system_prompt(
         "- 对话不承担设定讲解：人物不互相解释世界观或概念，读者靠情节自行理解。\n"
         "- 具体优于形容：少堆形容词，多写可感知的具体物件、动作、气味声响。\n"
         "- 允许留白：信息不必解释完，场景不必交代清，段落可以以一个动作或物件收住。\n"
+        "- 省略号节制：避免在叙事中习惯性地用「……」「...」拖腔；\n"
+        "用「，」「。」「——」承担语气停顿，不要让省略号成为情感拐杖。\n"
+        "- 避免堆叠四字格：连续使用四字成语/对仗句会显得机械、像 AI 生成的「金句段」；\n"
+        "人物对话和叙事以自然口语/长短句为主，四字格用一处即止。\n"
         "- 贴近真实节奏：长短句交错，不要每段都同样长度、不要句句工整。\n\n"
         "【续写纪律】只输出正文；保持与上一段的连贯；不要重复已写过的内容；"
         "每一轮都是「连载的一节」，不是一篇独立完整的短篇小说——"
@@ -243,6 +264,8 @@ def build_user_prompt(
     rag_has_forbidden: bool = False,
     *,
     directive_suffix: str | None = None,
+    node_prompt: str | None = None,
+    kg_slice: str | None = None,
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -262,6 +285,11 @@ def build_user_prompt(
 
     `directive_suffix` 是【续写指令】之后的运行时覆写（见
     `app.agents.prompt_overrides`）；为空（未设置覆写）时输出与旧版逐字节相同。
+
+    `node_prompt`（时间线，见 timeline.py）：传了它就走「按剧情点分段投喂」——
+    **不注入整条【大纲】，也不注入 plot_bible 的 synopsis/direction**（那会把结局走向
+    一次给全，导致第一章就讲完）。改注入当前剧情点的写作目标。
+    没传则走原逻辑（向后兼容，旧项目/无时间线项目不受影响）。
     """
     if prior_blocks:
         prior = "\n".join(prior_blocks)
@@ -269,6 +297,11 @@ def build_user_prompt(
         prior = "\n".join(f"{i+1}. {s}" for i, s in enumerate(prior_summaries))
     else:
         prior = "（首段，无前情）"
+
+    # v2.7：智谱弱模型「写约 N 字」是软性，常 1300-1500 字就停
+    # （v2.7 smoke 实测段 1 wc=1359 / 目标 3000 = 45%）。
+    # directive 模板里写「写不少于 min_chars」是硬性下限，让模型倾向写够才出 stop marker。
+    min_chars = int(max_chars * 0.8)
 
     rag = "\n---\n".join(rag_context) if rag_context else "（无检索上下文，凭风格自由发挥）"
 
@@ -280,8 +313,16 @@ def build_user_prompt(
             outline_text = str(outline)
 
     # —— 动态剧情指引（来自剧情圣经，随构思更新；不污染静态系统层）——
+    # 时间线模式（传了 node_prompt）下，**剔除整个 plot_bible**——它里边的
+    # synopsis/direction/relationships/foreshadowing/conflicts 任意一项都可能
+    # 携带整条故事走向（"与顾辰逸相知相守""父亲是董事长""感情升温"等），模型
+    # 拿到就会把后续剧情提前写进第一段，正是节点粒度问题的根因。
+    # 当前剧情点的具体指引已经在 node_prompt 里（entry/exit/emotion/beats），
+    # plot_bible 在时间线模式下的价值由 §7.3 节点规划阶段吸收——不需要再
+    # 在生成 prompt 里二次注入。
+    # 保留理由（向后兼容）：非时间线模式仍按原逻辑注所有 plot_bible 字段。
     bible_lines: list[str] = []
-    if plot_bible:
+    if plot_bible and not node_prompt:
         synopsis = plot_bible.get("synopsis")
         direction = plot_bible.get("direction")
         conflicts = plot_bible.get("conflicts") or []
@@ -314,15 +355,22 @@ def build_user_prompt(
     if is_opening:
         directive = (
             f"这是整篇的**开头**。请从建立人物与情境写起，抛出一个推动故事的冲突或事件，"
-            f"节奏舒展地写约 {max_chars} 字；**本节只负责铺陈与设悬，不要收尾、不要给出结局、"
+            f"节奏舒展地写不少于 {min_chars} 字（建议 {max_chars} 字）；**本节只负责铺陈与设悬，不要收尾、不要给出结局、"
             f"不要写『从此……』式的收束**，把更大的冲突留到后面展开。"
             f"风格与节奏以系统提示中的【风格】与【文风要求】为准。"
+            # v2.6：节点粒度根治——告诉模型在节末写 stop marker，
+            # provider 会传 stop=["【本节完】", ...] 给 LLM，模型写到此 marker 时停
+            "**节末信号**：写完本节主要内容后，请在文末单独一行写【本节完】三个字，"
+            "表示本节已完整收口（后端会切分正文与这个 marker）。"
         )
     else:
         directive = (
-            f"请续写约 {max_chars} 字，并在本节结尾停在某个仍未解决的冲突 / 悬念 / 动作中途，"
+            f"请续写不少于 {min_chars} 字（建议 {max_chars} 字），并在本节结尾停在某个仍未解决的冲突 / 悬念 / 动作中途，"
             f"为下一节留钩子——不要在此收束主线或给出结局。"
             f"风格与节奏以系统提示中的【风格】与【文风要求】为准。"
+            # v2.6：节点粒度根治——同上
+            "**节末信号**：写完本节主要内容后，请在文末单独一行写【本节完】三个字，"
+            "表示本节已完整收口。"
         )
 
     blocks = [
@@ -332,7 +380,10 @@ def build_user_prompt(
         "【剧情圣经·动态指引】",
         bible_block,
     ]
-    if premise:
+    # premise：用户给的故事大概，**时间线模式下剔除**（同 plot_bible 一样
+    # 携带整条故事走向，与 node_prompt 职责重复）。非时间线模式保留作
+    # "基调锚点"。
+    if premise and not node_prompt:
         blocks += ["", "【小说大概内容（用户给定，作为基调锚点）】", premise]
     rag_header = "【检索上下文（参考风格素材，可化用不可照抄）】"
     if rag_has_forbidden:
@@ -354,8 +405,16 @@ def build_user_prompt(
             "【风格样例（参考语料原文，学习其语气/节奏/段落编排/人物口吻，不要复用其内容）】",
             "\n\n".join(exemplar_lines),
         ]
-    if outline_text:
+    if node_prompt:
+        # 时间线模式：只投喂当前剧情点，不投喂整条【大纲】
+        blocks += ["", "【当前剧情进度（按点推进，不要越过本点）】", node_prompt]
+    elif outline_text:
         blocks += ["", "【大纲】", outline_text]
+    if kg_slice:
+        # v3.0 KG 切片：按当前剧情点动态取的近期实体/状态/伏笔/情报/事件。
+        # 只标红不强制——是给模型的「世界观锚点」，让它别写飞。与 plot_bible 区别：
+        # plot_bible 是用户构思（含走向，时间线模式剔除），kg_slice 是已生成事实。
+        blocks += ["", "【世界观事实（已发生，续写须保持一致，不得矛盾）】", kg_slice]
     blocks += ["", "【续写指令】", directive]
     directive_extra = _override_section(_OVERRIDE_DIRECTIVE_HEADER, directive_suffix)
     if directive_extra:

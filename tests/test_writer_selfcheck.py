@@ -60,13 +60,13 @@ class DistillStubProvider:
     蒸馏把正文当 JSON 解析而失败（实测踩过）。
     """
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
         return '{"人物描写手法": ["出场先写环境再写人（证据：医院里她抬起头）"]}'
 
     def summarize(self, text: str) -> str:
         return "蒸馏摘要"
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
         yield "蒸馏正文"
 
 
@@ -82,7 +82,7 @@ class SelfcheckStubProvider:
         self.chat_calls = 0
         self.prompts: list[tuple[str, str]] = []
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
         self.chat_calls += 1
         self.prompts.append((system, user))
         # 第 1 次 = 生成正文（要带 AI 腔才会触发重写）；第 2 次起 = 重写
@@ -91,7 +91,7 @@ class SelfcheckStubProvider:
     def summarize(self, text: str) -> str:
         return "测试摘要"
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
         yield _AI_TEXT
 
 

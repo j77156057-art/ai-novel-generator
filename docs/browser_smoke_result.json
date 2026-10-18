@@ -1,0 +1,14 @@
+{
+  "type": "browser_smoke_v2",
+  "test_count": 15,
+  "all_passed": true,
+  "checks": {
+    "B1": "preview GET / 200 text/html + 606 bytes",
+    "B2": "index.html 含 <div id=app> + module script ref /assets/",
+    "B3": "20 dist chunk 全部 200 (vue 路由懒加载所需)",
+    "B4": "KgWorkspace bundle 含 bucket + scale_ratio + short/medium/long（方案 B 字段打包成功）",
+    "B5": "端到端：uvicorn 8090 + 30 章 upload + 建项目 + style-warnings 200 + ProjectsView 200"
+  },
+  "frontend_build": "vue-tsc 0 error + vite build 4.7s（dist/ 14 chunk）",
+  "结论": "前端 build 干净 + 方案 B bucket 字段成功打包到 bundle + 端到端流程（模拟浏览器 → backend）链路通"
+}

@@ -65,14 +65,14 @@ class GenStubProvider:
     def __init__(self) -> None:
         self.chat_calls = 0
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
         self.chat_calls += 1
         return '{"人物描写手法": ["出场先写环境再写人（证据：' + self.EVIDENCE + '）"]}'
 
     def summarize(self, text: str) -> str:
         return "测试摘要"
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
         yield "测试正文"
 
 

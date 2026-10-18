@@ -529,7 +529,7 @@ def test_analyze_logs_calls_model_when_issues_hit(db_session, project_id, monkey
     class Recorder:
         model = "log-recorder-1"
 
-        def chat(self, system: str, user: str) -> str:
+        def chat(self, system: str, user: str, **kwargs) -> str:
             calls.append((system, user))
             return "（模型解释）失败集中在 provider 不可用。"
 
@@ -558,7 +558,7 @@ def test_analyze_logs_query_triggers_model_even_without_issues(
     class Recorder:
         model = "log-recorder-2"
 
-        def chat(self, system: str, user: str) -> str:
+        def chat(self, system: str, user: str, **kwargs) -> str:
             calls.append((system, user))
             return "（模型解释）历史里没有异常。"
 
@@ -1022,7 +1022,7 @@ def test_audit_calls_model_only_when_issues_or_query(db_session, project_id, mon
     class Recorder:
         model = "audit-recorder-1"
 
-        def chat(self, system: str, user: str) -> str:
+        def chat(self, system: str, user: str, **kwargs) -> str:
             calls.append((system, user))
             return "（模型解释）建议清理重复分片。"
 
@@ -1211,13 +1211,13 @@ def test_invoke_generation_marks_run_failed_on_provider_error(
     class BoomProvider:
         model = "boom-writer"
 
-        def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+        def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
             raise RuntimeError("writer chat exploded")
 
         def summarize(self, text: str) -> str:
             return text[:50]
 
-        def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+        def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
             raise RuntimeError("writer stream exploded")
             yield  # pragma: no cover - 让它成为生成器
 

@@ -18,6 +18,7 @@ from app.routers import assistant_proposals as assistant_proposals_router
 from app.routers import assistant_audit as assistant_audit_router
 from app.routers import assistant_generation as assistant_generation_router
 from app.routers import assistant_clean as assistant_clean_router
+from app.routers import kg_v3 as kg_v3_router
 
 
 @asynccontextmanager
@@ -53,6 +54,7 @@ app.add_middleware(
 app.include_router(novels.router)
 app.include_router(projects.router)
 app.include_router(generation.router)
+app.include_router(kg_v3_router.router)
 app.include_router(wizard.router)
 app.include_router(settings_router.router)
 app.include_router(assistant_router.router)

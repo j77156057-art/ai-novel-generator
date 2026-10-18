@@ -569,7 +569,8 @@ def assistant_run_detail(
     出参统一转 float——调用方不该知道存储引擎的怪癖。
     """
     run = db.get(AgentRun, run_id)
-    if run is None:
+    if run is None or run.role != "assistant":
+        # role 过滤：KG 批抽的行有自己的状态端点，不属于助手日志（404 同款语义）
         raise HTTPException(status_code=404, detail="agent run 不存在")
     if project_id is not None and run.project_id != project_id:
         raise HTTPException(status_code=404, detail="agent run 不存在")

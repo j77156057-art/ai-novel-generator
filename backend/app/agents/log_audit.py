@@ -117,6 +117,7 @@ def fetch_run_history(
     status: str | None = None,
     limit: int = 100,
     exclude_run_id: int | None = None,
+    role: str = "assistant",
 ) -> list[dict]:
     """取某项目的 AgentRun 历史（新的在前），附带每条的证据条数与耗时。
 
@@ -125,12 +126,17 @@ def fetch_run_history(
     `exclude_run_id` 排除某条 run——分析端点用它把**自己**（正在 running、
     evidence 还为 0 的那条）排除在被判历史之外，否则 `empty_evidence_runs`
     会把「这次分析自己」报成问题，而 `runs_analyzed` 也会把自己算进去。
+    `role` 默认 "assistant"：agent_runs 现在是多角色表（KG 批抽 worker 也写
+    role=kg_batch_extract 的行），assistant 的日志/分析只看自己的角色——
+    否则批抽的 failed 会进助手失败率，两边的可观测性互相污染。
 
     返回的 dict 是 GET /api/assistant/runs 与分析规则共用的**唯一形状**：
     id / project_id / role / status / model / note / started_at / finished_at /
     duration_ms / request_hash / evidence_count。
     """
     q = select(AgentRun).where(AgentRun.project_id == project_id)
+    if role:
+        q = q.where(AgentRun.role == role)
     if status:
         q = q.where(AgentRun.status == status)
     if exclude_run_id is not None:

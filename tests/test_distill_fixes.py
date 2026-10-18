@@ -63,14 +63,14 @@ class StubProvider:
 
     EVIDENCE = "医院里她抬起头"
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, **kwargs) -> str:
         return '{"人物描写手法": ["出场先写环境再写人（证据：' + self.EVIDENCE + '）"]}'
 
 
 class BoomProvider:
     """每次调用都炸——模拟 key 无效 / 限流 / 网络不通。"""
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, **kwargs) -> str:
         raise RuntimeError("模型服务不可用（测试注入）")
 
 
@@ -80,7 +80,7 @@ class FirstOkThenBoomProvider:
     def __init__(self) -> None:
         self.calls = 0
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, **kwargs) -> str:
         self.calls += 1
         if self.calls == 1:
             return '{"人物描写手法": ["出场先写环境再写人（证据：医院里她抬起头）"]}'
@@ -228,7 +228,7 @@ def test_all_chunks_unparseable_also_raises(db_session):
     proj = _make_project(db_session, nid, tier=TIER_FAST)
 
     class GarbageProvider:
-        def chat(self, system: str, user: str) -> str:
+        def chat(self, system: str, user: str, **kwargs) -> str:
             return "我不是 JSON，我是兜底文案"
 
     with pytest.raises(ValueError, match="全部调用模型失败"):

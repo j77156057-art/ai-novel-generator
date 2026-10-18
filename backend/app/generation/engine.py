@@ -16,6 +16,18 @@ from app.generation.prompts import (
     build_user_prompt,
     merged_constraint_items,
 )
+from app.generation.timeline import (
+    TimelineState,
+    advance,
+    build_node_prompt,
+    force_complete_current,
+    judge_node_completion,
+    plan_nodes_with_llm,
+    plan_timeline,
+    state_from_dict,
+    state_to_dict,
+    timeline_progress,
+)
 from app.generation.summary_tree import (
     budget_for_generation,
     compose_prior,
@@ -37,12 +49,21 @@ def _strip_thinking(text: str) -> str:
 
     双保险：provider 已显式传 thinking disabled，但 API 若忽略该参数，
     落库/注入前情的文本仍必须是干净的正文。
+
+    v2.6：节点粒度根治——如果 stop token 漏过（OpenAI 兼容 stop 通常不会
+    返回 stop 字符串本身，但保险起见），剥离正文末尾的【本节完】marker 行。
     """
     if " <think>" in text or " </think>" in text:
         end = text.rfind(" </think>")
         if end != -1:
-            return text[end + len(" </think>"):].strip()
+            text = text[end + len(" </think>"):].strip()
         # 只有开标签没有闭标签：从开标签后全部丢弃不可靠，退化为原样返回
+    # v2.6：剥离【本节完】marker 行（如果存在）。通常 stop token 已停在此之前，
+    # 但模型偶尔可能已输出 marker 才被 stop——保险剥离避免污染落库。
+    # 模式：行首可有 0+ 空白（包含换行/空格/制表），然后是 marker，
+    # marker 后到行尾可能有空白——$ 用 \Z 而不是 $（不受多行模式影响）
+    import re
+    text = re.sub(r"(?:[^\S\n]*\n)*[^\S\n]*【本节完】[ \t]*\Z", "", text).rstrip()
     return text
 
 
@@ -261,7 +282,29 @@ def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -
     """
     from app.kg.build import merge_segment_into_kg
 
-    return merge_segment_into_kg(db, project_id, text, segment_no)
+    stats = merge_segment_into_kg(db, project_id, text, segment_no)
+
+    # v3.0 独立 Judge Agent：只读 v3.0 KG 表，覆盖哨兵没做的瞬移/预知/秘密外泄/
+    # 时间穿越/伏笔超期/语言一致性。与哨兵并列（都只标红不改正文），失败同样不阻断。
+    # 合并说明：master 侧本函数是「内联四步 + judge」，HEAD 侧已把四步收归
+    # `merge_segment_into_kg` 唯一入口（7416114）。这里保留单一入口，只把
+    # master 的 judge 一步叠加在上——否则合并会把「只更一半」的旧路径带回来。
+    try:
+        from app.kg.judge import judge_segment, save_judge_findings
+
+        judge_res = judge_segment(db, project_id, text, segment_no)
+        # findings 必须落库（与哨兵同纪律）：只放单次响应里的告警，用户没盯着
+        # 就永远丢了，事后无法复核。落库失败不阻断生成。
+        try:
+            save_judge_findings(db, project_id, judge_res.get("findings", []),
+                                segment_no=segment_no)
+        except Exception:  # noqa: BLE001
+            pass
+        stats["judge"] = judge_res
+    except Exception as exc:  # noqa: BLE001
+        stats["judge"] = {"error": str(exc)[:100], "findings": []}
+
+    return stats
 
 
 def _require_distill_ready(db, project) -> None:
@@ -443,7 +486,73 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None) -> d
         "rag_has_forbidden": rag_has_forbidden,
         "novel_ids": novel_ids,
         "constraints": constraints,
+        # v3.0 KG 切片：按当前剧情点动态取的近期实体/状态/伏笔/情报/事件。
+        # 空库（未抽过）时为空串，build_user_prompt 跳过该块。
+        "kg_slice": _kg_slice_text(db, project),
     }
+
+
+def _kg_slice_text(db, project: Project) -> str:
+    """取 v3.0 KG 切片并渲染成 prompt 文本。失败返回空串（不阻断）。"""
+    try:
+        from app.kg.retrieval_v3 import slice_for_prompt, format_slice_for_prompt
+
+        current_seg = _next_segment_no(db, project.id) - 1
+        if current_seg < 1:
+            return ""
+        # active_characters：本段已写正文里的角色。首段无正文，用 plot_bible 角色名兜底。
+        active = _active_character_names(db, project, current_seg)
+        sl = slice_for_prompt(db, project.id, current_seg, active_characters=active)
+        return format_slice_for_prompt(sl)
+    except Exception:  # noqa: BLE001 —— KG 切片是增强，取不到不阻断生成
+        return ""
+
+
+def _enqueue_v3_extraction(db, project: Project, segment_no: int, text: str) -> dict:
+    """段 commit 后入队 v3.0 异步批抽（extractor_v3 落 v3.0 表）。
+
+    与 v2.6 同步合并（_merge_segment_into_graph）并存：同步合并喂 reminders（本段
+    立即可见），v3.0 批抽落 9 张表（供 Judge/检索切片/读侧 API）。
+    零 LLM、零阻塞：enqueue 只进内存队列，worker 线程后台抽。失败静默兜底。
+    """
+    try:
+        from app.kg import batch_worker as bw
+
+        bw.ensure_worker()
+        chapter = _next_segment_no(db, project.id) - 1  # 本段 commit 后 = segment_no
+        bw.enqueue_segment(db, project.id, segment_no, text, chapter=chapter)
+        return {"enqueued": True, "pending": bw._queue.pending_count(project.id)}
+    except Exception as exc:  # noqa: BLE001 —— 批抽是增强，失败不阻断
+        return {"enqueued": False, "error": str(exc)[:100]}
+
+
+def _active_character_names(db, project: Project, current_seg: int) -> list[str]:
+    """本段涉及的角色名（mention 反查）。空则用 plot_bible 角色名兜底。"""
+    try:
+        from app.models import KgMention, KgEntity
+        from sqlalchemy import select
+
+        ent_ids = {
+            m.entity_id for m in db.scalars(
+                select(KgMention).where(
+                    KgMention.project_id == project.id,
+                    KgMention.segment_no == current_seg,
+                )
+            )
+        }
+        names = []
+        for eid in ent_ids:
+            ent = db.get(KgEntity, eid)
+            if ent is not None and ent.kind == "character":
+                names.append(ent.canonical_name)
+        if names:
+            return names
+        # 兜底：plot_bible 里的角色名
+        bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+        return [c.get("name") for c in (bible.get("characters") or [])
+                if isinstance(c, dict) and c.get("name")]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _style_info(project: Project) -> dict | None:
@@ -488,12 +597,22 @@ def _style_profile(db, project: Project) -> dict | None:
 
 #: 生成后文风告警的高分位阈值：percentile 高于此值报"文风偏离档案"。
 #:
-#: **与 verify_stylometry.py 的 97.5 方向一致**：
+#: **与 verify_stylometry.py 的 97.5 方向一致**（同一分布同一口径）：
 #: percentile 的语义是"有多大比例的留出单元距离 ≤ 本段"，distance 越大 percentile 越大。
 #: 所以 percentile 高 = 比大多数人类样本都更偏离，percentile 低 = 更像正常文体。
-#: 这里用高分位（97.5）判"异常偏离"——与离线验收同一条线，不搞两套口径。
-#: 具体值由 `verify_stylometry.py` 在真实语料上扫 `unit_mean_abs_z` 分布后定，不拍脑袋。
-STYLE_WARN_PERCENTILE = 97.5
+#:
+#: v2.14 方案 B「对数粒度 profile」实施后，distance 系统性偏大问题缓解了
+#: （段 1 mean_abs_z 3.476 → 2.094，-40%），但 percentile 仍 100/100——
+#: bucket 留出分布 max 仍小于生成段 distance（30 章大奉 long bucket 留出 5
+#: 单元 max ~ 1.5，段 2 distance 6.461 远超）。阈值从 97.5 提到 99.5：
+#: (1) 与 verify_stylometry 离线验收保持同向，但放更宽——bucket 留出样本
+#: 数少是工程边界，不应让 100% 触发常态化；(2) 高于 99.5% 才是真异常
+#: （参考语料历史样本里都没有这种程度的距离）。
+#: 真要回到 97.5 阈值，需参考 50+ 章 30 万字让 long bucket 留出 20+ 单元
+#: —— 留出分布 max 自然扩大。详见 docs/style_log_buckets_design.md 风险评估节。
+STYLE_WARN_PERCENTILE = 99.5
+#: 每 N 段自动异步触发 audit_kg（防主链 LLM 拖慢，fire-and-forget 模式）
+AUTO_AUDIT_INTERVAL = 10
 
 #: AI 腔模式库：常见的中文 AI 写作套路。生成后检测这些模式，
 #: 命中则触发针对性重写。与 system prompt 的【文风要求：忌 AI 腔】互补——
@@ -866,6 +985,11 @@ def _style_warning(text: str, profile: dict | None) -> dict | None:
             f"最偏的特征：{'、'.join(k for k, _ in (d.get('worst') or [])[:3]) or '未知'}。"
             "建议重写或手动调整。"
         ),
+        # 方案 B「对数粒度 profile」：把 bucket / scale_ratio / chars 一起给前端
+        # Style 审计 subtab 可显式展示「本段走 long bucket / scale_ratio 2.0x」
+        "bucket": d.get("bucket"),
+        "scale_ratio": d.get("scale_ratio"),
+        "chars": d.get("chars"),
     }
 
 
@@ -891,6 +1015,212 @@ def _prompt_overrides(db, project_id: int) -> dict[str, str]:
             text = ""
         overrides[key] = text or ""
     return overrides
+
+
+def _schedule_async_audit_kg(db, project_id: int) -> None:
+    """每 N 段异步触发 audit_kg agent（fire-and-forget，不阻塞 generate）。
+
+    audit_kg 是 LLM 密集工具，**不能**在主链同步等结果。
+    用 daemon thread 启动，结果落 AgentRun 表 + 助手页可见。
+    """
+    import threading
+    from app.db import SessionLocal
+    from app.agents.registry import _impl_audit_kg  # 内部入口，避免走 LLM 路由
+
+    def _run():
+        try:
+            s = SessionLocal()
+            try:
+                _impl_audit_kg(db=s, project_id=project_id)
+            finally:
+                s.close()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "auto audit_kg 失败 (project %s)", project_id, exc_info=True)
+
+    t = threading.Thread(target=_run, daemon=True, name=f"audit-kg-{project_id}")
+    t.start()
+
+def _timeline_state_for(
+    project: Project, written_segments: int, provider=None, db=None
+) -> TimelineState | None:
+    """为项目取/建时间线状态（§11.3：DB 落库版）。
+
+    优先级：
+    1. 存档（project.plot_timeline）有效 → 反序列化恢复（不再调 LLM，省一次 plan）
+       ——若 written_segments > 存档中已写段数：快进补齐到当前；
+       若 < ：回退到重放（保守，advance 单向不可逆，宁可重算也不丢推进）
+    2. 无存档 → plan + §7.3 LLM 填实节点；填实后立即落库（若有 db）
+    3. 全部失败/无 outline → 返回 None 走原逻辑
+
+    `db` 不传时只读不写（用于 generate-plan 预检）。
+    """
+    if not project.outline:
+        return None
+    total_chars = project.target_length or 5000
+    per_seg = project.generation_length or 3000
+    total_segments = max(total_chars // max(per_seg, 1), 1)
+
+    # 路径 1：尝试从存档恢复
+    saved = project.plot_timeline if isinstance(project.plot_timeline, dict) else None
+    st = state_from_dict(saved, total_segments=total_segments) if saved else None
+
+    if st is None:
+        # 路径 2：首次规划
+        # v2.4 高潮密度蒸馏：plot_rhythm.avg_node_segments 取代首轮默认 5。
+        # plot_rhythm 由 compute_plot_rhythm 算，存到 project 列；调用方（生成
+        # 主流程）负责在首次 generate 前确保已蒸馏。
+        # 合法范围：v >= 1（avg 太小会触发 plan_timeline 的 div-by-zero 保护；
+        # 太大 plan_timeline 会 clamp 主干节点数到 [3,12]，所以这里只做下限
+        # 校验——>12 的值仍可用，只是主干节点被 clamp 到 12）。
+        avg_node_segments = 5  # DEFAULT_AVG_NODE_SEGMENTS
+        if isinstance(project.plot_rhythm, dict):
+            v = project.plot_rhythm.get("avg_node_segments")
+            if isinstance(v, int) and v >= 1:
+                avg_node_segments = v
+        st = plan_timeline(total_segments=total_segments, avg_node_segments=avg_node_segments)
+        if provider is not None:
+            outline_list = project.outline
+            if isinstance(outline_list, str):
+                import json as _json
+                try:
+                    outline_list = _json.loads(outline_list)
+                except Exception:  # noqa: BLE001
+                    outline_list = [outline_list]
+            filled = plan_nodes_with_llm(provider, outline_list, project.plot_bible, st.total_main)
+            if filled:
+                for node in filled:
+                    if node.id in st.nodes:
+                        node.segment_budget = st.nodes[node.id].segment_budget
+                        st.nodes[node.id] = node
+    else:
+        # 存档存在：若 written_segments 比存档进度多（应该不会发生但兜底），
+        # 不额外 advance——存档即权威。少的话走 advance 补齐。
+        archived_written = sum(st.seg_counts.values())
+        if written_segments > archived_written:
+            for _ in range(written_segments - archived_written):
+                st = advance(st)
+
+    # 落库（db 给定 + state 有效 + 还没存过/或被改过）
+    if db is not None and st is not None:
+        _persist_timeline_state(db, project, st)
+
+    return st
+
+
+def get_section_stop_sequences() -> list[str]:
+    """v2.6：节点粒度根治——返回节末 stop token 列表。
+
+    stop 列表：
+    - 【本节完】 — model 在节末单独一行写这个 marker，后端停在 marker 处
+    - 一些副 marker 防止 model 试图"写下一节"或"写小标题"时跑远
+
+    调用方在 chat(stream_stop_sequences=...) / stream_chat(stop_sequences=...) 传这个 list。
+    用 per-request 参数而不是 provider.set_stop_sequences() —— 避免单例被跨请求污染。
+    """
+    return [
+        "【本节完】",
+        "## 第",
+        "\n# ",
+        "\n## ",
+    ]
+
+
+def _persist_timeline_state(db, project: Project, st: TimelineState) -> None:
+    """把 state 序列化写回 project.plot_timeline。失败也不抛（generate 主流程不挂）。"""
+    try:
+        project.plot_timeline = state_to_dict(st)
+        db.add(project)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+
+
+def _load_timeline_state_for_branch(db, project: Project, written_segments: int):
+    """v2.5 helper：给 roll_branch 读存档 state——不调 LLM、不触发 advance。
+
+    与 _timeline_state_for 的差别：
+    - 不传 provider（不调 plan_nodes_with_llm）
+    - 不落库（只读，不写）
+    - 不调 advance 补齐（roll_branch 自己处理节流逻辑）
+    - 不做 LLM 节点规划（仅恢复存档）
+
+    失败 → 返回 None（roll_branch 走 no_state 路径，不切支线）
+    """
+    if not project.outline:
+        return None
+    saved = project.plot_timeline if isinstance(project.plot_timeline, dict) else None
+    if not saved:
+        return None
+    total_chars = project.target_length or 5000
+    per_seg = project.generation_length or 3000
+    total_segments = max(total_chars // max(per_seg, 1), 1)
+    # 不传 provider 给 state_from_dict（用最新 total_segments 复算骨架）
+    return state_from_dict(saved, total_segments=total_segments)
+
+
+def _judge_and_advance(
+    db, project: Project, provider, recent_text: str, written_segments: int
+) -> dict:
+    """v2.1：commit 段后调一次 LLM 判定当前节点 exit_condition 是否达成。
+
+    - 判定 True：取最新 state → force_complete_current → 落库
+    - 判定 False：只跑正常 advance（段数 +1，可能满 budget 自然 done）→ 落库
+    - 判定 None（失败/不确定/没 exit）：只跑正常 advance → 落库
+    - 没 outline / state 不可用：返回 skipped=True，不动 state
+
+    返回 dict 供 API 透传给前端（诊断/进度展示用）。失败兜底完全静默——
+    段数预算是兜底，LLM 加速只是「锦上添花」。
+    """
+    out = {"called": False, "judge": None, "forced": False, "advanced": False, "skipped": True}
+    if not project.outline:
+        return out
+    st = _timeline_state_for(project, written_segments, provider=None, db=None)
+    if st is None or not st.current_node or st.current_node not in st.nodes:
+        return out
+    cur_id = st.current_node
+    cur_node = st.nodes[cur_id]
+
+    # 1) 跑正常 advance（不管 LLM 怎么判，段数 +1）
+    archived_written = sum(st.seg_counts.values())
+    # _timeline_state_for 已做 archived 兜底：但传入 db=None 没重算
+    # 这里取出的 st 可能比 written_segments 落后一格（commit 前算的）
+    # 保险：手工 advance 一次（即使 archived ≥ written 也是幂等无害，next/beat 不变）
+    st = advance(st)
+    out["advanced"] = True
+    out["called"] = True
+    out["skipped"] = False
+
+    # 2) 调 LLM 判定——但只在「advance 之后该节点还未 done」时调
+    # （如果 advance 已让它 done，就没必要再让 LLM 重复判定）
+    if cur_id not in st.done and cur_node.exit_condition:
+        out["judge"] = judge_node_completion(provider, cur_node, recent_text)
+        if out["judge"] is True:
+            st = force_complete_current(st)
+            out["forced"] = True
+
+    # 3) 落库（用新 state 覆盖）
+    _persist_timeline_state(db, project, st)
+    out["current_node"] = st.current_node
+    out["done"] = sorted(st.done)
+    return out
+
+
+def current_node_prompt(
+    project: Project, written_segments: int, provider=None, db=None
+) -> str | None:
+    """算出当前剧情点的提示块（时间线启用时）；无 outline 返回 None。
+
+    供 generate_next_segment 与 generate-plan 共用——两条路径必须下发同一份提示，
+    否则预检看到的不算数。written_segments = 已写段数（_next_segment_no - 1）。
+    `db` 用于持久化；预检/读侧可不传（仅恢复，不写）。
+    """
+    st = _timeline_state_for(project, written_segments, provider, db=db)
+    if st is None or not st.current_node or st.current_node not in st.nodes:
+        return None
+    return build_node_prompt(
+        st.nodes[st.current_node], st.current_beat, timeline_progress(st)
+    )
 
 
 def generate_next_segment(
@@ -925,6 +1255,9 @@ def generate_next_segment(
 
     ctx = build_context(db, project, novel_ids)
     overrides = _prompt_overrides(db, project.id)
+    # —— 时间线：算出当前剧情点提示（有 outline 才启用；无则 None 走原逻辑）——
+    written = _next_segment_no(db, project.id) - 1
+    node_prompt = current_node_prompt(project, written, provider, db=db)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
         _style_profile(db, project), _style_narrative(db, project),
@@ -942,9 +1275,14 @@ def generate_next_segment(
         style_exemplars=ctx.get("style_exemplars"),
         rag_has_forbidden=ctx.get("rag_has_forbidden", False),
         directive_suffix=overrides[PromptKey.DIRECTIVE],
+        node_prompt=node_prompt,
+        kg_slice=ctx.get("kg_slice") or None,
     )
 
-    text = provider.chat(system, user, constraints=ctx["constraints"])
+    # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
+    # 重写/重生成是 AI 味修复，不传 stop
+    text = provider.chat(system, user, constraints=ctx["constraints"],
+                         stop_sequences=get_section_stop_sequences())
     summary = provider.summarize(text)
 
     # AI 味检测 + 针对性重写
@@ -962,19 +1300,76 @@ def generate_next_segment(
 
     gen, segment_no = _commit_segment(db, project, text, summary)
 
+    # —— v2.1：exit_condition LLM 判定 → 必要时提前切节点（§13 待定项落地）——
+    # 此时本段刚 commit 完，state 还没 advance（advance 是下次预检时触发的）。
+    # 在「commit 之前」的 current_node + 刚生成的正文上判定。
+    # 失败/不确定/节点没 exit → 走段数预算兜底，逻辑照旧。
+    node_judge = _judge_and_advance(db, project, provider, text, written)
+
     # —— 图谱进入生成闭环 ——
     # 每段生成后增量合并事实到 generated 图（不清空、upsert），
     # 使下一次生成的 reminders 能拿到本段新出现的角色 / 新埋的伏笔。
     kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+
+    # v3.0 异步批抽：入队 extractor_v3 落 9 张表（Judge/检索切片/读侧 API 的数据源）。
+    # 零 LLM 零阻塞，失败静默兜底。状态透传给前端（v3_extraction 键）。
+    v3_extraction = _enqueue_v3_extraction(db, project, segment_no, text)
+
+    # —— v2.5：支线滚动触发 ——
+    # 在 KG 合并后跑——这样能查到本段新产生的角色/钩子。
+    # roll_branch 读存档 state、判断 signal、切支线、落库——失败静默兜底。
+    # last_branch_written: 上次切支线时的已写段数——state 里没有存这个，
+    # 简化方案：从当前存档 plot_timeline 里读"分支段已写"（粗略：state.current_node
+    # 是否为分支 kind），如果当前是分支段已写过 MIN_GAP_SEGMENTS 才允许再切。
+    # 第一版简化：last_branch_written=None 总是允许切（最宽松）。
+    # 后续可优化：把 last_branch_written 存到 plot_timeline 顶层。
+    # 注：roll_branch 返回 (new_state, info_dict)——新 state 用于 state 推进，
+    # info_dict 透传给前端。这里 _new_state 不需要（roll_branch 内部已落库），
+    # 取 info_dict 当作 branch_roll。
+    from app.generation.branch import roll_branch as _roll_branch
+    _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
+    _new_state, branch_info = _roll_branch(
+        db, project, _load_timeline_state_for_branch(db, project, written),
+        provider, _post_commit_written, last_branch_written=None,
+    )
+
     # 摘要在**段落库之后**才滚上：滚上失败不会牵连已写成的段
     tree_stats = _rollup_summary_tree(db, project, provider)
 
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
     style_warning = _style_warning(text, _style_profile(db, project))
+    # v2.1：style_warning 落库（段级历史，>500 截断）
+    if style_warning:
+        try:
+            from app.style import append_style_warning
+            append_style_warning(db, project, segment_no, style_warning)
+        except Exception:  # noqa: BLE001 —— 落库失败绝不能阻断生成主流程
+            logging.getLogger(__name__).warning(
+                "style_warning 落库失败 (seg %s): %s", segment_no, style_warning, exc_info=True)
+    # v2.1：每 AUTO_AUDIT_INTERVAL 段异步触发 audit_kg（不阻塞 generate）
+    if segment_no and segment_no % AUTO_AUDIT_INTERVAL == 0:
+        _schedule_async_audit_kg(db, project.id)
+
+    # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换（旁路观测）
+    # 启发式会有假阳性（普通词组也报），调用方拿到列表后可聚合展示
+    from app.generation.guard import detect_unlisted_characters, collect_allowed_names
+    _allowed = collect_allowed_names(
+        ctx_reminders=ctx.get("reminders"),
+        plot_bible=project.plot_bible,
+    )
+    unlisted = detect_unlisted_characters(text, _allowed)
+    if unlisted:
+        logging.getLogger(__name__).warning(
+            "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
+            len(unlisted), unlisted[:10],  # 最多打 10 个，避免日志爆
+        )
 
     return {
         "kg_update": kg_stats,
+        "v3_extraction": v3_extraction,
         "summary_tree": tree_stats,
+        "node_judge": node_judge,
+        "branch_roll": branch_info,
         "segment_no": segment_no,
         "chapter_range": gen.chapter_range,
         "text": text,
@@ -984,6 +1379,7 @@ def generate_next_segment(
         "constraints": ctx["constraints"],
         "rag_context": ctx["rag_context"],
         "style_warning": style_warning,
+        "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
     }
 
@@ -999,6 +1395,10 @@ def generate_next_segment_stream(
 
     与 generate_next_segment 语义一致（组装→续写→总结→落库→更新主线摘要链），
     区别在续写过程逐块 yield，供 SSE 转发——长文首字即显、不干等。
+
+    v2.3：传 `node_prompt` 给 build_user_prompt——流式版也走时间线模式，
+    剔除 plot_bible 全字段 + premise。commit 段后调 `_judge_and_advance`
+    （与同步版同口径）—— yield 一个 `node_judge` 事件。
     """
     from app.llm.provider import get_llm_provider
 
@@ -1016,6 +1416,9 @@ def generate_next_segment_stream(
 
     ctx = build_context(db, project, novel_ids)
     overrides = _prompt_overrides(db, project.id)
+    # —— 时间线：算出当前剧情点提示（与同步版同口径，db 用于落库）——
+    written = _next_segment_no(db, project.id) - 1
+    node_prompt = current_node_prompt(project, written, provider, db=db)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
         _style_profile(db, project), _style_narrative(db, project),
@@ -1033,10 +1436,14 @@ def generate_next_segment_stream(
         style_exemplars=ctx.get("style_exemplars"),
         rag_has_forbidden=ctx.get("rag_has_forbidden", False),
         directive_suffix=overrides[PromptKey.DIRECTIVE],
+        node_prompt=node_prompt,
+        kg_slice=ctx.get("kg_slice") or None,
     )
 
+    # v2.6：节点粒度根治——流式版同步传 per-request stop token
     pieces: list[str] = []
-    for piece in provider.stream_chat(system, user, constraints=ctx["constraints"]):
+    for piece in provider.stream_chat(system, user, constraints=ctx["constraints"],
+                                       stop_sequences=get_section_stop_sequences()):
         pieces.append(piece)
         yield {"type": "chunk", "text": piece}
 
@@ -1057,6 +1464,8 @@ def generate_next_segment_stream(
             rewrite_info = info
 
     gen, segment_no = _commit_segment(db, project, text, summary)
+    # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
+    node_judge = _judge_and_advance(db, project, provider, text, written)
 
     # —— 图谱进入生成闭环（与 generate_next_segment 顺序对齐）——
     # 必须放在 _commit_segment 之后、_rollup_summary_tree 之前：正文已落库才归档，
@@ -1064,6 +1473,7 @@ def generate_next_segment_stream(
     # 复用 _merge_segment_into_graph（它已委托到 app.kg.build.merge_segment_into_kg
     # 做图谱+账本+别名归一+哨兵四步）——**不另写一套实现**：7416114 才把四步编排
     # 收归唯一入口，重写的结果就是又出现"只更一半"的路径。
+    # 保留 try/except：簿记异常绝不打断 SSE（正文已落库，done 必须照样发）。
     kg_stats = None
     try:
         kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
@@ -1072,10 +1482,32 @@ def generate_next_segment_stream(
         logging.getLogger(__name__).warning("流式 KG 簿记失败，段落已落库: %s", exc)
         kg_stats = {"merged": False, "reason": f"KG 簿记失败：{str(exc)[:100]}"}
 
+    # v3.0 异步批抽：与同步版同口径入队
+    v3_extraction = _enqueue_v3_extraction(db, project, segment_no, text)
+    _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
+    from app.generation.branch import roll_branch as _roll_branch
+    _new_state, branch_info = _roll_branch(
+        db, project, _load_timeline_state_for_branch(db, project, written),
+        provider, _post_commit_written, last_branch_written=None,
+    )
+
     tree_stats = _rollup_summary_tree(db, project, provider)
 
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
     style_warning = _style_warning(text, _style_profile(db, project))
+
+    # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换
+    from app.generation.guard import detect_unlisted_characters, collect_allowed_names
+    _allowed = collect_allowed_names(
+        ctx_reminders=ctx.get("reminders"),
+        plot_bible=project.plot_bible,
+    )
+    unlisted = detect_unlisted_characters(text, _allowed)
+    if unlisted:
+        logging.getLogger(__name__).warning(
+            "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
+            len(unlisted), unlisted[:10],
+        )
 
     yield {
         "type": "done",
@@ -1085,10 +1517,17 @@ def generate_next_segment_stream(
         "summary_tree": tree_stats,
         "id": gen.id,
         "style_warning": style_warning,
+        "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
         # 纯新增键：done 的既有字段语义一个都不改。挂簿记统计是为了让
         # 流式路径也能被观测（此前流式完全不做归档，出了问题无从判断）。
         "kg": kg_stats,
+        # master 侧把流式键统一为 kg_update（与同步路径同键）。两个都发：
+        # 老前端读 kg、新消费方读 kg_update，谁都不会静默拿不到。
+        "kg_update": kg_stats,
+        "node_judge": node_judge,
+        "v3_extraction": v3_extraction,
+        "branch_roll": branch_info,
     }
 
 
@@ -1100,6 +1539,7 @@ def _build_generation_prompts(
     max_chars: int | None = None,
     provider=None,
     reminders: dict | None = None,
+    node_prompt: str | None = None,
 ):
     """组装提示词；`before_segment` 给定时的前情**只取该段之前**（重生成用）。
 
@@ -1115,6 +1555,10 @@ def _build_generation_prompts(
 
     `novel_ids` 目前**未被使用**：重生成有意不带 RAG 素材（见下方 `[]` 实参），
     保留参数以维持调用方契约。
+    v2.3：新增 `node_prompt` 参数（v2.2 节点粒度强化后，stream 版走
+    原逻辑模式会注入整条 outline + plot_bible + premise，模型拿到就
+    演完整条故事——这正是"第一章就完结"bug 的变体）。传 node_prompt
+    后 build_user_prompt 走时间线模式，剔除全故事信息。
     """
     if max_chars is None:
         max_chars = project.generation_length or 3000
@@ -1149,6 +1593,7 @@ def _build_generation_prompts(
         project.premise,
         prior_blocks=blocks,
         directive_suffix=overrides[PromptKey.DIRECTIVE],
+        node_prompt=node_prompt,
     )
     return system, user, max_chars
 
@@ -1169,6 +1614,9 @@ def regenerate_segment_stream(
 
     `novel_ids` 目前**未被使用**——重生成有意不带 RAG 素材（见
     `_build_generation_prompts` 的 `[]` 实参），保留参数以维持调用方契约。
+    v2.3：传 `node_prompt` 给 `_build_generation_prompts`——重生成用时间线模式
+    剔除全故事信息。**不**调 `_judge_and_advance`——重生成替换第 N 段语义
+    上不改 `_next_segment_no`（已存在），不应触发 state advance。
     """
     from app.llm.provider import get_llm_provider
 
@@ -1191,11 +1639,16 @@ def regenerate_segment_stream(
     # 除了省一次查询，更是防止两次查询之间发生并发写入，导致「system 列了一套
     # 锁定名单、尾部 constraints 列了另一套」的自相矛盾提示词。
     reminders = get_reminders(db, project.id, source="generated")
+    # v2.3：算当前剧情点提示（重生成第 N 段时该段已存在，written_segments = N-1，
+    # 与 generate_next_segment 同步版同口径）。
+    written = segment_no - 1
+    node_prompt = current_node_prompt(project, written, provider, db=db)
 
     # 前情 = 只取该段之前的树（截断时若 L3 混入了被替换内容，会自动丢弃并重建）
     system, user, max_chars = _build_generation_prompts(
         db, project, before_segment=segment_no, novel_ids=novel_ids,
         max_chars=max_chars, provider=provider, reminders=reminders,
+        node_prompt=node_prompt,
     )
     # constraints 与正常续写同源（角色/伏笔的锁定名单不能因重生成而变）。
     # 只组装这一个 dict，**不跑 build_context**：那条路会为 RAG 与风格样例各加载

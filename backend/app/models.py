@@ -6,10 +6,13 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 
 from app.db import Base, IS_SQLITE
@@ -73,6 +76,21 @@ class Project(Base):
     # 「用哪一档算」的意图。产出里已经记了 tier，但那是结果不是偏好——用户改档
     # 之后要靠本字段才知道下次该按哪档重算。
     narrative_tier = Column(String(16), nullable=True)
+    # 时间线状态存档（§11.3）：替代进程内「已写段数重放 advance」恢复。
+    # JSON：{version, nodes, done, current_node, current_beat, branch_used, seg_counts, current_main_idx}
+    # 节点内容（title/entry/exit/beats/emotion）首次 §7.3 调 LLM 填实后落库，
+    # 之后段间推进只更新 done/current_*/seg_counts，不再调 LLM。
+    # 空表示「未启用时间线」或「尚未首次规划」——首次生成时回退到重放恢复+落库。
+    # version 用于将来 schema 演进时旧数据可识别并降级。
+    plot_timeline = Column(JSON, nullable=True)
+    # 节奏参数档（v2.4 高潮密度蒸馏）：
+    # JSON：{version, source_ids, chapter_emotions, avg_node_segments, branch_ratio, distilled_at}
+    # avg_node_segments 从语料章节情绪蒸馏：高潮章占比反推"平均每几段一个主干节点"，
+    # 取代首轮默认 5。branch_ratio 已落到 style_narrative，重复存是为了 plot_timeline
+    # 首次规划时不用去 style_narrative 找。
+    # 缓存指纹只有 source_ids + version（与 style_narrative 同模式）。
+    # 空表示「未蒸馏」——首次生成时回退到默认 5。
+    plot_rhythm = Column(JSON, nullable=True)
 
 
 class RawNovel(Base):
@@ -164,6 +182,264 @@ class Fact(Base):
     first_segment = Column(Integer, nullable=True)
     last_segment = Column(Integer, nullable=True)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+# ====================================================================
+# KG v3.0：工业界对齐的 9 张表（docs/kg-v3-design-final.md）
+#
+# 设计原则（吸收 The Narrative Graph / Novelium / leenbj skill 经验）：
+# - 领域分表（character/location/faction/item/worldrule/power_system 共用 kg_entities），
+#   软 schema 用 attrs JSON 承载，运行时校验不锁 DDL
+# - 关系带强度（strength）+ 独立演变表（kg_relation_evolution）——记过程不记快照
+# - 事件用 SVO triplet + location 必填 + in_story_date（物理时间校验的输入）
+# - 伏笔是独立表 + 5 态状态机（planted/developing/paid_off/dropped/expired），
+#   不用 event_link 间接表达
+# - 人物情报 kg_entity_knowledge 支撑「角色此刻知道什么」反查
+# - kg_mentions 是实体-段反向索引（检索最近 N 段涉及的实体，不 dump 全表）
+#
+# 与 v2.6 旧表（kg_nodes/kg_edges/facts）关系：旧表保留只读，新链路双写过渡。
+# ====================================================================
+
+
+class KgEntity(Base):
+    """v3.0 实体表：6 种 kind 共用一张表 + attrs 软 schema。
+
+    canonical_name + aliases 处理姓名分裂（宁折/宁折枝）；first/last_chapter
+    是实体活跃区间；mention_count 供节奏分析。attrs 按 kind 承载
+    arc/current_goal/secrets/power_level/region/leader_id 等软字段。
+    """
+
+    __tablename__ = "kg_entities"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    kind = Column(String(16), nullable=False)  # character|location|faction|item|worldrule|power_system
+    canonical_name = Column(String(128), nullable=False)
+    aliases = Column(JSON, nullable=True, default=list)  # 已归并到 canonical_name 的其它书写形态
+    attrs = Column(JSON, nullable=True, default=dict)  # 软 schema：arc/current_goal/secrets/power_level/region/leader_id
+    first_chapter = Column(Integer, nullable=True)
+    last_chapter = Column(Integer, nullable=True)
+    mention_count = Column(Integer, nullable=False, default=0)
+    confidence = Column(Float, nullable=False, default=1.0)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "kind", "canonical_name", name="uq_kg_entity"),
+        # 检索切片/批抽扫描：WHERE project_id=? + 归一 by canonical_name
+        Index("ix_kg_entity_project_kind", "project_id", "kind"),
+        Index("ix_kg_entity_project_canonical", "project_id", "canonical_name"),
+    )
+
+
+class KgRelation(Base):
+    """v3.0 关系表：带强度（0-1）+ since_chapter。
+
+    rel_type 取值域：ally|enemy|mentor|subordinate|romantic|belongs_to|located_at|owns。
+    strength 变化不覆盖本行——每次变化追加 kg_relation_evolution 一行，本行存最新。
+    """
+
+    __tablename__ = "kg_relations"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    from_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
+    to_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
+    rel_type = Column(String(32), nullable=False)
+    strength = Column(Float, nullable=False, default=0.5)
+    since_chapter = Column(Integer, nullable=True)
+    description = Column(String(200), nullable=True)
+    confidence = Column(Float, nullable=False, default=1.0)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "from_id", "to_id", "rel_type", name="uq_kg_relation"),
+        Index("ix_kg_relation_project", "project_id"),
+    )
+
+
+class KgRelationEvolution(Base):
+    """关系演变史：每次 strength 变化追加一行（不清历史）。
+
+    例：太子×魏征 ch5=0.3「初次合作」→ ch15=0.8「共渡危机」→ ch40=0.5「政见分歧」。
+    """
+
+    __tablename__ = "kg_relation_evolution"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    edge_id = Column(Integer, ForeignKey("kg_relations.id"), nullable=False)
+    chapter = Column(Integer, nullable=True)
+    strength = Column(Float, nullable=False)
+    note = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        # 关系曲线展开：按 edge_id 拉所有 evolution
+        Index("ix_kg_relation_evolution_edge", "edge_id"),
+    )
+
+
+class KgEvent(Base):
+    """v3.0 事件表：SVO triplet + location 必填 + 故事内时间。
+
+    in_story_date（如「贞观三年秋」）是物理时间校验的关键输入；
+    subject/object/location 存 entity canonical_name（抽取层名字，落库时解析为 id
+    失败时保留字符串在 extra JSON，不阻塞——judge 用 id，检索用字符串兜底）。
+    """
+
+    __tablename__ = "kg_events"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    sequence = Column(Integer, nullable=False)  # 项目内连续序号（全局事件顺序）
+    chapter = Column(Integer, nullable=True)
+    segment_no = Column(Integer, nullable=True)  # 生成段号（generations.segment_no）
+    event_type = Column(String(32), nullable=False)  # incident|revelation|foreshadow_plant|foreshadow_payoff|death|romance_milestone|battle|decision|time_marker
+    summary = Column(String(500), nullable=True)
+    subject_id = Column(Integer, nullable=True)  # SVO 主体 -> kg_entities.id
+    verb = Column(String(64), nullable=True)  # SVO 动作
+    object_id = Column(Integer, nullable=True)  # SVO 客体 -> kg_entities.id
+    location_id = Column(Integer, nullable=True)  # 物理时间校验需要
+    time_anchor_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
+    in_story_date = Column(String(64), nullable=True)  # 「贞观三年秋」式故事内时间
+    extra_actors = Column(JSON, nullable=True, default=list)  # 参与角色超过 2 个时存名字列表
+    confidence = Column(Float, nullable=False, default=1.0)
+    evidence_segment_ids = Column(JSON, nullable=True, default=list)
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "sequence", name="uq_kg_event_seq"),
+        # 切片取最近 N 段事件 ORDER BY sequence DESC；批抽取 max(sequence)
+        Index("ix_kg_event_project_sequence", "project_id", "sequence"),
+        Index("ix_kg_event_project_segment", "project_id", "segment_no"),
+    )
+
+
+class KgEventLink(Base):
+    """事件因果链：caused_by|causes|follows|resolves|reverses|parallel。"""
+
+    __tablename__ = "kg_event_links"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    from_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=False)
+    to_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=False)
+    link_type = Column(String(16), nullable=False)
+    confidence = Column(Float, nullable=False, default=1.0)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "from_event_id", "to_event_id", "link_type", name="uq_kg_event_link"),
+        Index("ix_kg_event_link_from", "from_event_id"),
+        Index("ix_kg_event_link_to", "to_event_id"),
+    )
+
+
+class KgCharacterState(Base):
+    """角色状态变化表：每章追踪 location/injury/mood/goal/inventory/alive 变化。
+
+    Novelium Character Dashboard 的数据结构；judge 查瞬移（location 与事件地点矛盾）、
+    死人说话（alive=false 后又出场）都从这里取基线。
+    """
+
+    __tablename__ = "kg_character_state"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    character_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
+    chapter = Column(Integer, nullable=True)
+    segment_no = Column(Integer, nullable=True)
+    state_type = Column(String(16), nullable=False)  # location|injury|mood|goal|inventory|alive
+    new_value = Column(String(500), nullable=True)  # 变化后的值
+    cause_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        # 切片按角色取最新状态（slice_for_prompt 查每角色每 state_type 最新一条）
+        Index("ix_kg_char_state_project_char", "project_id", "character_id"),
+        Index("ix_kg_char_state_project_segment", "project_id", "segment_no"),
+    )
+
+
+class KgForeshadow(Base):
+    """伏笔状态机表：独立不混入 kg_events。
+
+    5 态：planted|developing|paid_off|dropped|expired。
+    expired = 超过 planned_payoff_chapter 仍未回收（Novelium 伏笔超期检测的输入）。
+    """
+
+    __tablename__ = "kg_foreshadows"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    name = Column(String(200), nullable=False)
+    planted_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
+    payoff_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
+    status = Column(String(16), nullable=False, default="planted")
+    planted_chapter = Column(Integer, nullable=True)
+    planned_payoff_chapter = Column(Integer, nullable=True)
+    actual_payoff_chapter = Column(Integer, nullable=True)
+    description = Column(String(500), nullable=True)
+    confidence = Column(Float, nullable=False, default=1.0)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_kg_foreshadow"),
+        # 切片 active 过滤（status IN ('planted','developing')）+ Judge 超期检查
+        Index("ix_kg_foreshadow_project_status", "project_id", "status"),
+    )
+
+
+class KgEntityKnowledge(Base):
+    """人物情报追踪：entity 在哪个事件学到了什么（known_kind=entity|event|secret）。
+
+    Novelium 卖点——生成时反查「林悠然此刻知道什么」，喂进 prompt 防预知外挂。
+    """
+
+    __tablename__ = "kg_entity_knowledge"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    entity_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
+    known_entity_id = Column(Integer, nullable=True)  # 指向 entity/event/fact 之一（按 known_kind 解释）
+    known_kind = Column(String(16), nullable=True)  # entity|event|secret
+    # secret/event 类的事实文本（known_entity_id 为 NULL 时的内容载体）：
+    # - secret：秘密内容短句（"父亲的死因另有隐情"）——没有对应实体，只有文本
+    # - event：事件简述（解析失败时的降级载体；解析成功则 known_entity_id 指向 kg_events.id）
+    known_text = Column(String(200), nullable=True)
+    learned_at_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
+    learned_at_chapter = Column(Integer, nullable=True)
+    confidence = Column(Float, nullable=False, default=1.0)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "entity_id", "known_entity_id", "learned_at_event_id", name="uq_kg_entity_knowledge"),
+        Index("ix_kg_entity_knowledge_project_entity", "project_id", "entity_id"),
+    )
+
+
+class KgMention(Base):
+    """实体-段反向索引：context_window 保留原文片段（喂 LLM 用有血有肉的事实）。
+
+    slice_for_prompt 按 segment_no 倒序取最近 N 段涉及的实体，不 dump 全表。
+    """
+
+    __tablename__ = "kg_mentions"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    entity_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
+    generation_id = Column(Integer, ForeignKey("generations.id"), nullable=True)
+    segment_no = Column(Integer, nullable=True)
+    context_window = Column(String(500), nullable=True)  # 提及处原文片段
+    mention_kind = Column(String(16), nullable=True)  # direct|alias|reference
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "entity_id", "generation_id", name="uq_kg_mention"),
+        Index("ix_kg_mention_project_segment", "project_id", "segment_no"),
+        Index("ix_kg_mention_project_entity", "project_id", "entity_id"),
+    )
 
 
 class Generation(Base):
@@ -618,4 +894,41 @@ class AIFlavorMemory(Base):
         # 去重查找的加速索引；(scope, issue_key) 前缀即可覆盖 global 行的查找，
         # project 行的 project_id 等值条件由前缀过滤后在行级完成。
         Index("ix_ai_flavor_memory_key", "scope", "project_id", "issue_key"),
+    )
+
+
+class KgBibleRevision(Base):
+    """plot_bible 的版本快照——只存修改后状态 + 顶层 diff。
+
+    为什么是独立表（不复用 Fact）：
+    - 8 类事实枚举（character/plothole/relationship/...）已固化；bible 修订是
+      「元数据」不是事实，加 type=kg_bible_revision 会污染提醒/检索的过滤语义
+    - bible_json 体量大（几 KB），与事实账本混存会让 list/详情序列化变慢
+    - revision_no 需要严格单增，与 (project_id, revision_no) 联合唯一——Fact
+      的 (type, key) 唯一不直接复用
+
+    老项目无 revision 行属正常（迁移不补历史快照）。
+    """
+
+    __tablename__ = "kg_bible_revisions"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    # 项目内 1,2,3,4 自增；同一项目下严格连续
+    revision_no = Column(Integer, nullable=False)
+    # 修改后的完整 bible dict（plot_bible 全字段，与 PATCH body 同形状）
+    bible_json = Column(JSON, nullable=False)
+    # 顶层 key 维度的 diff：{added: {...}, removed: {...}, changed: {key: {old, new}}}
+    # 取自本次 PATCH body 的 plot_bible vs 落库前 proj.plot_bible
+    diff_json = Column(JSON, nullable=False)
+    # 本次 PATCH 触发的 KG 冲突清单（field 名 → 列表）
+    conflicts_json = Column(JSON, nullable=True)
+    # 来源标识：'user' = 人工改 / 'kg_lift' = KG 自动回流（暂未启用，结构预留）
+    source = Column(String(16), nullable=False, default="user")
+    # 备注（人工填的"为什么改"，可空）
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "revision_no", name="uq_kg_bible_revision"),
     )

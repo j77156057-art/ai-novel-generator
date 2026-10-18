@@ -43,7 +43,7 @@ from typing import Iterable, Sequence
 # 常量
 # --------------------------------------------------------------------------- #
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 
 #: 句子终结符（含中文全角）。省略号按整串处理，避免「……」被算成 2 个句子。
 SENT_END = "。！？!?…"
@@ -128,6 +128,38 @@ FEATURE_NOTES: dict[str, str] = {
 #: 代理指标——不是直接测量，只是结构性近似，判读时必须知道这一点
 PROXY_FEATURES = frozenset({"四字格密度", "短串占比"})
 
+#: 方案 C「features 长度归一化」——非密度类特征分组。
+#: 这 11 个特征是「按字/句/段/run 统计」的值，在 1000 字 vs 6000 字段上
+#: 统计波动大（CV/占比类尤其敏感），导致 z-score 系统性偏大。
+#: 方案 C 对它们乘 exp(-|log(len/unit_chars)| * 0.3) 双向收敛，让跨长度可比。
+NON_DENSITY_FEATURES = frozenset({
+    "句长均值", "句长CV", "句长p90",
+    "短句占比", "长句占比",
+    "段长CV", "段均句数",
+    "对白字占比", "对白段占比",
+    "短串占比", "段尾升华率",
+})
+
+#: 密度类特征（per1k 已归一化）——不变
+DENSITY_FEATURES = frozenset(FEATURES) - NON_DENSITY_FEATURES
+
+
+def _length_scale_factor(text_chars: int, unit_chars: int) -> float:
+    """按 log 长度比例缩放 features，让跨长度可比（方案 C）。
+
+    1x → 1.0（基准）
+    2x → 0.7（长文统计更稳定，缩 0.7 让短长文在同一长度基准下比较）
+    0.5x → 1.3（短文统计波动大，扩 1.3 拉回基准）
+    0.01x → 趋近 0（极端短文不缩放）
+
+    unit_chars <= 0 退化返 1.0（不缩放）。
+    """
+    if unit_chars is None or unit_chars <= 0 or text_chars <= 0:
+        return 1.0
+    ratio = text_chars / unit_chars
+    import math as _math
+    return _math.exp(-abs(_math.log(ratio)) * 0.3)
+
 
 # --------------------------------------------------------------------------- #
 # 切分与计数
@@ -203,8 +235,16 @@ def _cv(values: Sequence[float]) -> float:
 # 特征向量
 # --------------------------------------------------------------------------- #
 
-def features(text: str) -> dict[str, float]:
-    """一段文本的文体特征向量。全部是可机检的计数与比值。"""
+def features(text: str, *, unit_chars: int = 3000) -> dict[str, float]:
+    """一段文本的文体特征向量。全部是可机检的计数与比值。
+
+    方案 C「长度归一化」(v2.15+)：对 11 个非密度类特征（按字/句/段/run 统计）
+    乘 exp(-|log(len/unit_chars)| * 0.3) 双向收敛，让跨长度可比——治本
+    percentile 100% 触发。12 个密度类特征（per1k 已归一）不变。
+
+    unit_chars 默认 3000（与 generation_length 对齐）。unit_chars <= 0
+    时 scale=1.0（不缩放），保证旧调用兼容。
+    """
     text = text or ""
     n = len(text)
     paras = paragraphs(text)
@@ -258,6 +298,11 @@ def features(text: str) -> dict[str, float]:
         "短串占比": sum(1 for r in runs if r <= 3) / n_runs,
         "虚词密度": sum(text.count(w) for w in _FUNC_WORDS) * per1k,
     }
+    # 方案 C：11 个非密度特征按 log 长度缩放
+    scale = _length_scale_factor(n, unit_chars)
+    for k in NON_DENSITY_FEATURES:
+        if k in vec:
+            vec[k] = vec[k] * scale
     return {k: float(vec[k]) for k in FEATURES}
 
 
@@ -439,14 +484,45 @@ def style_distance(text: str, profile: dict) -> dict:
     ≤ 本段。distance 越大 percentile 越大：100% = 比所有人类样本都更偏离；
     0% = 比所有人类样本都更接近。**这个分位才是可判读的结论**，
     `mean_abs_z` 本身没有绝对含义。
+
+    PROFILE_VERSION=2 时（方案 B「对数粒度 profile」）—— 按 text 长度
+    选最匹配的 bucket 算 distance，解决「粒度不对齐时距离系统性偏大」的
+    老 bug。详见 docs/style_log_buckets_design.md。
     """
-    vec = features(text)
-    z = z_scores(vec, profile)
+    base_unit = int(
+        (profile.get("_meta") or {}).get("base_unit_chars")
+        or profile.get("unit_chars")
+        or 0
+    )
+    # 方案 C「长度归一化」：vec 用 text 选中的 bucket 的 unit_chars 算
+    # —— text 走 long bucket → 用 6000 缩（scale=0.81）→ z 更小
+    # v1 path 用 base_unit 兜底（profile.feat 是 base unit 切的）
+    base_unit = int(
+        (profile.get("_meta") or {}).get("base_unit_chars")
+        or profile.get("unit_chars")
+        or 0
+    )
+    # 方案 B 路径：v2 profile 有 buckets 字段 → 选 bucket
+    if profile.get("version") == 2 and profile.get("buckets"):
+        bucket_name = pick_bucket(len(text or ""), base_unit)
+        bucket = profile["buckets"].get(bucket_name) or profile["buckets"].get("medium")
+        if bucket is None:
+            # 极端：v2 但 buckets 都空 —— 退回 medium bucket 结构
+            bucket = {"unit_chars": base_unit, "feat": {}, "holdout": {}}
+        # 方案 C：vec 用 bucket.unit_chars 算（fit 时也是用这值算 feat）
+        vec = features(text, unit_chars=int(bucket.get("unit_chars") or base_unit or 3000))
+    else:
+        # v1 path
+        bucket_name = "v1"
+        bucket = profile
+        vec = features(text, unit_chars=base_unit if base_unit > 0 else 3000)
+
+    z = z_scores(vec, bucket)
     abs_z = {k: abs(v) for k, v in z.items()}
     total = statistics.fmean(list(abs_z.values())) if abs_z else 0.0
 
     ranked = sorted(abs_z.items(), key=lambda kv: kv[1], reverse=True)
-    holdout = profile.get("holdout") or {}
+    holdout = bucket.get("holdout") or {}
     hold = holdout.get("mean_abs_z") or {}
     # `unit_mean_abs_z` 是 `holdout` 的平级字段（见 `fit_profile`），不在 `mean_abs_z` 里面
     dist = holdout.get("unit_mean_abs_z") or []
@@ -455,12 +531,13 @@ def style_distance(text: str, profile: dict) -> dict:
         below = sum(1 for d in dist if d <= total)
         percentile = 100.0 * below / len(dist)
 
-    unit_chars = int(profile.get("unit_chars") or 0)
+    unit_chars = int(bucket.get("unit_chars") or 0)
     return {
         "chars": len(text or ""),
         "unit_chars": unit_chars,
+        "bucket": bucket_name,  # v2 才有意义（"short"/"medium"/"long"）
         # 粒度不对齐时距离会系统性偏大或偏小，必须如实标注而不是静默给个数字
-        "scale_ratio": round(len(text or "") / unit_chars, 2) if unit_chars else None,
+        "scale_ratio": round(len(text or "") / base_unit, 2) if base_unit else None,
         "mean_abs_z": round(total, 3),
         "max_abs_z": round(max(abs_z.values()), 3) if abs_z else 0.0,
         "percentile": None if percentile is None else round(percentile, 1),
@@ -494,10 +571,18 @@ def describe(profile: dict, *, max_features: int | None = None) -> str:
     确定性意味着：同一份档案永远产出同一段文本，不随段号/时间变化，
     因此放进静态 system 块不会破坏 prompt 缓存。
     """
+    # 方案 B 兼容：v2 profile 是 buckets 嵌套，主档用 medium bucket.feat
     feat = profile.get("feat") or {}
+    if not feat and profile.get("version") == 2:
+        medium = (profile.get("buckets") or {}).get("medium") or {}
+        feat = medium.get("feat") or {}
     if not feat:
         return ""
-    unit = int(profile.get("unit_chars") or 0)
+    unit = int(
+        (profile.get("_meta") or {}).get("base_unit_chars")
+        or profile.get("unit_chars")
+        or 0
+    )
 
     def st(k: str) -> dict:
         return feat.get(k) or {}
@@ -536,9 +621,16 @@ def describe(profile: dict, *, max_features: int | None = None) -> str:
 
 
 def feature_table(profile: dict) -> list[dict]:
-    """特征清单（面板/报告用）：均值、区间、留出波动、是否代理指标。"""
+    """特征清单（面板/报告用）：均值、区间、留出波动、是否代理指标。
+
+    v2 兼容：bucket 嵌套时取 medium bucket 的 feat + holdout。
+    """
     feat = profile.get("feat") or {}
     hold = ((profile.get("holdout") or {}).get("feat_abs_z") or {})
+    if not feat and profile.get("version") == 2:
+        medium = (profile.get("buckets") or {}).get("medium") or {}
+        feat = medium.get("feat") or {}
+        hold = ((medium.get("holdout") or {}).get("feat_abs_z") or {})
     rows = []
     for k in FEATURES:
         st = feat.get(k) or {}
@@ -554,3 +646,164 @@ def feature_table(profile: dict) -> list[dict]:
             "proxy": k in PROXY_FEATURES,
         })
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# 方案 B「对数粒度 profile」(PROFILE_VERSION=2)
+#
+# 8 轮真链路冒烟 + 1 轮 probe + 并行 v2.12 实测确认：fit_profile(unit_chars=3000)
+# 切 3000 字/单元统计 mean/std，但生成段 6264 字（2.09x）features 在不同长度
+# 上算密度的 z 系统性偏大，触发 percentile 100%。
+#
+# 修法：fit 3 套 bucket（base/2 + base + base*2），style_distance 按 text
+# 长度选最匹配 bucket。
+# 设计：docs/style_log_buckets_design.md
+# --------------------------------------------------------------------------- #
+
+#: bucket 选档阈值（基于 text_chars / base_unit_chars 比值）。
+#: < 0.6 → short，0.6-1.7 → medium，>= 1.7 → long。
+#: 留 0.6-1.7 给 medium 覆盖绝大多数「与 unit_chars 粒度接近」的段。
+BUCKET_THRESHOLDS = (0.6, 1.7)
+
+
+def pick_bucket(text_chars: int, base_unit_chars: int) -> str:
+    """按 text 长度选最匹配的 bucket 名。
+
+    base_unit_chars 是 profile fit 时的「主档」unit_chars（即 generation_length）。
+    阈值 BUCKET_THRESHOLDS = (0.6, 1.7)：
+    - text_chars / base_unit_chars < 0.6 → "short"（短文）
+    - 0.6 <= text_chars / base_unit_chars < 1.7 → "medium"（主档，对齐旧版）
+    - text_chars / base_unit_chars >= 1.7 → "long"（长文）
+
+    base_unit_chars <= 0 时降级返回 "medium"（最稳的兜底）。
+    """
+    if base_unit_chars <= 0:
+        return "medium"
+    ratio = text_chars / base_unit_chars
+    if ratio < BUCKET_THRESHOLDS[0]:
+        return "short"
+    if ratio < BUCKET_THRESHOLDS[1]:
+        return "medium"
+    return "long"
+
+
+def fit_profile_v2(
+    texts: Iterable[str],
+    *,
+    unit_chars: int = 3000,
+    train_ratio: float = 0.7,
+    max_units_per_text: int | None = 400,
+    label: str = "",
+) -> dict:
+    """对数粒度 profile fit：3 套 unit_chars（base/2 + base + base*2）。
+
+    返回 profile schema (PROFILE_VERSION=2)：
+        {
+            "version": 2,
+            "label": "...",
+            "_meta": {"base_unit_chars": 3000, "schema": "log_buckets_v1"},
+            "buckets": {
+                "short":  {unit_chars: 1500, n_train, n_holdout, n_units, feat, holdout},
+                "medium": {unit_chars: 3000, ...},
+                "long":   {unit_chars: 6000, ...},
+            }
+        }
+
+    每个 bucket 单独跑 fit 的核心逻辑（cut_units + train/holdout + feat + holdout 分布）。
+    短语料切不出某 bucket（< 4 单元）时跳过该 bucket，不报错。
+
+    退化：若 medium 切不出（极端短），保留至少 medium 桶用 short 配置。
+    """
+    base = int(unit_chars)
+    bucket_units: dict[str, int] = {
+        "short": max(500, base // 2),
+        "medium": base,
+        "long": base * 2,
+    }
+
+    # 切 3 套单元
+    bucket_texts: dict[str, list[str]] = {b: [] for b in bucket_units}
+    for t in texts:
+        for bname, uc in bucket_units.items():
+            for u in cut_units(t, uc, max_units=max_units_per_text):
+                bucket_texts[bname].append(u)
+
+    profile: dict = {
+        "version": PROFILE_VERSION,
+        "label": label,
+        "_meta": {
+            "base_unit_chars": base,
+            "schema": "log_buckets_v1",
+        },
+        "buckets": {},
+    }
+
+    for bname, units in bucket_texts.items():
+        if len(units) < 4:
+            # 短语料切不出该 bucket —— 跳过
+            continue
+        bucket_profile = _fit_single_bucket(
+            units,
+            unit_chars=bucket_units[bname],
+            train_ratio=0.5,  # 50/50 切分：bucket 单元数少时留出也能保留足够样本
+        )
+        profile["buckets"][bname] = bucket_profile
+
+    # 退化：medium 都没切出来，用 short 配置当 medium
+    if "medium" not in profile["buckets"] and "short" in profile["buckets"]:
+        profile["buckets"]["medium"] = dict(profile["buckets"]["short"])
+        profile["buckets"]["medium"]["unit_chars"] = base
+
+    return profile
+
+
+def _fit_single_bucket(
+    units: list[str],
+    *,
+    unit_chars: int,
+    train_ratio: float,
+) -> dict:
+    """单个 bucket 的 fit（与 fit_profile v1 同款逻辑，返回扁平 dict）。"""
+    train = [u for i, u in enumerate(units) if i % 10 < int(train_ratio * 10)]
+    holdout = [u for i, u in enumerate(units) if i % 10 >= int(train_ratio * 10)]
+    if not train:
+        train, holdout = units, []
+    if not holdout and len(train) > 2:
+        train, holdout = train[:-1], train[-1:]
+
+    train_vecs = [features(u, unit_chars=unit_chars) for u in train]
+    feat: dict[str, dict[str, float]] = {}
+    for k in FEATURES:
+        feat[k] = _summarize([v[k] for v in train_vecs])
+
+    bucket: dict = {
+        "version": PROFILE_VERSION,
+        "unit_chars": int(unit_chars),
+        "n_train": len(train),
+        "n_holdout": len(holdout),
+        "n_units": len(units),
+        "feat": feat,
+        "holdout": {},
+    }
+
+    if holdout:
+        d = [metric_mean_abs_z(features(u, unit_chars=unit_chars), bucket) for u in holdout]
+        bucket["holdout"] = {
+            "mean_abs_z": _summarize(d),
+            "unit_mean_abs_z": [round(x, 4) for x in d],
+        }
+        feat_holdout: dict[str, dict[str, float]] = {}
+        hvecs = [features(u, unit_chars=unit_chars) for u in holdout]
+        for k in FEATURES:
+            zs = [
+                abs((v[k] - feat[k]["mean"]) / feat[k]["std"])
+                if feat[k]["std"] > 0 else 0.0
+                for v in hvecs
+            ]
+            feat_holdout[k] = {
+                "mean": float(statistics.fmean(zs)) if zs else 0.0,
+                "p90": float(_quantile(sorted(zs), 0.90)),
+                "max": float(max(zs)) if zs else 0.0,
+            }
+        bucket["holdout"]["feat_abs_z"] = feat_holdout
+    return bucket

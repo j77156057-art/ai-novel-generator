@@ -83,7 +83,7 @@ class CountingProvider:
         self.calls = 0
         self.prompts: list[tuple[str, str]] = []
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, **kwargs) -> str:
         self.calls += 1
         self.prompts.append((system, user))
         return '{"人物描写手法": ["占位规则（证据：原文里根本没有这句话）"]}'

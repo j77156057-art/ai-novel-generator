@@ -93,12 +93,19 @@ PLOT_BIBLE = {
 
 #: 重生成路径 `(system, user)` 的 sha256 金标准。
 #:
-#: 2026-10-17 实测于父提交 `4592119`（同一夹具、同一 RecordingProvider），
-#: 值为 `b6e8ad8cb67db18ce1b388268b634fb51b5484de4eb2a8ec513800b6209efed3`；
-#: 在修复后的新 HEAD 上复测必须**同值**（父子同值 = 本次改动逐字节没动提示词）。
-#: 这两行若变了，说明重生成的提示词口径被动过，必须**重新论证**而不是随手改常数。
 #: 口径：`sha256(system + "\x00" + user)`，UTF-8。
-PROMPT_SHA256 = "b6e8ad8cb67db18ce1b388268b634fb51b5484de4eb2a8ec513800b6209efed3"
+#:
+#: 变更史（每次变更都必须能说清"变了什么、为什么"，不许随手改常数）：
+#: - `b6e8ad8c…` 2026-10-17 实测于父提交 `4592119`（同一夹具、同一 RecordingProvider）。
+#: - `7f554077…` 2026-10-18 合并 master 后重测。**唯一的差异来源**是 master 的
+#:   `e51e042`（fix(prompts): build_system_prompt 加 2 条 AI 腔禁忌——省略号节制 /
+#:   避免堆叠四字格）。这一点有独立证据：`test_qa_attack_ai_flavor_loop.py::test_e1`
+#:   断言「把这两条从当前 system prompt 里扣掉，即与 `4227c73^` 逐字节相同」。
+#:   除此之外本次合并没有改动重生成路径的任何提示词口径（`directive_suffix` /
+#:   `node_prompt` / `kg_slice` 在本用例的参数下均为 None，不产生字符）。
+#:
+#: 这两行若再变，说明重生成的提示词口径又被动过，必须**重新论证**而不是改常数。
+PROMPT_SHA256 = "7f5540770baba952ff3f0d4e626871d54c17a3f036f07dc204ea7c05f0859349"
 
 
 class RecordingProvider:
@@ -115,7 +122,7 @@ class RecordingProvider:
         self.users: list[str] = []
         self.constraints: list[dict | None] = []
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
         self.systems.append(system)
         self.users.append(user)
         self.constraints.append(constraints)
@@ -127,7 +134,7 @@ class RecordingProvider:
     def summarize_rollup(self, texts: list[str], level: str) -> str:
         return f"{level}滚上摘要"
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
         self.systems.append(system)
         self.users.append(user)
         self.constraints.append(constraints)
@@ -475,27 +482,35 @@ def test_regenerate_constraints_match_continue_path(db_session, monkeypatch):
     assert regen_prov.constraints, "重生成未把 constraints 交给 provider"
     assert cont_prov.constraints, "续写未把 constraints 交给 provider"
 
-    regen = regen_prov.constraints[0]
-    cont = cont_prov.constraints[0]
+    # 两侧在真正生成之前都会先为「时间线节点提示」发一次**不带 constraints** 的
+    # provider.chat（master v2.3，timeline.py:437 `_NODE_PLAN_SYSTEM`）。所以不能取
+    # [0]——要取**第一个带 constraints 的调用**，那才是真正的生成调用。
+    regen = next(c for c in regen_prov.constraints if c is not None)
+    cont = next(c for c in cont_prov.constraints if c is not None)
 
-    # —— 两条来源都在场（缺任一来源的夹具会让下面的等值断言失去意义）——
+    # —— constraints 的两条来源都在场 ——
+    # 合并后语义变更：master 的「bible 删除权威」规则（kg-cascade-protocol 阶段 2-3）
+    # 规定 `bible.characters` **显式列了**名字时，未列入的 KG 角色约束整条剔除。
+    # 本夹具的 bible 显式列了 林夜/白光，所以 KG 独有的「守夜人」**应当被过滤**——
+    # 这本身就是要守住的新规则，不能因为原断言而把它当回归。
+    # 因此「reminders 对 constraints 有贡献」这条性质改用**伏笔**举证（该规则只作用于
+    # 角色，不作用于 plotholes），角色侧改为显式断言过滤生效。
     assert "林夜" in regen["characters"], f"缺 plot_bible 侧角色：{regen['characters']}"
-    assert KG_ONLY_CHARACTER in regen["characters"], (
-        f"缺 KG 独有角色「{KG_ONLY_CHARACTER}」——reminders 对 constraints 零贡献，"
-        f"「同一 reminders 对象喂两处」这条性质没有被守住：{regen['characters']}"
+    assert "白光" in regen["characters"], f"缺 plot_bible 侧角色：{regen['characters']}"
+    assert KG_ONLY_CHARACTER not in regen["characters"], (
+        f"bible 显式声明了角色清册时，未列入的 KG 角色必须被剔除（bible 删除权威），"
+        f"但「{KG_ONLY_CHARACTER}」仍在：{regen['characters']}"
     )
     assert "黑铁钥匙的来历" in regen["plotholes"], f"缺 plot_bible 侧伏笔：{regen['plotholes']}"
     assert KG_ONLY_PLOTHOLE in regen["plotholes"], (
-        f"缺 KG 独有伏笔「{KG_ONLY_PLOTHOLE}」——同上：{regen['plotholes']}"
+        f"缺 KG 独有伏笔「{KG_ONLY_PLOTHOLE}」——reminders 对 constraints 零贡献，"
+        f"「同一 reminders 对象喂两处」这条性质没有被守住：{regen['plotholes']}"
     )
 
     # —— 顺序：bible 在前、KG 补后（`prompts.merged_constraint_items` 的权威顺序）——
     chars_at = {name: i for i, name in enumerate(regen["characters"])}
-    assert chars_at["林夜"] < chars_at[KG_ONLY_CHARACTER], (
-        f"角色顺序错：bible 角色必须排在 KG 角色之前：{regen['characters']}"
-    )
-    assert chars_at["白光"] < chars_at[KG_ONLY_CHARACTER], (
-        f"角色顺序错：bible 角色必须排在 KG 角色之前：{regen['characters']}"
+    assert chars_at["林夜"] < chars_at["白光"], (
+        f"bible 内部应保持声明顺序：{regen['characters']}"
     )
     holes_at = {text: i for i, text in enumerate(regen["plotholes"])}
     assert holes_at["黑铁钥匙的来历"] < holes_at[KG_ONLY_PLOTHOLE], (

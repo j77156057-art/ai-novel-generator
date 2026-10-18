@@ -84,7 +84,7 @@ class StubProvider:
         self.chat_calls = 0
         self.stream_calls = 0
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
         self.chat_calls += 1
         self.systems.append(system)
         return self.text
@@ -92,7 +92,7 @@ class StubProvider:
     def summarize(self, text: str) -> str:
         return "测试摘要"
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
         self.stream_calls += 1
         self.systems.append(system)
         yield self.text

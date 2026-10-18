@@ -1,0 +1,69 @@
+{
+ "n_segments_attempted": 2,
+ "endpoint_response": {
+  "warnings": [
+   {
+    "segment_no": 2,
+    "generated_at": "2026-10-17T01:49:49.049445+00:00",
+    "percentile": 100.0,
+    "mean_abs_z": 4.586,
+    "worst_features": [
+     "省略号密度",
+     "段均句数",
+     "比喻密度",
+     "问号密度",
+     "句号密度"
+    ],
+    "warn_message": "本段文风偏离档案（percentile 100.0，高于阈值 97.5）。最偏的特征：省略号密度、段均句数、比喻密度。建议重写或手动调整。"
+   },
+   {
+    "segment_no": 1,
+    "generated_at": "2026-10-17T01:49:17.430498+00:00",
+    "percentile": 100.0,
+    "mean_abs_z": 3.493,
+    "worst_features": [
+     "省略号密度",
+     "段均句数",
+     "句号密度",
+     "句长p90",
+     "长句占比"
+    ],
+    "warn_message": "本段文风偏离档案（percentile 100.0，高于阈值 97.5）。最偏的特征：省略号密度、段均句数、句号密度。建议重写或手动调整。"
+   }
+  ],
+  "total": 2,
+  "truncated": false
+ },
+ "db_style_warnings_count": 2,
+ "db_sample": [
+  {
+   "segment_no": 1,
+   "generated_at": "2026-10-17T01:49:17.430498+00:00",
+   "percentile": 100.0,
+   "mean_abs_z": 3.493,
+   "worst_features": [
+    "省略号密度",
+    "段均句数",
+    "句号密度",
+    "句长p90",
+    "长句占比"
+   ],
+   "warn_message": "本段文风偏离档案（percentile 100.0，高于阈值 97.5）。最偏的特征：省略号密度、段均句数、句号密度。建议重写或手动调整。"
+  },
+  {
+   "segment_no": 2,
+   "generated_at": "2026-10-17T01:49:49.049445+00:00",
+   "percentile": 100.0,
+   "mean_abs_z": 4.586,
+   "worst_features": [
+    "省略号密度",
+    "段均句数",
+    "比喻密度",
+    "问号密度",
+    "句号密度"
+   ],
+   "warn_message": "本段文风偏离档案（percentile 100.0，高于阈值 97.5）。最偏的特征：省略号密度、段均句数、比喻密度。建议重写或手动调整。"
+  }
+ ],
+ "verdict": "PASS"
+}

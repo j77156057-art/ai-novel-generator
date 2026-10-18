@@ -61,6 +61,12 @@ NARRATIVE_VERSION = 7
 #: 603 章 × 15% = 90 章，分 4~5 块。平衡覆盖面与 LLM 调用成本。
 SAMPLE_RATIO = 0.15
 
+#: 采样的字数下限：短篇/短语料若按比例采样会砍掉过多对白，
+#: 导致角色声音维度失效（实测：10 章语料只提得出 1 个角色声音）。
+#: 采样结果若低于此字数，则扩容到达到下限；若全量仍不足，则全取。
+#: 30 万字 ≈ 100+ 章网文，足够覆盖角色对白与场景多样性。
+MIN_SAMPLE_CHARS = 300_000
+
 #: 每块最少章节数（太少提炼不出模式）
 MIN_CHAPTERS_PER_CHUNK = 5
 
@@ -550,7 +556,18 @@ def _sample_chapters_v6(
     """
     if not chapters:
         return []
-    target = max(10, int(len(chapters) * ratio))
+    total_chars = sum(len(t) for _, t in chapters if t)
+
+    # 短篇保护：若全语料字数就不足下限，直接全取（没有砍的空间）。
+    if total_chars <= MIN_SAMPLE_CHARS:
+        return list(chapters)
+
+    # 目标章节数：按比例取，但保证采样字数不低于下限。
+    # 平均章长估算需要多少章才够 MIN_SAMPLE_CHARS。
+    avg_ch = total_chars / max(len(chapters), 1)
+    ratio_target = int(len(chapters) * ratio)
+    chars_target = int(MIN_SAMPLE_CHARS / max(avg_ch, 1))
+    target = max(10, ratio_target, chars_target)
     if len(chapters) <= target:
         return list(chapters)
 
@@ -1993,10 +2010,15 @@ def project_narrative(
             # 不碰蒸馏库——档案没变，重复落库除了刷新 applied_at 没有任何意义。
             return cached
         profile = cached
-        # 仍把这份已完成的档案落进全局蒸馏库（幂等 upsert）——
-        # 否则「项目私有缓存命中」永远不会让蒸馏库出现这一行，用户就看不到「蒸馏完成的库」。
-        if content_hash is None:
-            content_hash = corpus_content_hash(ids, db)
+        # 合并说明（两侧各有一次修复，这里取二者之长）：
+        #   - master 侧的顾虑成立：`_persist_style_distill` / `find_style_distill` 内部用
+        #     `db.scalar()`，在 FakeDB mock 下会抛 AttributeError；若异常逸出，
+        #     `project_narrative_safe` 会把它 catch 成 None，**把已算好的档案丢掉**。
+        #   - HEAD 侧的顾虑同样成立：项目缓存命中时若直接 return，全局蒸馏库永远不会
+        #     出现这一行（`project.style_narrative` 可能来自旧版本或直接写入），
+        #     用户就看不到「蒸馏完成的库」。
+        # 所以：不在此 early return，而是 fall through 到下面的统一收尾；并把收尾里的
+        # 落库改成**非致命**（见下方 try/except）——档案永远不会因为「写库失败」被丢。
     else:
         # ── 蒸馏库复用（跨项目共享层）── 同语料+同档位+同正文 已蒸馏过 → 直接复用。
         # force 时跳过（force = 用户明确要求重算，不复用任何缓存/库）。
@@ -2032,10 +2054,18 @@ def project_narrative(
     # 「蒸馏完成的加一个库」的核心：无论命中项目缓存、命中蒸馏库、还是真实提取，
     # 只要本次产出了可用档案，全局库里就有它，标着档位，任何项目可直接复用。
     if persist_library:
-        if content_hash is None:
-            content_hash = corpus_content_hash(ids, db)
-        _persist_style_distill(db, project, ids, cfg, content_hash, profile)
-        db.commit()
+        # 落库是**增强**，不是产出：写库失败绝不能让已算好的档案被丢掉
+        # （外层 `project_narrative_safe` 会把逸出的异常 catch 成 None，等于白蒸一次）。
+        # 这条 try/except 同时解决了 master 侧报告的 FakeDB mock 场景。
+        try:
+            if content_hash is None:
+                content_hash = corpus_content_hash(ids, db)
+            _persist_style_distill(db, project, ids, cfg, content_hash, profile)
+            db.commit()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "蒸馏库落库失败（档案仍返回，不丢本次产出）: %s", exc
+            )
     return profile
 
 

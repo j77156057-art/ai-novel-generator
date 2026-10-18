@@ -345,7 +345,7 @@ def test_provider_chat_failure_also_degrades(db_session, project_id, monkeypatch
     class BoomProvider:
         model = "assistant-test-model"
 
-        def chat(self, system: str, user: str) -> str:
+        def chat(self, system: str, user: str, **kwargs) -> str:
             raise TimeoutError("chat timeout")
 
     monkeypatch.setattr(
@@ -367,7 +367,7 @@ def test_query_triggers_model_even_without_issues(db_session, project_id, monkey
     class RecordingProvider:
         model = "recorder-1"
 
-        def chat(self, system: str, user: str) -> str:
+        def chat(self, system: str, user: str, **kwargs) -> str:
             calls.append((system, user))
             return "（模型解释）没有命中已知模式。"
 
@@ -390,7 +390,7 @@ def test_rules_alone_trigger_model(db_session, project_id, monkeypatch):
     class RecordingProvider:
         model = "recorder-2"
 
-        def chat(self, system: str, user: str) -> str:
+        def chat(self, system: str, user: str, **kwargs) -> str:
             calls.append((system, user))
             return "解释文本"
 

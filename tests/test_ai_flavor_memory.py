@@ -477,7 +477,7 @@ class _ScriptedLLM:
         self._responses = list(responses)
         self.calls: list[tuple[str, str]] = []
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, **kwargs) -> str:
         self.calls.append((system, user))
         if self._responses:
             return self._responses.pop(0)
@@ -487,7 +487,7 @@ class _ScriptedLLM:
 class _RaisingLLM:
     """一调就抛错的假 llm（模拟 LLM 渠道故障）。"""
 
-    def chat(self, system: str, user: str) -> str:  # noqa: ARG002
+    def chat(self, system: str, user: str, **kwargs) -> str:  # noqa: ARG002
         raise RuntimeError("llm 渠道故障")
 
 

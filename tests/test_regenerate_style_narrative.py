@@ -83,14 +83,14 @@ class RecordingProvider:
         self.text = text
         self.systems: list[str] = []
 
-    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+    def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
         self.systems.append(system)
         return self.text
 
     def summarize(self, text: str) -> str:
         return "测试摘要"
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None):
+    def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
         self.systems.append(system)
         yield self.text
 

@@ -73,7 +73,7 @@ class _BoomProvider:
 
     model = "boom-assistant"
 
-    def chat(self, system: str, user: str, constraints=None) -> str:  # noqa: ANN001
+    def chat(self, system: str, user: str, constraints=None, **kwargs) -> str:  # noqa: ANN001
         raise RuntimeError("模拟 assistant provider 不可用")
 
 
@@ -85,7 +85,7 @@ class _JsonProvider:
         self.model = "json-assistant"
         self.seen: tuple[str, str] | None = None
 
-    def chat(self, system: str, user: str, constraints=None) -> str:  # noqa: ANN001
+    def chat(self, system: str, user: str, constraints=None, **kwargs) -> str:  # noqa: ANN001
         self.seen = (system, user)
         return self.reply
 

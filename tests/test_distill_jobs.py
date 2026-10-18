@@ -90,7 +90,7 @@ class StubProvider:
     def __init__(self) -> None:
         self.calls = 0
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, **kwargs) -> str:
         self.calls += 1
         # 证据串必须**原样**落在语料里，且规则整体不是原文的某个句子
         # （否则会被 `_is_verbatim_copy` 当成「逐字复制」拒掉）。
@@ -100,7 +100,7 @@ class StubProvider:
 class BoomProvider:
     """每次调用都炸的 provider：用来验证失败不是静默的。"""
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, **kwargs) -> str:
         raise RuntimeError("模型服务不可用（测试注入）")
 
 
@@ -559,7 +559,7 @@ class MarkerProvider:
         self.mark = mark
         self.calls = 0
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, **kwargs) -> str:
         self.calls += 1
         return '{"人物描写手法": ["出场先写环境再写人（证据：医院里她抬起头）"]}'
 
