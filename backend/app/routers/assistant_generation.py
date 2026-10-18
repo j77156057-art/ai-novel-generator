@@ -33,6 +33,16 @@
 `AssistantToolRegistry` **不注册**任何直写工具（write_*/commit_* 前缀
 黑名单 + 只读白名单，见 `app.agents.registry`）。助手「调动生成」靠的是
 这个受审计的 HTTP 端点，不是工具表里的后门。
+
+## 生成后的 AI 腔反馈闭环（旁路，不动上面三条约束）
+
+两个分支生成成功并提交后，都会调用 `_run_ai_flavor_feedback()`：由
+**Assistant**（本端点，主 agent）检查 Writer（sub agent）刚产出的文本、
+把本次 AI 腔问题总结写进 `ai_flavor_memories`、并微调
+`prompt_overrides` 的 constraint_note 槽位——微调对象是「下次给 Writer
+的输入」，不是重写本次文本（检查者与生成者必须分离）。闭环零 LLM、
+自带事务与异常兜底：任一步失败只记日志，已落库的正文与已成功的响应
+都不受影响（正文落库与闭环成功是两个独立的事实）。
 """
 
 from __future__ import annotations
@@ -45,8 +55,19 @@ from pydantic import model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agents import ai_flavor_memory
+from app.agents.prompt_overrides import (
+    PromptKey,
+    get_active_override,
+    set_active_override,
+)
 from app.db import get_db
-from app.generation.engine import generate_next_segment, regenerate_segment_stream
+from app.generation.engine import (
+    _detect_ai_flavor,
+    _should_rewrite,
+    generate_next_segment,
+    regenerate_segment_stream,
+)
 from app.models import AgentRun, Evidence, Generation, Project
 from app.routers.assistant_shared import (
     _build_evidence_row,
@@ -170,6 +191,250 @@ def _record_generation_evidence(
 
 
 # ====================================================================
+# AI 腔反馈闭环（生成成功后的旁路：Assistant 检查 Writer 产出）
+# ====================================================================
+#
+# 架构（用户拍板，勿绕）：助理 agent 是主 agent，Writer 是 sub agent。生成
+# 成功后由 **Assistant** 检查刚产出的文本、把本次 AI 腔问题总结成一句人话
+# 写进 `ai_flavor_memories`；再读回合并后的记忆、渲染成「本轮优先避免」
+# 约束写入 `prompt_overrides` 的 constraint_note 槽位——下次生成时
+# `engine._prompt_overrides()` 会把它拼进 Writer 的系统提示（注入通道已由
+# 4227c73 打通，见 tests/test_prompt_override_wiring.py）。微调对象是
+# 「下次给 Writer 的输入」，不是重写本次文本：检查者与生成者必须分离，
+# Writer 自检自改是本末倒置。
+#
+# 三条硬约束（全部有测试守着）：
+# 1. **闭环是旁路**：检测 / 记忆 / 微调任一步抛异常，都吞掉并记日志，
+#    绝不让 /invoke-generation 失败——正文早已落库，闭环只是附加动作；
+# 2. **零 LLM、零语料**：只用 engine 的纯本地检测（`_should_rewrite` /
+#    `_detect_ai_flavor`）+ DB 读写，不调 provider.chat、不 hybrid_search；
+# 3. **不改本次文本**：闭环只读 text，不碰 Generation / target.text。
+
+
+#: AI 腔**记忆线**：单段检测 total 达到该值，才写记忆 + 微调 constraint_note。
+#:
+#: 与既有阈值的关系（两条线各管一件事，不许混用）：
+#: - `engine._should_rewrite` 的告警线是 total >= 5，管「**这一段**要不要
+#:   重写」——生成链路内的即时补救信号，代价至多一次重写调用；
+#: - 本常量管「**这个项目**要不要沉淀一条长期教训」——记忆行会进
+#:   `ai_flavor_memories` 表，并被 `load_memories()` 渲染进此后**每一次**
+#:   生成的提示词。若按 5 记账：普通中文小说里「终于 / 原来 / 从此 /
+#:   不禁」本就是高频叙事词，单段轻微命中 5-7 次很常见，表会被日常轻微
+#:   命中刷爆，提示词也会被同一批教训复读撑爆——正是 ai_flavor_memory
+#:   「有界膨胀」设计要防的事。
+#: 取 8 的理由：告警线上方留出 60% 缓冲带（5-7 归「轻微」，只告警不记账），
+#: 又不松到 10+ 把成段的系统性问题漏掉。参照系：单段 3000 字命中 8 次 ≈
+#: 每 375 字一次 AI 腔套路，已远超正常叙述密度，属「Writer 系统性复读」。
+_AI_FLAVOR_MEMORY_MIN_TOTAL = 8
+
+#: 单模式严重度分档线（按「同一模式在本段的命中次数」，语义对齐
+#: ai_flavor_memory.SEVERITY_RANK：high=明显破坏文风 / mid=润色级）：
+#: 单段约 3000 字里同一模式复读 4 次以上属「明显破坏文风」；2-3 次是
+#: 偶发的表述惯性；仅 1 次记档备查。
+_SEVERITY_HIGH_HITS = 4
+_SEVERITY_MID_HITS = 2
+
+#: 每个模式单次最多带的例句数。写入端总闸是 ai_flavor_memory.MAX_EXAMPLES
+#: （3 条，新的挤掉最旧的），这里取 2 是给后续段落的证据留合并空间——
+#: 一次把 3 个坑位占满，后面的段落再命中同模式就永远带不上新例句。
+_EXAMPLES_PER_PATTERN = 2
+
+#: 「本轮优先避免」约束块的标题行。写进 constraint_note 槽位后，会拼在
+#: Writer 系统提示的【续写纪律】之后，标题让 Writer 一眼知道这段约束的
+#: 来历（历史检查沉淀的教训，不是用户本轮的新要求）。
+_FLAVOR_OVERRIDE_HEADER = (
+    "【本轮优先避免】以下是历史生成检查沉淀的 AI 腔教训，本轮写作请优先规避这些表达："
+)
+
+#: 覆写写入者标识（prompt_overrides.created_by）：审计时一眼看出这条覆写
+#: 是闭环自动写的，还是人工提案批的。
+_FLAVOR_OVERRIDE_CREATED_BY = "assistant_ai_flavor_feedback"
+
+
+def _severity_for_count(count: int) -> str:
+    """单模式本段命中次数 → 严重度档位（high | mid | low）。
+
+    分档线见 `_SEVERITY_HIGH_HITS` / `_SEVERITY_MID_HITS` 注释：档位语义
+    与 `ai_flavor_memory.SEVERITY_RANK` 对齐——high 在 load_memories 排序
+    里最优先，提示词预算紧张时也必须先提醒「明显破坏文风」的问题。
+    """
+    if count >= _SEVERITY_HIGH_HITS:
+        return "high"
+    if count >= _SEVERITY_MID_HITS:
+        return "mid"
+    return "low"
+
+
+def _pattern_examples(
+    occurrences: list[dict] | None, segment_no: int | None
+) -> list[dict]:
+    """取该模式的前几条出现作为例句证据（字段口径见 `upsert_memory`）。
+
+    只截取不解释：`_detect_ai_flavor` 返回的 occurrences 已带 offset 与
+    snippet，这里补上 segment_no 即可直接喂给写入端。
+    """
+    picked: list[dict] = []
+    for occ in (occurrences or [])[:_EXAMPLES_PER_PATTERN]:
+        picked.append(
+            {
+                "segment_no": segment_no,
+                "offset": occ.get("offset"),
+                "snippet": str(occ.get("snippet") or ""),
+            }
+        )
+    return picked
+
+
+def _summarize_flavor_hits(
+    total: int, hits: dict[str, int], occurrences: dict[str, list[dict]]
+) -> str:
+    """把检测结果归纳成一句人话（模式×次数 + 一条例句）。
+
+    例：「AI 腔密集：全段命中 9 次（仿佛×5、宛如×4）；例：「…仿佛…」」。
+    只报前 3 个模式：总结是「让人一眼看懂」，不是把 hits 全量复读；例句取
+    top 模式的首次出现，证明这条总结有原文依据（不是凭空报数）。
+    """
+    top = sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+    head = "、".join(f"{pattern}×{count}" for pattern, count in top)
+    example = ""
+    for pattern, _count in top:
+        first = (occurrences.get(pattern) or [None])[0]
+        snippet = str((first or {}).get("snippet") or "").strip()
+        if snippet:
+            example = snippet
+            break
+    line = f"AI 腔密集：全段命中 {total} 次（{head}）"
+    if example:
+        line += f"；例：「{example}」"
+    return line
+
+
+def _render_flavor_constraint(db: Session, project_id: int) -> str:
+    """读回合并后的记忆，渲染成 constraint_note 槽位的覆写文本。
+
+    走 `load_memories()`（合并 global + 本项目、去重、按条数/字符预算裁剪）
+    + `render_memory_block()`：覆写文本是「全部生效教训」的快照，不是只有
+    本次命中——下次生成的 Writer 该知道这本账上到目前为止的所有教训。
+    无记忆时返回空串（调用方据此跳过写入，不产生空覆写行）。
+    """
+    items = ai_flavor_memory.load_memories(db, project_id)
+    block = ai_flavor_memory.render_memory_block(items)
+    if not block:
+        return ""
+    return f"{_FLAVOR_OVERRIDE_HEADER}\n{block}"
+
+
+def _run_ai_flavor_feedback(
+    db: Session,
+    project: Project,
+    text: str,
+    segment_no: int | None,
+    instruction: str,
+) -> dict | None:
+    """AI 腔反馈闭环：检查本次产出 → 总结 → 写记忆 → 微调下次生成的输入。
+
+    挂载点：`assistant_invoke_generation` 两个分支的主流程 `db.commit()`
+    之后、`return` 之前（正文已落库，闭环是旁路）。
+
+    四步（按序）：
+    1. **检查**：`_should_rewrite` / `_detect_ai_flavor`（纯本地、零 LLM、
+       零语料）。判据是 `total >= _AI_FLAVOR_MEMORY_MIN_TOTAL`——未达记忆
+       线的轻微命中只告警不记账（见常量注释里与告警线 5 的关系）；
+    2. **总结**：`_summarize_flavor_hits` 归纳「本次哪里犯了 AI 腔」
+       （模式×次数 + 例句）；
+    3. **写记忆**：每个命中的模式调一次 `upsert_memory`（issue_key=模式名，
+       hits_delta=1——hit_count 记的是「多少次检查命中过它」，本段密度写在
+       summary 与 severity 里），同一模式跨段累加一行，不插新行；
+    4. **微调**：`_render_flavor_constraint` 读回合并后的记忆渲染成约束，
+       经 `set_active_override` 写入 constraint_note 槽位（「同 key 先降旧
+       再插新」的既有不变量由此保留，不直接 db.add 绕开它）；内容与当前
+       生效覆写逐字节相同时跳过，不在历史表里堆无意义的新行。
+
+    事务与兜底：闭环自带事务边界（主流程提交后才开始），任一步抛异常 →
+    `db.rollback()` 丢掉本循环的半截写入 + `logger.warning`，**绝不影响**
+    已成功的生成——正文落库与闭环成功是两个独立的事实。
+
+    Returns:
+        走完闭环（含未达阈值提前返回）时的摘要 dict；异常时返回 None。
+    """
+    try:
+        # forbidden 传 None：本闭环只记账 AI 腔模式；反向禁忌是另一本账，
+        # 且取 forbidden 要读叙事档案——与「零语料」纪律无关但不必要。
+        alerted, reasons = _should_rewrite(text or "", None)
+        flavor = _detect_ai_flavor(text or "")
+        total = int(flavor.get("total") or 0)
+        if total < _AI_FLAVOR_MEMORY_MIN_TOTAL:
+            logger.info(
+                "AI 腔反馈闭环：未达记忆线，不写记忆不微调"
+                "（project=%s, segment=%s, total=%d < %d）",
+                project.id, segment_no, total, _AI_FLAVOR_MEMORY_MIN_TOTAL,
+            )
+            return None
+
+        hits: dict[str, int] = flavor.get("hits") or {}
+        occurrences: dict[str, list[dict]] = flavor.get("occurrences") or {}
+        summary = _summarize_flavor_hits(total, hits, occurrences)
+
+        # 写记忆：按命中次数降序（同次数按模式名），确定性顺序便于对账
+        for pattern, count in sorted(hits.items(), key=lambda kv: (-kv[1], kv[0])):
+            ai_flavor_memory.upsert_memory(
+                db,
+                scope="project",
+                project_id=project.id,
+                issue_key=pattern,
+                summary=(
+                    f"{pattern} 式 AI 腔：本段命中 {count} 次"
+                    f"（全段共 {total} 次）"
+                ),
+                hits_delta=1,
+                examples=_pattern_examples(
+                    occurrences.get(pattern) or [], segment_no
+                ),
+                segment_no=segment_no,
+                severity=_severity_for_count(count),
+            )
+
+        # 微调：读回合并后的记忆（含本次刚写的）渲染成约束写进槽位
+        override_text = _render_flavor_constraint(db, project.id)
+        if override_text:
+            current = get_active_override(db, project.id, PromptKey.CONSTRAINT)
+            if current is None or (current.override_text or "") != override_text:
+                set_active_override(
+                    db,
+                    project_id=project.id,
+                    prompt_key=PromptKey.CONSTRAINT,
+                    override_text=override_text,
+                    created_by=_FLAVOR_OVERRIDE_CREATED_BY,
+                )
+        db.commit()
+        logger.info(
+            "AI 腔反馈闭环完成（project=%s, segment=%s, instruction=%s）：%s"
+            "；重写告警判据：%s",
+            project.id, segment_no, (instruction or "").strip()[:60], summary,
+            "；".join(reasons) or "未告警",
+        )
+        return {
+            "total": total,
+            "summary": summary,
+            "alerted": alerted,
+            "override_written": bool(override_text),
+        }
+    except Exception as exc:  # noqa: BLE001 —— 闭环是旁路，失败绝不能影响已成功的生成
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 —— 回滚也失败就只能记日志，别把异常传出闭环
+            logger.warning(
+                "AI 腔反馈闭环回滚失败（project=%s），放弃本次闭环写入",
+                project.id,
+            )
+        logger.warning(
+            "AI 腔反馈闭环失败，已回滚半截写入（不影响本次生成，project=%s）：%s",
+            project.id, exc,
+        )
+        return None
+
+
+# ====================================================================
 # POST /api/assistant/invoke-generation
 # ====================================================================
 
@@ -190,6 +455,9 @@ def assistant_invoke_generation(
     5. 收尾 AgentRun：`model` 回显 Writer 实际模型，`note` 保留调用
        性质说明；失败 → run 记 failed 并返回 5xx（生成是用户明确要的
        结果，不降级成「空响应但 200」）。
+    6. AI 腔反馈闭环（旁路）：检查本次产出的 AI 腔问题、沉淀记忆并微调
+       下次生成的输入；自带事务与异常兜底，失败绝不影响本次已成功的
+       生成（见 `_run_ai_flavor_feedback`）。
 
     `instruction` 原样进 AgentRun.request_hash 与响应 `answer`，让
     「助手为什么写了这一段」在审计链里可回答。
@@ -238,6 +506,13 @@ def assistant_invoke_generation(
             run.finished_at = _now_utc()
             run.model = writer_model
             db.commit()
+            # AI 腔反馈闭环（旁路）：主流程已落库；闭环只读本次正文、写记忆
+            # 并微调下次生成的输入，自带事务与异常兜底，失败不影响本次成功。
+            segment_out = _segment_out(gen)
+            _run_ai_flavor_feedback(
+                db, project, result.get("text") or "",
+                result["segment_no"], body.instruction,
+            )
             return {
                 "answer": (
                     f"已按你的指令续写第 {result['segment_no']} 段"
@@ -247,7 +522,7 @@ def assistant_invoke_generation(
                 "agent_run_id": run_id,
                 "action": body.action,
                 "writer_model": writer_model,
-                "segment": _segment_out(gen),
+                "segment": segment_out,
                 "chars": len(result.get("text") or ""),
                 "summary": result.get("summary") or "",
                 "kg_update": result.get("kg_update") or {},
@@ -285,6 +560,10 @@ def assistant_invoke_generation(
         run.finished_at = _now_utc()
         run.model = writer_model
         db.commit()
+        # AI 腔反馈闭环（旁路）：与 generate_next 分支同一函数，不各写一遍
+        # （两处各写一遍必漂移是这个项目的历史教训）。
+        segment_out = _segment_out(gen)
+        _run_ai_flavor_feedback(db, project, text, body.segment_no, body.instruction)
         return {
             "answer": (
                 f"已按你的指令重写第 {body.segment_no} 段"
@@ -293,7 +572,7 @@ def assistant_invoke_generation(
             "agent_run_id": run_id,
             "action": body.action,
             "writer_model": writer_model,
-            "segment": _segment_out(gen),
+            "segment": segment_out,
             "chars": len(text),
             "summary": done.get("summary") or "",
             "summary_tree": done.get("summary_tree") or {},
