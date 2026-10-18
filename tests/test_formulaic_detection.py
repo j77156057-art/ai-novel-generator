@@ -32,6 +32,7 @@ from sqlalchemy import text  # noqa: E402
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.generation.formulaic import (  # noqa: E402
     MIN_CROSS_SEGMENTS,
+    MIN_SEGMENT_CHARS,
     analyze_formulaic,
     m1_ngram_repetition,
     m2_sentence_onset,
@@ -83,13 +84,15 @@ def test_m1_cross_segment_counts_and_threshold():
     three_segs = two_segs + [(3, TEMPLATE_A + "猫从墙角走过。")]
 
     # 默认门槛（3）：跨 2 段的模板不进报告
-    strict = m1_ngram_repetition(two_segs)
+    # min_segment_chars=0：本用例测的是**算法本身**（跨段计数与门槛），
+    # 刻意绕过样本量守卫；守卫本身由下面的守卫专项用例覆盖。
+    strict = m1_ngram_repetition(two_segs, min_segment_chars=0)
     assert strict["detail"]["repeated_ngrams"] == []
     assert strict["value"] == 0.0
     assert strict["verdict"] == "insufficient_baseline"  # 窗口不足 3 段
 
     # 门槛降到 2：可见，且跨段计数与段号列表正确
-    loose = m1_ngram_repetition(two_segs, min_segments=2)
+    loose = m1_ngram_repetition(two_segs, min_segments=2, min_segment_chars=0)
     hit = next(
         r for r in loose["detail"]["repeated_ngrams"] if r["ngram"] == "他缓缓抬起右"
     )
@@ -97,7 +100,7 @@ def test_m1_cross_segment_counts_and_threshold():
     assert hit["segments"] == [1, 2]
 
     # 跨 3 段：默认门槛下进报告
-    three = m1_ngram_repetition(three_segs)
+    three = m1_ngram_repetition(three_segs, min_segment_chars=0)
     hit3 = next(
         r for r in three["detail"]["repeated_ngrams"] if r["ngram"] == "他缓缓抬起右"
     )
@@ -120,7 +123,7 @@ def test_m1_excludes_ai_flavor_patterns_per_ngram():
         (2, TEMPLATE_FLAVORED + TEMPLATE_A + "雨忽然停了。"),
         (3, TEMPLATE_FLAVORED + TEMPLATE_A + "猫从墙角走过。"),
     ]
-    result = m1_ngram_repetition(segs)
+    result = m1_ngram_repetition(segs, min_segment_chars=0)
     reported = {r["ngram"] for r in result["detail"]["repeated_ngrams"]}
 
     # 含「仿佛」的两个 6-gram 必须被排除（口径分离：归 _detect_ai_flavor 管）
@@ -150,7 +153,7 @@ def test_m1_reference_distinguishes_own_template_from_author_habit():
     ]
     # top_k=50 取全量：报告列表默认只展示前 20 条（同跨段数按字典序截断），
     # 计数类口径（own_template_count 等）本就按全量算，不受展示上限影响。
-    result = m1_ngram_repetition(segs, reference, top_k=50)
+    result = m1_ngram_repetition(segs, reference, top_k=50, min_segment_chars=0)
     by_ngram = {r["ngram"]: r for r in result["detail"]["repeated_ngrams"]}
 
     habit = by_ngram["他缓缓抬起右"]
@@ -174,7 +177,7 @@ def test_m1_no_reference_is_insufficient_baseline():
         (2, TEMPLATE_A + "雨忽然停了。"),
         (3, TEMPLATE_A + "猫从墙角走过。"),
     ]
-    result = m1_ngram_repetition(segs)
+    result = m1_ngram_repetition(segs, min_segment_chars=0)
     assert result["value"] is not None and result["value"] > 0
     assert result["baseline"] is None
     assert result["verdict"] == "insufficient_baseline"
@@ -364,7 +367,7 @@ def test_edge_empty_inputs_all_metrics():
 
 def test_edge_single_segment_and_pure_punctuation():
     """单段：跨段重复无从谈起；纯标点：无可用的 n-gram / 句首口径。"""
-    single = m1_ngram_repetition([(1, TEMPLATE_A)])
+    single = m1_ngram_repetition([(1, TEMPLATE_A)], min_segment_chars=0)
     assert single["value"] == 0.0
     assert single["verdict"] == "insufficient_baseline"
 
@@ -373,7 +376,7 @@ def test_edge_single_segment_and_pure_punctuation():
         (2, "……；；；？？"),
         (3, "、、、。。。"),
     ]
-    m1 = m1_ngram_repetition(punct)
+    m1 = m1_ngram_repetition(punct, min_segment_chars=0)
     assert m1["value"] is None  # 全部 n-gram 被纯标点规则滤掉
     assert m1["detail"]["excluded_punct_ngrams"] > 0
     assert m1["verdict"] == "insufficient_baseline"
@@ -394,7 +397,7 @@ def test_edge_long_text_does_not_blow_up():
     segs = [(i, big + f"第{i}段的尾巴。") for i in range(1, 6)]
 
     t0 = time.monotonic()
-    m1 = m1_ngram_repetition(segs)
+    m1 = m1_ngram_repetition(segs, min_segment_chars=0)
     m2 = m2_sentence_onset(segs)
     m3 = m3_sentence_length(segs)
     elapsed = time.monotonic() - t0
@@ -466,7 +469,9 @@ def _seed_novel_with_chunks(db, texts: list[str]) -> int:
 
 def _gen_body(tag: str) -> str:
     """一段生成正文：共享模板 + 12 句同句首（「他说」）同句长的对白。"""
-    return TEMPLATE_A + "".join(f"他说{'啊' * 8}。" for _ in range(12)) + f"第{tag}段的尾巴。"
+    # 20 句（而非 12 句）：让总长越过 MIN_SEGMENT_CHARS=200，夹具才是真实段长量级
+    # （产品 generation_length 默认 3000 字，171 字的"段"本就失真）。
+    return TEMPLATE_A + "".join(f"他说{'啊' * 8}。" for _ in range(20)) + f"第{tag}段的尾巴。"
 
 
 def _ref_chunk(j: int) -> str:
@@ -590,3 +595,125 @@ def test_analyze_missing_project_raises(db):
     """项目不存在：明确报错，不返回一份空报告冒充成功。"""
     with pytest.raises(ValueError, match="项目不存在"):
         analyze_formulaic(db, 999999)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M1 最差段长守卫（MIN_SEGMENT_CHARS）
+#
+# 背景：`repeated_ratio` 的分母随段长萎缩，短段窗口下跨段偶发碰撞占比虚高。
+# 主理人在 novel_demo.db 实测：约 175 字的短段把项目 1 的比值从 0.0037 抬到
+# 0.0260（虚高 7 倍）；全部约 130 字的窗口得到 0.90，而够长段数为 0——纯假象。
+# 以下用例钉死守卫行为：不给误导性数值，而不是「把数值修正到正确」。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _long_seg(seg_no: int, template: str, total: int = 260) -> tuple[int, str]:
+    """构造一段 ≥ MIN_SEGMENT_CHARS 的正文。
+
+    补白按段号取名（`甲{seg_no}` 反复），保证**跨段的补白 n-gram 互不相同**，
+    不引入额外的跨段重复、污染被测的 template 计数。
+    """
+    fill_unit = f"甲{seg_no}丁"          # 4 字，段间互异
+    body = template
+    while len(body) < total:
+        body += fill_unit
+    return seg_no, body
+
+
+def test_guard_short_only_window_refuses_to_give_comparable_value():
+    """纯短段窗口（每段 130 字）：不给可比数值，绝不复现那个虚高的 0.9。
+
+    真实数据上这种窗口曾算出 repeated_ratio=0.9015——纯粹是偶发碰撞，
+    因为每段 distinct 6-gram 宇宙只有约 125 个。
+    """
+    short = [(i, TEMPLATE_A + "乙" * 110) for i in range(1, 6)]
+    assert all(len(t) < MIN_SEGMENT_CHARS for _n, t in short)
+
+    out = m1_ngram_repetition(short)
+
+    assert out["verdict"] == "insufficient_baseline"
+    assert out["value"] is None, (
+        f"短段窗口不得给出可比数值（会误导跨项目比较），实际 {out['value']}")
+    d = out["detail"]
+    assert d["qualifying_segments"] == 0
+    assert d["excluded_short_segments"] == 5
+    assert d["median_segment_chars"] < MIN_SEGMENT_CHARS
+    assert str(MIN_SEGMENT_CHARS) in out["baseline_note"]
+
+
+def test_guard_mixed_window_equals_long_only_window():
+    """核心断言：长短段混合的结果必须与「只用够长段」完全一致。
+
+    这是本修复的验收标准——短段不再影响任何数值。若哪天有人把守卫去掉，
+    这条会立刻变红。
+    """
+    long_segs = [
+        _long_seg(1, TEMPLATE_A + "柜台后的老钟敲了三下。"),
+        _long_seg(2, TEMPLATE_A + "雨忽然停了。"),
+        _long_seg(3, TEMPLATE_A + "猫从墙角走过。"),
+    ]
+    short_segs = [(91, TEMPLATE_A + "丙" * 100), (92, TEMPLATE_A + "丁" * 100)]
+
+    mixed = m1_ngram_repetition(long_segs + short_segs)
+    long_only = m1_ngram_repetition(long_segs)
+
+    assert mixed["value"] == long_only["value"]
+    assert mixed["detail"]["repeated_ngram_count"] == long_only["detail"]["repeated_ngram_count"]
+    assert mixed["detail"]["distinct_ngrams"] == long_only["detail"]["distinct_ngrams"]
+    # 混合窗口额外记录被排除的短段数量，且这些短段的段号不出现在报告里
+    assert mixed["detail"]["excluded_short_segments"] == 2
+    assert mixed["detail"]["qualifying_segments"] == 3
+    reported_nos = {no for r in mixed["detail"]["repeated_ngrams"] for no in r["segments"]}
+    assert not (reported_nos & {91, 92}), "被守卫排除的短段不得出现在重复报告里"
+
+
+def test_guard_too_few_long_segments_is_insufficient():
+    """够长段不足 MIN_CROSS_SEGMENTS：跨段重复无从谈起，只报不下判决。"""
+    two_long = [
+        _long_seg(1, TEMPLATE_A + "柜台后的老钟敲了三下。"),
+        _long_seg(2, TEMPLATE_A + "雨忽然停了。"),
+    ]
+    out = m1_ngram_repetition(two_long)
+    assert out["verdict"] == "insufficient_baseline"
+    assert out["detail"]["qualifying_segments"] == 2
+    assert f"仅 2 段" in out["baseline_note"] or "2 段" in out["baseline_note"]
+
+
+def test_guard_threshold_plateau_is_stable():
+    """平台稳定性：在 200/400 两个守卫线下结果一致。
+
+    主理人在真实项目 1 上实测 200–600 全给同一值（0.003711），说明短段是
+    失真全部来源、区间内取值不影响结论。这里用合成数据复现该性质。
+    """
+    segs = [
+        _long_seg(1, TEMPLATE_A + "柜台后的老钟敲了三下。", total=520),
+        _long_seg(2, TEMPLATE_A + "雨忽然停了。", total=520),
+        _long_seg(3, TEMPLATE_A + "猫从墙角走过。", total=520),
+        (9, TEMPLATE_A + "戊" * 260),   # 260 字：过 200，不过 400
+    ]
+    at_200 = m1_ngram_repetition(segs, min_segment_chars=200)
+    assert at_200["detail"]["qualifying_segments"] == 4
+
+    at_400 = m1_ngram_repetition(segs, min_segment_chars=400)
+    assert at_400["detail"]["qualifying_segments"] == 3
+    # 那条 260 字的段不含 TEMPLATE_A 之外的额外重复，剔除它不改变「模板跨几段」
+    assert at_200["detail"]["repeated_ngram_count"] == at_400["detail"]["repeated_ngram_count"]
+
+
+def test_guard_applies_to_reference_side_symmetrically():
+    """参考侧同口径过滤：短参考单元不计入参考分布，且排除数可对账。"""
+    gen = [
+        _long_seg(1, TEMPLATE_A + "柜台后的老钟敲了三下。"),
+        _long_seg(2, TEMPLATE_A + "雨忽然停了。"),
+        _long_seg(3, TEMPLATE_A + "猫从墙角走过。"),
+    ]
+    ref_long = ["庚" * 300, "辛" * 300, "壬" * 300]
+    ref_short = ["癸" * 120, "子" * 120]
+
+    out = m1_ngram_repetition(gen, ref_long + ref_short)
+
+    ref = out["detail"]["reference"]
+    assert ref["qualifying_chunks"] == 3
+    assert ref["excluded_short_chunks"] == 2
+    # 短参考单元不足 MIN_REFERENCE_CHUNKS 时不下判决（这里恰好 3 个够长，够）
+    assert out["verdict"] in {"ok", "watch", "insufficient_baseline"}

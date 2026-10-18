@@ -47,7 +47,13 @@ AI 腔检测负责。跨段 n-gram 里若含这些串（或其子串），在本
 - **M1 跨段 n-gram 重复**：字符 6-gram 段内去重成集合，统计每个 n-gram 跨
   几个不同段。局限：① n 固定为 6，更短/更长的模板句看不见；② AI 腔排除
   压低召回（见上）；③ 高频功能词组合（「了一下」「的时候」）可能进报告，
-  所以每条重复都带出现的段号列表，供人读例句。
+  所以每条重复都带出现的段号列表，供人读例句；④ **短段窗口下指标不适用**——
+  `repeated_ratio` 的分母随段长萎缩，实测约 175 字的短段可把比值抬高约 7 倍
+  （0.0037 → 0.0260），全部约 130 字的窗口更是纯粹假象。已由
+  `MIN_SEGMENT_CHARS` 守卫**缓解**：只统计够长单位，够长单位不足
+  `MIN_CROSS_SEGMENTS` 时拒绝给可比数值（`verdict` 置
+  `insufficient_baseline`）。注意这是「拒绝下结论」而非「把数值修正到正确」——
+  若就是要测短段碎片，请换指标。
 - **M2 句首集中度**：按 。！？；…\\n 断句，句首剥引号/括号/破折号（含常见
   前导标点）后取前 2 字。局限：① 2 字粒度粗，「他说」「她问」这类对白句首
   天然集中，单看数值会误判，必须与参考基线对照；② 归一化熵在类别少时天然
@@ -109,8 +115,28 @@ MIN_REFERENCE_CHUNKS = 3
 #: M2 一侧最少句首样本数。top5 占比 / 熵在极少句子上没有意义。
 MIN_ONSET_SAMPLES = 20
 
-#: M3 一侧最少「可算 CV 的段」数。少于 2 段算不出跨段极差，CV 也无从对照。
+#: M1 一侧最少「可算 CV 的段」数。少于 2 段算不出跨段极差，CV 也无从对照。
 MIN_CV_SEGMENTS = 2
+
+#: M1 的最差段长守卫：只有长度 ≥ 此值的段才参与跨段 n-gram 统计。
+#:
+#: **这是样本量守卫，不是对指标值拍正常/异常线**——与 MIN_REFERENCE_CHUNKS /
+#: MIN_ONSET_SAMPLES / MIN_CV_SEGMENTS 同族，属「数据不够就不下结论」。
+#:
+#: 为什么必须有它：`repeated_ratio = 重复n-gram数 / 全部distinct n-gram数` 的
+#: 分母随段长萎缩。段越短，distinct 6-gram 宇宙越小，跨段偶发碰撞的占比天然
+#: 越高，ratio 虚高——跨项目比较会得出完全错误的结论。
+#:
+#: 取 200 的依据（主理人在 `novel_demo.db` 真实项目上只读实测，非估计）：
+#:   - 项目 1 段长 [179,173,173,800,976,791,769,1206,2708]：纳入 3 个约 175 字
+#:     的短段，ratio = 0.025965；只用 ≥200 字的 6 段，ratio = 0.003711——
+#:     **虚高 7 倍**，且失真全部来自那 3 个短段。
+#:   - 项目 2 段长 [135,129,129,129,129]（中位 129）：ratio = 0.901515，而够长
+#:     段数为 **0**——那个 0.90 是纯粹假象，压根不够格做 6-gram 统计。
+#:   - 阈值扫描（项目 1）：200/300/400/500/600 全部给出同一值 0.003711（稳定
+#:     平台），800 才变（掉到 4 段）。**平台证明短段就是失真全部来源，且在此
+#:     区间内阈值取哪都不影响结果**，故取平台最包容端的 200。
+MIN_SEGMENT_CHARS = 200
 
 #: 参考语料抽样上限（按 (novel_id, idx) 均匀跨步）。纯资源bound：整库上千
 #: chunks 全算 n-gram 集合要分钟级；200 个 chunk 对四个指标的分布估计已足够。
@@ -328,6 +354,7 @@ def m1_ngram_repetition(
     *,
     n: int = NGRAM_N,
     min_segments: int = MIN_CROSS_SEGMENTS,
+    min_segment_chars: int = MIN_SEGMENT_CHARS,
     top_k: int = DETAIL_TOP_K,
 ) -> dict:
     """M1：跨段 n-gram 重复——「最近 N 段是不是在用同一批模板句」。
@@ -344,24 +371,51 @@ def m1_ngram_repetition(
     + `reference_chunk_count`（int，无参考语料时为 None——「没数据」与
     「数据说没有」必须分开）。
 
+    **最差段长守卫（`MIN_SEGMENT_CHARS`）**：只用长度达标的段/参考单元参与
+    统计。短段的 distinct n-gram 宇宙太小，偶发碰撞占比天然偏高，会把
+    `repeated_ratio` 整体抬起来（实测虚高 7 倍，见该常量的取值依据）。够长
+    单位不足 `min_segments` 时**不给可比数值**——`verdict` 置
+    `insufficient_baseline` 并在 note 里说明原因，而不是报一个会误导跨项目
+    比较的数字。生成侧与参考侧用**同一条线**过滤，否则又制造新的不可比。
+
+    `min_segment_chars` 默认即 `MIN_SEGMENT_CHARS`（守卫默认开启，安全侧）。
+    仅当调用方明确要测「算法本身」（如单元测试用短夹具）时才传 0 绕过——
+    这不是放宽门禁，而是把「算法」与「样本量策略」分开：绕过者在调用点自己
+    承担可比性责任。
+
     Args:
         segments: `[(segment_no, text), ...]`，正序。
         reference_chunks: 参考语料正文列表；None / 空 = 无基线。
         n: n-gram 阶数。
         min_segments: 跨段报告门槛。
+        min_segment_chars: 最差段长；0 = 显式绕过守卫（测试算法时用）。
         top_k: 报告列表最大条数。
 
     Returns:
         标准指标 dict：`value`（repeated_ratio）、`baseline`、`baseline_note`、
         `verdict`、`detail`。
     """
+    # —— 最差段长守卫：生成侧与参考侧同一条线 ——
+    # 短段的 n-gram 宇宙太小，偶发碰撞会系统性抬高 ratio；跨项目/跨窗口比较
+    # 前必须先过滤，否则数值不可比。过滤事实全部进 detail，可对账。
+    min_chars = max(0, int(min_segment_chars))
+    all_lens = sorted(len(str(t or "")) for _no, t in segments)
+    median_chars = all_lens[len(all_lens) // 2] if all_lens else 0
+    qualifying = [(int(no), str(t or "")) for no, t in segments
+                  if len(str(t or "")) >= min_chars]
+    excluded_short = len(segments) - len(qualifying)
+
+    ref_units = [(idx, str(c or "")) for idx, c in enumerate(reference_chunks or [])
+                 if len(str(c or "")) >= min_chars]
+    ref_excluded_short = len(reference_chunks or []) - len(ref_units)
+
     # —— 生成侧：段内集合 + 跨段计数 ——
     seg_sets: dict[int, set[str]] = {}
     dropped_flavor: set[str] = set()
     dropped_punct: set[str] = set()
-    for seg_no, text in segments:
-        kept, d_flavor, d_punct = _segment_ngram_set(str(text or ""), n)
-        seg_sets[int(seg_no)] = kept
+    for seg_no, text in qualifying:
+        kept, d_flavor, d_punct = _segment_ngram_set(text, n)
+        seg_sets[seg_no] = kept
         dropped_flavor |= d_flavor
         dropped_punct |= d_punct
 
@@ -373,10 +427,10 @@ def m1_ngram_repetition(
     repeated = {g: sorted(nos) for g, nos in cross.items() if len(nos) >= min_segments}
     ratio = (len(repeated) / total_distinct) if total_distinct else None
 
-    # —— 参考侧：同口径（chunk 视为「段」）——
+    # —— 参考侧：同口径（chunk 视为「段」，同样过最差段长线）——
     ref_cross: dict[str, set[int]] = {}
-    for idx, chunk in enumerate(reference_chunks or []):
-        kept, d_flavor, d_punct = _segment_ngram_set(str(chunk or ""), n)
+    for idx, chunk in ref_units:
+        kept, d_flavor, d_punct = _segment_ngram_set(chunk, n)
         dropped_flavor |= d_flavor
         dropped_punct |= d_punct
         for g in kept:
@@ -414,8 +468,10 @@ def m1_ngram_repetition(
     )
 
     # —— 三态 verdict：两侧样本量都够 + 两个 ratio 都算得出来才判 ok/watch ——
+    # 「够」的定义含最差段长守卫：够长段不足 min_segments 时，跨段重复统计的
+    # 分母太小、偶发碰撞主导，此时报 ok/watch 都是误导，只报数值不下判决。
     gen_ok = len(seg_sets) >= min_segments and total_distinct > 0
-    ref_ok = has_ref and len(reference_chunks or []) >= MIN_REFERENCE_CHUNKS and ref_total_distinct > 0
+    ref_ok = has_ref and len(ref_units) >= MIN_REFERENCE_CHUNKS and ref_total_distinct > 0
     if not gen_ok or not ref_ok or ratio is None or ref_ratio is None:
         verdict = "insufficient_baseline"
     else:
@@ -430,18 +486,49 @@ def m1_ngram_repetition(
         )
     else:
         note = (
-            f"参考侧 {len(reference_chunks or [])} 个 chunk 同口径计算（chunk 视为"
-            f"「段」，跨 {min_segments} 段以上计模板），distinct n-gram "
-            f"{ref_total_distinct} 个；「这个作者正常的多样性」以此分布为标尺。"
+            f"参考侧 {len(ref_units)}/{len(reference_chunks or [])} 个 chunk 同口径计算"
+            f"（chunk 视为「段」，跨 {min_segments} 个以上计模板，且同样只取 ≥"
+            f"{min_chars} 字的单元），distinct n-gram {ref_total_distinct} 个；"
+            "「这个作者正常的多样性」以此分布为标尺。"
         )
         if len(reference_chunks or []) < MIN_REFERENCE_CHUNKS:
             note += (
                 f"样本量 < {MIN_REFERENCE_CHUNKS}，参考分布不稳定，只报数值不下判决。"
             )
-        if not gen_ok:
+        elif len(ref_units) < MIN_REFERENCE_CHUNKS:
             note += (
-                f"生成侧不足 {min_segments} 段或无可用 n-gram，跨段重复无从谈起。"
+                f"够长（≥{min_chars} 字）的参考单元仅 {len(ref_units)} 个 < "
+                f"{MIN_REFERENCE_CHUNKS}，参考分布不稳定，只报数值不下判决。"
             )
+
+    # —— 守卫原因必须**两种分支都说**：只在「有参考」分支写，会让没有参考语料的
+    # 用户只看到「无参考基线」，永远不知道段太短也是拦下他的原因。注明是否
+    # 拦下，是让用户能判断「要不要先补段长/补参考语料」的唯一线索。
+    #
+    # 还要区分两种「够长段不足」的成因——否则会把「你只有 2 段」误报成
+    # 「你的段太短」，让用户去改段落长度而白费功夫：
+    #   ① 窗口里本来就没几段（excluded_short == 0）→ 段数不足；
+    #   ② 有段但被段长守卫筛掉（excluded_short > 0）→ 段太短。
+    if not gen_ok:
+        if excluded_short:
+            note += (
+                f"生成侧够长（≥{min_chars} 字）的段仅 {len(qualifying)} 段 / 窗口共 "
+                f"{len(segments)} 段（已排除 {excluded_short} 个短段，中位段长 "
+                f"{median_chars} 字）——短段的 distinct n-gram 宇宙太小，跨段偶发碰撞"
+                "会系统性抬高 ratio（实测可虚高约 7 倍），故只报数值、不作"
+                "跨项目/跨窗口比较。"
+            )
+        else:
+            note += (
+                f"生成侧窗口仅 {len(qualifying)} 段（均 ≥{min_chars} 字，中位段长 "
+                f"{median_chars} 字），不足跨段门槛 {min_segments} 段——跨段重复统计"
+                "无从谈起（这是**段数不够**，不是段太短）。"
+            )
+    elif excluded_short:
+        note += (
+            f"生成侧已排除 {excluded_short} 个短段（<{min_chars} 字），"
+            "统计只在够长段上进行。"
+        )
 
     return {
         "value": ratio,
@@ -451,6 +538,10 @@ def m1_ngram_repetition(
         "detail": {
             "n": n,
             "min_segments": min_segments,
+            "min_segment_chars": min_chars,
+            "qualifying_segments": len(qualifying),
+            "excluded_short_segments": excluded_short,
+            "median_segment_chars": median_chars,
             "distinct_ngrams": total_distinct,
             "repeated_ngram_count": len(repeated),
             "repeated_ratio": ratio,
@@ -462,6 +553,8 @@ def m1_ngram_repetition(
             "reference": (
                 {
                     "chunks": len(reference_chunks or []),
+                    "qualifying_chunks": len(ref_units),
+                    "excluded_short_chunks": ref_excluded_short,
                     "distinct_ngrams": ref_total_distinct,
                     "repeated_ngram_count": ref_repeated_count,
                     "repeated_ratio": ref_ratio,
