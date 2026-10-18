@@ -19,6 +19,12 @@
 - **运行时隔离**：`ProviderRegistry` 单例内部以 `role ∈ {writer, assistant}` 维度缓存与加锁，避免共享连接池导致 Writer 流量阻塞 Assistant 反向影响正文生成。
 - **并发安全**：Assistant 端的检索/诊断接口全部声明 `asyncio` + 每请求独立 client；Writer 主链路不在该注册表中复用，零耦合。
 - **失败隔离**：Assistant provider 异常只回落到"只读检索关闭、诊断走本地规则"，**不得**让 Assistant 异常重路由到 Writer provider。
+- **能力层级：Assistant 是主 agent，Writer 是 sub agent**
+  - **角色定位**：Assistant 承担意图理解、检索取证、质量判断、是否重写的决策与提示词微调（高层认知）；Writer 只按指令写一段（执行）。因此 **assistant 的模型能力必须 ≥ writer**。
+  - **硬性原则**：assistant **不得**与 writer 配成同一模型（同 provider + 同 model）——否则系统静默退化成"同一个模型既写又检"，直接违反 §1「检查者必须与生成者分离」：生成方能可靠检出自己写的 AI 腔，当初就不会写出来；检不出，则自我纠错只是把同一模型的偏差再采样一次。该退化**不会报错**，端点照常返回 200、结构照常完整，属最危险的一类失效。
+  - **现状与原则冲突（待整改）**：只读 `backend/novel_dev.db` 的 `app_settings` 得 `writer.model` = `glm-4-flash`、`assistant.model` = `glm-4-flash` → **当前即处于上述退化状态**；且 `assistant.timeout` = 60（writer 为 120）、`assistant.max_tokens` = 1024（writer 为 2048），两个默认值按"助手是轻量辅助"设计，与主 agent 定位相反（主 agent 要读上下文 + 检索 + 判断，反而给了更短超时与更小输出窗口）。
+  - **成本对冲**（消除"助手更强 = 成本翻倍"）：① Writer 是长输出（每段千字级），token 大头在 output；Assistant 多数是"读 + 短判断"，大头在 input；② Assistant **按需触发**（QA / 诊断 / 审核由用户主动发起或完整档才跑），不是每段必调；③ 档位闸门：完整档用强 Assistant 做语义检查，平衡 / 快速档退化为"规则 + 统计"零成本层（统计层已有基础：跨段 n-gram、句首集中度、句长方差、L1 摘要同质，以参考语料为基线）。
+  - **待办（不在本次范围）**：settings 写入时的校验防线（同 provider + 同 model → 拒绝或强警告），防止无声退化；默认值对齐（assistant 的 `timeout` / `max_tokens` 至少不低于 writer）。
 
 ## 3. 框架选型边界
 
