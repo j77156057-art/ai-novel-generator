@@ -351,7 +351,15 @@ def _row_to_item(row: Any) -> dict[str, Any]:
 def _render_line(item: dict[str, Any]) -> str:
     """单条记忆渲染成一行提示词文本（预算按这一行的实际长度计算）。"""
     sev = item.get("severity") or DEFAULT_SEVERITY
-    head = f"- 【{sev}】{item.get('summary') or item.get('issue_key') or ''}"
+    # summary 必须在此处再截一次：`upsert_memory` 入口的 MAX_SUMMARY_LEN 只管
+    # 「未来写入」，管不到历史上被直接写库（绕过 upsert）的超长行；而
+    # `load_memories` 的字符预算是**行间累计**，管不到单行内部——不截的话，
+    # 一条 5000 字脏行能吃掉整个预算，把同一批里真正该提醒的教训全挤掉
+    # （QA F2 的残留面：防住了「静默罢工」，没防住「一条脏行顶掉全部教训」）。
+    summary = str(item.get("summary") or item.get("issue_key") or "")
+    if len(summary) > MAX_SUMMARY_LEN:
+        summary = summary[:MAX_SUMMARY_LEN] + "…"
+    head = f"- 【{sev}】{summary}"
     tail = f"（累计 {int(item.get('hit_count') or 0)} 次"
     examples = item.get("examples") or []
     if examples:

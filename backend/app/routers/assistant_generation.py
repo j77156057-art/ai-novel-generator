@@ -545,7 +545,7 @@ def assistant_invoke_generation(
             # AI 腔反馈闭环（旁路）：主流程已落库；闭环只读本次正文、写记忆
             # 并微调下次生成的输入，自带事务与异常兜底，失败不影响本次成功。
             segment_out = _segment_out(gen)
-            _run_ai_flavor_feedback(
+            flavor_feedback = _run_ai_flavor_feedback(
                 db, project, result.get("text") or "",
                 result["segment_no"], body.instruction,
             )
@@ -563,6 +563,9 @@ def assistant_invoke_generation(
                 "summary": result.get("summary") or "",
                 "kg_update": result.get("kg_update") or {},
                 "summary_tree": result.get("summary_tree") or {},
+                # 闭环摘要（旁路观测）：记账/微调做了什么、异常时为 None。
+                # 没有它，调用方无从得知「这次自动微调到底发生了什么」。
+                "ai_flavor_feedback": flavor_feedback,
                 "debug": {
                     "system_prompt": result.get("system_prompt") or "",
                     "user_prompt": result.get("user_prompt") or "",
@@ -604,7 +607,7 @@ def assistant_invoke_generation(
         # provider 吐思维链时原文里的 AI 腔模式会被闭环当成正文问题写进记忆、
         # 再进提示词——幻记（QA F3）。generate_next 分支传 result["text"]，
         # 与落库同源，不受此影响。
-        _run_ai_flavor_feedback(
+        flavor_feedback = _run_ai_flavor_feedback(
             db, project, gen.text, body.segment_no, body.instruction
         )
         return {
@@ -619,6 +622,9 @@ def assistant_invoke_generation(
             "chars": len(text),
             "summary": done.get("summary") or "",
             "summary_tree": done.get("summary_tree") or {},
+            # 闭环摘要（旁路观测）：与 generate_next 分支同键同形状，
+            # 异常/未达记忆线时为 None。前端据此提示「本次已沉淀 AI 腔教训」。
+            "ai_flavor_feedback": flavor_feedback,
         }
     except Exception as exc:  # noqa: BLE001 - 生成失败必须留痕，不静默 200
         logger.warning("invoke-generation 失败（project=%s）：%s", project.id, exc)

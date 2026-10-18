@@ -404,6 +404,37 @@ def test_f2_upsert_truncates_oversized_summary(db_session):
     assert db_session.query(AIFlavorMemory).count() == 2
 
 
+def test_f2b_render_fallback_truncates_when_many_rows_exceed(db_session):
+    """渲染端兜底：单行都截断后累计仍超闸时，整段按 MAX_OVERRIDE_LEN 截断。
+
+    与 test_f2_render_truncates_oversized_block_to_max_override_len 分工：
+    那条验「单行超长」被 `_render_line` 的单行截断吃掉（总长远低于闸口）；
+    本条验「多条各自不超单行上限、但累计超闸」时，`_render_flavor_constraint`
+    的整段兜底截断仍然生效——两层都在，谁也不许退化成死代码。
+    """
+    proj = _make_project(db_session)
+    # 30 条各自刚好卡在单行上限内的记忆：单行截断管不了它们，
+    # 只能靠整段兜底。直接插库绕过 upsert 与 limit 裁剪（load_memories 的
+    # limit 是另一道闸，这里要逼的是 render 层的兜底）。
+    for i in range(30):
+        db_session.add(AIFlavorMemory(
+            scope="project", project_id=proj.id, issue_key=f"脏{i:02d}",
+            summary="脏" * ai_flavor_memory.MAX_SUMMARY_LEN,
+            hit_count=50 - i, severity="mid", active=True, last_segment_no=i,
+        ))
+    db_session.commit()
+
+    # 绕过 load_memories 的条数闸，直接喂全量 30 条给渲染器
+    items = [ai_flavor_memory._row_to_item(r) for r in
+             db_session.scalars(select(AIFlavorMemory)).all()]
+    block = ai_flavor_memory.render_memory_block(items)
+    assert len(block) > MAX_OVERRIDE_LEN, "构造应使渲染块超过闸口"
+
+    # 经端点的渲染入口：整段兜底必须把它压回闸内
+    text = gen_router._render_flavor_constraint(db_session, proj.id)
+    assert len(text) <= MAX_OVERRIDE_LEN
+
+
 def test_f2_render_truncates_oversized_block_to_max_override_len(db_session):
     """渲染端治标：既有超长脏行渲染出的覆写按 MAX_OVERRIDE_LEN 截断。"""
     proj = _make_project(db_session)
@@ -419,8 +450,14 @@ def test_f2_render_truncates_oversized_block_to_max_override_len(db_session):
     text = gen_router._render_flavor_constraint(db_session, proj.id)
 
     assert text.startswith(gen_router._FLAVOR_OVERRIDE_HEADER)
-    assert len(text) == MAX_OVERRIDE_LEN, (
-        f"超长渲染结果应截断到 {MAX_OVERRIDE_LEN}，实际 {len(text)}")
+    # 意图是「既有脏数据不得让渲染结果超限」——不是「必须恰好截到闸口」。
+    # 单行截断（_render_line）先生效时总长远低于闸口，那是更健康的状态；
+    # 断言用 <= 才是守住了意图本身。兜底层仍由
+    # test_f2b_render_fallback_truncates_when_many_rows_exceed 覆盖。
+    assert len(text) <= MAX_OVERRIDE_LEN, (
+        f"超长脏行渲染结果不得超过 {MAX_OVERRIDE_LEN}，实际 {len(text)}")
+    # 单行截断生效：脏行的 5000 字 summary 不会原样出现在渲染结果里
+    assert DIRTY_SUMMARY not in text
 
 
 def test_f2_loop_writes_override_despite_dirty_row(db_session, monkeypatch):
@@ -440,11 +477,13 @@ def test_f2_loop_writes_override_despite_dirty_row(db_session, monkeypatch):
                      instruction="写一段")
     assert result["segment"]["text"] == SEVERE_TEXT
 
-    # 闭环微调成功：有生效覆写、写入者标识是本闭环、长度正好压在闸口
+    # 闭环微调成功：有生效覆写、写入者标识是本闭环、且不超长度闸
     ov = _active_constraint_override(db_session, proj.id)
     assert ov is not None, "脏行不得让闭环微调静默罢工"
     assert ov.created_by == gen_router._FLAVOR_OVERRIDE_CREATED_BY
-    assert len(ov.override_text) == MAX_OVERRIDE_LEN
+    assert len(ov.override_text) <= MAX_OVERRIDE_LEN
+    # 本次的教训必须进得了提示词（脏行不得把它挤掉）
+    assert "仿佛" in ov.override_text, "脏行不得顶掉本次真正的教训"
 
     # 闭环自己的记忆行已落库（修复前会被整体回滚丢掉）；脏行原封不动
     rows = _memories(db_session)
