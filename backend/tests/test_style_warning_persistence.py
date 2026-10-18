@@ -97,8 +97,23 @@ print("\n=== 2. GET /api/projects/{id}/kg-v3/style-warnings ===")
 from fastapi.testclient import TestClient
 from app.main import app
 import os
-# 端到端在 conftest 跑（router+db），这里只验 route 注册
-routes = [r.path for r in app.routes]
+# 端到端在 conftest 跑（router+db），这里只验 route 注册。
+# 注意：FastAPI 0.141+ 的 include_router 不再把子路由展平进 app.routes，而是
+# 放一个没有 .path 的 _IncludedRouter 占位对象 —— 只看顶层会让子路由"整组
+# 消失"，于是「端点已注册」这类断言会假红。故递归展开 original_router。
+def _iter_route_paths(router, _depth=0):
+    if _depth > 8:
+        return
+    for r in getattr(router, "routes", []) or []:
+        p = getattr(r, "path", "")
+        if p:
+            yield p
+        sub = getattr(r, "original_router", None)
+        if sub is not None:
+            yield from _iter_route_paths(sub, _depth + 1)
+
+
+routes = list(_iter_route_paths(app))
 check("端点 /kg-v3/style-warnings 已注册",
       any("/kg-v3/style-warnings" in p for p in routes), True)
 

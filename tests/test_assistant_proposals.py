@@ -882,11 +882,30 @@ def test_action_field_is_required_and_must_match(client, db_session, project_id)
                        json={"action": "approve"}).status_code == 422
 
 
+def _iter_route_paths(router, _depth=0):
+    """递归收集全部路由 path —— 兼容 FastAPI <0.141 与 >=0.141。
+
+    FastAPI 0.141 起 include_router 不再把子路由展平进 app.routes，而是放一个
+    _IncludedRouter 占位对象（它没有 .path）。只遍历顶层会让所有子路由"整组
+    消失"，于是「核心端点缺失」这种断言会假红。
+    """
+    if _depth > 8:  # 防御：别让未来的嵌套结构把遍历变成指数爆炸
+        return
+    for r in getattr(router, "routes", []) or []:
+        p = getattr(r, "path", "")
+        if p:
+            yield p
+        # 0.141+：_IncludedRouter 用 original_router 挂子路由；老版本无此属性。
+        sub = getattr(r, "original_router", None)
+        if sub is not None:
+            yield from _iter_route_paths(sub, _depth + 1)
+
+
 def test_apply_has_no_bulk_route(client, db_session, project_id):
     """路由表里不存在「应用全部待批」这类端点。"""
     paths = {
-        getattr(r, "path", "") for r in fastapi_app.routes
-        if getattr(r, "path", "").startswith("/api/assistant")
+        p for p in _iter_route_paths(fastapi_app)
+        if p.startswith("/api/assistant")
     }
     # —— 模式化负面断言（不只是硬编码名字）——
     # 本测试的意图是「不存在批量应用入口」。硬编码几个具体路径名挡不住
