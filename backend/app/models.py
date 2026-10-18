@@ -525,7 +525,7 @@ class StyleDistill(Base):
 
 
 class AIFlavorMemory(Base):
-    """AI 腔反馈闭环的记忆行（Assistant 主导的全局/项目级「问题账本」）。
+    """AI 腔反馈闭环的记忆行（Assistant 主导的全局/项目级「问题账本 + 方案库」）。
 
     ## 它在闭环里的位置
 
@@ -559,6 +559,14 @@ class AIFlavorMemory(Base):
 
     停用某条记忆（`active=False`）只让它从 load 结果里消失，历史仍可查；
     显式的人工停用决策不会被 upsert 悄悄复活。
+
+    ## 从「问题账本」升级为「可复用方案库」
+
+    老版本只记**问题**（issue_key / hit_count / summary），不记**怎么修的**：
+    每次同模式复发都要重新想一遍微调方法，LLM 成本与不确定性随复发次数线性
+    增长。新增的 solution 系列字段把「当年沉淀的微调方法」也存下来——下次
+    同模式命中时优先复用（零成本、确定性），只有方案被验证无效
+    （flagged_ineffective）才重新规划。字段语义见各自行内注释。
     """
 
     __tablename__ = "ai_flavor_memories"
@@ -578,6 +586,33 @@ class AIFlavorMemory(Base):
     active = Column(Boolean, nullable=False, default=True)  # 软开关：停用不删历史
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+    # —— 可复用方案库：问题账本只记「哪里犯了 AI 腔」，下面几个字段记「当时
+    # 怎么修好的」，让下次同模式命中时先复用、后规划（见类注释末节）——
+    # 当年沉淀的微调方法文案，即实际写进 constraint_note 的那段。渲染提示词时
+    # 优先用它（那才是可执行的约束），没有它的老行才回落到 summary。
+    # 空串 = 尚未规划过方案（老行 / 首见），由 resolve_tuning 的规划分支补上。
+    solution = Column(Text, nullable=False, default="")
+    # 方案来源：template（模板渲染，零成本）/ assistant_llm（冷门模式现调 LLM
+    # 规划）/ fallback（LLM 不可用或调用失败时的通用兜底）。记来源是为了可
+    # 观测：模板命中率、LLM 调用量、兜底占比都能从这一列统计，兜底占比升高
+    # 说明 LLM 渠道出了问题，而不是「方案变简单了」。
+    solution_origin = Column(String(16), nullable=False, default="")
+    # 该方案被复用过多少次。>= 1 表示「这方案此前真的被应用过」——它是
+    # recurrences 计数的前提：只统计「已生效方案」的复发，避免把从未被应用
+    # 过的方案的复发误算成无效证据。
+    times_reused = Column(Integer, nullable=False, default=0)
+    # 最近一次复用（应用 / 重新规划）方案的时间。可空 = 从未被复用过。
+    last_reused_at = Column(DateTime, nullable=True)
+    # 方案生效后该问题又复发了多少次。复发说明方案可能没压住这个模式——
+    # 单次复发可能是巧合，连续复发才是方案无效的信号。
+    recurrences = Column(Integer, nullable=False, default=0)
+    # 复发达到 INEFFECTIVE_RECURRENCES 后的「可能无效」标记。
+    # 语义**不是删除、也不是停用**：历史行照常可查、可被 load；它改变的只是
+    # 下次同模式命中时的决策——不盲目复用这段方案，改为重新规划一条新的，
+    # 规划成功后本标记清零、计数重置，进入下一轮「应用 → 观察复发」循环。
+    # 与 active=False 的分工：active 是人工的「这条教训整体不要了」；
+    # 本标记是自动的「这个修法试试新的」。
+    flagged_ineffective = Column(Boolean, nullable=False, default=False)
 
     __table_args__ = (
         # 去重查找的加速索引；(scope, issue_key) 前缀即可覆盖 global 行的查找，

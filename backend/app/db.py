@@ -122,6 +122,18 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("versions", "content_hash", "VARCHAR(64)"),
         ("versions", "source_proposal_id", "INTEGER"),
         ("versions", "is_restore", "BOOLEAN NOT NULL DEFAULT 0"),
+        # —— AI 腔记忆升级为可复用方案库：solution 系列六列 ——
+        # 为什么必须进清单：本表虽是基线之后新建的表，但「表已存在、列不存在」
+        # 的老库（建表那次提交之后、本次升级之前的库）create_all 不会补列——
+        # 它只补缺失的表。任何 SELECT 都会 no such column。
+        # 全部 NOT NULL 列都带 DEFAULT：老行补列即有值，迁移只加列、不删列、
+        # 不改列；last_reused_at 可空表示「从未被复用」。
+        ("ai_flavor_memories", "solution", "TEXT NOT NULL DEFAULT ''"),
+        ("ai_flavor_memories", "solution_origin", "VARCHAR(16) NOT NULL DEFAULT ''"),
+        ("ai_flavor_memories", "times_reused", "INTEGER NOT NULL DEFAULT 0"),
+        ("ai_flavor_memories", "last_reused_at", "DATETIME"),
+        ("ai_flavor_memories", "recurrences", "INTEGER NOT NULL DEFAULT 0"),
+        ("ai_flavor_memories", "flagged_ineffective", "BOOLEAN NOT NULL DEFAULT 0"),
     ]
     eng = target_engine if target_engine is not None else engine
     with eng.begin() as conn:
