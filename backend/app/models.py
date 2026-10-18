@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Index,
     JSON,
     Boolean,
     Column,
@@ -521,3 +522,65 @@ class StyleDistill(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     # 最近一次被应用到某个项目的时间（命中复用也算）。可空 = 仅入库未被用过。
     applied_at = Column(DateTime, nullable=True)
+
+
+class AIFlavorMemory(Base):
+    """AI 腔反馈闭环的记忆行（Assistant 主导的全局/项目级「问题账本」）。
+
+    ## 它在闭环里的位置
+
+    助理 agent（Assistant）是主 agent：调度 Writer（`app.generation.engine`）
+    生成后，**由 Assistant 检查**产出、把本次 AI 腔问题总结成一句人话写进本表；
+    下次生成前，编排层读回本表、渲染成提示词块注入给 Writer 的输入——微调的
+    对象是「下次的输入」，不是重写本次文本（检查者与生成者必须分离）。
+
+    ## 去重键：(scope, project_id, issue_key)
+
+    同一个问题模式（如「仿佛」式机械比喻）无论在多少段里反复出现，都只累加
+    一行 `hit_count`。表长由「问题种类」决定而非「写作轮数」决定——没有这条，
+    一个 300 段的长篇能把表写爆，注入提示词的也会是同一句话的复读。
+
+    `scope=global` 的行 `project_id` 为 NULL：那是跨项目的通用教训，刻意不挂
+    到任何项目上（挂了就等于把全局记忆悄悄变成某个项目的私有记忆）。
+
+    ## 为什么没有 UNIQUE 约束
+
+    与 `PromptOverride` 同款判断（见其类注释）：`(project_id, issue_key)` 在
+    SQLite 与 PG 上对 NULL / False 的处理不一致，且去重要求「查得到才累加」，
+    本质是读-改-写，唯一性由应用层在写事务里保证（`app.agents.
+    ai_flavor_memory.upsert_memory`）。这里只建普通索引加速这次查找。
+
+    ## 有界膨胀
+
+    `examples` 每条最多 3 条证据（新的挤掉最旧的），读取时再按条数/字符预算
+    裁剪——两端同时设防，详见 ai_flavor_memory 模块注释。
+
+    ## active 是软开关
+
+    停用某条记忆（`active=False`）只让它从 load 结果里消失，历史仍可查；
+    显式的人工停用决策不会被 upsert 悄悄复活。
+    """
+
+    __tablename__ = "ai_flavor_memories"
+
+    id = Column(Integer, primary_key=True)
+    scope = Column(String(16), nullable=False, default="global")  # global | project
+    # scope=global 时为 NULL（见类注释）；scope=project 时必填。
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    # 命中的 AI 腔模式 / 归一化问题类型（如「仿佛」「宛如」），由检测侧归一后传入。
+    issue_key = Column(String(128), nullable=False)
+    summary = Column(Text, nullable=False, default="")  # 一句人话总结
+    hit_count = Column(Integer, nullable=False, default=0)  # 累计命中次数（去重累加）
+    # 例句证据 [{segment_no, offset, snippet}]，上限 3 条（写入端强制）。
+    examples = Column(JSON, nullable=True, default=list)
+    last_segment_no = Column(Integer, nullable=True)  # 最近一次出现在哪段
+    severity = Column(String(16), nullable=False, default="mid")  # high | mid | low（排序裁剪用）
+    active = Column(Boolean, nullable=False, default=True)  # 软开关：停用不删历史
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        # 去重查找的加速索引；(scope, issue_key) 前缀即可覆盖 global 行的查找，
+        # project 行的 project_id 等值条件由前缀过滤后在行级完成。
+        Index("ix_ai_flavor_memory_key", "scope", "project_id", "issue_key"),
+    )
