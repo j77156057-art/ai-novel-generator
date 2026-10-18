@@ -101,8 +101,15 @@ def main() -> int:
 
         _check(failures, all(t in plan["system_prompt"] for t in ("角色人设约束", "未填伏笔")),
                "system_prompt 含 角色约束/伏笔 两个区块")
-        _check(failures, all(t in plan["user_prompt"] for t in ("前情提要", "检索上下文", "大纲")),
-               "user_prompt 含 前情/检索/大纲 三个区块")
+        # 旧断言要求 user_prompt 同时含「前情提要 / 检索上下文 / 大纲」三个扁平区块标题。
+        # 该形态已被两次刻意变更取代：
+        #   ① 前情改走分层 `prior_blocks`（[主线] / [卷 k｜段 a-b] / [近情·段 n]），
+        #      不再有「前情提要」这个标题；
+        #   ② v2.3 时间线分级投喂生效时**不注入整条【大纲】**（否则结局一次给全）。
+        # 所以改为守真正稳定的不变量：user prompt 必须仍然是「续写指令」结构。
+        # 分层前情本身由本文件后面的 prior_blocks 专用断言覆盖。
+        _check(failures, "【续写指令】" in plan["user_prompt"],
+               "user_prompt 含【续写指令】结构（前情/大纲形态已改为分层 prior_blocks + 节点提示）")
         _check(failures, isinstance(plan["rag_context"], list), "rag_context 为列表")
 
         # 5) 续写单段
@@ -233,8 +240,14 @@ def main() -> int:
         print("  项目2 rag_context 条数 ->", len(plan2["rag_context"]))
         _check(failures, "沈砚" in sys2, "bible 角色进入 system_prompt")
         _check(failures, "铜镜背面的裂纹" in sys2, "bible 伏笔进入 system_prompt")
-        _check(failures, "沈砚" in plan2["user_prompt"] or "一桩尘封十年的旧案" in plan2["user_prompt"],
-               "bible 梗概进入 user_prompt")
+        # v2.3 起：bible 的 synopsis/direction **只进 system 提示，不再进 user prompt**
+        # ——时间线分级投喂把它拦在 user 侧（一次给全结局走向会让第一章就讲完）。
+        # 上面已断言沈砚与铜镜进入 system_prompt；这里反过来守住「user 侧不得再出现」，
+        # 防的是有人把整段 bible 又塞回 user 把分级投喂废掉。
+        _check(failures,
+               "一桩尘封十年的旧案" not in plan2["user_prompt"]
+               and "铜镜背面的裂纹" not in plan2["user_prompt"],
+               "bible 梗概不进 user_prompt（v2.3 分级投喂：只由 system 承载）")
         # 未选参考语料 → 不得凭空检索
         _check(failures, plan2["rag_context"] == [], "未选参考语料时 RAG 为空", plan2["rag_context"])
         # bible 层必须同时进 system_prompt **和** constraints（后者会被 provider 追加到

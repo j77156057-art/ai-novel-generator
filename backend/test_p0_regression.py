@@ -68,7 +68,7 @@ class FakeProvider:
         self.idx = 0
         self.seen_constraints = []
 
-    def chat(self, system, user, constraints=None):
+    def chat(self, system, user, constraints=None, **kwargs):
         self.seen_constraints.append(constraints)
         t = self.texts[min(self.idx, len(self.texts) - 1)]
         self.idx += 1
@@ -127,8 +127,17 @@ def main() -> int:
 
     print()
     print("=" * 72)
-    print("P0-2  plot_bible 不得静默遮蔽 KG reminders（合并语义）")
+    print("P0-2  plot_bible 与 KG reminders 的合并语义")
     print("=" * 72)
+    # ⚠️ 产品规则在 master 上**被有意反转**（kg-cascade-protocol 阶段 2-3）：
+    #   - 旧规则（本脚本原本守的 P0-2）：bible **不得**静默遮蔽 KG reminders，
+    #     KG 独有角色一律补充进来。
+    #   - 新规则「bible 删除权威」：`bible.characters` **显式列了**名字时，未列入的
+    #     KG 角色约束**整条剔除**——用户在 bible 里删掉某角色后，旧抽取事实不得再把
+    #     他说成锁定角色（旧段不可改，但未来段只认新设定）。
+    #   保守边界仍然保留：bible 无 characters 键或空列表 = 未显式宣告清册 → 不过滤。
+    #   所以下面同时断言「显式清册 → 过滤」与「无清册 → 不过滤」两侧，
+    #   避免这次反转把边界一起吃掉。
     bible = {"characters": [{"name": "陆见", "role": "主角"}], "foreshadowing": ["师父之死"]}
     reminders = {
         "character_constraints": [{"name": "陆见"}, {"name": "白光"}],
@@ -136,7 +145,7 @@ def main() -> int:
     }
     prompt = build_system_prompt("测试", reminders, {"类型": "仙侠"}, bible)
     check("bible 角色保留（陆见）", "陆见" in prompt)
-    check("KG 独有角色补充进来（白光）", "白光" in prompt)
+    check("bible 显式声明清册时，未列入的 KG 角色被剔除（白光）", "白光" not in prompt)
     check("bible 伏笔保留（师父之死）", "师父之死" in prompt)
     check("KG 独有伏笔补充进来（谁干的？）", "谁干的？" in prompt)
 
@@ -146,8 +155,8 @@ def main() -> int:
     # 且漏掉的恰是最高权威层 bible（用户构思）。
     m_chars, m_fores = merged_constraint_items(reminders, bible)
     check(
-        "合并口径：bible 角色在前、KG 独有角色补在后",
-        [c["name"] for c in m_chars] == ["陆见", "白光"],
+        "合并口径：bible 显式清册下只保留列入的角色（陆见，白光被剔除）",
+        [c["name"] for c in m_chars] == ["陆见"],
         str([c["name"] for c in m_chars]),
     )
     check(
@@ -328,8 +337,8 @@ def main() -> int:
         str(b_cons["characters"]),
     )
     check(
-        "图谱抽取的角色未被 bible 遮蔽（陆见/白光 仍在）",
-        {"陆见", "白光"} <= set(b_cons["characters"]),
+        "bible 显式清册下，图谱抽取但未列入 bible 的角色被剔除（陆见/白光 不在）",
+        not ({"陆见", "白光"} & set(b_cons["characters"])),
         str(b_cons["characters"]),
     )
     check(

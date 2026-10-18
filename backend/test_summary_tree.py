@@ -150,13 +150,13 @@ class FakeProvider:
         self.rollups: list[tuple[str, list[str]]] = []
         self.seen_user: list[str] = []
 
-    def chat(self, system, user, constraints=None):
+    def chat(self, system, user, constraints=None, **kwargs):
         self.seen_user.append(user)
         t = self.texts[min(self.idx, len(self.texts) - 1)] if self.texts else "正文占位"
         self.idx += 1
         return t
 
-    def stream_chat(self, system, user, constraints=None):
+    def stream_chat(self, system, user, constraints=None, **kwargs):
         yield self.chat(system, user, constraints)
 
     def summarize(self, text):
