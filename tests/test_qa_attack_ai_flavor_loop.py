@@ -291,8 +291,15 @@ def test_a2_global_row_enters_every_project_by_design(db_session, monkeypatch):
     _invoke(db_session, project_id=proj2.id, action="generate_next",
             instruction="再写一段")
     ov2 = _active_constraint_override(db_session, proj2.id)
+    # 只有 global 行命中（项目 2 自己没有「仿佛」行）时，微调方案直接沉淀到
+    # **global 行**上——这样所有项目都能受益，正符合「全局教训」的定位。
+    global_fang = [r for r in _memories(db_session)
+                   if r.scope == "global" and r.issue_key == "仿佛"]
+    assert global_fang, "global 的「仿佛」行应仍在"
+    assert global_fang[0].solution, "命中后应把微调方案补到该行上"
+    # 覆写里应是新沉淀的方案，而不是那条 global 行原来的 summary
     assert "全局版仿佛教训" not in ov2.override_text
-    assert "本段命中 9 次" in ov2.override_text
+    assert global_fang[0].solution in ov2.override_text
 
 
 def test_a3_writer_direct_path_never_triggers_loop(db_session, monkeypatch):
@@ -682,14 +689,30 @@ def test_c2_zero_extra_llm_calls_vs_loop_disabled(db_session, monkeypatch):
 
 
 @pytest.mark.parametrize("patch_target", [
-    "ai_flavor_memory.upsert_memory",   # 写记忆第二步炸锅
-    "ai_flavor_memory.load_memories",   # 读回渲染时炸锅（记忆已 flush）
-    "set_active_override",              # 微调写入时炸锅
+    "ai_flavor_memory.upsert_memory",   # 记账本身炸锅
+    "ai_flavor_memory.load_memories",   # 记账成功、读回渲染时炸锅
+    "set_active_override",              # 记账成功、微调写入时炸锅
 ])
 def test_c3_loop_failure_leaves_no_half_state(db_session, monkeypatch, patch_target):
-    """闭环任一步炸锅：端点成功、正文落库、无「半条记忆 + 一条 override」。"""
+    """闭环任一步炸锅：主流程成功不被吞，且不留下「不一致」状态。
+
+    两种故障拓扑的期望**不同**——这是有意的设计分工，不是放松断言：
+
+    - **记账本身失败**（`upsert_memory` 炸）：什么都不该留下，无记忆行、
+      无 override（观测还没发生，谈不上保留）。
+    - **记账成功但后续微调失败**（`load_memories` / `set_active_override` 炸）：
+      记忆行**应当保留**。记忆是「Writer 这次确实写了 AI 腔」的观测事实，
+      覆写才是可从记忆完整重建的派生状态。把观测数据连同一次可重试的覆写
+      失败一起丢掉，才是真损失——这正是 F1 修复时立下的「记账与微调互不
+      影响」。此时只要求：无覆写（微调未应用）、记忆行完整成形（非半条
+      垃圾）、且这些行确实还能被读回渲染（下一轮可自愈）。
+
+    两种拓扑共同的底线不变：主流程的成功绝不被吞。
+    """
     proj = _make_project(db_session)
     _install_writer(monkeypatch, StubProvider(SEVERE_TWO_PATTERN_TEXT))
+    # 记账前先抓一份真实的 load_memories，供末尾证明「记忆行仍可读回」
+    real_load = ai_flavor_memory.load_memories
 
     if patch_target == "set_active_override":
         def _boom(db, **kwargs):
@@ -708,18 +731,34 @@ def test_c3_loop_failure_leaves_no_half_state(db_session, monkeypatch, patch_tar
     result = _invoke(db_session, project_id=proj.id, action="generate_next",
                      instruction="会让闭环炸锅的一段")
 
-    # 主流程的成功不被吞
+    # 主流程的成功不被吞（共同底线）
     assert result["segment"]["text"] == SEVERE_TWO_PATTERN_TEXT
     assert result["answer"].startswith("已按你的指令续写第 1 段")
     run = db_session.get(AgentRun, result["agent_run_id"])
     assert run is not None and run.status == "success"
     assert db_session.scalar(
         select(func.count()).select_from(Generation)) == 1
-    # 无中间态残留
-    assert _memories(db_session) == [], "半截记忆行必须被回滚"
-    assert db_session.scalar(
-        select(func.count()).select_from(PromptOverride)) == 0, \
-        "不得留下半条 override"
+
+    rows = _memories(db_session)
+    overrides = db_session.scalar(
+        select(func.count()).select_from(PromptOverride))
+
+    if patch_target == "ai_flavor_memory.upsert_memory":
+        # 记账本身就失败：观测未发生，什么都不该留
+        assert rows == [], "记账失败时不得留下记忆行"
+        assert overrides == 0, "不得留下半条 override"
+    else:
+        # 记账成功、微调未应用：观测事实必须完整保留
+        assert rows, "记账已成功，观测事实不得因后续微调失败而被丢掉"
+        for r in rows:
+            assert r.issue_key, "记忆行必须完整成形（issue_key 不得空）"
+            assert r.solution, "记忆行必须完整成形（solution 不得空）"
+            assert r.hit_count >= 1
+        assert overrides == 0, "微调未应用时不得留下 override"
+        # 自愈能力：这些行用未被 patch 的真实读取器仍能读回并渲染
+        items = real_load(db_session, proj.id)
+        assert items, "已记账的行必须仍可读回（下一轮能自愈补上覆写）"
+        assert ai_flavor_memory.render_memory_block(items)
 
 
 def test_c4_regenerate_loop_checks_unstripped_stream_text(db_session, monkeypatch):
