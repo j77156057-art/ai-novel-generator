@@ -762,7 +762,10 @@ def _default_model_for(provider: str) -> str:
     """
     return {
         "openrouter": "apodex/apodex-1.1-mini:free",
-        "zhipu": "glm-4-flash",
+        # master 把 `config.zhipu_model` 升级为 `glm-4-flash-250414`（2025-04 快照，
+        # 7 类抽取全填 / event_type 多样化）时漏改本表与 PROVIDER_META，三处不一致。
+        # 以 config 为运行时真值源，此处补齐（由 test_model_lists_are_consistent_* 守住）。
+        "zhipu": "glm-4-flash-250414",
         "siliconflow": "Qwen/Qwen2.5-7B-Instruct",
         "minimax": "MiniMax-M3.1-Flash-Preview",
         "dashscope": "qwen-plus",

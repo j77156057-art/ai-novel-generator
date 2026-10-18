@@ -80,7 +80,17 @@ PROVIDER_META: dict[str, dict] = {
         "label": "智谱 GLM",
         "key_hint": "open.bigmodel.cn → 头像 → API Keys（形如 xxxxx.xxxxx）",
         "free_note": "GLM-4-Flash 永久免费不限 token；注册送 2000 万 token",
-        "default_models": ["glm-4-flash", "glm-z1-flash", "glm-4.6", "glm-4.5-air"],
+        # 首项必须是 `config.zhipu_model`（默认模型）。master 把默认升级到
+        # `glm-4-flash-250414`（2025-04 快照，7 类抽取全填）时漏改本清单，
+        # 导致下拉首项与运行时默认不一致 —— 由
+        # test_model_lists_are_consistent_across_three_sources 守住。
+        "default_models": [
+            "glm-4-flash-250414",
+            "glm-4-flash",
+            "glm-z1-flash",
+            "glm-4.6",
+            "glm-4.5-air",
+        ],
     },
     "siliconflow": {
         "label": "硅基流动",

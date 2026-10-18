@@ -133,7 +133,12 @@ def test_three_tiers_registered_with_readable_names():
     assert len(set(names)) == 3, f"三档名字必须互不相同：{names}"
 
 
-def test_sampling_axis_really_differs():
+def test_sampling_axis_really_differs(monkeypatch):
+    # 本用例只测**采样比例轴**；`MIN_SAMPLE_CHARS`（保底 30 万字，短篇全取）
+    # 是一条正交轴，已有专门用例覆盖。夹具只有 200/600 章 × 几个字，总字数远低于
+    # 保底线，不隔离的话会走「短篇全取」分支，测不到比例轴（曾因此误报 200/600）。
+    import app.style.narrative as _narrative_mod
+    monkeypatch.setattr(_narrative_mod, "MIN_SAMPLE_CHARS", 0)
     """采样轴：第一档百分比 0.15，后两档固定 30 章。"""
     full = TIER_REGISTRY[TIER_FULL]
     balanced = TIER_REGISTRY[TIER_BALANCED]
@@ -353,7 +358,10 @@ def test_default_tier_extract_matches_explicit_full_tier():
 # ====================================================================
 
 
-def test_reduced_tiers_sample_fewer_chapters():
+def test_reduced_tiers_sample_fewer_chapters(monkeypatch):
+    # 同上：只测采样比例轴，隔离「短篇全取」的保底下限（该轴另有专门用例）。
+    import app.style.narrative as _narrative_mod
+    monkeypatch.setattr(_narrative_mod, "MIN_SAMPLE_CHARS", 0)
     """采样轴端到端：后两档的采样章数必须少于完整档。
 
     用 600 章语料（600 × 15% = 90vs 固定 30）——200 章时恰好都是 30，

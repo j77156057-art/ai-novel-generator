@@ -49,7 +49,11 @@ _BASELINE = os.path.join(os.path.dirname(_dbmod.__file__), "schema_baseline.json
 def _listed_migration_columns() -> set[tuple[str, str]]:
     src = open(_dbmod.__file__, encoding="utf-8").read()
     assert "migrations = [" in src, "db.py 里找不到 migrations 清单，结构变了？"
-    body = src.split("migrations = [")[-1]
+    # ⚠️ 必须截到 migrations 列表自己的闭合 `]`：此前取 `split(...)[-1]` 一直读到文件尾，
+    # 而 db.py 在其后新增了 `v30_indexes = [...]`（(表, 索引名, 列SQL, 说明)），
+    # 于是索引被当成「列」解析出来 → 本用例误报 14 个 ghost column。
+    # 这里只取 migrations 列表体，索引由 db.py 的另一条路径负责，不属本断言范围。
+    body = src.split("migrations = [", 1)[1].split("\n    ]", 1)[0]
     return set(re.findall(r'\(\s*"(\w+)"\s*,\s*"(\w+)"', body))
 
 
