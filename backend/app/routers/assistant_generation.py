@@ -43,6 +43,11 @@
 的输入」，不是重写本次文本（检查者与生成者必须分离）。闭环零 LLM、
 自带事务与异常兜底：任一步失败只记日志，已落库的正文与已成功的响应
 都不受影响（正文落库与闭环成功是两个独立的事实）。
+
+两条护栏（均有回归测试钉死）：① 闭环检查的是**strip 后已落库的正文**
+（regen 分支传 `gen.text`），provider 思维链里的模式不会幻记进记忆；
+② 覆写写入前看来源：当前生效覆写来自人工/提案时跳过写入，闭环的自动
+微调不顶掉用户审批过的决策（记忆仍正常记账）。
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ from sqlalchemy.orm import Session
 
 from app.agents import ai_flavor_memory
 from app.agents.prompt_overrides import (
+    MAX_OVERRIDE_LEN,
     PromptKey,
     get_active_override,
     set_active_override,
@@ -316,12 +322,25 @@ def _render_flavor_constraint(db: Session, project_id: int) -> str:
     + `render_memory_block()`：覆写文本是「全部生效教训」的快照，不是只有
     本次命中——下次生成的 Writer 该知道这本账上到目前为止的所有教训。
     无记忆时返回空串（调用方据此跳过写入，不产生空覆写行）。
+
+    防御既有脏数据：`upsert_memory` 入口的 summary 截断（治本）管未来写入，
+    这里按 `MAX_OVERRIDE_LEN` 再截断（治标）兜底历史超长行——截断而不是
+    让 `set_active_override` 的长度闸抛错：异常会令闭环整体回滚，该项目
+    自动微调从此永久静默罢工（QA F2）。
     """
     items = ai_flavor_memory.load_memories(db, project_id)
     block = ai_flavor_memory.render_memory_block(items)
     if not block:
         return ""
-    return f"{_FLAVOR_OVERRIDE_HEADER}\n{block}"
+    text = f"{_FLAVOR_OVERRIDE_HEADER}\n{block}"
+    if len(text) > MAX_OVERRIDE_LEN:
+        logger.warning(
+            "AI 腔记忆渲染结果超长，已按 MAX_OVERRIDE_LEN 截断"
+            "（project=%s, %d > %d，疑似历史脏数据）",
+            project_id, len(text), MAX_OVERRIDE_LEN,
+        )
+        text = text[:MAX_OVERRIDE_LEN]
+    return text
 
 
 def _run_ai_flavor_feedback(
@@ -348,7 +367,10 @@ def _run_ai_flavor_feedback(
     4. **微调**：`_render_flavor_constraint` 读回合并后的记忆渲染成约束，
        经 `set_active_override` 写入 constraint_note 槽位（「同 key 先降旧
        再插新」的既有不变量由此保留，不直接 db.add 绕开它）；内容与当前
-       生效覆写逐字节相同时跳过，不在历史表里堆无意义的新行。
+       生效覆写逐字节相同时跳过，不在历史表里堆无意义的新行。当前生效
+       覆写若来自人工/提案（`created_by` 不是本闭环的标识），跳过写入
+       保留人工决策（治理口径见 `prompt_overrides` 模块注释）——记忆仍
+       正常写，记账与微调互不影响；
 
     事务与兜底：闭环自带事务边界（主流程提交后才开始），任一步抛异常 →
     `db.rollback()` 丢掉本循环的半截写入 + `logger.warning`，**绝不影响**
@@ -396,9 +418,22 @@ def _run_ai_flavor_feedback(
 
         # 微调：读回合并后的记忆（含本次刚写的）渲染成约束写进槽位
         override_text = _render_flavor_constraint(db, project.id)
+        override_written = False
         if override_text:
             current = get_active_override(db, project.id, PromptKey.CONSTRAINT)
-            if current is None or (current.override_text or "") != override_text:
+            if current is not None and \
+                    (current.created_by or "") != _FLAVOR_OVERRIDE_CREATED_BY:
+                # 当前生效覆写不是本闭环写的（created_by 为 None 或提案标识
+                # 等）：按 prompt_overrides 的治理口径，人工/提案来源的覆写是
+                # 用户审批的决策，闭环不得顶掉（QA F1）。记忆照写——记账与
+                # 微调是两件事；等人工覆写失效后，后续闭环再接手微调。
+                logger.info(
+                    "AI 腔反馈闭环：当前 constraint_note 覆写来源为 %r"
+                    "（非本闭环 %r），跳过本次微调写入，保留人工覆写"
+                    "（project=%s）",
+                    current.created_by, _FLAVOR_OVERRIDE_CREATED_BY, project.id,
+                )
+            elif current is None or (current.override_text or "") != override_text:
                 set_active_override(
                     db,
                     project_id=project.id,
@@ -406,6 +441,7 @@ def _run_ai_flavor_feedback(
                     override_text=override_text,
                     created_by=_FLAVOR_OVERRIDE_CREATED_BY,
                 )
+                override_written = True
         db.commit()
         logger.info(
             "AI 腔反馈闭环完成（project=%s, segment=%s, instruction=%s）：%s"
@@ -417,7 +453,7 @@ def _run_ai_flavor_feedback(
             "total": total,
             "summary": summary,
             "alerted": alerted,
-            "override_written": bool(override_text),
+            "override_written": override_written,
         }
     except Exception as exc:  # noqa: BLE001 —— 闭环是旁路，失败绝不能影响已成功的生成
         try:
@@ -563,7 +599,14 @@ def assistant_invoke_generation(
         # AI 腔反馈闭环（旁路）：与 generate_next 分支同一函数，不各写一遍
         # （两处各写一遍必漂移是这个项目的历史教训）。
         segment_out = _segment_out(gen)
-        _run_ai_flavor_feedback(db, project, text, body.segment_no, body.instruction)
+        # 闭环检查的是**已落库正文**（gen.text），不是流式拼接的原文 text：
+        # 引擎落库前做过 _strip_thinking（engine.regenerate_segment_stream），
+        # provider 吐思维链时原文里的 AI 腔模式会被闭环当成正文问题写进记忆、
+        # 再进提示词——幻记（QA F3）。generate_next 分支传 result["text"]，
+        # 与落库同源，不受此影响。
+        _run_ai_flavor_feedback(
+            db, project, gen.text, body.segment_no, body.instruction
+        )
         return {
             "answer": (
                 f"已按你的指令重写第 {body.segment_no} 段"

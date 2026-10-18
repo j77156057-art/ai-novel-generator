@@ -20,8 +20,8 @@
 2. **有界膨胀，写入端与读取端同时设防**。只堵一端堵不住：写入端漏进一条
    长文，或读取端出现一个新调用方忘了裁剪，提示词都会被撑爆。所以
    - 写入端：`examples` 最多 `MAX_EXAMPLES` 条（新的挤掉最旧的），单条
-     snippet 截断到 `MAX_SNIPPET_LEN`，同一处证据（segment_no+offset）
-     不重复记；
+     snippet 截断到 `MAX_SNIPPET_LEN`，`summary` 截断到
+     `MAX_SUMMARY_LEN`，同一处证据（segment_no+offset）不重复记；
    - 读取端：`load_memories()` 按 `limit`（条数）与 `char_budget`（字符
      预算，按**渲染后行长**精确计算）双重裁剪。
 
@@ -39,8 +39,11 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger("agent.ai_flavor_memory")
 
 # ====================================================================
 # 常量（有界膨胀的全部数值集中在这里，调参只改这一处）
@@ -63,6 +66,15 @@ MAX_EXAMPLES: int = 3
 #: 单条例句 snippet 的字符上限。例句是「证据」不是「原文归档」，200 字足够
 #: 定位问题；防的是某次检测把整段正文塞进 examples 把库撑爆。
 MAX_SNIPPET_LEN: int = 200
+
+#: 单条记忆 summary 的字符上限（一句人话总结，不是原文归档）。取 200 的
+#: 理由与 MAX_SNIPPET_LEN 同族：summary 会被 `_render_line` 原样拼进提示词
+#: 覆写（`- 【severity】{summary}（累计 N 次；例：「…」）`），12 条上限下
+#: 每条 200 字仍稳在读取端字符预算（DEFAULT_CHAR_BUDGET=2000）与
+#: `prompt_overrides.MAX_OVERRIDE_LEN`（4000）之内。超长**截断**而非报错：
+#: 报错会让闭环整体回滚、该项目自动微调永久静默罢工（QA F2）；截断只损失
+#: 一句总结的尾巴，不影响记账连续性。
+MAX_SUMMARY_LEN: int = 200
 
 #: issue_key 长度上限，与模型列宽（String(128)）一致。超长直接报错而非
 #: 截断——截断可能把两个不同的 key 截成同一个， silently 合并两种问题。
@@ -122,6 +134,25 @@ def _normalize_severity(severity: str) -> str:
     """严重度归一为小写；空值回落默认档。未知值原样保留（排序时排最后）。"""
     s = (severity or "").strip().lower()
     return s or DEFAULT_SEVERITY
+
+
+def _normalize_summary(summary: str, *, issue_key: str = "") -> str:
+    """一句人话总结：去空白；超长按 MAX_SUMMARY_LEN 截断并记日志。
+
+    为什么截断而不是报错：summary 会被 `_render_line` 原样拼进提示词覆写，
+    一条超长脏行就能把覆写顶出 `prompt_overrides.MAX_OVERRIDE_LEN` →
+    `set_active_override` 抛错 → 闭环整体回滚 → 该项目自动微调永久静默
+    罢工（QA F2）。截断只损失总结尾巴，记账与微调都保住。
+    """
+    s = (summary or "").strip()
+    if len(s) > MAX_SUMMARY_LEN:
+        logger.warning(
+            "AI 腔记忆 summary 超长，已截断到 %d 字"
+            "（issue_key=%r，原长 %d）",
+            MAX_SUMMARY_LEN, issue_key, len(s),
+        )
+        s = s[:MAX_SUMMARY_LEN]
+    return s
 
 
 def _normalize_examples(examples: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -200,7 +231,8 @@ def upsert_memory(
         project_id: scope=project 时必填；scope=global 时强制忽略为 NULL。
         issue_key: 命中的 AI 腔模式 / 归一化问题类型，如 "仿佛"。
         summary: 一句人话总结。空串表示「只累加命中，不更新描述」——
-            允许调用方在补刀命中时只报数。
+            允许调用方在补刀命中时只报数。超长按 MAX_SUMMARY_LEN 截断
+            （不报错：报错会令闭环回滚、自动微调静默罢工，见常量注释）。
         hits_delta: 本次命中次数，须 >= 0（0 = 仅刷新证据/描述）。
         examples: 本次例句 [{segment_no, offset, snippet}]。
         segment_no: 最近一次出现在哪段；None 表示不刷新该字段。
@@ -227,6 +259,7 @@ def upsert_memory(
     if not isinstance(hits_delta, int) or hits_delta < 0:
         raise ValueError(f"hits_delta 须为非负整数，收到 {hits_delta!r}")
     sev = _normalize_severity(severity)
+    summary_n = _normalize_summary(summary, issue_key=key)
     new_examples = _normalize_examples(examples)
 
     # 查重：global 行用 IS NULL 匹配（SQLAlchemy 的 == None 也会转 IS NULL，
@@ -247,7 +280,7 @@ def upsert_memory(
             scope=scope_n,
             project_id=pid,
             issue_key=key,
-            summary=(summary or "").strip(),
+            summary=summary_n,
             hit_count=hits_delta,
             examples=_merge_examples(None, new_examples),
             last_segment_no=segment_no,
@@ -257,8 +290,8 @@ def upsert_memory(
         db.add(row)
     else:
         row.hit_count = (row.hit_count or 0) + hits_delta
-        if (summary or "").strip():
-            row.summary = summary.strip()
+        if summary_n:
+            row.summary = summary_n
         row.severity = sev
         if segment_no is not None:
             # 直接刷新为「本次报告的段号」：段号由调用方按写作进度给出，
