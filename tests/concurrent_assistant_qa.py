@@ -12,9 +12,12 @@
 """
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
 import sys
 import threading
+import tempfile
 import time
 import traceback
 from collections import Counter
@@ -23,6 +26,33 @@ from collections import Counter
 _BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend"))
 if _BACKEND not in sys.path:
     sys.path.insert(0, _BACKEND)
+
+# ─── 真实库隔离（必须在任何 `import app.*` 之前）────────────────────────────
+# `app.db` 的 engine 由 `settings.database_url` 建立，默认 `sqlite:///./novel_dev.db`
+# ——**相对当前工作目录解析**。本脚本含 `Base.metadata.drop_all(bind=engine)`，
+# 若在 backend/ 或任何含有 `novel_dev.db` 的目录下直接跑，drop 掉的就是真实开发库
+# （2026-10-17 19:02 就是这样清空了 7941 个分片，且 drop 后 create_all 未成功，
+#  只留下 122.9MB 的空壳）。
+#
+# 做法与 tests/qa3_qa4_qa5 一致：
+#   1) 先把 DATABASE_URL 指到**本进程专属的临时库**；
+#   2) 若外部已显式把 DATABASE_URL 指向真实库，**直接拒绝运行**，而不是静默清库。
+_REAL_DB_NAMES = {"novel_dev.db", "novel_demo.db"}
+_ext_db = os.environ.get("DATABASE_URL", "")
+if _ext_db:
+    if not _ext_db.startswith("sqlite"):
+        raise SystemExit(f"拒绝运行：DATABASE_URL 不是 sqlite（{_ext_db}），本脚本会 drop_all。")
+    _ext_path = os.path.abspath(_ext_db.split("///", 1)[-1])
+    if os.path.basename(_ext_path) in _REAL_DB_NAMES:
+        raise SystemExit(
+            f"拒绝运行：DATABASE_URL 指向真实库 {_ext_path}。"
+            "本脚本会 drop_all 真实数据；请去掉该环境变量（脚本会自建临时库）。"
+        )
+_ISO_DIR = tempfile.mkdtemp(prefix="concurrent_qa_")
+os.environ["DATABASE_URL"] = f"sqlite:///{_ISO_DIR}/isolated.db"
+atexit.register(lambda: shutil.rmtree(_ISO_DIR, ignore_errors=True))
+print(f"[隔离] DATABASE_URL -> {os.environ['DATABASE_URL']}")
+# ─── 隔离块结束 ─────────────────────────────────────────────────────────────
 
 import app.llm.provider as llm_provider_mod  # noqa: E402
 from app.agents.registry import reset_tool_registry  # noqa: E402

@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 _BACKEND = Path(__file__).resolve().parent.parent / "backend"
+_REPO = _BACKEND.parent
 _PY = _BACKEND / "venv" / "Scripts" / "python.exe"
 _TIMEOUT = 180
 #: 临时库目录。**每个脚本一个独立文件**——否则某个脚本 drop_all/create_all 会串味到下一个。
@@ -41,18 +42,47 @@ _TMP_DIR = Path("D:/Temp/legacy_gate")
 #: 脚本可能打开的真实库（相对 backend/）。跑前跑后必须原样。
 _REAL_DBS = ("novel_demo.db", "novel_dev.db")
 
+#: 已知有缺陷的老脚本：**仍然跑**（让真实库守卫覆盖到它），但不作为通过条件。
+#: `concurrent_assistant_qa.py` 用 20 个线程对**同一个 sqlite 文件**并发写，必然撞
+#: `database is locked`——这与库隔离无关（换任何文件库都一样），是脚本自身的设计问题。
+#: 用 `xfail(strict=False)`：不阻塞门禁；若有人把它修好，会以 XPASS 显现。
+_KNOWN_BROKEN = {
+    "concurrent_assistant_qa.py":
+        "20 线程并发写同一 sqlite 文件 → database is locked（脚本设计问题，与隔离无关）",
+}
 
-def _discover() -> list[str]:
-    """收集待跑脚本（相对 backend/ 的 posix 路径），顺序稳定。"""
-    found: list[str] = []
-    found += [p.relative_to(_BACKEND).as_posix()
-              for p in sorted((_BACKEND / "tests").glob("test_*.py"))]
-    found += [p.relative_to(_BACKEND).as_posix()
-              for p in sorted(_BACKEND.glob("test_*.py"))]
+
+def _discover() -> list[Path]:
+    """收集待跑脚本（绝对路径）。
+
+    三组：
+      1. `backend/tests/test_*.py` —— 老式 sys.exit 脚本（v3.0 KG 等）
+      2. `backend/test_*.py`       —— 更早的一批
+      3. `tests/concurrent_*.py`   —— 并发压测脚本。**必须纳入**：它们曾因
+         `from app.db import engine` + `drop_all` 且无 DATABASE_URL 覆盖，
+         在 backend/ 下直接跑就能清掉真实库（与 2026-10-17 事故同类暴露面）。
+    """
+    found: list[Path] = []
+    found += sorted((_BACKEND / "tests").glob("test_*.py"))
+    found += sorted(_BACKEND.glob("test_*.py"))
+    found += sorted((_REPO / "tests").glob("concurrent_*.py"))
     return found
 
 
-SCRIPTS = _discover()
+def _params() -> list:
+    out = []
+    for p in _discover():
+        rel = p.relative_to(_REPO).as_posix().replace("/", "·")
+        reason = _KNOWN_BROKEN.get(p.name)
+        if reason:
+            out.append(pytest.param(
+                p, marks=pytest.mark.xfail(reason=reason, strict=False), id=rel))
+        else:
+            out.append(pytest.param(p, id=rel))
+    return out
+
+
+SCRIPTS = _params()
 
 
 def _db_fingerprint() -> dict[str, tuple[int, float]]:
@@ -79,12 +109,13 @@ def real_db_untouched():
     )
 
 
-@pytest.mark.parametrize("script", SCRIPTS, ids=lambda s: s.replace("/", "·"))
-def test_legacy_script_passes(script: str, real_db_untouched):
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_legacy_script_passes(script: Path, real_db_untouched):
     """该脚本必须以退出码 0 结束（其内部 check() 计数决定 0/1）。"""
     assert _PY.exists(), f"找不到解释器：{_PY}"
+    label = script.relative_to(_REPO).as_posix()
     _TMP_DIR.mkdir(parents=True, exist_ok=True)
-    db_file = _TMP_DIR / (script.replace("/", "_").replace(".py", "") + ".db")
+    db_file = _TMP_DIR / (script.stem + ".db")
     if db_file.exists():
         db_file.unlink()
     env = dict(os.environ)
@@ -92,14 +123,14 @@ def test_legacy_script_passes(script: str, real_db_untouched):
     env["PYTHONIOENCODING"] = "utf-8"
     try:
         r = subprocess.run(
-            [str(_PY), script], cwd=str(_BACKEND), env=env,
+            [str(_PY), str(script)], cwd=str(_BACKEND), env=env,
             capture_output=True, timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        pytest.fail(f"{script} 超时（>{_TIMEOUT}s）——可能死锁或等待外部服务")
+        pytest.fail(f"{label} 超时（>{_TIMEOUT}s）——可能死锁或等待外部服务")
 
     if r.returncode != 0:
         out = (r.stdout or b"").decode("utf-8", "replace").strip().splitlines()
         err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
         tail = "\n".join((out[-12:] + err[-12:]))
-        pytest.fail(f"{script} 退出码 {r.returncode}\n--- 输出尾部 ---\n{tail}")
+        pytest.fail(f"{label} 退出码 {r.returncode}\n--- 输出尾部 ---\n{tail}")
