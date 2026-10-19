@@ -195,7 +195,10 @@ class AssistantToolRegistry:
           - name 以黑名单前缀开头 → PermissionError（双重门：即便有人绕开 register
             直接调用 invoke，仍会被拒绝）；
           - name 未注册 → KeyError；
-          - spec.read_only is False → PermissionError（防御 register 时漏判）。
+          - spec.read_only is False → PermissionError（防御 register 时漏判）；
+          - spec.name 不在 ALLOWED_READ_ONLY_TOOLS 中 → PermissionError
+            （白名单双重门：与 register() 同源。即便有人绕过 register 直接把工具
+            塞进 _tools，invoke 仍会用白名单拦下，不给「注册即信任」留口子）。
 
         异常**不**写入任何状态：invoke_tool 抛错时本注册表的状态保持不变。
         """
@@ -208,6 +211,13 @@ class AssistantToolRegistry:
         if spec.read_only is False:
             raise PermissionError(
                 f"Assistant 拒绝非只读工具 {name!r}（spec.read_only=False）"
+            )
+        # 白名单双重门（与 register() 同源）：invoke 也按 ALLOWED_READ_ONLY_TOOLS
+        # fail-closed。放在真正调用 callable **之前**，保证被拒时 callable 一次都不会执行。
+        if spec.name not in ALLOWED_READ_ONLY_TOOLS:
+            raise PermissionError(
+                f"工具 {spec.name!r} 不在只读白名单 ALLOWED_READ_ONLY_TOOLS 中；"
+                "即便绕过 register 直接塞进 _tools 也不予调用"
             )
         # 把 db / project_id 显式注入；kwargs 是工具自身的额外参数（如 query / k）。
         # 工具 callable 不会拿到 db / project_id 之外的"特权"——返回 dict，不持引用。
