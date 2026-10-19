@@ -152,6 +152,23 @@ _SPEAK_ADV_PATTERN = (
 _SPEAK_RE = re.compile(
     rf"(?<![一-鿿])([一-鿿]{{2,3}}?){_SPEAK_ADV_PATTERN}{{0,2}}{_SPEAK_VERB_PATTERN}"
 )
+# 时间/量词停用表：整词命中时**不得作为说话归因的名**（62609a5 回归修复）。
+# 回归成因：62609a5 给副词槽补的 2 字方式副词让「许久后低声」恰好占满 {0,2}
+# （单字「后」+ 2 字「低声」），句末「道」收尾 → 整句归因给「许久」；而「许久」
+# 首字「许」是姓氏、2 字名直接过 _valid_name。QA 在三本语料上抓到这条
+# **属性级回归**：角色总数不变、只有 speaking 被升级——总数口径的对照表
+# 看不见它，是靠逐条判定新归因抓到的（大奉 12 条新归因中此条判错）。
+# 为什么只拦说话归因这一面、不进 _valid_name：这些时间词本就经主语 pass
+# 躺在角色集里（大奉「许久」mentions=260、跨 183 章），那是既存行为、不在
+# 本缺陷范围；在 _valid_name 全局拦会把它们从角色集抹掉，违反「角色集零抖动」。
+# 纪律同副词槽：只枚举、不放宽；拦的是「许久」这类时间词**整体**，不碰姓氏——
+# 「许七安」「许墨」是真角色，误伤钉子在 tests/test_kg_speak_attribution.py。
+_TIME_WORD_STOP = frozenset(
+    {
+        "许久", "半晌", "片刻", "良久", "半天", "少顷", "俄顷",
+        "须臾", "移时", "一会", "一阵",
+    }
+)
 # 说话动词字符集：供粘连检测复用（名末字与下一字都是它时，末字实为动词首字）。
 _SPEAK_VERBS = "说道问答笑"
 # 宾语位粘连体首字集合 = 说话动词 + 「听」（「听说」是转述动词短语，
@@ -463,11 +480,17 @@ class RuleBasedExtractor(KGExtractor):
                     c.chapters.add(ch_no)
             for m in _SPEAK_RE.finditer(text):
                 name = m.group(1)
-                if _valid_name(name):
-                    c = res.characters.setdefault(name, Character(name=name))
-                    c.mentions += 1
-                    c.chapters.add(ch_no)
-                    c.speaking = True
+                if not _valid_name(name):
+                    continue
+                # 时间词停用护栏（见 _TIME_WORD_STOP 注释）：整词命中即跳过，
+                # 连 mentions/chapters 一并跳过——恢复 62609a5 之前的计量口径
+                # （_sweep_chapters 仍按全文出现次数计数，角色集不受影响）。
+                if name in _TIME_WORD_STOP:
+                    continue
+                c = res.characters.setdefault(name, Character(name=name))
+                c.mentions += 1
+                c.chapters.add(ch_no)
+                c.speaking = True
 
             # —— 坑线索 ——
             # 判定原则：坑=「读者想知道但还不知道」的信息缺口。
