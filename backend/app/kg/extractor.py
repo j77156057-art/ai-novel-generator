@@ -174,6 +174,19 @@ _SPEAK_VERBS = "说道问答笑"
 # 宾语位粘连体首字集合 = 说话动词 + 「听」（「听说」是转述动词短语，
 # 「叫宝玉听说」的宾语位会切出「宝玉听」——只列说话动词会漏掉这一类）。
 _GLUE_VERB_LEADS = set(_SPEAK_VERBS) | {"听"}
+# R2 归并排斥集：2 字名 + 后一字归并成 3 字名时，后一字不得是
+#   ① 说话动词或「听」（_GLUE_VERB_LEADS）——挡住「宝玉笑道」→「宝玉笑」、
+#      「林夜说道」→「林夜说」、「宝玉听说」→「宝玉听」这类复活；
+#   ② 2 字方式副词的首字——挡住「林夜低声说道」→「林夜低」。
+# ①②都从既有表派生（①来自 _SPEAK_VERBS，②来自 _SPEAK_ADV_PATTERN 里的 2 字副词），
+# 不是手写新字表，不引入魔法常数。
+_SPEAK_ADV_LEAD_CHARS = frozenset(
+    a[0] for a in (
+        "低声", "冷冷", "缓缓", "微微", "淡淡", "轻声",
+        "朗声", "沉沉", "沉声", "幽幽", "默默", "轻轻",
+    )
+)
+_SPEAK_MERGE_BLOCK_CHARS = frozenset(_GLUE_VERB_LEADS) | _SPEAK_ADV_LEAD_CHARS
 # 粘连尾巴集合：名末字命中且前缀本身是已入图角色时，末字应判为粘连（对话桥接纠偏用）。
 _GLUE_TAIL_CHARS = set("说道问答笑听") | set("又便因都也却竟忙遂乃复再方才只就即已曾忽急正先后仍尚")
 # 换行续行归一：源文本（公版书扫描档）按行硬折行，人名会被换行切成两半
@@ -480,6 +493,19 @@ class RuleBasedExtractor(KGExtractor):
                     c.chapters.add(ch_no)
             for m in _SPEAK_RE.finditer(text):
                 name = m.group(1)
+                # —— R2 结构归并：2 字匹配把 3 字真名切碎时，归并回 3 字名 ——
+                # 根因见 _SPEAK_VERB_PATTERN 的 [一-鿿]道：非贪婪名字槽先试 2 字，
+                # 「许七安道」被切成 名字=许七 + 动词=安道；finditer 不会在同一位置
+                # 回退重试 3 字，故必须在此显式归并。
+                # 收紧纪律：归并的前提是 2 字片段**本身**就已通过 _valid_name。
+                # 不收紧会让「终于知道」→「终于知」（「终于」被 _NAME_WORD_STOP 拒收，
+                # 归并后却借「知」起死回生），凭空造出伪角色。
+                if len(name) == 2 and _valid_name(name):
+                    nxt = m.group(0)[len(name):len(name) + 1]
+                    if nxt and nxt not in _SPEAK_MERGE_BLOCK_CHARS:
+                        merged = name + nxt
+                        if _valid_name(merged):
+                            name = merged
                 if not _valid_name(name):
                     continue
                 # 时间词停用护栏（见 _TIME_WORD_STOP 注释）：整词命中即跳过，
