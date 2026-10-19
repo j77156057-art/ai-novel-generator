@@ -14,11 +14,11 @@
 - T2（8 条，护栏）：归并**不得**复活历史伪形态（「宝玉笑」「林夜说」「宝玉听」）、
   不得吃掉 2 字方式副词首字（「林夜低」）、不得破坏 `_TIME_WORD_STOP` 的
   「许久」钉子，也不得把 2 字真名「许墨」并成别的；
-- T3（5 条，待办）：R2 的结构归并候选已经构造正确（== 真名），但这 5 个真名的
-  **末字不在 `_NAME_CHARS`**（孝/年/叔/薇/旧），`_valid_name` 拒收 3 字候选，
-  端到端仍停在 2 字碎片。这是**字表缺口**、属方案 S（另行分派），本批纪律是
-  「只上 R2、不动 `_valid_name`」，故此处钉住"结构已修、字表未补"的当前事实；
-  等 S 补字后本组会自动翻绿，无需改测试。
+- T3（5 条）：R2 的结构归并候选已经构造正确（== 真名），端到端是否翻绿取决于
+  `_NAME_CHARS`。R2 落地时这 5 个真名的末字（孝/年/叔/薇/旧）不在 `_NAME_CHARS`，
+  `_valid_name` 拒收 3 字候选，故停在 2 字碎片（当时 3/8）；S1 补进这 5 字后
+  已随 T1 一并转绿（8/8）。此处保留「按 `_valid_name` 分流」的写法，字表若回退
+  会自动钉住"停在碎片"的事实而不是假装绿。
 
 纪律：先写、先在未修复的代码上跑出**红**，修完再跑出绿。
 """
@@ -109,9 +109,12 @@ def test_r2_tightening_blocks_resurrected_fragment() -> None:
     assert _speaking("终于知道原因了。") == set()
 
 
-# ── T3：结构已修、字表未补的 5 条（方案 S 待办） ──────────────────────────
-# 末字 孝/年/叔/薇/旧 不在 _NAME_CHARS，_valid_name 拒收 3 字候选。
-PENDING_NAME_CHARS = [
+# ── T3：R2 归并候选 == 真名，端到端翻绿依赖 _NAME_CHARS ──────────────────
+# 这 5 条的末字 孝/年/叔/薇/旧 曾不在 `_NAME_CHARS`，`_valid_name` 拒收 3 字候选，
+# 端到端停在 2 字碎片（R2 落地时是 3/8）。S1 把这 5 字补进 `_NAME_CHARS` 后
+# 已全部转绿（8/8）。这里保留「按 _valid_name 分流」的写法：万一将来字表回退，
+# 测试会自动退回到钉住"停在碎片"的事实，不会假装绿。
+FULL_NAME_CHARS = [
     ("朱广孝说道：“是。”", "朱广孝", "朱广"),
     ("许新年道：“嗯。”", "许新年", "许新"),
     ("许二叔道：“别闹。”", "许二叔", "许二"),
@@ -120,11 +123,11 @@ PENDING_NAME_CHARS = [
 ]
 
 
-@pytest.mark.parametrize("text,full,frag", PENDING_NAME_CHARS)
+@pytest.mark.parametrize("text,full,frag", FULL_NAME_CHARS)
 def test_r2_candidate_is_real_name_blocked_by_name_chars(
     text: str, full: str, frag: str
 ) -> None:
-    """R2 归并候选必须就是真名；端到端翻绿与否取决于 _NAME_CHARS（方案 S）。"""
+    """R2 归并候选必须就是真名；端到端翻绿与否取决于 `_NAME_CHARS`。"""
 
     m = next(_SPEAK_RE.finditer(text))
     g1 = m.group(1)
