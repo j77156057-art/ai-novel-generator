@@ -49,7 +49,10 @@ distiller:
   api_key: ""            # 空时按 provider 渠道名去 settings 拿对应 *_api_key
   base_url: ""           # 空时同上
   model: "glm-4-flash"
-  max_tokens: 2048       # 一次要输出较多维度特征，比诊断回答宽
+  # 一次要输出 11 个维度的规则 JSON 数组。2048 会让 JSON 被拦腰截断
+  # （智谱 finish_reason=length），截断的 JSON 解析失败 → 该块所有维度归零，
+  # 表现为 rejected 计数暴涨（雪中悍刀行 990 章实测 rejected=740，改 8192 后回落）。
+  max_tokens: 8192
   # 长任务：一次读几十段语料再压缩，60s 会频繁超时。
   # 180s 是「能跑完一整卷」的量级；配 :free 档仍嫌慢就再往上调。
   timeout: 180

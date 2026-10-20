@@ -179,7 +179,13 @@ class Settings(BaseSettings):
     distiller_api_key: str = _DISTILLER_DEFAULTS.get("api_key", "")
     distiller_base_url: str = _DISTILLER_DEFAULTS.get("base_url", "")
     distiller_model: str = _DISTILLER_DEFAULTS.get("model", "glm-4-flash")
-    distiller_max_tokens: int = int(_DISTILLER_DEFAULTS.get("max_tokens", 2048))
+    #: 蒸馏每次 LLM 调用的输出上限。
+    #:
+    #: 2026-10-19 从 2048 提到 8192。2048 会让叙事规则 JSON 被拦腰截断
+    #: （智谱 finish_reason=length），截断的 JSON 解析失败 → 该块所有维度归零，
+    #: 表现为 rejected 计数暴涨（雪中悍刀行 990 章实测 rejected=740）。
+    #: 蒸馏要一次输出 11 个维度的规则数组，8192 才够。
+    distiller_max_tokens: int = int(_DISTILLER_DEFAULTS.get("max_tokens", 8192))
     distiller_timeout: int = int(_DISTILLER_DEFAULTS.get("timeout", 180))
 
     def _legacy_channel_field(self, provider: str, field: str) -> str:

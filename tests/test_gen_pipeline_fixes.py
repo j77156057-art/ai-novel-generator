@@ -24,6 +24,8 @@ if _BACKEND not in sys.path:
 
 import pytest  # noqa: E402
 
+from _async_chat_stub import AsyncChatStub  # noqa: E402
+
 import app.llm as llm_mod  # noqa: E402
 import app.llm.provider as llm_provider_mod  # noqa: E402
 from app.db import Base, SessionLocal, engine  # noqa: E402
@@ -53,7 +55,7 @@ def db_session():
         s.close()
 
 
-class GenStubProvider:
+class GenStubProvider(AsyncChatStub):
     """蒸馏/生成两用的确定性假 provider（不真调 LLM）。
 
     chat 对 distill prompt 返回带维度键的合法 JSON（证据句在语料里），

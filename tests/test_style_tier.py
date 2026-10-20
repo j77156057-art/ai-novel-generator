@@ -35,6 +35,8 @@ if _BACKEND not in sys.path:
 
 import pytest  # noqa: E402
 
+from _async_chat_stub import AsyncChatStub  # noqa: E402
+
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.models import KgNode, NovelChunk, Project, RawNovel  # noqa: E402
 from app.style.narrative import (  # noqa: E402
@@ -69,7 +71,7 @@ def _clean_db():
     Base.metadata.drop_all(bind=engine)
 
 
-class CountingProvider:
+class CountingProvider(AsyncChatStub):
     """数调用次数的假 provider——绝不在测试里真调 LLM。
 
     返回的 JSON 带**合法维度键**但证据刻意不通过（原文里根本没有那句话），
@@ -139,13 +141,20 @@ def test_sampling_axis_really_differs(monkeypatch):
     # 保底线，不隔离的话会走「短篇全取」分支，测不到比例轴（曾因此误报 200/600）。
     import app.style.narrative as _narrative_mod
     monkeypatch.setattr(_narrative_mod, "MIN_SAMPLE_CHARS", 0)
-    """采样轴：第一档百分比 0.15，后两档固定 30 章。"""
+    """采样轴：第一档按百分比采样，后两档固定 30 章。
+
+    比例值本身**不在这里钉死**——它就是可调参数（2026-10-19 的 984f059 为了
+    角色覆盖不足把它从 0.15 提到 0.30）。钉死会让「调参」和「采样轴坏了」
+    这两种情况给出同一个红灯，分不清。这里断言的是**轴的结构**：
+    第一档 = 语料 × SAMPLE_RATIO 且随语料放大，后两档恒定 30 章。
+    """
     full = TIER_REGISTRY[TIER_FULL]
     balanced = TIER_REGISTRY[TIER_BALANCED]
     fast = TIER_REGISTRY[TIER_FAST]
 
     assert full.sampling_mode == "percentage"
-    assert full.sample_ratio == SAMPLE_RATIO == 0.15
+    assert full.sample_ratio == SAMPLE_RATIO
+    assert 0 < SAMPLE_RATIO < 1, f"SAMPLE_RATIO 越界：{SAMPLE_RATIO}"
     assert full.fixed_chapters is None
 
     for t in (balanced, fast):
@@ -159,12 +168,16 @@ def test_sampling_axis_really_differs(monkeypatch):
     n_balanced = len(sample_chapters_for_tier(chapters, balanced))
     n_fast = len(sample_chapters_for_tier(chapters, fast))
 
-    assert n_full == 30# 200 × 0.15
+    # 百分比档 = max(10, 语料 × SAMPLE_RATIO)；`max(10, …)` 是 _sample_chapters_v6
+    # 的下限保护，语料小到比例值不足 10 章时生效。
+    assert n_full == max(10, int(200 * SAMPLE_RATIO))
     assert n_balanced == 30
     assert n_fast == 30
-    # 章数在这里恰好相同（同为 30），但**方式**不同：把语料放大到 600 章才拉开
+    # 轴不同的本质：语料放大到 600 章，百分比档跟着涨，固定档一动不动
     chapters_big = [(i + 1, f"第{i + 1}章内容") for i in range(600)]
-    assert len(sample_chapters_for_tier(chapters_big, full)) == 90   # 600 × 15%
+    big_full = len(sample_chapters_for_tier(chapters_big, full))
+    assert big_full == max(10, int(600 * SAMPLE_RATIO))
+    assert big_full > n_full, "百分比档没随语料放大——采样轴失效"
     assert len(sample_chapters_for_tier(chapters_big, balanced)) == 30  # 固定 30
     assert len(sample_chapters_for_tier(chapters_big, fast)) == 30
 
@@ -364,8 +377,9 @@ def test_reduced_tiers_sample_fewer_chapters(monkeypatch):
     monkeypatch.setattr(_narrative_mod, "MIN_SAMPLE_CHARS", 0)
     """采样轴端到端：后两档的采样章数必须少于完整档。
 
-    用 600 章语料（600 × 15% = 90vs 固定 30）——200 章时恰好都是 30，
-    看不出差别，那不是「真的不同」。
+    用 600 章语料：完整档 = 600 × SAMPLE_RATIO，后两档固定 30。
+    比例值不钉死（它是可调参数，984f059 已把它从 0.15 提到 0.30），
+    这里钉的是**结构**：完整档严格多于固定档。
     """
     db = SessionLocal()
     try:
@@ -379,9 +393,10 @@ def test_reduced_tiers_sample_fewer_chapters(monkeypatch):
             )
             counts[key] = profile["n_chapters"]
 
-        assert counts[TIER_FULL] == 90, counts
+        assert counts[TIER_FULL] == max(10, int(600 * SAMPLE_RATIO)), counts
         assert counts[TIER_BALANCED] == 30, counts
         assert counts[TIER_FAST] == 30, counts
+        assert counts[TIER_FULL] > counts[TIER_BALANCED], counts
     finally:
         db.close()
 

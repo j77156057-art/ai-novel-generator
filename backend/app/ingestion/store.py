@@ -11,7 +11,7 @@ import json
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.corpus_health import scan_watermarks, strip_watermarks
+from app.corpus_health import scan_watermarks, strip_watermarks, strip_repeated_ads
 from app.db import IS_SQLITE
 from app.embeddings.provider import get_embedding_provider
 from app.ingestion.chunk import chunk_text
@@ -75,6 +75,24 @@ def ingest_text(
         text, cleaned_text, hits,
         rejected=scan["rejected"], thresholds=scan["thresholds"],
     )
+
+    # v2.245 第二步清洗：通用「重复段」广告识别。
+    # scan_watermarks 抓不到段首广告（final_ratio 判据 0% 全漏），
+    # 雪中悍刀行真链路 v2.238 因这些广告留下 rejected=1056 的废规则。
+    # 用更保守的 min_count=30（默认 15）—— 通用结构判据可能误伤 5-15 频次段的合法性。
+    # 报告合并到 clean_report，方便事后审计。
+    cleaned_text, ads_rep = strip_repeated_ads(cleaned_text, min_count=30)
+    if ads_rep["ads"]:
+        novel.clean_report = {
+            **(novel.clean_report or {}),
+            "repeated_ads": {
+                "removed_chars": ads_rep["removed"],
+                "templates": [
+                    {"text": ad["text"], "count": ad["count"]}
+                    for ad in ads_rep["ads"][:20]
+                ],
+            },
+        }
 
     if chapter_meta is not None:
         # 章元数据路径：body 已由上游解析，这里用**同一批**检出串清洗各章 body，

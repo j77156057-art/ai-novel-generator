@@ -2,7 +2,7 @@
 import sys
 sys.path.insert(0, ".")
 
-from app.style.narrative import MIN_SAMPLE_CHARS, _sample_chapters_v6
+from app.style.narrative import MIN_SAMPLE_CHARS, SAMPLE_RATIO, _sample_chapters_v6
 
 FAILS = []
 
@@ -35,24 +35,27 @@ check("刚好 30 万字全取", len(r), 100)
 check("空输入返回空", _sample_chapters_v6([]), [])
 
 # ── 长篇：全量超下限，采样须保底字数 ──
-# 600 章 × 3000 字 = 180 万字。15% = 90 章 = 27 万字 < 30 万下限
-# 应扩容到 100 章（30万/3000），而非 90 章
+# 600 章 × 3000 字 = 180 万字。SAMPLE_RATIO 采样后若 < 30 万下限，
+# 应扩容到 100 章（30万/3000），而非停在比例值。
 long_novel = mk_chapters(600, 3000)
 r = _sample_chapters_v6(long_novel)
 sampled_chars = sum(len(t) for _, t in r)
 print(f"\n长篇 600章/180万字: 采样 {len(r)} 章 / {sampled_chars} 字")
 check("长篇采样章节数 >= 字数下限所需", len(r) >= 100, True)
 check("长篇采样字数 >= 30万下限", sampled_chars >= MIN_SAMPLE_CHARS, True)
-# 不应超过按比例的目标太多（100 是下限所需，实际取 max(90,100)=100 附近）
+# 不应膨胀到全量
 check("长篇采样不膨胀到全量", len(r) < 600, True)
 
-# 章长大时长篇：600 章 × 5000 = 300 万字。15% = 90 章 = 45 万字 > 30 万
-# 比例目标即可，不被下限撑大
+# 章长大时长篇：600 章 × 5000 = 300 万字。比例采样目标 > 30 万下限，
+# 应恰好是 SAMPLE_RATIO × 600 章，不被下限撑大
+# 用 SAMPLE_RATIO 动态算期望值——改采样比例时这个断言自动跟随，不会失效
 long_big = mk_chapters(600, 5000)
 r = _sample_chapters_v6(long_big)
 sc = sum(len(t) for _, t in r)
-print(f"大章长篇 600章/300万字: 采样 {len(r)} 章 / {sc} 字")
-check("大章长篇按比例采样(90章)", len(r), 90)
+expected = int(600 * SAMPLE_RATIO)
+print(f"大章长篇 600章/300万字: 采样 {len(r)} 章 / {sc} 字 "
+      f"(SAMPLE_RATIO={SAMPLE_RATIO} → 期望 {expected} 章)")
+check(f"大章长篇按比例采样({expected}章)", len(r), expected)
 
 # 超长篇但每章极短：2000 章 × 500 字 = 100 万字。
 # 15% = 300 章 = 15 万字 < 30 万 → 扩容到 600 章（30万/500）

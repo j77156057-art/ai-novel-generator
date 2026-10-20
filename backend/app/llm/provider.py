@@ -17,6 +17,7 @@ ProviderRegistry 在此之上做 role→provider 路由 + 双锁并发安全 + �
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -99,6 +100,16 @@ def _backoff(attempt: int) -> float:
 class LLMProvider:
     def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
         raise NotImplementedError  # pragma: no cover - 接口
+
+    async def async_chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+        """v2.225+：异步包装同步 chat，用 loop.run_in_executor（避免 to_thread 跨 loop 问题）。
+
+        narrative.py 蒸馏多 chunk 并发时 gather 此方法。注意：单 provider 实例的
+        限流/锁/重试仍由 chat() 自己处理；并发只在不同请求间共享 default executor 池。
+        子类可重写为原生异步实现（如 OpenAIAsyncClient）。
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.chat, system, user, constraints)
 
     def summarize(self, text: str) -> str:
         """段级总结，默认截断；子类可覆盖为真实调用。"""

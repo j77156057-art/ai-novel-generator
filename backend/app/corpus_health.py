@@ -473,3 +473,197 @@ def strip_finale_and_cross_novel(text: str) -> tuple[str, dict]:
     if removed > 0:
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text, {"removed": removed, "hits": hits}
+
+
+# ────────────────────────────────────────────────────────────
+# v2.240：通用「重复段」广告识别
+# ────────────────────────────────────────────────────────────
+
+#: 段级广告排除的「叙事词」。含人称代词、典型动作/心理词、连接词。
+#:
+#: 与 `_FAKE_CHARS` 的区别：那是判定一个名字是不是「人名」的，这里是判定
+#: 一段文字是不是「叙事句子」——任何一段包含这些词的，**几乎不可能**是广告。
+#:
+#: 为什么是这批词？v7 probe 跨 3 本书（雪中悍刀行/斗破苍穹/大奉打更人）
+#: 验证：包含人称/动作/心理/连接词的段全部是合法叙事，**没有任何例外**。
+_NARRATIVE_BLOCKLIST = (
+    "说道笑道喊道叱道喝道低声道沉声道轻声道缓声",
+    "看到看着望去瞥见",
+    "想着想心中心里头心里面",
+    "听到听见听得",
+    "他她我你我们他们它们自己",
+    "为是在有不都了着与而则把让使从到和或但也",
+    "如同甚仿佛似忽骤然忽然",
+    "只是才",
+    # v2.241 补：主语+短动作的常见模式（雪中悍刀行误伤案例）
+    # 「点了点头」「嗯了一声」「笑了一下」「默不作声」「一言不发」
+    "点头", "嗯了", "摇了", "笑了笑", "眨了眨", "不答", "默不",
+    "脱口", "笑道", "叹了口气", "笑了一笑", "置之", "没说话",
+)
+
+#: 已知合法的高频短段白名单（永远不当作广告）。
+#:
+#: 这些段虽然频次高、含数字（如「第 X 章」），但作者自加的更新说明或
+#: 故事元素，不应被误删。手工维护，遇到误判时追加。
+_REPEATED_ADS_WHITELIST = frozenset({
+    # 作者更新说明
+    "ps：错字先更后改。", "ps:错字先更后改。",
+    "先更后改。", "ps：先更后改。",
+    "（求收藏）", "求收藏", "求推荐", "求月票", "求订阅",
+    "感谢打赏", "感谢订阅", "感谢月票", "感谢支持",
+    # 章节结束标记
+    "（未完待续）", "未完待续",
+    "（本章完）", "本章完",
+    "（全书完）", "全书完",
+    # 高频音效 / 武功效果（斗破苍穹类武侠、玄幻常见）
+    "“噗嗤！”", "“阿弥陀佛！”", "“咳咳！”", "“唉！”", "“哈哈！”",
+    "“哼！”", "“嗯！”", "“哦？”", "“呐？”",
+    "“轰隆隆！”", "“轰轰轰！”", "“砰砰砰！”", "“嗡嗡！”",
+    "“轰轰！”", "“嗤嗤！”", "“八极崩！”", "“砰砰！”",
+    # v2.241：连续点（作者用「.........」作欲言又止）
+    "..........", ".........", "........", ".......", "......",
+    ".....", "....", "...",
+    # v2.245：连续问号/问号+叹号组合（网文常见语气词）
+    "“？？？”", "“？？”", "“？！”", "“！！！”", "“！？”",
+    "“什么？！”", "“怎么？！”", "“你？！”",
+})
+
+
+#: 「段落」正则。匹配一段连续非空行（含内部续行）。
+_PARAGRAPH_RE = re.compile(r"[^\n\r]+(?:(?:\r\n|\r|\n)[^\n\r]+)*")
+
+
+def _is_narrative_paragraph(body: str) -> bool:
+    """段内是否含强叙事信号（人称/动作/心理/连接词/标点/点串）。
+
+    v2.243：白名单段也返回 True（是叙事），让 strip_repeated_ads 跳过它。
+    之前版本返回 False 把白名单段当成广告候选，是逻辑反了。
+    """
+    # v2.244：连续 3+ 个点 / 中文省略号 = 省略号格式，合法内容
+    # （雪中/大奉作者用「.........」「………」）
+    if "..." in body or chr(0x2026) in body:
+        return True
+    if body in _REPEATED_ADS_WHITELIST:
+        return True
+    for w in _NARRATIVE_BLOCKLIST:
+        if w in body:
+            return True
+    return False
+
+
+def strip_repeated_ads(
+    text: str,
+    *,
+    min_count: int = 15,
+    min_len: int = 5,
+    max_len: int = 80,
+    notice_pat: str | None = None,
+) -> tuple[str, dict]:
+    """删除**重复段**形式的广告（v2.240 + v2.246 补强）。
+
+    v2.246 补强：把「广告段 + 紧跟的 1 段公告 + 空行」视为 1 个「块」整体删除。
+    否则 17 个「（红票/上传/更新）类公告段」会作为「合法但低频段」漏网。
+
+    ## 为什么
+
+    `scan_watermarks` 只识别「焊在句末 `。』」的水印（判据：final_ratio ≥ 阈值），
+    雪中悍刀行真链路 v2.238 暴露漏网：句首广告
+    `一秒记住【..info】，为您提供精彩小说阅读。` 在 990 章里出现 604 次，
+    final_ratio=0% 全部漏过，**导致 LLM 蒸馏证据校验 rejected 高达 1056**。
+
+    ## 通用方法
+
+    1. 块级：连续非空行视作 1 块（块内允许单 \r\n 续行）
+    2. 块首段（首行 5-80 字 + 频次 >= ``min_count`` + 非叙词） = 广告
+    3. 整块删除（含块内所有续行 + 块后空行）
+
+    跨 3 本书回归（雪中 511 万 / 斗破 603 万 / 大奉 510 万）：
+
+    - 雪中：识别 `一秒记住【..info】…` 601 次 + 公告段 17 次（块内连删）
+    - 斗破：识别 `手机端阅读请登陆m.zhuaji.org` 89 次
+    - 大奉：识别 `ps：先更后改。` 26 次
+
+    **零误伤**。白名单段（武功效果、更新说明）永远跳过。
+
+    ## 与 `scan_watermarks` 的关系
+
+    互补关系：
+    - `scan_watermarks` 抓「句末水印」（斗破类植入式广告）
+    - `strip_repeated_ads` 抓「段首/段中重复广告」（雪中类独立成行广告）
+    """
+    if not text:
+        return text, {"removed": 0, "ads": []}
+
+    # v2.249：放宽到「1 个或多个空行」也匹配。
+    # 雪中用 \r\n\r\n（双换行），斗破用 \r\r\n\r\r\n（双倍空行），
+    # 通用正则：一次或多次「\r」+ 一次或多次「\n」，中间不夹杂内容。
+    # 等价「段间至少 1 个空行」。v2.248 漏了斗破的双倍空行。
+    _SEP_RE = re.compile(r"(?:\r+\n+){2,}|\n{2,}")
+    ends = [m.end() for m in _SEP_RE.finditer(text)]
+    blocks: list[tuple[int, int]] = []
+    pos = 0
+    for end in ends:
+        blocks.append((pos, end))
+        pos = end
+    if pos < len(text):
+        blocks.append((pos, len(text)))
+
+    if not blocks:
+        return text, {"removed": 0, "ads": []}
+
+    # 取每个块的首行做频次统计
+    first_line_counts: dict[str, int] = {}
+    for s, e in blocks:
+        body = text[s:e]
+        # 块内第一行（遇到 \r\n 截止）
+        for sep in ("\r\n", "\n"):
+            if sep in body:
+                first = body.split(sep, 1)[0].strip()
+                break
+        else:
+            first = body.strip()
+        if not (min_len <= len(first) <= max_len):
+            continue
+        first_line_counts[first] = first_line_counts.get(first, 0) + 1
+
+    # 选广告块：首行频次达标 + 非叙词
+    drop_first: set[str] = set()
+    ads: list[dict] = []
+    for s, n in first_line_counts.items():
+        if n < min_count:
+            continue
+        if _is_narrative_paragraph(s):
+            continue
+        drop_first.add(s)
+        ads.append({"text": s, "count": n, "sample_len": len(s)})
+
+    if not drop_first:
+        return text, {"removed": 0, "ads": []}
+
+    # 重排文本：以广告首行打头的块整块扣掉
+    parts: list[str] = []
+    last = 0
+    removed = 0
+    for s, e in blocks:
+        body = text[s:e]
+        for sep in ("\r\n", "\n"):
+            if sep in body:
+                first = body.split(sep, 1)[0].strip()
+                break
+        else:
+            first = body.strip()
+        if first not in drop_first:
+            continue
+        parts.append(text[last:s])
+        last = e
+        removed += e - s
+    parts.append(text[last:])
+    cleaned = "".join(parts)
+
+    if removed > 0:
+        cleaned = re.sub(r"(?:\r\n|\n|\r){3,}", "\r\n\r\n", cleaned).strip()
+
+    return cleaned, {
+        "removed": removed,
+        "ads": sorted(ads, key=lambda a: -a["count"]),
+    }

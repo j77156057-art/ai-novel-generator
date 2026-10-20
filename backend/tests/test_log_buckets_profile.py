@@ -194,10 +194,22 @@ def test_d_style_distance_uses_bucket():
     dist = style_distance(text_6000, profile)
     check("D1: distance 返回 bucket 字段", "bucket" in dist)
     check("D2: 6000 字选 long bucket (2.0x)", dist.get("bucket") == "long")
-    # 关键断言：percentile < 100（vs v2.10 智谱段 1 100% 触发）
+    # v2.231 契约变更：留出单元 < _MIN_HOLDOUT_FOR_PERCENTILE 时 percentile 报 None
+    # （分位被粗化到无意义——9 个样本每档 11.1%，超过最大值即 100%）。
+    # 因此这里接受两种合法结果：
+    #   (a) 留出充足 → percentile 有值且 < 100（原意：不是"必触发"）
+    #   (b) 留出不足 → percentile is None（诚实报告不可用，由调用方走绝对 z 兜底）
+    # 拒绝的只有"留出充足却仍 100%"这一种。
     pct = dist.get("percentile")
-    check("D3: 6000 字段 percentile < 100 (vs 旧版 100% 触发)", pct is not None and pct < 100,
-          detail=f"pct={pct}")
+    n_hold = (profile.get("buckets", {}).get("long", {}).get("n_holdout")
+              if profile.get("buckets") else profile.get("n_holdout"))
+    from app.style.stylometry import _MIN_HOLDOUT_FOR_PERCENTILE
+    if n_hold is not None and n_hold < _MIN_HOLDOUT_FOR_PERCENTILE:
+        check("D3: 6000 字 percentile（留出不足→None，诚实报告）",
+              pct is None, detail=f"n_holdout={n_hold}, pct={pct}")
+    else:
+        check("D3: 6000 字 percentile < 100", pct is not None and pct < 100,
+              detail=f"n_holdout={n_hold}, pct={pct}")
     # scale_ratio 应有
     check("D4: distance 返回 scale_ratio", "scale_ratio" in dist)
 

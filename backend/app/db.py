@@ -225,6 +225,24 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("kg_mentions", "ix_kg_mention_project_segment", "project_id, segment_no", "切片核心：按段号取最近 N 段"),
         ("kg_mentions", "ix_kg_mention_project_entity", "project_id, entity_id", "mention_count 聚合"),
     ]
+    # v3.0 KG 索引定义（ensure_schema 同步建，_migrate_sqlite_columns 老库补建）
+    v30_indexes = [
+        # (table, idx_name, cols_sql, note)
+        ("kg_entities", "ix_kg_entity_project_kind", "project_id, kind", "切片/批抽扫描 + 归一"),
+        ("kg_entities", "ix_kg_entity_project_canonical", "project_id, canonical_name", "归一 by canonical_name"),
+        ("kg_relations", "ix_kg_relation_project", "project_id", "切片扫关系"),
+        ("kg_relation_evolution", "ix_kg_relation_evolution_edge", "edge_id", "关系曲线展开"),
+        ("kg_events", "ix_kg_event_project_sequence", "project_id, sequence", "切片取最近 N 段 + 批抽 max(sequence)"),
+        ("kg_events", "ix_kg_event_project_segment", "project_id, segment_no", "按段号反查事件"),
+        ("kg_event_links", "ix_kg_event_link_from", "from_event_id", "因果链正向"),
+        ("kg_event_links", "ix_kg_event_link_to", "to_event_id", "因果链反向"),
+        ("kg_character_state", "ix_kg_char_state_project_char", "project_id, character_id", "按角色取最新状态"),
+        ("kg_character_state", "ix_kg_char_state_project_segment", "project_id, segment_no", "按段号查状态"),
+        ("kg_foreshadows", "ix_kg_foreshadow_project_status", "project_id, status", "active 过滤 + Judge 超期"),
+        ("kg_entity_knowledge", "ix_kg_entity_knowledge_project_entity", "project_id, entity_id", "Judge 预知 + 切片 known_facts"),
+        ("kg_mentions", "ix_kg_mention_project_segment", "project_id, segment_no", "切片核心：按段号取最近 N 段"),
+        ("kg_mentions", "ix_kg_mention_project_entity", "project_id, entity_id", "mention_count 聚合"),
+    ]
     eng = target_engine if target_engine is not None else engine
     with eng.begin() as conn:
         for table, col, coltype in migrations:

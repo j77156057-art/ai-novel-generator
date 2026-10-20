@@ -39,11 +39,25 @@ import re
 import statistics
 from typing import Iterable, Sequence
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # --------------------------------------------------------------------------- #
 # 常量
 # --------------------------------------------------------------------------- #
 
 PROFILE_VERSION = 2
+
+#: percentile 计算要求的最小留出单元数。
+#:
+#: 分位是「在留出分布中的位置」，样本太少时这个位置没有意义：
+#: - n 个样本只能给出 100/n 的档位（9 个 → 每档 11.1%）
+#: - 任何超过最大值的新文本直接得 100%，无论超多少
+#: 实测（豆棚闲话 11.2 万字 → 9 个留出单元）：同源文本 10/20 被判 percentile=100。
+#: 提到 20 是为了让分位分辨率至少到 5%，且最大值有足够样本支撑。
+#: 不足时 percentile 报 None，由调用方退回绝对阈值。
+_MIN_HOLDOUT_FOR_PERCENTILE = 20
 
 #: 句子终结符（含中文全角）。省略号按整串处理，避免「……」被算成 2 个句子。
 SENT_END = "。！？!?…"
@@ -527,9 +541,18 @@ def style_distance(text: str, profile: dict) -> dict:
     # `unit_mean_abs_z` 是 `holdout` 的平级字段（见 `fit_profile`），不在 `mean_abs_z` 里面
     dist = holdout.get("unit_mean_abs_z") or []
     percentile: float | None = None
-    if dist:
+    if len(dist) >= _MIN_HOLDOUT_FOR_PERCENTILE:
         below = sum(1 for d in dist if d <= total)
         percentile = 100.0 * below / len(dist)
+    elif dist:
+        # 留出单元太少（< _MIN_HOLDOUT_FOR_PERCENTILE）：分位被粗化到几乎没有分辨率。
+        # 9 个样本只能给 0/11.1/22.2/…/100 这些档，且「超过最大留出值」直接跳到 100%
+        # ——实测豆棚闲话 9 个留出单元时，同源文本 10/20 被判 percentile=100。
+        # 这时报分位是在骗人：不报（None），由调用方退回绝对阈值判断。
+        logger.debug(
+            "holdout 样本不足（%d < %d），percentile 置 None",
+            len(dist), _MIN_HOLDOUT_FOR_PERCENTILE,
+        )
 
     unit_chars = int(bucket.get("unit_chars") or 0)
     return {

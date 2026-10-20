@@ -25,6 +25,7 @@ if _BACKEND not in sys.path:
 
 import pytest  # noqa: E402
 
+from _async_chat_stub import AsyncChatStub  # noqa: E402
 import app.llm.provider as llm_provider_mod  # noqa: E402
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.models import DistillRun, NovelChunk, Project, RawNovel  # noqa: E402
@@ -58,7 +59,7 @@ def db_session():
         s.close()
 
 
-class StubProvider:
+class StubProvider(AsyncChatStub):
     """确定性假 provider：返回一条证据能通过的「人物描写手法」规则。"""
 
     EVIDENCE = "医院里她抬起头"
@@ -67,14 +68,14 @@ class StubProvider:
         return '{"人物描写手法": ["出场先写环境再写人（证据：' + self.EVIDENCE + '）"]}'
 
 
-class BoomProvider:
+class BoomProvider(AsyncChatStub):
     """每次调用都炸——模拟 key 无效 / 限流 / 网络不通。"""
 
     def chat(self, system: str, user: str, **kwargs) -> str:
         raise RuntimeError("模型服务不可用（测试注入）")
 
 
-class FirstOkThenBoomProvider:
+class FirstOkThenBoomProvider(AsyncChatStub):
     """第一次调用返回合法 JSON，之后全炸——模拟「部分块失败」。"""
 
     def __init__(self) -> None:
@@ -227,7 +228,7 @@ def test_all_chunks_unparseable_also_raises(db_session):
     nid = _make_corpus(db_session)
     proj = _make_project(db_session, nid, tier=TIER_FAST)
 
-    class GarbageProvider:
+    class GarbageProvider(AsyncChatStub):
         def chat(self, system: str, user: str, **kwargs) -> str:
             return "我不是 JSON，我是兜底文案"
 

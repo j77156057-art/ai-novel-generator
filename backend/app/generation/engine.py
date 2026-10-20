@@ -304,6 +304,23 @@ def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -
     except Exception as exc:  # noqa: BLE001
         stats["judge"] = {"error": str(exc)[:100], "findings": []}
 
+    # v3.0 独立 Judge Agent：只读 v3.0 KG 表，覆盖哨兵没做的瞬移/预知/秘密外泄/
+    # 时间穿越/伏笔超期/语言一致性。与哨兵并列（都只标红不改正文），失败同样不阻断。
+    try:
+        from app.kg.judge import judge_segment, save_judge_findings
+
+        judge_res = judge_segment(db, project_id, text, segment_no)
+        # findings 必须落库（与哨兵同纪律）：只放单次响应里的告警，用户没盯着
+        # 就永远丢了，事后无法复核。落库失败不阻断生成。
+        try:
+            save_judge_findings(db, project_id, judge_res.get("findings", []),
+                                segment_no=segment_no)
+        except Exception:  # noqa: BLE001
+            pass
+        stats["judge"] = judge_res
+    except Exception as exc:  # noqa: BLE001
+        stats["judge"] = {"error": str(exc)[:100], "findings": []}
+
     return stats
 
 
@@ -611,6 +628,18 @@ def _style_profile(db, project: Project) -> dict | None:
 #: 真要回到 97.5 阈值，需参考 50+ 章 30 万字让 long bucket 留出 20+ 单元
 #: —— 留出分布 max 自然扩大。详见 docs/style_log_buckets_design.md 风险评估节。
 STYLE_WARN_PERCENTILE = 99.5
+
+#: 留出样本不足时的绝对距离阈值（v2.231）。
+#:
+#: `style_distance` 在留出单元 < 20 时报 percentile=None（分位被粗化到无意义）。
+#: 此时改用 mean_abs_z 绝对值判定，否则等于把告警关掉——AI 腔文本也会放过。
+#:
+#: 阈值 3.0 的依据（豆棚闲话 11.2 万字 / 9 个留出单元的实测分离度）：
+#: - 同源 37 个片段：min 0.467 / p50 0.719 / p90 0.865 / max 1.087
+#: - AI 腔样本：等长段+升华 6.05 / 短句刷屏 12.07 / 情绪直陈 14.33 / 比喻+感叹号 36.91
+#: 两者相差 5.6 倍，3.0 取在同源 max 的 2.8 倍处——留足正常波动余量，
+#: 同时能抓住最弱的一类 AI 腔（等长段+升华 6.05）。
+STYLE_WARN_ABS_Z = 3.0
 #: 每 N 段自动异步触发 audit_kg（防主链 LLM 拖慢，fire-and-forget 模式）
 AUTO_AUDIT_INTERVAL = 10
 
@@ -964,6 +993,20 @@ def _style_warning(text: str, profile: dict | None) -> dict | None:
 
     告警只提示不阻断——自动重写会触发额外 LLM 调用，且改出来的未必更好。
     无档案时静默跳过（档案是增强，不是生成的前提）。
+
+    ## 两条判定路径（v2.231）
+
+    **主路径 percentile**：留出单元足够（≥20）时，分位是可判读的结论。
+
+    **兜底路径绝对 z**：留出单元不足时 `style_distance` 报 percentile=None
+    （分位被粗化，9 个样本只能给每档 11.1%，且超过最大值即 100%）。
+    此时若不判定就等于关掉了告警功能——AI 腔文本也放过去。改用绝对阈值：
+
+    实测（豆棚闲话 11.2 万字，9 个留出单元）：
+    - 同源 37 个片段 mean_abs_z: min 0.467 / p50 0.719 / max **1.087**
+    - AI 腔样本：等长段+升华 6.05 / 短句刷屏 12.07 / 情绪直陈 14.33 /
+      比喻+感叹号 36.91
+    分离度 5.6 倍，阈值取 3.0（同源 max 的 2.8 倍，最弱 AI 腔的 0.5 倍）。
     """
     if not profile or not text:
         return None
@@ -973,15 +1016,27 @@ def _style_warning(text: str, profile: dict | None) -> dict | None:
     except Exception:  # noqa: BLE001 —— 距离计算失败绝不能阻断生成主流程
         return None
     pct = d.get("percentile")
-    if pct is None or pct < STYLE_WARN_PERCENTILE:
-        return None
+    z = d.get("mean_abs_z")
+
+    if pct is not None:
+        if pct < STYLE_WARN_PERCENTILE:
+            return None
+        reason = f"percentile {pct}，高于阈值 {STYLE_WARN_PERCENTILE}"
+        pct_for_payload = pct
+    else:
+        # 兜底：留出样本不足，分位不可用 → 绝对距离判
+        if z is None or z < STYLE_WARN_ABS_Z:
+            return None
+        reason = f"mean_abs_z {z}，高于绝对阈值 {STYLE_WARN_ABS_Z}（留出样本不足，分位不可用）"
+        pct_for_payload = None
+
     return {
-        "percentile": pct,
-        "mean_abs_z": d.get("mean_abs_z"),
+        "percentile": pct_for_payload,
+        "mean_abs_z": z,
         "worst": d.get("worst", []),
         "holdout_ref": d.get("holdout_ref"),
         "message": (
-            f"本段文风偏离档案（percentile {pct}，高于阈值 {STYLE_WARN_PERCENTILE}）。"
+            f"本段文风偏离档案（{reason}）。"
             f"最偏的特征：{'、'.join(k for k, _ in (d.get('worst') or [])[:3]) or '未知'}。"
             "建议重写或手动调整。"
         ),

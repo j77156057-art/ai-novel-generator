@@ -24,6 +24,8 @@ if _BACKEND not in sys.path:
     sys.path.insert(0, _BACKEND)
 
 import pytest  # noqa: E402
+
+from _async_chat_stub import AsyncChatStub  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 import app.llm as llm_mod  # noqa: E402
@@ -53,7 +55,7 @@ _REWRITTEN = (
 _EVIDENCE_SNIPPET = "陆见微倒在雪地里，胸口那道伤口已经不再流血，手指僵在半空。"
 
 
-class DistillStubProvider:
+class DistillStubProvider(AsyncChatStub):
     """蒸馏用的假 provider：返回带维度键的合法 JSON。
 
     与 Writer 分开是必须的——蒸馏要 JSON、生成要正文，共用一个 stub 会让
@@ -70,7 +72,7 @@ class DistillStubProvider:
         yield "蒸馏正文"
 
 
-class SelfcheckStubProvider:
+class SelfcheckStubProvider(AsyncChatStub):
     """Writer 用的假 provider：第 1 次 chat 返回带 AI 腔的正文（触发重写），
     第 2 次起返回改写后的正文；记录每次 chat 收到的 (system, user)。
 

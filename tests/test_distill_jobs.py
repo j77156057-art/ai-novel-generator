@@ -39,6 +39,8 @@ if _BACKEND not in sys.path:
 
 import pytest  # noqa: E402
 
+from _async_chat_stub import AsyncChatStub  # noqa: E402
+
 import app.llm.provider as llm_provider_mod  # noqa: E402
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.models import DistillRun, NovelChunk, Project, RawNovel  # noqa: E402
@@ -77,7 +79,7 @@ def db_session():
         s.close()
 
 
-class StubProvider:
+class StubProvider(AsyncChatStub):
     """确定性假 provider：返回一条**证据能通过**的「人物描写手法」规则。
 
     证据句子必须真的出现在语料里（否则被 `_validate_evidence` 拦掉变成 rejected），
@@ -97,7 +99,7 @@ class StubProvider:
         return '{"人物描写手法": ["出场先写环境再写人（证据：' + self.EVIDENCE + '）"]}'
 
 
-class BoomProvider:
+class BoomProvider(AsyncChatStub):
     """每次调用都炸的 provider：用来验证失败不是静默的。"""
 
     def chat(self, system: str, user: str, **kwargs) -> str:
@@ -545,7 +547,7 @@ def test_stub_llm_isolates_distiller_role_not_just_writer(db_session, stub_llm):
 # ====================================================================
 
 
-class MarkerProvider:
+class MarkerProvider(AsyncChatStub):
     """带标记的假 provider——用来断言「到底调的是哪一个」。
 
     不真打 LLM，只记 `MARK` 便于断言。`chat` 返回一条**合法且证据能过**的
