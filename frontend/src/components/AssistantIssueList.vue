@@ -181,24 +181,15 @@ const issuesBySeverity = computed(() => {
   font-weight: 700;
   font-size: var(--fs-xs);
 }
+/* .link-btn 基础观感已提到全局 style/base.css，这里只保留本组件需要的对齐修正
+   （本组件的 link-btn 都挂在 flex 列里，需要顶对齐）。 */
 .link-btn {
-  font: inherit;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  border: none;
-  background: none;
-  color: var(--accent-ink);
-  cursor: pointer;
-  padding: 2px 6px;
   align-self: flex-start;
-}
-.link-btn:hover {
-  text-decoration: underline;
 }
 .ev-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--gap-md);
 }
 .ev {
   display: flex;
@@ -231,12 +222,12 @@ const issuesBySeverity = computed(() => {
 .sev-group {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--gap-md);
 }
 .sev-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .issue {
   display: flex;

@@ -119,7 +119,7 @@ function goCreate() {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--gap-md);
   padding: 18px 20px;
   margin-bottom: var(--gap-lg);
   border: 2px dashed var(--border-strong);
@@ -150,7 +150,7 @@ function goCreate() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--gap-md);
   padding: 12px 14px;
   border: var(--border-w) solid var(--border);
   border-radius: var(--radius-md);
@@ -162,6 +162,6 @@ function goCreate() {
 .row.tight {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 </style>

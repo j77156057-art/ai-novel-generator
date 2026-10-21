@@ -161,7 +161,7 @@ const summary = computed(() => {
   background: var(--bg-sunken);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .distill.is-active {
   border-color: var(--accent-line);
@@ -174,7 +174,7 @@ const summary = computed(() => {
 .distill-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
   flex-wrap: wrap;
 }
 .distill-title {
@@ -237,7 +237,7 @@ const summary = computed(() => {
 .distill-foot {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
   flex-wrap: wrap;
   font-size: var(--fs-xs);
 }

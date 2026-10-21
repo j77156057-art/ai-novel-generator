@@ -481,7 +481,7 @@ function submitTest(): void {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
   padding: 10px 12px;
   border-radius: var(--radius-md);
   background: var(--bg-sunken);
@@ -512,7 +512,7 @@ function submitTest(): void {
   cursor: pointer;
   color: var(--accent-ink);
   font-weight: 600;
-  margin-bottom: 8px;
+  margin-bottom: var(--gap-sm);
 }
 .advanced summary:hover {
   color: var(--accent);
@@ -535,33 +535,11 @@ function submitTest(): void {
 .role-actions {
   margin-top: 2px;
 }
-/*  chips / chip 在本组件内自含（scoped 样式不跨组件，全局 base.css 也没有） */
+/* .chips 容器本组件自含；.chip 本身已提到全局 style/base.css
+   （此前本组件与 ProjectWorkspace 各存了一份逐字相同的副本）。 */
 .chips {
   display: flex;
-  gap: 8px;
+  gap: var(--gap-sm);
   flex-wrap: wrap;
-}
-.chip {
-  font: inherit;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  padding: 8px 14px;
-  border-radius: var(--radius-full);
-  border: var(--border-w) solid var(--border-strong);
-  background: var(--bg);
-  color: var(--fg);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.chip:hover {
-  border-color: var(--accent);
-  color: var(--accent-ink);
-}
-.chip.on {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-fg);
 }
 </style>

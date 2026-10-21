@@ -56,6 +56,6 @@ onMounted(async () => {
   font-size: var(--fs-sm);
 }
 .hint.error {
-  color: var(--fg-danger, #d9534f);
+  color: var(--danger, #d9534f);
 }
 </style>

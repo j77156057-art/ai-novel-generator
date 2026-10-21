@@ -2380,7 +2380,7 @@ onUnmounted(stopDistillPolling);
         已生成段落 <span class="hint">{{ generations.length }} 段</span>
       </div>
 
-      <div class="row" style="margin-bottom: 12px; flex-wrap: wrap; align-items: center">
+      <div class="row" style="margin-bottom: var(--gap-md); flex-wrap: wrap; align-items: center">
         <span class="faint" style="font-size: var(--fs-xs)">每页</span>
         <select class="input sm" v-model.number="pageSize" @change="page = 1">
           <option :value="5">5</option>
@@ -2491,7 +2491,7 @@ onUnmounted(stopDistillPolling);
 .page-head .title-block {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--gap-md);
   flex-wrap: wrap;
 }
 .model-badge {
@@ -2514,24 +2514,13 @@ onUnmounted(stopDistillPolling);
   color: var(--accent-ink);
   text-decoration: underline dotted;
 }
-.link-btn {
-  font: inherit;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  border: none;
-  background: none;
-  color: var(--accent-ink);
-  cursor: pointer;
-  padding: 2px 6px;
-}
-.link-btn:hover {
-  text-decoration: underline;
-}
+/* .link-btn 统一走全局 style/base.css（本文件原先那份副本已删除）。
+   「重命名」按钮挂在 .title-block（align-items:center）里，不需要 align-self 修正。 */
 /* 强制重蒸馏勾选项：与 .row 同高、可点击、文字不换行 */
 .checkbox {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
   font-size: var(--fs-sm);
   cursor: pointer;
   user-select: none;
@@ -2660,64 +2649,42 @@ onUnmounted(stopDistillPolling);
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .lib-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--gap-md);
   flex-wrap: wrap;
   padding: 10px 12px;
   border: var(--border-w) solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-md);
   background: var(--bg);
 }
 .lib-meta {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
   flex-wrap: wrap;
   font-size: var(--fs-sm);
 }
 .lib-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--gap-sm);
   flex-shrink: 0;
 }
-/* 复用 distill 的小号按钮观感，避免再定义一套 .btn.sm 样式 */
-.btn.sm {
-  padding: 6px 12px;
-  font-size: var(--fs-sm);
-}
+/* 小号按钮只有一份定义：本文件末段的 .btn.sm（font-size:var(--fs-xs); padding:5px 10px）。
+   此前这里还有一份 padding:6px 12px / font-size:var(--fs-sm) 的同名规则，
+   被末段那份按源码顺序覆盖、永远不生效，已删除避免误读。 */
 .chips {
   display: flex;
-  gap: 8px;
+  gap: var(--gap-sm);
   flex-wrap: wrap;
 }
-.chip {
-  font: inherit;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  padding: 8px 14px;
-  border-radius: var(--radius-full);
-  border: var(--border-w) solid var(--border-strong);
-  background: var(--bg);
-  color: var(--fg);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.chip:hover {
-  border-color: var(--accent);
-  color: var(--accent-ink);
-}
-.chip.on {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-fg);
-}
+/* .chip / .chip:hover / .chip.on 统一走全局 style/base.css
+   （本文件原先那份与 RoleModelPanel 逐字相同的副本已删除）。
+   .chips 容器仍在本文件自含——各视图对它没有分歧，暂不上提。 */
 /* ---------- 蒸馏档位选择 ---------- */
 /* 卡片式而非 chip 式：三档要并排比较的是「什么时候用」和「要等多久」，
    一行 pill 装不下这些说明文字。 */
@@ -2814,7 +2781,7 @@ onUnmounted(stopDistillPolling);
   margin-top: 14px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--gap-md);
 }
 .qa {
   display: flex;
@@ -2835,12 +2802,15 @@ onUnmounted(stopDistillPolling);
 .bible-row {
   display: grid;
   grid-template-columns: 64px 1fr;
-  gap: 12px;
+  gap: var(--gap-md);
   align-items: start;
 }
 .bible-row .k {
   font-size: var(--fs-xs);
   color: var(--fg-faint);
+  font-weight: 700;
+  padding-top: 2px;
+}
 
 /* ===== plot_bible 编辑模态 + 冲突 toast（kg-cascade-protocol）===== */
 .bible-modal-mask {
@@ -2889,9 +2859,6 @@ onUnmounted(stopDistillPolling);
   overflow: auto;
   box-shadow: var(--shadow-md);
 }
-  font-weight: 700;
-  padding-top: 2px;
-}
 .bible-row .v {
   display: flex;
   flex-wrap: wrap;
@@ -2901,7 +2868,7 @@ onUnmounted(stopDistillPolling);
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding-top: 8px;
+  padding-top: var(--gap-sm);
 }
 .live-box {
   /* 阅读区默认给足高度（随视口自适应），长文不再被 360px 小框憋住 */
@@ -3026,7 +2993,7 @@ onUnmounted(stopDistillPolling);
   border-top: var(--border-w) solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--gap-md);
 }
 .prior-body > .notice {
   margin: 0;
@@ -3036,7 +3003,7 @@ onUnmounted(stopDistillPolling);
 .bar-wrap {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .bar {
   display: flex;
@@ -3140,18 +3107,18 @@ onUnmounted(stopDistillPolling);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .proof {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
   padding-top: 4px;
 }
 .proof-line {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .blk-head {
   color: var(--fg-faint);
@@ -3161,7 +3128,7 @@ onUnmounted(stopDistillPolling);
 .style-block {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
   padding-top: 4px;
 }
 .style-sample {
@@ -3194,7 +3161,7 @@ onUnmounted(stopDistillPolling);
    它们在 --warn-soft、--info-soft 这种浅底上达不到 AA 对比度。 */
 .quality-list {
   margin-top: var(--gap);
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .quality-item {
   display: flex;

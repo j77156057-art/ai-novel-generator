@@ -179,7 +179,7 @@ a {
   align-items: flex-end;
 }
 .row.tight {
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .grid-2 {
   display: grid;
@@ -287,6 +287,26 @@ textarea.input {
   font-family: var(--font-sans);
 }
 
+/* 文字型按钮：去掉 .btn 的边框/底色，看起来就是个链接，但仍是 button 语义。
+   全局共享——此前 AssistantIssueList / AssistantWorkspace / ProjectWorkspace
+   各存了一份逐字相同的副本。
+   注意：这里**不设** align-self。放在 align-items:center 的容器里（例如
+   ProjectWorkspace 的 .title-block）时，强加 flex-start 会把按钮顶到上边造成
+   视觉偏移；需要顶/左对齐的调用方自己在 scoped 里补 align-self: flex-start。 */
+.link-btn {
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  border: none;
+  background: none;
+  color: var(--accent-ink);
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.link-btn:hover {
+  text-decoration: underline;
+}
+
 /* ---------- 标签 / 徽标 ---------- */
 .tag {
   display: inline-flex;
@@ -324,6 +344,33 @@ textarea.input {
   background: var(--danger-soft);
   color: var(--danger);
   border-color: transparent;
+}
+
+/* 可点击的胶囊选择器（.on = 选中态）。
+   全局共享——此前 RoleModelPanel / ProjectWorkspace 各存了一份逐字相同的副本。
+   KgWorkspace 的 bucket chip 原本只写了 class 没有样式来源，一并落到同一观感。 */
+.chip {
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  padding: 8px 14px;
+  border-radius: var(--radius-full);
+  border: var(--border-w) solid var(--border-strong);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chip:hover {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+.chip.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
 }
 
 /* ---------- 表格 / 列表 ---------- */

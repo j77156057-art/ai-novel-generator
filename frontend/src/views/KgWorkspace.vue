@@ -576,54 +576,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
               <div style="flex: 1">{{ f.name }}</div>
               <span class="tag warn">{{ f.status }}</span>
               <span class="faint mono" style="font-size: var(--fs-xs)">
-                埋@{{ f.planted_chapter ?? "?" }}<template v-if="f.planned_payoff_chapter"> → 计划{{ f.planned_payoff_chapter }}
-
-  <!-- ============ Tab 7：Style 审计（v2.1 + v2.19 bucket chip + v2.20 max_tokens） ============ -->
-  <section v-if="(activeTab as string) === 'style'" class="card">
-    <h2>文风告警（v2.1）</h2>
-    <p style="color: var(--muted-foreground); font-size: 0.9em">
-      percentile ≥ 99.5（留出集分位）触发告警（v2.15 从 97.5 提到 99.5——
-      bucket 留出样本数少是工程边界，100% 触发常态化不构成真异常）。
-      段 1 mean_abs_z ≈ 1.27 与 medium bucket 留出 max 几乎齐平——
-      percentile = UI 标尺，bucket chip + scale + 字数更直观。
-    </p>
-    <div v-if="styleLoading" class="empty">加载中…</div>
-    <div v-else-if="styleErr" class="empty error">{{ styleErr }}</div>
-    <div v-else-if="styleWarnings.length === 0" class="empty">
-      暂无告警——所有生成段 percentile 都在 99.5 分位以内。
-    </div>
-    <div v-else>
-      <div style="display: flex; gap: 16px; margin: 8px 0 16px; font-size: 0.9em">
-        <span><b>{{ styleTotal }}</b> 条告警</span>
-        <span v-if="styleTruncated" style="color: #b00">已截断（&gt;500 保留最新 500）</span>
-      </div>
-      <table class="prior-table">
-        <thead>
-          <tr><th>段号</th><th>时间</th><th>percentile</th><th>mean_abs_z</th><th>bucket</th><th>scale</th><th>字数</th><th>最偏特征</th><th>消息</th></tr>
-        </thead>
-        <tbody>
-          <tr v-for="w in styleWarnings" :key="w.segment_no + '_' + w.generated_at">
-            <td>{{ w.segment_no }}</td>
-            <td style="font-family: monospace; font-size: 0.85em">{{ w.generated_at }}</td>
-            <td>{{ fmtPct(w.percentile) }}</td>
-            <td>{{ w.mean_abs_z?.toFixed(2) ?? "—" }}</td>
-            <td>
-              <span v-if="w.bucket" class="chip"
-                    :style="bucketChipStyle(w.bucket)">{{ w.bucket }}</span>
-              <span v-else>—</span>
-            </td>
-            <td>{{ w.scale_ratio != null ? w.scale_ratio + 'x' : '—' }}</td>
-            <td>{{ w.chars ?? '—' }}</td>
-            <td>
-              <span v-for="f in w.worst_features" :key="f" class="chip" style="margin-right: 4px">{{ f }}</span>
-            </td>
-            <td style="font-size: 0.85em">{{ w.warn_message ?? "—" }}</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
-</template>
+                埋@{{ f.planted_chapter ?? "?" }}<template v-if="f.planned_payoff_chapter"> → 计划{{ f.planned_payoff_chapter }}</template>
               </span>
             </div>
             <div v-if="!slice.active_foreshadows.length" class="empty">无未回收伏笔</div>
@@ -703,7 +656,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
             </div>
             <div v-if="!charKnows.length" class="empty">该角色暂无情报记录</div>
           </div>
-          <button class="btn ghost" style="margin-top: 12px; font-size: var(--fs-xs)" @click="knowCharacter = selectedChar.name; knowFact = charKnows[0] ?? ''">
+          <button class="btn ghost" style="margin-top: var(--gap-md); font-size: var(--fs-xs)" @click="knowCharacter = selectedChar.name; knowFact = charKnows[0] ?? ''">
             带入下方查询
           </button>
         </template>
@@ -1024,6 +977,52 @@ function bucketChipStyle(bucket: string): Record<string, string> {
         </div>
       </div>
     </template>
+  </section>
+
+  <!-- ============ Tab 7：Style 审计（v2.1 + v2.19 bucket chip + v2.20 max_tokens） ============ -->
+  <section v-if="(activeTab as string) === 'style'" class="card">
+    <h2>文风告警（v2.1）</h2>
+    <p style="color: var(--fg-muted); font-size: 0.9em">
+      percentile ≥ 99.5（留出集分位）触发告警（v2.15 从 97.5 提到 99.5——
+      bucket 留出样本数少是工程边界，100% 触发常态化不构成真异常）。
+      段 1 mean_abs_z ≈ 1.27 与 medium bucket 留出 max 几乎齐平——
+      percentile = UI 标尺，bucket chip + scale + 字数更直观。
+    </p>
+    <div v-if="styleLoading" class="empty">加载中…</div>
+    <div v-else-if="styleErr" class="empty error">{{ styleErr }}</div>
+    <div v-else-if="styleWarnings.length === 0" class="empty">
+      暂无告警——所有生成段 percentile 都在 99.5 分位以内。
+    </div>
+    <div v-else>
+      <div style="display: flex; gap: 16px; margin: 8px 0 16px; font-size: 0.9em">
+        <span><b>{{ styleTotal }}</b> 条告警</span>
+        <span v-if="styleTruncated" style="color: #b00">已截断（&gt;500 保留最新 500）</span>
+      </div>
+      <table class="prior-table">
+        <thead>
+          <tr><th>段号</th><th>时间</th><th>percentile</th><th>mean_abs_z</th><th>bucket</th><th>scale</th><th>字数</th><th>最偏特征</th><th>消息</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="w in styleWarnings" :key="w.segment_no + '_' + w.generated_at">
+            <td>{{ w.segment_no }}</td>
+            <td style="font-family: monospace; font-size: 0.85em">{{ w.generated_at }}</td>
+            <td>{{ fmtPct(w.percentile) }}</td>
+            <td>{{ w.mean_abs_z?.toFixed(2) ?? "—" }}</td>
+            <td>
+              <span v-if="w.bucket" class="chip"
+                    :style="bucketChipStyle(w.bucket)">{{ w.bucket }}</span>
+              <span v-else>—</span>
+            </td>
+            <td>{{ w.scale_ratio != null ? w.scale_ratio + 'x' : '—' }}</td>
+            <td>{{ w.chars ?? '—' }}</td>
+            <td>
+              <span v-for="f in w.worst_features" :key="f" class="chip" style="margin-right: 4px">{{ f }}</span>
+            </td>
+            <td style="font-size: 0.85em">{{ w.warn_message ?? "—" }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <div class="row" style="margin-top: var(--gap-lg)">

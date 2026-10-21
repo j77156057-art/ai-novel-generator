@@ -754,7 +754,7 @@ onMounted(async () => {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--gap-sm);
   margin-top: 10px;
 }
 .asst-project {
@@ -777,7 +777,7 @@ onMounted(async () => {
 .stream-hint {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
   padding: var(--gap);
   border: 1px dashed var(--border-strong);
   border-radius: var(--radius-md);
@@ -789,7 +789,7 @@ onMounted(async () => {
 .turn {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
 }
 .bubble {
   display: flex;
@@ -825,19 +825,10 @@ onMounted(async () => {
   font-weight: 700;
   font-size: var(--fs-xs);
 }
+/* .link-btn 基础观感已提到全局 style/base.css，这里只保留本组件需要的对齐修正
+   （本组件的 link-btn 都挂在 flex 列里，需要顶对齐）。 */
 .link-btn {
-  font: inherit;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  border: none;
-  background: none;
-  color: var(--accent-ink);
-  cursor: pointer;
-  padding: 2px 6px;
   align-self: flex-start;
-}
-.link-btn:hover {
-  text-decoration: underline;
 }
 .btn.sm {
   font-size: var(--fs-xs);
@@ -846,7 +837,7 @@ onMounted(async () => {
 .ev-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--gap-md);
 }
 .ev {
   display: flex;
@@ -855,7 +846,8 @@ onMounted(async () => {
   padding: 10px 12px;
   border: var(--border-w) solid var(--border);
   border-radius: var(--radius-md);
-  background: var(--bg);
+  /* 证据卡是内嵌块，统一走下沉底色（与 AssistantIssueList.vue 的 .ev 一致） */
+  background: var(--bg-sunken);
 }
 /* 长文本默认限高可展开：既不撑爆面板，也不把内容憋在小框里。 */
 .snippet {
@@ -881,7 +873,7 @@ onMounted(async () => {
 .card-pending {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
   padding: 12px 14px;
   border: var(--border-w) solid var(--border-strong);
   /* 左侧色条只是辅助：真正的等级判断靠上面的文字标签。 */
@@ -912,7 +904,7 @@ onMounted(async () => {
 .confirm-box {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--gap-md);
   line-height: 1.7;
 }
 .diffbox {
@@ -933,7 +925,7 @@ onMounted(async () => {
 .composer {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-sm);
   padding-top: var(--gap);
   border-top: 1px solid var(--border-strong);
 }
