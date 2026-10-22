@@ -35,6 +35,8 @@
   **绝不能**被 Assistant 故障污染（失败时只回退到"只读检索关闭、诊断走本地规则"）。
 - 响应必须包含 {answer, evidence[], confidence, agent_run_id}；
   evidence 项是 dict（含 ref_id / snippet / score / kind / source）。
+  `/qa` 的段落证据 ref_id 形如 `segment:3`、snippet 前缀形如 `第3段（…）：`
+  ——段号随证据一起出参，调用方无需再去猜这条证据对应哪一段。
 - 端点**不**暴露任何写权限字段：请求体里只有 project_id / query / scope / version_id。
   任何 patch_json / target_table / target_id 等字段被请求体携带 → 422。
 - 不引入 LangGraph 节点 / Deep Agents。
@@ -152,6 +154,110 @@ class AssistantAnalyzeLogsRequest(_AssistantRequestBase):
 
 
 # ====================================================================
+# /qa 的证据行（段号 + 截断标记）
+# ====================================================================
+#
+# 修的是「问第 N 段写了什么必答错」（实测 4/4 复现）。四条根因全部落在
+# 「段号在 工具结果 → Evidence → 提示词 这条链路上被丢掉 / 被截断」：
+#
+# 1. 工具固定 `{"limit": 5}` 取最新 5 段，从不传 `segment_no`
+#    → 问「第 1 段」时证据里根本没有第 1 段；
+# 2. Evidence 的 ref_id 用 Generation 主键（2/3），段号与章节区间全丢；
+# 3. 提示词的证据行只有 kind/source/ref_id/score/snippet
+#    → 模型看不出「这是第几段」，两段在它眼里长得一样；
+# 4. snippet 被 `[:120]` 静默截断 → 模型把截断尾巴当正文接着往下写
+#    （实测：模型输出末 27 字与无标记截断片段的末 27 字完全相同）。
+#
+# 对策：段号从工具结果一路带到 ref_id / 落库 snippet / 提示词行（提示词行在
+# 造 Evidence 行时**同时**生成，避免事后从 row 反推时又丢一次），截断处打
+# 明确标记并在 system 提示词里禁止续写。
+
+#: 落库 snippet 的截断长度（Evidence.snippet 上限 1000，这里取更紧的值）。
+_QA_STORE_SNIPPET_LIMIT = 200
+
+#: 进提示词的片段截断长度。
+_QA_PROMPT_SNIPPET_LIMIT = 120
+
+#: 截断标记。**必须带**：不带标记时模型会顺着截断处把正文续写下去，
+#: 那是「引用」变「创作」，比答错更难被用户发现。
+_QA_TRUNCATION_MARK = "…（以下截断，原文未提供）"
+
+
+def _clip_with_mark(text: str | None, limit: int) -> str:
+    """截断并在截断处打标记；未截断则原样返回。
+
+    空文本返回 `(空)`：提示词里出现空片段时，模型容易把它读成
+    「这段没有内容」之外的东西（比如自行补一段）。
+    """
+    value = (text or "").strip()
+    if not value:
+        return "(空)"
+    if len(value) <= limit:
+        return value
+    return value[:limit] + _QA_TRUNCATION_MARK
+
+
+def _qa_target_segment_no(query: str | None) -> int | None:
+    """从用户问题里解析「第 N 段」的段号；解析不出 → None（回退原行为）。
+
+    复用 `app.agents.pending_actions.extract_segment_no`——段号正则的唯一
+    真源，本文件不复制第二份（复制出来的两份正则必然漂移）。
+
+    fail-safe：解析抛错 / 模块不可用时返回 None，调用方按「取最新 5 段」
+    走原路径。定向只是增强，解析出错不该让一次问答拿不到正文证据。
+    """
+    try:
+        from app.agents.pending_actions import extract_segment_no
+    except Exception as exc:  # noqa: BLE001 - 解析模块不可用时降级为不定向
+        logger.warning("assistant/qa 段号解析器不可用，回退取最新段：%s", exc)
+        return None
+    try:
+        return extract_segment_no(query or "")
+    except Exception as exc:  # noqa: BLE001 - 同上
+        logger.warning("assistant/qa 段号解析失败，回退取最新段：%s", exc)
+        return None
+
+
+#: 「最后一段 / 最新一段」的说法：没有段号可解析，但语义明确
+#: ——按 segment_no 倒序取 1 段即可（工具默认就是倒序）。
+_QA_LAST_SEGMENT_MARKERS: tuple[str, ...] = (
+    "最后一段",
+    "最新一段",
+    "最后那一段",
+    "最后写的那段",
+    "末尾那段",
+)
+
+
+def _qa_asks_last_segment(query: str | None) -> bool:
+    """用户问的是不是「最后一段」（没有段号、但语义明确的那一段）。"""
+    text = query or ""
+    return any(marker in text for marker in _QA_LAST_SEGMENT_MARKERS)
+
+
+def _qa_segment_ref_id(segment_no: Any) -> str:
+    """生成段证据的 ref_id：**带段号**（原来是 Generation 主键，段号丢失）。"""
+    if segment_no is None:
+        return "segment:unknown"
+    return f"segment:{segment_no}"
+
+
+def _qa_segment_label(segment_no: Any) -> str:
+    """提示词里的来源标签：让模型能区分各段。"""
+    if segment_no is None:
+        return "[正文 段号未知]"
+    return f"[正文 第{segment_no}段]"
+
+
+def _qa_segment_snippet(segment_no: Any, chapter_range: Any, text: str) -> str:
+    """落库 snippet：前缀带上段号与章节区间，UI 直接可读。"""
+    head = f"第{segment_no}段" if segment_no is not None else "段号未知"
+    chapter = str(chapter_range or "").strip()
+    prefix = f"{head}（{chapter}）" if chapter else head
+    return f"{prefix}：{text}"
+
+
+# ====================================================================
 # POST /api/assistant/qa
 # ====================================================================
 
@@ -183,10 +289,31 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
 
     # 2) 调用白名单工具：read_generation_segments + search_novel_chunks + get_reminders
     #    收集 evidence（不抛错即全部入 evidence 表；单工具失败时跳过那一项）
+    #
+    #    段号定向：用户问「第 N 段」时**定向取该段**。固定取最新 5 段的写法下，
+    #    问「第 1 段」拿到的证据里根本没有第 1 段，模型只能拿别的段顶替——
+    #    这是「问第 N 段必答错」的第一条根因。解析不出段号 → 回退原行为。
+    target_segment_no = _qa_target_segment_no(body.query)
+    if target_segment_no is not None:
+        segment_kwargs: dict[str, Any] = {"segment_no": target_segment_no, "limit": 1}
+    elif _qa_asks_last_segment(body.query):
+        # 「最后一段」解析不出段号，但语义明确：倒序取 1 段就是它。
+        # 不特殊处理时它会落到「最新 5 段」，模型面对 5 段截断片段只会
+        # 回「无法判断最后一段讲了什么」——答得诚实，但等于没答。
+        segment_kwargs = {"limit": 1}
+    else:
+        segment_kwargs = {"limit": 5}
     evidence_rows: list[Evidence] = []
+    # 提示词行与 evidence_rows **一一对应、同时生成**：Evidence 表没有段号列，
+    # 若等到拼 prompt 时再从 row 反推，段号只能从 ref_id 里 parse 回来
+    # （regex 一改就漂）。在这里一并生成，段号只走一处。
+    evidence_lines: list[str] = []
+    # 本次实际取到的正文段号：用于「用户点了不存在的段」时给模型一个确定性
+    # 事实，而不是让它自己猜（实测：不给时它会拿别的段顶替）。
+    generation_segment_nos: list[int] = []
     tool_results: dict[str, Any] = {}
     for tool_name, kwargs in (
-        ("read_generation_segments", {"limit": 5}),
+        ("read_generation_segments", segment_kwargs),
         ("search_novel_chunks", {"query": body.query, "k": 5}),
         ("get_reminders", {}),
     ):
@@ -195,20 +322,56 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
             tool_results[tool_name] = result
             # 工具结果 → evidence 行
             if tool_name == "read_generation_segments":
-                for g in (result.get("segments") or [])[:5]:
-                    snippet = (g.get("text") or "")[:200]
+                segments = list(result.get("segments") or [])
+                if not segments and target_segment_no is not None:
+                    # 定向落空（该段不存在 / 用户另有所指）→ 回退「最新 5 段」。
+                    # 宁可证据泛一些，也不能让一次问答拿到 0 条正文证据。
+                    logger.warning(
+                        "assistant/qa 定向取第 %s 段落空，回退取最新 5 段",
+                        target_segment_no,
+                    )
+                    result = invoke_tool(
+                        tool_name, db, project_id=project.id, limit=5
+                    )
+                    tool_results[tool_name] = result
+                    segments = list(result.get("segments") or [])
+                for g in segments[:5]:
+                    seg_no = g.get("segment_no")
+                    if seg_no is not None:
+                        generation_segment_nos.append(int(seg_no))
+                    raw_text = (g.get("text") or "").strip()
+                    stored = _qa_segment_snippet(
+                        seg_no,
+                        g.get("chapter_range"),
+                        _clip_with_mark(raw_text, _QA_STORE_SNIPPET_LIMIT),
+                    )
                     score = 0.6
                     row = _build_evidence_row(run_id, kind="generation",
-                                               source="generation", ref_id=g.get("id", ""),
-                                               snippet=snippet, score=score)
+                                               source="generation",
+                                               ref_id=_qa_segment_ref_id(seg_no),
+                                               snippet=stored, score=score)
                     db.add(row); evidence_rows.append(row)
+                    evidence_lines.append(
+                        f"- {_qa_segment_label(seg_no)} ref={row.ref_id} "
+                        f"score={score:.2f} "
+                        f"片段={_clip_with_mark(raw_text, _QA_PROMPT_SNIPPET_LIMIT)}"
+                    )
             elif tool_name == "search_novel_chunks":
                 for h in (result.get("hits") or [])[:5]:
+                    raw_text = h.get("text", "")
+                    score = float(h.get("score", 0.0))
                     row = _build_evidence_row(run_id, kind="chunk",
                                                source="novel", ref_id=h.get("chunk_id", ""),
-                                               snippet=h.get("text", "")[:200],
-                                               score=float(h.get("score", 0.0)))
+                                               snippet=_clip_with_mark(
+                                                   raw_text, _QA_STORE_SNIPPET_LIMIT),
+                                               score=score)
                     db.add(row); evidence_rows.append(row)
+                    evidence_lines.append(
+                        # 标签必须写明是参考语料：之前不标来源时，模型会把语料
+                        # 片段当成「本项目某段正文」来回答段落问题。
+                        f"- [参考语料片段] ref={row.ref_id} score={score:.2f} "
+                        f"片段={_clip_with_mark(raw_text, _QA_PROMPT_SNIPPET_LIMIT)}"
+                    )
             elif tool_name == "get_reminders":
                 # 提醒作为 evidence 也保留：决定置信度的旁证
                 rem_count = (len(result.get("unresolved_plotholes") or [])
@@ -219,6 +382,9 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
                     score=0.4,
                 )
                 db.add(row); evidence_rows.append(row)
+                evidence_lines.append(
+                    f"- [知识图谱提醒] ref=summary score=0.40 片段={rem_count} 条提醒"
+                )
         except PermissionError:
             # 黑名单工具被 Assistant 误调：直接 fail-fast（绝不静默）
             run.status = "failed"
@@ -237,17 +403,44 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
         provider = _ensure_assistant_provider()
         model_label = getattr(provider, "model", "") or getattr(provider, "label", "") or ""
         # 构造一个最小 system + user：把 evidence 拼进 user（不击穿 system 缓存）
-        evidence_blob = "\n".join(
-            f"- kind={r.kind} source={r.source} ref={r.ref_id} score={r.score} "
-            f"snippet={(r.snippet or '')[:120]}"
-            for r in evidence_rows[:5]
-        ) or "(无 evidence)"
-        system = "你是小说创作的诊断型助手。只能基于用户给出的 evidence 回答问题，"
-        system += "禁止编造证据外的内容；无证据时明确说明。"
+        evidence_blob = "\n".join(evidence_lines[:8]) or "(无 evidence)"
+        system = (
+            "你是小说创作的诊断型助手。只能基于用户给出的 evidence 回答问题，"
+            "禁止编造证据外的内容；无证据时明确说明。\n"
+            "evidence 每行的开头方括号是来源标签，必须按标签回答：\n"
+            "1. [正文 第N段] = 本项目已生成的第 N 段正文；用户问「第 N 段」时，"
+            "只引用标签为 [正文 第N段] 的那一行，不得把别的段当成第 N 段，"
+            "也不得把标签不同的行混在一起；\n"
+            "2. [参考语料片段] = 参考语料（**不是**本项目正文），"
+            "只有用户问语料/参考时才引用，回答问题段落时不得使用；\n"
+            "3. [知识图谱提醒] = 图谱里的未填坑与角色约束，不是正文；\n"
+            "4. 「最后一段」「最新一段」= 标签里数字最大的那段；\n"
+            "5. 片段末尾的「…（以下截断，原文未提供）」表示证据到此为止，"
+            "其后原文你并不知道——**严禁**顺着截断处续写、补全或推测，"
+            "只能引用片段里实际出现的文字，也不要照抄这个省略标记本身；\n"
+            "6. 要求逐字引用时，输出片段里真实存在的连续原文，"
+            "不要润色、拼接或改写。"
+        )
+        # 用户点了不存在的段时，把「没有这一段」作为**事实**写进提示词：
+        # 不给这句时，模型会拿编号最接近的段顶替（实测问「第 3 段」得到
+        # 第 2 段的内容，且不带任何说明）——那正是本缺陷要修的错位。
+        missing_note = ""
+        if (
+            target_segment_no is not None
+            and target_segment_no not in generation_segment_nos
+            and generation_segment_nos
+        ):
+            existing = "、".join(str(n) for n in sorted(set(generation_segment_nos)))
+            missing_note = (
+                f"\n\n（事实：本项目**不存在第 {target_segment_no} 段**"
+                f"——已按段号定向查询，无结果。本项目现有段号：{existing}。"
+                f"请把这个事实直接告诉用户：没有这一段，因此无法引用它的原文；"
+                f"不要用别的段顶替。）"
+            )
         user = (
             f"项目标题：{project.title or '未命名'}\n"
             f"问题：{body.query}\n\n"
-            f"evidence:\n{evidence_blob}"
+            f"evidence:\n{evidence_blob}{missing_note}"
         )
         raw = provider.chat(system, user)
         answer = raw.strip() if isinstance(raw, str) else str(raw or "")

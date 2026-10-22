@@ -1034,6 +1034,136 @@ def rule_generation_ai_flavor(
     ]
 
 
+#: plot_bible 登记角色名时常带的身份 / 职业 / 描述性前缀。
+#:
+#: 形如「记者小杨」「神秘失踪者A」「上司老李」——bible 里写全了身份，
+#: 正文里却只用核心名（实测 project 5：正文「小杨」54 次、「失踪者A」10 次，
+#: 而全名「记者小杨」「神秘失踪者A」0 次）。拿全名做精确子串匹配必假阳。
+#:
+#: 收录原则：**只收几乎不会单独成名的前缀**（职业 / 职务 / 关系 / 描述性
+#: 修饰），不收姓氏与单字通配——前缀一放宽，任何名字都能被剥成两三个字，
+#: 匹配就退化成「随便命中」。
+_IDENTITY_PREFIXES: tuple[str, ...] = (
+    # 职业 / 职务
+    "记者", "编辑", "作家", "医生", "律师", "老师", "教授", "警察", "刑警",
+    "法医", "护士", "司机", "保姆", "保安", "秘书", "助手", "保镖", "侦探",
+    "老板", "经理", "主任", "所长", "局长", "队长", "组长", "书记", "村长",
+    "导演", "编剧", "演员", "歌手", "学生", "士兵", "军官", "将军",
+    "工程师", "程序员", "会计师",
+    # 关系 / 称谓
+    "同事", "邻居", "同学", "同乡", "上司", "下属", "师父", "徒弟",
+    "师兄", "师姐",
+    # 描述性修饰（bible 常用特征标注还没起名的角色）
+    "神秘", "年轻", "资深", "首席", "退休", "陌生", "可疑", "失踪",
+)
+
+#: 剥前缀后核心名的最小长度。
+#:
+#: 2 是硬底线：1 字核心（「记者小李」→「李」）在中文正文里几乎必然命中
+#: 别人（姓李的一大把），匹配就失去了证据意义。剥完不足 2 字 → 不用核心名，
+#: 只认全名。
+_MIN_CORE_NAME_LEN = 2
+
+
+#: 剥前缀后核心名的禁用头字。
+#:
+#: 这些字只在「X者」「X员」「X生」里当**后缀**——剥完它们跑到核心名开头，
+#: 说明剥过头了（`失踪者B` 剥成 `者B`）。这种形态在正文里几乎必然匹配到
+#: 别的东西（`幸存者B`、`目击者B` 都含 `者B`），留着它就是白放宽匹配。
+_CORE_HEAD_DENY: tuple[str, ...] = ("者", "员", "生", "士")
+
+
+def _bible_name_surface_forms(name: str) -> tuple[str, ...]:
+    """一个 plot_bible 角色名的全部可匹配书写形态（全名 + 去前缀核心名）。
+
+    例：`记者小杨` → `("记者小杨", "小杨")`；`神秘失踪者A` →
+    `("神秘失踪者A", "失踪者A")`；`许七安` → `("许七安",)`（无前缀可剥）。
+
+    只剥**一层**、且只剥**开头**命中前缀表的部分：
+    - 只剥一层：剥两层（`神秘失踪者A` → `失踪者A` → `者A`）会把名字削成
+      无意义的碎片，误命中率陡增；
+    - 只剥开头：前缀的定义就是「写在名字前面的身份」，不是任意子串；
+    - 剥完不足 `_MIN_CORE_NAME_LEN` 字 → 丢弃该形态。
+    """
+    full = (name or "").strip()
+    if not full:
+        return ()
+    forms = [full]
+    for prefix in _IDENTITY_PREFIXES:
+        if not full.startswith(prefix):
+            continue
+        core = full[len(prefix):].strip()
+        if (
+            len(core) >= _MIN_CORE_NAME_LEN
+            and core[0] not in _CORE_HEAD_DENY
+        ):
+            forms.append(core)
+        break  # 一层即止；多个前缀命中时按表内顺序取第一个
+    return tuple(dict.fromkeys(forms))
+
+
+def _name_in_bible(name: str, bible_names: Sequence[str]) -> bool:
+    """判定 `name` 是否就是 bible 名单里的某个角色（双向包含）。
+
+    命中条件（任一）：
+    - 与某个 bible 名的**任一书写形态**完全相同；
+    - `name` 包含某个形态（正文里叫「记者小杨」，bible 登记「小杨」）；
+    - `name` 被某个形态包含（bible 登记「记者小杨」，正文里叫「小杨」）。
+
+    为什么允许双向包含而不是只做相等：bible 与正文的命名口径本来就不一致，
+    只认相等就得等两边都改对齐——那是数据治理，不是审核规则能等到的。
+    """
+    target = (name or "").strip()
+    if not target:
+        return False
+    for bible_name in bible_names:
+        for form in _bible_name_surface_forms(bible_name):
+            if not form:
+                continue
+            if target == form or form in target or target in form:
+                return True
+    return False
+
+
+def _bible_name_appears(name: str, full_text: str) -> bool:
+    """plot_bible 角色 `name` 是否在正文里出场（全名匹配不上时回退核心名）。
+
+    ## 为什么需要回退（F3）
+    原实现是 `name not in full_text`——拿 bible 的**带身份前缀全名**去正文
+    做精确子串匹配，而正文只用短名 → 主角被报成「从未出场」（实测 project 5：
+    「小杨」54 次、「失踪者A」10 次，全名 0 次）。
+
+    ## 为什么不复用 `app.kg.entity_resolve`
+    那个模块只处理「X的/之/者 + 单字亲属称谓」（`林悠然的父亲` → `父亲`），
+    与本次的形状（身份前缀 + 核心名）不重叠：`神秘失踪者A` 经
+    `parse_canonical` 原样返回。且它的核心是**单字**亲属称谓，放进本规则的
+    正文匹配会退化成「正文出现『父亲』就算该角色出场」——那是把
+    `林悠然的父亲` 和任何人的父亲混为一谈，误伤远大于收益。故不复用，
+    判据边界写在本函数里。
+
+    ## 误伤边界（镜像缺陷「短名搭长名便车」为什么不会重现）
+    那条缺陷的形状是：**短名被当成多个不同长名的同一实体**，在 KG 里连出
+    错边（`凤年--[对话]-->徐凤`）。本规则的形状不同，且副作用方向相反：
+    - 本规则只回答「要不要给用户报一条 warn」，产出的是**告警**，不是图数据，
+      放宽匹配不会写出任何边；
+    - 放宽的方向是**少报**（把假阳抹掉），不是多报。残留风险是漏报——
+      bible 记 `记者小杨`，正文里的 `小杨` 其实是另一个人（如 `陈小杨`）
+      时不报。这个残留是刻意接受的：`从未出场` 是 warn 级**提示**，
+      报错的代价（用户以为漏写了主角、去改剧情）大于漏报的代价
+      （用户自己知道谁出场了）；
+    - 核心名 ≥2 字 + 只剥一层 + 前缀表只收不成名的词，把漏报压在
+      「同一个核心名被两个不同角色共用」这一种情形上。真出现这种情形时
+      （bible 里同时有 `记者小杨` 与 `邻居小杨`），任一出现即视为出场，
+      也不报——宁可不报警，也不指认错人。
+    """
+    if not name:
+        return False
+    for form in _bible_name_surface_forms(name):
+        if form and form in full_text:
+            return True
+    return False
+
+
 def _bible_character_names(project: Any) -> list[str]:
     """plot_bible 里的角色名清单（缺表/坏形状 → 空列表，不抛）。"""
     bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
@@ -1061,14 +1191,19 @@ def rule_generation_bible_character_mismatch(
     issues: list[DiagnosticIssue] = []
 
     # 方向 ①：bible 角色在全部生成段中零出现（计划了却没写）
-    absent = [n for n in bible_names if n not in full_text]
+    # 匹配走 `_bible_name_appears`：全名 → 去身份前缀的核心名，两级都找不到
+    # 才算「没出场」（见该函数的误伤边界说明）。
+    absent = [n for n in bible_names if not _bible_name_appears(n, full_text)]
     if absent:
         evidence = tuple(
             IssueEvidence(
                 kind="kg",
                 source=_kg_source(),
                 ref_id=f"bible_character:{n}",
-                snippet=f"plot_bible 角色「{n}」在全部生成段中零出现",
+                snippet=(
+                    f"plot_bible 角色「{n}」在全部生成段中零出现"
+                    f"（已按全名与去身份前缀的核心名各查一次）"
+                ),
                 score=0.5,
             )
             for n in absent[:MAX_EVIDENCE_PER_ISSUE]
@@ -1102,11 +1237,12 @@ def rule_generation_bible_character_mismatch(
             )
         ).all()
     )
-    bible_set = set(bible_names)
+    # 方向 ② 与方向 ① 必须用**同一套**匹配口径：一边说「记者小杨 == 小杨」、
+    # 另一边说「小杨不在 bible 里」，两条规则会在同一次审核里自相矛盾。
     extra = []
     for n in kg_chars:
         name = (n.props or {}).get("name")
-        if not name or name in bible_set:
+        if not name or _name_in_bible(name, bible_names):
             continue
         mentions = (n.props or {}).get("mentions") or 0
         if int(mentions) >= PROMINENT_CHARACTER_MENTIONS:
