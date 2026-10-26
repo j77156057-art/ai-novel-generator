@@ -33,7 +33,7 @@
         "缺历史契约时保留局部结论但维持应用阻塞；只能用真实历史契约重新显式复核，不造快照、不迁旧提案",
         "某件物品的使用含义歧义，以及本次局部矛盾之外的正文语义，不在局部证明范围内，保留unknown；不由四维supported宣布全段合格",
         "封闭权限复验必须引用指定required_authority_source_ids全部来源及changed_body_source_ids至少一端；顶层observed与finding supported严格区分，不能用相关权威或未改段替代",
-        "协议修复后的一次真实复验已引用指定权威端与改动段支持「目标依赖已消除」，但时间/地点/参与者仍unknown；证据见docs/authority-body-repair-review-v2-report.json，严格验收仍失败，不能晋升validated或升级旧提案",
+        "协议修复后的一次真实复验已引用指定权威端与改动段支持「目标依赖已消除」，但时间/地点/参与者仍unknown；复验结论见docs/authority-body-repair-recovery-design.md，严格验收仍失败，不能晋升validated或升级旧提案",
         "完整清单约束必须随新段保存原设定权威，不从当前设定倒填历史。full-contract-real-v2已真实消费完整权威但漏检正文新增的未授权物件；四维supported不得替代人工完整清单验收，方法保持experimental"
       ]
     }

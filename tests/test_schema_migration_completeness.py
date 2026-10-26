@@ -16,7 +16,7 @@
 
 「某列是建表就有的基础列，还是后来加的」这个信息**只存在于 git 历史里**，
 单测自己拿不到。于是把迁移体系建立之前的 schema 抽成可版本化的基线
-`backend/schema_baseline.json`（由 `gen_schema_baseline.py` 从首次引入
+`backend/app/schema_baseline.json`（由 `gen_schema_baseline.py` 从首次引入
 数据层的提交自动生成），测试用它算差集：
 
     当前 schema − 基线 = 历史上所有「后加的列」

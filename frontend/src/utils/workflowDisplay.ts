@@ -9,7 +9,7 @@ import type {
  *
  * 为什么单独成模块：这个面板只有「显示」，但显示里有判断 —— 两条轨怎么分、
  * 哪一步是当前步、状态词怎么说。让组件里直接写这些判断，就没法离线测；
- * 抽成纯函数后，`node --test` 能直接守住它们（见 tests/workflowDisplay.test.ts）。
+ * 抽成纯函数后，`node --test` 能直接守住它们（见 frontend/tests/workflowDisplay.test.ts）。
  *
  * 两条纪律：
  * 1. **状态词优先用服务端给的** `state_label`（服务端才知道「下一步」是哪个、

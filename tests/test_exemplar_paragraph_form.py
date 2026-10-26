@@ -59,8 +59,19 @@ def test_no_broken_string_literals_in_repo():
     特征：某一行以 `"` 或 `"\\` 结尾（引号未闭合），下一行以 `"` 开头。
     """
     suspicious = []
+    # 只扫**本项目自己的**源码。
+    # 排除清单里必须有 venv —— README 第一步就是 `python -m venv .venv`，
+    # 而 venv 建在仓库里（backend/.venv），site-packages 里的第三方代码
+    # 会被这个「引号未闭合」的启发式误判成坏写法。
+    # 2026-10-26 在空白机上抓到：pip install 之后这条测试直接红，
+    # 报的是 fastapi/sqlalchemy/pygments 的源码行 —— 全是误报。
+    SKIP_DIRS = {
+        ".git", "node_modules", "__pycache__", ".pytest_cache",
+        ".venv", "venv", "env", ".env", "site-packages", "dist", "build",
+        ".cache", ".tox", ".mypy_cache", ".ruff_cache", ".eggs", ".workbuddy",
+    }
     for path in REPO.rglob("*.py"):
-        if any(part in {".git", "node_modules", "__pycache__", ".pytest_cache"} for part in path.parts):
+        if any(part in SKIP_DIRS for part in path.parts):
             continue
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
