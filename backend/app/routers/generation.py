@@ -91,11 +91,40 @@ class RegenerateBody(StrictRequest):
     max_chars: int | None = None
 
 
+def _generate_guarded(fn, *args, **kwargs):
+    """跑生成，**照搬门禁**的失败转成 409（其余异常照旧冒出去）。"""
+    from app.generation.verbatim import VerbatimViolation
+
+    try:
+        return fn(*args, **kwargs)
+    except VerbatimViolation as exc:
+        raise _verbatim_conflict(exc) from exc
+
+
 def _require_project(db: Session, project_id: int) -> Project:
     proj = db.get(Project, project_id)
     if proj is None:
         raise HTTPException(status_code=404, detail="project 不存在")
     return proj
+
+
+def _verbatim_conflict(exc: Exception) -> HTTPException:
+    """照搬门禁拦下 ⇒ 转成 409 + **人话**说明。
+
+    为什么不让异常自己冒出去：默认会变成 500 "Internal Server Error"，
+    用户只看到「出错了」，不知道这一段为什么没保存、也不知道能不能重试。
+
+    内部代号（possible_copy）只放在 `status` 里给程序看，
+    `message` 是写给人看的。
+    """
+    spans = list(getattr(exc, "spans", None) or [])
+    return HTTPException(status_code=409, detail={
+        "status": "possible_copy",
+        "message": ("这一段里有地方和参考语料是一字不差的，已经自动改过一遍，"
+                    "还是没能换掉，所以这次没有保存。重新生成一次就好。"),
+        "match_count": len(spans),
+        "excerpts": [str(s.get("text") or "")[:60] for s in spans[:3]],
+    })
 
 
 def _require_workflow_ready(db: Session, proj: Project) -> None:
@@ -191,7 +220,8 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
     # 与「允许单次试用而不改项目配置」的说法相反；而且 False 写进去也没用
     # （库里 0 与「从没设过」分不开，引擎会回落到全局开关）。
     # 现在直接透传给引擎：True = 这段都改、False = 这段别改、None = 跟随项目/全局。
-    result = generate_next_segment(
+    result = _generate_guarded(
+        generate_next_segment,
         db, proj, novel_ids=novel_ids, max_chars=body.max_chars,
         profile=body.profile, style_rewrite=body.style_rewrite,
     )
@@ -230,7 +260,13 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
             ):
                 yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 把异常也作为 SSE 事件下发，前端可提示
-            yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+            from app.generation.verbatim import VerbatimViolation
+            if isinstance(exc, VerbatimViolation):
+                # 照搬门禁：给**人话**，别把内部代号甩给用户
+                _d = _verbatim_conflict(exc).detail
+                yield f"data: {_json.dumps({'type': 'error', 'message': _d['message'], 'status': _d['status'], 'match_count': _d['match_count']}, ensure_ascii=False)}\n\n"
+            else:
+                yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
             sdb.close()
 
@@ -264,7 +300,13 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
             ):
                 yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 异常也作为 SSE 事件下发
-            yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+            from app.generation.verbatim import VerbatimViolation
+            if isinstance(exc, VerbatimViolation):
+                # 照搬门禁：给**人话**，别把内部代号甩给用户
+                _d = _verbatim_conflict(exc).detail
+                yield f"data: {_json.dumps({'type': 'error', 'message': _d['message'], 'status': _d['status'], 'match_count': _d['match_count']}, ensure_ascii=False)}\n\n"
+            else:
+                yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
             sdb.close()
 
@@ -286,7 +328,8 @@ def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)
     _require_story_seed(proj)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
     # 同 /generate：单次覆盖，不写进项目（见那里的说明）。
-    results = generate_loop(
+    results = _generate_guarded(
+        generate_loop,
         db, proj, novel_ids=novel_ids, segments=body.segments, max_chars=body.max_chars,
         profile=body.profile, style_rewrite=body.style_rewrite,
     )

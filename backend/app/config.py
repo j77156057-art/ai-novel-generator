@@ -239,6 +239,22 @@ class Settings(BaseSettings):
     #    （整段形态改写已实测 0/20 不可靠，局部插入采纳率 5/6）。
     style_beat_insert: bool = False
 
+    # 照搬门禁：生成出来的正文 vs 参考语料原文（app/generation/verbatim.py）。
+    # 为什么要有：已有的 copy_check 只管「规划节点 vs 参考规则」，水印检测只管
+    # 语料清洗 —— **正文复读原文**这一段是空的，而项目自己踩过
+    # （v2.272：5 章全在重写同一段，第 4/5 段前 3 句几乎逐字相同）。
+    #
+    # 阈值 25 是实测标定的，不是拍的（2026-10-26，498 万字真实语料）：
+    #   真实生产产物 vs 语料 → 最长公共串 9 字
+    #   本轮 25 篇生成      → 11 字
+    #   **无关真书 vs 语料** → 15 字（中文共用地毯的实测上限）
+    # 25 远高于上限 ⇒ 判得死，够得上 error 级；12~24 字只告警不拦。
+    style_verbatim_gate: bool = True
+    style_verbatim_threshold: int = 25
+    # 回灌自改最多几次（把命中的片段指给模型，让它自己换措辞）。
+    # 改不掉就不落库 —— 宁可这一段没有，不能落一段照搬的。
+    style_verbatim_max_rewrites: int = 2
+
     # 阿里百炼 DashScope（兼容 OpenAI 协议）
     dashscope_models: str = "qwen-plus,qwen-max,qwen-turbo,qwen-flash"
 

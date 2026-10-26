@@ -984,6 +984,121 @@ def _maybe_rewrite_style(
         return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
 
 
+#: 照搬回灌改写后，允许的最短比例（低于它 = 改坏了，不采纳）。
+#: 与 `generation/rewrite.py` 的 `MIN_LEN_RATIO` 同一口径：
+#: 改写掉内容比改不掉更糟 —— 宁可这一段不落库，也不能悄悄丢情节。
+_VERBATIM_MIN_LEN_RATIO = 0.60
+
+
+def _maybe_fix_verbatim(
+    db,
+    project: Project,
+    text: str,
+    provider,
+    *,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """照搬门禁：正文里若**逐字搬了**参考语料的原文，改掉；改不掉就不落库。
+
+    ## 为什么放在所有正文改写之后、落库之前
+
+    落库的是最终文本，门禁必须量最终文本 —— 任何在它之前的改写
+    （去重 / 文风改写 / 形态校正 / beat 插入）都可能重新引入原文片段。
+
+    ## 命中之后：回灌自改 → 改不掉就不落库
+
+    与 `plot_structure.CopyViolation` 同一口径：把命中的片段指给模型，
+    让它用自己的措辞重写，比直接报错让用户重做一次改对的概率高得多。
+    仍改不掉 ⇒ 抛 `VerbatimViolation`（可重试失败），由路由层转成
+    明确可读的错误，**这一段不落库**。
+
+    ## 降级一律放行
+
+    没有语料、索引没建好、扫描出错 —— 一律放行并在报告里标注「未执行」。
+    门禁是加分项，不是主链路：索引坏了不能连正文都写不出来。
+    """
+    from app.config import settings
+    from app.generation.verbatim import (
+        VerbatimViolation, load_index, scan_verbatim, warm_index_async,
+    )
+
+    if not settings.style_verbatim_gate:
+        return text, {"enabled": False, "verdict": "disabled"}
+    if not text:
+        return text, {"enabled": True, "verdict": "skipped", "reason": "empty_text"}
+
+    ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+    if not ids:
+        return text, {"enabled": True, "verdict": "skipped", "reason": "no_reference_corpus"}
+
+    threshold = int(settings.style_verbatim_threshold or 25)
+    index = load_index(db, ids)
+    if index is None:
+        # 索引还没建（建它要扫全语料，不能卡在请求里）→ 后台建，这一段先放行。
+        warm_index_async(db, ids)
+        return text, {"enabled": True, "verdict": "skipped", "reason": "index_not_ready"}
+
+    report = scan_verbatim(text, index, threshold=threshold)
+    report["enabled"] = True
+    if report["verdict"] != "possible_copy":
+        return text, report
+
+    # —— 回灌自改（有界）——
+    max_rewrites = max(0, int(settings.style_verbatim_max_rewrites or 0))
+    attempts = 0
+    for attempt in range(1, max_rewrites + 1):
+        attempts = attempt
+        hint = VerbatimViolation._build_hint(report["spans"], threshold)
+        try:
+            rewritten = provider.chat(_verbatim_system_prompt(threshold), text + hint)
+        except Exception as exc:  # noqa: BLE001 —— 改写挂了不能连累正文以外的东西
+            logging.getLogger(__name__).warning("照搬回灌失败，保留原文: %s", exc)
+            break
+        rewritten = _strip_thinking(rewritten or "")
+        if not rewritten:
+            break
+        # 改写把内容削掉太多 ⇒ 判为「改坏了」，不采纳（照抄 MIN_LEN_RATIO 的口径：
+        # 改写掉内容比改不掉更糟 —— 宁可这一段不落库，也不能悄悄丢情节）。
+        if len(rewritten) < len(text) * _VERBATIM_MIN_LEN_RATIO:
+            logging.getLogger(__name__).info(
+                "照搬回灌：改写后字数 %d < 原文 %d 的 %.0f%%，判为改坏了，不采纳",
+                len(rewritten), len(text), _VERBATIM_MIN_LEN_RATIO * 100)
+            break
+        again = scan_verbatim(rewritten, index, threshold=threshold)
+        report["last_attempt"] = {"attempt": attempt, "verdict": again["verdict"],
+                                  "match_count": again["match_count"]}
+        if again["verdict"] != "possible_copy":
+            report.update(again)
+            report["rewritten"] = True
+            report["attempts"] = attempts
+            return rewritten, report
+        report = again
+    report["rewritten"] = False
+    report["attempts"] = attempts
+    # 改不掉 ⇒ 这一段不落库（抛可重试失败，让调用方/用户重试）。
+    raise VerbatimViolation(report)
+
+
+def _verbatim_system_prompt(threshold: int = 25) -> str:
+    """回灌改写用的 system prompt。
+
+    刻意只给一条要求：**换掉与参考原文逐字相同的那几处**。
+    不让它「重写整段」—— 那是文风改写的活，两件事混在一起会把情节改丢。
+
+    阈值写进提示里（而不是写死 25）—— 阈值是配置项，提示必须跟它一致。
+    """
+    return (
+        "你是一位中文小说编辑。你的任务只有一件：把下面这段文字里"
+        "**与参考原文逐字相同**的地方改写成你自己的措辞。\n\n"
+        "要求：\n"
+        "1. 情节、人物、对白内容、信息量一律不变；\n"
+        "2. 只改**被指出来的那几处**的句子与用词，其余原样保留；\n"
+        f"3. 改完之后，**不得**再出现任何连续 {threshold} 个字以上与参考原文相同的片段；\n"
+        "4. 长度与原文差不多（上下浮动 10% 以内）。\n\n"
+        "只输出改写后的正文，不要解释。"
+    )
+
+
 def _commit_segment(db, project: Project, text: str, summary: str) -> tuple[Generation, int]:
     """落库一段：写 Generation + 追加 L1 到摘要树 + 同步扁平归档。
 
@@ -2410,6 +2525,15 @@ def generate_next_segment(
             or beat_info.get("applied")):
         summary = provider.summarize(text)
 
+    # 照搬门禁：正文 vs 参考语料。放在**所有**正文改写之后、落库之前 ——
+    # 落库的是最终文本，门禁必须量最终文本。
+    # 改不掉就抛 VerbatimViolation（可重试失败），这一段不落库。
+    text, verbatim_info = _maybe_fix_verbatim(
+        db, project, text, provider, novel_ids=novel_ids,
+    )
+    if verbatim_info.get("rewritten"):
+        summary = provider.summarize(text)
+
     gen, segment_no = _commit_segment(db, project, text, summary)
     # 正文变了 → 上一版的整段验收**不再覆盖这一版**：义务换绑（不删除），
     # 派生状态作废（引擎只做增量合并，不是解锁要求的全量重建）。
@@ -2502,6 +2626,7 @@ def generate_next_segment(
         "form_info": form_info,
         "candidate_pool": pool_info,
         "beat_info": beat_info,
+        "verbatim_info": verbatim_info,
     }
 
 
@@ -2642,6 +2767,15 @@ def generate_next_segment_stream(
             or beat_info.get("applied")):
         summary = provider.summarize(text)
 
+    # 照搬门禁：正文 vs 参考语料。放在**所有**正文改写之后、落库之前 ——
+    # 落库的是最终文本，门禁必须量最终文本。
+    # 改不掉就抛 VerbatimViolation（可重试失败），这一段不落库。
+    text, verbatim_info = _maybe_fix_verbatim(
+        db, project, text, provider, novel_ids=novel_ids,
+    )
+    if verbatim_info.get("rewritten"):
+        summary = provider.summarize(text)
+
     gen, segment_no = _commit_segment(db, project, text, summary)
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
     node_judge = _judge_and_advance(db, project, provider, text, written)
@@ -2690,6 +2824,7 @@ def generate_next_segment_stream(
         "form_info": form_info,
         "candidate_pool": _pool_info,
         "beat_info": beat_info,
+        "verbatim_info": verbatim_info,
         "node_judge": node_judge,
         "kg_update": kg_stats,
         "v3_extraction": v3_extraction,

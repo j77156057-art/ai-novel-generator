@@ -127,6 +127,15 @@ def ingest_text(
         db.rollback()
         raise RuntimeError("ingest readback mismatch")
     db.commit()
+    # 照搬门禁的语料索引：入库后**后台**建好，用户第一次生成时就不用等。
+    # 建索引要扫全语料（百万字级 ⇒ 几十秒），放请求里会把上传卡住 —— 所以放后台线程。
+    # 期间门禁降级放行（宁可漏判，不堵死真活）。
+    try:
+        from app.generation.verbatim import warm_index_async
+        warm_index_async(db, [novel.id])
+    except Exception as exc:  # noqa: BLE001 —— 建索引失败不影响入库
+        import logging
+        logging.getLogger(__name__).warning("照搬索引后台构建失败: %s", exc)
     return {
         "check_status": checked["status"],
         "novel_id": novel.id,
