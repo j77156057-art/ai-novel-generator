@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import re
 import sqlite3
 import sys
@@ -19,9 +20,9 @@ sys.path.insert(0, str(ROOT / 'backend'))
 from app.style.character_profile import normalize_character_profile  # noqa: E402
 
 ART = Path(sys.argv[1]) if len(sys.argv) > 1 else (
-    Path(os.path.expandvars(r'%LOCALAPPDATA%')) / 'hermes' / 'cache' / 'scratch' / 'foundation-distill-v4')
-VIEW_OUT = ROOT / 'docs' / 'authority-distill-method-view.json'
-L2_OUT = ROOT / 'docs' / 'authority-distill-l2-clean.json'
+    Path(os.environ.get('LOCALAPPDATA') or tempfile.gettempdir()) / 'novel-scratch' / 'foundation-distill-v4')
+VIEW_OUT = ROOT / '.cache' / 'authority-distill-method-view.json'
+L2_OUT = ROOT / '.cache' / 'authority-distill-l2-clean.json'
 
 VOICE_DIMENSION = '角色声音词典'
 #: 规则形态：'<方法句>（证据：<原文>）'。外层收尾括号全角/半角都出现过，

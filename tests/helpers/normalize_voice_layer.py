@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import re
 import sys
 from collections import Counter
@@ -17,8 +18,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'backend'))
 
 ART = Path(sys.argv[1]) if len(sys.argv) > 1 else (
-    Path(os.path.expandvars(r'%LOCALAPPDATA%')) / 'hermes' / 'cache' / 'scratch' / 'foundation-distill-v4')
-OUT = ROOT / 'docs' / 'authority-distill-voice-normalized.json'
+    Path(os.environ.get('LOCALAPPDATA') or tempfile.gettempdir()) / 'novel-scratch' / 'foundation-distill-v4')
+OUT = ROOT / '.cache' / 'authority-distill-voice-normalized.json'
 VOICE_DIMENSION = '角色声音词典'
 EV = re.compile(r'（证据[:：]\s*([\s\S]+?)\s*[)）]\s*$')
 #: 模型自己说"判不出来"的空规则：自称/句长/语气/节奏/关系全是「未出现…无法判断」。
