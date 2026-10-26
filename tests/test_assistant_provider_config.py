@@ -345,7 +345,19 @@ def test_qa_endpoint_really_reaches_assistant_chat(monkeypatch):
 
 
 def test_writer_config_unchanged_by_assistant_fix():
-    """get_provider_config('writer') 返回值（含 _fallback_to_legacy 标记）保持原样。"""
+    """get_provider_config('writer') 返回的字段集合（含 `_fallback_to_legacy` 标记）。
+
+    契约在 2026-10-26 **有意**扩了一个字段：`thinking`（思考档位）。
+    为什么它不算破坏这条红线：
+
+    - 它是**新增的可选字段**，默认空串 ⇒ `_thinking_kwargs()` 返回 `{}`，
+      请求体一个字段都不多发 —— **Writer 的实际行为不变**（下面那条断言钉的就是这个：
+      `_fallback_to_legacy` 仍为 True，工厂仍走原单例）；
+    - 它存在的理由是对正文有正收益：实测 M3.1 的 effort=low 让 2400 字续写
+      从「66.7 秒、正文为空（预算被思考吃满）」变成「36 秒、正文完整」。
+
+    ⇒ 红线是「**行为**不变」，不是「字段集合永不增长」。新增字段必须默认不生效。
+    """
     settings.llm_provider = "zhipu"
     settings.zhipu_api_key = "zhipu-legacy-key"
 
@@ -353,10 +365,12 @@ def test_writer_config_unchanged_by_assistant_fix():
 
     assert set(cfg) == {
         "provider", "api_key", "base_url", "model",
-        "max_tokens", "timeout", "_fallback_to_legacy",
+        "max_tokens", "timeout", "thinking", "_fallback_to_legacy",
     }
     # writer_* 默认全空 → 委托标记必须为 True（工厂据此走 get_llm_provider() 单例）
     assert cfg["_fallback_to_legacy"] is True
+    # 新增字段默认空 ⇒ 不往请求体加任何东西（行为不变的关键）
+    assert cfg["thinking"] == ""
 
 
 def test_writer_singleton_keeps_its_own_key_and_timeouts():

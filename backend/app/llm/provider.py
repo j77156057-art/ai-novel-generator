@@ -674,15 +674,30 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
 class GenericOpenAIChatProvider(OpenAICompatibleChatProvider):
     """通用 OpenAI 兼容接口（渠道名 "openai"）。
 
-    不绑定任何厂商：只要端点实现了 `POST {base_url}/chat/completions` +
-    `Authorization: Bearer <key>` 就能接（OpenAI 官方 / 自建 one-api /
-    vLLM / LM Studio / LocalAI / 第三方中转站…）。
+    额外支持 **关闭思考**（`thinking_off=True` → 请求体带
+    `thinking: {"type": "disabled"}`）。
+
+    为什么这个渠道要单独处理：它给任何 OpenAI 兼容端点用，
+    而**不同厂商对思考的控制字段不同** —— DeepSeek 吃
+    `thinking={"type":"disabled"}`（实测 v4-pro 27.8s → 8.2s、reasoning 归零），
+    却不认 `reasoning_effort`（实测传了没反应）。不认识的字段服务端是
+    静默忽略的，所以这里只发**验证过**的那一个。
 
     与父类的唯一差别是 label（界面上要显示成「通用 OpenAI」而不是泛泛的
     "LLM"）——协议层完全复用，因此本渠道**不新增任何依赖**（仍是 stdlib urllib）。
     """
 
     label = "OpenAI"
+
+    def __init__(self, api_key: str, base_url: str, model: str,
+                 models: list[str] | None = None,
+                 thinking_off: bool = False, **kwargs) -> None:
+        extra: dict = {}
+        if thinking_off:
+            # 实测：DeepSeek 认这个字段；不认 reasoning_effort（传了没反应）。
+            extra["thinking"] = {"type": "disabled"}
+        super().__init__(api_key, base_url, model, extra_body=extra,
+                         models=models, **kwargs)
 
 
 class LocalFallbackLLMProvider(LLMProvider):
@@ -864,7 +879,38 @@ def apply_runtime_config(overrides: dict[str, object | None]) -> None:
         reset_distiller_provider_cache()
 
 
+def _thinking_kwargs(provider: str, model: str, thinking: str) -> dict:
+    """把角色级的「思考档位」翻译成 provider 构造参数。
+
+    返回的 dict 直接 `**kwargs` 给构造器：`reasoning_effort` 或 `thinking_off`。
+    拿不准就不返回任何键（保持官方默认，行为与加这个开关之前一致）。
+    """
+    value = (thinking or "").strip().lower()
+    if not value:
+        return {}
+    prov = (provider or "").strip().lower()
+    name = (model or "").strip()
+
+    if prov == "minimax" and name.startswith("MiniMax-M3.1"):
+        # M3.1：只能调档，关不掉
+        if value == "off":
+            logging.getLogger(__name__).info(
+                "MiniMax M3.1 关不掉思考，已降级为最低档 low（而不是忽略这个设置）"
+            )
+            return {"reasoning_effort": "low"}
+        if value in ("low", "medium", "high", "xhigh", "max"):
+            return {"reasoning_effort": value}
+        return {}
+
+    if value == "off":
+        # 能关的：老 M3（类里本来默认就关）与通用兼容渠道（DeepSeek）
+        if prov == "minimax" or prov == "openai":
+            return {"thinking_off": True}
+    return {}
+
+
 def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
+                   thinking_off: bool = False,
                    max_tokens: int | None = None, timeout: int = 120,
                    stream_timeout: int = 180) -> LLMProvider:
     """按渠道名直接构造 provider 实例（测试端点用，不走缓存/单例）。
@@ -908,6 +954,7 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
         # 「配了但一直在用离线模板」，是极难排查的静默失效。
         url = base_url or settings.openai_base_url
         return GenericOpenAIChatProvider(api_key, url, model, models=[model],
+                                         thinking_off=thinking_off,
                                          max_tokens=max_tokens, timeout=timeout,
                                          stream_timeout=stream_timeout)
     return LocalFallbackLLMProvider()
@@ -973,6 +1020,9 @@ def build_role_provider(role: str, stream_timeout: int = 60) -> LLMProvider:
     # stream_timeout 暂时不分配置项（这两个角色都不走流式）但显式传值，
     # 防御未来子类把默认改成别的值。
     kwargs["stream_timeout"] = stream_timeout
+    # 思考档位（角色级）。不配 = 不传，行为与加这个开关之前一致。
+    kwargs.update(_thinking_kwargs(provider, model,
+                                   str(cfg.get("thinking") or "")))
     return build_provider(provider, api_key, model, base_url, **kwargs)
 
 

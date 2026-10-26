@@ -77,6 +77,8 @@ interface RoleFormState {
   baseUrl: string;
   maxTokens: string;
   timeout: string;
+  /** 思考档位（取值由渠道决定；空 = 不发这个字段）。 */
+  thinking: string;
   showKey: boolean;
 }
 
@@ -89,6 +91,7 @@ function createForm(): RoleFormState {
     baseUrl: "",
     maxTokens: "",
     timeout: "",
+    thinking: "",
     showKey: false,
   };
 }
@@ -174,6 +177,34 @@ function splitChain(text: string): string[] {
 /** 当前渠道是否要求自定义端点（通用 OpenAI 接口）。 */
 const showBaseUrl = computed(() => needsBaseUrl(form.provider));
 
+/**
+ * 这个渠道 + 模型能用的思考档位。
+ *
+ * 由后端下发（`providers[渠道].thinking`），因为**各家控制方式不同**：
+ *   MiniMax M3.1 → 只能调档（关不掉；省略 = 最强最慢）
+ *   DeepSeek 类   → 能关
+ *   其它          → 未验证，不提供（按了没反应的开关比没有更糟）
+ * 拿不到或 mode === "none" → null ⇒ 界面上不显示这一块。
+ */
+const thinkingOptions = computed(() => {
+  const ctl = props.providers[form.provider]?.thinking;
+  if (!ctl || ctl.mode === "none" || !ctl.levels?.length) return null;
+  return ctl;
+});
+
+/** 档位的「人话」标签：不出现 reasoning_effort 这种内部字段名。 */
+const THINKING_LABELS: Record<string, string> = {
+  low: "最省（最快，适合写正文）",
+  medium: "平衡",
+  high: "更仔细",
+  xhigh: "很仔细",
+  max: "最强（最慢最贵，省略即此档）",
+  off: "关闭（最快）",
+  default: "默认（由模型决定）",
+};
+
+const thinkingLabel = (level: string): string => THINKING_LABELS[level] ?? level;
+
 /** 解析非负整数输入：空 → null（不改）；非法 → undefined（调用方报错）。 */
 function parseCount(raw: string): number | null | undefined {
   const t = raw.trim();
@@ -204,6 +235,8 @@ const dirty = computed(() => {
     ).join(",");
     if (chain !== baseChain) return true;
   }
+  // 思考档位：只在该渠道+模型支持时参与脏值比较。
+  if (thinkingOptions.value && (form.thinking || "") !== (s?.thinking ?? "")) return true;
   if (supportsLimits.value) {
     if (form.maxTokens.trim() !== (s?.max_tokens != null ? String(s.max_tokens) : "")) return true;
     if (form.timeout.trim() !== (s?.timeout != null ? String(s.timeout) : "")) return true;
@@ -228,6 +261,10 @@ function submitSave(): void {
   if (supportsChain.value) {
     const chain = splitChain(form.chainText);
     payload.models = chain.length ? chain : null;
+  }
+  // 思考档位：只在该渠道+模型支持时带上（空 = 不改变）。
+  if (thinkingOptions.value) {
+    payload.thinking = form.thinking || null;
   }
   if (supportsLimits.value) {
     const maxTokens = parseCount(form.maxTokens);
@@ -408,6 +445,23 @@ function submitTest(): void {
           蒸馏是长任务：语料越多越慢，建议 ≥180s。
         </span>
       </div>
+    </div>
+
+    <!-- 思考档位：只在该渠道+模型支持时出现（后端下发能力，前端不自作主张） -->
+    <div v-if="thinkingOptions" class="field thinking-field">
+      <label :for="`${uid}-thinking`">思考</label>
+      <select :id="`${uid}-thinking`" class="input" v-model="form.thinking">
+        <option value="">（不改变）</option>
+        <option v-for="lv in thinkingOptions.levels" :key="lv" :value="lv">
+          {{ thinkingLabel(lv) }}
+        </option>
+      </select>
+      <span class="faint limit-note">
+        {{ thinkingOptions.note }}
+        <template v-if="thinkingOptions.mode === 'effort'">
+          建议正文续写选「最省」：实测 2400 字从 66.7 秒降到 36 秒，思考少占九成预算。
+        </template>
+      </span>
     </div>
 
     <!-- 操作：测试只测这一个角色；保存只保存这一个角色 -->

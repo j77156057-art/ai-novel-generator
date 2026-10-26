@@ -75,6 +75,93 @@ from app.schemas import StrictRequest
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 # 渠道元数据：供前端下拉与说明（key 获取地址 / 免费政策 / 默认候选模型）
+#: 各渠道的「思考控制」方式 —— **按厂家文档与实测**填，没验证过的不写。
+#:
+#: mode 的含义：
+#:   "effort"   只能调档（reasoning_effort），**关不掉**；省略 = 最高档
+#:   "disable"  能开关（thinking={"type":"disabled"}）
+#:   "none"     该渠道/模型不支持控制（不发任何字段）
+#:
+#: 为什么不能给一个全局「思考强度」下拉：三家写法互不相同，且同一渠道的不同模型
+#: 也可能不同（MiniMax M3.1 只能调档，老 M3 能关）。给错字段的后果是
+#: **按了没反应**（服务端静默忽略），比没有这个开关更糟。
+THINKING_CONTROL: dict[str, dict] = {
+    "minimax": {
+        "mode": "effort",
+        "field": "reasoning_effort",
+        # 实测 2026-10-26：M3.1 系（含 Preview）吃这个字段；
+        # 老 M3 不吃（传了反而更慢）—— 见 provider.MiniMaxChatProvider 的注释。
+        "models": ("MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview"),
+        "levels": ("low", "medium", "high", "xhigh", "max"),
+        "note": "M3.1 关不掉思考，只能调档；省略档位 = 最高档（最慢最贵）",
+    },
+    "deepseek": {
+        "mode": "disable",
+        "field": "thinking",
+        # 实测 2026-10-26：flash 3.4s→2.4s、v4-pro 27.8s→8.2s，且 reasoning 归零。
+        "models": ("deepseek-chat", "deepseek-reasoner", "deepseek-flash", "deepseek-v4-pro"),
+        "levels": ("default", "off"),
+        "note": "能关掉思考（实测 v4-pro 27.8s → 8.2s）",
+    },
+    "openai": {
+        # 通用 OpenAI 兼容渠道：可以为任何厂商服务，所以**按模型名认**。
+        # DeepSeek 走这条渠道时也命中（`/v1` + Bearer，与本渠道同形）。
+        "mode": "disable",
+        "field": "thinking",
+        "models": ("deepseek-chat", "deepseek-reasoner", "deepseek-flash", "deepseek-v4-pro"),
+        "levels": ("default", "off"),
+        "note": "通用渠道：DeepSeek 系可关思考；其它模型不保证，未验证",
+    },
+}
+
+#: 渠道 → 该渠道下「模型名 → 控制方式」的解析结果。
+def thinking_control_for(provider: str, model: str = "") -> dict:
+    """这个渠道 + 这个模型能用哪种思考控制？拿不准就返回 {"mode": "none"}。
+
+    **宁可返回 none，也不给一个按了没反应的开关** —— 服务端对不认识的字段是
+    静默忽略的，用户会以为生效了。
+
+    两条容易踩的坑（都实测过）：
+    1. **同一个渠道的不同模型规则不同**：MiniMax M3.1 只能调档（关不掉），
+       而老 M3 不认 effort（传 low 反而更慢 22.8s vs 19.9s），它走 thinking=disabled。
+    2. **通用兼容渠道按模型名认厂商**：DeepSeek 就是从这条渠道进来的。
+    """
+    provider = (provider or "").strip().lower()
+    model = (model or "").strip()
+
+    if provider == "minimax":
+        if model.startswith("MiniMax-M3.1"):
+            # 只能调档：关不掉（disabled → 400），省略 = max
+            return {"mode": "effort", "field": "reasoning_effort",
+                    "levels": ("low", "medium", "high", "xhigh", "max"),
+                    "note": "M3.1 关不掉思考，只能调档；省略档位 = 最高档（最慢最贵）"}
+        if model.startswith("MiniMax-M3"):
+            # 老 M3：不认 effort（实测传了更慢）；能关，代码里已默认关
+            return {"mode": "disable", "field": "thinking",
+                    "levels": ("off",),
+                    "note": "老 M3 只能关思考（它不认 effort，默认就关着）"}
+        return {"mode": "none", "field": None, "levels": (), "note": ""}
+
+    if provider == "openai":
+        # 通用兼容渠道：只有实测过的 DeepSeek 系给出开关
+        if any(model.startswith(m) for m in ("deepseek-chat", "deepseek-reasoner",
+                                             "deepseek-flash", "deepseek-v4-pro")):
+            return {"mode": "disable", "field": "thinking",
+                    "levels": ("default", "off"),
+                    "note": "实测可关（v4-pro 27.8s → 8.2s，reasoning 归零）"}
+        return {"mode": "none", "field": None, "levels": (), "note": ""}
+
+    spec = THINKING_CONTROL.get(provider)
+    if spec is None:
+        return {"mode": "none", "field": None, "levels": (), "note": ""}
+    return {
+        "mode": spec["mode"],
+        "field": spec["field"],
+        "levels": spec["levels"],
+        "note": spec["note"],
+    }
+
+
 PROVIDER_META: dict[str, dict] = {
     "zhipu": {
         "label": "智谱 GLM",
@@ -183,6 +270,11 @@ _DB_KEY_MODELS = "llm.models"
 #: 角色配置的六个字段（与 `Settings.get_provider_config` 的返回契约一致）。
 _ROLE_FIELDS: tuple[str, ...] = (
     "provider", "api_key", "base_url", "model", "max_tokens", "timeout",
+    # 思考档位（2026-10-26）。取值由渠道决定：
+    #   MiniMax M3.1 → low/medium/high/xhigh/max（关不掉，只能调档）
+    #   DeepSeek / 通用渠道 → default/off（off = 关掉思考）
+    #   其它渠道 → 不出现（未验证的控制字段按下去没反应，比没有更糟）
+    "thinking",
 )
 #: 其中取整数的字段（AppSetting 里按字符串存，读回时转 int）。
 _ROLE_INT_FIELDS: frozenset[str] = frozenset({"max_tokens", "timeout"})
@@ -350,6 +442,12 @@ def _current(db: Session) -> dict:
         "model": model,
         "keys": keys_status,
         "providers": PROVIDER_META,
+        # 每个渠道 + 当前模型能用的思考档位（拿不准就是 mode=none，
+        # 界面上不给按了没反应的开关）。
+        "thinking_options": {
+            name: thinking_control_for(name, (meta.get("default_models") or [""])[0])
+            for name, meta in PROVIDER_META.items()
+        },
         "effective": effective,
         # 第 7 步：分角色视图（前端「模型设置」页的数据基础）。
         # 三个角色各一块，键名与前端 LlmConfig 的字段一一对应。

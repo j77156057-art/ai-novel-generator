@@ -261,6 +261,15 @@ class Settings(BaseSettings):
     writer_base_url: str = _WRITER_DEFAULTS.get("base_url", "")
     writer_model: str = _WRITER_DEFAULTS.get("model", "")
     writer_max_tokens: int = int(_WRITER_DEFAULTS.get("max_tokens", 2048))
+    # 思考档位（2026-10-26）。取值由渠道+模型决定，见
+    # `routers/settings.py` 的 thinking_control_for()：
+    #   MiniMax M3.1 → low/medium/high/xhigh/max（关不掉，只能调档）
+    #   DeepSeek / 通用渠道 → off（关掉思考）
+    #   留空 → 不发任何字段（保持官方默认，行为与加这个开关之前一致）
+    writer_thinking: str = ""
+    assistant_thinking: str = ""
+    distiller_thinking: str = ""
+
     writer_timeout: int = int(_WRITER_DEFAULTS.get("timeout", 120))
 
     assistant_provider: str = _ASSISTANT_DEFAULTS.get("provider", "zhipu")
@@ -378,6 +387,7 @@ class Settings(BaseSettings):
                 "model": self.writer_model,
                 "max_tokens": self.writer_max_tokens,
                 "timeout": self.writer_timeout,
+                "thinking": self.writer_thinking,
                 # 标记：writer 空 provider 时由工厂委托给原 Writer 单例
                 "_fallback_to_legacy": not bool(self.writer_provider),
             }
@@ -403,6 +413,7 @@ class Settings(BaseSettings):
                 "model": str(getattr(self, f"{role}_model") or "").strip(),
                 "max_tokens": getattr(self, f"{role}_max_tokens"),
                 "timeout": getattr(self, f"{role}_timeout"),
+                "thinking": str(getattr(self, f"{role}_thinking") or "").strip(),
                 "_fallback_to_legacy": False,
             }
         raise ValueError(f"未知 role: {role!r}（应为 'writer' / 'assistant' / 'distiller'）")

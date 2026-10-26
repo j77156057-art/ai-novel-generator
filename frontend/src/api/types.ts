@@ -278,11 +278,28 @@ export interface ExpertQuestions {
  */
 export type LlmRole = "writer" | "assistant" | "distiller";
 
+/**
+ * 这个渠道的「思考」控制方式（后端按渠道+模型算好后下发）。
+ *
+ * mode:
+ *   "effort"  → 只能调档（MiniMax M3.1 关不掉思考）
+ *   "disable" → 能开关（DeepSeek 类）
+ *   "none"    → 未验证/不支持 ⇒ 界面上**不显示**这个控件
+ */
+export interface LlmThinkingControl {
+  mode: "effort" | "disable" | "none";
+  field: string | null;
+  levels: string[];
+  note: string;
+}
+
 export interface LlmProviderMeta {
   label: string;
   key_hint: string;
   free_note: string;
   default_models: string[];
+  /** 拿不到 / 未验证就不给开关（按了没反应比没有更糟）。 */
+  thinking?: LlmThinkingControl;
 }
 
 export interface LlmKeyStatus {
@@ -359,6 +376,13 @@ export interface LlmRoleSavePayload {
   base_url?: string | null;
   /** 仅 writer：候选模型链（限流切换用）。 */
   models?: string[] | null;
+  /**
+   * 思考档位（取值由渠道+模型决定）：
+   *   MiniMax M3.1 → low / medium / high / xhigh / max（关不掉，只能调档）
+   *   DeepSeek 类  → off（关掉思考）
+   * null / 空 = 不改变（后端不发该字段，行为与没这个开关时一致）。
+   */
+  thinking?: string | null;
   /** 仅 assistant：助手模型的 max_tokens / timeout。 */
   max_tokens?: number | null;
   timeout?: number | null;
@@ -389,6 +413,8 @@ export interface LlmTestResult {
 export interface LlmRoleConfig {
   provider: string;
   model: string;
+  /** 思考档位（取值由渠道决定；空 = 不发这个字段）。 */
+  thinking?: string | null;
   /** 脱敏 key（如 "95ef…"）；null = 该角色尚未保存 key。 */
   api_key_masked: string | null;
   has_key: boolean;
