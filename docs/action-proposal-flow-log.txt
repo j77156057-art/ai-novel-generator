@@ -1,0 +1,32 @@
+蒸馏库条目 #4
+项目 id=8，档案已应用
+
+【提提案之前】
+  write_body  blocked / 还没有剧情大纲 —— 写出来的正文过不了正文审查（正文审查要拿每段的段契约当判据基准）。
+  当前步: write_body
+
+【agent 构造的卡】kind=action_proposal endpoint=/api/assistant/action-proposals
+  库里动作提案行数 = 0（只构造，没落库）✓
+  提案已创建：id=1 status=pending
+  前提：项目还没有剧情大纲，且设定与人物没变
+  已批准 status=approved
+  已执行：大纲已写入。下一步写正文时，引擎会据此规划剧情节点并冻结段契约（段契约是正文审查的判据基准）。
+
+【写正文】
+  HTTP 200
+
+【提案之后】
+  corpus_ready     done     参考语料已切分 5323 片。
+  clean_check      done     抽检通过（5 条提示不阻塞）。
+  distill          done     文风档案已就位（从蒸馏库应用）。
+  review_narrative done     蒸馏产物审查通过（15 条提示不阻塞）。
+  review_prompt    done     提示词体检通过（0 条提示不阻塞）。
+  write_body       done     已写出 2 段。
+  review_body      pending  还没做整段验收（要先跑闭环审计）。
+  repair           done     没有待批的写回建议。
+  converged        pending  还没到「正文审查」（还没做整段验收（要先跑闭环审计）。）
+  当前步: review_body
+  gates: []
+
+  时间线节点: ['n1', 'n2', 'n3']
+  冻结段契约: ['1', '2']

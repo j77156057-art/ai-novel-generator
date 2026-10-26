@@ -144,7 +144,7 @@ flowchart TD
     Gen -->|段级总结| Tree[层级摘要树 Summary Tree]
     Tree -->|有界前情 compose_prior + 覆盖证明| Gen
     Gen -->|Writer 续写| LLM1[Writer Model]
-    Gen -->|诊断 / 提卡| AG[助理 Agent · 25 工具]
+    Gen -->|诊断 / 提卡| AG[助理 Agent · 28 工具]
     AG -->|提案 Proposal| Gate[提案闸门 人批]
     Gate -->|批准| Gen
     Gate -->|版本快照| Ver[(Versions · diff · restore)]
@@ -211,7 +211,7 @@ npm run dev            # http://localhost:5173 , /api proxies to :8000
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/ -q              # 1,300 项用例
+python -m pytest tests/ -q              # 1,422 项用例
 ```
 
 主要端点(完整清单在 `docs/`):
@@ -273,8 +273,8 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **1,300** 项 pytest 用例（单源真源，`pytest tests/`） |
-| `docs/` | 48 份设计文档与指南：架构怎么定的、判据为什么这么定 |
+| `tests/` | **1,422** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `docs/` | 61 份设计文档与指南：架构怎么定的、判据为什么这么定 |
 | `ENGINEERING.md` | 工程纪律：每一条规矩背后都是一次真实踩坑 |
 | `data/seed/` | 语料**投放区**（空目录 + 投放说明） |
 
@@ -287,6 +287,8 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 - **任何真实作品的书名与人物名** —— 文中出现的《北荒刀歌》《焚天录》《镜中局》等书名，
   以及陆长风、老周、楚惊蛰等人物，**全部是自造的示例**，不指向任何真实作品或出版书。
   真实语料只在本机投放、按需替换即可（见 `data/seed/README-投放真实语料.md`）。
+  唯一提到真实出版物的只有**公版古典**（《红楼梦》这类），它们只出现在「公版书怎么解析、
+  怎么切章」这类规则的举例里，不含任何正文。
 
 ---
 
@@ -305,10 +307,14 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   `tests/qa4_verify_proposal_write_path.py`(提案写路径)、
   `tests/qa6_assistant_browser_smoke.py`(真实浏览器端到端)。
 - **构建闸门** —— 前端要 `vue-tsc --noEmit` + `vite build` 都过;后端有真实 `uvicorn` HTTP 冒烟。
-- **空白机自检** —— 仓库在一台**干净机器**上跑过完整一遍:新建 venv → 装依赖 → 照 README 复制
-  `.env` → 空 SQLite 起服务 → 打真实 HTTP → 前端 `npm install && npm run build`。
-  19 项全绿(零 key、零配置、零手工干预)。
-- **规模** —— 后端 **1,300** 项测试(`pytest tests`),前端 7 个纯逻辑测试文件。
+- **空白机自检** —— 仓库**已发布的那棵树**（`git archive HEAD` 导到干净目录）真跑过一遍：
+  新建 venv → `pip install -r backend/requirements.txt` → `pytest tests/` 全绿 →
+  照 README 复制 `.env` → 空 SQLite 起 uvicorn → `/openapi.json` 与 `/api/novels`
+  真打 HTTP 200 → 前端 `npm ci && npm run build` 产出 dist
+  （零 key、零配置、零手工干预）。
+  这轮复验抓出并修掉三个真问题（venv 被全仓扫描、脚本式断言假绿、全局队列跨测试串味），
+  详见 `ENGINEERING.md`「发布前体检」。
+- **规模** —— 后端 **1,422** 项测试(`pytest tests`)，前端 7 个纯逻辑测试文件（38 项）。
   **当前全绿**。此前长期红的 8 项已清零：7 项是断言滞后于设计变更(采样率 15%→30%、
   维度 14→16、采样加了「30 万字下限保护」)，1 项是模型清单三处不一致的真 bug;
   另有 1 处是测试自己的假 provider 少实现 `async_chat` 接口，导致计数失真

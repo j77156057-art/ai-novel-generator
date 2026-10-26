@@ -1606,3 +1606,63 @@ pip 会退回源码编译，然后要本机有 `pg_config`（PostgreSQL 开发�
 **验收方式**：真 clone 到新目录 → 新建 venv → `pip install -r requirements.txt`（走网络）
 → 空 SQLite 起 uvicorn → 打真实 HTTP → 前端 `npm install && npm run build`。
 
+## 发布前体检：把「面试官在空白电脑上 clone 下来」当第一用例（2026-10-26）
+
+发布版的目标读者是**面试官**：他在自己电脑上 clone、装依赖、跑测试、起服务。
+所以「能不能在空白机器上跑」不是加分项，是**及格线**。这次把已发布的那棵树
+（`git archive HEAD`，433 个文件）导到干净目录，真跑了一遍，抓到三个真问题。
+
+### 怎么验（别只在自己的机器上跑）
+
+    git archive HEAD | tar -x -C <干净目录>     # 导出**已发布**的那棵树
+    python -m venv .venv && .venv/Scripts/python -m pip install -r backend/requirements.txt
+    .venv/Scripts/python -m pytest tests/ -q
+    .venv/Scripts/python -m uvicorn app.main:app --port 8899   # 打真实 HTTP
+    cd frontend && npm ci && npm run build
+
+用 `git archive` 而不是扫工作副本：工作副本里有未提交的文件，扫出来的结论会骗人。
+
+### 抓到的三个真问题（都不是「洁癖」，是会让人当场卡住的）
+
+1. **测试把刚装出来的 venv 也扫进去了**。
+   `tests/test_exemplar_paragraph_form.py` 用 `REPO.rglob("*.py")` 全仓扫「字符串字面量
+   含真实换行」这种坏写法，排除清单里**没有 `.venv`**。README 第一步就是
+   `python -m venv .venv`，于是面试官 `pip install` 之后这条测试必红 ——
+   报的还是 `fastapi/sqlalchemy/pygments` 的源码行，全是误报。
+   本机 venv 建在仓库外，所以一直绿着。**教训：全仓扫描类测试必须显式排除
+   `.venv / venv / site-packages / dist / node_modules`**，
+   否则「装完依赖就跑测试」这个最常见的动作会把它引爆。
+
+2. **「脚本式断言」的测试挂进 pytest 是假绿**。
+   有一批文件的 `check()` 只往 `FAILED` 列表里记一笔、**不抛异常**，
+   文件末尾 `sys.exit(0 if FAIL == 0 else 1)`。它们单跑会红，但被 pytest 收进去以后
+   **永远绿** —— 断言根本没生效。改成 `assert` 之后，这些文件立刻暴露出
+   三处与当前实现脱节的旧断言（provider 签名加了 `max_tokens`、
+   `features` 从 20 维长到 21 维、节点提示词措辞换了）。
+   **规矩：`check()` 在 pytest 里必须抛**；脚本式文件要么改成断言，要么就别放进 `tests/`。
+
+3. **模块级全局状态会跨测试串味**。
+   `app.kg.batch_worker` 的队列是**进程级全局**的，`engine` 里调 `ensure_worker()`
+   会拉起后台线程去消费它。有一条 e2e 测试单跑绿、全量跑红 ——
+   后台线程把它的批抢走了，批里混着前面别的测试塞进去的段，落库失败，
+   它看到「0 个 event」。
+   修法：测试期间停掉 worker、用独占的 project id、先把队列里本项目的残留倒干净，
+   `finally` 里把 `SessionLocal` 与 worker 状态还原。
+   **规矩：测全局队列/单例，必须自己把「谁在消费」这件事钉死**，
+   否则绿红全看测试顺序。
+
+### 发布卫生（这几项每次发版都扫）
+
+| 项 | 判据 | 这次的结果 |
+|---|---|---|
+| 路径硬依赖 | 代码/文档里不得出现本机绝对路径 | 0 处（`C:\Users\…` 全清） |
+| 密钥 | 扫 `sk- / ghu_ / ghp_ / AKIA / eyJ` | 0 处 |
+| 内部文件 | 不带语料、验收产物、任务书/PRD、交接单 | 未发现（`data/seed/` 只有投放说明） |
+| 悬空引用 | 文档/代码提到的仓库内文件必须存在 | **25 处 → 0**（补回 12 份设计文档 + 9 个测试文件） |
+| 真实作品专名 | 不出现任何真实出版作品的书名/人物名/作者名 | **130+ 处 → 0**（中性化为本项目自造世界观） |
+
+真实作品专名这条最容易漏：README 里写着「书名与人物名全部是自造的示例」，
+但代码注释里还留着**真书的角色名**（被探测过的那本书的主角、他的家族名、作者署名）。
+这种泄漏在面试官眼里是「这不是他写的」—— 一条注释就能毁掉整份可信度。
+本项目自己的书名（《北荒刀歌》《焚天录》《镜中局》）与公版古典（《红楼梦》这种
+用来举解析规则的例子）不属于这一类，但要在 README 里写清楚差别。

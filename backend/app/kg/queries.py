@@ -103,7 +103,7 @@ def get_reminders(db, project_id: int, source: str = "generated",
     风格检索混淆成事实约束。这是「设计上隔离、实现上没贯穿」的修复点。
 
     top_k：清单封顶（默认 REMINDER_TOP_K）。生成路径**必须**封顶，否则提示词随账本
-    线性膨胀（见 docs/验收指标.md §6）。top_k=None 不封顶，仅供一次性人工查阅的 API。
+    线性膨胀（见 docs/acceptance-metrics.md §6）。top_k=None 不封顶，仅供一次性人工查阅的 API。
     """
     holes = db.scalars(
         select(KgNode).where(

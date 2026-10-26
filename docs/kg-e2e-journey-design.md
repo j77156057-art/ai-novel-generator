@@ -1,5 +1,7 @@
 # e2e user journey 测试设计（kg-e2e-user-journey）
 
+> 本文提到的 `scratch/…` 是本地工作目录下的脚本与中间产物，**不随仓库分发**（仓库只留设计与结论）。
+
 > 2026-10-16。目标：补齐候选 #6——「用户视角」全链路测试。
 > 现状：所有 v3.0 测试都是**单段级 mock**（内存库 + 构造数据），
 > 没有一条测试是「从建项目开始，一路点到豁免」的真实流程。
@@ -40,7 +42,7 @@
 | 项 | 值 | 来源 |
 |---|---|---|
 | provider | zhipu / glm-4-flash | 用户 2026-10-16 指定 |
-| 语料 | 红楼梦 (data/seed/红楼梦.txt, 1047687 字) | reference_novel_ids |
+| 语料 | 本地投放的公版长篇（1,047,687 字；正文不入库） | reference_novel_ids |
 | 段数 | 8 段 | v2.6 同参数（20-30 分钟量级） |
 | generation_length | 3000+ 字 | 用户对样本量的下限要求 |
 | table_seed | 新建空库 | 幂等，不用续跑 |
@@ -78,7 +80,7 @@
 收尾: kill 服务进程（taskkill /F /PID，单斜杠）
 ```
 
-测试文件（正式化）：`backend/tests/test_e2e_journey_pipeline.py`——
+测试文件（正式化）：`tests/test_e2e_journey_pipeline.py`——
 按 skill 的模板**不依赖网络/智谱**，mock provider 走**同样的六步流程**
 （建项目→mock 生成→mock 批抽→读侧→断言→豁免），
 保证「流程本身」有回归保护，真 LLM 冒烟脚本只跑一次手工触发。

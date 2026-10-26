@@ -1,8 +1,8 @@
 """把 data/seed/ 下的真实小说 txt 灌入库并重建知识图谱。
 
 背景：RAG 每次生成都会把检索到的语料原文作为"文风参考"注入提示词。原来库里
-只有 322 字 demo 文本（data/seed/sample_novel.txt），而那段文本本身带 AI 腔
-（段尾升华 + 旁白预告），模型在学它。换真人小说才能治本。
+只有一段 322 字 demo 文本（随仓库不带，见 data/seed/README-投放真实语料.md），
+而那段文本本身带 AI 腔（段尾升华 + 旁白预告），模型在学它。换真人小说才能治本。
 
 用法：
     python load_corpus.py                         # 灌入 data/seed 全部 txt + 重建图谱

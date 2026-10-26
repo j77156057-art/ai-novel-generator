@@ -287,7 +287,8 @@ Step(id, 名称, 前置条件, 读工具, 写提案类型, 判据, 下一跳)
 | 4a | 阶段三那篇用**真实判官**重审（审计 0 违例 + 整段验收 accepted）→ `docs/stage3-real-rerun.md` | ✅ 已做 |
 | 4b | 一本**真书**（《北荒刀歌》 990 章）从交稿走到收敛的完整九道工序 → `docs/realbook-full-flow.md` | ✅ 已做 |
 
-**还没做完的**（逐条带状态与依据）：`docs/assistant-open-items.md`。
+**还没做完的**（逐条带状态与依据）：见下方「片 4b 挖出来的缺口」与
+`docs/acceptance-metrics.md` 里标「需人工」的验收项。
 
 **片 4b 挖出来的缺口（片 2c / 3 要解决的）**：工序链的「写正文」这步
 `write_proposal=None` —— agent 看得见「写正文 pending」，却没法提一个

@@ -113,5 +113,4 @@ percentile 100% 常态不等于告警无用。**以下场景** percentile > 99.5
 - `docs/percentile_root_cause_analysis.md`：13 轮验证 percentile 100% 真因
 - `docs/style_log_buckets_design.md`：方案 B「对数粒度 profile」设计
 - `docs/style_length_normalize_design.md`：方案 C「features 长度归一化」设计
-- `docs/v21-v220_*_smoke_*.json`：20 轮真链路 + probe raw 数据
-- `docs/kg-v3-stage5-handoff.md`：stage5 接手文档（方案 C 实施 + 真链路仍 100%）
+- `docs/realbook-full-flow.md`：真书全流程九道工序的落地记录
