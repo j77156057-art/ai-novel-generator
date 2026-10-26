@@ -1,0 +1,11 @@
+# 开发/测试依赖（跑测试用；只跑服务不需要这个文件）
+#
+# 用法：
+#   cd backend
+#   pip install -r requirements-dev.txt
+#   cd .. && python -m pytest tests/ -q
+#
+# 为什么单独一个文件：服务运行只需要 requirements.txt 里的那些；
+# 测试额外要 pytest，而 httpx（TestClient 的硬依赖）已经在 requirements.txt 里了。
+-r requirements.txt
+pytest==9.1.1

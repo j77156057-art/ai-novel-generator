@@ -196,6 +196,15 @@ npm run dev            # http://localhost:5173 , /api proxies to :8000
 > 以前 `psycopg2-binary==2.9.9` 没有 Python 3.13 的预编译轮子,pip 会退回源码编译然后
 > 要本机装 `pg_config`,空白机器上必然卡死。
 
+**跑测试**(可选,面试官最常做的第一件事):
+
+```bash
+cd backend
+pip install -r requirements-dev.txt     # 额外的只有 pytest
+cd ..
+python -m pytest tests/ -q              # 1,300 项用例
+```
+
 主要端点(完整清单在 `docs/`):
 
 ```bash
