@@ -64,11 +64,22 @@ def _has_quote(p: str) -> bool:
     return any(q in p for q in _OPENERS)
 
 
+def _outside_chars(p: str) -> int:
+    """引号外的字数 —— **与 `is_bare_paragraph` 同一个口径**。
+
+    ⚠️ 这里必须复用尺子自己的算法，不能另写一套：判定「是不是纯台词段」
+    看的就是这个数（≤ 6 即为纯台词段），而并段的收益也完全取决于它 ——
+    并进来的叙述若只贡献 ≤ 6 字，并完之后那一段**仍然是纯台词段**，
+    指标一动不动（白并）。所以门槛必须从这条边界推出来。
+    """
+    return len(_strip_quoted(p).strip("：:，。！？…、；; \t　"))
+
+
 def merge_bare_dialogue(
     paragraphs: Sequence[str],
     target_ratio: float,
     *,
-    min_narration_chars: int = 20,
+    min_narration_chars: int | None = None,
 ) -> tuple[list[str], dict]:
     """把「纯台词段」并进它前面那段叙述，逼近目标裸台词占比。
 
@@ -99,6 +110,14 @@ def merge_bare_dialogue(
         info["reason"] = "已经贴近目标"
         return paras, info
 
+    # 门槛 = **指标自己的边界**：叙述的引号外字数必须 > BARE_TAIL_MAX，
+    # 并进来之后那一段才不再是「纯台词段」。
+    # （早先用「原始长度 ≥ 20 字」是拍脑袋的数：它把 7~19 字的短叙述
+    #   全挡在外面 —— 而那些段并进来照样能把指标拉下来。实测 9 段真实产物：
+    #   旧门槛并 77 段（71.5% → 56.3%），按边界并 112 段（→ 49.3%）；
+    #   参考书 40 万字 22.7% → 旧 19.4% / 新 18.7%。两边内容都逐字未变。）
+    gate = BARE_TAIL_MAX + 1 if min_narration_chars is None else min_narration_chars
+
     # 从后往前并：每并一段，它前面那段叙述就归它所有
     merged = 0
     drop: set[int] = set()
@@ -112,7 +131,7 @@ def merge_bare_dialogue(
         if j < 0:
             continue
         prev = paras[j]
-        if _has_quote(prev) or len(prev.strip()) < min_narration_chars:
+        if _has_quote(prev) or _outside_chars(prev) < gate:
             continue
         paras[i] = f"{prev.strip()}{paras[i].strip()}"
         drop.add(j)
