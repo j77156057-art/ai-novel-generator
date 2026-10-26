@@ -1,0 +1,16 @@
+# PostgreSQL + pgvector 专用依赖（可选）
+#
+# 用法：
+#   docker compose up -d                              # 起 PG（pgvector 镜像）
+#   pip install -r requirements-postgres.txt          # 装驱动
+#   DATABASE_URL=postgresql+psycopg2://novel:novel@localhost:5432/novel
+#
+# 只用 SQLite（零配置起步）的话**不需要**这个文件。
+#
+# 版本说明：psycopg2-binary 从 2.9.9 提到 2.9.10 ——
+#   2.9.9 没有 Python 3.13 的预编译轮子，pip 会退回源码编译，
+#   而源码编译要求本机有 pg_config（PostgreSQL 开发环境），空白机器上必然失败。
+#   2.9.10 提供 cp313 预编译轮子，装即用。
+-r requirements.txt
+pgvector==0.3.1
+psycopg2-binary==2.9.10

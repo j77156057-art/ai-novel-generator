@@ -1,0 +1,50 @@
+{
+  "id": "prompt_health_audit",
+  "version": 1,
+  "status": "experimental",
+  "applicable_tasks": [
+    "prompt_health_audit"
+  ],
+  "agent_roles": [
+    "diagnostic"
+  ],
+  "required_capabilities": [
+    {
+      "id": "inspect_prompt_health",
+      "min_version": 1
+    }
+  ],
+  "steps": [
+    {
+      "id": "assemble",
+      "capability": "inspect_prompt_health",
+      "requires": [],
+      "observe": [
+        "组装一次 writer 的静态系统提示词，逐条查静默失败",
+        "文风档案有没有真进到提示词里（没进 → 蒸馏白做）",
+        "原创模式有没有漏进参考书的角色说话方式（漏进 → 正文开始像参考书）",
+        "禁用词与档案正文是否自相矛盾；提示词是否过长"
+      ]
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "narrative_presence_checked",
+      "requires_evidence": true
+    },
+    {
+      "id": "override_contradiction_checked",
+      "requires_evidence": true
+    }
+  ],
+  "source_evidence": [],
+  "failure_boundaries": [
+    "static_prompt_only",
+    "no_artistic_quality_guarantee",
+    "no_business_write",
+    "no_prompt_mutation",
+    "unknown_preserved"
+  ],
+  "allowed_actions": [],
+  "supersedes": null
+}

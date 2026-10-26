@@ -1,0 +1,2503 @@
+{
+  "previous": {
+    "run_id": 77,
+    "scope": {
+      "segment_nos": [
+        1
+      ]
+    },
+    "checks": [
+      {
+        "id": "time_1",
+        "status": "supported",
+        "reason": "开头为九点整，随后时钟显示九点四十，约九点四十五分进行复核，时间先后连续。",
+        "citations": [
+          {
+            "source_id": "G1P001",
+            "quote": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。",
+            "start": 0,
+            "end": 59,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P092",
+            "quote": "每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”",
+            "start": 3081,
+            "end": 3143,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P130",
+            "quote": "陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”",
+            "start": 4376,
+            "end": 4506,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      },
+      {
+        "id": "place_2",
+        "status": "supported",
+        "reason": "林夏、陈舟、桌面、图册及登记本均处于同一室内检查场景；窗外车辆和社区声音未引入另一参与地点。",
+        "citations": [
+          {
+            "source_id": "G1P001",
+            "quote": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。",
+            "start": 0,
+            "end": 59,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P003",
+            "quote": "陈舟已经在桌边站了一会儿，他把袖口往上挽了半截，点点头：“先检查封面，再翻正文？”",
+            "start": 111,
+            "end": 152,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P005",
+            "quote": "窗外有送货车倒车的提示音，隔着玻璃传进来，拖得很长，陈舟的手便停在图册上方，等林夏示意，才用两指捏住封面右下角。",
+            "start": 227,
+            "end": 283,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P092",
+            "quote": "每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”",
+            "start": 3081,
+            "end": 3143,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P119",
+            "quote": "窗外传来社区门口开门的声音，接着有人拖着购物车轮子经过，轮子在门槛处卡了一下，声音停在门外，又重新响起来，陈舟的手指也跟着停了一瞬，随后把第四十七页压平。",
+            "start": 3981,
+            "end": 4058,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      },
+      {
+        "id": "participants_3",
+        "status": "supported",
+        "reason": "主要参与者始终为林夏和陈舟；两人共同检查旧植物图册、填写并复核登记本，未见参与者增减冲突。",
+        "citations": [
+          {
+            "source_id": "G1P001",
+            "quote": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。",
+            "start": 0,
+            "end": 59,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P003",
+            "quote": "陈舟已经在桌边站了一会儿，他把袖口往上挽了半截，点点头：“先检查封面，再翻正文？”",
+            "start": 111,
+            "end": 152,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P014",
+            "quote": "陈舟嗯了一声，翻开登记本，林夏便放慢语速报出封面情况：“封面中部横向旧折痕，靠近上沿，纸面有压痕，是否伴随纸纤维裂开，待复核。右下角翘起，线脚外露。”",
+            "start": 562,
+            "end": 637,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P075",
+            "quote": "陈舟看了看窗外的天色，又低头看图册，窗玻璃上映出桌边两个人的影子，一个坐着，一个站着，他把第十一页托稳，重新翻过去。",
+            "start": 2473,
+            "end": 2531,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P130",
+            "quote": "陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”",
+            "start": 4376,
+            "end": 4506,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P143",
+            "quote": "陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。",
+            "start": 5009,
+            "end": 5088,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      },
+      {
+        "id": "object_state_4",
+        "status": "contradicted",
+        "reason": "登记本在同一检查时段被翻开、陈舟写下第一行，之后持续记录、补记、核对页码并被林夏圈改，末尾却称“登记本都还没有使用”。这里的登记本是同一物件，“使用”明显包含记录行为，不能由刷和压板尚未开始加固反推登记本未使用。",
+        "citations": [
+          {
+            "source_id": "G1P014",
+            "quote": "陈舟嗯了一声，翻开登记本，林夏便放慢语速报出封面情况：“封面中部横向旧折痕，靠近上沿，纸面有压痕，是否伴随纸纤维裂开，待复核。右下角翘起，线脚外露。”",
+            "start": 562,
+            "end": 637,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P015",
+            "quote": "陈舟写下第一行，笔尖随即停住：“待复核要写到哪里？封面问题这一栏？”",
+            "start": 639,
+            "end": 673,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P017",
+            "quote": "他应了一声，把那行补完整，林夏又看向他：“再检查一遍。”",
+            "start": 714,
+            "end": 742,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P047",
+            "quote": "陈舟把笔尖压低，写完又从头看了一遍，字挤得有点紧，他往后退了一点，问：“要不要把第二页也单独列一项？”",
+            "start": 1671,
+            "end": 1722,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P061",
+            "quote": "陈舟抿了抿嘴，重新检查那一页，纸边虽然有裂痕，线脚还在，页脚也没有大范围移动，他在登记本上补了一句“未见明显脱线”，刚写完，林夏便伸手轻轻按住纸页。",
+            "start": 2107,
+            "end": 2181,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P092",
+            "quote": "每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”",
+            "start": 3081,
+            "end": 3143,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P112",
+            "quote": "陈舟补完，才发现前面有几处页码写得不够具体，他翻回第十四页，把“页角有折”改成“第十四页右下角短折痕”，又翻回第二十九页，把“裂”改成“靠近下沿短裂口，长度待量”。",
+            "start": 3674,
+            "end": 3756,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P128",
+            "quote": "陈舟把笔尖落到登记本上，写下那行字，写到“连续”时，他停了一下：“要写‘初步’吗？”",
+            "start": 4288,
+            "end": 4330,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P130",
+            "quote": "陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”",
+            "start": 4376,
+            "end": 4506,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P136",
+            "quote": "“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”",
+            "start": 4717,
+            "end": 4818,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P145",
+            "quote": "陈舟看着那本旧图册，封面的折痕从中间横过去，纸面被压出的凹线还没有因为检查而改变，登记本上那一行行字，留着不同页码、不同位置和问题描述。",
+            "start": 5140,
+            "end": 5208,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P154",
+            "quote": "桌面上的刷、压板和登记本都还没有使用，旧图册保持摊开的状态，等着下一步。",
+            "start": 5517,
+            "end": 5553,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      },
+      {
+        "id": "object_state_5",
+        "status": "supported",
+        "reason": "就图册加固工具而言，末尾前明确说明尚未开始刷、尚未开始压，方案也仍待下一步，因此刷子、浆糊和压板尚未用于加固有直接支持。软刷前文仅被用于轻碰胶带边缘，不能把这一试探性动作扩大为加固使用，也不能据此消解登记本矛盾。",
+        "citations": [
+          {
+            "source_id": "G1P002",
+            "quote": "“先不刷浆糊。”她说，“先看一遍。哪里松，哪里裂，哪一页会跟着动，都记下来。看不清的地方别猜。”",
+            "start": 61,
+            "end": 109,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P085",
+            "quote": "陈舟没马上回答，他拿着软刷的刷柄，用刷背轻轻碰了碰胶带边缘，胶带一动，下面便有一小片纸色跟着变浅。",
+            "start": 2821,
+            "end": 2870,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P136",
+            "quote": "“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”",
+            "start": 4717,
+            "end": 4818,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P143",
+            "quote": "陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。",
+            "start": 5009,
+            "end": 5088,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P144",
+            "quote": "林夏逐样点过：“纸、浆糊、刷子、压板、垫纸、登记本，都在桌面上。现在没有开始刷，也没有开始压。”",
+            "start": 5090,
+            "end": 5138,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P154",
+            "quote": "桌面上的刷、压板和登记本都还没有使用，旧图册保持摊开的状态，等着下一步。",
+            "start": 5517,
+            "end": 5553,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      }
+    ],
+    "observations": [
+      {
+        "capability": "read_body_consistency",
+        "data": {
+          "sources": {
+            "G1P001": {
+              "source_id": "generation:10",
+              "quote": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。",
+              "start": 0,
+              "end": 59
+            },
+            "G1P002": {
+              "source_id": "generation:10",
+              "quote": "“先不刷浆糊。”她说，“先看一遍。哪里松，哪里裂，哪一页会跟着动，都记下来。看不清的地方别猜。”",
+              "start": 61,
+              "end": 109
+            },
+            "G1P003": {
+              "source_id": "generation:10",
+              "quote": "陈舟已经在桌边站了一会儿，他把袖口往上挽了半截，点点头：“先检查封面，再翻正文？”",
+              "start": 111,
+              "end": 152
+            },
+            "G1P004": {
+              "source_id": "generation:10",
+              "quote": "“先封面，再首页。”林夏把无酸纸袋往旁边挪开，给图册腾出一块地方，“页码不能因为看着完整就跳过。封面也要看折角和装订边，不是只摸一下松不松。”",
+              "start": 154,
+              "end": 225
+            },
+            "G1P005": {
+              "source_id": "generation:10",
+              "quote": "窗外有送货车倒车的提示音，隔着玻璃传进来，拖得很长，陈舟的手便停在图册上方，等林夏示意，才用两指捏住封面右下角。",
+              "start": 227,
+              "end": 283
+            },
+            "G1P006": {
+              "source_id": "generation:10",
+              "quote": "图册不厚，封面却比内页硬一些，他刚往上提，靠近书脊的位置便发出一声轻响，纸边随之翘起，下面露出暗色的线脚。",
+              "start": 285,
+              "end": 338
+            },
+            "G1P007": {
+              "source_id": "generation:10",
+              "quote": "“这个松了。”他说。",
+              "start": 340,
+              "end": 350
+            },
+            "G1P008": {
+              "source_id": "generation:10",
+              "quote": "“先说依据。”林夏没有低头记，“哪里松？”",
+              "start": 352,
+              "end": 373
+            },
+            "G1P009": {
+              "source_id": "generation:10",
+              "quote": "“封面右下角，离书脊大概三指宽，纸边翘起来了。用手一抬，能看见下面的线。”",
+              "start": 375,
+              "end": 412
+            },
+            "G1P010": {
+              "source_id": "generation:10",
+              "quote": "“还有呢？”",
+              "start": 414,
+              "end": 420
+            },
+            "G1P011": {
+              "source_id": "generation:10",
+              "quote": "陈舟把封面放平，指腹沿着折痕滑过去，横过封面中部有一道旧折痕，纸面微微凹下去，靠近上沿的地方颜色更浅，他用指甲在旁边比了一下，没有碰那道凹线。",
+              "start": 422,
+              "end": 493
+            },
+            "G1P012": {
+              "source_id": "generation:10",
+              "quote": "“这道也算松吗？”他问。",
+              "start": 495,
+              "end": 507
+            },
+            "G1P013": {
+              "source_id": "generation:10",
+              "quote": "林夏俯身看了看：“先别叫松。记‘旧折痕’，长度和位置也写上。松不松，要看纸有没有分离，不能凭颜色定。”",
+              "start": 509,
+              "end": 560
+            },
+            "G1P014": {
+              "source_id": "generation:10",
+              "quote": "陈舟嗯了一声，翻开登记本，林夏便放慢语速报出封面情况：“封面中部横向旧折痕，靠近上沿，纸面有压痕，是否伴随纸纤维裂开，待复核。右下角翘起，线脚外露。”",
+              "start": 562,
+              "end": 637
+            },
+            "G1P015": {
+              "source_id": "generation:10",
+              "quote": "陈舟写下第一行，笔尖随即停住：“待复核要写到哪里？封面问题这一栏？”",
+              "start": 639,
+              "end": 673
+            },
+            "G1P016": {
+              "source_id": "generation:10",
+              "quote": "“先写可见情况。判断留在后面。你别为了让句子完整，把没看见的东西补进去。”",
+              "start": 675,
+              "end": 712
+            },
+            "G1P017": {
+              "source_id": "generation:10",
+              "quote": "他应了一声，把那行补完整，林夏又看向他：“再检查一遍。”",
+              "start": 714,
+              "end": 742
+            },
+            "G1P018": {
+              "source_id": "generation:10",
+              "quote": "“什么？”",
+              "start": 744,
+              "end": 749
+            },
+            "G1P019": {
+              "source_id": "generation:10",
+              "quote": "“折痕两侧有没有裂口，翘起的地方能不能被手带动。你刚才看的是表面。”",
+              "start": 751,
+              "end": 785
+            },
+            "G1P020": {
+              "source_id": "generation:10",
+              "quote": "陈舟把图册重新转向自己，封面下方有些发灰，像长期放在潮气重的地方，他用指腹沿边缘压过，到了右下角时停住。",
+              "start": 787,
+              "end": 839
+            },
+            "G1P021": {
+              "source_id": "generation:10",
+              "quote": "“这里有两种声音。”他说，“一处是纸边摩擦，一处像线在里面被拉动。”",
+              "start": 841,
+              "end": 875
+            },
+            "G1P022": {
+              "source_id": "generation:10",
+              "quote": "“记声音吗？”",
+              "start": 877,
+              "end": 884
+            },
+            "G1P023": {
+              "source_id": "generation:10",
+              "quote": "“也要记？”",
+              "start": 886,
+              "end": 892
+            },
+            "G1P024": {
+              "source_id": "generation:10",
+              "quote": "“如果你判断它和脱线有关，就写观察到的触感。不要写成已经脱线。”",
+              "start": 894,
+              "end": 926
+            },
+            "G1P025": {
+              "source_id": "generation:10",
+              "quote": "陈舟把前半句划掉，重新改成：“右下角翘起，触碰时纸边摩擦，线脚有牵动感，未确认脱线。”",
+              "start": 928,
+              "end": 971
+            },
+            "G1P026": {
+              "source_id": "generation:10",
+              "quote": "林夏这才点头：“翻首页。”",
+              "start": 973,
+              "end": 986
+            },
+            "G1P027": {
+              "source_id": "generation:10",
+              "quote": "首页靠近书脊的地方有一小块起毛，纸张边缘没有破，但被封面遮住的一角颜色更深，陈舟翻得很慢，每翻一页就把手指停在页脚，等林夏看清。",
+              "start": 988,
+              "end": 1052
+            },
+            "G1P028": {
+              "source_id": "generation:10",
+              "quote": "“别把页码翻过去太快。”她说，“今天只需要确认数量和连续性，但每页都要看。页脚有没有断，装订边有没有脱，纸面有没有新裂，分别记。”",
+              "start": 1054,
+              "end": 1119
+            },
+            "G1P029": {
+              "source_id": "generation:10",
+              "quote": "“所有页都写吗？”",
+              "start": 1121,
+              "end": 1130
+            },
+            "G1P030": {
+              "source_id": "generation:10",
+              "quote": "“正常的可以不写。异常写位置和范围，别用‘多处’代替具体页码。”",
+              "start": 1132,
+              "end": 1164
+            },
+            "G1P031": {
+              "source_id": "generation:10",
+              "quote": "陈舟翻到第三页，忽然停住：“这页右下角有旧折角。”",
+              "start": 1166,
+              "end": 1191
+            },
+            "G1P032": {
+              "source_id": "generation:10",
+              "quote": "“抬起来看。”",
+              "start": 1193,
+              "end": 1200
+            },
+            "G1P033": {
+              "source_id": "generation:10",
+              "quote": "他用指尖轻轻托住折角，纸张下方露出的颜色比上面深，折痕沿页面斜着走，靠近边缘的地方却没有完全断开。",
+              "start": 1202,
+              "end": 1251
+            },
+            "G1P034": {
+              "source_id": "generation:10",
+              "quote": "“这个能直接压平吗？”陈舟问。",
+              "start": 1253,
+              "end": 1268
+            },
+            "G1P035": {
+              "source_id": "generation:10",
+              "quote": "“先记页码、三页右下角，折角长度大约两厘米，纸面未完全断裂。再看它会不会牵动下一页。”",
+              "start": 1270,
+              "end": 1313
+            },
+            "G1P036": {
+              "source_id": "generation:10",
+              "quote": "“牵动？”",
+              "start": 1315,
+              "end": 1320
+            },
+            "G1P037": {
+              "source_id": "generation:10",
+              "quote": "“翻回去，再翻过来。如果下一页跟着抬，不能当普通折角处理。”",
+              "start": 1322,
+              "end": 1352
+            },
+            "G1P038": {
+              "source_id": "generation:10",
+              "quote": "陈舟依言翻回第二页，又慢慢翻开第三页，那一页的折角确实带起了旁边一小块纸面，第二页右下角也出现了一条不太明显的波浪。",
+              "start": 1354,
+              "end": 1412
+            },
+            "G1P039": {
+              "source_id": "generation:10",
+              "quote": "林夏伸手挡住书脊：“停。”",
+              "start": 1414,
+              "end": 1427
+            },
+            "G1P040": {
+              "source_id": "generation:10",
+              "quote": "陈舟立刻把手移开：“我是不是翻快了？”",
+              "start": 1429,
+              "end": 1448
+            },
+            "G1P041": {
+              "source_id": "generation:10",
+              "quote": "“慢一点可以，但先别急。这里不能只看折角。”她拿起一页空白记录纸，垫在第三页下面，“页脚有没有跟着动，刚才没有看清。再看。”",
+              "start": 1450,
+              "end": 1512
+            },
+            "G1P042": {
+              "source_id": "generation:10",
+              "quote": "窗外的车轮声停了，室内只剩下纸页摩擦的声音，陈舟把第三页抬起半厘米，观察下面的第二页，两页之间有一道细细的缝隙，第二页边缘被带得微微翘起，却没有脱落。",
+              "start": 1514,
+              "end": 1589
+            },
+            "G1P043": {
+              "source_id": "generation:10",
+              "quote": "“连着。”他说。",
+              "start": 1591,
+              "end": 1599
+            },
+            "G1P044": {
+              "source_id": "generation:10",
+              "quote": "“记‘相邻页有联动风险’，不要直接写‘脱页’。”林夏说，“你看到的是纸边跟着动，还是装订线牵着纸？”",
+              "start": 1601,
+              "end": 1651
+            },
+            "G1P045": {
+              "source_id": "generation:10",
+              "quote": "“像纸边。”",
+              "start": 1653,
+              "end": 1659
+            },
+            "G1P046": {
+              "source_id": "generation:10",
+              "quote": "“那就写纸边。”",
+              "start": 1661,
+              "end": 1669
+            },
+            "G1P047": {
+              "source_id": "generation:10",
+              "quote": "陈舟把笔尖压低，写完又从头看了一遍，字挤得有点紧，他往后退了一点，问：“要不要把第二页也单独列一项？”",
+              "start": 1671,
+              "end": 1722
+            },
+            "G1P048": {
+              "source_id": "generation:10",
+              "quote": "“先写在同一条里。关联页码要同时写清，后面处理才知道要看哪里。”",
+              "start": 1724,
+              "end": 1756
+            },
+            "G1P049": {
+              "source_id": "generation:10",
+              "quote": "他们继续往后翻，第四页、第五页的纸张大多平整，到了第六页，靠装订边的位置有一道细裂，裂口不长，纸面没有明显翘起，林夏让陈舟用手电从侧面照了一下，光线从纸背透过来，裂缝的边缘比正面更清楚。",
+              "start": 1758,
+              "end": 1851
+            },
+            "G1P050": {
+              "source_id": "generation:10",
+              "quote": "“这里算裂口吗？”陈舟问。",
+              "start": 1853,
+              "end": 1866
+            },
+            "G1P051": {
+              "source_id": "generation:10",
+              "quote": "“算。先记位置，再写长度。别现在决定它要不要补。”",
+              "start": 1868,
+              "end": 1893
+            },
+            "G1P052": {
+              "source_id": "generation:10",
+              "quote": "“补什么？”",
+              "start": 1895,
+              "end": 1901
+            },
+            "G1P053": {
+              "source_id": "generation:10",
+              "quote": "“先完成记录。修复方案要等全部页面看完再定。”",
+              "start": 1903,
+              "end": 1926
+            },
+            "G1P054": {
+              "source_id": "generation:10",
+              "quote": "陈舟低头写，笔尖在“六页装订边”下面停了停：“这页要不要先做保护？”",
+              "start": 1928,
+              "end": 1962
+            },
+            "G1P055": {
+              "source_id": "generation:10",
+              "quote": "林夏看了他一眼：“你觉得现在该做什么？”",
+              "start": 1964,
+              "end": 1984
+            },
+            "G1P056": {
+              "source_id": "generation:10",
+              "quote": "“我想在它翻页时用纸托一下，免得裂口扩大。”",
+              "start": 1986,
+              "end": 2008
+            },
+            "G1P057": {
+              "source_id": "generation:10",
+              "quote": "“有理由可以先说，但方案要等看完再定。垫纸不代表处理，先记为‘翻页时注意’。”",
+              "start": 2010,
+              "end": 2049
+            },
+            "G1P058": {
+              "source_id": "generation:10",
+              "quote": "“好。”",
+              "start": 2051,
+              "end": 2055
+            },
+            "G1P059": {
+              "source_id": "generation:10",
+              "quote": "他写完，视线又落到图册上方：“如果是书脊断了呢？”",
+              "start": 2057,
+              "end": 2082
+            },
+            "G1P060": {
+              "source_id": "generation:10",
+              "quote": "“现在没有看到断。先别把可能性写成发现。”",
+              "start": 2084,
+              "end": 2105
+            },
+            "G1P061": {
+              "source_id": "generation:10",
+              "quote": "陈舟抿了抿嘴，重新检查那一页，纸边虽然有裂痕，线脚还在，页脚也没有大范围移动，他在登记本上补了一句“未见明显脱线”，刚写完，林夏便伸手轻轻按住纸页。",
+              "start": 2107,
+              "end": 2181
+            },
+            "G1P062": {
+              "source_id": "generation:10",
+              "quote": "“别把‘未见’当‘没有’。检查到当前角度和光线，只能这样记。”",
+              "start": 2183,
+              "end": 2214
+            },
+            "G1P063": {
+              "source_id": "generation:10",
+              "quote": "陈舟把笔放下：“我知道了。”",
+              "start": 2216,
+              "end": 2230
+            },
+            "G1P064": {
+              "source_id": "generation:10",
+              "quote": "“继续。”",
+              "start": 2232,
+              "end": 2237
+            },
+            "G1P065": {
+              "source_id": "generation:10",
+              "quote": "翻到第十页时，他发现纸张边缘有一处较深的磨白，磨白靠近下沿，纸张厚度还在，没有洞，但表面起了细小的纤维。",
+              "start": 2239,
+              "end": 2291
+            },
+            "G1P066": {
+              "source_id": "generation:10",
+              "quote": "“这个要修吗？”他问。",
+              "start": 2293,
+              "end": 2304
+            },
+            "G1P067": {
+              "source_id": "generation:10",
+              "quote": "“先问是什么。”",
+              "start": 2306,
+              "end": 2314
+            },
+            "G1P068": {
+              "source_id": "generation:10",
+              "quote": "“边缘磨损。”",
+              "start": 2316,
+              "end": 2323
+            },
+            "G1P069": {
+              "source_id": "generation:10",
+              "quote": "“怎么造成的能看出来吗？”",
+              "start": 2325,
+              "end": 2338
+            },
+            "G1P070": {
+              "source_id": "generation:10",
+              "quote": "“可能是经常翻。”",
+              "start": 2340,
+              "end": 2349
+            },
+            "G1P071": {
+              "source_id": "generation:10",
+              "quote": "“可能不算依据。先记‘下沿磨白，范围一厘米左右，未见穿透’。”",
+              "start": 2351,
+              "end": 2382
+            },
+            "G1P072": {
+              "source_id": "generation:10",
+              "quote": "陈舟写完，忽然翻页的动作快了些，林夏用指尖压住第十一页：“一页一页来。”",
+              "start": 2384,
+              "end": 2420
+            },
+            "G1P073": {
+              "source_id": "generation:10",
+              "quote": "“我在赶时间。”",
+              "start": 2422,
+              "end": 2430
+            },
+            "G1P074": {
+              "source_id": "generation:10",
+              "quote": "“我知道。”林夏说，“但你现在赶的不是速度，是记录。今天慢一点，后面少返工。”",
+              "start": 2432,
+              "end": 2471
+            },
+            "G1P075": {
+              "source_id": "generation:10",
+              "quote": "陈舟看了看窗外的天色，又低头看图册，窗玻璃上映出桌边两个人的影子，一个坐着，一个站着，他把第十一页托稳，重新翻过去。",
+              "start": 2473,
+              "end": 2531
+            },
+            "G1P076": {
+              "source_id": "generation:10",
+              "quote": "第十二页、第十三页的纸张没有明显异常，第十四页右下角有一道短折痕，折痕很浅，纸面完整，第十六页靠近书脊的边缘起了一点毛，第十八页有一处颜色变浅的旧污痕，林夏没有让他停下，只提醒每项都写具体页码和位置。",
+              "start": 2533,
+              "end": 2633
+            },
+            "G1P077": {
+              "source_id": "generation:10",
+              "quote": "翻到第二十页，陈舟的肩膀明显紧了。",
+              "start": 2635,
+              "end": 2652
+            },
+            "G1P078": {
+              "source_id": "generation:10",
+              "quote": "“这里。”他说。",
+              "start": 2654,
+              "end": 2662
+            },
+            "G1P079": {
+              "source_id": "generation:10",
+              "quote": "第二十页靠近装订边的纸面被撕开过，裂口已用旧胶带贴过，胶带边缘发黄，底下的纸纤维翘起来，裂口不长，但每次翻页都会碰到相邻两页。",
+              "start": 2664,
+              "end": 2727
+            },
+            "G1P080": {
+              "source_id": "generation:10",
+              "quote": "林夏把图册平放在无酸纸袋旁边：“先别碰胶带。”",
+              "start": 2729,
+              "end": 2752
+            },
+            "G1P081": {
+              "source_id": "generation:10",
+              "quote": "“能不能把胶带揭掉？”",
+              "start": 2754,
+              "end": 2765
+            },
+            "G1P082": {
+              "source_id": "generation:10",
+              "quote": "“你先说依据。”",
+              "start": 2767,
+              "end": 2775
+            },
+            "G1P083": {
+              "source_id": "generation:10",
+              "quote": "“它已经不粘了，边缘翘起来，会刮到旁边的纸。”",
+              "start": 2777,
+              "end": 2800
+            },
+            "G1P084": {
+              "source_id": "generation:10",
+              "quote": "“揭掉以后有没有可能带走纸纤维？”",
+              "start": 2802,
+              "end": 2819
+            },
+            "G1P085": {
+              "source_id": "generation:10",
+              "quote": "陈舟没马上回答，他拿着软刷的刷柄，用刷背轻轻碰了碰胶带边缘，胶带一动，下面便有一小片纸色跟着变浅。",
+              "start": 2821,
+              "end": 2870
+            },
+            "G1P086": {
+              "source_id": "generation:10",
+              "quote": "林夏立刻说：“停。”",
+              "start": 2872,
+              "end": 2882
+            },
+            "G1P087": {
+              "source_id": "generation:10",
+              "quote": "陈舟收回手。",
+              "start": 2884,
+              "end": 2890
+            },
+            "G1P088": {
+              "source_id": "generation:10",
+              "quote": "“这个位置补记进去。”她说，“第二十页装订边旧胶带覆盖，边缘翘起，揭除时有纸纤维带起风险。”",
+              "start": 2892,
+              "end": 2938
+            },
+            "G1P089": {
+              "source_id": "generation:10",
+              "quote": "“那要怎么处理？”",
+              "start": 2940,
+              "end": 2949
+            },
+            "G1P090": {
+              "source_id": "generation:10",
+              "quote": "“先记。还没到方案时间。”",
+              "start": 2951,
+              "end": 2964
+            },
+            "G1P091": {
+              "source_id": "generation:10",
+              "quote": "陈舟把胶带那页单独做了记号，又在页脚压了一张小纸条，免得翻页时再次摩擦，后面几页也有不同问题，第二十六页内折角，折痕附近纸面变白，第二十九页靠近下沿有短裂，三十三页装订边有多处起毛，三十七页纸面没有破，但折过两次，压痕还留着。",
+              "start": 2966,
+              "end": 3079
+            },
+            "G1P092": {
+              "source_id": "generation:10",
+              "quote": "每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”",
+              "start": 3081,
+              "end": 3143
+            },
+            "G1P093": {
+              "source_id": "generation:10",
+              "quote": "陈舟翻到第四十页时，林夏忽然叫住他：“你刚才是不是从三十九直接翻到了四十一？”",
+              "start": 3145,
+              "end": 3184
+            },
+            "G1P094": {
+              "source_id": "generation:10",
+              "quote": "他低头一看，果然，手里的纸页已经越过四十页。",
+              "start": 3186,
+              "end": 3208
+            },
+            "G1P095": {
+              "source_id": "generation:10",
+              "quote": "“我没看清。”",
+              "start": 3210,
+              "end": 3217
+            },
+            "G1P096": {
+              "source_id": "generation:10",
+              "quote": "“重新看。”",
+              "start": 3219,
+              "end": 3225
+            },
+            "G1P097": {
+              "source_id": "generation:10",
+              "quote": "陈舟把第三十九页翻回来，停在第四十页上，页脚印着“40”，没有破损，他又回看第三十九页，确认页码是“39”，再重新翻到四十一页。",
+              "start": 3227,
+              "end": 3291
+            },
+            "G1P098": {
+              "source_id": "generation:10",
+              "quote": "“四十页在这里。”他说，“刚才漏了记录。”",
+              "start": 3293,
+              "end": 3314
+            },
+            "G1P099": {
+              "source_id": "generation:10",
+              "quote": "“漏看和漏记不是一回事。页码是不是连续，要现场再核一遍。”",
+              "start": 3316,
+              "end": 3345
+            },
+            "G1P100": {
+              "source_id": "generation:10",
+              "quote": "“刚才看过了。”",
+              "start": 3347,
+              "end": 3355
+            },
+            "G1P101": {
+              "source_id": "generation:10",
+              "quote": "“刚才看过了，不代表这一遍不用看。”",
+              "start": 3357,
+              "end": 3375
+            },
+            "G1P102": {
+              "source_id": "generation:10",
+              "quote": "陈舟没有争辩，他从第四十一页开始，一页一页往回核，第四十二页的页码印得偏右，靠近边缘，但没有缺页，第四十五页纸角有一道浅折，第四十八页的页码完整，纸张却比前面几页松，靠近书脊的地方有一道细小的裂线。",
+              "start": 3377,
+              "end": 3476
+            },
+            "G1P103": {
+              "source_id": "generation:10",
+              "quote": "“这里要写松页吗？”陈舟问。",
+              "start": 3478,
+              "end": 3492
+            },
+            "G1P104": {
+              "source_id": "generation:10",
+              "quote": "林夏把图册托起来：“你看到了什么？”",
+              "start": 3494,
+              "end": 3512
+            },
+            "G1P105": {
+              "source_id": "generation:10",
+              "quote": "“书脊边的纸面有裂线，翻页时比别页容易抬。”",
+              "start": 3514,
+              "end": 3536
+            },
+            "G1P106": {
+              "source_id": "generation:10",
+              "quote": "“写‘纸张活动度较大’，不要直接写松页。再看它是单独一页，还是和前后页有关。”",
+              "start": 3538,
+              "end": 3577
+            },
+            "G1P107": {
+              "source_id": "generation:10",
+              "quote": "陈舟把第四十八页抬起，第四十七页跟着动了一点，随后才露出下一页的边角。",
+              "start": 3579,
+              "end": 3614
+            },
+            "G1P108": {
+              "source_id": "generation:10",
+              "quote": "“前后有联动。”",
+              "start": 3616,
+              "end": 3624
+            },
+            "G1P109": {
+              "source_id": "generation:10",
+              "quote": "“记页码。”",
+              "start": 3626,
+              "end": 3632
+            },
+            "G1P110": {
+              "source_id": "generation:10",
+              "quote": "“四十七、四十八。”",
+              "start": 3634,
+              "end": 3644
+            },
+            "G1P111": {
+              "source_id": "generation:10",
+              "quote": "林夏用铅笔在登记本上做了一个小标记：“写清楚范围。”",
+              "start": 3646,
+              "end": 3672
+            },
+            "G1P112": {
+              "source_id": "generation:10",
+              "quote": "陈舟补完，才发现前面有几处页码写得不够具体，他翻回第十四页，把“页角有折”改成“第十四页右下角短折痕”，又翻回第二十九页，把“裂”改成“靠近下沿短裂口，长度待量”。",
+              "start": 3674,
+              "end": 3756
+            },
+            "G1P113": {
+              "source_id": "generation:10",
+              "quote": "“别用‘待量’。”林夏说，“现场量不了，就写‘未测’。不要留下一个像是漏掉的步骤。”",
+              "start": 3758,
+              "end": 3800
+            },
+            "G1P114": {
+              "source_id": "generation:10",
+              "quote": "陈舟抬眼看她。",
+              "start": 3802,
+              "end": 3809
+            },
+            "G1P115": {
+              "source_id": "generation:10",
+              "quote": "“你是不是觉得只要记了，就算做完？”",
+              "start": 3811,
+              "end": 3829
+            },
+            "G1P116": {
+              "source_id": "generation:10",
+              "quote": "“不是。”他说，“我只是怕写得不够完整。”",
+              "start": 3831,
+              "end": 3852
+            },
+            "G1P117": {
+              "source_id": "generation:10",
+              "quote": "“完整不等于填满。先把知道的写清楚，不知道的也写清楚。”",
+              "start": 3854,
+              "end": 3882
+            },
+            "G1P118": {
+              "source_id": "generation:10",
+              "quote": "他低下头，把“待量”改成“未测”，直到四十八页翻完，林夏让他从第一页重新核页码，陈舟没有再一口翻到底，只把每页的页脚露出来，手指从第一页移到第四十八页，遇到折角便停一下，确认前后页码后继续。",
+              "start": 3884,
+              "end": 3979
+            },
+            "G1P119": {
+              "source_id": "generation:10",
+              "quote": "窗外传来社区门口开门的声音，接着有人拖着购物车轮子经过，轮子在门槛处卡了一下，声音停在门外，又重新响起来，陈舟的手指也跟着停了一瞬，随后把第四十七页压平。",
+              "start": 3981,
+              "end": 4058
+            },
+            "G1P120": {
+              "source_id": "generation:10",
+              "quote": "“一、二、三……”他低声数。",
+              "start": 4060,
+              "end": 4074
+            },
+            "G1P121": {
+              "source_id": "generation:10",
+              "quote": "林夏没有催他，数到第四十八页时，陈舟把最后一张纸页压住，翻回去又确认一遍。",
+              "start": 4076,
+              "end": 4113
+            },
+            "G1P122": {
+              "source_id": "generation:10",
+              "quote": "“1到48，连续。”他说，“没有缺页。”",
+              "start": 4115,
+              "end": 4135
+            },
+            "G1P123": {
+              "source_id": "generation:10",
+              "quote": "“再说一遍依据。”",
+              "start": 4137,
+              "end": 4146
+            },
+            "G1P124": {
+              "source_id": "generation:10",
+              "quote": "“我逐页看了页脚，前一页和后一页的数字都能接上。第十页、二十页、三十页这些整数页都在，其他页码顺序也没有跳。”",
+              "start": 4148,
+              "end": 4203
+            },
+            "G1P125": {
+              "source_id": "generation:10",
+              "quote": "“第三页和第四十八页的页码有没有被折痕遮住？”",
+              "start": 4205,
+              "end": 4228
+            },
+            "G1P126": {
+              "source_id": "generation:10",
+              "quote": "“第三页页码在右下角，折角没有遮住。第四十八页页码清楚。”",
+              "start": 4230,
+              "end": 4259
+            },
+            "G1P127": {
+              "source_id": "generation:10",
+              "quote": "林夏这才点头：“这项可以写‘页码1至48连续’。”",
+              "start": 4261,
+              "end": 4286
+            },
+            "G1P128": {
+              "source_id": "generation:10",
+              "quote": "陈舟把笔尖落到登记本上，写下那行字，写到“连续”时，他停了一下：“要写‘初步’吗？”",
+              "start": 4288,
+              "end": 4330
+            },
+            "G1P129": {
+              "source_id": "generation:10",
+              "quote": "林夏想了想：“这轮检查范围内连续。加‘本轮检查未见缺页或跳页’，比只写连续更准确。”",
+              "start": 4332,
+              "end": 4374
+            },
+            "G1P130": {
+              "source_id": "generation:10",
+              "quote": "陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”",
+              "start": 4376,
+              "end": 4506
+            },
+            "G1P131": {
+              "source_id": "generation:10",
+              "quote": "陈舟把本子拿回来，改完，又问：“这些都要写进修复方案吗？”",
+              "start": 4508,
+              "end": 4537
+            },
+            "G1P132": {
+              "source_id": "generation:10",
+              "quote": "“把可见问题分成三类。”林夏翻到空白页，“一类是现在能确定的，比如封面纸边翘起、旧折痕和胶带翘边；一类是需要谨慎处理的，比如第三页折角牵动相邻页、第二十页胶带可能带起纤维；一类是暂时不能确定的，比如第四十七、四十八页的联动是否和装订受力有关。”",
+              "start": 4539,
+              "end": 4661
+            },
+            "G1P133": {
+              "source_id": "generation:10",
+              "quote": "“那不确定的怎么办？”",
+              "start": 4663,
+              "end": 4674
+            },
+            "G1P134": {
+              "source_id": "generation:10",
+              "quote": "“保持原状，翻页时避开，不为了弄明白就继续试。”",
+              "start": 4676,
+              "end": 4700
+            },
+            "G1P135": {
+              "source_id": "generation:10",
+              "quote": "陈舟看着那几页，点了点头。",
+              "start": 4702,
+              "end": 4715
+            },
+            "G1P136": {
+              "source_id": "generation:10",
+              "quote": "“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”",
+              "start": 4717,
+              "end": 4818
+            },
+            "G1P137": {
+              "source_id": "generation:10",
+              "quote": "陈舟跟着念了一遍，念到“压放范围只覆盖封面”时，他抬头问：“压板要不要先铺一层干净纸？”",
+              "start": 4820,
+              "end": 4864
+            },
+            "G1P138": {
+              "source_id": "generation:10",
+              "quote": "“要。直接压到封面，浆糊没干时会粘住，也会把水分压进旁边。”",
+              "start": 4866,
+              "end": 4896
+            },
+            "G1P139": {
+              "source_id": "generation:10",
+              "quote": "“浆糊先调稀一点，还是按平时的稠度？”",
+              "start": 4898,
+              "end": 4917
+            },
+            "G1P140": {
+              "source_id": "generation:10",
+              "quote": "“看现在的状态。太稀容易流，太稠不容易铺匀。先少量试刷，不够再加。”",
+              "start": 4919,
+              "end": 4953
+            },
+            "G1P141": {
+              "source_id": "generation:10",
+              "quote": "“如果刷到无酸纸边缘，需要停吗？”",
+              "start": 4955,
+              "end": 4972
+            },
+            "G1P142": {
+              "source_id": "generation:10",
+              "quote": "“边缘超出加固范围就停。纸边要留出余量，不能让它跟着书脊卷进去。”",
+              "start": 4974,
+              "end": 5007
+            },
+            "G1P143": {
+              "source_id": "generation:10",
+              "quote": "陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。",
+              "start": 5009,
+              "end": 5088
+            },
+            "G1P144": {
+              "source_id": "generation:10",
+              "quote": "林夏逐样点过：“纸、浆糊、刷子、压板、垫纸、登记本，都在桌面上。现在没有开始刷，也没有开始压。”",
+              "start": 5090,
+              "end": 5138
+            },
+            "G1P145": {
+              "source_id": "generation:10",
+              "quote": "陈舟看着那本旧图册，封面的折痕从中间横过去，纸面被压出的凹线还没有因为检查而改变，登记本上那一行行字，留着不同页码、不同位置和问题描述。",
+              "start": 5140,
+              "end": 5208
+            },
+            "G1P146": {
+              "source_id": "generation:10",
+              "quote": "他把笔放下，又伸手去碰无酸纸袋，林夏没有阻止，只问：“以后你先看什么？”",
+              "start": 5210,
+              "end": 5246
+            },
+            "G1P147": {
+              "source_id": "generation:10",
+              "quote": "陈舟的手停在袋口，想了几秒。",
+              "start": 5248,
+              "end": 5262
+            },
+            "G1P148": {
+              "source_id": "generation:10",
+              "quote": "“先看……”他说，“先看封面，再看页码。”",
+              "start": 5264,
+              "end": 5285
+            },
+            "G1P149": {
+              "source_id": "generation:10",
+              "quote": "林夏没有接话，只把登记本往他那边推了一点，让他能看见刚写下的方案，陈舟低头看着“压板范围”“待复核”几个字，又补问：“如果开始加固前发现无酸纸边缘有波纹，也要记吗？”",
+              "start": 5287,
+              "end": 5370
+            },
+            "G1P150": {
+              "source_id": "generation:10",
+              "quote": "“要看它会不会影响贴合。看得见的，都要记。”",
+              "start": 5372,
+              "end": 5394
+            },
+            "G1P151": {
+              "source_id": "generation:10",
+              "quote": "“我去拿纸巾？”",
+              "start": 5396,
+              "end": 5404
+            },
+            "G1P152": {
+              "source_id": "generation:10",
+              "quote": "“先别拿纸巾。”林夏把桌角的压板扶正，“纸巾会把桌面上的水汽带过来。我们按方案准备，不提前处理。”",
+              "start": 5406,
+              "end": 5455
+            },
+            "G1P153": {
+              "source_id": "generation:10",
+              "quote": "窗外又有车辆驶过，发动机声从远处靠近，又慢慢移开，陈舟把无酸纸袋的封口捏住，确认纸没有受潮，随后把袋子放到图册旁边。",
+              "start": 5457,
+              "end": 5515
+            },
+            "G1P154": {
+              "source_id": "generation:10",
+              "quote": "桌面上的刷、压板和登记本都还没有使用，旧图册保持摊开的状态，等着下一步。",
+              "start": 5517,
+              "end": 5553
+            }
+          },
+          "body_texts": {
+            "10": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。\n\n“先不刷浆糊。”她说，“先看一遍。哪里松，哪里裂，哪一页会跟着动，都记下来。看不清的地方别猜。”\n\n陈舟已经在桌边站了一会儿，他把袖口往上挽了半截，点点头：“先检查封面，再翻正文？”\n\n“先封面，再首页。”林夏把无酸纸袋往旁边挪开，给图册腾出一块地方，“页码不能因为看着完整就跳过。封面也要看折角和装订边，不是只摸一下松不松。”\n\n窗外有送货车倒车的提示音，隔着玻璃传进来，拖得很长，陈舟的手便停在图册上方，等林夏示意，才用两指捏住封面右下角。\n\n图册不厚，封面却比内页硬一些，他刚往上提，靠近书脊的位置便发出一声轻响，纸边随之翘起，下面露出暗色的线脚。\n\n“这个松了。”他说。\n\n“先说依据。”林夏没有低头记，“哪里松？”\n\n“封面右下角，离书脊大概三指宽，纸边翘起来了。用手一抬，能看见下面的线。”\n\n“还有呢？”\n\n陈舟把封面放平，指腹沿着折痕滑过去，横过封面中部有一道旧折痕，纸面微微凹下去，靠近上沿的地方颜色更浅，他用指甲在旁边比了一下，没有碰那道凹线。\n\n“这道也算松吗？”他问。\n\n林夏俯身看了看：“先别叫松。记‘旧折痕’，长度和位置也写上。松不松，要看纸有没有分离，不能凭颜色定。”\n\n陈舟嗯了一声，翻开登记本，林夏便放慢语速报出封面情况：“封面中部横向旧折痕，靠近上沿，纸面有压痕，是否伴随纸纤维裂开，待复核。右下角翘起，线脚外露。”\n\n陈舟写下第一行，笔尖随即停住：“待复核要写到哪里？封面问题这一栏？”\n\n“先写可见情况。判断留在后面。你别为了让句子完整，把没看见的东西补进去。”\n\n他应了一声，把那行补完整，林夏又看向他：“再检查一遍。”\n\n“什么？”\n\n“折痕两侧有没有裂口，翘起的地方能不能被手带动。你刚才看的是表面。”\n\n陈舟把图册重新转向自己，封面下方有些发灰，像长期放在潮气重的地方，他用指腹沿边缘压过，到了右下角时停住。\n\n“这里有两种声音。”他说，“一处是纸边摩擦，一处像线在里面被拉动。”\n\n“记声音吗？”\n\n“也要记？”\n\n“如果你判断它和脱线有关，就写观察到的触感。不要写成已经脱线。”\n\n陈舟把前半句划掉，重新改成：“右下角翘起，触碰时纸边摩擦，线脚有牵动感，未确认脱线。”\n\n林夏这才点头：“翻首页。”\n\n首页靠近书脊的地方有一小块起毛，纸张边缘没有破，但被封面遮住的一角颜色更深，陈舟翻得很慢，每翻一页就把手指停在页脚，等林夏看清。\n\n“别把页码翻过去太快。”她说，“今天只需要确认数量和连续性，但每页都要看。页脚有没有断，装订边有没有脱，纸面有没有新裂，分别记。”\n\n“所有页都写吗？”\n\n“正常的可以不写。异常写位置和范围，别用‘多处’代替具体页码。”\n\n陈舟翻到第三页，忽然停住：“这页右下角有旧折角。”\n\n“抬起来看。”\n\n他用指尖轻轻托住折角，纸张下方露出的颜色比上面深，折痕沿页面斜着走，靠近边缘的地方却没有完全断开。\n\n“这个能直接压平吗？”陈舟问。\n\n“先记页码、三页右下角，折角长度大约两厘米，纸面未完全断裂。再看它会不会牵动下一页。”\n\n“牵动？”\n\n“翻回去，再翻过来。如果下一页跟着抬，不能当普通折角处理。”\n\n陈舟依言翻回第二页，又慢慢翻开第三页，那一页的折角确实带起了旁边一小块纸面，第二页右下角也出现了一条不太明显的波浪。\n\n林夏伸手挡住书脊：“停。”\n\n陈舟立刻把手移开：“我是不是翻快了？”\n\n“慢一点可以，但先别急。这里不能只看折角。”她拿起一页空白记录纸，垫在第三页下面，“页脚有没有跟着动，刚才没有看清。再看。”\n\n窗外的车轮声停了，室内只剩下纸页摩擦的声音，陈舟把第三页抬起半厘米，观察下面的第二页，两页之间有一道细细的缝隙，第二页边缘被带得微微翘起，却没有脱落。\n\n“连着。”他说。\n\n“记‘相邻页有联动风险’，不要直接写‘脱页’。”林夏说，“你看到的是纸边跟着动，还是装订线牵着纸？”\n\n“像纸边。”\n\n“那就写纸边。”\n\n陈舟把笔尖压低，写完又从头看了一遍，字挤得有点紧，他往后退了一点，问：“要不要把第二页也单独列一项？”\n\n“先写在同一条里。关联页码要同时写清，后面处理才知道要看哪里。”\n\n他们继续往后翻，第四页、第五页的纸张大多平整，到了第六页，靠装订边的位置有一道细裂，裂口不长，纸面没有明显翘起，林夏让陈舟用手电从侧面照了一下，光线从纸背透过来，裂缝的边缘比正面更清楚。\n\n“这里算裂口吗？”陈舟问。\n\n“算。先记位置，再写长度。别现在决定它要不要补。”\n\n“补什么？”\n\n“先完成记录。修复方案要等全部页面看完再定。”\n\n陈舟低头写，笔尖在“六页装订边”下面停了停：“这页要不要先做保护？”\n\n林夏看了他一眼：“你觉得现在该做什么？”\n\n“我想在它翻页时用纸托一下，免得裂口扩大。”\n\n“有理由可以先说，但方案要等看完再定。垫纸不代表处理，先记为‘翻页时注意’。”\n\n“好。”\n\n他写完，视线又落到图册上方：“如果是书脊断了呢？”\n\n“现在没有看到断。先别把可能性写成发现。”\n\n陈舟抿了抿嘴，重新检查那一页，纸边虽然有裂痕，线脚还在，页脚也没有大范围移动，他在登记本上补了一句“未见明显脱线”，刚写完，林夏便伸手轻轻按住纸页。\n\n“别把‘未见’当‘没有’。检查到当前角度和光线，只能这样记。”\n\n陈舟把笔放下：“我知道了。”\n\n“继续。”\n\n翻到第十页时，他发现纸张边缘有一处较深的磨白，磨白靠近下沿，纸张厚度还在，没有洞，但表面起了细小的纤维。\n\n“这个要修吗？”他问。\n\n“先问是什么。”\n\n“边缘磨损。”\n\n“怎么造成的能看出来吗？”\n\n“可能是经常翻。”\n\n“可能不算依据。先记‘下沿磨白，范围一厘米左右，未见穿透’。”\n\n陈舟写完，忽然翻页的动作快了些，林夏用指尖压住第十一页：“一页一页来。”\n\n“我在赶时间。”\n\n“我知道。”林夏说，“但你现在赶的不是速度，是记录。今天慢一点，后面少返工。”\n\n陈舟看了看窗外的天色，又低头看图册，窗玻璃上映出桌边两个人的影子，一个坐着，一个站着，他把第十一页托稳，重新翻过去。\n\n第十二页、第十三页的纸张没有明显异常，第十四页右下角有一道短折痕，折痕很浅，纸面完整，第十六页靠近书脊的边缘起了一点毛，第十八页有一处颜色变浅的旧污痕，林夏没有让他停下，只提醒每项都写具体页码和位置。\n\n翻到第二十页，陈舟的肩膀明显紧了。\n\n“这里。”他说。\n\n第二十页靠近装订边的纸面被撕开过，裂口已用旧胶带贴过，胶带边缘发黄，底下的纸纤维翘起来，裂口不长，但每次翻页都会碰到相邻两页。\n\n林夏把图册平放在无酸纸袋旁边：“先别碰胶带。”\n\n“能不能把胶带揭掉？”\n\n“你先说依据。”\n\n“它已经不粘了，边缘翘起来，会刮到旁边的纸。”\n\n“揭掉以后有没有可能带走纸纤维？”\n\n陈舟没马上回答，他拿着软刷的刷柄，用刷背轻轻碰了碰胶带边缘，胶带一动，下面便有一小片纸色跟着变浅。\n\n林夏立刻说：“停。”\n\n陈舟收回手。\n\n“这个位置补记进去。”她说，“第二十页装订边旧胶带覆盖，边缘翘起，揭除时有纸纤维带起风险。”\n\n“那要怎么处理？”\n\n“先记。还没到方案时间。”\n\n陈舟把胶带那页单独做了记号，又在页脚压了一张小纸条，免得翻页时再次摩擦，后面几页也有不同问题，第二十六页内折角，折痕附近纸面变白，第二十九页靠近下沿有短裂，三十三页装订边有多处起毛，三十七页纸面没有破，但折过两次，压痕还留着。\n\n每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”\n\n陈舟翻到第四十页时，林夏忽然叫住他：“你刚才是不是从三十九直接翻到了四十一？”\n\n他低头一看，果然，手里的纸页已经越过四十页。\n\n“我没看清。”\n\n“重新看。”\n\n陈舟把第三十九页翻回来，停在第四十页上，页脚印着“40”，没有破损，他又回看第三十九页，确认页码是“39”，再重新翻到四十一页。\n\n“四十页在这里。”他说，“刚才漏了记录。”\n\n“漏看和漏记不是一回事。页码是不是连续，要现场再核一遍。”\n\n“刚才看过了。”\n\n“刚才看过了，不代表这一遍不用看。”\n\n陈舟没有争辩，他从第四十一页开始，一页一页往回核，第四十二页的页码印得偏右，靠近边缘，但没有缺页，第四十五页纸角有一道浅折，第四十八页的页码完整，纸张却比前面几页松，靠近书脊的地方有一道细小的裂线。\n\n“这里要写松页吗？”陈舟问。\n\n林夏把图册托起来：“你看到了什么？”\n\n“书脊边的纸面有裂线，翻页时比别页容易抬。”\n\n“写‘纸张活动度较大’，不要直接写松页。再看它是单独一页，还是和前后页有关。”\n\n陈舟把第四十八页抬起，第四十七页跟着动了一点，随后才露出下一页的边角。\n\n“前后有联动。”\n\n“记页码。”\n\n“四十七、四十八。”\n\n林夏用铅笔在登记本上做了一个小标记：“写清楚范围。”\n\n陈舟补完，才发现前面有几处页码写得不够具体，他翻回第十四页，把“页角有折”改成“第十四页右下角短折痕”，又翻回第二十九页，把“裂”改成“靠近下沿短裂口，长度待量”。\n\n“别用‘待量’。”林夏说，“现场量不了，就写‘未测’。不要留下一个像是漏掉的步骤。”\n\n陈舟抬眼看她。\n\n“你是不是觉得只要记了，就算做完？”\n\n“不是。”他说，“我只是怕写得不够完整。”\n\n“完整不等于填满。先把知道的写清楚，不知道的也写清楚。”\n\n他低下头，把“待量”改成“未测”，直到四十八页翻完，林夏让他从第一页重新核页码，陈舟没有再一口翻到底，只把每页的页脚露出来，手指从第一页移到第四十八页，遇到折角便停一下，确认前后页码后继续。\n\n窗外传来社区门口开门的声音，接着有人拖着购物车轮子经过，轮子在门槛处卡了一下，声音停在门外，又重新响起来，陈舟的手指也跟着停了一瞬，随后把第四十七页压平。\n\n“一、二、三……”他低声数。\n\n林夏没有催他，数到第四十八页时，陈舟把最后一张纸页压住，翻回去又确认一遍。\n\n“1到48，连续。”他说，“没有缺页。”\n\n“再说一遍依据。”\n\n“我逐页看了页脚，前一页和后一页的数字都能接上。第十页、二十页、三十页这些整数页都在，其他页码顺序也没有跳。”\n\n“第三页和第四十八页的页码有没有被折痕遮住？”\n\n“第三页页码在右下角，折角没有遮住。第四十八页页码清楚。”\n\n林夏这才点头：“这项可以写‘页码1至48连续’。”\n\n陈舟把笔尖落到登记本上，写下那行字，写到“连续”时，他停了一下：“要写‘初步’吗？”\n\n林夏想了想：“这轮检查范围内连续。加‘本轮检查未见缺页或跳页’，比只写连续更准确。”\n\n陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”\n\n陈舟把本子拿回来，改完，又问：“这些都要写进修复方案吗？”\n\n“把可见问题分成三类。”林夏翻到空白页，“一类是现在能确定的，比如封面纸边翘起、旧折痕和胶带翘边；一类是需要谨慎处理的，比如第三页折角牵动相邻页、第二十页胶带可能带起纤维；一类是暂时不能确定的，比如第四十七、四十八页的联动是否和装订受力有关。”\n\n“那不确定的怎么办？”\n\n“保持原状，翻页时避开，不为了弄明白就继续试。”\n\n陈舟看着那几页，点了点头。\n\n“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”\n\n陈舟跟着念了一遍，念到“压放范围只覆盖封面”时，他抬头问：“压板要不要先铺一层干净纸？”\n\n“要。直接压到封面，浆糊没干时会粘住，也会把水分压进旁边。”\n\n“浆糊先调稀一点，还是按平时的稠度？”\n\n“看现在的状态。太稀容易流，太稠不容易铺匀。先少量试刷，不够再加。”\n\n“如果刷到无酸纸边缘，需要停吗？”\n\n“边缘超出加固范围就停。纸边要留出余量，不能让它跟着书脊卷进去。”\n\n陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。\n\n林夏逐样点过：“纸、浆糊、刷子、压板、垫纸、登记本，都在桌面上。现在没有开始刷，也没有开始压。”\n\n陈舟看着那本旧图册，封面的折痕从中间横过去，纸面被压出的凹线还没有因为检查而改变，登记本上那一行行字，留着不同页码、不同位置和问题描述。\n\n他把笔放下，又伸手去碰无酸纸袋，林夏没有阻止，只问：“以后你先看什么？”\n\n陈舟的手停在袋口，想了几秒。\n\n“先看……”他说，“先看封面，再看页码。”\n\n林夏没有接话，只把登记本往他那边推了一点，让他能看见刚写下的方案，陈舟低头看着“压板范围”“待复核”几个字，又补问：“如果开始加固前发现无酸纸边缘有波纹，也要记吗？”\n\n“要看它会不会影响贴合。看得见的，都要记。”\n\n“我去拿纸巾？”\n\n“先别拿纸巾。”林夏把桌角的压板扶正，“纸巾会把桌面上的水汽带过来。我们按方案准备，不提前处理。”\n\n窗外又有车辆驶过，发动机声从远处靠近，又慢慢移开，陈舟把无酸纸袋的封口捏住，确认纸没有受潮，随后把袋子放到图册旁边。\n\n桌面上的刷、压板和登记本都还没有使用，旧图册保持摊开的状态，等着下一步。"
+          }
+        }
+      }
+    ]
+  },
+  "verification": {
+    "task_id": "8519863462194d9a9eb452e114a6f2cf",
+    "parent_run_id": null,
+    "project_id": 5,
+    "task_type": "repair_verification",
+    "agent_role": "diagnostic",
+    "provider_role": "assistant",
+    "scope": {
+      "character": "",
+      "cursor": 0,
+      "limit": 5,
+      "segment_nos": [
+        1
+      ]
+    },
+    "status": "completed",
+    "assessment": "observed",
+    "model_participated": true,
+    "findings": [
+      {
+        "assessment": "observed",
+        "reason": "候选仅将末句全称未使用断言中的登记本排除，保留刷和压板未使用状态，与前文登记本被多次翻开、书写、核对和查看方案的事实一致。观察未提供保存契约，且business_written为false，无法验证写入契约；仅按限定第1段复验正文，未引入新动作或结果。",
+        "evidence_refs": [
+          "read_body_consistency:0c196819e1e9f21f"
+        ],
+        "advisory": true
+      }
+    ],
+    "evidence_refs": [
+      "read_body_consistency:0c196819e1e9f21f"
+    ],
+    "coverage": [
+      {
+        "novel_ids": [],
+        "cursor": 0,
+        "limit": 5,
+        "segment_nos": [
+          1
+        ],
+        "source": "Generation.text+saved_segment_contract",
+        "complete": true,
+        "contract_complete": false
+      }
+    ],
+    "missing_capabilities": [],
+    "proposed_actions": [],
+    "acceptance": [
+      {
+        "id": "time",
+        "requires_evidence": true
+      },
+      {
+        "id": "place",
+        "requires_evidence": true
+      },
+      {
+        "id": "participants",
+        "requires_evidence": true
+      },
+      {
+        "id": "object_state",
+        "requires_evidence": true
+      }
+    ],
+    "unresolved": [
+      "missing_saved_contract"
+    ],
+    "observations": [
+      {
+        "evidence_ref": "read_body_consistency:0c196819e1e9f21f",
+        "capability": "read_body_consistency",
+        "capability_version": 1,
+        "input_fingerprint": "77365a2b1cf30a45f0d55526b0d415427cef8149d0c1bfe876577f08367d7f13",
+        "coverage": {
+          "novel_ids": [],
+          "cursor": 0,
+          "limit": 5,
+          "segment_nos": [
+            1
+          ],
+          "source": "Generation.text+saved_segment_contract",
+          "complete": true,
+          "contract_complete": false
+        },
+        "data": {
+          "sources": {
+            "G1P001": {
+              "source_id": "generation:10",
+              "quote": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。",
+              "start": 0,
+              "end": 59
+            },
+            "G1P002": {
+              "source_id": "generation:10",
+              "quote": "“先不刷浆糊。”她说，“先看一遍。哪里松，哪里裂，哪一页会跟着动，都记下来。看不清的地方别猜。”",
+              "start": 61,
+              "end": 109
+            },
+            "G1P003": {
+              "source_id": "generation:10",
+              "quote": "陈舟已经在桌边站了一会儿，他把袖口往上挽了半截，点点头：“先检查封面，再翻正文？”",
+              "start": 111,
+              "end": 152
+            },
+            "G1P004": {
+              "source_id": "generation:10",
+              "quote": "“先封面，再首页。”林夏把无酸纸袋往旁边挪开，给图册腾出一块地方，“页码不能因为看着完整就跳过。封面也要看折角和装订边，不是只摸一下松不松。”",
+              "start": 154,
+              "end": 225
+            },
+            "G1P005": {
+              "source_id": "generation:10",
+              "quote": "窗外有送货车倒车的提示音，隔着玻璃传进来，拖得很长，陈舟的手便停在图册上方，等林夏示意，才用两指捏住封面右下角。",
+              "start": 227,
+              "end": 283
+            },
+            "G1P006": {
+              "source_id": "generation:10",
+              "quote": "图册不厚，封面却比内页硬一些，他刚往上提，靠近书脊的位置便发出一声轻响，纸边随之翘起，下面露出暗色的线脚。",
+              "start": 285,
+              "end": 338
+            },
+            "G1P007": {
+              "source_id": "generation:10",
+              "quote": "“这个松了。”他说。",
+              "start": 340,
+              "end": 350
+            },
+            "G1P008": {
+              "source_id": "generation:10",
+              "quote": "“先说依据。”林夏没有低头记，“哪里松？”",
+              "start": 352,
+              "end": 373
+            },
+            "G1P009": {
+              "source_id": "generation:10",
+              "quote": "“封面右下角，离书脊大概三指宽，纸边翘起来了。用手一抬，能看见下面的线。”",
+              "start": 375,
+              "end": 412
+            },
+            "G1P010": {
+              "source_id": "generation:10",
+              "quote": "“还有呢？”",
+              "start": 414,
+              "end": 420
+            },
+            "G1P011": {
+              "source_id": "generation:10",
+              "quote": "陈舟把封面放平，指腹沿着折痕滑过去，横过封面中部有一道旧折痕，纸面微微凹下去，靠近上沿的地方颜色更浅，他用指甲在旁边比了一下，没有碰那道凹线。",
+              "start": 422,
+              "end": 493
+            },
+            "G1P012": {
+              "source_id": "generation:10",
+              "quote": "“这道也算松吗？”他问。",
+              "start": 495,
+              "end": 507
+            },
+            "G1P013": {
+              "source_id": "generation:10",
+              "quote": "林夏俯身看了看：“先别叫松。记‘旧折痕’，长度和位置也写上。松不松，要看纸有没有分离，不能凭颜色定。”",
+              "start": 509,
+              "end": 560
+            },
+            "G1P014": {
+              "source_id": "generation:10",
+              "quote": "陈舟嗯了一声，翻开登记本，林夏便放慢语速报出封面情况：“封面中部横向旧折痕，靠近上沿，纸面有压痕，是否伴随纸纤维裂开，待复核。右下角翘起，线脚外露。”",
+              "start": 562,
+              "end": 637
+            },
+            "G1P015": {
+              "source_id": "generation:10",
+              "quote": "陈舟写下第一行，笔尖随即停住：“待复核要写到哪里？封面问题这一栏？”",
+              "start": 639,
+              "end": 673
+            },
+            "G1P016": {
+              "source_id": "generation:10",
+              "quote": "“先写可见情况。判断留在后面。你别为了让句子完整，把没看见的东西补进去。”",
+              "start": 675,
+              "end": 712
+            },
+            "G1P017": {
+              "source_id": "generation:10",
+              "quote": "他应了一声，把那行补完整，林夏又看向他：“再检查一遍。”",
+              "start": 714,
+              "end": 742
+            },
+            "G1P018": {
+              "source_id": "generation:10",
+              "quote": "“什么？”",
+              "start": 744,
+              "end": 749
+            },
+            "G1P019": {
+              "source_id": "generation:10",
+              "quote": "“折痕两侧有没有裂口，翘起的地方能不能被手带动。你刚才看的是表面。”",
+              "start": 751,
+              "end": 785
+            },
+            "G1P020": {
+              "source_id": "generation:10",
+              "quote": "陈舟把图册重新转向自己，封面下方有些发灰，像长期放在潮气重的地方，他用指腹沿边缘压过，到了右下角时停住。",
+              "start": 787,
+              "end": 839
+            },
+            "G1P021": {
+              "source_id": "generation:10",
+              "quote": "“这里有两种声音。”他说，“一处是纸边摩擦，一处像线在里面被拉动。”",
+              "start": 841,
+              "end": 875
+            },
+            "G1P022": {
+              "source_id": "generation:10",
+              "quote": "“记声音吗？”",
+              "start": 877,
+              "end": 884
+            },
+            "G1P023": {
+              "source_id": "generation:10",
+              "quote": "“也要记？”",
+              "start": 886,
+              "end": 892
+            },
+            "G1P024": {
+              "source_id": "generation:10",
+              "quote": "“如果你判断它和脱线有关，就写观察到的触感。不要写成已经脱线。”",
+              "start": 894,
+              "end": 926
+            },
+            "G1P025": {
+              "source_id": "generation:10",
+              "quote": "陈舟把前半句划掉，重新改成：“右下角翘起，触碰时纸边摩擦，线脚有牵动感，未确认脱线。”",
+              "start": 928,
+              "end": 971
+            },
+            "G1P026": {
+              "source_id": "generation:10",
+              "quote": "林夏这才点头：“翻首页。”",
+              "start": 973,
+              "end": 986
+            },
+            "G1P027": {
+              "source_id": "generation:10",
+              "quote": "首页靠近书脊的地方有一小块起毛，纸张边缘没有破，但被封面遮住的一角颜色更深，陈舟翻得很慢，每翻一页就把手指停在页脚，等林夏看清。",
+              "start": 988,
+              "end": 1052
+            },
+            "G1P028": {
+              "source_id": "generation:10",
+              "quote": "“别把页码翻过去太快。”她说，“今天只需要确认数量和连续性，但每页都要看。页脚有没有断，装订边有没有脱，纸面有没有新裂，分别记。”",
+              "start": 1054,
+              "end": 1119
+            },
+            "G1P029": {
+              "source_id": "generation:10",
+              "quote": "“所有页都写吗？”",
+              "start": 1121,
+              "end": 1130
+            },
+            "G1P030": {
+              "source_id": "generation:10",
+              "quote": "“正常的可以不写。异常写位置和范围，别用‘多处’代替具体页码。”",
+              "start": 1132,
+              "end": 1164
+            },
+            "G1P031": {
+              "source_id": "generation:10",
+              "quote": "陈舟翻到第三页，忽然停住：“这页右下角有旧折角。”",
+              "start": 1166,
+              "end": 1191
+            },
+            "G1P032": {
+              "source_id": "generation:10",
+              "quote": "“抬起来看。”",
+              "start": 1193,
+              "end": 1200
+            },
+            "G1P033": {
+              "source_id": "generation:10",
+              "quote": "他用指尖轻轻托住折角，纸张下方露出的颜色比上面深，折痕沿页面斜着走，靠近边缘的地方却没有完全断开。",
+              "start": 1202,
+              "end": 1251
+            },
+            "G1P034": {
+              "source_id": "generation:10",
+              "quote": "“这个能直接压平吗？”陈舟问。",
+              "start": 1253,
+              "end": 1268
+            },
+            "G1P035": {
+              "source_id": "generation:10",
+              "quote": "“先记页码、三页右下角，折角长度大约两厘米，纸面未完全断裂。再看它会不会牵动下一页。”",
+              "start": 1270,
+              "end": 1313
+            },
+            "G1P036": {
+              "source_id": "generation:10",
+              "quote": "“牵动？”",
+              "start": 1315,
+              "end": 1320
+            },
+            "G1P037": {
+              "source_id": "generation:10",
+              "quote": "“翻回去，再翻过来。如果下一页跟着抬，不能当普通折角处理。”",
+              "start": 1322,
+              "end": 1352
+            },
+            "G1P038": {
+              "source_id": "generation:10",
+              "quote": "陈舟依言翻回第二页，又慢慢翻开第三页，那一页的折角确实带起了旁边一小块纸面，第二页右下角也出现了一条不太明显的波浪。",
+              "start": 1354,
+              "end": 1412
+            },
+            "G1P039": {
+              "source_id": "generation:10",
+              "quote": "林夏伸手挡住书脊：“停。”",
+              "start": 1414,
+              "end": 1427
+            },
+            "G1P040": {
+              "source_id": "generation:10",
+              "quote": "陈舟立刻把手移开：“我是不是翻快了？”",
+              "start": 1429,
+              "end": 1448
+            },
+            "G1P041": {
+              "source_id": "generation:10",
+              "quote": "“慢一点可以，但先别急。这里不能只看折角。”她拿起一页空白记录纸，垫在第三页下面，“页脚有没有跟着动，刚才没有看清。再看。”",
+              "start": 1450,
+              "end": 1512
+            },
+            "G1P042": {
+              "source_id": "generation:10",
+              "quote": "窗外的车轮声停了，室内只剩下纸页摩擦的声音，陈舟把第三页抬起半厘米，观察下面的第二页，两页之间有一道细细的缝隙，第二页边缘被带得微微翘起，却没有脱落。",
+              "start": 1514,
+              "end": 1589
+            },
+            "G1P043": {
+              "source_id": "generation:10",
+              "quote": "“连着。”他说。",
+              "start": 1591,
+              "end": 1599
+            },
+            "G1P044": {
+              "source_id": "generation:10",
+              "quote": "“记‘相邻页有联动风险’，不要直接写‘脱页’。”林夏说，“你看到的是纸边跟着动，还是装订线牵着纸？”",
+              "start": 1601,
+              "end": 1651
+            },
+            "G1P045": {
+              "source_id": "generation:10",
+              "quote": "“像纸边。”",
+              "start": 1653,
+              "end": 1659
+            },
+            "G1P046": {
+              "source_id": "generation:10",
+              "quote": "“那就写纸边。”",
+              "start": 1661,
+              "end": 1669
+            },
+            "G1P047": {
+              "source_id": "generation:10",
+              "quote": "陈舟把笔尖压低，写完又从头看了一遍，字挤得有点紧，他往后退了一点，问：“要不要把第二页也单独列一项？”",
+              "start": 1671,
+              "end": 1722
+            },
+            "G1P048": {
+              "source_id": "generation:10",
+              "quote": "“先写在同一条里。关联页码要同时写清，后面处理才知道要看哪里。”",
+              "start": 1724,
+              "end": 1756
+            },
+            "G1P049": {
+              "source_id": "generation:10",
+              "quote": "他们继续往后翻，第四页、第五页的纸张大多平整，到了第六页，靠装订边的位置有一道细裂，裂口不长，纸面没有明显翘起，林夏让陈舟用手电从侧面照了一下，光线从纸背透过来，裂缝的边缘比正面更清楚。",
+              "start": 1758,
+              "end": 1851
+            },
+            "G1P050": {
+              "source_id": "generation:10",
+              "quote": "“这里算裂口吗？”陈舟问。",
+              "start": 1853,
+              "end": 1866
+            },
+            "G1P051": {
+              "source_id": "generation:10",
+              "quote": "“算。先记位置，再写长度。别现在决定它要不要补。”",
+              "start": 1868,
+              "end": 1893
+            },
+            "G1P052": {
+              "source_id": "generation:10",
+              "quote": "“补什么？”",
+              "start": 1895,
+              "end": 1901
+            },
+            "G1P053": {
+              "source_id": "generation:10",
+              "quote": "“先完成记录。修复方案要等全部页面看完再定。”",
+              "start": 1903,
+              "end": 1926
+            },
+            "G1P054": {
+              "source_id": "generation:10",
+              "quote": "陈舟低头写，笔尖在“六页装订边”下面停了停：“这页要不要先做保护？”",
+              "start": 1928,
+              "end": 1962
+            },
+            "G1P055": {
+              "source_id": "generation:10",
+              "quote": "林夏看了他一眼：“你觉得现在该做什么？”",
+              "start": 1964,
+              "end": 1984
+            },
+            "G1P056": {
+              "source_id": "generation:10",
+              "quote": "“我想在它翻页时用纸托一下，免得裂口扩大。”",
+              "start": 1986,
+              "end": 2008
+            },
+            "G1P057": {
+              "source_id": "generation:10",
+              "quote": "“有理由可以先说，但方案要等看完再定。垫纸不代表处理，先记为‘翻页时注意’。”",
+              "start": 2010,
+              "end": 2049
+            },
+            "G1P058": {
+              "source_id": "generation:10",
+              "quote": "“好。”",
+              "start": 2051,
+              "end": 2055
+            },
+            "G1P059": {
+              "source_id": "generation:10",
+              "quote": "他写完，视线又落到图册上方：“如果是书脊断了呢？”",
+              "start": 2057,
+              "end": 2082
+            },
+            "G1P060": {
+              "source_id": "generation:10",
+              "quote": "“现在没有看到断。先别把可能性写成发现。”",
+              "start": 2084,
+              "end": 2105
+            },
+            "G1P061": {
+              "source_id": "generation:10",
+              "quote": "陈舟抿了抿嘴，重新检查那一页，纸边虽然有裂痕，线脚还在，页脚也没有大范围移动，他在登记本上补了一句“未见明显脱线”，刚写完，林夏便伸手轻轻按住纸页。",
+              "start": 2107,
+              "end": 2181
+            },
+            "G1P062": {
+              "source_id": "generation:10",
+              "quote": "“别把‘未见’当‘没有’。检查到当前角度和光线，只能这样记。”",
+              "start": 2183,
+              "end": 2214
+            },
+            "G1P063": {
+              "source_id": "generation:10",
+              "quote": "陈舟把笔放下：“我知道了。”",
+              "start": 2216,
+              "end": 2230
+            },
+            "G1P064": {
+              "source_id": "generation:10",
+              "quote": "“继续。”",
+              "start": 2232,
+              "end": 2237
+            },
+            "G1P065": {
+              "source_id": "generation:10",
+              "quote": "翻到第十页时，他发现纸张边缘有一处较深的磨白，磨白靠近下沿，纸张厚度还在，没有洞，但表面起了细小的纤维。",
+              "start": 2239,
+              "end": 2291
+            },
+            "G1P066": {
+              "source_id": "generation:10",
+              "quote": "“这个要修吗？”他问。",
+              "start": 2293,
+              "end": 2304
+            },
+            "G1P067": {
+              "source_id": "generation:10",
+              "quote": "“先问是什么。”",
+              "start": 2306,
+              "end": 2314
+            },
+            "G1P068": {
+              "source_id": "generation:10",
+              "quote": "“边缘磨损。”",
+              "start": 2316,
+              "end": 2323
+            },
+            "G1P069": {
+              "source_id": "generation:10",
+              "quote": "“怎么造成的能看出来吗？”",
+              "start": 2325,
+              "end": 2338
+            },
+            "G1P070": {
+              "source_id": "generation:10",
+              "quote": "“可能是经常翻。”",
+              "start": 2340,
+              "end": 2349
+            },
+            "G1P071": {
+              "source_id": "generation:10",
+              "quote": "“可能不算依据。先记‘下沿磨白，范围一厘米左右，未见穿透’。”",
+              "start": 2351,
+              "end": 2382
+            },
+            "G1P072": {
+              "source_id": "generation:10",
+              "quote": "陈舟写完，忽然翻页的动作快了些，林夏用指尖压住第十一页：“一页一页来。”",
+              "start": 2384,
+              "end": 2420
+            },
+            "G1P073": {
+              "source_id": "generation:10",
+              "quote": "“我在赶时间。”",
+              "start": 2422,
+              "end": 2430
+            },
+            "G1P074": {
+              "source_id": "generation:10",
+              "quote": "“我知道。”林夏说，“但你现在赶的不是速度，是记录。今天慢一点，后面少返工。”",
+              "start": 2432,
+              "end": 2471
+            },
+            "G1P075": {
+              "source_id": "generation:10",
+              "quote": "陈舟看了看窗外的天色，又低头看图册，窗玻璃上映出桌边两个人的影子，一个坐着，一个站着，他把第十一页托稳，重新翻过去。",
+              "start": 2473,
+              "end": 2531
+            },
+            "G1P076": {
+              "source_id": "generation:10",
+              "quote": "第十二页、第十三页的纸张没有明显异常，第十四页右下角有一道短折痕，折痕很浅，纸面完整，第十六页靠近书脊的边缘起了一点毛，第十八页有一处颜色变浅的旧污痕，林夏没有让他停下，只提醒每项都写具体页码和位置。",
+              "start": 2533,
+              "end": 2633
+            },
+            "G1P077": {
+              "source_id": "generation:10",
+              "quote": "翻到第二十页，陈舟的肩膀明显紧了。",
+              "start": 2635,
+              "end": 2652
+            },
+            "G1P078": {
+              "source_id": "generation:10",
+              "quote": "“这里。”他说。",
+              "start": 2654,
+              "end": 2662
+            },
+            "G1P079": {
+              "source_id": "generation:10",
+              "quote": "第二十页靠近装订边的纸面被撕开过，裂口已用旧胶带贴过，胶带边缘发黄，底下的纸纤维翘起来，裂口不长，但每次翻页都会碰到相邻两页。",
+              "start": 2664,
+              "end": 2727
+            },
+            "G1P080": {
+              "source_id": "generation:10",
+              "quote": "林夏把图册平放在无酸纸袋旁边：“先别碰胶带。”",
+              "start": 2729,
+              "end": 2752
+            },
+            "G1P081": {
+              "source_id": "generation:10",
+              "quote": "“能不能把胶带揭掉？”",
+              "start": 2754,
+              "end": 2765
+            },
+            "G1P082": {
+              "source_id": "generation:10",
+              "quote": "“你先说依据。”",
+              "start": 2767,
+              "end": 2775
+            },
+            "G1P083": {
+              "source_id": "generation:10",
+              "quote": "“它已经不粘了，边缘翘起来，会刮到旁边的纸。”",
+              "start": 2777,
+              "end": 2800
+            },
+            "G1P084": {
+              "source_id": "generation:10",
+              "quote": "“揭掉以后有没有可能带走纸纤维？”",
+              "start": 2802,
+              "end": 2819
+            },
+            "G1P085": {
+              "source_id": "generation:10",
+              "quote": "陈舟没马上回答，他拿着软刷的刷柄，用刷背轻轻碰了碰胶带边缘，胶带一动，下面便有一小片纸色跟着变浅。",
+              "start": 2821,
+              "end": 2870
+            },
+            "G1P086": {
+              "source_id": "generation:10",
+              "quote": "林夏立刻说：“停。”",
+              "start": 2872,
+              "end": 2882
+            },
+            "G1P087": {
+              "source_id": "generation:10",
+              "quote": "陈舟收回手。",
+              "start": 2884,
+              "end": 2890
+            },
+            "G1P088": {
+              "source_id": "generation:10",
+              "quote": "“这个位置补记进去。”她说，“第二十页装订边旧胶带覆盖，边缘翘起，揭除时有纸纤维带起风险。”",
+              "start": 2892,
+              "end": 2938
+            },
+            "G1P089": {
+              "source_id": "generation:10",
+              "quote": "“那要怎么处理？”",
+              "start": 2940,
+              "end": 2949
+            },
+            "G1P090": {
+              "source_id": "generation:10",
+              "quote": "“先记。还没到方案时间。”",
+              "start": 2951,
+              "end": 2964
+            },
+            "G1P091": {
+              "source_id": "generation:10",
+              "quote": "陈舟把胶带那页单独做了记号，又在页脚压了一张小纸条，免得翻页时再次摩擦，后面几页也有不同问题，第二十六页内折角，折痕附近纸面变白，第二十九页靠近下沿有短裂，三十三页装订边有多处起毛，三十七页纸面没有破，但折过两次，压痕还留着。",
+              "start": 2966,
+              "end": 3079
+            },
+            "G1P092": {
+              "source_id": "generation:10",
+              "quote": "每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”",
+              "start": 3081,
+              "end": 3143
+            },
+            "G1P093": {
+              "source_id": "generation:10",
+              "quote": "陈舟翻到第四十页时，林夏忽然叫住他：“你刚才是不是从三十九直接翻到了四十一？”",
+              "start": 3145,
+              "end": 3184
+            },
+            "G1P094": {
+              "source_id": "generation:10",
+              "quote": "他低头一看，果然，手里的纸页已经越过四十页。",
+              "start": 3186,
+              "end": 3208
+            },
+            "G1P095": {
+              "source_id": "generation:10",
+              "quote": "“我没看清。”",
+              "start": 3210,
+              "end": 3217
+            },
+            "G1P096": {
+              "source_id": "generation:10",
+              "quote": "“重新看。”",
+              "start": 3219,
+              "end": 3225
+            },
+            "G1P097": {
+              "source_id": "generation:10",
+              "quote": "陈舟把第三十九页翻回来，停在第四十页上，页脚印着“40”，没有破损，他又回看第三十九页，确认页码是“39”，再重新翻到四十一页。",
+              "start": 3227,
+              "end": 3291
+            },
+            "G1P098": {
+              "source_id": "generation:10",
+              "quote": "“四十页在这里。”他说，“刚才漏了记录。”",
+              "start": 3293,
+              "end": 3314
+            },
+            "G1P099": {
+              "source_id": "generation:10",
+              "quote": "“漏看和漏记不是一回事。页码是不是连续，要现场再核一遍。”",
+              "start": 3316,
+              "end": 3345
+            },
+            "G1P100": {
+              "source_id": "generation:10",
+              "quote": "“刚才看过了。”",
+              "start": 3347,
+              "end": 3355
+            },
+            "G1P101": {
+              "source_id": "generation:10",
+              "quote": "“刚才看过了，不代表这一遍不用看。”",
+              "start": 3357,
+              "end": 3375
+            },
+            "G1P102": {
+              "source_id": "generation:10",
+              "quote": "陈舟没有争辩，他从第四十一页开始，一页一页往回核，第四十二页的页码印得偏右，靠近边缘，但没有缺页，第四十五页纸角有一道浅折，第四十八页的页码完整，纸张却比前面几页松，靠近书脊的地方有一道细小的裂线。",
+              "start": 3377,
+              "end": 3476
+            },
+            "G1P103": {
+              "source_id": "generation:10",
+              "quote": "“这里要写松页吗？”陈舟问。",
+              "start": 3478,
+              "end": 3492
+            },
+            "G1P104": {
+              "source_id": "generation:10",
+              "quote": "林夏把图册托起来：“你看到了什么？”",
+              "start": 3494,
+              "end": 3512
+            },
+            "G1P105": {
+              "source_id": "generation:10",
+              "quote": "“书脊边的纸面有裂线，翻页时比别页容易抬。”",
+              "start": 3514,
+              "end": 3536
+            },
+            "G1P106": {
+              "source_id": "generation:10",
+              "quote": "“写‘纸张活动度较大’，不要直接写松页。再看它是单独一页，还是和前后页有关。”",
+              "start": 3538,
+              "end": 3577
+            },
+            "G1P107": {
+              "source_id": "generation:10",
+              "quote": "陈舟把第四十八页抬起，第四十七页跟着动了一点，随后才露出下一页的边角。",
+              "start": 3579,
+              "end": 3614
+            },
+            "G1P108": {
+              "source_id": "generation:10",
+              "quote": "“前后有联动。”",
+              "start": 3616,
+              "end": 3624
+            },
+            "G1P109": {
+              "source_id": "generation:10",
+              "quote": "“记页码。”",
+              "start": 3626,
+              "end": 3632
+            },
+            "G1P110": {
+              "source_id": "generation:10",
+              "quote": "“四十七、四十八。”",
+              "start": 3634,
+              "end": 3644
+            },
+            "G1P111": {
+              "source_id": "generation:10",
+              "quote": "林夏用铅笔在登记本上做了一个小标记：“写清楚范围。”",
+              "start": 3646,
+              "end": 3672
+            },
+            "G1P112": {
+              "source_id": "generation:10",
+              "quote": "陈舟补完，才发现前面有几处页码写得不够具体，他翻回第十四页，把“页角有折”改成“第十四页右下角短折痕”，又翻回第二十九页，把“裂”改成“靠近下沿短裂口，长度待量”。",
+              "start": 3674,
+              "end": 3756
+            },
+            "G1P113": {
+              "source_id": "generation:10",
+              "quote": "“别用‘待量’。”林夏说，“现场量不了，就写‘未测’。不要留下一个像是漏掉的步骤。”",
+              "start": 3758,
+              "end": 3800
+            },
+            "G1P114": {
+              "source_id": "generation:10",
+              "quote": "陈舟抬眼看她。",
+              "start": 3802,
+              "end": 3809
+            },
+            "G1P115": {
+              "source_id": "generation:10",
+              "quote": "“你是不是觉得只要记了，就算做完？”",
+              "start": 3811,
+              "end": 3829
+            },
+            "G1P116": {
+              "source_id": "generation:10",
+              "quote": "“不是。”他说，“我只是怕写得不够完整。”",
+              "start": 3831,
+              "end": 3852
+            },
+            "G1P117": {
+              "source_id": "generation:10",
+              "quote": "“完整不等于填满。先把知道的写清楚，不知道的也写清楚。”",
+              "start": 3854,
+              "end": 3882
+            },
+            "G1P118": {
+              "source_id": "generation:10",
+              "quote": "他低下头，把“待量”改成“未测”，直到四十八页翻完，林夏让他从第一页重新核页码，陈舟没有再一口翻到底，只把每页的页脚露出来，手指从第一页移到第四十八页，遇到折角便停一下，确认前后页码后继续。",
+              "start": 3884,
+              "end": 3979
+            },
+            "G1P119": {
+              "source_id": "generation:10",
+              "quote": "窗外传来社区门口开门的声音，接着有人拖着购物车轮子经过，轮子在门槛处卡了一下，声音停在门外，又重新响起来，陈舟的手指也跟着停了一瞬，随后把第四十七页压平。",
+              "start": 3981,
+              "end": 4058
+            },
+            "G1P120": {
+              "source_id": "generation:10",
+              "quote": "“一、二、三……”他低声数。",
+              "start": 4060,
+              "end": 4074
+            },
+            "G1P121": {
+              "source_id": "generation:10",
+              "quote": "林夏没有催他，数到第四十八页时，陈舟把最后一张纸页压住，翻回去又确认一遍。",
+              "start": 4076,
+              "end": 4113
+            },
+            "G1P122": {
+              "source_id": "generation:10",
+              "quote": "“1到48，连续。”他说，“没有缺页。”",
+              "start": 4115,
+              "end": 4135
+            },
+            "G1P123": {
+              "source_id": "generation:10",
+              "quote": "“再说一遍依据。”",
+              "start": 4137,
+              "end": 4146
+            },
+            "G1P124": {
+              "source_id": "generation:10",
+              "quote": "“我逐页看了页脚，前一页和后一页的数字都能接上。第十页、二十页、三十页这些整数页都在，其他页码顺序也没有跳。”",
+              "start": 4148,
+              "end": 4203
+            },
+            "G1P125": {
+              "source_id": "generation:10",
+              "quote": "“第三页和第四十八页的页码有没有被折痕遮住？”",
+              "start": 4205,
+              "end": 4228
+            },
+            "G1P126": {
+              "source_id": "generation:10",
+              "quote": "“第三页页码在右下角，折角没有遮住。第四十八页页码清楚。”",
+              "start": 4230,
+              "end": 4259
+            },
+            "G1P127": {
+              "source_id": "generation:10",
+              "quote": "林夏这才点头：“这项可以写‘页码1至48连续’。”",
+              "start": 4261,
+              "end": 4286
+            },
+            "G1P128": {
+              "source_id": "generation:10",
+              "quote": "陈舟把笔尖落到登记本上，写下那行字，写到“连续”时，他停了一下：“要写‘初步’吗？”",
+              "start": 4288,
+              "end": 4330
+            },
+            "G1P129": {
+              "source_id": "generation:10",
+              "quote": "林夏想了想：“这轮检查范围内连续。加‘本轮检查未见缺页或跳页’，比只写连续更准确。”",
+              "start": 4332,
+              "end": 4374
+            },
+            "G1P130": {
+              "source_id": "generation:10",
+              "quote": "陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”",
+              "start": 4376,
+              "end": 4506
+            },
+            "G1P131": {
+              "source_id": "generation:10",
+              "quote": "陈舟把本子拿回来，改完，又问：“这些都要写进修复方案吗？”",
+              "start": 4508,
+              "end": 4537
+            },
+            "G1P132": {
+              "source_id": "generation:10",
+              "quote": "“把可见问题分成三类。”林夏翻到空白页，“一类是现在能确定的，比如封面纸边翘起、旧折痕和胶带翘边；一类是需要谨慎处理的，比如第三页折角牵动相邻页、第二十页胶带可能带起纤维；一类是暂时不能确定的，比如第四十七、四十八页的联动是否和装订受力有关。”",
+              "start": 4539,
+              "end": 4661
+            },
+            "G1P133": {
+              "source_id": "generation:10",
+              "quote": "“那不确定的怎么办？”",
+              "start": 4663,
+              "end": 4674
+            },
+            "G1P134": {
+              "source_id": "generation:10",
+              "quote": "“保持原状，翻页时避开，不为了弄明白就继续试。”",
+              "start": 4676,
+              "end": 4700
+            },
+            "G1P135": {
+              "source_id": "generation:10",
+              "quote": "陈舟看着那几页，点了点头。",
+              "start": 4702,
+              "end": 4715
+            },
+            "G1P136": {
+              "source_id": "generation:10",
+              "quote": "“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”",
+              "start": 4717,
+              "end": 4818
+            },
+            "G1P137": {
+              "source_id": "generation:10",
+              "quote": "陈舟跟着念了一遍，念到“压放范围只覆盖封面”时，他抬头问：“压板要不要先铺一层干净纸？”",
+              "start": 4820,
+              "end": 4864
+            },
+            "G1P138": {
+              "source_id": "generation:10",
+              "quote": "“要。直接压到封面，浆糊没干时会粘住，也会把水分压进旁边。”",
+              "start": 4866,
+              "end": 4896
+            },
+            "G1P139": {
+              "source_id": "generation:10",
+              "quote": "“浆糊先调稀一点，还是按平时的稠度？”",
+              "start": 4898,
+              "end": 4917
+            },
+            "G1P140": {
+              "source_id": "generation:10",
+              "quote": "“看现在的状态。太稀容易流，太稠不容易铺匀。先少量试刷，不够再加。”",
+              "start": 4919,
+              "end": 4953
+            },
+            "G1P141": {
+              "source_id": "generation:10",
+              "quote": "“如果刷到无酸纸边缘，需要停吗？”",
+              "start": 4955,
+              "end": 4972
+            },
+            "G1P142": {
+              "source_id": "generation:10",
+              "quote": "“边缘超出加固范围就停。纸边要留出余量，不能让它跟着书脊卷进去。”",
+              "start": 4974,
+              "end": 5007
+            },
+            "G1P143": {
+              "source_id": "generation:10",
+              "quote": "陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。",
+              "start": 5009,
+              "end": 5088
+            },
+            "G1P144": {
+              "source_id": "generation:10",
+              "quote": "林夏逐样点过：“纸、浆糊、刷子、压板、垫纸、登记本，都在桌面上。现在没有开始刷，也没有开始压。”",
+              "start": 5090,
+              "end": 5138
+            },
+            "G1P145": {
+              "source_id": "generation:10",
+              "quote": "陈舟看着那本旧图册，封面的折痕从中间横过去，纸面被压出的凹线还没有因为检查而改变，登记本上那一行行字，留着不同页码、不同位置和问题描述。",
+              "start": 5140,
+              "end": 5208
+            },
+            "G1P146": {
+              "source_id": "generation:10",
+              "quote": "他把笔放下，又伸手去碰无酸纸袋，林夏没有阻止，只问：“以后你先看什么？”",
+              "start": 5210,
+              "end": 5246
+            },
+            "G1P147": {
+              "source_id": "generation:10",
+              "quote": "陈舟的手停在袋口，想了几秒。",
+              "start": 5248,
+              "end": 5262
+            },
+            "G1P148": {
+              "source_id": "generation:10",
+              "quote": "“先看……”他说，“先看封面，再看页码。”",
+              "start": 5264,
+              "end": 5285
+            },
+            "G1P149": {
+              "source_id": "generation:10",
+              "quote": "林夏没有接话，只把登记本往他那边推了一点，让他能看见刚写下的方案，陈舟低头看着“压板范围”“待复核”几个字，又补问：“如果开始加固前发现无酸纸边缘有波纹，也要记吗？”",
+              "start": 5287,
+              "end": 5370
+            },
+            "G1P150": {
+              "source_id": "generation:10",
+              "quote": "“要看它会不会影响贴合。看得见的，都要记。”",
+              "start": 5372,
+              "end": 5394
+            },
+            "G1P151": {
+              "source_id": "generation:10",
+              "quote": "“我去拿纸巾？”",
+              "start": 5396,
+              "end": 5404
+            },
+            "G1P152": {
+              "source_id": "generation:10",
+              "quote": "“先别拿纸巾。”林夏把桌角的压板扶正，“纸巾会把桌面上的水汽带过来。我们按方案准备，不提前处理。”",
+              "start": 5406,
+              "end": 5455
+            },
+            "G1P153": {
+              "source_id": "generation:10",
+              "quote": "窗外又有车辆驶过，发动机声从远处靠近，又慢慢移开，陈舟把无酸纸袋的封口捏住，确认纸没有受潮，随后把袋子放到图册旁边。",
+              "start": 5457,
+              "end": 5515
+            },
+            "G1P154": {
+              "source_id": "generation:10",
+              "quote": "桌面上的刷和压板都还没有使用，旧图册保持摊开的状态，等着下一步。",
+              "start": 5517,
+              "end": 5549
+            }
+          },
+          "segments": [
+            {
+              "generation_id": 10,
+              "segment_no": 1,
+              "text_hash": "e73b337eca9c8898a732d6a35506b567f227cc8249ecb595797be8affff663ba",
+              "contract": null,
+              "unknown": "missing_saved_contract"
+            }
+          ],
+          "body_texts": {
+            "10": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。\n\n“先不刷浆糊。”她说，“先看一遍。哪里松，哪里裂，哪一页会跟着动，都记下来。看不清的地方别猜。”\n\n陈舟已经在桌边站了一会儿，他把袖口往上挽了半截，点点头：“先检查封面，再翻正文？”\n\n“先封面，再首页。”林夏把无酸纸袋往旁边挪开，给图册腾出一块地方，“页码不能因为看着完整就跳过。封面也要看折角和装订边，不是只摸一下松不松。”\n\n窗外有送货车倒车的提示音，隔着玻璃传进来，拖得很长，陈舟的手便停在图册上方，等林夏示意，才用两指捏住封面右下角。\n\n图册不厚，封面却比内页硬一些，他刚往上提，靠近书脊的位置便发出一声轻响，纸边随之翘起，下面露出暗色的线脚。\n\n“这个松了。”他说。\n\n“先说依据。”林夏没有低头记，“哪里松？”\n\n“封面右下角，离书脊大概三指宽，纸边翘起来了。用手一抬，能看见下面的线。”\n\n“还有呢？”\n\n陈舟把封面放平，指腹沿着折痕滑过去，横过封面中部有一道旧折痕，纸面微微凹下去，靠近上沿的地方颜色更浅，他用指甲在旁边比了一下，没有碰那道凹线。\n\n“这道也算松吗？”他问。\n\n林夏俯身看了看：“先别叫松。记‘旧折痕’，长度和位置也写上。松不松，要看纸有没有分离，不能凭颜色定。”\n\n陈舟嗯了一声，翻开登记本，林夏便放慢语速报出封面情况：“封面中部横向旧折痕，靠近上沿，纸面有压痕，是否伴随纸纤维裂开，待复核。右下角翘起，线脚外露。”\n\n陈舟写下第一行，笔尖随即停住：“待复核要写到哪里？封面问题这一栏？”\n\n“先写可见情况。判断留在后面。你别为了让句子完整，把没看见的东西补进去。”\n\n他应了一声，把那行补完整，林夏又看向他：“再检查一遍。”\n\n“什么？”\n\n“折痕两侧有没有裂口，翘起的地方能不能被手带动。你刚才看的是表面。”\n\n陈舟把图册重新转向自己，封面下方有些发灰，像长期放在潮气重的地方，他用指腹沿边缘压过，到了右下角时停住。\n\n“这里有两种声音。”他说，“一处是纸边摩擦，一处像线在里面被拉动。”\n\n“记声音吗？”\n\n“也要记？”\n\n“如果你判断它和脱线有关，就写观察到的触感。不要写成已经脱线。”\n\n陈舟把前半句划掉，重新改成：“右下角翘起，触碰时纸边摩擦，线脚有牵动感，未确认脱线。”\n\n林夏这才点头：“翻首页。”\n\n首页靠近书脊的地方有一小块起毛，纸张边缘没有破，但被封面遮住的一角颜色更深，陈舟翻得很慢，每翻一页就把手指停在页脚，等林夏看清。\n\n“别把页码翻过去太快。”她说，“今天只需要确认数量和连续性，但每页都要看。页脚有没有断，装订边有没有脱，纸面有没有新裂，分别记。”\n\n“所有页都写吗？”\n\n“正常的可以不写。异常写位置和范围，别用‘多处’代替具体页码。”\n\n陈舟翻到第三页，忽然停住：“这页右下角有旧折角。”\n\n“抬起来看。”\n\n他用指尖轻轻托住折角，纸张下方露出的颜色比上面深，折痕沿页面斜着走，靠近边缘的地方却没有完全断开。\n\n“这个能直接压平吗？”陈舟问。\n\n“先记页码、三页右下角，折角长度大约两厘米，纸面未完全断裂。再看它会不会牵动下一页。”\n\n“牵动？”\n\n“翻回去，再翻过来。如果下一页跟着抬，不能当普通折角处理。”\n\n陈舟依言翻回第二页，又慢慢翻开第三页，那一页的折角确实带起了旁边一小块纸面，第二页右下角也出现了一条不太明显的波浪。\n\n林夏伸手挡住书脊：“停。”\n\n陈舟立刻把手移开：“我是不是翻快了？”\n\n“慢一点可以，但先别急。这里不能只看折角。”她拿起一页空白记录纸，垫在第三页下面，“页脚有没有跟着动，刚才没有看清。再看。”\n\n窗外的车轮声停了，室内只剩下纸页摩擦的声音，陈舟把第三页抬起半厘米，观察下面的第二页，两页之间有一道细细的缝隙，第二页边缘被带得微微翘起，却没有脱落。\n\n“连着。”他说。\n\n“记‘相邻页有联动风险’，不要直接写‘脱页’。”林夏说，“你看到的是纸边跟着动，还是装订线牵着纸？”\n\n“像纸边。”\n\n“那就写纸边。”\n\n陈舟把笔尖压低，写完又从头看了一遍，字挤得有点紧，他往后退了一点，问：“要不要把第二页也单独列一项？”\n\n“先写在同一条里。关联页码要同时写清，后面处理才知道要看哪里。”\n\n他们继续往后翻，第四页、第五页的纸张大多平整，到了第六页，靠装订边的位置有一道细裂，裂口不长，纸面没有明显翘起，林夏让陈舟用手电从侧面照了一下，光线从纸背透过来，裂缝的边缘比正面更清楚。\n\n“这里算裂口吗？”陈舟问。\n\n“算。先记位置，再写长度。别现在决定它要不要补。”\n\n“补什么？”\n\n“先完成记录。修复方案要等全部页面看完再定。”\n\n陈舟低头写，笔尖在“六页装订边”下面停了停：“这页要不要先做保护？”\n\n林夏看了他一眼：“你觉得现在该做什么？”\n\n“我想在它翻页时用纸托一下，免得裂口扩大。”\n\n“有理由可以先说，但方案要等看完再定。垫纸不代表处理，先记为‘翻页时注意’。”\n\n“好。”\n\n他写完，视线又落到图册上方：“如果是书脊断了呢？”\n\n“现在没有看到断。先别把可能性写成发现。”\n\n陈舟抿了抿嘴，重新检查那一页，纸边虽然有裂痕，线脚还在，页脚也没有大范围移动，他在登记本上补了一句“未见明显脱线”，刚写完，林夏便伸手轻轻按住纸页。\n\n“别把‘未见’当‘没有’。检查到当前角度和光线，只能这样记。”\n\n陈舟把笔放下：“我知道了。”\n\n“继续。”\n\n翻到第十页时，他发现纸张边缘有一处较深的磨白，磨白靠近下沿，纸张厚度还在，没有洞，但表面起了细小的纤维。\n\n“这个要修吗？”他问。\n\n“先问是什么。”\n\n“边缘磨损。”\n\n“怎么造成的能看出来吗？”\n\n“可能是经常翻。”\n\n“可能不算依据。先记‘下沿磨白，范围一厘米左右，未见穿透’。”\n\n陈舟写完，忽然翻页的动作快了些，林夏用指尖压住第十一页：“一页一页来。”\n\n“我在赶时间。”\n\n“我知道。”林夏说，“但你现在赶的不是速度，是记录。今天慢一点，后面少返工。”\n\n陈舟看了看窗外的天色，又低头看图册，窗玻璃上映出桌边两个人的影子，一个坐着，一个站着，他把第十一页托稳，重新翻过去。\n\n第十二页、第十三页的纸张没有明显异常，第十四页右下角有一道短折痕，折痕很浅，纸面完整，第十六页靠近书脊的边缘起了一点毛，第十八页有一处颜色变浅的旧污痕，林夏没有让他停下，只提醒每项都写具体页码和位置。\n\n翻到第二十页，陈舟的肩膀明显紧了。\n\n“这里。”他说。\n\n第二十页靠近装订边的纸面被撕开过，裂口已用旧胶带贴过，胶带边缘发黄，底下的纸纤维翘起来，裂口不长，但每次翻页都会碰到相邻两页。\n\n林夏把图册平放在无酸纸袋旁边：“先别碰胶带。”\n\n“能不能把胶带揭掉？”\n\n“你先说依据。”\n\n“它已经不粘了，边缘翘起来，会刮到旁边的纸。”\n\n“揭掉以后有没有可能带走纸纤维？”\n\n陈舟没马上回答，他拿着软刷的刷柄，用刷背轻轻碰了碰胶带边缘，胶带一动，下面便有一小片纸色跟着变浅。\n\n林夏立刻说：“停。”\n\n陈舟收回手。\n\n“这个位置补记进去。”她说，“第二十页装订边旧胶带覆盖，边缘翘起，揭除时有纸纤维带起风险。”\n\n“那要怎么处理？”\n\n“先记。还没到方案时间。”\n\n陈舟把胶带那页单独做了记号，又在页脚压了一张小纸条，免得翻页时再次摩擦，后面几页也有不同问题，第二十六页内折角，折痕附近纸面变白，第二十九页靠近下沿有短裂，三十三页装订边有多处起毛，三十七页纸面没有破，但折过两次，压痕还留着。\n\n每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”\n\n陈舟翻到第四十页时，林夏忽然叫住他：“你刚才是不是从三十九直接翻到了四十一？”\n\n他低头一看，果然，手里的纸页已经越过四十页。\n\n“我没看清。”\n\n“重新看。”\n\n陈舟把第三十九页翻回来，停在第四十页上，页脚印着“40”，没有破损，他又回看第三十九页，确认页码是“39”，再重新翻到四十一页。\n\n“四十页在这里。”他说，“刚才漏了记录。”\n\n“漏看和漏记不是一回事。页码是不是连续，要现场再核一遍。”\n\n“刚才看过了。”\n\n“刚才看过了，不代表这一遍不用看。”\n\n陈舟没有争辩，他从第四十一页开始，一页一页往回核，第四十二页的页码印得偏右，靠近边缘，但没有缺页，第四十五页纸角有一道浅折，第四十八页的页码完整，纸张却比前面几页松，靠近书脊的地方有一道细小的裂线。\n\n“这里要写松页吗？”陈舟问。\n\n林夏把图册托起来：“你看到了什么？”\n\n“书脊边的纸面有裂线，翻页时比别页容易抬。”\n\n“写‘纸张活动度较大’，不要直接写松页。再看它是单独一页，还是和前后页有关。”\n\n陈舟把第四十八页抬起，第四十七页跟着动了一点，随后才露出下一页的边角。\n\n“前后有联动。”\n\n“记页码。”\n\n“四十七、四十八。”\n\n林夏用铅笔在登记本上做了一个小标记：“写清楚范围。”\n\n陈舟补完，才发现前面有几处页码写得不够具体，他翻回第十四页，把“页角有折”改成“第十四页右下角短折痕”，又翻回第二十九页，把“裂”改成“靠近下沿短裂口，长度待量”。\n\n“别用‘待量’。”林夏说，“现场量不了，就写‘未测’。不要留下一个像是漏掉的步骤。”\n\n陈舟抬眼看她。\n\n“你是不是觉得只要记了，就算做完？”\n\n“不是。”他说，“我只是怕写得不够完整。”\n\n“完整不等于填满。先把知道的写清楚，不知道的也写清楚。”\n\n他低下头，把“待量”改成“未测”，直到四十八页翻完，林夏让他从第一页重新核页码，陈舟没有再一口翻到底，只把每页的页脚露出来，手指从第一页移到第四十八页，遇到折角便停一下，确认前后页码后继续。\n\n窗外传来社区门口开门的声音，接着有人拖着购物车轮子经过，轮子在门槛处卡了一下，声音停在门外，又重新响起来，陈舟的手指也跟着停了一瞬，随后把第四十七页压平。\n\n“一、二、三……”他低声数。\n\n林夏没有催他，数到第四十八页时，陈舟把最后一张纸页压住，翻回去又确认一遍。\n\n“1到48，连续。”他说，“没有缺页。”\n\n“再说一遍依据。”\n\n“我逐页看了页脚，前一页和后一页的数字都能接上。第十页、二十页、三十页这些整数页都在，其他页码顺序也没有跳。”\n\n“第三页和第四十八页的页码有没有被折痕遮住？”\n\n“第三页页码在右下角，折角没有遮住。第四十八页页码清楚。”\n\n林夏这才点头：“这项可以写‘页码1至48连续’。”\n\n陈舟把笔尖落到登记本上，写下那行字，写到“连续”时，他停了一下：“要写‘初步’吗？”\n\n林夏想了想：“这轮检查范围内连续。加‘本轮检查未见缺页或跳页’，比只写连续更准确。”\n\n陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”\n\n陈舟把本子拿回来，改完，又问：“这些都要写进修复方案吗？”\n\n“把可见问题分成三类。”林夏翻到空白页，“一类是现在能确定的，比如封面纸边翘起、旧折痕和胶带翘边；一类是需要谨慎处理的，比如第三页折角牵动相邻页、第二十页胶带可能带起纤维；一类是暂时不能确定的，比如第四十七、四十八页的联动是否和装订受力有关。”\n\n“那不确定的怎么办？”\n\n“保持原状，翻页时避开，不为了弄明白就继续试。”\n\n陈舟看着那几页，点了点头。\n\n“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”\n\n陈舟跟着念了一遍，念到“压放范围只覆盖封面”时，他抬头问：“压板要不要先铺一层干净纸？”\n\n“要。直接压到封面，浆糊没干时会粘住，也会把水分压进旁边。”\n\n“浆糊先调稀一点，还是按平时的稠度？”\n\n“看现在的状态。太稀容易流，太稠不容易铺匀。先少量试刷，不够再加。”\n\n“如果刷到无酸纸边缘，需要停吗？”\n\n“边缘超出加固范围就停。纸边要留出余量，不能让它跟着书脊卷进去。”\n\n陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。\n\n林夏逐样点过：“纸、浆糊、刷子、压板、垫纸、登记本，都在桌面上。现在没有开始刷，也没有开始压。”\n\n陈舟看着那本旧图册，封面的折痕从中间横过去，纸面被压出的凹线还没有因为检查而改变，登记本上那一行行字，留着不同页码、不同位置和问题描述。\n\n他把笔放下，又伸手去碰无酸纸袋，林夏没有阻止，只问：“以后你先看什么？”\n\n陈舟的手停在袋口，想了几秒。\n\n“先看……”他说，“先看封面，再看页码。”\n\n林夏没有接话，只把登记本往他那边推了一点，让他能看见刚写下的方案，陈舟低头看着“压板范围”“待复核”几个字，又补问：“如果开始加固前发现无酸纸边缘有波纹，也要记吗？”\n\n“要看它会不会影响贴合。看得见的，都要记。”\n\n“我去拿纸巾？”\n\n“先别拿纸巾。”林夏把桌角的压板扶正，“纸巾会把桌面上的水汽带过来。我们按方案准备，不提前处理。”\n\n窗外又有车辆驶过，发动机声从远处靠近，又慢慢移开，陈舟把无酸纸袋的封口捏住，确认纸没有受潮，随后把袋子放到图册旁边。\n\n桌面上的刷和压板都还没有使用，旧图册保持摊开的状态，等着下一步。"
+          },
+          "warning": "quote_location_is_not_semantic_proof"
+        },
+        "candidate_overlay": {
+          "generation_id": 10,
+          "base_content_hash": "60cd380bbe7fb387ec6bcfe33acf8cb5992dfe1190828069f5d503c613d8d908",
+          "fixed_range": {
+            "start": 5517,
+            "end": 5535,
+            "range_hash": "6b2cd72e3f7f9815af75bb94cd20c082830a11c0ad69c712dcf6ac717ac596b5",
+            "replacement": "桌面上的刷和压板都还没有使用"
+          },
+          "business_written": false
+        }
+      }
+    ],
+    "skill": {
+      "id": "body_consistency",
+      "version": 1,
+      "status": "experimental"
+    },
+    "previous_run_id": 77,
+    "input_fingerprint": "b8df60d5ce3fff7d16aaeb726888c729ce6dae666d0dfa0c6ac7e1d81b5091e7",
+    "input_changed": true,
+    "model": "MiniMax-M3",
+    "model_response_raw": "{\"assessment\":\"observed\",\"reason\":\"候选仅将末句全称未使用断言中的登记本排除，保留刷和压板未使用状态，与前文登记本被多次翻开、书写、核对和查看方案的事实一致。观察未提供保存契约，且business_written为false，无法验证写入契约；仅按限定第1段复验正文，未引入新动作或结果。\",\"findings\":[{\"dimension\":\"time\",\"assessment\":\"supported\",\"reason\":\"第1段时间顺序一致：九点整开始检查，九点四十继续核对，九点四十五左右复看登记本并写入方案；末尾等待下一步，没有把未使用的刷和压板说成已使用。\",\"source_ids\":[\"G1P001\",\"G1P092\",\"G1P130\",\"G1P154\"]},{\"dimension\":\"place\",\"assessment\":\"supported\",\"reason\":\"第1段持续描写同一桌面场景，人物、图册和工具的位置前后相符；末尾替换未改变地点信息。\",\"source_ids\":[\"G1P001\",\"G1P004\",\"G1P143\",\"G1P154\"]},{\"dimension\":\"participants\",\"assessment\":\"supported\",\"reason\":\"第1段参与者始终为林夏和陈舟，叙述中的检查、记录、核对和方案讨论均有对应人物，未见因末句替换产生参与者冲突。\",\"source_ids\":[\"G1P001\",\"G1P003\",\"G1P130\",\"G1P136\",\"G1P154\"]},{\"dimension\":\"object_state\",\"assessment\":\"supported\",\"reason\":\"刷和压板未使用的全称断言未涉及登记本，因此不再与前文登记本多次记录、核对、修改及写入方案相冲突；前文关于刷曾接触胶带的动作也未延伸为刷子或压板已使用。\",\"source_ids\":[\"G1P014\",\"G1P047\",\"G1P092\",\"G1P130\",\"G1P136\",\"G1P143\",\"G1P154\"]}]}",
+    "checks": [
+      {
+        "id": "time_1",
+        "status": "supported",
+        "reason": "第1段时间顺序一致：九点整开始检查，九点四十继续核对，九点四十五左右复看登记本并写入方案；末尾等待下一步，没有把未使用的刷和压板说成已使用。",
+        "citations": [
+          {
+            "source_id": "G1P001",
+            "quote": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。",
+            "start": 0,
+            "end": 59,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P092",
+            "quote": "每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”",
+            "start": 3081,
+            "end": 3143,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P130",
+            "quote": "陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”",
+            "start": 4376,
+            "end": 4506,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P154",
+            "quote": "桌面上的刷和压板都还没有使用，旧图册保持摊开的状态，等着下一步。",
+            "start": 5517,
+            "end": 5549,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      },
+      {
+        "id": "place_2",
+        "status": "supported",
+        "reason": "第1段持续描写同一桌面场景，人物、图册和工具的位置前后相符；末尾替换未改变地点信息。",
+        "citations": [
+          {
+            "source_id": "G1P001",
+            "quote": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。",
+            "start": 0,
+            "end": 59,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P004",
+            "quote": "“先封面，再首页。”林夏把无酸纸袋往旁边挪开，给图册腾出一块地方，“页码不能因为看着完整就跳过。封面也要看折角和装订边，不是只摸一下松不松。”",
+            "start": 154,
+            "end": 225,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P143",
+            "quote": "陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。",
+            "start": 5009,
+            "end": 5088,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P154",
+            "quote": "桌面上的刷和压板都还没有使用，旧图册保持摊开的状态，等着下一步。",
+            "start": 5517,
+            "end": 5549,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      },
+      {
+        "id": "participants_3",
+        "status": "supported",
+        "reason": "第1段参与者始终为林夏和陈舟，叙述中的检查、记录、核对和方案讨论均有对应人物，未见因末句替换产生参与者冲突。",
+        "citations": [
+          {
+            "source_id": "G1P001",
+            "quote": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。",
+            "start": 0,
+            "end": 59,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P003",
+            "quote": "陈舟已经在桌边站了一会儿，他把袖口往上挽了半截，点点头：“先检查封面，再翻正文？”",
+            "start": 111,
+            "end": 152,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P130",
+            "quote": "陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”",
+            "start": 4376,
+            "end": 4506,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P136",
+            "quote": "“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”",
+            "start": 4717,
+            "end": 4818,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P154",
+            "quote": "桌面上的刷和压板都还没有使用，旧图册保持摊开的状态，等着下一步。",
+            "start": 5517,
+            "end": 5549,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      },
+      {
+        "id": "object_state_4",
+        "status": "supported",
+        "reason": "刷和压板未使用的全称断言未涉及登记本，因此不再与前文登记本多次记录、核对、修改及写入方案相冲突；前文关于刷曾接触胶带的动作也未延伸为刷子或压板已使用。",
+        "citations": [
+          {
+            "source_id": "G1P014",
+            "quote": "陈舟嗯了一声，翻开登记本，林夏便放慢语速报出封面情况：“封面中部横向旧折痕，靠近上沿，纸面有压痕，是否伴随纸纤维裂开，待复核。右下角翘起，线脚外露。”",
+            "start": 562,
+            "end": 637,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P047",
+            "quote": "陈舟把笔尖压低，写完又从头看了一遍，字挤得有点紧，他往后退了一点，问：“要不要把第二页也单独列一项？”",
+            "start": 1671,
+            "end": 1722,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P092",
+            "quote": "每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”",
+            "start": 3081,
+            "end": 3143,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P130",
+            "quote": "陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”",
+            "start": 4376,
+            "end": 4506,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P136",
+            "quote": "“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”",
+            "start": 4717,
+            "end": 4818,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P143",
+            "quote": "陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。",
+            "start": 5009,
+            "end": 5088,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          },
+          {
+            "source_id": "G1P154",
+            "quote": "桌面上的刷和压板都还没有使用，旧图册保持摊开的状态，等着下一步。",
+            "start": 5517,
+            "end": 5549,
+            "body_source_id": "generation:10",
+            "location_verified": true
+          }
+        ]
+      }
+    ],
+    "run_id": 79
+  },
+  "candidate": {
+    "base_content_hash": "60cd380bbe7fb387ec6bcfe33acf8cb5992dfe1190828069f5d503c613d8d908",
+    "after_text": "九点整，林夏把登记本推到桌面中间，钢笔横在本子上方，却没有先碰那本旧植物图册，只隔着桌面扫了一眼封面的折角与书脊边缘。\n\n“先不刷浆糊。”她说，“先看一遍。哪里松，哪里裂，哪一页会跟着动，都记下来。看不清的地方别猜。”\n\n陈舟已经在桌边站了一会儿，他把袖口往上挽了半截，点点头：“先检查封面，再翻正文？”\n\n“先封面，再首页。”林夏把无酸纸袋往旁边挪开，给图册腾出一块地方，“页码不能因为看着完整就跳过。封面也要看折角和装订边，不是只摸一下松不松。”\n\n窗外有送货车倒车的提示音，隔着玻璃传进来，拖得很长，陈舟的手便停在图册上方，等林夏示意，才用两指捏住封面右下角。\n\n图册不厚，封面却比内页硬一些，他刚往上提，靠近书脊的位置便发出一声轻响，纸边随之翘起，下面露出暗色的线脚。\n\n“这个松了。”他说。\n\n“先说依据。”林夏没有低头记，“哪里松？”\n\n“封面右下角，离书脊大概三指宽，纸边翘起来了。用手一抬，能看见下面的线。”\n\n“还有呢？”\n\n陈舟把封面放平，指腹沿着折痕滑过去，横过封面中部有一道旧折痕，纸面微微凹下去，靠近上沿的地方颜色更浅，他用指甲在旁边比了一下，没有碰那道凹线。\n\n“这道也算松吗？”他问。\n\n林夏俯身看了看：“先别叫松。记‘旧折痕’，长度和位置也写上。松不松，要看纸有没有分离，不能凭颜色定。”\n\n陈舟嗯了一声，翻开登记本，林夏便放慢语速报出封面情况：“封面中部横向旧折痕，靠近上沿，纸面有压痕，是否伴随纸纤维裂开，待复核。右下角翘起，线脚外露。”\n\n陈舟写下第一行，笔尖随即停住：“待复核要写到哪里？封面问题这一栏？”\n\n“先写可见情况。判断留在后面。你别为了让句子完整，把没看见的东西补进去。”\n\n他应了一声，把那行补完整，林夏又看向他：“再检查一遍。”\n\n“什么？”\n\n“折痕两侧有没有裂口，翘起的地方能不能被手带动。你刚才看的是表面。”\n\n陈舟把图册重新转向自己，封面下方有些发灰，像长期放在潮气重的地方，他用指腹沿边缘压过，到了右下角时停住。\n\n“这里有两种声音。”他说，“一处是纸边摩擦，一处像线在里面被拉动。”\n\n“记声音吗？”\n\n“也要记？”\n\n“如果你判断它和脱线有关，就写观察到的触感。不要写成已经脱线。”\n\n陈舟把前半句划掉，重新改成：“右下角翘起，触碰时纸边摩擦，线脚有牵动感，未确认脱线。”\n\n林夏这才点头：“翻首页。”\n\n首页靠近书脊的地方有一小块起毛，纸张边缘没有破，但被封面遮住的一角颜色更深，陈舟翻得很慢，每翻一页就把手指停在页脚，等林夏看清。\n\n“别把页码翻过去太快。”她说，“今天只需要确认数量和连续性，但每页都要看。页脚有没有断，装订边有没有脱，纸面有没有新裂，分别记。”\n\n“所有页都写吗？”\n\n“正常的可以不写。异常写位置和范围，别用‘多处’代替具体页码。”\n\n陈舟翻到第三页，忽然停住：“这页右下角有旧折角。”\n\n“抬起来看。”\n\n他用指尖轻轻托住折角，纸张下方露出的颜色比上面深，折痕沿页面斜着走，靠近边缘的地方却没有完全断开。\n\n“这个能直接压平吗？”陈舟问。\n\n“先记页码、三页右下角，折角长度大约两厘米，纸面未完全断裂。再看它会不会牵动下一页。”\n\n“牵动？”\n\n“翻回去，再翻过来。如果下一页跟着抬，不能当普通折角处理。”\n\n陈舟依言翻回第二页，又慢慢翻开第三页，那一页的折角确实带起了旁边一小块纸面，第二页右下角也出现了一条不太明显的波浪。\n\n林夏伸手挡住书脊：“停。”\n\n陈舟立刻把手移开：“我是不是翻快了？”\n\n“慢一点可以，但先别急。这里不能只看折角。”她拿起一页空白记录纸，垫在第三页下面，“页脚有没有跟着动，刚才没有看清。再看。”\n\n窗外的车轮声停了，室内只剩下纸页摩擦的声音，陈舟把第三页抬起半厘米，观察下面的第二页，两页之间有一道细细的缝隙，第二页边缘被带得微微翘起，却没有脱落。\n\n“连着。”他说。\n\n“记‘相邻页有联动风险’，不要直接写‘脱页’。”林夏说，“你看到的是纸边跟着动，还是装订线牵着纸？”\n\n“像纸边。”\n\n“那就写纸边。”\n\n陈舟把笔尖压低，写完又从头看了一遍，字挤得有点紧，他往后退了一点，问：“要不要把第二页也单独列一项？”\n\n“先写在同一条里。关联页码要同时写清，后面处理才知道要看哪里。”\n\n他们继续往后翻，第四页、第五页的纸张大多平整，到了第六页，靠装订边的位置有一道细裂，裂口不长，纸面没有明显翘起，林夏让陈舟用手电从侧面照了一下，光线从纸背透过来，裂缝的边缘比正面更清楚。\n\n“这里算裂口吗？”陈舟问。\n\n“算。先记位置，再写长度。别现在决定它要不要补。”\n\n“补什么？”\n\n“先完成记录。修复方案要等全部页面看完再定。”\n\n陈舟低头写，笔尖在“六页装订边”下面停了停：“这页要不要先做保护？”\n\n林夏看了他一眼：“你觉得现在该做什么？”\n\n“我想在它翻页时用纸托一下，免得裂口扩大。”\n\n“有理由可以先说，但方案要等看完再定。垫纸不代表处理，先记为‘翻页时注意’。”\n\n“好。”\n\n他写完，视线又落到图册上方：“如果是书脊断了呢？”\n\n“现在没有看到断。先别把可能性写成发现。”\n\n陈舟抿了抿嘴，重新检查那一页，纸边虽然有裂痕，线脚还在，页脚也没有大范围移动，他在登记本上补了一句“未见明显脱线”，刚写完，林夏便伸手轻轻按住纸页。\n\n“别把‘未见’当‘没有’。检查到当前角度和光线，只能这样记。”\n\n陈舟把笔放下：“我知道了。”\n\n“继续。”\n\n翻到第十页时，他发现纸张边缘有一处较深的磨白，磨白靠近下沿，纸张厚度还在，没有洞，但表面起了细小的纤维。\n\n“这个要修吗？”他问。\n\n“先问是什么。”\n\n“边缘磨损。”\n\n“怎么造成的能看出来吗？”\n\n“可能是经常翻。”\n\n“可能不算依据。先记‘下沿磨白，范围一厘米左右，未见穿透’。”\n\n陈舟写完，忽然翻页的动作快了些，林夏用指尖压住第十一页：“一页一页来。”\n\n“我在赶时间。”\n\n“我知道。”林夏说，“但你现在赶的不是速度，是记录。今天慢一点，后面少返工。”\n\n陈舟看了看窗外的天色，又低头看图册，窗玻璃上映出桌边两个人的影子，一个坐着，一个站着，他把第十一页托稳，重新翻过去。\n\n第十二页、第十三页的纸张没有明显异常，第十四页右下角有一道短折痕，折痕很浅，纸面完整，第十六页靠近书脊的边缘起了一点毛，第十八页有一处颜色变浅的旧污痕，林夏没有让他停下，只提醒每项都写具体页码和位置。\n\n翻到第二十页，陈舟的肩膀明显紧了。\n\n“这里。”他说。\n\n第二十页靠近装订边的纸面被撕开过，裂口已用旧胶带贴过，胶带边缘发黄，底下的纸纤维翘起来，裂口不长，但每次翻页都会碰到相邻两页。\n\n林夏把图册平放在无酸纸袋旁边：“先别碰胶带。”\n\n“能不能把胶带揭掉？”\n\n“你先说依据。”\n\n“它已经不粘了，边缘翘起来，会刮到旁边的纸。”\n\n“揭掉以后有没有可能带走纸纤维？”\n\n陈舟没马上回答，他拿着软刷的刷柄，用刷背轻轻碰了碰胶带边缘，胶带一动，下面便有一小片纸色跟着变浅。\n\n林夏立刻说：“停。”\n\n陈舟收回手。\n\n“这个位置补记进去。”她说，“第二十页装订边旧胶带覆盖，边缘翘起，揭除时有纸纤维带起风险。”\n\n“那要怎么处理？”\n\n“先记。还没到方案时间。”\n\n陈舟把胶带那页单独做了记号，又在页脚压了一张小纸条，免得翻页时再次摩擦，后面几页也有不同问题，第二十六页内折角，折痕附近纸面变白，第二十九页靠近下沿有短裂，三十三页装订边有多处起毛，三十七页纸面没有破，但折过两次，压痕还留着。\n\n每翻一页，陈舟都要在登记本上核对页码，声音逐渐变得均匀，直到林夏看了一眼桌面上的时钟：“九点了四十。先把已看的页码接着核。”\n\n陈舟翻到第四十页时，林夏忽然叫住他：“你刚才是不是从三十九直接翻到了四十一？”\n\n他低头一看，果然，手里的纸页已经越过四十页。\n\n“我没看清。”\n\n“重新看。”\n\n陈舟把第三十九页翻回来，停在第四十页上，页脚印着“40”，没有破损，他又回看第三十九页，确认页码是“39”，再重新翻到四十一页。\n\n“四十页在这里。”他说，“刚才漏了记录。”\n\n“漏看和漏记不是一回事。页码是不是连续，要现场再核一遍。”\n\n“刚才看过了。”\n\n“刚才看过了，不代表这一遍不用看。”\n\n陈舟没有争辩，他从第四十一页开始，一页一页往回核，第四十二页的页码印得偏右，靠近边缘，但没有缺页，第四十五页纸角有一道浅折，第四十八页的页码完整，纸张却比前面几页松，靠近书脊的地方有一道细小的裂线。\n\n“这里要写松页吗？”陈舟问。\n\n林夏把图册托起来：“你看到了什么？”\n\n“书脊边的纸面有裂线，翻页时比别页容易抬。”\n\n“写‘纸张活动度较大’，不要直接写松页。再看它是单独一页，还是和前后页有关。”\n\n陈舟把第四十八页抬起，第四十七页跟着动了一点，随后才露出下一页的边角。\n\n“前后有联动。”\n\n“记页码。”\n\n“四十七、四十八。”\n\n林夏用铅笔在登记本上做了一个小标记：“写清楚范围。”\n\n陈舟补完，才发现前面有几处页码写得不够具体，他翻回第十四页，把“页角有折”改成“第十四页右下角短折痕”，又翻回第二十九页，把“裂”改成“靠近下沿短裂口，长度待量”。\n\n“别用‘待量’。”林夏说，“现场量不了，就写‘未测’。不要留下一个像是漏掉的步骤。”\n\n陈舟抬眼看她。\n\n“你是不是觉得只要记了，就算做完？”\n\n“不是。”他说，“我只是怕写得不够完整。”\n\n“完整不等于填满。先把知道的写清楚，不知道的也写清楚。”\n\n他低下头，把“待量”改成“未测”，直到四十八页翻完，林夏让他从第一页重新核页码，陈舟没有再一口翻到底，只把每页的页脚露出来，手指从第一页移到第四十八页，遇到折角便停一下，确认前后页码后继续。\n\n窗外传来社区门口开门的声音，接着有人拖着购物车轮子经过，轮子在门槛处卡了一下，声音停在门外，又重新响起来，陈舟的手指也跟着停了一瞬，随后把第四十七页压平。\n\n“一、二、三……”他低声数。\n\n林夏没有催他，数到第四十八页时，陈舟把最后一张纸页压住，翻回去又确认一遍。\n\n“1到48，连续。”他说，“没有缺页。”\n\n“再说一遍依据。”\n\n“我逐页看了页脚，前一页和后一页的数字都能接上。第十页、二十页、三十页这些整数页都在，其他页码顺序也没有跳。”\n\n“第三页和第四十八页的页码有没有被折痕遮住？”\n\n“第三页页码在右下角，折角没有遮住。第四十八页页码清楚。”\n\n林夏这才点头：“这项可以写‘页码1至48连续’。”\n\n陈舟把笔尖落到登记本上，写下那行字，写到“连续”时，他停了一下：“要写‘初步’吗？”\n\n林夏想了想：“这轮检查范围内连续。加‘本轮检查未见缺页或跳页’，比只写连续更准确。”\n\n陈舟照着写完，纸页上的铅笔印透过薄纸显出来，九点四十五分左右，林夏把登记本拿过去，从头看了一遍，没有评价陈舟写得对不对，只用笔在旁边圈出几处：“这里的‘疑似脱线’改成‘线脚有牵动感’，这里‘松页’改成‘纸张活动度较大’，这里‘无裂’删掉。我们没有做背面检查。”\n\n陈舟把本子拿回来，改完，又问：“这些都要写进修复方案吗？”\n\n“把可见问题分成三类。”林夏翻到空白页，“一类是现在能确定的，比如封面纸边翘起、旧折痕和胶带翘边；一类是需要谨慎处理的，比如第三页折角牵动相邻页、第二十页胶带可能带起纤维；一类是暂时不能确定的，比如第四十七、四十八页的联动是否和装订受力有关。”\n\n“那不确定的怎么办？”\n\n“保持原状，翻页时避开，不为了弄明白就继续试。”\n\n陈舟看着那几页，点了点头。\n\n“方案先这样。”林夏在登记本上写下，“封面用无酸纸加固，使用浆糊，贴合后压放；正文暂不做全面揭除和补纸，翻页时避开已记录问题；工具使用前检查，压放范围只覆盖封面加固区域，避免影响相邻页。加固后待复核。”\n\n陈舟跟着念了一遍，念到“压放范围只覆盖封面”时，他抬头问：“压板要不要先铺一层干净纸？”\n\n“要。直接压到封面，浆糊没干时会粘住，也会把水分压进旁边。”\n\n“浆糊先调稀一点，还是按平时的稠度？”\n\n“看现在的状态。太稀容易流，太稠不容易铺匀。先少量试刷，不够再加。”\n\n“如果刷到无酸纸边缘，需要停吗？”\n\n“边缘超出加固范围就停。纸边要留出余量，不能让它跟着书脊卷进去。”\n\n陈舟把这些内容记下，又抬头看桌上的工具，无酸纸袋还在左边，浆糊碗没有打开，软刷横放刷毛朝外，压板靠在桌角，旁边有一块干净的棉布，登记本摊开，铅笔放在本子下方。\n\n林夏逐样点过：“纸、浆糊、刷子、压板、垫纸、登记本，都在桌面上。现在没有开始刷，也没有开始压。”\n\n陈舟看着那本旧图册，封面的折痕从中间横过去，纸面被压出的凹线还没有因为检查而改变，登记本上那一行行字，留着不同页码、不同位置和问题描述。\n\n他把笔放下，又伸手去碰无酸纸袋，林夏没有阻止，只问：“以后你先看什么？”\n\n陈舟的手停在袋口，想了几秒。\n\n“先看……”他说，“先看封面，再看页码。”\n\n林夏没有接话，只把登记本往他那边推了一点，让他能看见刚写下的方案，陈舟低头看着“压板范围”“待复核”几个字，又补问：“如果开始加固前发现无酸纸边缘有波纹，也要记吗？”\n\n“要看它会不会影响贴合。看得见的，都要记。”\n\n“我去拿纸巾？”\n\n“先别拿纸巾。”林夏把桌角的压板扶正，“纸巾会把桌面上的水汽带过来。我们按方案准备，不提前处理。”\n\n窗外又有车辆驶过，发动机声从远处靠近，又慢慢移开，陈舟把无酸纸袋的封口捏住，确认纸没有受潮，随后把袋子放到图册旁边。\n\n桌面上的刷和压板都还没有使用，旧图册保持摊开的状态，等着下一步。",
+    "after_hash": "e73b337eca9c8898a732d6a35506b567f227cc8249ecb595797be8affff663ba",
+    "verified": false,
+    "apply_state": "candidate_only",
+    "fixed_range": {
+      "start": 5517,
+      "end": 5535,
+      "range_hash": "6b2cd72e3f7f9815af75bb94cd20c082830a11c0ad69c712dcf6ac717ac596b5",
+      "replacement": "桌面上的刷和压板都还没有使用"
+    }
+  },
+  "generation_id": 10,
+  "preserve_source_ids": [
+    "G1P015",
+    "G1P061",
+    "G1P092",
+    "G1P130",
+    "G1P136",
+    "G1P145"
+  ],
+  "conflict_source_id": "G1P154",
+  "objective": "保持登记本已多次记录、核对及写入方案的既有事实；从末尾全称未使用断言中排除登记本，消除这一矛盾。保留其他物件原有状态，不引入任何新动作或结果。只替换选定18字符，不复制后续逗号及旧图册句。"
+}

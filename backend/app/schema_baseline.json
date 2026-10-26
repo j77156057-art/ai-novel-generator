@@ -1,0 +1,60 @@
+{
+  "_baseline_commit": "8b7d5d14b4e189bdc6cabadfc50fc4f76d731668",
+  "_comment": "迁移体系建立前的 schema；加列时不要重跑本脚本，只改 db.py 迁移清单",
+  "tables": {
+    "generations": [
+      "id",
+      "project_id",
+      "segment_no",
+      "chapter_range",
+      "text",
+      "summary"
+    ],
+    "kg_edges": [
+      "id",
+      "from_id",
+      "to_id",
+      "type",
+      "props"
+    ],
+    "kg_nodes": [
+      "id",
+      "project_id",
+      "type",
+      "props",
+      "first_chapter",
+      "last_chapter"
+    ],
+    "novel_chunks": [
+      "id",
+      "novel_id",
+      "chapter_no",
+      "idx",
+      "text",
+      "embedding"
+    ],
+    "projects": [
+      "id",
+      "user_id",
+      "title",
+      "target_length",
+      "style_dims",
+      "mode",
+      "outline",
+      "summary",
+      "status",
+      "created_at"
+    ],
+    "raw_novels": [
+      "id",
+      "title",
+      "author",
+      "platform",
+      "genre",
+      "heat",
+      "tags",
+      "source_url",
+      "status"
+    ]
+  }
+}

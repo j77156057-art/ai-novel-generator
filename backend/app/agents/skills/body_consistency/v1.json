@@ -1,0 +1,59 @@
+{
+  "id": "body_consistency",
+  "version": 1,
+  "status": "experimental",
+  "applicable_tasks": [
+    "body_consistency",
+    "repair_verification"
+  ],
+  "agent_roles": [
+    "diagnostic"
+  ],
+  "required_capabilities": [
+    {
+      "id": "read_body_consistency",
+      "min_version": 1
+    }
+  ],
+  "steps": [
+    {
+      "id": "body",
+      "capability": "read_body_consistency",
+      "requires": [],
+      "observe": [
+        "限定segment_nos，正文与保存契约",
+        "时间地点人物物件状态",
+        "矛盾两端source IDs",
+        "回忆谎言设想有意重复不直接当事实矛盾"
+      ]
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "time",
+      "requires_evidence": true
+    },
+    {
+      "id": "place",
+      "requires_evidence": true
+    },
+    {
+      "id": "participants",
+      "requires_evidence": true
+    },
+    {
+      "id": "object_state",
+      "requires_evidence": true
+    }
+  ],
+  "source_evidence": [],
+  "failure_boundaries": [
+    "unknown_preserved",
+    "missing_saved_contract_unknown",
+    "quote_location_is_not_semantic_proof",
+    "single_project_only",
+    "no_business_write"
+  ],
+  "allowed_actions": [],
+  "supersedes": null
+}

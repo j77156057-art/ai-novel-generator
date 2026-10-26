@@ -1,0 +1,9 @@
+# Bounded repair verification (v3 experimental)
+
+Server derives `verification_scope=local_repair_verification` from the diagnosed contradiction, selected conflicting source and preserved source IDs. Clients cannot choose an easier verification scope. Coverage binds original/candidate hashes, fixed range, objective, diagnostic and verification run IDs. `covered` names only the diagnosed checks resolved by cited supported findings and the exact preserved facts; `uncovered` retains all other semantics and segment-plan consistency.
+
+Local `accepted` requires matching segment scope and audit overlay, original contradicted check association, supported recheck in the same dimension citing the changed endpoint and a preserved endpoint, every preservation quote unchanged, and no independent contradicted/unknown result or unresolved item except missing historical contract. It is a bounded Assistant judgment, not proof of whole-segment quality. `segment_plan_consistency` and `overall` stay unknown: this body-only protocol does not verify all plan obligations, even when a saved contract exists.
+
+Keep current strict application policy: `semantic_accepted` still requires full existing verification without unresolved items. Missing-contract candidates can show local acceptance but remain blocked for application. Recovery requires an authentic historical contract and a new explicit verification request; never synthesize a snapshot from current planning or mutate old proposals/audits. New metadata must be read back from the exact verification run before use. No model retries for interpreting old evidence.
+
+Existing generation saves the active contract before advancing via `_judge_and_advance`, shared by sync/stream. No backfill of historical segments is introduced. Tests must exercise the existing saved-contract boundary separately from this bounded result.

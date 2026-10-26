@@ -1,0 +1,68 @@
+# backend/config/providers.yaml
+#
+# Provider 双轨隔离的默认配置（ADR-2026-10-12 第 2 步）。
+#
+# 优先级（低 → 高）：
+#   1. 本文件（本目录就是 backend/config/providers.yaml）
+#   2. .env 里的 WRITER_* / ASSISTANT_* / DISTILLER_* 环境变量覆盖同名字段
+#   3. 运行时通过 routers/settings.py 的 PUT /api/settings/llm 热覆盖
+#
+# 设计原则：
+# - writer 默认留空：原 Writer 路径继续走 llm_provider / *_api_key 等老字段，
+#   不强行覆盖 b58c763 的行为。返回的字段全空 → 工厂会委托给 get_llm_provider()。
+# - assistant 默认走 zhipu（GLM-4-Flash 永久免费不限 token；中文诊断稳）。
+# - distiller 默认也走 zhipu，但 timeout 明显更大（长任务，见该块注释）。
+# - max_tokens / timeout 独立可调，但 writer 的默认值与 Writer 路径保持一致，
+#   避免 Assistant 与 Writer 体量差异被误读为「不同步」。
+#
+# 失败兜底：任何 provider 配置出错（缺 key / 模型下架 / 网络不可达），registry
+# 只会让该 role 抛错，**绝不**串到另一个 role 的缓存或单例。
+
+writer:
+  provider: ""           # 空 = 委托给 get_llm_provider() 的原 Writer 单例
+  api_key: ""
+  base_url: ""
+  # 写手模型。2026-10-25 真跑实测（同一提示/上下文/真书续写）：
+  #   MiniMax-M3         对白段典型 17.7 字 · 纯台词段 58.1% · 句长 19.6 · 20~28s
+  #   MiniMax-M3.1-Flash 对白段典型 39.5 字 · 纯台词段 27.7% · 句长 28.9 · 112~141s
+  #   （参考书：61 字 / 20.8% / 48.5）
+  # M3.1-Flash 的对白形态几乎贴住参考书，代价是慢 4~5 倍（思考关不掉）。
+  model: "MiniMax-M3.1-Flash"
+  # 单次生成的上限，单位是 **token**（不是字）。实测 glm-4-flash 中文约
+  # 1.67 字/token：3000 字的段落约需 1800 token。原先写 2048 只剩 14% 余量，
+  # 一旦模型写得稍长就被拦腰截断，而系统当时**根本不检查 finish_reason**
+  # （provider.py 里出现 0 次），半截文字会被当完整段落直接落库。
+  # 4096 ≈ 6800 字，对 3000 字目标有 2 倍以上余量。
+  # 若把 project.generation_length 调到 6000 以上，请同步上调这里。
+  # v2.19: 拉到 8192 (≈13600 字) 让智谱/Nemotron 真能写 6000+ 字段不再截断
+  # 2026-10-25: 抬到 32768 —— adaptive thinking 模型（M3.1-Flash）思考 token
+  #   **算进 completion 预算**，实测写 2400 字正文用掉 111.8s；8192 会让正文
+  #   被思考挤掉、被拦腰截断。provider 里还有一道按模型的**预算地板**兜着
+  #   （MiniMaxChatProvider.MIN_ADAPTIVE_MAX_TOKENS），存下来的旧值也掐不死它。
+  max_tokens: 32768
+  # 单次请求的读超时（秒）。M3.1-Flash 实测单段 112~141s，120s 会撞线。
+  timeout: 300
+
+assistant:
+  provider: "zhipu"      # 默认走智谱 GLM（中文诊断 / 检索增强）
+  api_key: ""            # 空时按 provider 渠道名去 settings 拿对应 *_api_key
+  base_url: ""           # 空时同上
+  model: "glm-4-flash"   # GLM-4-Flash 永久免费不限 token，国内低延迟
+  max_tokens: 1024       # 诊断/检索回答通常比正文短
+  timeout: 60            # 诊断路径必须快速失败，不允许长等
+
+distiller:
+  # 文风档案抽取专用角色。**不是**「蒸馏档位」——
+  # 档位（full / balanced / fast）在 app/style/narrative.py，决定「抽多细」；
+  # 本块决定「用哪个模型抽」。
+  provider: "zhipu"      # 与 assistant 同渠道起步（免费档即可跑通）
+  api_key: ""            # 空时按 provider 渠道名去 settings 拿对应 *_api_key
+  base_url: ""           # 空时同上
+  model: "glm-4-flash"
+  # 一次要输出 11 个维度的规则 JSON 数组。2048 会让 JSON 被拦腰截断
+  # （智谱 finish_reason=length），截断的 JSON 解析失败 → 该块所有维度归零，
+  # 表现为 rejected 计数暴涨（雪中悍刀行 990 章实测 rejected=740，改 8192 后回落）。
+  max_tokens: 8192
+  # 长任务：一次读几十段语料再压缩，60s 会频繁超时。
+  # 180s 是「能跑完一整卷」的量级；配 :free 档仍嫌慢就再往上调。
+  timeout: 180

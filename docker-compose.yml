@@ -1,0 +1,19 @@
+services:
+  db:
+    image: ankane/pgvector:pg16
+    environment:
+      POSTGRES_USER: novel
+      POSTGRES_PASSWORD: novel
+      POSTGRES_DB: novel
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U novel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

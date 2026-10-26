@@ -1,0 +1,35 @@
+{
+  "id": "foundation_input_health",
+  "version": 1,
+  "status": "experimental",
+  "applicable_tasks": ["foundation_diagnosis", "timeline_review", "binding_review", "claim_review", "repair_verification"],
+  "agent_roles": ["diagnostic"],
+  "required_capabilities": [
+    {"id": "inspect_timeline_state", "min_version": 1},
+    {"id": "inspect_narrative_binding", "min_version": 1},
+    {"id": "read_distill_evidence", "min_version": 1}
+  ],
+  "steps": [
+    {"id": "binding", "capability": "inspect_narrative_binding", "requires": [], "observe": ["current_fingerprint", "project_match", "shared_match"]},
+    {"id": "timeline", "capability": "inspect_timeline_state", "requires": [], "observe": ["status", "completion", "last_judged_segment"]},
+    {"id": "claims", "capability": "read_distill_evidence", "requires": [], "observe": ["quote_locations", "verification", "coverage"]}
+  ],
+  "acceptance": [
+    {"id": "current_input_bound", "requires_evidence": true},
+    {"id": "coverage_explicit", "requires_evidence": true},
+    {"id": "uncertainty_preserved", "requires_evidence": true}
+  ],
+  "source_evidence": [{
+    "run_ref": "scratch/diagnostic-agent/diagnostic-copy.db#AgentRun:73",
+    "code_version": "foundation-release:4ec7db8 + diagnostic prototype (pre-commit)",
+    "input_fingerprint": "d56ec1920dda61dc5519c4f47cb851600e650c10abe471c3a174b691593fcceb",
+    "scope": "project:1 / novel:1 / binding_review only",
+    "provider_role": "assistant",
+    "model": "MiniMax-M3",
+    "independent_verification": "tools/verify_diagnostic_probe.py: exact AgentRun/Evidence readback; source hash/stat unchanged",
+    "limitations": "Cache v9/v7 mismatch only; no persisted L2 ledger, no repair, no cross-corpus acceptance; remains experimental"
+  }],
+  "failure_boundaries": ["missing_capability", "input_changed", "unsupported_semantics", "model_unavailable", "scope_denied"],
+  "allowed_actions": [],
+  "supersedes": null
+}

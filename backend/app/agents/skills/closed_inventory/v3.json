@@ -1,0 +1,10 @@
+{
+  "id": "closed_inventory", "version": 3, "status": "experimental",
+  "applicable_tasks": ["body_consistency", "repair_verification"], "agent_roles": ["diagnostic"],
+  "required_capabilities": [{"id": "read_closed_inventory", "min_version": 1}],
+  "steps": [{"id": "inventory", "capability": "read_closed_inventory", "requires": [], "observe": ["scoped constraints", "literal entity surface with server contexts and all offsets", "versioned resume of validated v2 checkpoints", "isolated mention rejection", "independent scoped verdict with both source endpoints"]}],
+  "acceptance": [{"id": "explicit_closure", "requires_evidence": true}, {"id": "full_scope_coverage", "requires_evidence": true}],
+  "source_evidence": [],
+  "failure_boundaries": ["Experimental v3; v1/v2 and raw failures preserved.", "Model selects literal source surface; no fuzzy repair, generated quote or first-occurrence guessing.", "One bad mention leaves its source unresolved; source coverage does not prove entity recall.", "Resume only successful v2 checkpoints revalidated against identical full input hash and original payload key.", "Partial verdicts remain explicit; unselected candidates and person/place unknown.", "Independent verdict must select verified body and closed authority endpoints; lexical difference is only a candidate.", "No Writer, distillation, body changes or apply; no ReAct core changes."],
+  "allowed_actions": [], "supersedes": null
+}

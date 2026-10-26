@@ -1,0 +1,171 @@
+/* ============================================================
+   设计 Token（主题可切换）
+   ------------------------------------------------------------
+   所有颜色/圆角/字体/描边/间距都走语义 token。
+   换肤 = 改 <html data-theme> 或下面某个主题块的取值，组件零改动。
+   默认：editorial（暖纸 / 墨 / 朱红），作为中性基线。
+   另附 brutalist / soft 两套，供方向拍板后一键切换。
+   ============================================================ */
+
+:root,
+[data-theme="editorial"] {
+  color-scheme: light;
+
+  /* 表面 */
+  --bg: #f6f3ec;          /* 暖纸 */
+  --bg-elev: #fffdf8;     /* 卡片/抬升面 */
+  --bg-sunken: #ece7dc;   /* 凹陷/代码/表头 */
+  --fg: #1c1a17;          /* 墨 */
+  --fg-muted: #57504a;
+  --fg-faint: #6b6357;     /* 5.3:1 on --bg，满足 AA（原 #8d857a 仅 3.2:1 不达标） */
+  --border: #ded7c9;
+  --border-strong: #c9c0ad;
+
+  /* 强调（朱红） */
+  --accent: #bf3b26;        /* 图形/填充：白字其上 5.2:1 */
+  --accent-hover: #a5321f;
+  --accent-ink: #a5321f;    /* 强调色文字（浅底）：6.2:1，满足 WCAG AA */
+  --accent-fg: #fffdf8;
+  --accent-soft: #f3e0d9;
+  --accent-line: #e6b9ac;
+
+  /* 状态 */
+  --ok: #276b43;
+  --ok-soft: #dfeee2;
+  --warn: #8a5a00;
+  --warn-soft: #f4ead2;
+  --danger: #bf3b26;
+  --danger-soft: #f3e0d9;
+  --info: #35618f;
+  --info-soft: #dde7f0;
+
+  /* 字体 */
+  --font-sans: "Sarasa Gothic SC", "Noto Sans SC", "PingFang SC",
+    "Microsoft YaHei", system-ui, sans-serif;
+  --font-serif: "Noto Serif SC", "Songti SC", "SimSun", Georgia, serif;
+  --font-mono: "Sarasa Mono SC", "Cascadia Code", "JetBrains Mono", ui-monospace,
+    Consolas, monospace;
+
+  /* 圆角 */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
+  --radius-full: 999px;
+
+  /* 描边 */
+  --border-w: 1px;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 2px rgba(28, 26, 23, 0.06);
+  --shadow-md: 0 6px 20px rgba(28, 26, 23, 0.1);
+
+  /* 排版比例 */
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --fs-xl: 24px;
+  --fs-2xl: 32px;
+
+  /* 节奏 */
+  --gap: 16px;
+  --gap-lg: 24px;
+}
+
+[data-theme="brutalist"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --bg-elev: #ffffff;
+  --bg-sunken: #f2f2f2;
+  --fg: #0a0a0a;
+  --fg-muted: #333333;
+  --fg-faint: #6b6b6b;
+  --border: #0a0a0a;
+  --border-strong: #0a0a0a;
+
+  --accent: #ff4d00;
+  --accent-hover: #d63f00;
+  --accent-fg: #ffffff;
+  --accent-soft: #ffe6d9;
+  --accent-line: #0a0a0a;
+  --accent-ink: #cc3d00;
+
+  --ok: #0a7d2c;
+  --ok-soft: #d6f0dc;
+  --warn: #b35c00;
+  --warn-soft: #f2e6c8;
+  --danger: #d40000;
+  --danger-soft: #ffd9d9;
+  --info: #0a3d91;
+  --info-soft: #d9e2f5;
+
+  --font-sans: "Arial Black", "Helvetica Neue", "Noto Sans SC", system-ui, sans-serif;
+  --font-serif: "Georgia", "Times New Roman", "Noto Serif SC", serif;
+  --font-mono: "Courier New", ui-monospace, monospace;
+
+  --radius-sm: 0px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --radius-full: 0px;
+
+  --border-w: 2px;
+
+  --shadow-sm: 2px 2px 0 #0a0a0a;
+  --shadow-md: 4px 4px 0 #0a0a0a;
+
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 19px;
+  --fs-xl: 26px;
+  --fs-2xl: 36px;
+}
+
+[data-theme="soft"] {
+  color-scheme: light;
+  --bg: #eef1f6;
+  --bg-elev: #ffffff;
+  --bg-sunken: #e6eaf1;
+  --fg: #1a2030;
+  --fg-muted: #4a5468;
+  --fg-faint: #8a93a6;
+  --border: #d6dde8;
+  --border-strong: #bcc6d8;
+
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-fg: #ffffff;
+  --accent-soft: #e6e4fb;
+  --accent-line: #c3bff5;
+  --accent-ink: #4338ca;
+
+  --ok: #16a34a;
+  --ok-soft: #dcf3e3;
+  --warn: #d97706;
+  --warn-soft: #fbeed7;
+  --danger: #dc2626;
+  --danger-soft: #fbdede;
+  --info: #2563eb;
+  --info-soft: #dde8fb;
+
+  --font-sans: "Inter", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+  --font-serif: "Georgia", "Noto Serif SC", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-full: 999px;
+
+  --border-w: 1px;
+
+  --shadow-sm: 0 1px 3px rgba(26, 32, 48, 0.08);
+  --shadow-md: 0 10px 30px rgba(26, 32, 48, 0.12);
+
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --fs-xl: 24px;
+  --fs-2xl: 30px;
+}

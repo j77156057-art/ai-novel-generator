@@ -1,0 +1,73 @@
+{
+  "id": "planning_review",
+  "version": 2,
+  "status": "experimental",
+  "applicable_tasks": [
+    "planning_review",
+    "repair_verification"
+  ],
+  "agent_roles": [
+    "diagnostic"
+  ],
+  "required_capabilities": [
+    {
+      "id": "inspect_planning_review",
+      "min_version": 1
+    }
+  ],
+  "steps": [
+    {
+      "id": "planning",
+      "capability": "inspect_planning_review",
+      "requires": [],
+      "observe": [
+        "逐节点检查premise motivation action result cost，unknown及NA允许",
+        "缺失时间、地点、参与者、entry/exit状态时输出clarification_required及依赖节点",
+        "时间空间与信息取得连续性",
+        "规划与正文的时间、地点、参与者、entry/exit状态差异",
+        "两处矛盾的具体记录值、原件来源、登记留痕与责任机制",
+        "人物及物件关系端点类型是否符合关系语义，不以出现即错误",
+        "仅评价可观察文本，不冒称作者思维"
+      ]
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "causal_chain",
+      "requires_evidence": true
+    },
+    {
+      "id": "time_space",
+      "requires_evidence": true
+    },
+    {
+      "id": "state_transfer",
+      "requires_evidence": true
+    },
+    {
+      "id": "missing_premise_clarification",
+      "requires_evidence": true
+    },
+    {
+      "id": "evidence_responsibility",
+      "requires_evidence": true
+    },
+    {
+      "id": "entity_endpoints",
+      "requires_evidence": true
+    }
+  ],
+  "source_evidence": [],
+  "failure_boundaries": [
+    "single_project_only",
+    "quote_location_is_not_semantic_proof",
+    "no_artistic_quality_guarantee",
+    "no_business_write",
+    "unknown_preserved"
+  ],
+  "allowed_actions": [],
+  "supersedes": {
+    "id": "planning_review",
+    "version": 1
+  }
+}

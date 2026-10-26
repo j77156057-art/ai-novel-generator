@@ -1,0 +1,49 @@
+{
+  "id": "text_quality_audit",
+  "version": 1,
+  "status": "experimental",
+  "applicable_tasks": [
+    "text_quality_audit"
+  ],
+  "agent_roles": [
+    "diagnostic"
+  ],
+  "required_capabilities": [
+    {
+      "id": "inspect_text_quality",
+      "min_version": 1
+    }
+  ],
+  "steps": [
+    {
+      "id": "scan",
+      "capability": "inspect_text_quality",
+      "requires": [],
+      "observe": [
+        "正文里半角标点夹在中文之间、连续重复标点：error 级，要改",
+        "中文叙事里混进的英文词：warn 级，可能是专名/型号/引文，机器不替人判断",
+        "事实自洽那一层需要模型，本次未查（fact_checked=false），不代表没问题"
+      ]
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "punctuation_accidents_listed",
+      "requires_evidence": true
+    },
+    {
+      "id": "foreign_terms_left_to_human",
+      "requires_evidence": true
+    }
+  ],
+  "source_evidence": [],
+  "failure_boundaries": [
+    "machine_rule_only",
+    "no_artistic_quality_guarantee",
+    "no_business_write",
+    "unknown_preserved",
+    "fact_layer_not_checked_without_model"
+  ],
+  "allowed_actions": [],
+  "supersedes": null
+}

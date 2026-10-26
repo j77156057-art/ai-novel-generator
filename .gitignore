@@ -1,0 +1,37 @@
+# 用户上传的附件（不可信文件）
+data/attachments/
+backend/data/attachments/
+
+# ── 语料投放区：只放本机文件，**不进 git** ────────────────────────
+# 参考书原文受版权保护，这里放的是你自己的书 —— 别提交上去。
+data/seed/*.txt
+!data/seed/README-投放真实语料.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# 本地/测试数据库（开发态 sqlite，勿入库）
+*.db
+*.sqlite
+*.sqlite3
+
+# 运行期缓存（实体档案等）
+.cache/
+
+# 前端
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 测试与工具产物
+.pytest_cache/
+.pytest_counts.txt
+.pytest_report.xml
+coverage.xml
+htmlcov/
+
+# 个人状态目录
+.workbuddy/

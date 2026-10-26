@@ -1,0 +1,11 @@
+# Bounded body consistency and completion evidence
+
+Inputs: exact project segment numbers (1–10 explicit numbers), persisted generation text and saved segment contract only. Missing historical contract is reported unknown, never substituted with the current node. Each nonempty paragraph receives a deterministic short ID; quotes and Unicode offsets are computed on the server and bound to content hashes. No retrieval, distillation, ensures or business writes.
+
+Completion judge: request only source IDs, retain a sanitized visible response, parse/validation error categories, node/plan hash and segment identity/text hash. Reject unknown IDs. Preserve the strict legacy evidence validator for recorded response replay; never repair invalid explicit offsets. An old failure whose raw response was not saved cannot retrospectively be attributed to a specific cause.
+
+Diagnostic: independent experimental body_consistency v1, Assistant role. Check time, place, participants and object state, separating narrated facts from memories, lies, hypotheticals, intentional repetition and unknowns. Contradictions require two distinct evidence endpoints. Location verification is not semantic proof. Persist audit tables only and keep the existing ReAct loop unchanged.
+
+Repair: user-authorized fixed Unicode range, full body hash and range hash; Writer returns replacement text only. Server constructs the candidate, preserving every character outside the range. Reuse pending generation_text EditProposal; no apply and no business mutation. Candidate verification uses the same segment/contract scope with the candidate as an explicit audit-only overlay tied to the original hash, never writes it into Generation.
+
+Acceptance: RED/GREEN tests for reference selection, invalid JSON/IDs/legacy offsets, read-only SQL boundary, explicit segment scope, missing contract, two-endpoint contradictions, unknown/normal narrative, candidate staleness and outside-range invariance. Run existing planning/timeline tests. One real completion rejudge, one Assistant diagnosis, one Writer replacement and one independent Assistant candidate verification on preserved generation 10; checkpoint outputs and errors, no silent fallback or repeat full generation. Snapshot/hash the original and historical experiment DBs before and after. Single-project results leave the skill experimental.
