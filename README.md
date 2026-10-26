@@ -297,7 +297,10 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   `.env` → 空 SQLite 起服务 → 打真实 HTTP → 前端 `npm install && npm run build`。
   19 项全绿(零 key、零配置、零手工干预)。
 - **规模** —— 后端 **1,300** 项测试(`pytest tests`),前端 7 个纯逻辑测试文件。
-  当前基线有 **8 项既有失败**(`settings_roles` ×1、`style_tier` ×7),与最近改动无关。
+  **当前全绿**。此前长期红的 8 项已清零：7 项是断言滞后于设计变更(采样率 15%→30%、
+  维度 14→16、采样加了「30 万字下限保护」)，1 项是模型清单三处不一致的真 bug;
+  另有 1 处是测试自己的假 provider 少实现 `async_chat` 接口，导致计数失真
+  (详见 `ENGINEERING.md`)。
 - **工程纪律** —— 见 `ENGINEERING.md`:每条规矩都对应一次真实踩坑,不是口号。
 
 ---

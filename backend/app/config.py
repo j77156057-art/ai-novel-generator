@@ -139,9 +139,17 @@ class Settings(BaseSettings):
     # 代价：M3.1-Flash 是 adaptive thinking 模型，思考关不掉 → 慢 4~5 倍、
     # 预算要 32K token / 300s 超时（provider 里有按模型的预算地板兜着）。
     minimax_model: str = "MiniMax-M3.1-Flash"
-    # 限流切换链：主模型 429/403 时按这个顺序换下一个。
-    # M3（关思考、快）留在链首当第一兜底 —— 它比 M2.7 稳得多。
-    minimax_models: str = "MiniMax-M3,MiniMax-M2.7-highspeed"
+    # 限流切换链（主模型 429/403 时按这个顺序换下一个）。
+    # 与 `PROVIDER_META["minimax"]["default_models"]`、`_default_model_for("minimax")`
+    # **三处必须一致**（下拉里能选的模型得在运行时切换链上，否则界面与生成链路对不上）。
+    #
+    # 顺序按实测：M3.1-Flash-Preview（推理在独立字段、正文干净）→ M3（关思考后干净、快）
+    # → M3.1-Flash（写手默认：对白形态最好，但 adaptive thinking 慢）→ Text-01（链尾兜底）。
+    # M2.7/M2.5 已从链里去掉：实测「返回空正文或 200s+，不可用」。
+    #
+    # 注意：写手默认（`minimax_model`）= M3.1-Flash 与**链首**不同是有意的 ——
+    # 前者是 2026-10-25 按「对白形态」实测选出来的，后者是限流兜底的首选。
+    minimax_models: str = "MiniMax-M3.1-Flash-Preview,MiniMax-M3,MiniMax-M3.1-Flash,MiniMax-Text-01"
     # 全局默认的文风改写开关（生成档位会写它）。
     # 项目级 projects.style_rewrite 非空时以项目为准——项目是显式选择，
     # 全局只是「新项目/未设置时的默认值」。三者优先级：

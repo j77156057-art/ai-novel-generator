@@ -80,7 +80,11 @@ PROVIDER_META: dict[str, dict] = {
         "label": "智谱 GLM",
         "key_hint": "open.bigmodel.cn → 头像 → API Keys（形如 xxxxx.xxxxx）",
         "free_note": "GLM-4-Flash 永久免费不限 token；注册送 2000 万 token",
-        "default_models": ["glm-4-flash", "glm-z1-flash", "glm-4.6", "glm-4.5-air"],
+        # 与 `config.zhipu_models` 的 CSV 与 `_default_model_for("zhipu")` 三处一致
+        # （首项 = 默认模型 = config.zhipu_model = glm-4-flash-250414）。
+        "default_models": [
+            "glm-4-flash-250414", "glm-4-flash", "glm-z1-flash", "glm-4.6", "glm-4.5-air",
+        ],
     },
     "siliconflow": {
         "label": "硅基流动",
@@ -97,7 +101,9 @@ PROVIDER_META: dict[str, dict] = {
         "label": "MiniMax",
         "key_hint": "platform.minimaxi.com → 账号管理 → 接口 Keys（形如 sk-cp-...，仅国内站可用）",
         "free_note": "实测唯一干净可用：M3.1-Flash-Preview（推理独立字段，正文不混思维链）；M3/M2.x 会把思维链混进正文",
-        "default_models": ["MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview", "MiniMax-Text-01"],
+        "default_models": [
+            "MiniMax-M3.1-Flash-Preview", "MiniMax-M3", "MiniMax-M3.1-Flash", "MiniMax-Text-01",
+        ],
     },
     "openrouter": {
         "label": "OpenRouter",

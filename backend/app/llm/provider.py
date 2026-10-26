@@ -887,7 +887,7 @@ def _default_model_for(provider: str) -> str:
     """
     return {
         "openrouter": "apodex/apodex-1.1-mini:free",
-        "zhipu": "glm-4-flash",
+        "zhipu": "glm-4-flash-250414",
         "siliconflow": "Qwen/Qwen2.5-7B-Instruct",
         "minimax": "MiniMax-M3.1-Flash-Preview",
         "dashscope": "qwen-plus",

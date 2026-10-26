@@ -39,6 +39,7 @@ from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.models import KgNode, NovelChunk, Project, RawNovel  # noqa: E402
 from app.style.narrative import (  # noqa: E402
     DEFAULT_TIER,
+    MIN_SAMPLE_CHARS,
     NARRATIVE_VERSION,
     corpus_content_hash,
     NARRATIVE_DIMENSIONS,
@@ -49,6 +50,7 @@ from app.style.narrative import (  # noqa: E402
     TIER_REGISTRY,
     NarrativeTier,
     _build_character_name_index,
+    _FAST_TIER_DROP_DIMENSIONS,
     extract_narrative_profile,
     list_tiers,
     narrative_fingerprint,
@@ -76,8 +78,12 @@ class CountingProvider:
 
     返回的 JSON 刻意做成「什么都匹配不上」的形态，让所有规则都被证据验证
     拦掉（rejected 路径）。我们要量的是**调用次数**，不是规则内容。
-    """
 
+    **必须实现 `async_chat`**：蒸馏管线走的是并发异步入口
+    （`_gather_chat_async` → `provider.async_chat(system, user, constraints=...)`），
+    只实现 `chat` 的话异步那批会**静默失败**（异常被收集成返回值），
+    计数只剩零星几次 —— 量出来的不是「档位调用量」，是「假 provider 缺接口」。
+    """
     def __init__(self) -> None:
         self.calls = 0
         self.prompts: list[tuple[str, str]] = []
@@ -87,19 +93,36 @@ class CountingProvider:
         self.prompts.append((system, user))
         return '{"占位": ["占位规则（证据：原文里根本没有这句话）"]}'
 
+    async def async_chat(self, system: str, user: str, constraints=None) -> str:
+        return self.chat(system, user)
 
-def _make_corpus(db, n_chapters: int = 120) -> int:
-    """造一本 n_chapters 章的语料，返回 novel_id。"""
+
+#: 填充文本：造「够字数」语料用。
+#:
+#: 为什么需要它：采样有一条 **30 万字下限保护**（`MIN_SAMPLE_CHARS`）——
+#: 全语料不足下限时**直接全取**（短篇保护，见 narrative.py 注释）。
+#: 语料太小时三个档位的章数都是全量，量出来的不是「档位没生效」，
+#: 是「保护生效」。要量档位差，就得造够字数的语料。
+_FILLER = "雨落在窗台上，顺着玻璃往下淌。"
+
+
+def _make_corpus(db, n_chapters: int = 120, chars_per_chapter: int = 0) -> int:
+    """造一本 n_chapters 章的语料，返回 novel_id。
+
+    `chars_per_chapter > 0` 时把每章补到该字数（见 `_FILLER` 的说明）。
+    """
     novel = RawNovel(title=f"档位测试语料{n_chapters}", status="imported")
     db.add(novel)
     db.commit()
     db.refresh(novel)
     for i in range(n_chapters):
+        text = ("医院里她抬起头，看着走廊尽头的光。".format(i=i)
+                + "他说：走吧。" * (i % 3 + 1)
+                + "安小落沉默了很久，才低声开口。")
+        if chars_per_chapter and len(text) < chars_per_chapter:
+            text += (_FILLER * (chars_per_chapter // len(_FILLER) + 1))[:chars_per_chapter]
         db.add(NovelChunk(
-            novel_id=novel.id, chapter_no=i + 1, idx=i,
-            text=("医院里她抬起头，看着走廊尽头的光。".format(i=i)
-                  + "他说：走吧。" * (i % 3 + 1)
-                  + "安小落沉默了很久，才低声开口。"),
+            novel_id=novel.id, chapter_no=i + 1, idx=i, text=text,
         ))
     db.commit()
     return novel.id
@@ -133,13 +156,22 @@ def test_three_tiers_registered_with_readable_names():
 
 
 def test_sampling_axis_really_differs():
-    """采样轴：第一档百分比 0.15，后两档固定 30 章。"""
+    """采样轴：完整档按**百分比**（跟 `SAMPLE_RATIO` 走），后两档固定 30 章。
+
+    两条契约，都不写死数字：
+
+    1. 完整档的比例 = `SAMPLE_RATIO`——这个值被实测调过（15% → 30%，理由见
+       narrative.py 的注释）。断言里写死数字，会让「调比例」变成「改测试」，
+       于是真调比例时测试先红，人就不知道是设计变了还是坏了。
+    2. 百分比采样有一条**下限保护**：全语料不足 `MIN_SAMPLE_CHARS`（30 万字）
+       时直接全取（短篇保护）。所以要造**够字数**的语料才看得出比例差。
+    """
     full = TIER_REGISTRY[TIER_FULL]
     balanced = TIER_REGISTRY[TIER_BALANCED]
     fast = TIER_REGISTRY[TIER_FAST]
 
     assert full.sampling_mode == "percentage"
-    assert full.sample_ratio == SAMPLE_RATIO == 0.15
+    assert full.sample_ratio == SAMPLE_RATIO
     assert full.fixed_chapters is None
 
     for t in (balanced, fast):
@@ -147,38 +179,38 @@ def test_sampling_axis_really_differs():
         assert t.fixed_chapters == 30
         assert t.sample_ratio is None
 
-    # 采样方式真的产出不同的章数（用同一份 200 章语料）
-    chapters = [(i + 1, f"第{i + 1}章内容") for i in range(200)]
-    n_full = len(sample_chapters_for_tier(chapters, full))
-    n_balanced = len(sample_chapters_for_tier(chapters, balanced))
-    n_fast = len(sample_chapters_for_tier(chapters, fast))
-
-    assert n_full == 30# 200 × 0.15
-    assert n_balanced == 30
-    assert n_fast == 30
-    # 章数在这里恰好相同（同为 30），但**方式**不同：把语料放大到 600 章才拉开
-    chapters_big = [(i + 1, f"第{i + 1}章内容") for i in range(600)]
-    assert len(sample_chapters_for_tier(chapters_big, full)) == 90   # 600 × 15%
+    # 够字数的语料：1000 章 × 1200 字 = 120 万字（> 30 万字下限）
+    chapters_big = [(i + 1, _FILLER * 80) for i in range(1000)]
+    assert len(sample_chapters_for_tier(chapters_big, full)) == 1000 * SAMPLE_RATIO
     assert len(sample_chapters_for_tier(chapters_big, balanced)) == 30  # 固定 30
     assert len(sample_chapters_for_tier(chapters_big, fast)) == 30
 
+    # 短篇保护：总字数不足下限 ⇒ 全取（这是设计，不是档位失效）
+    chapters_small = [(i + 1, "很短的一章。") for i in range(50)]
+    assert sum(len(t) for _, t in chapters_small) < MIN_SAMPLE_CHARS
+    assert len(sample_chapters_for_tier(chapters_small, full)) == 50
+
 
 def test_dimension_axis_really_differs():
-    """维度轴：完整/平衡全维度（14），快速档是 11 的真子集。"""
+    """维度轴：完整/平衡全维度，快速档是**真子集**。
+
+    维度数不写死：全局维度清单会随能力增补而变（14 → 16），
+    断言跟着 `NARRATIVE_DIMENSIONS` 与 `_FAST_TIER_DROP_DIMENSIONS` 走。
+    """
     full = TIER_REGISTRY[TIER_FULL]
     balanced = TIER_REGISTRY[TIER_BALANCED]
     fast = TIER_REGISTRY[TIER_FAST]
 
-    assert full.dimension_count == 14
-    assert balanced.dimension_count == 14
-    assert fast.dimension_count == 11, (
-        f"快速档维度数应为 11（14 − 3 个 v5 增量维度），实际 {fast.dimension_count}"
+    assert full.dimension_count == len(NARRATIVE_DIMENSIONS)
+    assert balanced.dimension_count == len(NARRATIVE_DIMENSIONS)
+    assert fast.dimension_count == len(NARRATIVE_DIMENSIONS) - len(_FAST_TIER_DROP_DIMENSIONS), (
+        f"快速档维度数应为 全维度 − 被砍维度数，实际 {fast.dimension_count}"
     )
 
     # 快速档必须是**真子集**，不是重排
     assert set(fast.dimensions) < set(full.dimensions)
     dropped = set(full.dimensions) - set(fast.dimensions)
-    assert dropped == {"节拍序列", "高频场景模板", "潜台词模式"}, dropped
+    assert dropped == set(_FAST_TIER_DROP_DIMENSIONS), dropped
 
 
 def test_cleaning_and_normalization_axes_differ():
@@ -356,12 +388,13 @@ def test_default_tier_extract_matches_explicit_full_tier():
 def test_reduced_tiers_sample_fewer_chapters():
     """采样轴端到端：后两档的采样章数必须少于完整档。
 
-    用 600 章语料（600 × 15% = 90vs 固定 30）——200 章时恰好都是 30，
-    看不出差别，那不是「真的不同」。
+    语料要**够字数**（1000 章 × 1200 字 = 120 万字）：采样有 30 万字下限保护，
+    全语料不足下限时直接全取 —— 那样三个档位都是全量，看不出差别，
+    那不是「真的不同」。
     """
     db = SessionLocal()
     try:
-        nid = _make_corpus(db, 600)
+        nid = _make_corpus(db, 1000, chars_per_chapter=1200)
         proj = _make_project(db, nid)
 
         counts = {}
@@ -371,7 +404,7 @@ def test_reduced_tiers_sample_fewer_chapters():
             )
             counts[key] = profile["n_chapters"]
 
-        assert counts[TIER_FULL] == 90, counts
+        assert counts[TIER_FULL] == 1000 * SAMPLE_RATIO, counts
         assert counts[TIER_BALANCED] == 30, counts
         assert counts[TIER_FAST] == 30, counts
     finally:
@@ -383,10 +416,18 @@ def test_reduced_tiers_sample_fewer_chapters():
     ids=["balanced", "fast"],
 )
 def test_reduced_tiers_make_fewer_llm_calls(tier_key):
-    """采样更少 + 维度更少 → LLM 调用量必须少于完整档。"""
+    """采样更少 + 维度更少 → LLM 调用量与**送进模型的字数**都必须少于完整档。
+
+    两道断言：调用次数少（次数 = 块数 × 维度数），以及送进模型的字数少
+    （这才是真正的成本口径 —— 一次调用塞 2 万字和塞 20 万字不是一回事）。
+
+    语料要够字数（见 `_make_corpus` 的 `chars_per_chapter` 说明）：
+    字数不足时采样保护会把全量取走，三档都只切出一个块，调用次数都是 1，
+    量出来的不是「档位没省成本」。
+    """
     db = SessionLocal()
     try:
-        nid = _make_corpus(db, 600)
+        nid = _make_corpus(db, 1000, chars_per_chapter=1200)
         proj = _make_project(db, nid)
 
         p_full = CountingProvider()
@@ -404,6 +445,11 @@ def test_reduced_tiers_make_fewer_llm_calls(tier_key):
         assert p_tier.calls < p_full.calls, (
             f"{tier_key} 的 LLM 调用量应少于完整档：{p_tier.calls} vs {p_full.calls}"
         )
+        full_chars = sum(len(s) + len(u) for s, u in p_full.prompts)
+        tier_chars = sum(len(s) + len(u) for s, u in p_tier.prompts)
+        assert tier_chars < full_chars / 2, (
+            f"{tier_key} 送进模型的字数应显著少于完整档：{tier_chars} vs {full_chars}"
+        )
         assert tier_profile["tier"] == tier_key
     finally:
         db.close()
@@ -413,11 +459,14 @@ def test_fast_tier_calls_are_less_than_half_of_full():
     """快速档的成本必须**显著**低于完整档——这正是它存在的理由。
 
     完整档是最贵的一档；如果快速档只省一点点，用户就没有理由选它。
-    差异来自两处：采样 90→30 章（分块数减少）+ 砍掉 3 个每块都要调的维度。
+    差异来自两处：采样量（分块数减少）+ 砍掉几个每块都要调的维度。
+
+    同时量**送进模型的字数** —— 那才是真正的成本口径。
+    语料要够字数（见 `_make_corpus` 的说明），否则采样保护会让三档都全取。
     """
     db = SessionLocal()
     try:
-        nid = _make_corpus(db, 600)
+        nid = _make_corpus(db, 1000, chars_per_chapter=1200)
         proj = _make_project(db, nid)
 
         p_full = CountingProvider()
@@ -429,6 +478,11 @@ def test_fast_tier_calls_are_less_than_half_of_full():
         assert p_fast.calls > 0
         assert p_fast.calls < p_full.calls / 2, (
             f"快速档调用量应显著低于完整档（< 一半）：{p_fast.calls} vs {p_full.calls}"
+        )
+        full_chars = sum(len(s) + len(u) for s, u in p_full.prompts)
+        fast_chars = sum(len(s) + len(u) for s, u in p_fast.prompts)
+        assert fast_chars < full_chars / 2, (
+            f"快速档送进模型的字数应显著低于完整档（< 一半）：{fast_chars} vs {full_chars}"
         )
     finally:
         db.close()
@@ -730,8 +784,12 @@ def test_legacy_profile_without_tier_field_is_not_a_cache_hit():
 
 
 def test_narrative_dimensions_unchanged_by_tier_work():
-    """档位机制不许改动全局维度清单（全维度档依赖它仍是 14）。"""
-    assert len(NARRATIVE_DIMENSIONS) == 14
+    """档位机制不许改动全局维度清单（全维度档依赖它）。
+
+    断言的是「全维度档 = 全局清单」这条**关系**，不是某个具体数字 ——
+    维度清单会随能力增补而变（14 → 16），变更是设计，不是回归。
+    """
+    assert len(NARRATIVE_DIMENSIONS) >= 14, "维度清单不该被砍"
     assert TIER_REGISTRY[TIER_FULL].dimensions == tuple(NARRATIVE_DIMENSIONS)
     assert TIER_REGISTRY[TIER_BALANCED].dimensions == tuple(NARRATIVE_DIMENSIONS)
     assert len(NARRATIVE_DIMENSIONS) == len(TIER_REGISTRY[TIER_FULL].dimensions)
