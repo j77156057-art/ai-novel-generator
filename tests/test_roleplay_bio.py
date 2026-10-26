@@ -92,7 +92,7 @@ def test_verify_claims_drops_unsupported():
     """书里没有的事件 ⇒ 丢掉（宁可少给，不可给错）。"""
     lines = [(1, "老周蹲在马厩里擦马镫。"), (2, "陆长风啃着黄瓜。")]
     corpus, starts = _corpus(lines)
-    profile = {"name": "老周", "关键经历": ["他当年在武帝城连败三大高手"]}
+    profile = {"name": "老周", "关键经历": ["他当年在北荒边城连败三大高手"]}
     accepted, rejected = verify_claims(profile, corpus, starts, lines)
     assert accepted == []
     assert len(rejected) == 1
