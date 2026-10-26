@@ -192,11 +192,12 @@ const thinkingOptions = computed(() => {
   return ctl;
 });
 
-/** 档位的「人话」标签：不出现 reasoning_effort 这种内部字段名。 */
+/** 档位的「人话」标签：不出现 reasoning_effort 这种内部字段名。
+ *  措辞对着 2026-10-26 的真跑数据：low 最稳最省、medium 实测更快、high 字数更接近目标。 */
 const THINKING_LABELS: Record<string, string> = {
-  low: "最省（最快，适合写正文）",
-  medium: "平衡",
-  high: "更仔细",
+  low: "省思考（最稳，适合写正文）",
+  medium: "平衡（实测更快）",
+  high: "更细（字数更接近目标）",
   xhigh: "很仔细",
   max: "最强（最慢最贵，省略即此档）",
   off: "关闭（最快）",

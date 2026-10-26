@@ -610,6 +610,16 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
     #:   36.0 秒、completion 2605、正文完整写出 ⇒ 8192 绰绰有余。
     MIN_ADAPTIVE_MAX_TOKENS_EFFORT = 8192
     MIN_ADAPTIVE_TIMEOUT_EFFORT = 180
+    #:
+    #: ⚠️ **「发了 effort ⇒ 地板降一档」这条只对 low/medium/high 成立**
+    #: （2026-10-26 补测）。xhigh / max 档**思考照旧吃预算**：
+    #:   effort=xhigh（2400 字正文，max_tokens=8192）：
+    #:     149.8s、reasoning **8190**、completion **8192 打满**、finish=length、
+    #:     **正文 0 字** —— 思考把预算吃光了，一行正文都没写出来。
+    #:   effort 省略（=max，max_tokens=32768）：**超过 300s 仍未返回**，读超时。
+    #: ⇒ 判据不是「有没有发 effort」，是「**这个档位把思考压下来了吗**」。
+    #:   low/medium/high 压下来了 ⇒ 8192 够；xhigh/max 没压下来 ⇒ 必须给最坏情况。
+    _EFFORT_THINKS_LESS = ("low", "medium", "high")
 
     #: effort 的合法档位（官方：low / medium / high / xhigh / max；省略 = max）。
     #: 非法值**不发**（发了会被忽略，白白让人以为调了档）。
@@ -641,10 +651,12 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
                     "minimax reasoning_effort=%r 不是合法档位（%s），已忽略",
                     reasoning_effort, "/".join(self._EFFORT_LEVELS),
                 )
-            # 预算地板按「有没有真的把思考调低」给：
-            #   调低了 ⇒ 思考几乎不占预算 ⇒ 地板降一档（实测 2605 token / 36 秒够用）；
-            #   没调低 ⇒ 思考照旧吃预算 ⇒ 地板保持最坏情况（否则正文会被静默截断）。
-            if extra.get("reasoning_effort"):
+            # 预算地板按「**这个档位有没有把思考压下来**」给：
+            #   low/medium/high 压下来了 ⇒ 思考几乎不占预算 ⇒ 地板降一档
+            #     （实测 2605 token / 36 秒够用；high 档 completion 2584~3058 也够）；
+            #   xhigh/max 没压下来 ⇒ 思考照旧吃预算 ⇒ 地板保持最坏情况
+            #     （否则正文会被静默截断 —— 实测 xhigh 在 8192 下**正文 0 字**）。
+            if extra.get("reasoning_effort") in self._EFFORT_THINKS_LESS:
                 floor_tokens = self.MIN_ADAPTIVE_MAX_TOKENS_EFFORT
                 floor_timeout = self.MIN_ADAPTIVE_TIMEOUT_EFFORT
             else:

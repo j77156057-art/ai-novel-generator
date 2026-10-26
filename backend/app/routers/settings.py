@@ -92,8 +92,11 @@ THINKING_CONTROL: dict[str, dict] = {
         # 实测 2026-10-26：M3.1 系（含 Preview）吃这个字段；
         # 老 M3 不吃（传了反而更慢）—— 见 provider.MiniMaxChatProvider 的注释。
         "models": ("MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview"),
-        "levels": ("low", "medium", "high", "xhigh", "max"),
-        "note": "M3.1 关不掉思考，只能调档；省略档位 = 最高档（最慢最贵）",
+        # 只给**实测能写出正文**的三档。xhigh / max 在写手场景写不出正文
+        # （xhigh：reasoning 8190 把 8192 预算吃满，finish=length，正文 0 字；
+        #   max：>300s 未返回）⇒ 不提供。
+        "levels": ("low", "medium", "high"),
+        "note": "M3.1 关不掉思考，只能调档；省略档位 = 最高档（最慢最贵，且写不出正文）",
     },
     "deepseek": {
         "mode": "disable",
@@ -131,10 +134,23 @@ def thinking_control_for(provider: str, model: str = "") -> dict:
 
     if provider == "minimax":
         if model.startswith("MiniMax-M3.1"):
-            # 只能调档：关不掉（disabled → 400），省略 = max
+            # 只能调档：关不掉（disabled → 400 "requires adaptive thinking"），省略 = max
+            #
+            # 2026-10-26 两轮实测（写 2400 字，共 15 次调用）：
+            #   档位    成功/总   用时       reasoning    裸台词段(项目尺)
+            #   low      7/7     55~99s    92~398       70~92%
+            #   medium   6/7     40~57s    250~3203     4~98%
+            #   high     6/6     53~127s   429~2835     66~89%
+            #   xhigh    2/3     150~169s  5763~8191    **1 次正文 0 字**（8192 打满）
+            #   max(省略) **0/2  >300s 未返回**
+            # ⇒ 三个可用档位**形态分不出高下**（组内方差远大于组间差异），
+            #   能分辨的只有用时（medium 快约 25%）与思考 token（low 最省）。
+            # ⇒ **xhigh / max 不提供**：它们在写手场景要么正文 0 字，要么读超时。
             return {"mode": "effort", "field": "reasoning_effort",
-                    "levels": ("low", "medium", "high", "xhigh", "max"),
-                    "note": "M3.1 关不掉思考，只能调档；省略档位 = 最高档（最慢最贵）"}
+                    "levels": ("low", "medium", "high"),
+                    "note": "关不掉思考，只能调档。实测三档形态差不多；"
+                            "medium 快约 25%，low 最省思考 token。"
+                            "xhigh/max 写手场景会写不出正文（超 300 秒或正文为空），不提供"}
         if model.startswith("MiniMax-M3"):
             # 老 M3：不认 effort（实测传了更慢）；能关，代码里已默认关
             return {"mode": "disable", "field": "thinking",
@@ -150,17 +166,25 @@ def thinking_control_for(provider: str, model: str = "") -> dict:
             #
             #   flash   基线 25.8s / reasoning 87 / 纯台词段 41.0%
             #           关思考 18.6s / 0        / 41.2%      ⇒ **快 28%，质量基本不变**
-            #   v4-pro  基线 64.6s / reasoning 336 / 纯台词段 **4.9%**
-            #           关思考 63.9s / 0        / **44.0%**   ⇒ **几乎不省时间，质量崩**
             #
-            # 所以给 flash 建议关、给 v4-pro **明确建议别关**：
-            # v4-pro 的思考真的在改善对白形态（4.9% 比参考书 7.5% 还接近理想，
-            # 而关掉后 44% —— 比我们一直改不动的提示词/样例方案差得多）。
+            # v4-pro 上「关思考会毁掉对白形态」这个说法**已被推翻**（同日复测 6 篇）：
+            #   原来记的「基线 4.9% → 关掉 44.0%」不可信 —— 4.9% 那一篇的
+            #   **含引号段只有 20 段**，比例在极小的分母上失真。
+            #   复测 6 篇（3 场景 × 2 次）：纯台词段给出 0.0% / 12.5% / 15.4% /
+            #   42.9% / 71.4% / 100.0% —— 其中 100% 那篇全文 10 段、**1 个引号**。
+            #   换成不吃分母的绝对量：v4-pro 每篇 2400~2900 字只有 **1~13 段对白**，
+            #   对白段长中位 72 字（参考书 30 字）、段内叙述字中位 43 字（参考书 24 字）
+            #   ⇒ **它是对白写得少，不是写得好**。
+            #   用时也顶不住：6 次平均 173s，最长 291s（单段落就快撞 300s 超时线）。
+            #
+            # ⇒ 两个 DeepSeek 模型都给「可关」，但理由不同：
+            #   flash —— 关了又快 28%、质量不变，**建议关**；
+            #   v4-pro —— 关了不省时间，且它本来就少写对白，**建议保持默认**。
             if model.startswith("deepseek-v4-pro"):
                 return {"mode": "disable", "field": "thinking",
                         "levels": ("default", "off"),
-                        "note": "不建议关：实测关掉后纯台词段 4.9%→44%，"
-                                "而用时几乎不省（64.6s→63.9s）。它的思考在改善对白形态。"}
+                        "note": "建议保持默认：实测关掉几乎不省时间（64.6s→63.9s），"
+                                "而它每篇只有 1~13 段对白、平均 173s，最长 291s。"}
             return {"mode": "disable", "field": "thinking",
                     "levels": ("default", "off"),
                     "note": "可关：实测快 28%（25.8s→18.6s），对白形态基本不变"}

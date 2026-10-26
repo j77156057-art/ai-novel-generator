@@ -62,11 +62,14 @@ def test_legacy_m3_ignores_effort_and_keeps_thinking_disabled():
     assert p.extra_body.get("thinking") == {"type": "disabled"}
 
 
-# ── 3. 预算地板：按「有没有真的把思考调低」给 ────────────────────
+# ── 3. 预算地板：按「这个档位有没有把思考压下来」给 ─────────────
 def test_budget_floor_is_lower_when_effort_was_sent():
-    """调低思考后思考几乎不占预算 ⇒ 地板降一档（实测 2605 token / 36 秒够用）。
+    """**压低思考**的档位（low/medium/high）⇒ 地板降一档。
 
-    没调低时地板保持最坏情况 —— 否则思考会吃满预算，**正文被静默截断**
+    实测（effort=low，写 2400 字正文）：36.0 秒、completion 2605、正文完整
+    ⇒ 8192 绰绰有余。
+
+    没压低时地板保持最坏情况 —— 否则思考会吃满预算，**正文被静默截断**
     （2026-10-25 真跑：111.8 秒撞 120 秒超时线，max_tokens 8192 不够）。
     """
     tuned = _mk("MiniMax-M3.1-Flash", reasoning_effort="low",
@@ -82,9 +85,51 @@ def test_budget_floor_is_lower_when_effort_was_sent():
     assert big.timeout == 300
 
 
+def test_high_effort_also_gets_the_lower_floor():
+    """high 档也压得住思考 ⇒ 同样用低地板。
+
+    实测 high：completion 2584~3058、写满正文、62.5s —— 与 low 同档预算够用。
+    """
+    p = _mk("MiniMax-M3.1-Flash", reasoning_effort="high", max_tokens=4096, timeout=60)
+    assert p.max_tokens == MiniMaxChatProvider.MIN_ADAPTIVE_MAX_TOKENS_EFFORT
+    assert p.timeout == MiniMaxChatProvider.MIN_ADAPTIVE_TIMEOUT_EFFORT
+
+
+def test_xhigh_and_max_get_the_worst_case_floor():
+    """xhigh / max **没压住**思考 ⇒ 地板必须给最坏情况。
+
+    2026-10-26 实测（2400 字正文）：
+      effort=xhigh（max_tokens=8192）：149.8s、reasoning **8190**、completion **8192 打满**、
+        finish=length、**正文 0 字** —— 思考把预算吃光了，一行正文都没写出来。
+      effort 省略（=max，max_tokens=32768）：**超过 300s 仍未返回**，读超时。
+
+    ⇒ 判据不是「有没有发 effort」，是「**这个档位有没有把思考压下来**」。
+    按旧判据（有 effort 就给 8192）会让 xhigh **静默产出空正文**。
+    """
+    for level in ("xhigh", "max"):
+        p = _mk("MiniMax-M3.1-Flash", reasoning_effort=level,
+                max_tokens=4096, timeout=60)
+        assert p.max_tokens == MiniMaxChatProvider.MIN_ADAPTIVE_MAX_TOKENS, level
+        assert p.timeout == MiniMaxChatProvider.MIN_ADAPTIVE_TIMEOUT, level
+
+
 # ── 4. 写手通道用配置里的档位；蒸馏/助理角色不传（保持 max）───────
 def test_writer_path_uses_configured_effort():
-    """写手要吞吐 ⇒ 用配置里的档位（默认 low）。"""
+    """写手默认 **low** —— 两轮实测复核后**维持原判**。
+
+    2026-10-26 晚两轮共 15 次调用（写 2400 字正文）：
+      档位    成功/总   用时       reasoning    裸台词段(项目尺)
+      low      7/7     55~99s     92~398       70~92%
+      medium   6/7     40~57s     250~3203     4~98%
+      high     6/6     53~127s    429~2835     66~89%
+      xhigh    2/3     150~169s   5763~8191    **1 次正文 0 字**
+      max      0/2     **>300s 未返回**
+
+    一度想改成 high（第一轮 n=2 看着形态最好），但第二轮 3 场景复测**推翻了它**：
+    三个可用档位在形态上分不出高下（组内方差远大于组间差异），
+    而 low 是**最可靠**（7/7 成功，其余档位都出现过超时或空正文）、
+    **思考 token 最省**、用时也不吃亏太多。⇒ 没有证据就不改默认。
+    """
     from app.config import settings
 
     assert settings.minimax_reasoning_effort == "low", (

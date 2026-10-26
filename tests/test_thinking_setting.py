@@ -44,7 +44,24 @@ def test_role_fields_include_thinking():
 def test_minimax_m31_can_only_tune_effort():
     c = thinking_control_for("minimax", "MiniMax-M3.1-Flash")
     assert c["mode"] == "effort"
-    assert c["levels"] == ("low", "medium", "high", "xhigh", "max")
+    # 只给**实测能写出正文**的三档（2026-10-26 实测，见 ENGINEERING.md）：
+    #   low    63.4s  reasoning  92  正文 4152 字  裸台词段 91.1%
+    #   medium 48.6s  reasoning 291  正文 2926 字  裸台词段 81.6%
+    #   high   62.5s  reasoning 570  正文 3581 字  裸台词段 76.2%  ← 形态最好
+    #   xhigh 149.8s  reasoning 8190  **正文 0 字**（8192 打满，思考吃光预算）
+    #   max(省略) **>300s 未返回**
+    # ⇒ xhigh/max 在写手场景是「按了写不出正文」，**不给**。
+    assert c["levels"] == ("low", "medium", "high")
+
+
+def test_minimax_m31_does_not_offer_unusable_levels():
+    """xhigh / max 不进选项 —— 实测正文写不出来（预算被思考吃光）。
+
+    宁可少给两个档位，也不能给「按了没反应（没反应还是最坏的那种：正文为空）」。
+    """
+    c = thinking_control_for("minimax", "MiniMax-M3.1-Flash")
+    assert "xhigh" not in c["levels"]
+    assert "max" not in c["levels"]
 
 
 def test_minimax_legacy_m3_cannot_tune_effort():
@@ -61,17 +78,22 @@ def test_deepseek_via_generic_channel_can_disable():
 
 
 def test_deepseek_v4_pro_warns_against_turning_thinking_off():
-    """v4-pro 能关，但**不该关** —— 实测关掉后质量崩而时间不省。
+    """v4-pro 能关，但**不该关** —— 实测关掉后时间不省，而它本来就少写对白。
 
     2026-10-26 真跑（2400 字续写，同提示）：
-      基线   64.6s / reasoning 336 / 纯台词段 **4.9%**
-      关思考 63.9s / reasoning 0   / 纯台词段 **44.0%**
-    ⇒ 它的思考真的在改善对白形态（4.9% 比参考书 7.5% 还接近理想），
-    而用时几乎没省（64.6 → 63.9s）。所以界面上必须明确警告，不能让人以为"关了更快"。
+      基线   64.6s / reasoning 336
+      关思考 63.9s / reasoning 0
+    复测 6 篇（3 场景 × 2 次）后，原来「基线纯台词段 4.9% → 关掉 44.0%」这个数**作废**：
+    4.9% 那篇的含引号段只有 20 段，比例在极小的分母上失真（详见 ENGINEERING.md）。
+    现在的事实是：v4-pro 每篇 2400~2900 字只有 **1~13 段对白**，
+    6 次平均 173s、最长 291s —— 关思考既不省时间也没别的收益。
+    ⇒ 界面上必须明确说「建议保持默认」，不能让人以为「关了更快」。
     """
     c = thinking_control_for("openai", "deepseek-v4-pro")
-    assert "不建议关" in c["note"], c["note"]
-    assert "4.9%" in c["note"] and "44" in c["note"]
+    assert "建议保持默认" in c["note"], c["note"]
+    assert "173" in c["note"] and "291" in c["note"], c["note"]
+    # 不能再出现那个已被推翻的数
+    assert "4.9%" not in c["note"]
 
 
 def test_deepseek_flash_is_the_opposite():
