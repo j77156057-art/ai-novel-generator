@@ -60,6 +60,47 @@ def test_deepseek_via_generic_channel_can_disable():
     assert "off" in c["levels"]
 
 
+def test_deepseek_v4_pro_warns_against_turning_thinking_off():
+    """v4-pro 能关，但**不该关** —— 实测关掉后质量崩而时间不省。
+
+    2026-10-26 真跑（2400 字续写，同提示）：
+      基线   64.6s / reasoning 336 / 纯台词段 **4.9%**
+      关思考 63.9s / reasoning 0   / 纯台词段 **44.0%**
+    ⇒ 它的思考真的在改善对白形态（4.9% 比参考书 7.5% 还接近理想），
+    而用时几乎没省（64.6 → 63.9s）。所以界面上必须明确警告，不能让人以为"关了更快"。
+    """
+    c = thinking_control_for("openai", "deepseek-v4-pro")
+    assert "不建议关" in c["note"], c["note"]
+    assert "4.9%" in c["note"] and "44" in c["note"]
+
+
+def test_deepseek_flash_is_the_opposite():
+    """flash 相反：关思考快 28%，对白形态基本不变（41.0% → 41.2%）。
+
+    2026-10-26 真跑（2400 字续写）：25.8s → 18.6s，reasoning 87 → 0。
+    """
+    c = thinking_control_for("openai", "deepseek-flash")
+    assert "可关" in c["note"], c["note"]
+    assert "28%" in c["note"]
+
+
+def test_deepseek_does_not_accept_effort_levels():
+    """DeepSeek **不认** reasoning_effort 的档位 —— 别把 MiniMax 那套抄过来。
+
+    2026-10-26 真跑（reasoning_tokens 是硬判据，不受网络波动影响）：
+      flash  基线 22 → effort=low 30.5 / medium 30.5 / high 30.5 / minimal 32.5（**全部没降**）
+      v4-pro 基线 72.5 → low 74.5 / medium 73.5 / high 70.0 / minimal 61.0（**全部没降**）
+      thinking={"type":"disabled"} → 两个模型都归零 ✓
+    ⇒ 所以 `_thinking_kwargs` 只对 DeepSeek 发 thinking_off，**不发 effort**。
+    """
+    # 传 MiniMax 风格的档位给 DeepSeek 渠道：不该产生任何请求字段
+    for lvl in ("low", "medium", "high", "xhigh", "max"):
+        assert _thinking_kwargs("openai", "deepseek-v4-pro", lvl) == {}, lvl
+    # 但 "off" 要生效
+    assert _thinking_kwargs("openai", "deepseek-v4-pro", "off") == {"thinking_off": True}
+
+
+
 def test_unknown_channel_offers_nothing():
     """没验证过的渠道**不给开关** —— 按了没反应比没有更糟。"""
     for prov in ("zhipu", "siliconflow", "dashscope", "openrouter"):

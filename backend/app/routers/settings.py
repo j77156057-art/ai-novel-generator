@@ -146,9 +146,24 @@ def thinking_control_for(provider: str, model: str = "") -> dict:
         # 通用兼容渠道：只有实测过的 DeepSeek 系给出开关
         if any(model.startswith(m) for m in ("deepseek-chat", "deepseek-reasoner",
                                              "deepseek-flash", "deepseek-v4-pro")):
+            # 2026-10-26 真跑（2400 字续写，两种模型各两组）—— 两个模型的**结论相反**：
+            #
+            #   flash   基线 25.8s / reasoning 87 / 纯台词段 41.0%
+            #           关思考 18.6s / 0        / 41.2%      ⇒ **快 28%，质量基本不变**
+            #   v4-pro  基线 64.6s / reasoning 336 / 纯台词段 **4.9%**
+            #           关思考 63.9s / 0        / **44.0%**   ⇒ **几乎不省时间，质量崩**
+            #
+            # 所以给 flash 建议关、给 v4-pro **明确建议别关**：
+            # v4-pro 的思考真的在改善对白形态（4.9% 比参考书 7.5% 还接近理想，
+            # 而关掉后 44% —— 比我们一直改不动的提示词/样例方案差得多）。
+            if model.startswith("deepseek-v4-pro"):
+                return {"mode": "disable", "field": "thinking",
+                        "levels": ("default", "off"),
+                        "note": "不建议关：实测关掉后纯台词段 4.9%→44%，"
+                                "而用时几乎不省（64.6s→63.9s）。它的思考在改善对白形态。"}
             return {"mode": "disable", "field": "thinking",
                     "levels": ("default", "off"),
-                    "note": "实测可关（v4-pro 27.8s → 8.2s，reasoning 归零）"}
+                    "note": "可关：实测快 28%（25.8s→18.6s），对白形态基本不变"}
         return {"mode": "none", "field": None, "levels": (), "note": ""}
 
     spec = THINKING_CONTROL.get(provider)
