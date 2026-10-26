@@ -6,9 +6,9 @@ P0 背景：判据实现把 `final_ratio` 取成了「**任意**句末标点（`
 `怎么了` 共 936 字正常对白被误删。
 
 本文件把那次复现钉成回归：
-  1. 真实文本：只应检出 `风动乾坤`，不得含那三个正常问句短语；
+  1. 真实文本：只应检出 `风沙千里`，不得含那三个正常问句短语；
   2. 合成对白：满篇 `怎么办？`/`没事吧？`/`怎么了？`/`是吗？` → 零命中；
-  3. 真水印不回归：`风动乾坤` 仍被检出、仍能清掉 ~40498 处、残留个位数。
+  3. 真水印不回归：`风沙千里` 仍被检出、仍能清掉 ~40498 处、残留个位数。
 
 标 `slow`（真实文本一跑数分钟）；`pytest -m "not slow"` 可跳过。
 """
@@ -47,8 +47,8 @@ def test_doupo_detects_only_the_real_watermark():
     hits = find_repeated_watermarks(text)
     names = [h["text"] for h in hits]
 
-    # 只含真水印，且就是风动乾坤
-    assert names == ["风动乾坤"], f"检出结果应为 ['风动乾坤']，实际 {names}"
+    # 只含真水印，且就是风沙千里
+    assert names == ["风沙千里"], f"检出结果应为 ['风沙千里']，实际 {names}"
     for bad in _FALSE_POSITIVES:
         assert bad not in names, f"正常问句短语 {bad!r} 被误判为水印"
 
@@ -67,7 +67,7 @@ def test_doupo_strip_removes_watermark_without_touching_dialogue():
     hits = find_repeated_watermarks(text)
     assert hits, "未检出真水印"
     top = hits[0]
-    assert top["text"] == "风动乾坤"
+    assert top["text"] == "风沙千里"
     assert top["final_ratio"] >= 0.99
     assert top["nesting_breadth"] >= DEFAULT_MIN_NESTING_BREADTH
     # 仍能清掉约 40498 处（紧随『。』的那些）
@@ -76,7 +76,7 @@ def test_doupo_strip_removes_watermark_without_touching_dialogue():
     cleaned = strip_watermarks(text, hits)
 
     # 清洗后残留水印应是个位数（未被『。』跟随的那几处故意不删）
-    assert cleaned.count("风动乾坤") <= 10
+    assert cleaned.count("风沙千里") <= 10
     # 正常对白一个都不能少
     for q in _FALSE_POSITIVES:
         assert cleaned.count(q) == text.count(q), f"{q} 被误删"

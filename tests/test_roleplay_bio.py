@@ -45,7 +45,7 @@ def test_event_skips_colon_ending():
 
 def test_event_skips_name_inside_quotes():
     """名字在引号内 ⇒ 那是**别人说他的**，不是他做的事。"""
-    line = "陆长风笑道：“老周，你说温华这小子成天就想着练剑。”"
+    line = "陆长风笑道：“老周，你说楚惊蛰这小子成天就想着练剑。”"
     assert _event_candidate(line, "老周") is None
 
 

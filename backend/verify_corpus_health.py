@@ -11,10 +11,10 @@
      把与阈值 0.9 的余量摆出来 —— 余量窄就说明阈值是在赌，不是有区分度。
 
   B. **去嵌套必须是真去嵌套**：定长 n-gram 会在注入串周围造出一整套阶梯
-     （`动乾坤` ⊂ `风动乾坤` ⊂ `道风动乾坤` ⊂ `笑道风动乾坤` …）。
+     （`动乾坤` ⊂ `风沙千里` ⊂ `道风沙千里` ⊂ `笑道风沙千里` …）。
      这里给四个方向的用例：
        B1 纯注入            → 只报 1 条，且是注入串本身
-       B3 正文合法含 `撼动乾坤`（含 `动乾坤`）→ 仍只报 `风动乾坤`，不得报 `动乾坤`
+       B3 正文合法含 `撼动乾坤`（含 `动乾坤`）→ 仍只报 `风沙千里`，不得报 `动乾坤`
        B4 注入串前缀恒定    → 报**带前缀**的那一串（前缀确实属于注入内容）
        B5 短串计数 > 长串计数（这次的实战形态）→ 不得两个都报
 
@@ -157,7 +157,7 @@ def synth(
     rng.shuffle(sents)
 
     if mark:
-        # 必须**不重复采样**：重复采样会把水印叠在一起变成 `风动乾坤风动乾坤。`，
+        # 必须**不重复采样**：重复采样会把水印叠在一起变成 `风沙千里风沙千里。`，
         # 于是没有一处跟在句末标点前，整个用例会假 PASS（我第一版就踩了这个坑）。
         assert n_inject <= len(sents), f"句子不够注入: {n_inject} > {len(sents)}"
         for k in rng.sample(range(len(sents)), n_inject):
@@ -192,8 +192,8 @@ def main() -> int:
           n_hit_total == 1, f"实际 {n_hit_total} 条")
     if n_hit_total == 1:
         only = next(h for v in marks_by_book.values() for h in v)
-        check("命中的就是《风动乾坤》这一串",
-              only["text"] == "风动乾坤", repr(only["text"]))
+        check("命中的就是《风沙千里》这一串",
+              only["text"] == "风沙千里", repr(only["text"]))
         check("它 99% 以上直接跟在句末标点前（判据成立）",
               only["final_ratio"] >= 0.99, str(only["final_ratio"]))
 
@@ -236,30 +236,30 @@ def main() -> int:
     section("B. 去嵌套（合成对抗用例）")
     # ======================================================================
     # B1 纯注入
-    txt, _ = synth(mark="风动乾坤")
+    txt, _ = synth(mark="风沙千里")
     hits = find_repeated_watermarks(txt)
     check("B1 纯注入 → 恰好 1 条（不是阶梯里的 13 条）",
           len(hits) == 1, f"实际 {len(hits)}: {[h['text'] for h in hits]}")
     check("B1 报的就是注入串本身",
-          hits and hits[0]["text"] == "风动乾坤", str([h["text"] for h in hits]))
+          hits and hits[0]["text"] == "风沙千里", str([h["text"] for h in hits]))
 
     # B3 正文合法含「撼动乾坤」（其中含 `动乾坤`）—— 注入串仍须胜出
-    txt3, _ = synth(mark="风动乾坤", legit=[("撼动乾坤", 20, 0)])
+    txt3, _ = synth(mark="风沙千里", legit=[("撼动乾坤", 20, 0)])
     hits3 = find_repeated_watermarks(txt3)
     names3 = [h["text"] for h in hits3]
-    check("B3 正文合法含「撼动乾坤」时，仍只报 `风动乾坤`",
-          names3 == ["风动乾坤"], f"实际 {names3}")
+    check("B3 正文合法含「撼动乾坤」时，仍只报 `风沙千里`",
+          names3 == ["风沙千里"], f"实际 {names3}")
     check("B3 未把 `动乾坤` / `撼动乾坤` 当成水印",
           "动乾坤" not in names3 and "撼动乾坤" not in names3, f"实际 {names3}")
     print(f"        （`动乾坤` 此时计数被正文抬高到 "
-          f"{txt3.count('动乾坤')} > `风动乾坤` {txt3.count('风动乾坤')}，"
+          f"{txt3.count('动乾坤')} > `风沙千里` {txt3.count('风沙千里')}，"
           f"旧的「按计数降序 + in 判被包含」写法在这里必然漏掉）")
 
     # B4 前缀恒定 → 前缀属于注入内容，应当带上前缀
-    txt4, _ = synth(mark="道风动乾坤")
+    txt4, _ = synth(mark="道风沙千里")
     hits4 = find_repeated_watermarks(txt4)
     check("B4 注入串前缀恒定时，报带前缀的那一串（前缀确实属于注入内容）",
-          len(hits4) == 1 and hits4[0]["text"] == "道风动乾坤",
+          len(hits4) == 1 and hits4[0]["text"] == "道风沙千里",
           f"实际 {[h['text'] for h in hits4]}")
 
     # B5 短串计数 > 长串计数（本次实战形态）—— 不得两个都报
@@ -271,12 +271,12 @@ def main() -> int:
         for L in (3, 4, 5, 6):
             for i in range(len(s) - L + 1):
                 cnt_all[s[i:i + L]] = cnt_all.get(s[i:i + L], 0) + 1
-    ladder = sorted(((c, k) for k, c in cnt_all.items() if "风动乾坤" in k), reverse=True)
+    ladder = sorted(((c, k) for k, c in cnt_all.items() if "风沙千里" in k), reverse=True)
     for c, k in ladder[:6]:
         print(f"    {k!r:12} 计数={c}")
-    check("B5 短串(`动乾坤`)计数确实高于长串(`风动乾坤`)——这正是旧写法失效的原因",
-          txt3.count("动乾坤") > txt3.count("风动乾坤"),
-          f"{txt3.count('动乾坤')} vs {txt3.count('风动乾坤')}")
+    check("B5 短串(`动乾坤`)计数确实高于长串(`风沙千里`)——这正是旧写法失效的原因",
+          txt3.count("动乾坤") > txt3.count("风沙千里"),
+          f"{txt3.count('动乾坤')} vs {txt3.count('风沙千里')}")
 
     # ======================================================================
     section("C. 清洗安全性（误删正文是静默损失，必须双实现对拍）")
@@ -284,13 +284,13 @@ def main() -> int:
     # C1 合成：已知干净文本 → 清洗后必须逐字相同
     clean_units = [b + "。" for b in _BODY]
     clean_text = "".join(clean_units * 3)
-    txt_c, _ = synth(mark="风动乾坤")
+    txt_c, _ = synth(mark="风沙千里")
     stripped_c = strip_watermarks(clean_text, find_repeated_watermarks(txt_c))
     check("C1 对**干净文本**施清洗 → 逐字不变",
           stripped_c == clean_text, f"长度 {len(clean_text)} → {len(stripped_c)}")
 
     # C2 合成：注入文本 → 清洗后必须等于「去掉注入串」的文本
-    expect = txt_c.replace("风动乾坤。", "。")
+    expect = txt_c.replace("风沙千里。", "。")
     check("C2 对注入文本施清洗 → 等于逐点去掉注入串的结果",
           strip_watermarks(txt_c, find_repeated_watermarks(txt_c)) == expect,
           f"差 {abs(len(strip_watermarks(txt_c, find_repeated_watermarks(txt_c)))-len(expect))} 字")
@@ -315,7 +315,7 @@ def main() -> int:
         check("C5 正文上下文短语计数前后不变（未误删上下文）", ctx_ok,
               str({w: (t.count(w), got.count(w)) for w in ("笑道", "的目光", "点点头", "的气息")}))
         print(f"        清洗: {len(t)} → {len(got)} 字, 删 {removed} "
-              f"({removed/len(t)*100:.2f}%), 残留水印 {got.count('风动乾坤')} 处"
+              f"({removed/len(t)*100:.2f}%), 残留水印 {got.count('风沙千里')} 处"
               f"（= 未被句末标点跟随的 {hits[0]['count']-hits[0]['final']} 处，故意不删）")
     else:
         check("C3-C5 需要焚天录命中水印", False, "未命中")
@@ -327,7 +327,7 @@ def main() -> int:
     check("D2 短文本（< min_count）→ []", find_repeated_watermarks("你好。") == [])
     check("D3 strip_watermarks(text, []) → 原样返回",
           strip_watermarks("你好。", []) == "你好。")
-    tail = "".join(b + "风动乾坤。" for b in _BODY) * 8
+    tail = "".join(b + "风沙千里。" for b in _BODY) * 8
     check("D4 未通过判据的串不会被删（判据与删除用同一把尺）",
           strip_watermarks(tail, [{"text": "的一点", "count": 1}]) == tail)
 

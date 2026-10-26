@@ -160,7 +160,7 @@ def main() -> int:
         check("块里有具体数字（不是形容词）",
               "句长" in with_block and any(c.isdigit() for c in with_block))
         check("块里带体检留痕（说明数字是清洗后算的）",
-              "已剔除注入串" in with_block and "风动乾坤" in with_block)
+              "已剔除注入串" in with_block and "风沙千里" in with_block)
         check("两次组装 system 逐字节一致（静态块，不击穿缓存）", again == with_block)
 
         proj.reference_novel_ids = []
