@@ -41,7 +41,7 @@ def test_method_view_artifact_carries_no_entity_voice_or_evidence():
     if not path.exists():
         return
     view = json.loads(path.read_text(encoding='utf-8'))
-    l2_names = {'徐凤年', '徐骁', '王仙芝', '徐北枳', '曹长卿', '姜泥', '轩辕青锋', '陈芝豹'}
+    l2_names = {'陆长风', '陆崇', '楚惊蛰', '陆北枝', '裴长卿', '小宁', '赵青锋', '孟豹'}
     for rule in view['rules']:
         assert rule['dimension'] != VOICE_DIMENSION, rule
         assert '（证据' not in rule['method'], rule

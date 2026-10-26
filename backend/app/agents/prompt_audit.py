@@ -128,7 +128,7 @@ def run_prompt_audit(db: Any, project: Any, *, profile: str = 'original'
     # 渲染块里本来就没有这个维度。
     #
     # 老写法查的是「档案里有没有这个维度」→ 任何含真书档案的项目在原创模式
-    # 都被判成泄漏，连带被生成闸门挡住（实测：雪中悍刀行真书档案必误报）。
+    # 都被判成泄漏，连带被生成闸门挡住（实测：《北荒刀歌》真书档案必误报）。
     # 它给的建议「或修 profiles.PROFILE_RULES['original']['include_voice']」
     # 更是让人去修一件**早就修好**的事 —— 那就是判据查错了对象的信号。
     if isinstance(narrative, dict) and narrative and normalize_profile(profile) == 'original':

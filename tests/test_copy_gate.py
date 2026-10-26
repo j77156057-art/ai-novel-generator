@@ -36,7 +36,7 @@ def _nodes(action: str):
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv('ENTITY_CACHE_DIR', str(tmp_path / 'entities'))
     from app.style.entity_store import save_table
-    save_table(1, {'characters': ['徐凤年'], 'places': [], 'factions': [], 'items': [],
+    save_table(1, {'characters': ['陆长风'], 'places': [], 'factions': [], 'items': [],
                    'version': 2})
     engine = create_engine('sqlite://', connect_args={'check_same_thread': False},
                            poolclass=StaticPool)
@@ -120,7 +120,7 @@ def test_a_phrase_the_model_never_saw_is_not_treated_as_copying(tmp_path, monkey
     """模型看不到的规则（每维只取 4 条，落选的第 5 条）与它产出相同只是巧合。"""
     monkeypatch.setenv('ENTITY_CACHE_DIR', str(tmp_path / 'entities'))
     from app.style.entity_store import save_table
-    save_table(1, {'characters': ['徐凤年'], 'places': [], 'factions': [], 'items': [],
+    save_table(1, {'characters': ['陆长风'], 'places': [], 'factions': [], 'items': [],
                    'version': 2})
     rules = {'高频场景模板': [RULE],
              '节拍序列': [f'规则{i}：铺垫→升温；目标者拒绝或僵持{i}' for i in range(4)] + [UNPICKED]}

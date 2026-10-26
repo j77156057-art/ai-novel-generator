@@ -50,8 +50,8 @@ def test_parsing_is_forgiving(raw):
 
 def test_a_rule_naming_a_reference_character_is_dropped():
     from app.style.character_template import entity_free_rules
-    rules = ["先给动作再给评价", "徐凤年咳了两声掩饰不舍"]
-    kept, dropped = entity_free_rules(rules, ["徐凤年", "北凉军"])
+    rules = ["先给动作再给评价", "陆长风咳了两声掩饰不舍"]
+    kept, dropped = entity_free_rules(rules, ["陆长风", "北荒军"])
     assert kept == ["先给动作再给评价"]
     assert dropped == 1
 
@@ -60,7 +60,7 @@ def test_a_rule_naming_a_place_or_faction_is_dropped():
     from app.style.character_template import entity_free_rules
     kept, dropped = entity_free_rules(
         ["在太安城这样的地方铺陈", "用旁人的反应侧写主角"],
-        ["太安城", "北凉王府"])
+        ["太安城", "北荒王府"])
     assert kept == ["用旁人的反应侧写主角"]
     assert dropped == 1
 
@@ -70,7 +70,7 @@ def test_long_plot_reciting_and_verbatim_copies_are_dropped():
     long_rule = "用" + "很" * 90 + "的手法塑造人物"
     kept, dropped = entity_free_rules(
         [long_rule, "本章里作者写了很多细节", "医院里她抬起头，看着走廊尽头的光。"],
-        ["徐凤年"], chunk_text="医院里她抬起头，看着走廊尽头的光。")
+        ["陆长风"], chunk_text="医院里她抬起头，看着走廊尽头的光。")
     assert kept == []
     assert dropped == 3
 
@@ -130,7 +130,7 @@ class _TemplateProvider:
         if "人物塑造模板" in system:
             return json.dumps({"人物塑造模板": [
                 "先给动作再给评价，让读者自己得出结论",
-                "徐凤年在江边咳了两声，掩饰不舍",
+                "陆长风在江边咳了两声，掩饰不舍",
             ]}, ensure_ascii=False)
         return '{"占位": ["占位规则（证据：原文里根本没有这句话）"]}'
 
@@ -168,16 +168,16 @@ def test_the_extraction_filters_entity_names_out(monkeypatch):
     db = Session(engine)
     try:
         nid, project = _corpus_and_project(db)
-        # 专名表：这一本里有「徐凤年」和「太安城」
+        # 专名表：这一本里有「陆长风」和「太安城」
         monkeypatch.setattr(entity_store, 'ensure_table',
                             lambda db_, novel_id, **kw: {
-                                "characters": ["徐凤年"], "places": ["太安城"],
+                                "characters": ["陆长风"], "places": ["太安城"],
                                 "factions": [], "items": [],
                             })
         row = extract_character_template(db, project, [nid], provider=_TemplateProvider())
         rules = row.rules
         assert "先给动作再给评价，让读者自己得出结论" in rules
-        assert not any("徐凤年" in r for r in rules), "带专名的规则不能进产物"
+        assert not any("陆长风" in r for r in rules), "带专名的规则不能进产物"
     finally:
         db.close()
 

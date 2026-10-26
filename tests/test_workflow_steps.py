@@ -255,7 +255,7 @@ def test_the_converged_step_says_how_many_steps_are_left():
 def test_distill_step_is_done_when_the_profile_is_already_applied():
     """档案已经在项目上 → 这道工序就是做完了，哪怕本项目没跑过蒸馏。
 
-    实测（雪中悍刀行真书档案）：项目从蒸馏库**应用**了档案，`distill_runs` 是空的。
+    实测（《北荒刀歌》真书档案）：项目从蒸馏库**应用**了档案，`distill_runs` 是空的。
     老判据只看 distill_runs → 「文风蒸馏 待做」紧挨着「档案审查 已完成」，
     链条自相矛盾（面板上一眼就能看出不对）。
     """

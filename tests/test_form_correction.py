@@ -23,7 +23,7 @@ from app.style.form import (  # noqa: E402
 )
 
 BARE = "“都退后。”"
-LEAD = "徐骁沉声道，声音压得很低：“都退后。”"
+LEAD = "陆崇沉声道，声音压得很低：“都退后。”"
 NARR = "院子里静了下来，檐下的灯笼被风吹得转了半圈。"
 
 
@@ -104,7 +104,7 @@ def test_reject_when_form_does_not_move():
 def test_reject_when_length_changes_too_much():
     """纯灌水（对白一个字没动，只是把叙述写长）→ 拒绝。"""
     text = _pad([BARE] * 40)
-    flooded = _pad([BARE] * 40, filler=NARR + "徐凤年没有再说话，只是把手里的木匣往袖中又塞深了一寸，腕子上的铜钱磕在匣壁上，发出极轻的一声脆响，屋里没有人接话。", n=400)
+    flooded = _pad([BARE] * 40, filler=NARR + "陆长风没有再说话，只是把手里的木匣往袖中又塞深了一寸，腕子上的铜钱磕在匣壁上，发出极轻的一声脆响，屋里没有人接话。", n=400)
     out, info = correct_form(text, _Provider(flooded), target_ratio=0.16, examples=[LEAD])
     assert info["applied"] is False, info
     assert out == text

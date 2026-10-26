@@ -22,56 +22,56 @@ from app.style.exemplar import exemplars_from_character_hits  # noqa: E402
 # ── 来源标注 ─────────────────────────────────────────────────────────────
 def test_origin_speaking_is_firsthand():
     """他自己开过口 ⇒ 亲历。"""
-    text = "因为在马厩躺了会，头上粘上几根马草的老黄挠挠头道：“剑匣三层六格。”"
-    origin, basis = classify_origin(text, "老黄")
+    text = "因为在马厩躺了会，头上粘上几根马草的老周挠挠头道：“剑匣三层六格。”"
+    origin, basis = classify_origin(text, "老周")
     assert origin == "亲历", basis
 
 
 def test_origin_others_talking_to_him_is_heard():
     """别人在跟他说 ⇒ 他在场听到，不是亲历。"""
-    text = "手没闲着拿了根黄瓜的徐凤年苦笑道：“老黄，你给我说说，这剑匣里有几把剑？”"
-    origin, _basis = classify_origin(text, "老黄")
+    text = "手没闲着拿了根黄瓜的陆长风苦笑道：“老周，你给我说说，这剑匣里有几把剑？”"
+    origin, _basis = classify_origin(text, "老周")
     assert origin == "在场听到"
 
 
 def test_origin_narration_only_is_heard():
     """叙述里提到他、但没有他的对白 ⇒ 在场听到。"""
-    text = "老黄想了想，一脸为难道：“少爷，我不懂这些。”"
+    text = "老周想了想，一脸为难道：“少爷，我不懂这些。”"
     # 这句他其实开了口，但名字与说话动词之间隔了逗号 —— 保守判成「在场听到」
-    origin, _basis = classify_origin(text, "老黄")
+    origin, _basis = classify_origin(text, "老周")
     assert origin in ("亲历", "在场听到")
 
 
 def test_origin_conservative_direction():
     """漏判的方向必须是**保守**的：不会把别人的话算成他的记忆。"""
-    text = "徐凤年站在城门前，看着老黄离去的背影，想起了很多事。"
-    origin, _basis = classify_origin(text, "老黄")
+    text = "陆长风站在城门前，看着老周离去的背影，想起了很多事。"
+    origin, _basis = classify_origin(text, "老周")
     assert origin == "在场听到"
 
 
 # ── 写法样板：从角色检索命中的块里取他的台词 ───────────────────────────
 def test_exemplars_from_character_hits():
     hits = [{
-        "text": "手没闲着拿了根黄瓜的徐凤年苦笑道：“老黄，你给我说说，这剑匣里有几把剑？”\n"
-                "因为在马厩躺了会的老黄挠挠头道：“剑匣三层六格，原先有天下十大名剑里的六把。”\n"
-                "徐凤年无言以对。\n"
-                "老黄憨憨道：“若少爷想要耍剑，俺留下三四把便是。”\n"
-                "徐凤年摇头道：“不了，少爷巴不得你背上百八十把剑。”",
+        "text": "手没闲着拿了根黄瓜的陆长风苦笑道：“老周，你给我说说，这剑匣里有几把剑？”\n"
+                "因为在马厩躺了会的老周挠挠头道：“剑匣三层六格，原先有天下十大名剑里的六把。”\n"
+                "陆长风无言以对。\n"
+                "老周憨憨道：“若少爷想要耍剑，俺留下三四把便是。”\n"
+                "陆长风摇头道：“不了，少爷巴不得你背上百八十把剑。”",
         "chunk_id": 1, "chapter_no": 14, "idx": 0,
     }]
-    ex = exemplars_from_character_hits(hits, "老黄")
+    ex = exemplars_from_character_hits(hits, "老周")
     assert len(ex) == 1
     assert ex[0]["character_filtered"] is True
-    assert "老黄挠挠头道" in ex[0]["text"]
+    assert "老周挠挠头道" in ex[0]["text"]
 
 
 def test_exemplars_skip_blocks_without_him():
     """块里没有他（他被别称代称）⇒ 不做样板。"""
     hits = [{
-        "text": "徐凤年笑了一声，看向那位缺胳膊的老马夫。",
+        "text": "陆长风笑了一声，看向那位缺胳膊的老马夫。",
         "chunk_id": 2, "chapter_no": 20, "idx": 0,
     }]
-    assert exemplars_from_character_hits(hits, "老黄") == []
+    assert exemplars_from_character_hits(hits, "老周") == []
 
 
 # ── 档案裁剪（死规则复活） ──────────────────────────────────────────────
@@ -81,8 +81,8 @@ def _profile_with_voice():
             "对白风格": [{"rule": "短句多含轻佻戏谑，长句多用于正式议事"}],
             "伏笔与悬念设计": [{"rule": "悬念先用异常细节埋设"}],
             "角色声音词典": [
-                {"rule": "老黄：自称多省略，惯用点头、咧嘴和憨笑"},
-                {"rule": "徐凤年：自称「本世子」，语气自得"},
+                {"rule": "老周：自称多省略，惯用点头、咧嘴和憨笑"},
+                {"rule": "陆长风：自称「本世子」，语气自得"},
             ],
         },
         "forbidden": {},
@@ -92,7 +92,7 @@ def _profile_with_voice():
 def test_dims_empty_removes_method_dimensions():
     from app.style.narrative import describe_narrative
 
-    body = describe_narrative(_profile_with_voice(), dims=(), voice_character="老黄")
+    body = describe_narrative(_profile_with_voice(), dims=(), voice_character="老周")
     assert "对白风格" not in body
     assert "伏笔" not in body
 
@@ -105,7 +105,7 @@ def test_voice_character_filters_voice_dictionary():
     """
     from app.style.narrative import describe_narrative
 
-    body = describe_narrative(_profile_with_voice(), dims=(), voice_character="老黄")
+    body = describe_narrative(_profile_with_voice(), dims=(), voice_character="老周")
     assert "惯用点头、咧嘴和憨笑" in body, body
     assert "本世子" not in body, body
 
@@ -125,11 +125,11 @@ class _P:
 
 
 def test_roleplay_character_from_plot_bible():
-    assert _roleplay_character_name(_P({"roleplay_character": "老黄"})) == "老黄"
+    assert _roleplay_character_name(_P({"roleplay_character": "老周"})) == "老周"
 
 
 def test_roleplay_character_falls_back_to_first_bible_character():
-    assert _roleplay_character_name(_P({"characters": [{"name": "徐凤年"}]})) == "徐凤年"
+    assert _roleplay_character_name(_P({"characters": [{"name": "陆长风"}]})) == "陆长风"
 
 
 def test_roleplay_character_falls_back_to_graph_characters():
@@ -137,8 +137,8 @@ def test_roleplay_character_falls_back_to_graph_characters():
 
     取不到 ⇒ 角色定向检索压根没跑（实测 rag_items 0 条）⇒ 角色「什么都不知道」。
     """
-    rem = {"character_constraints": [{"name": "徐凤年"}, {"name": "老黄"}]}
-    assert _roleplay_character_name(_P({}), rem) == "徐凤年"
+    rem = {"character_constraints": [{"name": "陆长风"}, {"name": "老周"}]}
+    assert _roleplay_character_name(_P({}), rem) == "陆长风"
 
 
 def test_roleplay_character_none_when_nothing():

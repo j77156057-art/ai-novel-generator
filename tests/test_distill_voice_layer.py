@@ -10,15 +10,15 @@ from normalize_voice_layer import (  # noqa: E402
     is_degenerate_voice, resolve_ambiguous_name,
 )
 
-AMBIGUOUS = {'轩辕', '慕容'}
+AMBIGUOUS = {'赵', '慕容'}
 
 
 def test_ambiguous_name_resolved_from_the_rule_itself():
-    """「轩辕」那条规则自己写着「以姓名"轩辕大磐"自称」——能从规则自身解析。"""
-    rule = '轩辕： 自称「以姓名“轩辕大磐”自称；内心认同强硬自我立场时使用“老子”」 口头禅「真是可笑至极」'
-    corpus = '轩辕大磐站在门口。'
-    resolved, problem = resolve_ambiguous_name('轩辕', rule, corpus, AMBIGUOUS)
-    assert resolved == '轩辕大磐'
+    """「赵」那条规则自己写着「以姓名"赵磐石"自称」——能从规则自身解析。"""
+    rule = '赵： 自称「以姓名“赵磐石”自称；内心认同强硬自我立场时使用“老子”」 口头禅「真是可笑至极」'
+    corpus = '赵磐石站在门口。'
+    resolved, problem = resolve_ambiguous_name('赵', rule, corpus, AMBIGUOUS)
+    assert resolved == '赵磐石'
     assert problem is None
 
 
@@ -32,22 +32,22 @@ def test_ambiguous_name_not_guessed_when_unresolvable():
 
 def test_candidate_must_exist_in_the_corpus():
     """规则里出现但语料里没有的名字不算数。"""
-    rule = '轩辕： 以姓名“轩辕大磐”自称'
-    resolved, problem = resolve_ambiguous_name('轩辕', rule, '语料里没有这个角色。', AMBIGUOUS)
-    assert resolved == '轩辕'
+    rule = '赵： 以姓名“赵磐石”自称'
+    resolved, problem = resolve_ambiguous_name('赵', rule, '语料里没有这个角色。', AMBIGUOUS)
+    assert resolved == '赵'
     assert problem == 'ambiguous_unresolvable'
 
 
 def test_non_ambiguous_name_is_untouched():
-    resolved, problem = resolve_ambiguous_name('徐凤年', '徐凤年： 自称「我」', '徐凤年', AMBIGUOUS)
-    assert (resolved, problem) == ('徐凤年', None)
+    resolved, problem = resolve_ambiguous_name('陆长风', '陆长风： 自称「我」', '陆长风', AMBIGUOUS)
+    assert (resolved, problem) == ('陆长风', None)
 
 
 def test_degenerate_voice_rule_is_detected():
     """模型自己说「判不出来」的空规则必须被认出来。"""
     assert is_degenerate_voice(
         '慕容： 自称「本段未出现可直接识别的自称。」 句长未形成对白句式特征 语气未出现直接对白，无法判断。')
-    assert not is_degenerate_voice('徐凤年： 自称「我」 句长偏短，语气清冷。')
+    assert not is_degenerate_voice('陆长风： 自称「我」 句长偏短，语气清冷。')
 
 
 def test_voice_normalization_artifact_is_self_consistent():

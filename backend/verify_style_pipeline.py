@@ -72,7 +72,7 @@ def main() -> int:
     if len(corpus) < 2:
         print("语料不足，无法验证")
         return 1
-    dirty_id = max(corpus)  # 斗破苍穹 = 被污染那本
+    dirty_id = max(corpus)  # 《焚天录》 = 被污染那本
     dirty_name = corpus[dirty_id][0]
     print(f"语料：{ {i: t for i, (t, _) in corpus.items()} }")
     print(f"被污染语料：{dirty_name} (id={dirty_id})")
@@ -160,7 +160,7 @@ def main() -> int:
         check("块里有具体数字（不是形容词）",
               "句长" in with_block and any(c.isdigit() for c in with_block))
         check("块里带体检留痕（说明数字是清洗后算的）",
-              "已剔除注入串" in with_block and "武动乾坤" in with_block)
+              "已剔除注入串" in with_block and "风动乾坤" in with_block)
         check("两次组装 system 逐字节一致（静态块，不击穿缓存）", again == with_block)
 
         proj.reference_novel_ids = []

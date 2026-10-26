@@ -346,7 +346,7 @@ def _distill(db: Any, project: Any, ctx: dict[str, Any] | None = None) -> tuple[
     只看 `distill_runs` 的老写法会把第 1 条里的「应用来的」误判成
     「还没跑过文风蒸馏」，而同一时刻「档案审查」却显示 done（档案确实在）——
     面板上就出现「蒸馏 待做」紧挨着「档案审查 已完成」。
-    实测：雪中悍刀行真书档案的两个项目正是这样（distill_runs=0，档案在位）。
+    实测：《北荒刀歌》真书档案的两个项目正是这样（distill_runs=0，档案在位）。
     """
     if not _project_corpus_ids(project):
         if _has_story_seed(project):

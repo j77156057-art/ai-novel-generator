@@ -22,7 +22,7 @@ from app.ingestion.encoding import (  # noqa: E402
     decode_text,
 )
 
-_CN = "《大奉打更人》\r\n第一章 牢狱之灾\r\n他说：这是一段中文正文，包含标点、数字 123 与英文 abc。\r\n"
+_CN = "《长夜司》\r\n第一章 牢狱之灾\r\n他说：这是一段中文正文，包含标点、数字 123 与英文 abc。\r\n"
 
 
 # ====================================================================
@@ -34,7 +34,7 @@ def test_utf8_sig_with_bom():
     raw = _CN.encode("utf-8-sig")
     text, enc = decode_text(raw, filename="bom.txt")
     assert enc == "utf-8-sig"
-    assert text.lstrip("\ufeff").startswith("《大奉打更人》")
+    assert text.lstrip("\ufeff").startswith("《长夜司》")
     assert "\ufeff" not in text  # BOM 已被剥离
 
 

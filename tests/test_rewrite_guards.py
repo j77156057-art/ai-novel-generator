@@ -78,11 +78,11 @@ def test_bare_ratio_helper():
        仍然算「几乎是纯台词」，尾巴要够长才算「叙述与台词同段」。
     """
     only_bare = "“都退后。”\n\n他抬起头。"
-    with_lead = "徐骁沉声道，声音压得很低：“都退后。”\n\n他抬起头。"
+    with_lead = "陆崇沉声道，声音压得很低：“都退后。”\n\n他抬起头。"
     assert _bare_ratio(only_bare) == 1.0, _bare_ratio(only_bare)
     assert _bare_ratio(with_lead) == 0.0, _bare_ratio(with_lead)
     # 一半一半
-    mixed = "“都退后。”\n\n徐骁沉声道，声音压得很低：“你过来。”"
+    mixed = "“都退后。”\n\n陆崇沉声道，声音压得很低：“你过来。”"
     assert _bare_ratio(mixed) == 0.5, _bare_ratio(mixed)
 
 
@@ -119,13 +119,13 @@ def test_bare_ratio_regression_rejected():
     - 字数没膨胀（甚至略缩）；
     - 但纯台词段从 0% 变成 75%（把对白拆成了一行一句）。
     """
-    line = "“都退后。”徐骁沉声道，声音压得很低。"
+    line = "“都退后。”陆崇沉声道，声音压得很低。"
     text = "\n\n".join([line] * 20)
     assert _bare_ratio(text) == 0.0, _bare_ratio(text)
 
     long_narration = (
-        "“都退后。”屋里没有人动，徐骁沉声道，声音压得很低，"
-        "徐凤年握刀不动，檐下的灯笼被风吹得转了半圈，灰尘落了一小撮。"
+        "“都退后。”屋里没有人动，陆崇沉声道，声音压得很低，"
+        "陆长风握刀不动，檐下的灯笼被风吹得转了半圈，灰尘落了一小撮。"
     )
     bare = "“你过来。”"
     split = "\n\n".join([long_narration] * 5 + [bare] * 15)

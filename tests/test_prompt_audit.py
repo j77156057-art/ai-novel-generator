@@ -42,14 +42,14 @@ def test_voice_dictionary_in_the_archive_is_not_a_leak_by_itself():
 
     泄漏的判据是**渲染结果**：原创模式的 `include_voice=False`，渲染块里
     本来就没有这个维度。老写法查的是「档案里有没有这个维度」→ 任何含真书
-    档案的项目在原创模式都被判成泄漏（实测：雪中悍刀行真书档案必误报，
+    档案的项目在原创模式都被判成泄漏（实测：《北荒刀歌》真书档案必误报，
     并被生成闸门挡住）。
     """
     from app.agents.prompt_audit import run_prompt_audit
     db, p = fixture()
     p.style_narrative = _profile(
         dims={'对白风格': [{'rule': '台词短促，少用长句修饰'}],
-              '角色声音词典': [{'rule': '轩辕青锋：语气冷淡，带有嘲讽'}]})
+              '角色声音词典': [{'rule': '赵青锋：语气冷淡，带有嘲讽'}]})
     db.commit()
     report, stats = run_prompt_audit(db, p)
     assert stats['narrative_injected'] is True
@@ -69,7 +69,7 @@ def test_voice_leak_is_caught_when_the_original_prompt_actually_includes_it(monk
     db, p = fixture()
     p.style_narrative = _profile(
         dims={'对白风格': [{'rule': '台词短促，少用长句修饰'}],
-              '角色声音词典': [{'rule': '轩辕青锋：语气冷淡，带有嘲讽'}]})
+              '角色声音词典': [{'rule': '赵青锋：语气冷淡，带有嘲讽'}]})
     db.commit()
     monkeypatch.setitem(profiles.PROFILE_RULES['original'], 'include_voice', True)
     report, _stats = run_prompt_audit(db, p)

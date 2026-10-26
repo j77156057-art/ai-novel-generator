@@ -23,7 +23,7 @@ OUT = ROOT / 'docs' / 'authority-distill-isolation-replay.json'
 def main():
     view = json.loads(VIEW.read_text(encoding='utf-8'))
     voices = json.loads(VOICES.read_text(encoding='utf-8')) if VOICES.exists() else {}
-    l2_names = {'徐凤年', '徐骁', '王仙芝', '徐北枳', '曹长卿', '姜泥', '轩辕青锋', '陈芝豹'}
+    l2_names = {'陆长风', '陆崇', '楚惊蛰', '陆北枝', '裴长卿', '小宁', '赵青锋', '孟豹'}
     voice_names = {r.get('name') for r in (voices.get('rows') or []) if r.get('name')}
 
     # 视图 → 消费路径要的档案形状（按维度分组的规则字典）。

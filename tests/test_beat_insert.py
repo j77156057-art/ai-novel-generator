@@ -43,7 +43,7 @@ class _Provider:
 
 
 BODY = (
-    "老黄蹲在马厩里擦马镫。\n\n"
+    "老周蹲在马厩里擦马镫。\n\n"
     "“世子想听实话？”\n\n"
     "“你跟着我这么多年，还不知道我从不问自己会心疼的账？”\n\n"
     "“原来不在他身上。”"
@@ -59,7 +59,7 @@ def test_rejects_too_short():
 
 
 def test_rejects_too_long():
-    p = _Provider(["老黄抬起头看了看门外的天色，然后慢慢地把手里的旧布叠好"
+    p = _Provider(["老周抬起头看了看门外的天色，然后慢慢地把手里的旧布叠好"
                    "放回腰间，又低下头继续去擦那副已经被磨得发亮的马镫。"])
     _text, info = _insert_beats(BODY, p, target_ratio=0.0)
     assert info["inserted"] == 0
@@ -68,7 +68,7 @@ def test_rejects_too_long():
 
 # ── 引号判据（不能写台词）────────────────────────────────────────────────
 def test_rejects_quote_in_beat():
-    p = _Provider(["老黄说：“这是军马。”"])
+    p = _Provider(["老周说：“这是军马。”"])
     _text, info = _insert_beats(BODY, p, target_ratio=0.0)
     assert info["inserted"] == 0
     assert any("引号" in r["reason"] for r in info["rejected"])
@@ -76,7 +76,7 @@ def test_rejects_quote_in_beat():
 
 # ── 新专名判据（不能凭空造事实）──────────────────────────────────────────
 #: 参考书的专名表（真书项目里 `entity_store` 的表就是这个形状）。
-PROPER_NOUNS = {"徐凤年", "老黄", "北凉", "王府", "徐骁", "北凉王"}
+PROPER_NOUNS = {"陆长风", "老周", "北荒", "王府", "陆崇", "北荒王"}
 
 
 def test_rejects_declared_proper_noun_not_in_table():
@@ -97,9 +97,9 @@ def test_allows_declared_proper_noun_in_table():
     （句子要够长 —— 低于 10 字会被长度判据先拒掉，那是对的。）
     """
     p = _Provider([
-        "老黄没有抬头，手里的旧布在马镫上来回蹭着。\n专名：老黄",
-        "徐凤年把袖口拢了拢，指尖在布边停住。\n专名：徐凤年",
-        "徐骁将手按在木槽上，抬眼看去。\n专名：徐骁",
+        "老周没有抬头，手里的旧布在马镫上来回蹭着。\n专名：老周",
+        "陆长风把袖口拢了拢，指尖在布边停住。\n专名：陆长风",
+        "陆崇将手按在木槽上，抬眼看去。\n专名：陆崇",
     ])
     _text, info = _insert_beats(BODY, p, target_ratio=0.0, proper_nouns=PROPER_NOUNS)
     assert info["inserted"] == 3
@@ -119,9 +119,9 @@ def test_rejects_numbers():
 def test_plain_action_is_accepted():
     """正常的动作/神态叙述 ⇒ 放行（不误杀）。"""
     p = _Provider([
-        "老黄没有抬头，手里的旧布在马镫上来回蹭着。",
-        "徐凤年把袖口拢了拢，指尖在布边停住。",
-        "徐骁将手按在木槽上，抬眼看去。",
+        "老周没有抬头，手里的旧布在马镫上来回蹭着。",
+        "陆长风把袖口拢了拢，指尖在布边停住。",
+        "陆崇将手按在木槽上，抬眼看去。",
     ])
     _text, info = _insert_beats(BODY, p, target_ratio=0.0, proper_nouns=PROPER_NOUNS)
     assert info["inserted"] == 3
@@ -130,7 +130,7 @@ def test_plain_action_is_accepted():
 
 def test_declared_noun_line_is_stripped_from_beat():
     """「专名：」那行不能进正文。"""
-    p = _Provider(["老黄没有抬头。\n专名：老黄"])
+    p = _Provider(["老周没有抬头。\n专名：老周"])
     text, info = _insert_beats(BODY, p, target_ratio=0.0, proper_nouns=PROPER_NOUNS)
     assert "专名：" not in text
 
@@ -147,15 +147,15 @@ def test_rejects_non_narrative():
 def test_accepts_good_beat():
     # 三处候选给**三句不同**的话（判据 4 会拒重复，见下面那个测试）
     p = _Provider([
-        "老黄没有抬头，手里的旧布在马镫上来回蹭着。",
-        "徐凤年把袖口拢了拢，指尖在布边停住。",
-        "门外的风把草料吹散了几根，徐骁弯腰拾起。",
+        "老周没有抬头，手里的旧布在马镫上来回蹭着。",
+        "陆长风把袖口拢了拢，指尖在布边停住。",
+        "门外的风把草料吹散了几根，陆崇弯腰拾起。",
     ])
     text, info = _insert_beats(BODY, p, target_ratio=0.0)
     # target_ratio=0.0 ⇒ 三段 A 类全是候选（3 处）⇒ 全部插入
     assert info["inserted"] == 3
     assert info["slots"] == 3
-    assert "老黄没有抬头" in text
+    assert "老周没有抬头" in text
     # 插入后那段变成 C 类（**并进**那一段，不是另起一段）
     from app.style.beat import has_action
 
@@ -167,7 +167,7 @@ def test_accepts_good_beat():
 
 
 def test_uses_low_temperature():
-    p = _Provider(["老黄没有抬头。"])
+    p = _Provider(["老周没有抬头。"])
     _insert_beats(BODY, p, target_ratio=0.0)
     assert p.temps and all(t is not None and t <= 0.3 for t in p.temps)
 
@@ -176,8 +176,8 @@ def test_uses_low_temperature():
 def test_one_failure_does_not_block_others():
     p = _Provider([
         "太短。",                                     # 第 1 处：长度不过
-        "老黄没有抬头，手里的旧布在马镫上来回蹭着。",  # 第 2 处：合格
-        "徐凤年把袖口拢了拢，指尖在布边停住。",       # 第 3 处：合格
+        "老周没有抬头，手里的旧布在马镫上来回蹭着。",  # 第 2 处：合格
+        "陆长风把袖口拢了拢，指尖在布边停住。",       # 第 3 处：合格
     ])
     text, info = _insert_beats(BODY, p, target_ratio=0.0)
     # 第 1 处长度不过 → 拒；其余的插入
@@ -196,8 +196,8 @@ def test_all_failed_returns_original():
 def test_provider_exception_is_contained():
     p = _Provider([
         RuntimeError("boom"),
-        "老黄没有抬头，手里的旧布在马镫上来回蹭着。",
-        "徐凤年把袖口拢了拢，指尖在布边停住。",
+        "老周没有抬头，手里的旧布在马镫上来回蹭着。",
+        "陆长风把袖口拢了拢，指尖在布边停住。",
     ])
     text, info = _insert_beats(BODY, p, target_ratio=0.0)
     assert info["inserted"] == 2
@@ -213,13 +213,13 @@ def test_no_slots_returns_original():
 
 # ── 清洗输出 ─────────────────────────────────────────────────────────────
 def test_clean_beat_strips_quotes_and_extra_lines():
-    assert _clean_beat("“老黄没有抬头。”") == "老黄没有抬头。"
-    assert _clean_beat("老黄没有抬头。\n解释：这是动作。") == "老黄没有抬头。"
+    assert _clean_beat("“老周没有抬头。”") == "老周没有抬头。"
+    assert _clean_beat("老周没有抬头。\n解释：这是动作。") == "老周没有抬头。"
     assert _clean_beat("  ") == ""
 
 
 def test_looks_like_narration():
-    assert _looks_like_narration("老黄抬起头。")
+    assert _looks_like_narration("老周抬起头。")
     assert not _looks_like_narration("因为军马吃草，所以私马也得吃草。")
     assert not _looks_like_narration("“带引号的”。")
 
@@ -234,7 +234,7 @@ def test_narration_judge_does_not_kill_valid_action_lines():
     """
     # 真跑原句：没有白名单里的动词，但都是标准的动作/神态叙述
     assert _looks_like_narration("拢着湿布的手微微收紧，指节泛白。")
-    assert _looks_like_narration("徐凤年眉梢微动，指尖搭在黄绢边角。")
+    assert _looks_like_narration("陆长风眉梢微动，指尖搭在黄绢边角。")
 
 
 def test_narration_judge_still_rejects_reasoning():
@@ -249,7 +249,7 @@ def test_duplicate_beats_are_rejected():
     p = _Provider([
         "他垂下眼，指尖在袖口边停了停。",
         "他垂下眼，手指在袖口上停了停。",
-        "徐骁将手按在木槽上，抬眼看去。",
+        "陆崇将手按在木槽上，抬眼看去。",
     ])
     _text, info = _insert_beats(BODY, p, target_ratio=0.0)
     assert info["inserted"] == 2, "第二条与第一条重复，应当被拒"
@@ -261,7 +261,7 @@ def test_find_duplicate_unit():
 
     a = "他垂下眼，指尖在袖口边停了停。"
     b = "他垂下眼，手指在袖口上停了停。"
-    c = "徐骁将手按在木槽上，抬眼看去。"
+    c = "陆崇将手按在木槽上，抬眼看去。"
     assert _find_duplicate(b, [a])
     assert not _find_duplicate(c, [a])
     assert not _find_duplicate(a, [])
@@ -271,31 +271,31 @@ def test_find_duplicate_unit():
 def test_beat_must_not_duplicate_adjacent_original():
     """真跑原句：beat 跟**紧邻的原文段**做了同一个动作。
 
-    原文：「徐骁将手中的蜡书放在木槽上。」
-    beat：「徐骁将手按在木槽上，抬眼看去。」
+    原文：「陆崇将手中的蜡书放在木槽上。」
+    beat：「陆崇将手按在木槽上，抬眼看去。」
     ⇒ 相邻两段连着往木槽上放东西，读起来像卡带。
     """
     from app.style.beat_insert import _too_similar_to_context
 
-    beat = "徐骁将手按在木槽上，抬眼看去。"
-    ctx = "徐骁将手中的蜡书放在木槽上。"
+    beat = "陆崇将手按在木槽上，抬眼看去。"
+    ctx = "陆崇将手中的蜡书放在木槽上。"
     assert _too_similar_to_context(beat, [ctx])
     # 干净的 beat 不该被误杀
     assert not _too_similar_to_context("袖口忽然绷紧，又缓缓松开。", [ctx])
-    assert not _too_similar_to_context("老黄没有抬头，手里的旧布在马镫上来回蹭着。", [ctx])
+    assert not _too_similar_to_context("老周没有抬头，手里的旧布在马镫上来回蹭着。", [ctx])
 
 
 def test_context_duplicate_is_rejected_in_insert():
     """走完整流程：上下文重复的那条要被拒，其余照插。"""
     body = (
-        "徐骁将手中的蜡书放在木槽上。\n\n"
+        "陆崇将手中的蜡书放在木槽上。\n\n"
         "“京中来了密旨。”\n\n"
-        "老黄蹲在栏边，正给一匹枣红马刷去肩上的干泥。\n\n"
+        "老周蹲在栏边，正给一匹枣红马刷去肩上的干泥。\n\n"
         "“世子想听实话？”"
     )
     p = _Provider([
-        "徐骁将手按在木槽上，抬眼看去。",   # 与紧邻原文重复 ⇒ 拒
-        "老黄停下刷子，抬眼看向门口。",     # 干净 ⇒ 插
+        "陆崇将手按在木槽上，抬眼看去。",   # 与紧邻原文重复 ⇒ 拒
+        "老周停下刷子，抬眼看向门口。",     # 干净 ⇒ 插
     ])
     _text, info = _insert_beats(body, p, target_ratio=0.0)
     assert info["inserted"] == 1, info

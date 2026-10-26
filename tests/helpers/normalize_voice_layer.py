@@ -29,7 +29,7 @@ DEGENERATE = ('未出现可直接识别', '无法判断', '未出现直接对白
 def resolve_ambiguous_name(name, rule, corpus, ambiguous):
     """把歧义名解析到具体人：规则正文里出现的、以它为前缀的更长全名。
 
-    「轩辕」这一条规则自己写着「以姓名"轩辕大磐"自称」——所以能从**规则自身**解析。
+    「赵」这一条规则自己写着「以姓名"赵磐石"自称」——所以能从**规则自身**解析。
     解析出的全名必须在真实语料里出现过，才算数；解析不出来就保持歧义（不得猜）。
 
     Returns: (resolved_name, problem) —— problem 为 None 表示已解析或本无歧义。
@@ -67,7 +67,7 @@ def main():
     ambiguous = {a.get('name') for a in l2_audit if a.get('status') == 'rejected'
                  and a.get('reason') == 'ambiguous_reference'}
 
-    # 语料里出现过的候选全名（用于把「轩辕」这类前缀解析到具体人）。
+    # 语料里出现过的候选全名（用于把「赵」这类前缀解析到具体人）。
     candidates = json.loads((ART / 'v4-probe-candidates.json').read_text(encoding='utf-8'))
     known_names = set(canonical)
     for item in candidates if isinstance(candidates, list) else []:

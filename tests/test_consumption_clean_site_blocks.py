@@ -32,8 +32,8 @@ def clean(text: str) -> str:
 
 def test_bare_info_token_is_removed_without_touching_the_sentence():
     """站点把域名尾巴插在句中：只删 token，句子其余部分逐字不动。"""
-    text = "手中把玩着轩辕青锋上交王府的名刺。.info轩辕青锋站在凉亭外。"
-    assert clean(text) == "手中把玩着轩辕青锋上交王府的名刺。轩辕青锋站在凉亭外。"
+    text = "手中把玩着赵青锋上交王府的名刺。.info赵青锋站在凉亭外。"
+    assert clean(text) == "手中把玩着赵青锋上交王府的名刺。赵青锋站在凉亭外。"
 
 
 def test_wap_prefixed_info_token_is_removed():
@@ -92,7 +92,7 @@ def test_zongheng_in_prose_is_never_removed():
 
 def test_site_phrase_in_the_middle_of_a_line_is_kept():
     """只有**行首**的站点短语才算整行广告；行中间的不能连着正文一起删。"""
-    text = "他把书名改成了《雪中悍刀行》，更新快，很得意。"
+    text = "他把书名改成了《北荒刀歌》，更新快，很得意。"
     assert clean(text) == text
 
 

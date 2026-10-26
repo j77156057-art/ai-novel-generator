@@ -37,24 +37,24 @@ def _profile_with_rule(rule: str) -> dict:
 def test_no_example_without_redactor():
     """没有专名表 ⇒ **不给例句**（证据是参考书原句，不脱敏会带进专名）。"""
     profile = _profile_with_rule(
-        "用微表情表现迟疑（证据：徐凤年的手指在袖口里动了一下，又停住。）"
+        "用微表情表现迟疑（证据：陆长风的手指在袖口里动了一下，又停住。）"
     )
     out = describe_narrative(profile, dims=("人物描写手法",))
     assert "例：" not in out, out
-    assert "徐凤年" not in out, out
+    assert "陆长风" not in out, out
 
 
 def test_example_rendered_and_redacted():
     """有专名表 ⇒ 例句脱敏后附在要求后面。"""
     from app.style.entities import Redactor
 
-    red = Redactor({"characters": ["徐凤年"]})
+    red = Redactor({"characters": ["陆长风"]})
     profile = _profile_with_rule(
-        "用微表情表现迟疑（证据：徐凤年的手指在袖口里动了一下，又停住。）"
+        "用微表情表现迟疑（证据：陆长风的手指在袖口里动了一下，又停住。）"
     )
     out = describe_narrative(profile, dims=("人物描写手法",), redactor=red)
     assert "例：" in out, out
-    assert "徐凤年" not in out, out
+    assert "陆长风" not in out, out
     assert "袖口里动了一下" in out, out
 
 
@@ -62,14 +62,14 @@ def test_example_keeps_placeholder_length():
     """占位符**等长** —— 换名字会改变句长，模型从例句里学到的句长就错了。"""
     from app.style.entities import Redactor
 
-    red = Redactor({"characters": ["徐凤年"]})
+    red = Redactor({"characters": ["陆长风"]})
     profile = _profile_with_rule(
-        "用微表情表现迟疑（证据：徐凤年的手指在袖口里动了一下，又停住。）"
+        "用微表情表现迟疑（证据：陆长风的手指在袖口里动了一下，又停住。）"
     )
     out = describe_narrative(profile, dims=("人物描写手法",), redactor=red)
     ex = out.split("例：", 1)[1].split("）", 1)[0]
-    assert "徐凤年" not in ex
-    assert len(ex) == len("徐凤年的手指在袖口里动了一下，又停住"), (ex, len(ex))
+    assert "陆长风" not in ex
+    assert len(ex) == len("陆长风的手指在袖口里动了一下，又停住"), (ex, len(ex))
 
 
 def test_example_dropped_when_contains_pmi_candidate():
@@ -100,6 +100,6 @@ def test_example_kept_when_guard_does_not_match():
         "用微表情表现迟疑（证据：那只手在袖口里动了一下，又停住。）"
     )
     out = describe_narrative(
-        profile, dims=("人物描写手法",), redactor=red, example_guard=["耶律慕容", "北凉"],
+        profile, dims=("人物描写手法",), redactor=red, example_guard=["耶律慕容", "北荒"],
     )
     assert "例：" in out, out

@@ -42,7 +42,7 @@ def db():
     session.add(novel)
     session.flush()
     for i, t in enumerate([
-        "老黄低头擦着马镫。“今天风大。”",
+        "老周低头擦着马镫。“今天风大。”",
         "“那你说怎么办。”",
         "他抬头看了看天色。“再等等。”",
     ]):
@@ -59,7 +59,7 @@ class _Project:
 class _FakeProvider:
     """回一句合格的 beat（动作叙述，无引号、10~30 字、不报数）。"""
 
-    def __init__(self, out="老黄停下手中的动作，抬头看了看来人。"):
+    def __init__(self, out="老周停下手中的动作，抬头看了看来人。"):
         self.out = out
         self.calls = 0
 
@@ -71,9 +71,9 @@ class _FakeProvider:
 # ── 1. 拼起参考书切块 ────────────────────────────────────────────────────
 def test_reference_corpus_text_joins_chunks(db):
     txt = _reference_corpus_text(db, _Project(), [1])
-    assert "老黄低头擦着马镫" in txt
+    assert "老周低头擦着马镫" in txt
     assert "他抬头看了看天色" in txt
-    assert txt.index("老黄") < txt.index("他抬头")
+    assert txt.index("老周") < txt.index("他抬头")
 
 
 # ── 2. 没有参考书 → 空串 ─────────────────────────────────────────────────
@@ -82,7 +82,7 @@ def test_reference_corpus_text_empty_without_ids(db):
         reference_novel_ids = []
 
     # 显式给了 id → 就该取到（项目有没有参考书不影响）
-    assert "老黄低头擦着马镫" in _reference_corpus_text(db, _NoRef(), [1])
+    assert "老周低头擦着马镫" in _reference_corpus_text(db, _NoRef(), [1])
     # 项目也没有参考书、也没显式给 id → 空串（调用方退化成「上下文白名单」）
     assert _reference_corpus_text(db, _NoRef(), None) == ""
     assert _reference_corpus_text(db, _NoRef(), []) == ""
@@ -91,7 +91,7 @@ def test_reference_corpus_text_empty_without_ids(db):
 def test_reference_corpus_text_falls_back_to_project_ids(db):
     """`novel_ids` 传空 → 回落到**项目自己的**参考书（与 `_reference_plain_dialogue_ratio` 同口径）。"""
     txt = _reference_corpus_text(db, _Project(), [])
-    assert "老黄低头擦着马镫" in txt
+    assert "老周低头擦着马镫" in txt
 
 
 # ── 3. 超长截断 ──────────────────────────────────────────────────────────

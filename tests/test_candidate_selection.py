@@ -235,7 +235,7 @@ def test_same_ruler_as_mechanical_correction():
     with eng.connect() as conn:
         rows = conn.execute(sa_text(
             "SELECT c.text FROM novel_chunks c JOIN raw_novels n ON n.id = c.novel_id "
-            "WHERE n.title = '雪中悍刀行' ORDER BY c.idx LIMIT 400"
+            "WHERE n.title = '《北荒刀歌》' ORDER BY c.idx LIMIT 400"
         )).fetchall()
     joined = "\n\n".join(r[0] or "" for r in rows)
     assert joined

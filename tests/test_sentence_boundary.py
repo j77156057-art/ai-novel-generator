@@ -33,7 +33,7 @@ def test_closing_quote_stays_with_its_sentence():
 def test_no_orphan_closer_sentences():
     """对白密集的段落里，不该出现只剩一个闭合引号的「句」。"""
     text = (
-        "曹长卿平静道：“前辈何止第八？世人只知李剑神两袖青蛇不可匹敌。”\n"
+        "裴长卿平静道：“前辈何止第八？世人只知李剑神两袖青蛇不可匹敌。”\n"
         "“有。”\n"
         "“嗯？”\n"
         "“冷。”\n"
@@ -48,7 +48,7 @@ def test_measurement_and_chunking_share_the_same_sentence_boundary():
 
     两边口径不一致时，档案（按块文本拟合）与运行时（按生成段测量）就不是同一把尺。
     """
-    text = "曹长卿平静道：“前辈何止第八？世人只知李剑神两袖青蛇不可匹敌。”然后他走了。"
+    text = "裴长卿平静道：“前辈何止第八？世人只知李剑神两袖青蛇不可匹敌。”然后他走了。"
     assert sentences(text) == chunk_split(text)
 
 
@@ -73,7 +73,7 @@ def test_profile_baseline_matches_runtime_measurement():
 
     # 对白密集的语料（闭合引号问题最容易暴露的那种）
     body = (
-        "曹长卿平静道：“前辈何止第八？世人只知李剑神两袖青蛇不可匹敌。”\n"
+        "裴长卿平静道：“前辈何止第八？世人只知李剑神两袖青蛇不可匹敌。”\n"
         "“有。”\n"
         "“嗯？”\n"
         "“冷。”\n"

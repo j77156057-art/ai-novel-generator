@@ -194,12 +194,12 @@ class Settings(BaseSettings):
     # beat 插入：在连续对白段的开头补一句动作/神态叙述（app/style/beat.py）。
     # **默认关闭，而且默认关着是对的**（2026-10-25 真跑量完才看清）：
     # 1. 15 本真书的「光台词段」占比是 **中位 72%**（min 7% / max 88%），
-    #    雪中悍刀行（7%）是**特例**；我们生成的是 61% —— **已在真书区间下沿**，
+    #    《北荒刀歌》（7%）是**特例**；我们生成的是 61% —— **已在真书区间下沿**，
     #    不是「差了一倍」。
     # 2. 真跑曲线：插 6/12/24/48 处 ⇒ 动作密度升到真书的 5 倍（= 网球法），
     #    而 A 类只降到 35%；采纳率还随量下降（模型在敷衍）。
     # ⇒ **对多数书这条路是错的**。留在这里是因为：① 目标比例取自**参考书自己**
-    #    （`_reference_plain_dialogue_ratio`），对雪中/魔道祖师那种动作密集的书
+    #    （`_reference_plain_dialogue_ratio`），对北荒刀歌/《道途魔典》那种动作密集的书
     #    仍然有意义；② 它同时是「局部插入」这条路的**实现与判据**范例
     #    （整段形态改写已实测 0/20 不可靠，局部插入采纳率 5/6）。
     style_beat_insert: bool = False
@@ -262,7 +262,7 @@ class Settings(BaseSettings):
     #:
     #: 2026-10-19 从 2048 提到 8192。2048 会让叙事规则 JSON 被拦腰截断
     #: （智谱 finish_reason=length），截断的 JSON 解析失败 → 该块所有维度归零，
-    #: 表现为 rejected 计数暴涨（雪中悍刀行 990 章实测 rejected=740）。
+    #: 表现为 rejected 计数暴涨（《北荒刀歌》 990 章实测 rejected=740）。
     #: 蒸馏要一次输出 11 个维度的规则数组，8192 才够。
     distiller_max_tokens: int = int(_DISTILLER_DEFAULTS.get("max_tokens", 8192))
     distiller_timeout: int = int(_DISTILLER_DEFAULTS.get("timeout", 180))

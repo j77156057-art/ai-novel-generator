@@ -1059,7 +1059,7 @@ def rule_style_plain_dialogue_ratio(
     ref_zero = _zero_window_ratio(ref_sorted)
     # 阈值：低于参考书自己的一半 ⇒ 明显偏离。
     # 用**比例**而不是分位点：p99 这类分位点在「分布顶端有质量」时退化
-    # （实测雪中 p99 = 100% ⇒ 「窗口 > p99」永远不成立 ⇒ 一条都不报）。
+    # （实测北荒刀歌 p99 = 100% ⇒ 「窗口 > p99」永远不成立 ⇒ 一条都不报）。
     zero_threshold = ref_zero * 0.5
 
     from app.style.stylometry import _strip_speech_tag, paragraphs
@@ -1083,7 +1083,7 @@ def rule_style_plain_dialogue_ratio(
         if len(wins) >= 3:
             # 门槛 2（窗口够）：段内「有叙述垫着」的地方（0% 窗口）
             # 明显少于参考书自己 —— 看的是**分布形状**，不是分位点
-            # （p99 在「分布顶端有质量」时退化：实测雪中 p99=100% ⇒ 一条都报不出来）。
+            # （p99 在「分布顶端有质量」时退化：实测北荒刀歌 p99=100% ⇒ 一条都报不出来）。
             zero_ratio = _zero_window_ratio(wins)
             if zero_ratio >= zero_threshold:
                 continue

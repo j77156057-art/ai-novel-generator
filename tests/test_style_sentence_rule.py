@@ -68,7 +68,7 @@ def _text(sent_len: int, dialogue: bool = False) -> str:
     句子里**不能自带句号**（那会把一句话切成两句，平均句长就变了两句的）。
     对白版要给闭合引号 —— 引号不成对时对白占比算出来是 0。
     """
-    unit = "北凉王府的灯在风里晃了晃像是谁在檐下轻轻咳了一声管家便把灯芯挑亮了些"
+    unit = "北荒王府的灯在风里晃了晃像是谁在檐下轻轻咳了一声管家便把灯芯挑亮了些"
     body = (unit * 3)[:sent_len - 1]
     per_para = max(1, 500 // sent_len)
     lines = []
@@ -240,7 +240,7 @@ def test_the_issue_can_back_a_rewrite_proposal():
                      if i.rule == "style_sentence_length_deviation")
 
         # 「改正文某段」是整段替换 → 草稿必须是完整新正文（长度相当）。
-        draft = text.replace("北凉王府的灯", "北凉王府那盏灯")
+        draft = text.replace("北荒王府的灯", "北荒王府那盏灯")
         card = _impl_propose_text_edit(
             db=db, project_id=proj.id, type="text_edit", target_kind="generation_text",
             target_id=str(seg_id), draft=draft, from_issue=issue.id,

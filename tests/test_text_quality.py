@@ -56,7 +56,7 @@ def test_a_latin_word_glued_to_chinese_is_reported_but_does_not_block():
     """
     from app.agents.text_quality import run_text_quality_audit
     db, p = fixture()
-    _seed(db, p, '“Already惹了。”徐凤年捂着后脑退回老黄身边。')
+    _seed(db, p, '“Already惹了。”陆长风捂着后脑退回老周身边。')
     report, stats = run_text_quality_audit(db, p)
     warns = [i for i in report.issues if i.severity == 'warn']
     assert len(warns) == 1, report.issues
@@ -70,7 +70,7 @@ def test_a_quoted_english_phrase_is_not_reported():
     """引文里**分开**的外文是合法的（“Hello” 他说）—— 不该报。"""
     from app.agents.text_quality import run_text_quality_audit
     db, p = fixture()
-    _seed(db, p, '“Hello，”徐凤年说，“你听我解释。”')
+    _seed(db, p, '“Hello，”陆长风说，“你听我解释。”')
     report, stats = run_text_quality_audit(db, p)
     assert stats['foreign_latin_hits'] == 0, report.issues
 
@@ -97,7 +97,7 @@ def test_a_model_code_is_not_reported():
 def test_the_agent_can_run_the_text_quality_audit():
     from app.agents.registry import get_tool_registry
     db, p = fixture()
-    _seed(db, p, '“Already惹了。”徐凤年捂着后脑退回老黄身边。')
+    _seed(db, p, '“Already惹了。”陆长风捂着后脑退回老周身边。')
     out = get_tool_registry().invoke('audit_text_quality', db, p.id)
     assert out['found'] is True, out
     assert out['errors'] == 0
@@ -149,7 +149,7 @@ def test_the_agent_refuses_to_fix_a_segment_without_punctuation_problems():
     """没有可自动修正的问题 → 拒（外来英文词机器不替人改）。"""
     from app.agents.registry import get_tool_registry
     db, p = fixture()
-    _seed(db, p, '“Already惹了。”徐凤年捂着后脑退回老黄身边。')
+    _seed(db, p, '“Already惹了。”陆长风捂着后脑退回老周身边。')
     gen_id = db.query(Generation).filter_by(project_id=p.id).one().id
     out = get_tool_registry().invoke('propose_text_fix', db, p.id,
                                      generation_id=gen_id)

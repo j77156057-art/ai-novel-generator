@@ -185,7 +185,7 @@ def main() -> int:
         ("「问」在非台词位置不算说话", "陆见微的问题没人回答。", E_SPEAK),
         ("单独的「道」在「知道」里不算说话", "陆见微知道真相。", E_SPEAK),
         # 状语槽放开到「带 的/地 标记的 1~4 字」之后，必须挡住**归属错人**：
-        # `萧炎的死对头说道` 说话的是死对头，不是萧炎。记错人比漏报更糟。
+        # `石昀的死对头说道` 说话的是死对头，不是石昀。记错人比漏报更糟。
         ("「X的死对头说道」不得记成 X 在说话", "陆见微的死对头说道：「你来了。」", E_SPEAK),
         ("「X和Y的师父说道」不得记成 X 或 Y 在说话", "陆见微和沈砚的师父说道：「别闹。」", E_SPEAK),
         ("「突破重围」不是境界推进", "陆见微突破重围。", E_REALM_UP),
@@ -280,7 +280,7 @@ def main() -> int:
           not any(x.rule == "item_owner_conflict" for x in f), str([x.rule for x in f]))
 
     # D6 未登记物品的持握不得报冲突 —— 这是 116 万字真实网文抓到的那条误报的回归测试。
-    # `茶杯` 在《大奉打更人》里出现 12 次、6 个不同的人端着，各是各的杯子。
+    # `茶杯` 在《长夜司》里出现 12 次、6 个不同的人端着，各是各的杯子。
     st = {}
     apply_event(st, events("陆见微握住茶杯。")[0])
     f = check_segment(st, events("沈砚举起茶杯。", 4))
@@ -437,21 +437,21 @@ def main() -> int:
     # --------------------------------------------------------------------- #
     LADDER = ("斗之气", "斗者", "斗师", "大斗师", "斗灵", "斗王", "斗皇", "斗宗",
               "斗尊", "斗圣", "斗帝")
-    got = extract_events("萧炎突破到斗皇。", segment_no=1, names=["萧炎"], realm_order=LADDER)
+    got = extract_events("石昀突破到斗皇。", segment_no=1, names=["石昀"], realm_order=LADDER)
     check("F3 传了自定义阶梯 → 该阶梯的词抽得出来（`斗皇`）",
           [(e.kind, e.value, e.order) for e in got] == [(E_REALM_UP, "斗皇", 7)],
           str([(e.kind, e.value, e.order) for e in got]))
-    got = extract_events("萧炎突破到金丹。", segment_no=1, names=["萧炎"], realm_order=LADDER)
+    got = extract_events("石昀突破到金丹。", segment_no=1, names=["石昀"], realm_order=LADDER)
     check("F3 传了自定义阶梯 → 表外的词不该凭空抽出来（`金丹` 不在该表里）",
           got == [], f"实得 {[(e.kind, e.value) for e in got]}（抽取结果不能取决于调用方没传的表）")
-    got = extract_events("萧炎突破到斗皇。", segment_no=1, names=["萧炎"],
+    got = extract_events("石昀突破到斗皇。", segment_no=1, names=["石昀"],
                          realm_order=(LADDER, ("一星", "二星", "三星")))
     check("F3 二维阶梯也能用（一维/二维都吃）",
           [(e.kind, e.value, e.scale) for e in got] == [(E_REALM_UP, "斗皇", "ladder:0")],
           str([(e.kind, e.value, e.scale) for e in got]))
 
     # --------------------------------------------------------------------- #
-    # F4 复合档位 `N段<阶梯>` —— 这是《斗破苍穹》真正的核心句式。
+    # F4 复合档位 `N段<阶梯>` —— 这是《焚天录》真正的核心句式。
     #
     # 真实语料实测（38.8 万字）里的写法是：`突破十段斗之气`、`晋升第四段斗之气`、
     # `达到七段斗之气`、`进入第四段斗之气`。生产模式此前既没有 `第` 前缀、
@@ -460,18 +460,18 @@ def main() -> int:
     # 但 `段` 不能当普通序号单位加进去：`突破了一段时间` 会被切成 `一段`，
     # 判成「突破」—— 所以只在**后面紧跟阶梯词**时才认（下面 F4b 就是这个守卫）。
     # --------------------------------------------------------------------- #
-    got = extract_events("萧炎突破到第七段斗之气。", segment_no=1, names=["萧炎"],
+    got = extract_events("石昀突破到第七段斗之气。", segment_no=1, names=["石昀"],
                          realm_order=LADDER)
     check("F4a 复合档位 `第七段斗之气` → 抽得到，rank=7，量纲带子阶梯",
           [(e.kind, e.value, e.order, e.scale) for e in got]
           == [(E_REALM_UP, "第七段", 7, "ord:段@斗之气")],
           str([(e.kind, e.value, e.order, e.scale) for e in got]))
-    got = extract_events("萧炎达到十段斗之气。", segment_no=1, names=["萧炎"],
+    got = extract_events("石昀达到十段斗之气。", segment_no=1, names=["石昀"],
                          realm_order=LADDER)
     check("F4a 无「第」的写法也算：`十段斗之气` → rank=10",
           [(e.value, e.order) for e in got] == [("十段", 10)],
           str([(e.value, e.order) for e in got]))
-    got = extract_events("萧炎突破了一段时间。", segment_no=1, names=["萧炎"],
+    got = extract_events("石昀突破了一段时间。", segment_no=1, names=["石昀"],
                          realm_order=LADDER)
     check("F4b `突破了一段时间` **不得**被当成境界推进（`段` 的后视守卫）",
           got == [], f"实得 {[(e.kind, e.value) for e in got]}")
@@ -479,7 +479,7 @@ def main() -> int:
     # F4e 子阶梯隔离：`第五段炼体术` 与 `第三段斗之气` 不是一个刻度，不可比。
     # 这里必须把两套子阶梯都放进表里，否则「不判」会被后视守卫挡掉而不是被量纲挡掉，
     # 那样这条断言就测不到它想测的东西。
-    got_a = audit(["萧炎进入第五段炼体术。", "萧炎进入第三段斗之气。"],
+    got_a = audit(["石昀进入第五段炼体术。", "石昀进入第三段斗之气。"],
                   realm_order=("炼体术",) + LADDER)
     check("F4e 不同子阶梯不可比：`炼体术` 与 `斗之气` 的段位互不判定",
           got_a == [], f"实得 {got_a}")
@@ -700,7 +700,7 @@ def main() -> int:
         #
         # 实测结论：真实人类网文里，境界描写的主语基本都不在构造里
         # （`十一岁突破十段斗之气`、`半个月晋升第四段斗之气`、`今天一定能突破到第七段斗之气`）。
-        # 硬要认就得允许跨句找远主语，而 `萧炎和萧战交谈，然后突破到斗皇` 会把功劳记到
+        # 硬要认就得允许跨句找远主语，而 `石昀和萧战交谈，然后突破到斗皇` 会把功劳记到
         # 萧战头上 —— **记错人比漏报更糟**，所以按模块一贯的「少报优于误报」沉默以对。
         #
         # 分母是量具（去掉主语锚点的同一构造），分子是真实抽取结果。
@@ -747,7 +747,7 @@ def main() -> int:
                 if verb in sample[1]:
                     frag = sample[1][sample[1].index(verb):]
                     break
-            got_h4 = extract_events("萧炎" + frag, segment_no=1, names=["萧炎"],
+            got_h4 = extract_events("石昀" + frag, segment_no=1, names=["石昀"],
                                     realm_order=LADDERS.get(3, REALM_SYSTEMS))
             check("H4a 真实语料的境界构造，补上主语后必须抽得出来（模式认得真实句式）",
                   bool(got_h4), f"实得 {[(e.kind, e.value) for e in got_h4]}；片段 {frag}",

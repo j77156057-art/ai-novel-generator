@@ -17,7 +17,7 @@ from app.style.form_merge import (  # noqa: E402
 )
 
 BARE = "“都退后。”"
-NARR = "徐骁站在门口，手按在刀柄上，听见这句，眉头慢慢拧起，北凉王府里没几个人能让她这样说话。"
+NARR = "陆崇站在门口，手按在刀柄上，听见这句，眉头慢慢拧起，北荒王府里没几个人能让她这样说话。"
 
 
 def _strip_ws(t: str) -> str:

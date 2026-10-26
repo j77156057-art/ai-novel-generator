@@ -5,7 +5,7 @@
 真书实测（990 章）里，盗版站把 SEO 词**插进句子中间**、把广告**整行**塞进章节：
 
     立即隐相最新章节去别院拿来三根黄瓜
-    姜泥这才狠狠说道最低调的巨星最新章节：“你说的那笔买卖还作数？”
+    小宁这才狠狠说道最低调的巨星最新章节：“你说的那笔买卖还作数？”
     请记住本书首发域名：.。三掌门手机版阅读网址：m.
 
 `ingestion/clean.py` 能删掉 87% 的站点垃圾（那些有边界、可整块删的），
@@ -30,8 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 from app.ingestion.clean import is_site_marker_line, strip_site_marker_lines  # noqa: E402
 from app.style.exemplar import _split_into_samples  # noqa: E402
 
-NOVEL_LINE = "徐凤年握住刀柄，往前半步：“爹，让我进去。”"
-SEO_INJECTED = "徐凤年估摸一下时分，那白发老魁怎么也应该蹲完茅厕，立即隐相最新章节去别院拿来三根黄瓜"
+NOVEL_LINE = "陆长风握住刀柄，往前半步：“爹，让我进去。”"
+SEO_INJECTED = "陆长风估摸一下时分，那白发老魁怎么也应该蹲完茅厕，立即隐相最新章节去别院拿来三根黄瓜"
 SITE_AD_LINE = "请记住本书首发域名：.。三掌门手机版阅读网址：m。"
 AUTHOR_NOTE = "（更多的更新，已经在微信公众号上传了，大家可以去关注阅读，微信号：fenghuo1985）"
 
@@ -46,10 +46,10 @@ def test_site_marker_line_detection():
 def test_normal_prose_words_are_not_markers():
     """正文常有的词不能触发删除 —— 精度比覆盖重要。"""
     for line in (
-        "徐凤年打赏了一个滚字。",
-        "老黄说这两千两银子够姑娘们打赏一阵了。",
+        "陆长风打赏了一个滚字。",
+        "老周说这两千两银子够姑娘们打赏一阵了。",
         "掌柜笑说这批货今日最新，卖得比昨日还快。",
-        "读者收藏了这本《雪中悍刀行》。",
+        "读者收藏了这本《北荒刀歌》。",
         "免费是指不收钱，与官府无关。",
     ):
         assert not is_site_marker_line(line), line

@@ -66,26 +66,26 @@ def test_legacy_profile_preserved_but_labelled_unverified():
 
 
 def test_action_claim_requires_subject_to_be_the_actor():
-    text = '一大一小经常死皮赖脸缠着姜泥御剑飞行。'
-    raw = {'claims': [{'subject': '姜泥', 'predicate': '御剑飞行',
-                      'field': '行为倾向', 'value': '一大一小经常死皮赖脸缠着姜泥御剑飞行',
+    text = '一大一小经常死皮赖脸缠着小宁御剑飞行。'
+    raw = {'claims': [{'subject': '小宁', 'predicate': '御剑飞行',
+                      'field': '行为倾向', 'value': '一大一小经常死皮赖脸缠着小宁御剑飞行',
                       'quote': text, 'chapter': 962, 'status': 'observed', 'kind': 'action'}]}
-    profile = normalize_character_profile(raw, '姜泥', sources=[(962, text)])
+    profile = normalize_character_profile(raw, '小宁', sources=[(962, text)])
     assert not profile['行为倾向']
     assert profile['evidence'][0]['verification'] == 'subject_not_actor'
 
 
 def test_speech_style_claim_cannot_use_eye_action_as_speech():
-    text = '轩辕青锋冷冷看了一眼，嘴角挂起讥讽笑意。'
-    raw = {'claims': [{'subject': '轩辕青锋', 'predicate': '冷冷',
+    text = '赵青锋冷冷看了一眼，嘴角挂起讥讽笑意。'
+    raw = {'claims': [{'subject': '赵青锋', 'predicate': '冷冷',
                       'field': '说话方式', 'value': '冷冷', 'quote': text,
                       'chapter': 172, 'status': 'observed', 'kind': 'speech'}]}
-    profile = normalize_character_profile(raw, '轩辕青锋', sources=[(172, text)])
+    profile = normalize_character_profile(raw, '赵青锋', sources=[(172, text)])
     assert not profile['说话方式']
     assert profile['evidence'][0]['verification'] == 'non_speech_context'
 
 
 def test_prompt_requires_minimal_claim_provenance_and_statuses():
-    system, _ = build_character_profile_prompt('姜泥', ['姜泥说道：“走。”'])
+    system, _ = build_character_profile_prompt('小宁', ['小宁说道：“走。”'])
     assert 'subject,predicate,field,quote,source' in system
     assert 'observed/inferred/unknown' in system

@@ -22,13 +22,13 @@ RULES = {
         {'rule': '静→动→静；先立规矩再破规矩→代价显现→默认回到规矩但已不同（证据：另一句）'},
     ],
     '高频场景模板': [
-        {'rule': '贵客抵达→开中门并铺陈仪仗→以小利诱引对方（证据：徐凤年进了府）'},
+        {'rule': '贵客抵达→开中门并铺陈仪仗→以小利诱引对方（证据：陆长风进了府）'},
     ],
     '伏笔与悬念设计': [
         {'rule': '把答案放在场景的边缘物件上，读者看见但主角没注意（证据：一句）'},
     ],
     '语序编排': [{'rule': '先环境后人物（证据：另一句）'}],
-    '角色声音词典': [{'rule': '徐凤年：自称「本世子」（证据：一句）'}],
+    '角色声音词典': [{'rule': '陆长风：自称「本世子」（证据：一句）'}],
 }
 
 
@@ -75,7 +75,7 @@ def test_fails_closed_without_a_usable_entity_table(tmp_path, monkeypatch):
 def test_redacts_reference_names_when_a_table_exists(tmp_path, monkeypatch):
     monkeypatch.setenv('ENTITY_CACHE_DIR', str(tmp_path / 'entities'))
     from app.style.entity_store import save_table
-    save_table(1, {'characters': ['徐凤年'], 'places': ['横水城'], 'factions': [],
+    save_table(1, {'characters': ['陆长风'], 'places': ['横水城'], 'factions': [],
                    'items': [], 'version': 2})
     from app.generation.plot_structure import for_project
     db = Session(create_engine('sqlite://', poolclass=StaticPool))
@@ -84,14 +84,14 @@ def test_redacts_reference_names_when_a_table_exists(tmp_path, monkeypatch):
     picked, note = for_project(db, p, '雨夜有人来敲门，主人不肯开门')
     assert picked, note
     blob = json.dumps(picked, ensure_ascii=False)
-    assert '徐凤年' not in blob, '参考书专名不能进规划提示'
+    assert '陆长风' not in blob, '参考书专名不能进规划提示'
     assert '角色声音词典' not in blob
 
 
 def test_outline_prompt_carries_the_structure_section(tmp_path, monkeypatch):
     monkeypatch.setenv('ENTITY_CACHE_DIR', str(tmp_path / 'entities'))
     from app.style.entity_store import save_table
-    save_table(1, {'characters': ['徐凤年'], 'places': [], 'factions': [], 'items': [],
+    save_table(1, {'characters': ['陆长风'], 'places': [], 'factions': [], 'items': [],
                    'version': 2})
     engine = create_engine('sqlite://', connect_args={'check_same_thread': False},
                            poolclass=StaticPool)
@@ -127,4 +127,4 @@ def test_outline_prompt_carries_the_structure_section(tmp_path, monkeypatch):
         assert data['plot_structure_note'], data
         payload = json.loads(seen[0])
         assert payload['plot_structure'], '规划提示里必须带剧情结构参考'
-        assert '徐凤年' not in seen[0]
+        assert '陆长风' not in seen[0]

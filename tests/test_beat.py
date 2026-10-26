@@ -2,19 +2,19 @@
 
 ## 验的是什么
 
-1. **A/C 判定**：引号前只有「说话人+提示语」（「徐骁问道：」）不算有动作；
-   有真动作（「徐骁也不恼怒，乐呵呵道：」）才算。
+1. **A/C 判定**：引号前只有「说话人+提示语」（「陆崇问道：」）不算有动作；
+   有真动作（「陆崇也不恼怒，乐呵呵道：」）才算。
    —— 这是「同一把尺」的前提，否则两侧不可比。
 2. **选点**：
    - 只选 A 类段，C 类（有动作）不动；
-   - 目标是把 A 类占比降到参考书自己的比例（雪中 6%）；
+   - 目标是把 A 类占比降到参考书自己的比例（北荒刀歌 6%）；
    - 选点**分散**（第 1 位优先，但不会全挤在第 1 位）；
    - 已经达标 → 一个都不选。
 3. **插入**只改段落边界与那一段的内容，不动别的段。
 
 ## 数据
 
-用**真书原文**（雪中悍刀行）与**真实生成正文**当输入 ——
+用**真书原文**（《北荒刀歌》）与**真实生成正文**当输入 ——
 不是人造的最小例子。
 """
 import os
@@ -42,21 +42,21 @@ from app.style.beat import (  # noqa: E402
 
 # ── 1. A/C 判定 ──────────────────────────────────────────────────────────
 def test_speech_tag_only_is_not_action():
-    """「徐骁问道：」是提示语，**不是动作** —— 读者看不到任何反应。"""
-    p = "徐骁问道：“看得懂？”"
+    """「陆崇问道：」是提示语，**不是动作** —— 读者看不到任何反应。"""
+    p = "陆崇问道：“看得懂？”"
     assert action_narration_len(p) < 3
     assert is_plain_dialogue(p)
 
 
 def test_real_action_counts():
-    """「徐骁也不恼怒，乐呵呵道：」有动作 ⇒ 不是光台词。"""
-    p = "徐骁也不恼怒，乐呵呵道：“好好好，爹等着就是。”"
+    """「陆崇也不恼怒，乐呵呵道：」有动作 ⇒ 不是光台词。"""
+    p = "陆崇也不恼怒，乐呵呵道：“好好好，爹等着就是。”"
     assert action_narration_len(p) >= 3
     assert not is_plain_dialogue(p)
 
 
 def test_narration_before_quote_counts():
-    p = "徐凤年低头继续擦马镫，过了片刻才道：“那得看是按军马算。”"
+    p = "陆长风低头继续擦马镫，过了片刻才道：“那得看是按军马算。”"
     assert not is_plain_dialogue(p)
 
 
@@ -75,7 +75,7 @@ def _ps(*items):
 
 def test_finds_slots_only_on_plain_dialogue():
     ps = _ps(
-        "老黄蹲在马厩里擦马镫。",
+        "老周蹲在马厩里擦马镫。",
         "“世子想听实话？”",
         "“你跟着我这么多年。”",
         "“原来不在他身上。”",
@@ -90,7 +90,7 @@ def test_finds_slots_only_on_plain_dialogue():
 def test_skips_paragraphs_that_already_have_action():
     ps = _ps(
         "“这可造不了反。”",
-        "徐凤年轻笑道：“苦惯了，只要有半口饭吃，就没人乐意揭竿而起。”",
+        "陆长风轻笑道：“苦惯了，只要有半口饭吃，就没人乐意揭竿而起。”",
         "“老许，你再说些风土人情。”",
     )
     slots = find_slots(ps, target_ratio=0.0)
@@ -101,9 +101,9 @@ def test_skips_paragraphs_that_already_have_action():
 def test_no_slots_when_already_at_target():
     """A 类占比已达标 → 一个都不选。"""
     ps = _ps(
-        "老黄低头继续擦马镫，过了片刻才道：“那得看是按军马算。”",
+        "老周低头继续擦马镫，过了片刻才道：“那得看是按军马算。”",
         "“还有这种分别？”",
-        "徐凤年坐直了些：“还有这种分别？”",
+        "陆长风坐直了些：“还有这种分别？”",
     )
     assert find_slots(ps, target_ratio=0.5) == []
 
@@ -130,7 +130,7 @@ def test_slots_are_dispersed_not_all_first_rank():
 
 def test_slot_context_is_available_for_prompt():
     ps = _ps(
-        "老黄蹲在马厩里擦马镫。",
+        "老周蹲在马厩里擦马镫。",
         "“世子想听实话？”",
         "“你跟着我这么多年。”",
     )
@@ -156,10 +156,10 @@ def test_merge_beat_merges_into_the_paragraph():
     因为 A 类的定义是「整段只有引号」，插在它**前面**不改变它是不是 A 类。
     ⇒ beat 必须并到**引号前面**（变成「动作 + 台词」），整段才从 A 变 C。
     """
-    ps = ["老黄蹲在马厩里擦马镫。", "“世子想听实话？”"]
-    out = merge_beat(ps, 1, "老黄没有抬头。")
+    ps = ["老周蹲在马厩里擦马镫。", "“世子想听实话？”"]
+    out = merge_beat(ps, 1, "老周没有抬头。")
     assert len(out) == 2, "不能多出一段"
-    assert out[1] == "老黄没有抬头。“世子想听实话？”"
+    assert out[1] == "老周没有抬头。“世子想听实话？”"
     # 合并后那段不再是「光台词」
     assert has_action(out[1])
     assert not is_plain_dialogue(out[1])
@@ -183,16 +183,16 @@ def test_beat_length_range_matches_reference():
 
 
 def test_default_target_matches_reference():
-    """兜底目标 = **15 本真书的中位**（72%），不是雪中（7%）。
+    """兜底目标 = **15 本真书的中位**（72%），不是北荒刀歌（7%）。
 
-    雪中悍刀行是**特例**（动作叙述极密）；拿它当标准会让系统把多数书
+    《北荒刀歌》是**特例**（动作叙述极密）；拿它当标准会让系统把多数书
     硬掰成网球法（实测：动作密度升到真书 5 倍）。
     """
     assert DEFAULT_TARGET_A_RATIO == pytest.approx(0.72, abs=0.01)
 
 
 def test_default_target_is_not_the_outlier_book():
-    """兜底值**不能**是雪中那个特例。"""
+    """兜底值**不能**是北荒刀歌那个特例。"""
     assert DEFAULT_TARGET_A_RATIO > 0.5
 
 
@@ -217,7 +217,7 @@ def test_on_real_reference_book_slots_are_few():
     for t, txt in rows:
         by_novel.setdefault(t, []).append(txt or "")
     for t in by_novel:
-        if t.startswith("雪中"):
+        if t.startswith("北荒刀歌"):
             book = t
             break
     assert book

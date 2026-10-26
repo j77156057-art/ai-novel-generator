@@ -41,7 +41,7 @@ from app.style.stylometry import (  # noqa: E402
 # 2) 动作/神态 + 台词（参考书 77% 的形态）
 # 3) 叙述 + 台词
 BARE = "“都退后。”"
-WITH_ACTION = "徐龙象握住刀柄，往前半步：“爹，让我进去。”"
+WITH_ACTION = "陆龙象握住刀柄，往前半步：“爹，让我进去。”"
 NARRATIVE = "院子里静了下来，只有风声。老人抬起头，看着门口的年轻人：“你来了。”"
 
 

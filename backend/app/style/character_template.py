@@ -81,7 +81,7 @@ def build_character_template_prompt(chunk_text: str, chunk_label: str) -> tuple[
         "  先给动作再给评价，让读者自己得出结论\n"
         "  用旁人的反应侧写主角，主角自己不自述\n"
         "**错误的写法**（含具体内容，严禁）：\n"
-        "  老黄在江边咳了两声，掩饰自己的不舍\n\n"
+        "  老周在江边咳了两声，掩饰自己的不舍\n\n"
         "输出格式（JSON，0~3 条）：\n"
         '{\n'
         '  "人物塑造模板": [\n'

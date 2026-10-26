@@ -148,9 +148,9 @@
 规则在真书正文上跑出来的结果：
 
 ```text
-project 2「雪中续写验证」  stats: punctuation=0, foreign_latin=1（紧贴=1）, blocking=0
+project 2「北荒刀歌续写验证」  stats: punctuation=0, foreign_latin=1（紧贴=1）, blocking=0
   [warn] 1 处疑似外来英文
-    证据: 掌拍在他后脑勺上：“你这张嘴，迟早惹祸。”  “Already惹了。”  徐凤年捂着后脑退回老黄身边…
+    证据: 掌拍在他后脑勺上：“你这张嘴，迟早惹祸。”  “Already惹了。”  陆长风捂着后脑退回老周身边…
 
 project 7「旧北站夜班读数」 stats: 全 0（干净正文不误报）✓
 project 8「真书提案化验证」  stats: 全 0 ✓

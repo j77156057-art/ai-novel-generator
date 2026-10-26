@@ -37,7 +37,7 @@ def test_structural_reuse_without_copying_is_clean():
 def test_outline_response_reports_the_copy_check(tmp_path, monkeypatch):
     monkeypatch.setenv('ENTITY_CACHE_DIR', str(tmp_path / 'entities'))
     from app.style.entity_store import save_table
-    save_table(1, {'characters': ['徐凤年'], 'places': [], 'factions': [], 'items': [],
+    save_table(1, {'characters': ['陆长风'], 'places': [], 'factions': [], 'items': [],
                    'version': 2})
     engine = create_engine('sqlite://', connect_args={'check_same_thread': False},
                            poolclass=StaticPool)
