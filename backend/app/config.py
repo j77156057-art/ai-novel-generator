@@ -150,6 +150,27 @@ class Settings(BaseSettings):
     # 注意：写手默认（`minimax_model`）= M3.1-Flash 与**链首**不同是有意的 ——
     # 前者是 2026-10-25 按「对白形态」实测选出来的，后者是限流兜底的首选。
     minimax_models: str = "MiniMax-M3.1-Flash-Preview,MiniMax-M3,MiniMax-M3.1-Flash,MiniMax-Text-01"
+    # ------------------------------------------------------------------
+    # MiniMax 的**思考深度**（M3.1 系）。
+    #
+    # 官方：思考**关不掉**（thinking={"type":"disabled"} / effort="none" → 400
+    # "requires adaptive thinking"），但 effort 可调档：low / medium / high /
+    # xhigh / max，**省略 = max**（最慢最贵）。
+    #
+    # 2026-10-26 真跑（api.minimaxi.com，OpenAI 兼容端点，字段名 reasoning_effort）：
+    #   2400 字续写（max_tokens=8000）
+    #     effort 省略(=max)：66.7s  completion 8000 打满  finish=length  **正文为空**
+    #                       （预算全被思考吃掉 ⇒ 正文被拦腰截断）
+    #     effort=low        ：36.0s  completion 2605      finish=stop    正文完整 4079 字
+    #   300 字小任务
+    #     M3.1-Flash        ：默认 20.5s/3081 token → low 5.2s/262 token
+    #     M3.1-Flash-Preview：默认 20.9s/2160 token → low 13.8s/284 token
+    #   **M3（老）不吃 effort**：传 low 反而更慢（22.8s vs 19.9s）—— 它是"老式 adaptive"，
+    #   思考混在 content 里，只能靠 thinking=disabled + _strip_thinking 兜底。
+    #
+    # 为什么**写手**默认 low：正文续写要吞吐，且实测 low 档正文质量没掉（写得更完整）。
+    # 为什么**蒸馏/诊断**不传：那两个角色要"判断对错"，思考有实际价值 ⇒ 留默认 max。
+    minimax_reasoning_effort: str = "low"
     # 全局默认的文风改写开关（生成档位会写它）。
     # 项目级 projects.style_rewrite 非空时以项目为准——项目是显式选择，
     # 全局只是「新项目/未设置时的默认值」。三者优先级：

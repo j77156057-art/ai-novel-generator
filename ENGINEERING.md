@@ -398,7 +398,8 @@ A 类却只降到 35%；**采纳率还随量下降**（模型在敷衍）。
 **代价与坑（换之前必须知道）**：
 
 1. M3.1-Flash 是 **adaptive thinking** 模型（`provider.py` 的
-   `_ADAPTIVE_THINKING_MODELS`），思考**关不掉**，单段慢 4~5 倍；
+   `_ADAPTIVE_THINKING_MODELS`），思考**关不掉**（`thinking={"type":"disabled"}` /
+   `effort="none"` → 400），但**可以调低**（见下），单段慢 4~5 倍的问题由此缓解；
 2. 写手基线现在是 **max_tokens 8192 / timeout 120s**（`backend/config/providers.yaml`
    的 writer 块），**不够**：实测一次用掉 111.8s 就撞上 120s 超时线 ——
    要抬到 max_tokens 32768 / timeout 300s；
@@ -414,6 +415,35 @@ A 类却只降到 35%；**采纳率还随量下降**（模型在敷衍）。
 - **provider 里加了按模型的预算地板**（`MiniMaxChatProvider.MIN_ADAPTIVE_MAX_TOKENS/
   MIN_ADAPTIVE_TIMEOUT`）：存下来的旧值（8192 / 120s）**掐不死** adaptive 模型 ——
   这条对「429 自动切到 M3.1-Flash」的链路同样要紧（那条路今天就是带着 8192 跑的）。
+
+### 思考**关不掉**，但**能调低**（2026-10-26 实测，M3.1 专属）
+
+官方 effort 档位：`low / medium / high / xhigh / max`，**省略 = max**（最慢最贵）；
+思考本身关不掉（`disabled` / `none` → 400 "requires adaptive thinking"）。
+**M3.1 系支持 effort，M3（老）不支持**（老模型是"老式 adaptive"，思考混在 content 里）。
+
+真跑（api.minimaxi.com，OpenAI 兼容端点，字段名 `reasoning_effort`）：
+
+| 任务 | effort | 用时 | completion | 结果 |
+|---|---|---|---|---|
+| 2400 字续写（max_tokens=8000） | 省略(=max) | 66.7s | **8000 打满** | `finish=length`，**正文为空**（预算全被思考吃掉） |
+| 2400 字续写（同上） | **low** | **36.0s** | 2605 | `finish=stop`，正文完整 4079 字 / 185 段 |
+| 300 字小任务 | 省略 / low | 20.5s→**5.2s** | 3081→**262** | M3.1-Flash |
+| 300 字小任务 | 省略 / low | 20.9s→13.8s | 2160→284 | M3.1-Flash-Preview |
+| 300 字小任务 | 省略 / low | 19.9s→**22.8s** | 2220→3315 | M3（老）—— **effort 无效，还更慢** |
+
+⇒ 一句话：**「思考关不掉」这个结论只对 M3（老）成立；M3.1 用 effort=low
+能快 1.5~4 倍、思考 token 省 90%、正文从"写不出来"变成"完整写出"。**
+
+已落地：
+
+- `config.minimax_reasoning_effort`（默认 `low`）——**写手**用它；
+  蒸馏/助理角色**不传**（那两个角色要判断力，思考有实际价值）；
+- 预算地板按「有没有真的调低」分两档（`MIN_ADAPTIVE_MAX_TOKENS_EFFORT=8192` /
+  `MIN_ADAPTIVE_TIMEOUT_EFFORT=180` vs 不调低时的 32768 / 300）——
+  没调低时思考照样吃预算，地板必须按最坏情况给，否则正文会被**静默截断**；
+- 非法档位（如 `minimal`）**不发**（发了服务端会忽略，白白让人以为调了档）。
+
 
 ### 「对白形态」是**书级**特征：跨 15 本真书的实测
 

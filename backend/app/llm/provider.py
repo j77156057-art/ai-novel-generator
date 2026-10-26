@@ -565,6 +565,10 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
       （"requires adaptive thinking; thinking.type='disabled' is not allowed"）。
     - M3 / M2.7 / M2.5：把 <think> 思维链混进 content，且传 disabled 也压不住，
       只能由 engine._strip_thinking 兜底剥离 → 不作默认，也不入切换链。
+
+    2026-10-26 补充：M3.1 系的思考**关不掉但可以调低** ——
+    官方 effort 档位（low/medium/high/xhigh/max，省略 = max）。
+    真跑见下面 `__init__` 的注释。**M3（老）不吃 effort**，行为不变。
     """
 
     label = "MiniMax"
@@ -591,36 +595,69 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
         "MiniMax-M3.1-Flash",
     )
 
-    #: adaptive thinking 模型的**预算地板**（max_tokens / 超时秒）。
+    #: adaptive thinking 模型的**预算地板**（max_tokens / 超时秒）——分两种：
     #:
-    #: 为什么要有：这类模型思考关不掉，思考 token **算进 completion 预算**，
-    #: 所以「写 2400 字正文」实测要 **110~140 秒、32K token 起步**。
-    #: 2026-10-25 真跑（把写手换成 M3.1-Flash）：一次生成用掉 **111.8 秒**就撞上
-    #: 120 秒的默认超时线；max_tokens 8192 也不够 —— 思考先把预算吃掉了，
-    #: 正文被拦腰截断（finish_reason='length'，而引擎当时**不检查**它）。
-    #:
-    #: 所以按模型抬地板：写手配置里**存下来的旧值**（8192 / 120s）不能把
-    #: adaptive 模型掐死。这条对「429 自动切到 M3.1-Flash」的链路同样要紧 ——
-    #: 那条路今天就是带着 8192 跑的。
+    #: **没发 effort**（用官方默认 max）：思考照样吃预算 ⇒ 地板按最坏情况给
+    #:   （32768 / 300s）。2026-10-25 真跑：一次生成用掉 **111.8 秒**就撞上
+    #:   120 秒的默认超时线；max_tokens 8192 也不够 —— 思考先把预算吃掉了，
+    #:   正文被拦腰截断（finish_reason='length'）。这条对「429 自动切到
+    #:   M3.1-Flash」的链路同样要紧 —— 那条路今天就是带着 8192 跑的。
     MIN_ADAPTIVE_MAX_TOKENS = 32768
     MIN_ADAPTIVE_TIMEOUT = 300
+    #:
+    #: **发了 effort**（思考调低）：思考几乎不占预算 ⇒ 地板可以降一档
+    #:   （8192 / 180s）。2026-10-26 真跑（effort=low，写 2400 字正文）：
+    #:   36.0 秒、completion 2605、正文完整写出 ⇒ 8192 绰绰有余。
+    MIN_ADAPTIVE_MAX_TOKENS_EFFORT = 8192
+    MIN_ADAPTIVE_TIMEOUT_EFFORT = 180
+
+    #: effort 的合法档位（官方：low / medium / high / xhigh / max；省略 = max）。
+    #: 非法值**不发**（发了会被忽略，白白让人以为调了档）。
+    _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
     def __init__(self, api_key: str, base_url: str, model: str,
-                 models: list[str] | None = None, **kwargs) -> None:
+                 models: list[str] | None = None,
+                 reasoning_effort: str | None = None, **kwargs) -> None:
         extra: dict = {}
         if model.startswith(self._ADAPTIVE_THINKING_MODELS):
-            # adaptive thinking：思考关不掉 → 只能给足预算（地板见上面的常量）。
+            # adaptive thinking：思考关不掉（disabled/none → 400），但**可以调低**。
+            #
+            # 2026-10-26 真跑（api.minimaxi.com，OpenAI 兼容端点，字段名 reasoning_effort）：
+            #   2400 字续写（max_tokens=8000）
+            #     省略 effort(=max)：66.7s  completion 8000 打满  finish=length  **正文为空**
+            #     effort=low        ：36.0s  completion 2605      finish=stop    正文完整 4079 字
+            #   300 字小任务：M3.1-Flash 默认 20.5s/3081 token → low 5.2s/262 token
+            #                  M3.1-Flash-Preview 默认 20.9s/2160 → low 13.8s/284
+            #   **M3（老）不吃 effort**（传 low 反而更慢）—— 它不在本分支里，行为不变。
+            #
             # 非 adaptive 分支**一个字节都不改**（ADR-2026-10-12：调用方没显式
             # 传这三个参数时，Writer 行为绝对不变）。
             kwargs = dict(kwargs)
+            effort = (reasoning_effort or "").strip().lower()
+            if effort in self._EFFORT_LEVELS:
+                extra["reasoning_effort"] = effort
+            elif effort:
+                logging.getLogger(__name__).warning(
+                    "minimax reasoning_effort=%r 不是合法档位（%s），已忽略",
+                    reasoning_effort, "/".join(self._EFFORT_LEVELS),
+                )
+            # 预算地板按「有没有真的把思考调低」给：
+            #   调低了 ⇒ 思考几乎不占预算 ⇒ 地板降一档（实测 2605 token / 36 秒够用）；
+            #   没调低 ⇒ 思考照旧吃预算 ⇒ 地板保持最坏情况（否则正文会被静默截断）。
+            if extra.get("reasoning_effort"):
+                floor_tokens = self.MIN_ADAPTIVE_MAX_TOKENS_EFFORT
+                floor_timeout = self.MIN_ADAPTIVE_TIMEOUT_EFFORT
+            else:
+                floor_tokens = self.MIN_ADAPTIVE_MAX_TOKENS
+                floor_timeout = self.MIN_ADAPTIVE_TIMEOUT
             kwargs["max_tokens"] = max(
-                int(kwargs.get("max_tokens") or 0), self.MIN_ADAPTIVE_MAX_TOKENS
+                int(kwargs.get("max_tokens") or 0), floor_tokens
             )
             kwargs["timeout"] = max(
-                int(kwargs.get("timeout") or 0), self.MIN_ADAPTIVE_TIMEOUT
+                int(kwargs.get("timeout") or 0), floor_timeout
             )
             kwargs["stream_timeout"] = max(
-                int(kwargs.get("stream_timeout") or 0), self.MIN_ADAPTIVE_TIMEOUT
+                int(kwargs.get("stream_timeout") or 0), floor_timeout
             )
         else:
             # 老模型（M3/M2.x）会吐思维链，能关则关；关不掉由 _strip_thinking 兜底。
@@ -743,6 +780,9 @@ def get_llm_provider() -> LLMProvider:
             models=settings.minimax_model_list,
             max_tokens=settings.writer_max_tokens,
             timeout=settings.writer_timeout,
+            # 写手要吞吐：思考调低（实测又快又不再截断，见 MiniMaxChatProvider）。
+            # 蒸馏/助理角色不传 ⇒ 保持官方默认（max），那两个角色要判断力。
+            reasoning_effort=settings.minimax_reasoning_effort,
         )
     # ------------------------------------------------------------------
     # 通用 OpenAI 兼容渠道（第 8 步新增，判据与上面 5 个分支同形）。
