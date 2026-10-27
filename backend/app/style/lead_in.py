@@ -97,6 +97,47 @@ LEAD_IN_MAX_CHARS = 30
 #: 一次最多补几处（防止模型调用失控）。
 MAX_LEAD_INS = 24
 
+#: 「补到带的上沿」之后**再多给几处余量**。
+#:
+#: ## 为什么不是「补到均值」（2026-10-27 量出来的）
+#:
+#: 补 L 处 ⇒ 裸台词段少 L、含引号段数不变 ⇒ `ratio' = (b-L)/q`。
+#: 所以在**同一份真实正文**上，两个目标差多少是可以直接算的
+#: （两份真实产物是同一批正文的两个快照，**去重后 7 段**；其中机械合并后
+#: 仍出带的 5 段，两份快照各自跑一遍，每段数字一致）：
+#:
+#: | 补到哪 | 每段调用 | 补完是否进带（按采纳率 0.94 估） |
+#: |---|---|---|
+#: | 均值（旧行为） | **11.7 / 11.8** | 5/5 |
+#: | 带的上沿 p90 | 4.1 / 4.5 | **2/7、2/6 ✗**（不留给量，采纳损失把它顶出带） |
+#: | **上沿 + 2 处**（单轮） | **5.6 / 5.8** | 5/5（按 94% 采纳率**估**的） |
+#: | 均值与上沿的中点 | 7.9 / 8.2 | 5/5 |
+#:
+#: ⇒ 目标是「**进带**」而不是「打到均值」，所以补到上沿就够；
+#: 但**必须留给量** —— 采纳率不是 100%，补 8 处只成 7~8 处，
+#: 正好落在上沿附近会被顶出去。2 处约等于一次小幅补偿。
+#:
+#: 代价对比：11.7 → 5.6 次/段（**-52%**）。
+#: ⚠️ 这个「2 处」是按**采纳率 94%** 估的 —— 换个模型不一定是这个数，
+#: 所以下面还有一层**自适应**兜底（`LEAD_IN_MAX_ROUNDS`）。
+LEAD_IN_SAFETY_SLOTS = 2
+
+#: 最多补几轮（每轮都是「补到上沿 + 余量」）。
+#:
+#: ## 为什么要有「第二轮」（2026-10-28 真跑逼出来的）
+#:
+#: 上面那个「余量 2 处」是按**采纳率 94%** 估的。换成真实中转站的模型，
+#: 实测采纳率只有 **67%~82%** —— 于是余量 2 处**有时候不够**：
+#: 真跑有两段只差 **1 个槽位**（0.350 / 0.352，上沿 0.335）就掉在带外。
+#:
+#: ⇒ 固定余量救不了这种情况 —— **采纳率是模型决定的，不是常量**，
+#: 写死一个数只能赌某个模型；换模型就会翻车。
+#:
+#: ⇒ 改成**自适应**：补一轮 → 量一下 → 还差就**再补一轮**
+#: （只补**剩下的**那些段：已经补过的段不再是「裸台词段」，不会被重复挑中）。
+#: 代价只在**真的不够**时才付（实测 5 段里 2 段要第二轮）。
+LEAD_IN_MAX_ROUNDS = 3
+
 #: 并发调用数。0 = 不并发（串行）。
 #:
 #: 串行实测每段约 73 秒（9 段 661 秒）—— 慢到不能默认开。
@@ -340,27 +381,67 @@ def _speaker_check(
     return None, None
 
 
+def should_fill_lead_ins(ratio: float, *, p10: float, p90: float) -> bool:
+    """这段正文**该不该**花钱补引导语。
+
+    ## 为什么只看**上沿**（这道闸以前写成「不在带内」）
+
+    补引导语的效果是单向的：它只会让「裸台词段 / 含引号段」**变小**。
+    ⇒ 比值**低于 p10**（裸台词太少）时补写只会把它压得更低、离带更远，
+    那次调用是纯浪费（虽然末端闸门会把它丢掉，钱已经花了）。
+
+    ⇒ 只有 `ratio > p90`（裸台词**太多**）才值得补。
+
+    ## 为什么正好等于 p90 也不补
+
+    落在带上沿已经在带内；再补就进到带中间，等于白付调用去买「更靠中间」。
+    本次改动的目标就是「进带」，不是「打到均值」。
+    """
+    return float(ratio) > float(p90)
+
+
 def pick_lead_in_slots(
     paragraphs: Sequence[str],
     target_ratio: float,
     *,
     max_slots: int = MAX_LEAD_INS,
+    safety_slots: int = 0,
 ) -> list[int]:
     """挑哪些裸台词段要补引导语。返回段落下标。
 
     ## 怎么挑
 
-    1. 先算还差几段：裸台词段 n、含引号段 q ⇒ 目标裸台词段数 = target×q，
+    1. 先算还差几段：裸台词段 n、含引号段 q ⇒ 目标裸台词段数 = **floor**(target×q)，
        差多少就补多少；
-    2. **均匀摊开**（每隔几个挑一个）—— 参考书里裸台词段是**散着**的
+       ⚠️ **必须向下取整**（不是 round）—— 详见代码里的注释：
+       round 会允许「补完仍比上沿高半段」的结果，而且下一轮会误判成
+       「已经在目标附近」不再补 ⇒ 卡在带外（真跑抓到的）。
+    2. **再多给 `safety_slots` 处**（只在确实要补时给）—— 采纳率不是 100%，
+       补 8 处只成 7~8 处，正好冲着上沿去就会被顶出带（见
+       `LEAD_IN_SAFETY_SLOTS` 里那张实测表）；
+    3. **均匀摊开**（每隔几个挑一个）—— 参考书里裸台词段是**散着**的
        （B→B 只占 176/2662），全挤在一处会像补过。
+
+    Args:
+        target_ratio: 补到哪个比例为止。**线上传的是带的上沿**（p90），
+            不是均值 —— 目的是「进带」，不是「打到平均」。
+        safety_slots: 额外的余量处数。0 = 不留给量（默认，向后兼容）。
     """
     ps = list(paragraphs)
     quote_n = sum(1 for p in ps if _has_quote(p))
     bare = [i for i, p in enumerate(ps) if is_bare_paragraph(p)]
     if not quote_n or not bare:
         return []
-    need = len(bare) - int(round(target_ratio * quote_n))
+    # ⚠️ 这里**必须向下取整**（floor），不能用 round：
+    #   round(0.3346 * 68) = 23 段 ⇒ 允许的比值 23/68 = **0.3382 > 上沿 0.3346**
+    #   ⇒ 补完仍然在带外，而且下一轮会认为「已经在目标附近」不再补 ⇒ 卡在带外。
+    #   floor(0.3346 * 68) = 22 段 ⇒ 22/68 = 0.3235 ≤ 上沿 ✓
+    #   （这是真跑抓到的：gid4 差 0.003 掉在带外，根因就是这个取整方向。）
+    allowed_bare = int(float(target_ratio) * quote_n)
+    need = len(bare) - allowed_bare
+    if need <= 0:
+        return []
+    need += max(0, int(safety_slots))
     need = max(0, min(need, len(bare), max_slots))
     if need <= 0:
         return []
@@ -373,6 +454,7 @@ def insert_lead_ins(
     provider,
     *,
     target_ratio: float,
+    safety_slots: int = 0,
     proper_nouns: set[str] | None = None,
     corpus_text: str | None = None,
     character_names: set[str] | None = None,
@@ -387,6 +469,13 @@ def insert_lead_ins(
     2. 并发调模型写引导语（低温）；
     3. **逐条验收**（七道判据，见模块 docstring）；
     4. 通过的并进那一段（冒号形态 `引导语：“台词”`）。
+
+    ## `target_ratio` / `safety_slots` 是干什么的
+
+    线上传的是**带的上沿 p90** + `LEAD_IN_SAFETY_SLOTS` 处余量 ——
+    目的是「进带」而不是「打到均值」，`-52%` 的调用量就是这么来的
+    （见 `LEAD_IN_SAFETY_SLOTS` 的实测表）。这两个参数只是「补到哪」的旋钮，
+    判据与形态不受影响。
 
     ## `character_names` 是干什么的
 
@@ -410,11 +499,15 @@ def insert_lead_ins(
     - 全部失败 → 原文返回，诊断写明。
     """
     ps = list(paragraphs)
-    info = {"applied": False, "inserted": 0, "slots": 0, "rejected": []}
+    info = {"applied": False, "inserted": 0, "slots": 0, "rejected": [],
+            "fill_ratio": round(float(target_ratio), 4),
+            "safety_slots": int(safety_slots)}
     if not ps:
         return ps, info
 
-    slots = pick_lead_in_slots(ps, target_ratio, max_slots=max_lead_ins)
+    slots = pick_lead_in_slots(
+        ps, target_ratio, max_slots=max_lead_ins, safety_slots=safety_slots,
+    )
     info["slots"] = len(slots)
     if not slots:
         info["reason"] = "不需要补（已经在目标附近）"
@@ -543,3 +636,90 @@ def insert_lead_ins(
         "引导语补写：%d 处候选，%d 处通过验收", len(slots), len(accepted),
     )
     return out, info
+
+
+def fill_lead_ins_until_in_band(
+    paragraphs: Sequence[str],
+    provider,
+    *,
+    p10: float,
+    p90: float,
+    safety_slots: int = LEAD_IN_SAFETY_SLOTS,
+    max_rounds: int = LEAD_IN_MAX_ROUNDS,
+    **kwargs,
+) -> tuple[list[str], dict]:
+    """补引导语，直到**进带**为止（自适应轮数）。返回 (新段落列表, 诊断)。
+
+    ## 为什么要有轮数
+
+    单轮的余量（`safety_slots`）是按**某个采纳率**估出来的，而采纳率是
+    **模型决定的常量**：同一个模型上 94%，换个模型可能只有 67%。
+    ⇒ 写死余量只能赌某个模型；真跑（2026-10-28）就撞上了：两段只差
+    **1 个槽位**（0.350 / 0.352，上沿 0.335）掉在带外。
+
+    ⇒ 改成**补一轮、量一次、还差就再来一轮**：
+    第二轮只补**剩下的**裸台词段（已经补过的段不再是「裸台词段」，
+    不会被重复挑中），所以不会补重、也不会重复花钱。
+
+    ## 什么时候停
+
+    - 已经进带（`ratio <= p90`）⇒ 立刻停，不再多花钱；
+    - 这一轮**一处都没成** ⇒ 停（再来一轮也是白花钱：模型就是写不出来）；
+    - 轮数用完 ⇒ 停，如实把「还差多少」写进诊断（**不假装成功**）。
+
+    ## 诊断里会写什么
+
+    `rounds`（跑了几轮）、`inserted`（一共补了几处）、`slots`（一共花了几次调用）、
+    `final_ratio`（最后的比值）、`in_band`（有没有进带）、`rounds_detail`（逐轮）。
+    """
+    from app.style.form import measure_form
+
+    ps = list(paragraphs)
+    info = {"applied": False, "inserted": 0, "slots": 0, "rounds": 0,
+            "rejected": [], "notes": [], "rounds_detail": [],
+            "safety_slots": int(safety_slots)}
+    if not ps:
+        return ps, info
+
+    for rnd in range(1, max(1, int(max_rounds)) + 1):
+        ratio = measure_form("\n".join(ps))["bare_ratio"]
+        if ratio <= p90:
+            break
+        nxt, li = insert_lead_ins(
+            ps, provider, target_ratio=p90, safety_slots=safety_slots, **kwargs
+        )
+        inserted = int(li.get("inserted") or 0)
+        info["rounds"] = rnd
+        info["slots"] += int(li.get("slots") or 0)
+        info["inserted"] += inserted
+        info["rejected"] += list(li.get("rejected") or [])
+        info["notes"] += list(li.get("notes") or [])
+        info["rounds_detail"].append({
+            "round": rnd,
+            "ratio_before": round(ratio, 4),
+            "slots": int(li.get("slots") or 0),
+            "inserted": inserted,
+            "reason": li.get("reason"),
+        })
+        if inserted <= 0:
+            # 一处都没成 ⇒ 再来一轮也是白花钱（模型写不出来 / 全被判据拒了）
+            break
+        ps = nxt
+
+    final_ratio = measure_form("\n".join(ps))["bare_ratio"]
+    info["final_ratio"] = round(final_ratio, 4)
+    info["in_band"] = bool(float(p10) <= final_ratio <= float(p90))
+    info["applied"] = info["inserted"] > 0
+    if not info["in_band"]:
+        # **如实说没进带** —— 不许「补了几处」就当成成功。
+        if info["inserted"] > 0:
+            info["reason"] = (
+                f"补了 {info['inserted']} 处仍未进带"
+                f"（{final_ratio:.3f} > 上沿 {float(p90):.3f}）"
+            )
+        else:
+            info["reason"] = (
+                f"一处都没补上，仍未进带（{final_ratio:.3f} > 上沿 {float(p90):.3f}）"
+            )
+    return ps, info
+

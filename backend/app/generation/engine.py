@@ -595,10 +595,26 @@ def _maybe_correct_form(
         # （实测 9 段真实产物：71.5% → 42.2%，参考书 22.7%）。
         # 剩下的差距只能靠**新增内容**补 —— 而这一步**会新增文字**，
         # 所以它跟机械合并不是一回事：**闸门相同、判据不同**。
-        # 只有「机械合并之后仍在带外」才付这次模型调用的钱。
+        #
+        # 三处「按需」（2026-10-27 量着定的，别改成凭感觉）：
+        # 1. **只在裸台词太多时才付这笔钱** —— 低于下沿 p10 时补引导语只会让
+        #    比值更小、离带更远（这道闸以前写成「不在带内」，两个方向都进）；
+        # 2. **补到带的上沿就够，不追均值** —— 目的是「进带」，不是「打到平均」；
+        # 3. **余量 2 处 + 不够就再来一轮**（`fill_lead_ins_until_in_band`）。
+        #    余量是按某个采纳率估的，而**采纳率是模型决定的**：实测换模型后
+        #    采纳率只有 67%~82%，固定余量会漏掉「只差 1 个槽位」的段。
+        #    实测代价：11.7 → 5.6 次模型调用/段（-52%），出带的 5 段全部进带。
         lead_info = {"applied": False}
         ratio_now = after_merge["bare_ratio"]
-        if not (target["p10"] <= ratio_now <= target["p90"]):
+        try:
+            from app.style.lead_in import should_fill_lead_ins
+
+            want_lead = should_fill_lead_ins(
+                ratio_now, p10=target["p10"], p90=target["p90"],
+            )
+        except Exception:  # noqa: BLE001 —— 判不出来就别花钱
+            want_lead = False
+        if want_lead:
             try:
                 from app.config import settings as _st2
                 lead_on = bool(getattr(_st2, "style_lead_in", False))
@@ -606,10 +622,11 @@ def _maybe_correct_form(
                 lead_on = False
             if lead_on:
                 try:
-                    from app.style.lead_in import insert_lead_ins
+                    from app.style.lead_in import fill_lead_ins_until_in_band
 
-                    work_paras, lead_info = insert_lead_ins(
-                        work_paras, provider, target_ratio=target["target"],
+                    work_paras, lead_info = fill_lead_ins_until_in_band(
+                        work_paras, provider,
+                        p10=target["p10"], p90=target["p90"],
                         proper_nouns=_reference_proper_nouns(db, project, novel_ids),
                         corpus_text=_reference_corpus_text(db, project, novel_ids) or None,
                         character_names=_project_character_names(db, project),

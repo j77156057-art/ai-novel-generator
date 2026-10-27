@@ -35,3 +35,6 @@ htmlcov/
 
 # 个人状态目录
 .workbuddy/
+
+# 真跑测量台的输出（每次跑都会变，不进版本库）
+tests/qa_lead_on_demand_run.json
