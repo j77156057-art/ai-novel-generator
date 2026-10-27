@@ -282,7 +282,7 @@ Step(id, 名称, 前置条件, 读工具, 写提案类型, 判据, 下一跳)
 | 1b | **两条轨**（提示词轨 / 正文轨）+ 每道工序的派发对象 + **提示词体检**（`prompt_audit.py` + 工具 `audit_prompt`）+ 派发留痕工具 `record_workflow_step` | ✅ 已做 |
 | 2a | 前端工序面板（进度条 + 两条轨 + 当前步 + 人话状态词） | ✅ 已做 |
 | 2b | 面板「等着你处理的改动」区：批准 → 写进正文分两步 + 看改动 diff | ✅ 已做 |
-| 2c | 写工序提案化：动作提案表 + 八类动作（`start_distill` / `plan_outline` / `extend_plan` / `invoke_generation` / `close_acceptance` / `apply_body_repair` / `derived_rebuild` / `unlock_generation`）含 apply 路径 | ✅ 已做（`prompt_override` 一类仍空，见 B2） |
+| 2c | 写工序提案化：动作提案表 + 八类动作（`start_distill` / `plan_outline` / `extend_plan` / `invoke_generation` / `close_acceptance` / `apply_body_repair` / `derived_rebuild` / `unlock_generation`）含 apply 路径 | ✅ 已做（`prompt_override` 一类 2026-10-27 也接上了：批准后真的进生成提示词） |
 | 3 | 闭环工序接入验收/修复/重建/解锁/扩展规划的提案类型 + 收敛判据 + 「以此类推」的循环 | ✅ 已做（链条 9 → **11 步**：新增「派生重建」「解锁放行」） |
 | 4a | 阶段三那篇用**真实判官**重审（审计 0 违例 + 整段验收 accepted）→ `docs/stage3-real-rerun.md` | ✅ 已做 |
 | 4b | 一本**真书**（《北荒刀歌》 990 章）从交稿走到收敛的完整九道工序 → `docs/realbook-full-flow.md` | ✅ 已做 |

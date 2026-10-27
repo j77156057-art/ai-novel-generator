@@ -96,10 +96,20 @@ def run_prompt_audit(db: Any, project: Any, *, profile: str = 'original'
     except Exception:  # noqa: BLE001
         style_profile = None
 
+    # 体检的是**真正下发的那份提示词** —— 运行时覆写已经接进生成路径了，
+    # 体检不带上覆写就会漏判「覆写把提示词撑太长」这类问题。
+    try:
+        from app.agents.prompt_overrides import resolve_overrides_for_generation
+        _ov = resolve_overrides_for_generation(db, project.id)
+    except Exception:  # noqa: BLE001 - 取不到覆写不算体检失败
+        _ov = {}
+
     system = build_system_prompt(
         project.title or '', reminders, style_dims or None, project.plot_bible,
         style_profile, narrative if isinstance(narrative, dict) else None,
         profile=profile, character_names=None,
+        override_style=_ov.get("style_suffix", ""),
+        override_constraint=_ov.get("constraint_note", ""),
     )
     stats['system_prompt_chars'] = len(system)
 

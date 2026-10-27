@@ -6,9 +6,33 @@
 
 提示里的【前情提要】【检索上下文】【大纲】标记同时被 LocalFallbackLLMProvider
 解析回显，保证离线可验证约束进入生成环。
+
+## 运行时覆写（prompt_override）是**追加口**，不是改写口
+
+`override_style` / `override_constraint` / `override_directive` 三个参数对应
+`prompt_overrides` 表的三个键（见 `app.agents.prompt_overrides`）。它们的约束是：
+
+- **只能加，不能减** —— 覆写文本被渲染成独立的一段，插在对应块**之后**；
+  代码里的默认块（角色锁定 / 伏笔纪律 / 文风要求）一个字节都不动，
+  覆写也**删不掉**它们（想改维度级行为要去 `profiles.PROFILE_RULES`，不是这里）。
+- **不传就等于没接** —— 三个参数默认空串，此时输出与接入之前**逐字节相同**
+  （这是本文件唯一的兼容底线，由 `tests/test_prompt_override_wiring.py` 钉住）。
 """
 
 from typing import Any, Sequence
+
+
+def _override_block(text: str, label: str, *, leading_newline: bool = False) -> str:
+    """把一段运行时覆写渲染成提示词里的追加块。
+
+    空串/纯空白 ⇒ 返回空串 ⇒ 调用方拼出来的提示词**一个字节都不变**
+    （这是「没设覆写就等于没接」的实现方式：不是加一个判断再跳过，
+    而是渲染结果本身就是空的）。
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    return ("\n" if leading_newline else "") + f"【{label}】\n{t}\n"
 
 
 def _style_block(style_dims: dict | None) -> str:
@@ -251,6 +275,8 @@ def build_system_prompt(
     profile: str | None = None,
     character_names: list[str] | None = None,
     entity_table: dict | None = None,
+    override_style: str = "",
+    override_constraint: str = "",
 ) -> str:
     """静态系统提示——整轮生成保持不变，置于最前，保证提示词缓存命中率。
 
@@ -261,6 +287,9 @@ def build_system_prompt(
     渲染成静态块；自由生成（未选参考语料）时为 None，该块整段不出现。
     `style_narrative` 由 `app.style.narrative.project_narrative` 产出（按指纹缓存），
     是 LLM 提炼的 L2/L3 叙事规则，同样为 None 时不出现。
+
+    `override_style` / `override_constraint` 是**运行时覆写**（`prompt_overrides` 表）：
+    渲染成独立的一段，插在【风格】之后 / 【续写纪律】之后；默认空串 ⇒ 输出不变。
     """
     # —— 合并而非遮蔽 ——
     # 旧实现「有 plot_bible 就只取 bible」会让生成后抽取的事实（KG reminders）被静默丢弃：
@@ -286,6 +315,12 @@ def build_system_prompt(
         or "  · 暂无伏笔"
     )
 
+    # —— 运行时覆写（只加不改；空串 ⇒ 渲染结果为空 ⇒ 输出逐字节不变）——
+    _style_override = _override_block(override_style, "附加文风说明")
+    _constraint_override = _override_block(
+        override_constraint, "附加硬约束", leading_newline=True
+    )
+
     return (
         f"你是一位长篇小说续写助手。当前创作项目：《{project_title}》。\n\n"
         "【角色人设约束】续写时必须保持以下角色一致，不得凭空新增主要人物，"
@@ -297,6 +332,7 @@ def build_system_prompt(
         f"{hole_lines}\n\n"
         f"【风格】{_style_block(style_dims)}\n"
         "（以上维度是倾向参考，不要直接翻译成类型套路或标签化文风。）\n"
+        f"{_style_override}"
         f"{_profile_block(style_profile)}\n"
         f"{_narrative_block(style_narrative, include_voice=_profile_rules.get('include_voice', True), dims=_profile_rules.get('narrative_dims'), voice_character=_voice_character_for(profile, character_names), entity_table=entity_table)}"
         f"{_character_template_block(style_narrative, enabled=bool(_profile_rules.get('include_character_template')))}"
@@ -320,6 +356,7 @@ def build_system_prompt(
         "结尾必须停在某个仍未解决的冲突、悬念或动作中途（为下一节留钩子），"
         "不得在本次续写里收束主线、给出结局，也不要写「从此……／自此……」式的收尾；"
         "每轮控制在指定字数内。"
+        f"{_constraint_override}"
     )
 
 
@@ -339,6 +376,7 @@ def build_user_prompt(
     prev_scene: str | None = None,
     rag_blocks: list[tuple[str, str]] | None = None,
     scene_contract: str | None = None,
+    override_directive: str = "",
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -538,6 +576,13 @@ def build_user_prompt(
             "**节末信号**：写完本节主要内容后，请在文末单独一行写【本节完】三个字，"
             "表示本节已完整收口。"
         )
+
+    # —— 运行时覆写（directive_suffix）：并进【续写指令】这一段，**不另起一块**——
+    # 另起一块会被后面的【句法样板】挤到注意力更弱的位置，而样板刻意放最末；
+    # 并进指令段则落在「模型正在读指令」的位置上。
+    _directive_override = (override_directive or "").strip()
+    if _directive_override:
+        directive = directive + "\n" + _directive_override
 
     blocks = [
         "【前情提要】",

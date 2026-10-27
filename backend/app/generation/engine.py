@@ -1666,6 +1666,27 @@ def _style_narrative(db, project: Project) -> dict | None:
     return copy.deepcopy(cached) if isinstance(cached, dict) else None
 
 
+def _prompt_overrides(db, project_id: int) -> dict[str, str]:
+    """项目的运行时提示词覆写（`prompt_overrides` 表）。
+
+    以前这张表只有「写进去」和「体检看得见」两条路，**生成路径从来不读它**
+    —— 于是「批准了提示词改动」与「正文真的变了」之间是断的。
+    现在三条生成路径（同步 / 流式 / 重生成）都从这里取文本追加进提示词。
+
+    取不到就当没有覆写（记一条 warning，不静默）：覆写是增强，缺了不该阻断生成；
+    但缺了要留痕，否则又是一次「看起来改了、其实没改」。
+    """
+    try:
+        from app.agents.prompt_overrides import resolve_overrides_for_generation
+
+        return resolve_overrides_for_generation(db, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "提示词覆写读取失败，本段按无覆写生成: %s", exc
+        )
+        return {}
+
+
 def _style_profile(db, project: Project) -> dict | None:
     """项目级文体档案（参考语料实测），按指纹缓存，整轮恒定。
 
@@ -2480,12 +2501,15 @@ def generate_next_segment(
             'message': '规划已写完：这一版的剧情点都写过了。要继续写，请先扩展规划'
                        '（否则新写的正文没有保存权威可核对）。',
             'written_segments': written})
+    _ov = _prompt_overrides(db, project.id)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
         _style_profile(db, project), ctx.get("style_narrative"),
         profile=profile,
         character_names=_l2_character_names(project, ctx, profile),
         entity_table=ctx.get("entity_table"),
+        override_style=_ov.get("style_suffix", ""),
+        override_constraint=_ov.get("constraint_note", ""),
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -2506,6 +2530,7 @@ def generate_next_segment(
         # v2.293：分块检索上下文（位置块 / 语义块 / 角色块各带标签）
         rag_blocks=ctx.get("rag_blocks") or None,
         scene_contract=_scene_contract_for_generation(project, {**ctx, "prev_scene": _prev_scene_hint(db, project)}, profile, written),
+        override_directive=_ov.get("directive_suffix", ""),
     )
 
     # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
@@ -2720,12 +2745,15 @@ def generate_next_segment_stream(
     # —— 时间线：算出当前剧情点提示（与同步版同口径，db 用于落库）——
     written = _next_segment_no(db, project.id) - 1
     node_prompt = current_node_prompt(project, written, provider, db=db)
+    _ov = _prompt_overrides(db, project.id)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
         _style_profile(db, project), ctx.get("style_narrative"),
         profile=profile,
         character_names=_l2_character_names(project, ctx, profile),
         entity_table=ctx.get("entity_table"),
+        override_style=_ov.get("style_suffix", ""),
+        override_constraint=_ov.get("constraint_note", ""),
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -2743,6 +2771,7 @@ def generate_next_segment_stream(
         # 流式预览与最终结果会对不上。
         rag_blocks=ctx.get("rag_blocks") or None,
         scene_contract=_scene_contract_for_generation(project, {**ctx, "prev_scene": _prev_scene_hint(db, project)}, profile, written),
+        override_directive=_ov.get("directive_suffix", ""),
     )
 
     # v2.6：节点粒度根治——流式版同步传 per-request stop token
@@ -2919,12 +2948,15 @@ def _build_generation_prompts(
         tree, budget_chars=budget_for_generation(project.generation_length)
     )
     ctx = build_context(db, project, novel_ids=novel_ids, profile=profile or "continuation")
+    _ov = _prompt_overrides(db, project.id)
     system = build_system_prompt(
         project.title, get_reminders(db, project.id, source="generated"),
         _style_info(project), project.plot_bible, _style_profile(db, project),
         # 重写第 N 章：属于续写模式（写的是原书章节），原书角色声音要保留
         ctx.get("style_narrative"), profile=profile or "continuation",
         character_names=_l2_character_names(project, {**ctx, "prior_summaries": l1_chain(tree), "prior_blocks": blocks}, profile or "continuation"),
+        override_style=_ov.get("style_suffix", ""),
+        override_constraint=_ov.get("constraint_note", ""),
     )
     user = build_user_prompt(
         l1_chain(tree),
@@ -2935,6 +2967,7 @@ def _build_generation_prompts(
         project.premise,
         prior_blocks=blocks,
         node_prompt=node_prompt,
+        override_directive=_ov.get("directive_suffix", ""),
     )
     return system, user, max_chars
 

@@ -126,6 +126,41 @@ def resolve_prompt_block(db: Any, project_id: int, prompt_key: str) -> tuple[str
     return (CODE_DEFAULTS.get(key, ""), "code_default")
 
 
+def resolve_overrides_for_generation(db: Any, project_id: int) -> dict[str, str]:
+    """取三个键当前生效的覆写文本，供**生成路径**追加进提示词。
+
+    返回 `{prompt_key: text}`；没有覆写 ⇒ 空串（拼进提示词等于没拼）。
+    一次查完三个键（不是三次 `resolve_prompt_block`）：生成每段都要调，
+    多两次查询没有意义。
+
+    这一条是「运行时覆写」真正生效的那一环 —— 以前只有「写表 + 体检能看见」，
+    **生成路径从来不读这张表**（`prompts.py` 里没有任何覆写入口），
+    于是「批准了提示词改动」和「正文变了」之间是断的。
+    """
+    from sqlalchemy import select
+
+    from app.models import PromptOverride
+
+    rows = list(
+        db.scalars(
+            select(PromptOverride)
+            .where(
+                PromptOverride.project_id == project_id,
+                PromptOverride.prompt_key.in_(PROMPT_KEYS),
+                PromptOverride.active.is_(True),
+            )
+            .order_by(PromptOverride.id.desc())
+        ).all()
+    )
+    out: dict[str, str] = {key: "" for key in PROMPT_KEYS}
+    for row in rows:
+        key = row.prompt_key
+        # id 倒序 ⇒ 先遇到的就是最新一条；已被占位的不再覆盖。
+        if key in out and not out[key]:
+            out[key] = (row.override_text or "").strip()
+    return out
+
+
 def active_prompt_report(db: Any, project_id: int) -> list[dict[str, Any]]:
     """全部可覆写键的当前生效来源（`GET /api/assistant/prompts/active` 用）。"""
     report: list[dict[str, Any]] = []

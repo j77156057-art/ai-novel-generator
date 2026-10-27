@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node --test tests/*.test.ts",
+    "test": "node --test tests/*.test.ts && npm run test:components",
+    "test:logic": "node --test tests/*.test.ts",
+    "test:components": "vitest run",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit"
@@ -18,8 +20,11 @@
     "@tsconfig/node22": "^22.0.0",
     "@types/node": "^22.10.2",
     "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.5.1",
+    "jsdom": "^25.0.1",
     "typescript": "^5.7.2",
     "vite": "^6.0.5",
+    "vitest": "^5.0.5",
     "vue-tsc": "^2.2.0"
   }
 }

@@ -354,11 +354,21 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
     profile = _resolve_profile(proj, body.profile)
     ctx = build_context(db, proj, novel_ids=novel_ids, profile=profile)
     style_prof = proj.style_profile  # Preview reads prepared cache only; no fitting writes.
+    # 预检必须看到**和真正下发一致**的那份 prompt —— 运行时覆写也要带上，
+    # 否则用户看到的是「没有覆写时的样子」，批准了覆写也看不出差别。
+    #
+    # 这里**故意不吞异常**（与生成路径不同）：生成路径读不到覆写时降级成「按无覆写生成」
+    # 并留一条 warning（正文不能因为增强功能挂了就停）；但预检页如果读不到，
+    # 就该明确报错 —— 它若默默显示一份**少了覆写**的提示词，就是在骗人。
+    from app.agents.prompt_overrides import resolve_overrides_for_generation
+    _ov = resolve_overrides_for_generation(db, proj.id)
     system = build_system_prompt(
         proj.title, ctx["reminders"], _style_info(proj), proj.plot_bible,
         style_prof, ctx.get("style_narrative"),
         profile=profile,
         character_names=_l2_character_names(proj, ctx, profile),
+        override_style=_ov.get("style_suffix", ""),
+        override_constraint=_ov.get("constraint_note", ""),
     )
     _node = current_node_prompt(proj, _next_segment_no(db, body.project_id) - 1)
     # v2.290：预检页必须看到和真正下发一致的那份 prompt。
@@ -377,6 +387,7 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         kg_slice=ctx.get("kg_slice") or None,
         segment_no=_seg,
         prev_scene=None if _node else _prev_scene_hint(db, proj),
+        override_directive=_ov.get("directive_suffix", ""),
     )
     return {
         "reminders": ctx["reminders"],
