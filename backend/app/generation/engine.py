@@ -675,44 +675,45 @@ def _candidate_pool_size() -> int:
         return 1
 
 
-def _recheck_pool_verdict(pool_info: dict, text: str, *, profile: dict | None,
-                          target_chars: int | None) -> dict:
-    """落库前用**同一把尺**复判最终文本：择优的结论到末端还成立吗？
+def _judge_final_text(text: str, *, profile: dict | None,
+                      target_chars: int | None = None) -> dict:
+    """用**同一把尺**量「落库形态」：这份**成品**合不合格。
 
-    零模型调用（只量不算）。量的是**落库形态**（不再预演机械校正）——
-    落库的那份已经过了机械校正，再预演等于把它又合一次。
+    零模型调用（只量不算）。量的是**成品**（不是原稿、也不是预览）——
+    这正是末端择优要的那一刀。
 
-    不合格**不阻断落库**（正文已经写出来了，硬拒会白扔一次生成），
-    但必须**留痕**：`pool_info["final_recheck"]` 里如实记着。
-    ⇒ 「择优的结论失效了」这件事从此**看得见**，而不是静默。
+    ## 为什么只判形态，不判字数
 
-    只有真的开了候选池才复判（池关着时根本没有「择优结论」可失效）。
+    长度由**段长闸门**负责（池内每份候选都过一遍，见 `_run_pool_selection`）。
+    而落库前的**文风改写**会压缩 15%~25%（实测 3216 → 约 2700）⇒
+    链后的文本常常落在目标的 **60%~80%**，正好压在池的守恒下限（60%）附近。
+    拿那个下限去裁决链后的文本 ⇒ **系统性误杀**（不是形态不好，
+    是闸门已经管过的事，而且再判一次只会把整池的链白跑一遍）。
+
+    ⇒ 末端只判**形态**（`band_check` 的「纯台词段占比」，与机械校正闸门、
+    池的先验分同一把尺）；字数只**如实报出**（`length_ratio`），不参与裁决。
     """
-    if not pool_info or not pool_info.get("applied"):
-        return {}
-    try:
-        from app.generation.candidate import score_candidate
+    from app.generation.candidate import score_candidate
 
-        cand = score_candidate(text, profile=profile, baseline_chars=target_chars)
-    except Exception as exc:  # noqa: BLE001 —— 量不出来不算失效
-        result = {"checked": False, "reason": f"{type(exc).__name__}: {exc}"}
-        pool_info["final_recheck"] = result
-        return result
+    try:
+        # `baseline_chars=None` ⇒ 不做字数守恒（理由见上面），只判形态。
+        cand = score_candidate(text, profile=profile, baseline_chars=None)
+    except Exception as exc:  # noqa: BLE001 —— 量不出来不算不合格
+        return {"checked": False, "ok": True, "reason": f"{type(exc).__name__}: {exc}"}
     result = {
         "checked": True,
         "ok": bool(cand.ok),
         "reject": cand.reject,
         "score": None if cand.score == float("inf") else round(cand.score, 4),
         "form": cand.form,
+        "target": cand.target,
     }
-    pool_info["final_recheck"] = result
-    if not result["ok"]:
-        logging.getLogger(__name__).warning(
-            "候选池的择优结论在末端已失效：%s（正文照落，但这条留痕）", result["reject"])
+    if target_chars:
+        result["length_ratio"] = round(_cjk_count(text) / max(1, target_chars), 4)
     return result
 
 
-def _generate_with_pool(
+def _run_pool_selection(
     provider,
     system: str,
     user: str,
@@ -722,76 +723,47 @@ def _generate_with_pool(
     pool_size: int = 1,
     profile: dict | None = None,
     target_chars: int | None = None,
-) -> tuple[str, dict]:
-    """同一提示采 N 份，按「参考书自己的分布」择优，返回 (正文, 诊断)。
+    run_chain=None,
+) -> tuple[str, dict, dict]:
+    """候选池：采样 → 每份走完整条链 → 同一把尺量**成品** → 落库第一份合格的。
 
-    ## 这是什么
+    返回 (落库正文, 候选池诊断, 选中那份的 `{summary, chain}`)。
 
-    文献里对付「输出不达标但目标可测」的标准解法（Best-of-N / 拒绝采样）：
-    同一提示采样多份，用一个**外部打分器**选最好的那份
-    （[Best-of-N](https://api.emergentmind.com/topics/best-of-n-bon)、
-    [拒绝采样](https://yijia.ws/llm/2026-08-26-057)）。
+    ## 这就是「末端择优」
 
-    ## 为什么在我们这里特别顺
+    拒绝采样（Best-of-N）跑在**整条链**上：候选不是「一次采样的原稿」，
+    而是「一整条流水线的产物」⇒ **落库的那份，就是尺子判过的那份**。
 
-    Best-of-N 的头号风险是 **reward hacking** —— 打分器有偏时，
-    选择压力会放大它的偏好，挑出「分高但人读着差」的稿子。
-    我们的打分器**不是学出来的偏好，是参考书自己拟合出来的分布**，
-    它不会为了讨好指标而牺牲别的东西。
+    ## 为什么必须走到末端
 
-    ## 形态怎么打分：先机械校正，再量
+    择优若发生在链之前，链上那几道会改文本的工序（AI 味重写 / 文风改写 /
+    形态校正 / beat 插入 / 照搬门禁 …）会把「被认可的那份」改掉 ⇒
+    **落库的与择优认可的从来不是同一份**。
+    实测（2026-10-27 两轮真跑）：池交出 2733 字 → 落库 2558 字；
+    另一轮落库形态 41%，而带上沿是 33.5% ⇒ 出带。
 
-    打分针对的是**校正后**的形态（机械校正能把「一行一句台词」掰成参考书形态），
-    所以择优时用「预览变换」先并一遍再量 —— 但**返回的是原文**，
-    真正的校正仍由流水线自己的那道工序做（它还有闸门与模式开关）。
+    ## 代价：链很贵 ⇒ **按需跑**
 
-    ## 段长闸门在**池内**（2026-10-27 改）
+    采样与走链**交替**进行：采一份、走一条链、量一次；
+    合格就停（多数情况只跑一条链）⇒ 不合格才采下一份、走下一条链。
+    ⇒ 不用为「可能用不上的候选」先付采样与闸门的钱
+    （以前是「先采 N 份、挑一份、跑一条链」，现在多跑的那条链是**按需**的）。
 
-    闸门在字数不够时是**回灌让模型重写整段**（`_enforce_length` 里 `text = grown`，
-    整段替换）。它原来排在**打分之后** ⇒ 被择优认可的那份稿子会被当场换掉，
-    换上去的新稿子**从没被那把尺量过** —— 「择优形态 ≠ 落库形态」。
+    ## 都不合格怎么办
 
-    这不是边角情况：候选池守恒下限 = 目标 × 60%，闸门下限 = 目标 × 80%
-    ⇒ 落在 **[60%, 80%)** 的候选「池放行、闸门必然重写」
-    （实测 9 段真实正文：4/9 段落在这条缝里）。
-
-    ⇒ 现在**打分之前**先过闸门：**闸门这一道不再换掉被择优认可的稿子**。
-    代价：闸门对**每一份**候选跑（不是只对选中那份）⇒ 偏短的候选要多扩写一次
-    （实测 9 段真实正文里 4/9 段偏短），池开着时这项开销按候选数放大。
-
-    ⚠️ **别把这句读成「落库的那份一定就是池选中的那份」**：
-    闸门只是整段换稿的**一道**工序，后面还有场景审计、AI 味重写、去重、
-    文风改写、形态校正、beat 插入、照搬门禁 —— 它们**也都会改文本**
-    （真跑实测：池交出 2733 字 → 落库 2558 字，差 175 字）。
-    ⇒ 真正保证「末端那条形态线仍然成立」的是**末端复判**
-    （`_recheck_pool_verdict`，落库前用同一把尺量最终文本，失效就留痕），
-    不是「闸门挪进来了」这件事本身。
-
-    `pool_size = 1`（默认）时这条路径**根本不走**（直接返回第一次输出），
-    默认路径逐字节不变。
-
-    ## 成本
-
-    N 次生成调用（一次真跑 4~9 分钟/段）。所以：
-    - `pool_size = 1` 时**一次调用都不多**（直接返回第一次的输出）；
-    - 要开得显式开（`settings.style_candidate_pool`）。
-
-    ## 失败策略
-
-    任何一份采样失败都跳过；一份都没成功 → 抛错让上层按老路处理。
+    落库**离目标最近**的那份，并如实标注偏离 —— 与池的既有下限兜底一致
+    （拒绝采样：预算不确定，但保证最低质量）。
     """
     if pool_size <= 1:
-        text = provider.chat(system, user, constraints=constraints,
-                             stop_sequences=stop_sequences)
-        return _strip_thinking(text), {"applied": False, "reason": "候选池关闭"}
+        return "", {"applied": False, "reason": "候选池关闭"}, {}
 
     from app.generation.candidate import score_candidate
 
     def _preview(t: str) -> str:
-        """形态预览：机械合并一遍（不改原文，只为打分）。
+        """形态预览：机械合并一遍（不改原文，只为打分与诊断）。
 
-        候选池要按**最终形态**判合格 —— 机械校正是流水线后面那道工序，
-        所以这里先把它「预演」一遍。
+        机械校正是流水线后面那道工序，所以这里先把它「预演」一遍 ——
+        这份预览就是**候选在链前**的形态估计。
         """
         try:
             from app.style.form import form_target
@@ -806,15 +778,9 @@ def _generate_with_pool(
         except Exception:  # noqa: BLE001
             return t
 
-    # —— 阈值式拒绝采样：边采边判，合格即停 ——
-    # 固定 N 的问题是「白花两份的钱」：实测 Flash 经机械校正后 4/4 候选已在带内，
-    # 多数情况第一份就合格。改成边采边判 ⇒ 多数情况成本 = 1 份。
-    cands: list[str] = []
-    scored: list = []
-    gates: list[dict] = []
+    results: list[dict] = []
     last_exc: Exception | None = None
-    stopped_early = False
-    for _i in range(pool_size):
+    for i in range(pool_size):
         try:
             raw = provider.chat(system, user, constraints=constraints,
                                 stop_sequences=stop_sequences)
@@ -825,9 +791,9 @@ def _generate_with_pool(
         t = _strip_thinking(raw)
         if not (t and t.strip()):
             continue
-        # —— 段长闸门挪进池内：打分之前先过 ⇒ 择优的对象 = 落库的对象 ——
+        # —— 段长闸门在**打分与走链之前** ——
         # 闸门在字数不够时是**整段重写**，放在打分之后就会把「被认可的稿子」
-        # 当场换掉，而新稿没被量过（见函数 docstring 的实测数据）。
+        # 当场换掉，而新稿没被量过（口径差的根）。
         # 没有字数目标（target_chars 为空）就没法量 ⇒ 不跑闸门（也不假装跑过）。
         if target_chars:
             t, gate = _enforce_length(
@@ -835,67 +801,240 @@ def _generate_with_pool(
                 constraints=constraints, stop_sequences=stop_sequences)
         else:
             gate = {}
-        gates.append(gate)
-        cands.append(t)
-        # 守恒判据的基准 = **外部的字数目标**（段长闸门用的那个），
-        # **不是**同伴中位数 —— 候选之间长度天然不同（形态差的稿子往往更短），
-        # 拿同伴当基准会把正常的候选判成「膨胀」或「缩水」。
-        scored.append(score_candidate(_preview(t), profile=profile,
-                                      baseline_chars=target_chars))
-        if scored[-1].ok:
-            # 合格即停 —— 不再采下一份（这一轮改动省时间的地方）
-            stopped_early = True
+        # 先验分 = **链前**的形态估计（机械合并预览）⇒ 只作诊断与排序参考，
+        # 落库由末端那一刀决定。
+        prior = score_candidate(_preview(t), profile=profile,
+                                baseline_chars=target_chars)
+        final_text, summary, chain = run_chain(t)
+        verdict = _judge_final_text(final_text, profile=profile,
+                                   target_chars=target_chars)
+        results.append({
+            "index": i,
+            "text": t,
+            "gate": gate,
+            "prior": {
+                "ok": bool(prior.ok),
+                "score": None if prior.score == float("inf") else round(prior.score, 4),
+                "reject": prior.reject,
+                "form": prior.form,
+            },
+            "final_text": final_text,
+            "summary": summary,
+            "chain": chain,
+            "verdict": verdict,
+        })
+        if verdict.get("ok"):
             break
 
-    if not cands:
+    if not results:
         # 全部失败 → **把真实的异常抛出去**。
         # 不能在这里再调一次 provider（那只会再失败一次，把错误藏起来）。
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("候选池全部采样失败且没有异常信息")
 
-    qualified_idx = [i for i, c in enumerate(scored) if c.ok]
-    pool_idx = qualified_idx if qualified_idx else list(range(len(scored)))
-    best_idx = min(pool_idx, key=lambda i: (scored[i].score, i))
-    picked = cands[best_idx]
-    best_score = scored[best_idx].score
-    info = {
+    accepted = [r for r in results if r["verdict"].get("ok")]
+    if accepted:
+        chosen = accepted[0]
+    else:
+        chosen = min(results, key=lambda r: (
+            r["verdict"].get("score")
+            if r["verdict"].get("score") is not None else float("inf")))
+
+    pool_info = {
         "applied": True,
-        "n_candidates": len(cands),
-        "n_qualified": len(qualified_idx),
-        "picked": best_idx,
-        "pool_size": pool_size,
-        "stopped_early": stopped_early,
-        "score": (None if best_score == float("inf") else round(best_score, 4)),
-        "reject": scored[best_idx].reject,
-        # 闸门已在池内跑过（打分之前）⇒ 上层**不要再扩写一遍**：
-        # 再跑一次会对同一份稿子发起第二次扩写调用（白花钱），而且两次扩写
-        # 的结果不同 ⇒ 落库的就不再是「池选中的那份」了。
-        #
-        # 注意 `gated` 必须**如实反映闸门真的跑过**：`target_chars` 为空时
-        # 没跑闸门（没法量字数），这时报 True 会让上层以为「已经闸过了」
-        # 而跳过长度管控 —— 那就是「假装跑过」。
-        "gated": bool(target_chars),
-        "length_report": (gates[best_idx] if best_idx < len(gates) else {}),
+        "mode": "final_selection",
+        "n_candidates": len(results),
+        "n_tried": len(results),
+        "picked": chosen["index"],
+        "accepted": bool(chosen["verdict"].get("ok")),
+        "score": chosen["verdict"].get("score"),
+        "reject": chosen["verdict"].get("reject"),
+        "form": chosen["verdict"].get("form"),
+        "target": chosen["verdict"].get("target"),
+        # 闸门已在池内跑过（打分之前）⇒ 上层**不要再扩写一遍**。
+        # `gated` 必须**如实反映闸门真的跑过**：没有字数目标时没跑闸门，
+        # 这时报 True 会让上层以为「已经闸过了」而跳过长度管控 —— 那是「假装跑过」。
+        "gated": bool(chosen["gate"]),
+        "length_report": chosen["gate"] or {},
         "candidates": [
             {
-                "index": i,
-                "chars": _cjk_count(c),
-                "score": (None if s.score == float("inf") else round(s.score, 4)),
-                "reject": s.reject,
+                "index": r["index"],
+                "chars": _cjk_count(r["text"]),
+                "prior_ok": r["prior"]["ok"],
+                "prior_score": r["prior"]["score"],
+                "prior_reject": r["prior"]["reject"],
             }
-            for i, (c, s) in enumerate(zip(cands, scored))
+            for r in results
         ],
+        "attempts": [
+            {
+                "index": r["index"],
+                "ok": bool(r["verdict"].get("ok")),
+                "reject": r["verdict"].get("reject"),
+                "score": r["verdict"].get("score"),
+                "form": r["verdict"].get("form"),
+                "length_ratio": r["verdict"].get("length_ratio"),
+                "chars": _cjk_count(r["final_text"]),
+            }
+            for r in results
+        ],
+        # 旧键保留：落库那份的末端复判（前端/日志看的就是这个）。
+        "final_recheck": chosen["verdict"],
     }
-    if not qualified_idx:
-        info["reason"] = "无合格候选，落库离目标最近的一份并标注偏离"
+    if not pool_info["accepted"]:
+        pool_info["reason"] = "无合格候选，落库离目标最近的一份并标注偏离"
     logging.getLogger(__name__).info(
-        "候选池择优：采 %d 份%s，选第 %s 份（合格 %s/%s，离目标 %.1f%%）",
-        len(cands), "（提前合格即停）" if stopped_early else "",
-        info.get("picked"), info.get("n_qualified"), info.get("n_candidates"),
-        (info.get("score") or 0.0) * 100,
+        "候选池末端择优：试了 %d 份候选，落库第 %s 份（合格 %s）",
+        pool_info["n_tried"], pool_info["picked"], pool_info["accepted"])
+    payload = {"summary": chosen["summary"], "chain": chosen["chain"]}
+    return chosen["final_text"], pool_info, payload
+
+
+def _run_text_chain(
+    provider,
+    db,
+    project: Project,
+    *,
+    text: str,
+    reference_texts: list[str] | None = None,
+    novel_ids: list[int] | None = None,
+    style_rewrite: bool | None = None,
+) -> tuple[str, str, dict]:
+    """把一份稿子走完**落库前的全部改文本工序**，返回 (正文, 段级摘要, 诊断)。
+
+    ## 为什么抽成独立函数
+
+    末端择优要**对多份候选重复跑同一条链**（见 `_run_pool_selection`）⇒
+    这条链必须能被调用多次。所以它得满足两条：
+
+    1. **只做文本变换 + 只读数据库** —— 不落库、不写库（唯一例外是照搬门禁
+       的后台索引预热，幂等）；
+    2. **不依赖任何调用方的局部状态**。
+
+    ## 顺序有讲究（别随手改）
+
+      场景审计 → AI 味重写 → 去重 → 文风改写 → 形态校正 → beat 插入 → 照搬门禁
+
+    - **去重在改写之前**：复读段落改写后可能「看起来不同」而逃过去重；
+    - **文风改写**要对着「最终要落库的文本」做；
+    - **形态校正**在文风改写之后：它把对白组织方式掰到参考书自己的形态；
+    - **beat 插入**在形态校正之后：形态校正只重排已有叙述，缺口要**新增**叙述来填；
+    - **照搬门禁**在所有改写之后：落库的是最终文本，门禁必须量最终文本。
+    """
+    text, scene_audit = _audit_and_repair_scene(
+        text, provider, reference_texts=reference_texts)
+    summary = provider.summarize(text)
+
+    # AI 味检测 + 针对性重写
+    narrative = _style_narrative(db, project)
+    forbidden = (narrative or {}).get("forbidden") or {}
+    ai_rewrite_info = None
+    need_rewrite, reasons = _should_rewrite(text, forbidden)
+    if need_rewrite:
+        try:
+            rw_system, rw_user = _rewrite_prompt(text, reasons, forbidden)
+            rewritten = provider.chat(rw_system, rw_user)
+            rewritten = _strip_thinking(rewritten)
+            if rewritten and len(rewritten) > len(text) * 0.5:
+                ai_rewrite_info = {"reasons": reasons, "original_chars": len(text),
+                                   "rewritten_chars": len(rewritten)}
+                text = rewritten
+                summary = provider.summarize(text)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("AI 味重写失败，保留原文: %s", exc)
+
+    # v2.273：落库前清段内自我重复（长文复读退化的确定性兜底）
+    text, dedup_stats = _dedup_before_commit(text)
+    if dedup_stats["removed_paragraphs"]:
+        summary = provider.summarize(text)
+
+    # v2.278：两段式文风改写。默认按**闸门**触发 —— 偏离参考书越远的那段
+    # 才值得多花一次模型调用（尺子 = 真正注入提示词的那份档案）。
+    text, rewrite_info = _maybe_rewrite_style(
+        project, text, provider,
+        profile=_style_profile(db, project), override=style_rewrite,
     )
-    return picked, info
+    # 形态校正：把对白组织方式掰到参考书自己的形态（闸门 = 参考书的逐单元分布带）
+    text, form_info = _maybe_correct_form(
+        db, project, text, provider,
+        profile=_style_profile(db, project), novel_ids=novel_ids,
+    )
+    # beat 插入：在连续对白段的开头补一句动作/神态叙述。
+    # 放在形态校正**之后** —— 形态校正只重排已有的叙述，碰到「前面也是台词」
+    # 就并无可并；这一步是**新增**叙述，填的正是那个缺口。
+    text, beat_info = _maybe_insert_beats(
+        db, project, text, provider, novel_ids=novel_ids,
+    )
+    if (rewrite_info.get("applied") or form_info.get("applied")
+            or beat_info.get("applied")):
+        summary = provider.summarize(text)
+
+    # 照搬门禁：正文 vs 参考语料。放在**所有**正文改写之后、落库之前 ——
+    # 落库的是最终文本，门禁必须量最终文本。
+    # 改不掉就抛 VerbatimViolation（可重试失败），这一段不落库。
+    text, verbatim_info = _maybe_fix_verbatim(
+        db, project, text, provider, novel_ids=novel_ids,
+    )
+    if verbatim_info.get("rewritten"):
+        summary = provider.summarize(text)
+
+    return text, summary, {
+        "scene_audit": scene_audit,
+        # `rewrite_info` = 文风改写那道的诊断（与从前一致：AI 味重写的诊断
+        # 以前会被它覆盖掉，这里另存一份，**不改变对外返回的字段含义**）。
+        "rewrite_info": rewrite_info,
+        "ai_rewrite_info": ai_rewrite_info,
+        "dedup_stats": dedup_stats,
+        "form_info": form_info,
+        "beat_info": beat_info,
+        "verbatim_info": verbatim_info,
+    }
+
+
+def _produce_with_pool(
+    provider,
+    db,
+    project: Project,
+    *,
+    system: str,
+    user: str,
+    ctx: dict,
+    stop_sequences=None,
+    pool_size: int = 1,
+    profile: dict | None = None,
+    target_chars: int | None = None,
+    novel_ids: list[int] | None = None,
+    style_rewrite: bool | None = None,
+) -> tuple[str, str, dict, dict, dict]:
+    """候选池路径：采样 → 逐份走链 → 同一把尺量**成品** → 落库第一份合格的。
+
+    返回 (最终正文, 段级摘要, 各道工序诊断, 候选池诊断, 段长报告)。
+
+    同步路径与流式路径共用这一份实现 ⇒ 两条路径的池口径**必然一致**
+    （以前两处各写一遍，改一处就会漏另一处）。
+    """
+    reference_texts = [
+        item.get("text", "") for item in (ctx.get("rag_items") or [])
+        if isinstance(item, dict)
+    ]
+
+    def _run_chain(t: str):
+        return _run_text_chain(
+            provider, db, project, text=t,
+            reference_texts=reference_texts,
+            novel_ids=novel_ids, style_rewrite=style_rewrite,
+        )
+
+    text, pool_info, payload = _run_pool_selection(
+        provider, system, user,
+        constraints=ctx.get("constraints"),
+        stop_sequences=stop_sequences,
+        pool_size=pool_size, profile=profile, target_chars=target_chars,
+        run_chain=_run_chain,
+    )
+    return (text, payload["summary"], payload["chain"], pool_info,
+            pool_info.get("length_report") or {})
 
 
 def _reference_plain_dialogue_ratio(
@@ -2668,91 +2807,44 @@ def generate_next_segment(
     # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
     # 重写/重生成是 AI 味修复，不传 stop
     #
-    # 候选池（Best-of-N / 拒绝采样）：同一提示采 N 份，按「参考书自己的分布」择优。
+    # 候选池（Best-of-N / 拒绝采样）：同一提示采 N 份，**每份走完整条链之后**
+    # 用同一把尺量**成品**，落库第一份合格的（末端择优，见 `_run_pool_selection`）。
     # 默认 pool_size=1 → 一次调用都不多，行为与从前完全一致。
-    text, pool_info = _generate_with_pool(
-        provider, system, user,
-        constraints=ctx["constraints"],
-        stop_sequences=get_section_stop_sequences(),
-        pool_size=_candidate_pool_size(),
-        profile=_style_profile(db, project),
-        target_chars=max_chars,
-    )
-    text = _strip_thinking(text)
-    # 段长闸门：写完先量**汉字**数，不够就回灌让模型扩写（有界）。
-    # 原来长度只是提示里的「软希望」——实测同一段要求 3000 汉字，模型交出 1900，
-    # 系统照收不误。提示单位改成汉字之后，这道闸门才量得准。
-    #
-    # 候选池开着时，闸门**已经在池内跑过**（打分之前）⇒ 这里不能再跑一遍：
-    # 再跑一次 = 对同一份稿子发起第二次扩写调用（白花钱），而且两次扩写的
-    # 结果不同 ⇒ 落库的就不再是「池选中的那份」，口径差又回来了。
-    if pool_info.get("gated"):
-        length_report = pool_info.get("length_report") or {}
+    _pool_size = _candidate_pool_size()
+    _profile = _style_profile(db, project)
+    if _pool_size > 1:
+        # 池路径：采样 → 逐份走链 → 末端择优。
+        # 段长闸门**在池内跑**（打分之前）⇒ 池外这道闸门不再跑一遍：
+        # 再跑一次 = 对同一份稿子发起第二次扩写调用（白花钱），而且两次扩写的
+        # 结果不同 ⇒ 落库的就不再是「池选中的那份」，口径差又回来了。
+        text, summary, chain, pool_info, length_report = _produce_with_pool(
+            provider, db, project, system=system, user=user, ctx=ctx,
+            stop_sequences=get_section_stop_sequences(),
+            pool_size=_pool_size, profile=_profile, target_chars=max_chars,
+            novel_ids=novel_ids, style_rewrite=style_rewrite,
+        )
     else:
+        raw = provider.chat(system, user, constraints=ctx["constraints"],
+                            stop_sequences=get_section_stop_sequences())
+        text = _strip_thinking(raw)
+        # 段长闸门：写完先量**汉字**数，不够就回灌让模型扩写（有界）。
+        # 原来长度只是提示里的「软希望」——实测同一段要求 3000 汉字，模型交出 1900，
+        # 系统照收不误。提示单位改成汉字之后，这道闸门才量得准。
         text, length_report = _enforce_length(
             provider, system, user, text, target_chars=max_chars,
             constraints=ctx["constraints"], stop_sequences=get_section_stop_sequences(),
             node_prompt=node_prompt)
-    text, scene_audit = _audit_and_repair_scene(text, provider, reference_texts=[item.get("text", "") for item in (ctx.get("rag_items") or []) if isinstance(item, dict)])
-    summary = provider.summarize(text)
-
-    # AI 味检测 + 针对性重写
-    narrative = _style_narrative(db, project)
-    forbidden = (narrative or {}).get("forbidden") or {}
-    rewrite_info = None
-    need_rewrite, reasons = _should_rewrite(text, forbidden)
-    if need_rewrite:
-        try:
-            rw_system, rw_user = _rewrite_prompt(text, reasons, forbidden)
-            rewritten = provider.chat(rw_system, rw_user)
-            rewritten = _strip_thinking(rewritten)
-            if rewritten and len(rewritten) > len(text) * 0.5:
-                rewrite_info = {"reasons": reasons, "original_chars": len(text), "rewritten_chars": len(rewritten)}
-                text = rewritten
-                summary = provider.summarize(text)
-        except Exception as exc:  # noqa: BLE001
-            logging.getLogger(__name__).warning("AI 味重写失败，保留原文: %s", exc)
-
-    # v2.273：落库前清段内自我重复（长文复读退化的确定性兜底）
-    text, dedup_stats = _dedup_before_commit(text)
-    if dedup_stats["removed_paragraphs"]:
-        summary = provider.summarize(text)
-
-    # v2.278：两段式文风改写。默认按**闸门**触发 —— 偏离参考书越远的那段
-    # 才值得多花一次模型调用（尺子 = 真正注入提示词的那份档案）。
-    # 实测：一次性生成 3000 字句长只有 16，而改写已有文本能到 60。
-    text, rewrite_info = _maybe_rewrite_style(
-        project, text, provider,
-        profile=_style_profile(db, project), override=style_rewrite,
-    )
-    # 形态校正：把对白组织方式掰到参考书自己的形态（闸门 = 参考书的逐单元分布带）
-    text, form_info = _maybe_correct_form(
-        db, project, text, provider,
-        profile=_style_profile(db, project), novel_ids=novel_ids,
-    )
-    # 正文变了 → 段级摘要要重算（改写与形态校正都可能改了正文）
-    # beat 插入：在连续对白段的开头补一句动作/神态叙述。
-    # 放在形态校正**之后** —— 形态校正只重排已有的叙述，碰到「前面也是台词」
-    # 就并无可并；这一步是**新增**叙述，填的正是那个缺口。
-    text, beat_info = _maybe_insert_beats(
-        db, project, text, provider, novel_ids=novel_ids,
-    )
-    if (rewrite_info.get("applied") or form_info.get("applied")
-            or beat_info.get("applied")):
-        summary = provider.summarize(text)
-
-    # 照搬门禁：正文 vs 参考语料。放在**所有**正文改写之后、落库之前 ——
-    # 落库的是最终文本，门禁必须量最终文本。
-    # 改不掉就抛 VerbatimViolation（可重试失败），这一段不落库。
-    text, verbatim_info = _maybe_fix_verbatim(
-        db, project, text, provider, novel_ids=novel_ids,
-    )
-    if verbatim_info.get("rewritten"):
-        summary = provider.summarize(text)
-
-    # 末端复判：择优的结论到落库这一刻还成立吗？（零模型调用，只量不算）
-    _recheck_pool_verdict(pool_info, text, profile=_style_profile(db, project),
-                          target_chars=max_chars)
+        pool_info = {"applied": False, "reason": "候选池关闭"}
+        # 落库前的全部改文本工序（抽成独立函数：末端择优要对多份候选重复跑它）
+        text, summary, chain = _run_text_chain(
+            provider, db, project, text=text,
+            reference_texts=[item.get("text", "") for item in (ctx.get("rag_items") or []) if isinstance(item, dict)],
+            novel_ids=novel_ids, style_rewrite=style_rewrite)
+    scene_audit = chain["scene_audit"]
+    rewrite_info = chain["rewrite_info"]
+    form_info = chain["form_info"]
+    beat_info = chain["beat_info"]
+    verbatim_info = chain["verbatim_info"]
 
     gen, segment_no = _commit_segment(db, project, text, summary)
     # 正文变了 → 上一版的整段验收**不再覆盖这一版**：义务换绑（不删除），
@@ -2920,25 +3012,23 @@ def generate_next_segment_stream(
     # v2.6：节点粒度根治——流式版同步传 per-request stop token
     #
     # 候选池（Best-of-N / 拒绝采样）：流式路径**不能**边生成边择优
-    # （择优要看到全貌），所以这里先非流式采 N 份、择优，再把选中那份**分块吐出来**。
+    # （择优要看到全貌），所以这里先非流式采 N 份、**每份走完整条链**，
+    # 用同一把尺量**成品**，落库第一份合格的（末端择优）。
+    # ⇒ 池路径吐出来的字与落库的**逐字相同**（以前吐的是链之前的稿子，
+    #   链上几道工序改完就与界面显示的对不上了）。
     # pool_size=1（默认）时走下面的默认路径。
     _pool_size = _candidate_pool_size()
+    _profile = _style_profile(db, project)
     if _pool_size > 1:
-        _picked, _pool_info = _generate_with_pool(
-            provider, system, user,
-            constraints=ctx["constraints"],
+        text, summary, chain, _pool_info, length_report = _produce_with_pool(
+            provider, db, project, system=system, user=user, ctx=ctx,
             stop_sequences=get_section_stop_sequences(),
-            pool_size=_pool_size,
-            profile=_style_profile(db, project),
-            # 目标字数：池内的段长闸门与守恒判据都要它（同步版一直传，
-            # 流式版以前漏了 ⇒ 池在流式路径上**不查字数**，与同步版口径不一致）。
-            target_chars=max_chars,
+            pool_size=_pool_size, profile=_profile, target_chars=max_chars,
+            novel_ids=novel_ids, style_rewrite=style_rewrite,
         )
-        text = _strip_thinking(_picked)
-        # 分块吐出去（前端按 chunk 增量渲染）
+        # 分块吐出去（前端按 chunk 增量渲染）—— 吐的是**落库的那一份**
         for _i in range(0, len(text), 800):
             yield {"type": "chunk", "text": text[_i:_i + 800]}
-        length_report = _pool_info.get("length_report") or {}
     else:
         # —— 默认路径（候选池关着）——
         #
@@ -2966,66 +3056,16 @@ def generate_next_segment_stream(
         # 分块吐出去（前端按 chunk 增量渲染）
         for _i in range(0, len(text), 800):
             yield {"type": "chunk", "text": text[_i:_i + 800]}
-    text, scene_audit = _audit_and_repair_scene(text, provider, reference_texts=[item.get("text", "") for item in (ctx.get("rag_items") or []) if isinstance(item, dict)])
-    summary = provider.summarize(text)
-
-    # AI 味检测 + 针对性重写（补救措施，与 system prompt 的预防互补）
-    narrative = _style_narrative(db, project)
-    forbidden = (narrative or {}).get("forbidden") or {}
-    rewrite_info = None
-    need_rewrite, reasons = _should_rewrite(text, forbidden)
-    if need_rewrite:
-        try:
-            rw_system, rw_user = _rewrite_prompt(text, reasons, forbidden)
-            rewritten = provider.chat(rw_system, rw_user)
-            rewritten = _strip_thinking(rewritten)
-            if rewritten and len(rewritten) > len(text) * 0.5:
-                rewrite_info = {"reasons": reasons, "original_chars": len(text), "rewritten_chars": len(rewritten)}
-                text = rewritten
-                summary = provider.summarize(text)
-        except Exception as exc:  # noqa: BLE001 —— 重写失败不阻断，保留原文
-            logging.getLogger(__name__).warning("AI 味重写失败，保留原文: %s", exc)
-
-    # v2.273：落库前清段内自我重复（长文复读退化的确定性兜底）
-    text, dedup_stats = _dedup_before_commit(text)
-    if dedup_stats["removed_paragraphs"]:
-        summary = provider.summarize(text)
-
-    # v2.278：两段式文风改写。默认按**闸门**触发 —— 偏离参考书越远的那段
-    # 才值得多花一次模型调用（尺子 = 真正注入提示词的那份档案）。
-    # 实测：一次性生成 3000 字句长只有 16，而改写已有文本能到 60。
-    text, rewrite_info = _maybe_rewrite_style(
-        project, text, provider,
-        profile=_style_profile(db, project), override=style_rewrite,
-    )
-    # 形态校正：把对白组织方式掰到参考书自己的形态（闸门 = 参考书的逐单元分布带）
-    text, form_info = _maybe_correct_form(
-        db, project, text, provider,
-        profile=_style_profile(db, project), novel_ids=novel_ids,
-    )
-    # 正文变了 → 段级摘要要重算（改写与形态校正都可能改了正文）
-    # beat 插入：在连续对白段的开头补一句动作/神态叙述。
-    # 放在形态校正**之后** —— 形态校正只重排已有的叙述，碰到「前面也是台词」
-    # 就并无可并；这一步是**新增**叙述，填的正是那个缺口。
-    text, beat_info = _maybe_insert_beats(
-        db, project, text, provider, novel_ids=novel_ids,
-    )
-    if (rewrite_info.get("applied") or form_info.get("applied")
-            or beat_info.get("applied")):
-        summary = provider.summarize(text)
-
-    # 照搬门禁：正文 vs 参考语料。放在**所有**正文改写之后、落库之前 ——
-    # 落库的是最终文本，门禁必须量最终文本。
-    # 改不掉就抛 VerbatimViolation（可重试失败），这一段不落库。
-    text, verbatim_info = _maybe_fix_verbatim(
-        db, project, text, provider, novel_ids=novel_ids,
-    )
-    if verbatim_info.get("rewritten"):
-        summary = provider.summarize(text)
-
-    # 末端复判：择优的结论到落库这一刻还成立吗？（零模型调用，只量不算）
-    _recheck_pool_verdict(_pool_info, text, profile=_style_profile(db, project),
-                          target_chars=max_chars)
+        # 落库前的全部改文本工序（抽成独立函数：末端择优要对多份候选重复跑它）
+        text, summary, chain = _run_text_chain(
+            provider, db, project, text=text,
+            reference_texts=[item.get("text", "") for item in (ctx.get("rag_items") or []) if isinstance(item, dict)],
+            novel_ids=novel_ids, style_rewrite=style_rewrite)
+    scene_audit = chain["scene_audit"]
+    rewrite_info = chain["rewrite_info"]
+    form_info = chain["form_info"]
+    beat_info = chain["beat_info"]
+    verbatim_info = chain["verbatim_info"]
 
     gen, segment_no = _commit_segment(db, project, text, summary)
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）

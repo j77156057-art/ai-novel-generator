@@ -1,18 +1,19 @@
-"""候选打分与择优（`app/generation/candidate.py`）
+"""候选打分（`app/generation/candidate.py`）
 
 覆盖的判据：
 
 1. 空文本 → 不合格；
-2. 守恒判据：比同伴缩水太多 → 不合格；膨胀太多 → 不合格；
+2. 守恒判据：比**外部字数目标**缩水太多 → 不合格；膨胀太多 → 不合格；
 3. 形态不在参考书分布带内 → 不合格（**带**取档案的 p10~p90）；
-4. 择优：合格里选离分布中心最近的；
-5. **下限兜底**：一个都不合格时，落库离目标最近的那份（不闭眼挑）；
-6. 只有一个候选 → 原样返回，不做选择；
-7. 没有档案 → 判不出形态，但**不判不合格**（档案是增强，不是生成的前提）；
-8. N 的收敛：1 = 关闭，超上限被夹住；
-9. **打分必须在校正之后**（用真实档案验证：机械校正后形态才进带）。
+4. 没有档案 → 判不出形态，但**不判不合格**（档案是增强，不是生成的前提）；
+5. N 的收敛：1 = 关闭，超上限被夹住；
+6. **打分必须在校正之后**（用真实档案验证：机械校正后形态才进带）。
 
-第 9 条用的是**真实语料**：从参考书语料里切一段当档案，
+「**选哪一份**」不在本模块：选择发生在整条链跑完之后
+（`engine._run_pool_selection` 的末端择优），对应用例见
+`tests/test_candidate_pool_engine.py`。
+
+第 6 条用的是**真实语料**：从参考书语料里切一段当档案，
 再用生产代码 `merge_bare_dialogue` 校正一段「一行一句台词」的正文 ——
 校正前应在带外、校正后应进带。这是本模块与机械校正**同一把尺**的证明。
 """
@@ -32,7 +33,6 @@ from app.generation.candidate import (  # noqa: E402
     MAX_POOL_SIZE,
     normalize_pool_size,
     score_candidate,
-    select_best,
 )
 
 
@@ -92,16 +92,20 @@ def test_shrunk_candidate_rejected():
 
 
 def test_short_but_shape_good_is_not_killed_by_peer_median():
-    """**不传**字数基准时，只按形态判 —— 一份短但形态好的稿子不该被杀。
+    """守恒判据的**基准是外部的字数目标**，不是同伴中位数。
 
-    这是第一版的真 bug：拿同伴中位数当基准 → 形态最差（也最短）的那份
-    先被字数判据毙掉，择优变成了「谁长谁赢」。
+    踩过的坑：拿同伴中位数当基准时，两份候选长度天然不同（形态差的稿子往往更短）
+    ⇒ 正常的候选被判成「膨胀/缩水」而误杀，择优变成了「谁长谁赢」。
+    ⇒ 同一个外部目标下：形态好的那份**不会**因为比同伴短而被杀，
+    形态差的那份照样不合格（形态判据在起作用）。
     """
-    short_good = _text(_mixed_paragraphs(3))
-    long_bad = _text(_bare_paragraphs(12))
-    picked, info = select_best([short_good, long_bad], profile=_profile())
-    assert picked == short_good, "短但形态好的候选应被选中"
-    assert info["n_qualified"] >= 1
+    short_good = _text(_mixed_paragraphs(3))     # 短、但形态好
+    long_bad = _text(_bare_paragraphs(12))       # 形态差（纯台词 100%）
+    target = 100                                 # 外部的字数目标（段长闸门用的那个）
+    c = score_candidate(short_good, profile=_profile(), baseline_chars=target)
+    assert c.ok, c.reject
+    assert not score_candidate(long_bad, profile=_profile(),
+                               baseline_chars=target).ok
 
 
 def test_inflated_candidate_rejected():
@@ -156,47 +160,14 @@ def test_in_band_accepted():
     assert c.score >= 0
 
 
-# ── 4. 择优：合格里选最近的 ──────────────────────────────────────────────
-def test_selects_closest_among_qualified():
-    # 两个合格（形态都在带内）、一个不合格（纯台词）
-    a = _text(_mixed_paragraphs(6))
-    b = _text(_mixed_paragraphs(6))
-    bad = _text(_bare_paragraphs(6))
-    picked, info = select_best([a, b, bad], profile=_profile())
-    assert info["applied"]
-    assert info["n_qualified"] == 2
-    assert picked in (a, b)          # 绝不会选中不合格的那份
-    assert info["picked"] != 2
+# ── 4. 选择规则（择优/兜底）现在住在引擎里 ──────────────────────────────
+# 「合格里选最近的」「都不合格时落最接近的那份」由
+# `engine._run_pool_selection` 承担（因为它要看**成品**，不是原稿）——
+# 对应用例见 `tests/test_candidate_pool_engine.py`。
+# 本模块只负责**量**：给一份文本打分、判它合不合格。
 
 
-# ── 5. 下限兜底 ──────────────────────────────────────────────────────────
-def test_all_unqualified_falls_back_to_closest():
-    bad1 = _text(_bare_paragraphs(6))       # 形态 100%
-    bad2 = _text(_bare_paragraphs(6))
-    picked, info = select_best([bad1, bad2], profile=_profile())
-    assert info["applied"]
-    assert info["n_qualified"] == 0
-    assert picked in (bad1, bad2)
-    assert "落库" in info.get("reason", "")
-
-
-def test_fallback_picks_min_distance_not_first():
-    # 两份都不合格，但离目标远近不同 → 必须选近的
-    far = _text(_bare_paragraphs(12))   # 更极端
-    near = _text(_mixed_paragraphs(3) + _bare_paragraphs(3))
-    picked, info = select_best([far, near], profile=_profile())
-    assert picked == near
-
-
-# ── 6. 单候选 ────────────────────────────────────────────────────────────
-def test_single_candidate_passthrough():
-    t = _text(_mixed_paragraphs(3))
-    picked, info = select_best([t], profile=_profile())
-    assert picked == t
-    assert not info["applied"]
-
-
-# ── 7. 没有档案 ──────────────────────────────────────────────────────────
+# ── 5. 没有档案 ──────────────────────────────────────────────────────────
 def test_no_profile_means_unjudgeable_not_不合格():
     t = _text(_bare_paragraphs(6))
     c = score_candidate(t, profile=None)

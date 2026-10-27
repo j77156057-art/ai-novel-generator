@@ -38,3 +38,4 @@ htmlcov/
 
 # 真跑测量台的输出（每次跑都会变，不进版本库）
 tests/qa_lead_on_demand_run.json
+tests/qa_pool_final_selection_run.json

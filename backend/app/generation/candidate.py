@@ -1,4 +1,13 @@
-"""候选打分与择优：给「同一提示采样 N 份，选最好的那份」提供一把尺子。
+"""候选打分：给「同一提示采样 N 份」提供**一把尺子**。
+
+## 这个模块负责什么 / 不负责什么
+
+- **负责**：给一份文本打分 —— 守恒（字数不缩水/不膨胀）+ 形态（落在参考书
+  自己的分布带里），并给出「离分布中心多远」这个可比较的分数。
+- **不负责**：**选哪一份**。选择发生在**整条链跑完之后**
+  （`engine._run_pool_selection` 的末端择优）——
+  因为落库的不是「一次采样的原稿」，而是它被后面几道工序改过之后的东西。
+  ⇒ 量与选**分开**：本模块是纯函数，好测；选择在引擎里，因为它要看成品。
 
 ## 为什么有这个东西
 
@@ -25,6 +34,9 @@ Best-of-N 的头号风险是 **reward hacking**：打分器有偏时，选择压
 1. **打分必须含「守恒」判据**，不能只看形态。
    否则就是 reward hacking 的温和版：挑到「形态对但内容空」的稿子。
    所以每一份候选都要过**字数不缩水/不膨胀 + 对白不丢**。
+   （例外：**末端**那次判定只判形态 —— 长度已由段长闸门管过，
+   而文风改写会压缩 15%~25%，用守恒下限去裁决链后的文本会系统性误杀。
+   见 `engine._judge_final_text`。）
 2. **N 有界且默认小**：收益随 log(N) 增长、成本线性增长
    （[拒绝采样实践要点](https://yijia.ws/llm/2026-08-26-057)：N=16~32 性价比最高，
    但那是「生成很便宜」的假设；我们一次真跑 4~9 分钟，N 必须小）。
@@ -50,7 +62,6 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass, field
-from typing import Sequence
 
 #: 候选池的默认上限。
 #:
@@ -209,90 +220,6 @@ def score_candidate(
         cand.score = 0.0
         cand.form = {"error": f"{type(exc).__name__}: {exc}"}
         return cand
-
-
-def select_best(
-    texts: Sequence[str],
-    *,
-    profile: dict | None,
-    pool_size: int = DEFAULT_POOL_SIZE,
-    preview=None,
-    target_chars: int | None = None,
-) -> tuple[str, dict]:
-    """从若干份候选里挑一份，返回 (选中的正文, 诊断)。
-
-    ## 选择规则（先合格、再择优）
-
-    1. **合格** = 过了守恒判据，且形态落在参考书自己的分布带里；
-    2. 合格里选**离分布中心最近**的（`score` 最小）；
-    3. **一个都不合格 → 选 score 最小的那个**（下限兜底：宁可偏离也要落库），
-       并如实标注它为什么不合格。
-
-    ## `preview` 是什么
-
-    打分用的**变换后**文本，而**返回的是原文**。用来做「先机械校正、再择优」：
-    机械合并能把「一行一句台词」掰成参考书形态，所以应该按**校正后**的形态打分；
-    但校正这件事由流水线自己的那道工序做（它还有闸门与模式开关），
-    择优层只借它**预测**一下结果，不越俎代庖。
-
-    ## `target_chars` 是什么
-
-    守恒判据的**字数目标**（段长闸门用的那个）。给了才做字数检查 ——
-    给了就按目标判（比目标短太多 = 内容没写够；比目标膨胀太多 = 凭空扩写）。
-    不给 → 只按形态判（字数不可知时不猜）。
-
-    ## 为什么第 3 条不是「随便挑一个」
-
-    拒绝采样的要点是「预算不确定，但**保证最低质量**」。这里保证的「最低质量」
-    = 形态离参考书最近的那份。哪怕都超出分布带，也比闭眼挑一份强。
-    """
-    pool = [t for t in (texts or []) if (t or "").strip()]
-    if not pool:
-        return "", {"applied": False, "reason": "没有候选"}
-    if len(pool) == 1:
-        return pool[0], {"applied": False, "reason": "只有一个候选", "picked": 0}
-
-    def _pv(t: str) -> str:
-        if preview is None:
-            return t
-        try:
-            out = preview(t)
-            return out if (out or "").strip() else t
-        except Exception:  # noqa: BLE001 —— 预览失败就用原文打分
-            return t
-
-    scored = [
-        score_candidate(_pv(t), profile=profile, baseline_chars=target_chars)
-        for t in pool
-    ]
-
-    qualified = [c for c in scored if c.ok]
-    pool_used = qualified if qualified else scored
-    best = min(pool_used, key=lambda c: (c.score, len(c.text)))
-
-    picked = next(i for i, c in enumerate(scored) if c is best)
-    info = {
-        "applied": True,
-        "n_candidates": len(scored),
-        "n_qualified": len(qualified),
-        "picked": picked,
-        "score": round(best.score, 4),
-        "form": best.form,
-        "target": best.target,
-        "candidates": [
-            {
-                "index": i,
-                "chars": _cjk_len(c.text),
-                "score": (None if c.score == float("inf") else round(c.score, 4)),
-                "reject": c.reject,
-                "form_value": (c.form or {}).get("value"),
-            }
-            for i, c in enumerate(scored)
-        ],
-    }
-    if not qualified:
-        info["reason"] = "无合格候选，落库离目标最近的一份并标注偏离"
-    return best.text, info
 
 
 def normalize_pool_size(value: int | None) -> int:
