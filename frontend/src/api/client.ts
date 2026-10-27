@@ -381,6 +381,10 @@ export const api = {
     ),
 
   // 流式续写：SSE 逐块回调 onChunk，结束回调 onDone。流结束时 Promise resolve。
+  //
+  // ⚠️ chunk 的**到达时机**变了（2026-10-27）：后端现在「先生成 + 过段长闸门，
+  // 再分块吐出」⇒ 首字延迟从秒级变成整段生成的时长。
+  // 换来的是：界面落库的段长与同步接口一致（闸门下限 = 目标 × 80%）。
   generateStream: (
     projectId: number,
     maxChars: number | null,
@@ -390,6 +394,17 @@ export const api = {
       chars: number;
       summary: string;
       id: number;
+      /** 实际汉字数（与 length_report.cjk 相同） */
+      cjk?: number;
+      /** 段长闸门的报告：目标 / 下限 / 实测 / 是否达标 */
+      length_report?: {
+        target_cjk?: number;
+        floor_cjk?: number;
+        cjk?: number;
+        attempts?: number;
+        below_target?: boolean;
+        below_floor?: boolean;
+      };
     }) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
@@ -427,6 +442,17 @@ export const api = {
                       chars: number;
                       summary: string;
                       id: number;
+                      /** 实际汉字数（与 length_report.cjk 相同） */
+                      cjk?: number;
+                      /** 段长闸门的报告：目标 / 下限 / 实测 / 是否达标 */
+                      length_report?: {
+                        target_cjk?: number;
+                        floor_cjk?: number;
+                        cjk?: number;
+                        attempts?: number;
+                        below_target?: boolean;
+                        below_floor?: boolean;
+                      };
                     }
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
@@ -491,6 +517,17 @@ export const api = {
                       chars: number;
                       summary: string;
                       id: number;
+                      /** 实际汉字数（与 length_report.cjk 相同） */
+                      cjk?: number;
+                      /** 段长闸门的报告：目标 / 下限 / 实测 / 是否达标 */
+                      length_report?: {
+                        target_cjk?: number;
+                        floor_cjk?: number;
+                        cjk?: number;
+                        attempts?: number;
+                        below_target?: boolean;
+                        below_floor?: boolean;
+                      };
                     }
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
