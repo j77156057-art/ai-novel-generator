@@ -181,7 +181,21 @@ if _url_to_path(_bound) is None or os.path.abspath(
 
 
 def _cleanup_temp_db() -> None:
-    """会话结束：删掉临时库文件（连同可能产生的 -wal/-shm）与专属临时目录。"""
+    """会话结束：删掉临时库文件（连同可能产生的 -wal/-shm）与专属临时目录。
+
+    ⚠️ 必须先 `engine.dispose()`：**Windows 上「进程自己打开的文件」也删不掉**。
+    连接池里挂着一个没关的 SQLite 连接，`os.remove` / `rmtree` 就会失败
+    （前者被 `except OSError` 吞掉、后者靠 `ignore_errors=True` 静默跳过）
+    ⇒ 每跑一次测试就在临时目录留一个 test.db。
+    本机曾经就这样攒下 600 多个 `ai_novel_pytest_<pid>.db`。
+    """
+    app_db = sys.modules.get("app.db")
+    if app_db is not None:
+        try:
+            app_db.engine.dispose()
+        except Exception:  # pragma: no cover - 解释器收尾时模块可能已被拆
+            pass
+
     path = _url_to_path(_TEMP_DB_URL)
     if path:
         for suffix in ("", "-wal", "-shm"):
