@@ -17,9 +17,11 @@
 ```bash
 # 需要：一个带**新口径形态档案**的库（档案里要有「纯台词段占比」这一项）+ 一个可用的 OpenAI 兼容端点
 export LEAD_API_KEY=sk-...            # 凭据只从环境变量读，不进仓库、不进日志
-export LEAD_BASE_URL=https://…/v1
-export LEAD_MODEL=qiniu/conatus-free  # 端点上**真的能调**的模型
-export LEAD_THINKING=off              # off = 发 thinking:{"type":"disabled"}
+export LEAD_MODE=minimax              # minimax = **生产写手那条**（官方端点 + 生产模型链）
+export LEAD_MODE=relay                # relay = OpenAI 兼容中转站
+export LEAD_BASE_URL=https://…/v1   # relay 模式才需要
+export LEAD_MODEL=qiniu/conatus-free  # relay 模式：端点上**真的能调**的模型
+export LEAD_THINKING=off              # relay 模式：off = 发 thinking:{"type":"disabled"}
 python tests/qa_lead_on_demand.py <库路径> [<库路径> …]
 ```
 
@@ -56,7 +58,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(REPO, "backend"))
 
 from app.config import settings  # noqa: E402
-from app.llm.provider import GenericOpenAIChatProvider  # noqa: E402
+from app.llm.provider import GenericOpenAIChatProvider, MiniMaxChatProvider  # noqa: E402
 from app.style.form import form_target, measure_form  # noqa: E402
 from app.style.form_merge import merge_bare_dialogue  # noqa: E402
 from app.style.lead_in import (  # noqa: E402
@@ -73,6 +75,11 @@ OUT = os.path.join(REPO, "tests", "qa_lead_on_demand_run.json")
 #: 拿到别的 OpenAI 兼容端点上是 403 —— 模型链必须跟着端点走。
 LEAD_MODELS = ("qiniu/conatus-free", "moonshotai/kimi-k3-free")
 
+#: `relay` = OpenAI 兼容中转站；`minimax` = **生产写手那条**（官方端点 + 生产模型链）。
+#: 两者跑同一批正文，量的东西一样（调用数 / 采纳率 / 进带率 / 耗时），
+#: 区别只在「生产开箱即用的那条路」表现如何。
+LEAD_MODE = (os.environ.get("LEAD_MODE") or "relay").strip().lower()
+
 #: kimi-k3 是思考类模型：`max_tokens=320` 时每次都 `finish=length` 空返回。
 #: 引导语正文只用 ~30 字，需要的是「先想几个词再写完」的预算。
 LEAD_MAX_TOKENS = int(os.environ.get("LEAD_MAX_TOKENS", "3000"))
@@ -83,10 +90,29 @@ LEAD_THINKING = (os.environ.get("LEAD_THINKING") or "off").strip().lower()
 
 
 def _provider():
-    """提供方**只**从环境变量拿凭据 —— 不读库、不打印、不落盘。"""
+    """提供方**只**从环境变量拿凭据 —— 不读库、不打印、不落盘。
+
+    `minimax` 模式复刻**生产写手那条**：官方端点 + 生产模型链
+    （`settings.minimax_model_list`）+ 生产的 `max_tokens` / `timeout` /
+    `reasoning_effort`。所以「生产开箱即用」的表现能被量出来，
+    而不是「另配一套参数跑出来的」。
+    """
     key = (os.environ.get("LEAD_API_KEY") or "").strip()
     if not key:
         raise SystemExit("no api key in env (LEAD_API_KEY)")
+    if LEAD_MODE == "minimax":
+        model = (os.environ.get("LEAD_MODEL")
+                 or (getattr(settings, "minimax_model", "") or "")).strip()
+        chain = [model] + [m for m in (settings.minimax_model_list or [])
+                           if m != model]
+        return MiniMaxChatProvider(
+            key, (os.environ.get("LEAD_BASE_URL")
+                  or settings.minimax_base_url).rstrip("/"), model,
+            models=chain,
+            max_tokens=int(getattr(settings, "writer_max_tokens", 0) or 0) or None,
+            timeout=int(getattr(settings, "writer_timeout", 0) or 0) or 300,
+            reasoning_effort=getattr(settings, "minimax_reasoning_effort", None),
+        )
     base = (os.environ.get("LEAD_BASE_URL") or "").strip().rstrip("/")
     if not base:
         raise SystemExit("no base url in env (LEAD_BASE_URL)")
@@ -163,8 +189,12 @@ def main() -> None:
 
     print("style_lead_in(default) =", bool(getattr(settings, "style_lead_in", None)))
     print("LEAD_IN_SAFETY_SLOTS  =", LEAD_IN_SAFETY_SLOTS)
-    print("relay model/max_tokens =", (os.environ.get("LEAD_MODEL") or LEAD_MODELS[0]),
-          LEAD_MAX_TOKENS, "thinking=" + LEAD_THINKING)
+    if LEAD_MODE == "minimax":
+        print("mode=minimax (生产写手那条)  model=", os.environ.get("LEAD_MODEL")
+              or settings.minimax_model, " chain=", settings.minimax_model_list)
+    else:
+        print("relay model/max_tokens =", (os.environ.get("LEAD_MODEL") or LEAD_MODELS[0]),
+              LEAD_MAX_TOKENS, "thinking=" + LEAD_THINKING)
     print()
 
     segs: list = []
