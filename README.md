@@ -363,6 +363,9 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 - **CI** —— `.github/workflows/ci.yml`:每次 push / PR 跑**后端全量 pytest** 与
   **前端测试 + 构建**（`npm test` + `npm run build`，后者自带 `vue-tsc` 类型检查）。
   跑的就是 README「跑测试」那一节写的命令 —— 不给 CI 另写一套更严格的检查。
+  **在 Linux 上绿**（不是只有本机绿）。
+  第一次跑就红过一次，抓到的是本机**看不见**的缺陷（测试子进程把父进程的 SQLite
+  文件删了 —— Windows 删不掉打开中的文件，所以本机全绿）：详见 `ENGINEERING.md`。
 - **规模** —— 后端 **1,500** 项测试(`pytest tests`)，前端 7 个纯逻辑测试文件（38 项）
   + 3 个组件级测试文件（26 项，vitest + jsdom）。**当前全绿**。此前长期红的 8 项已清零：7 项是断言滞后于设计变更(采样率 15%→30%、
   维度 14→16、采样加了「30 万字下限保护」)，1 项是模型清单三处不一致的真 bug;
