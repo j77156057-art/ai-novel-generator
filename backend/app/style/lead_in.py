@@ -17,21 +17,26 @@ A 类也只降到 35%，采纳率还随量下降 ⇒ 那条路被否掉（`style
 本模块把引导语**并进台词段本身**（冒号形态 `叙述：“台词”`）⇒
 **裸台词段直接变成混合段**，指标当场下降。
 
-实测（9 段真实产物，MiniMax-M3.1-Flash，effort=low）：
+实测（9 段真实产物，MiniMax-M3.1-Flash，effort=low，**两轮独立复跑**）：
 
 | | 纯台词段占比（汇总口径） |
 |---|---|
 | 校正前 | 71.5% |
 | 机械合并后 | 42.2% |
-| **加引导语后** | **21.3%**（参考书 22.7%，目标 18.7%） |
+| **加引导语后** | **20.9% / 21.8%** |
 
-采纳率 90%（115/128），9 段共 109 秒，正文字数 +7.2%。
+参考书 22.7%、目标 18.7% ⇒ 进了参考书的分布带。
+
+采纳率 97% / 93%，正文字数 +7.0~7.1%，9 段共 135~165 秒（并发 6）。
+两轮的差别只来自模型采样（温度 0.2 不是 0）⇒ **单次数字不能当结论**。
 
 ## 判据（六道，全过才采纳）
 
 1. **长度** 10~30 字（真书引导语 p25~p75 = 7~27 字）；
 2. **不含引号** + **像叙述**（默认是叙述，只在明确是说理时才拒）；
 3. **不含新的人名/地名/物件**、**不报数**（不能凭空造事实）；
+   —— 模型自报的专名必须在「专名表 / 上下文 / **参考书原文**」里
+   （参考书原文当**专名白名单**用：整串精确匹配，没有误杀风险）；
 4. **不与已采纳的引导语重复**（2-gram Jaccard ≥ 0.40 或字符集 Jaccard ≥ 0.60）；
 5. **不与上下文局部重复**（滑动窗口 2-gram Jaccard ≥ 0.25）——
    整段 Jaccard 会把短句跟长段比，相似度被稀释 ⇒ 漏检（实测漏掉 10/14）；
@@ -236,6 +241,7 @@ def insert_lead_ins(
     *,
     target_ratio: float,
     proper_nouns: set[str] | None = None,
+    corpus_text: str | None = None,
     max_lead_ins: int = MAX_LEAD_INS,
     concurrency: int = LEAD_IN_CONCURRENCY,
 ) -> tuple[list[str], dict]:
@@ -331,6 +337,7 @@ def insert_lead_ins(
         new_words, degraded = check_no_new_facts(
             lead, f"{before}\n{dialogue}\n{after}\n" + "\n".join(ps),
             proper_nouns=proper_nouns, declared_nouns=declared,
+            corpus_text=corpus_text,
         )
         if degraded:
             info["degraded"] = True

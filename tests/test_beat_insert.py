@@ -125,7 +125,7 @@ def test_plain_action_is_accepted():
     ])
     _text, info = _insert_beats(BODY, p, target_ratio=0.0, proper_nouns=PROPER_NOUNS)
     assert info["inserted"] == 3
-    assert info["vocab_source"] == "参考书原文" or "vocab_source" in info
+    assert "proper_noun_source" in info
 
 
 def test_declared_noun_line_is_stripped_from_beat():

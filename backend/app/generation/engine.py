@@ -611,6 +611,7 @@ def _maybe_correct_form(
                     work_paras, lead_info = insert_lead_ins(
                         work_paras, provider, target_ratio=target["target"],
                         proper_nouns=_reference_proper_nouns(db, project, novel_ids),
+                        corpus_text=_reference_corpus_text(db, project, novel_ids) or None,
                     )
                 except Exception as exc:  # noqa: BLE001 —— 补写失败绝不能影响正文
                     logging.getLogger(__name__).warning("引导语补写异常，保留机械结果: %s", exc)

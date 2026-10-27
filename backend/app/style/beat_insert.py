@@ -28,13 +28,30 @@
 1. **长度**在 10~30 字（真书 C 类引号前叙述 p25~p75 = 7~27 字）；
 2. **不含引号**（不能写台词 —— 那是改写，不是插入）+ **像叙述**
    （默认是叙述，只在明确是说理时才拒 —— 白名单当必要条件会误杀）；
-3. **不含新的人名/地名/物件**（不能凭空造事实；用真实专名表过滤）；
+3. **不含新的人名/地名/物件**（不能凭空造事实；用真实专名表过滤）——
+   **模型自报的专名**必须在「专名表 / 上下文 / **参考书原文**」里；
 4. **不推进剧情** —— 靠「不出现上下文里没有的专名」近似保证
    （模型若要写新事实，必然要引入新专名或新事件描述）；
-5. **不重复**：① 不能与**已采纳的 beat** 重复（公共前缀 ≥ 4 字或字符集合
-   Jaccard ≥ 0.60）；② 不能与**插入点附近的原文**重复（2-gram Jaccard ≥ 0.45）
-   —— 上下文相似 ⇒ 句子撞车，真跑实测 4 条采纳里 2 条几乎一样，
-   另有 1 条与紧邻原文重复。
+5. **不重复**：① 不能与**已采纳的 beat** 重复（2-gram Jaccard ≥ 0.40
+   或字符集合 Jaccard ≥ 0.60）；② 不能与**插入点附近的原文**重复
+   （2-gram Jaccard ≥ 0.45）—— 上下文相似 ⇒ 句子撞车，真跑实测 4 条采纳里 2 条
+   几乎一样，另有 1 条与紧邻原文重复。
+
+## 2026-10-27 复验（真模型，9 段真实产物）
+
+判据 3 与 5 在那天被改过（见 `_ONE_IS_SOFT` / `_DUP_2GRAM_JACCARD` 的注释），
+**本路径的真模型记录是旧判据下测的** ⇒ 补跑：槽位 52、采纳 **49（94%）**，
+被拒 3 条全是「与上下文重复」。
+
+复验时还查出两处**真问题**：
+
+- `corpus_vocabulary()` 定义了却**从没被调用** ⇒ `corpus_text` 只影响一个诊断标签，
+  而那条标签（`vocab_source=参考书原文`）**在说谎** ——
+  模块 docstring 宣称「语汇白名单优先用参考书原文（最强）」，实际什么都没有。
+  ⇒ 已把参考书原文真的接上（只当**专名白名单**用，见 `check_no_new_facts`），
+  诊断字段改名 `proper_noun_source`，把话说准。
+- 同一文件里 `_windows()` **定义了两次**（后者覆盖前者），另有一个从未被调用的
+  `_context_proper_nouns()` ⇒ 已清掉。
 
 ## 失败策略
 
@@ -170,6 +187,12 @@ def _real_proper_nouns(text: str) -> set[str]:
 #: ⇒ 改成**逐字滑动**取 2 字窗口，与上下文的 2 字窗口集合比。
 #: 「没有抬头」在上下文里没有 ⇒ 会被疑；这仍然偏严，
 #: 但比整块切好得多（正常 beat 的实词多为上下文里出现过的 2 字组合）。
+#:
+#: ⚠️ 2026-10-27：**这套 2 字窗口的语汇白名单最终没有接上**。
+#: 三版都试过（按汉字块切 / 2 字窗口 / 采样语料），全都误杀正常 beat；
+#: 而「精确匹配**模型自报的专名**」没有这个问题（整串在不在书里是确定的）
+#: ⇒ 现在参考书原文只当**专名白名单**用，见 `check_no_new_facts`。
+#: 下面这个窗口函数保留着（判据 5 的「与上下文重复」用它算 2-gram）。
 _CONTENT_WINDOW = 2
 
 
@@ -179,47 +202,6 @@ def _windows(text: str, n: int = _CONTENT_WINDOW) -> set[str]:
     if len(clean) < n:
         return {clean} if clean else set()
     return {clean[i:i + n] for i in range(len(clean) - n + 1)}
-
-
-def _context_proper_nouns(context: str) -> set[str]:
-    """从上下文里抽「像专名的词」，当白名单用（没有专名表时的降级方案）。"""
-    out: set[str] = set()
-    for m in _PROPER_NOUN_HINT.finditer(context or ""):
-        s = m.group(1).strip()
-        if 2 <= len(s) <= 12:
-            out.add(s)
-    for m in _SPEAKER_HINT.finditer(context or ""):
-        out.add(m.group(1))
-    for w in _KNOWN_PROPER:
-        if w in (context or ""):
-            out.add(w)
-    return out
-
-
-def _windows(text: str, n: int = _CONTENT_WINDOW) -> set[str]:
-    """文本里所有 n 字连续窗口（去标点后）。"""
-    clean = re.sub(r"[^\u4e00-\u9fff]", "", text or "")
-    if len(clean) < n:
-        return {clean} if clean else set()
-    return {clean[i:i + n] for i in range(len(clean) - n + 1)}
-
-
-#: 参考书语汇白名单的缓存（按原文长度+首尾片段做 key）。
-#:
-#: 参考书有 500 万字，一次全量扫 2 字窗口约 1~2 秒 —— 同一段正文里要查好几次，
-#: 不缓存的话每次插入都重扫。
-_VOCAB_CACHE: dict[str, set[str]] = {}
-
-
-def corpus_vocabulary(corpus_text: str) -> set[str]:
-    """参考书的 2 字组合白名单（带缓存）。"""
-    key = f"{len(corpus_text)}:{corpus_text[:64]}:{corpus_text[-64:]}"
-    cached = _VOCAB_CACHE.get(key)
-    if cached is not None:
-        return cached
-    vocab = _windows(corpus_text)
-    _VOCAB_CACHE[key] = vocab
-    return vocab
 
 
 #: beat 里出现**数字** ⇒ 拒。
@@ -261,6 +243,7 @@ def check_no_new_facts(
     *,
     proper_nouns: set[str] | None = None,
     declared_nouns: list[str] | None = None,
+    corpus_text: str | None = None,
 ) -> tuple[list[str], bool]:
     """beat 里有没有可能造出事实的地方？
 
@@ -268,17 +251,35 @@ def check_no_new_facts(
 
     ## 三层判据（各管一件事，见模块 docstring）
 
-    1. **模型自报的专名**（`declared_nouns`）必须都在**专名表/上下文**里
+    1. **模型自报的专名**（`declared_nouns`）必须都在**专名表 / 上下文 / 参考书原文**里
        —— 模型自己说「我用了京城」，我们只管查表（确定性）。
     2. **数字** ⇒ 拒（新事实的来源）。
-    3. 专名表给了白名单，但**不逐词查**（中文没词边界，误杀太多）。
+    3. 专名表给了白名单，但**不逐词查内容词**（中文没词边界，误杀太多）。
 
-    ## 为什么不做「逐词查表」
+    ## 参考书原文当**专名白名单**（2026-10-27 接上）
 
-    试过三版都不成立（详见模块 docstring）：按汉字块切会把「老周没有抬头」
-    整块当成一个词 ⇒ 所有正常 beat 全被拒；按 2 字窗口切则「来回」「蹭着」
-    这类词上下文里本来就没有 ⇒ 照样误杀（13 个疑词）；
-    用采样过的语料查 ⇒ 仍误杀（「抬头」这种组合语料里不一定有）。
+    之前 `corpus_vocabulary()` 定义了却**从没被调用** —— `corpus_text` 只影响一个
+    诊断标签（`vocab_source=参考书原文`），而那条标签**在说谎**：
+    模块 docstring 宣称「判据 3 的语汇白名单优先用参考书原文（最强）」，
+    实际上什么都没有。
+
+    ⇒ 现在真的接上，但**只用于「模型自报的专名」这一条**：
+    一个专名如果**确实出现在参考书原文里**（整串精确匹配），它就不是新造的
+    事实 ⇒ 放行。
+
+    **为什么不逐词查内容词**（原方案）：试过三版都不成立（详见模块 docstring）
+    —— 按汉字块切会把「老周没有抬头」整块当成一个词 ⇒ 所有正常 beat 全被拒；
+    按 2 字窗口切则「来回」「蹭着」这类词上下文里本来就没有 ⇒ 照样误杀。
+    **精确匹配一个专名**没有这个问题：模型自己报上来的名字就那么几个，
+    整串在不在书里是确定的。
+
+    ## 为什么判据 1 不放行 `_KNOWN_PROPER`
+
+    `_KNOWN_PROPER`（常见地名/物件/称谓白名单）的用途是「**认出**常见专名」，
+    这里要的是「**检查有没有造新事实**」——
+    「京城」在白名单里被放行 = 允许模型凭空提到一个地名（实测：插入数 2 而非 0）。
+    ⇒ 这里**只**认专名表（`proper_nouns`）、上下文里出现过的名字、
+    以及**参考书原文里确实有**的名字。
     """
     suspicious: list[str] = []
 
@@ -287,7 +288,8 @@ def check_no_new_facts(
     #: **注意**：`_KNOWN_PROPER`（常见地名/物件/称谓白名单）**不能**在这里放行 ——
     #: 它的用途是「认出常见专名」，而这里是「检查有没有造新事实」：
     #: 「京城」在白名单里被放行 = 允许模型凭空提到一个地名（实测：插入数 2 而非 0）。
-    #: ⇒ 这里**只**认专名表（`proper_nouns`）与上下文里出现过的名字。
+    #: ⇒ 这里**只**认专名表（`proper_nouns`）、上下文里出现过的名字、
+    #: 以及参考书原文里确实有的名字。
     allowed = set(proper_nouns or ())
     for n in (declared_nouns or []):
         n = (n or "").strip()
@@ -297,6 +299,8 @@ def check_no_new_facts(
             continue
         if n in context:
             continue
+        if corpus_text and n in corpus_text:
+            continue        # 参考书原文里确实有这个名字 ⇒ 不是新造的
         suspicious.append(f"专名:{n}")
 
     # 判据 2：数字
@@ -539,9 +543,9 @@ def _insert_beats(
         info["reason"] = "不需要插入（A 类占比已在目标内）"
         return text, info
 
-    # 判据 3 的语汇白名单：优先用参考书原文（最强），
-    # 没有就退化成「上下文里出现过的词组」（并在诊断里标明降级）。
-    info["vocab_source"] = "参考书原文" if corpus_text else "上下文（降级）"
+    # 判据 3 的**专名白名单**：优先用参考书原文（整串精确匹配，最强且不误杀），
+    # 没有就退化成「上下文里出现过的名字」。
+    info["proper_noun_source"] = "参考书原文" if corpus_text else "仅上下文（降级）"
 
     accepted: list[tuple[int, str]] = []
     for slot in slots:
@@ -575,6 +579,7 @@ def _insert_beats(
         new_words, degraded = check_no_new_facts(
             beat, f"{slot.before}\n{slot.after}\n{text}",
             proper_nouns=proper_nouns, declared_nouns=declared,
+            corpus_text=corpus_text,
         )
         if degraded:
             info["degraded"] = True
