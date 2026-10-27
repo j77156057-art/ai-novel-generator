@@ -1,0 +1,73 @@
+name: CI
+
+# 每次 push / PR 都跑一遍：**后端全量 pytest + 前端测试与构建**。
+#
+# 为什么要有：README 里那些数字（用例数、前端测试数）本来只能靠人记着改；
+# 有了 CI，它们每次 push 都被机器重新验一遍。
+#
+# 跑的就是 README「跑测试」那一节写的命令 —— 本地能跑的，CI 也跑；
+# 不给 CI 另写一套「更严格」的检查。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend · pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+
+      - name: 跑全量测试
+        # pytest.ini 里已设 pythonpath = backend、testpaths = tests，
+        # 所以在仓库根跑 `pytest tests/` 就行。
+        # 缺外部语料/验收库的那几条会 **skip**（不是失败）——
+        # 那是「本机没有前置条件」，不是「这条用例不存在」。
+        run: python -m pytest tests/ -q
+
+  frontend:
+    name: frontend · test + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 跑测试
+        # = node --test tests/*.test.ts（纯逻辑）+ vitest run（组件级）
+        run: npm test
+
+      - name: 类型检查 + 构建
+        # package.json 的 build 脚本本身就是 `vue-tsc --noEmit && vite build`
+        run: npm run build

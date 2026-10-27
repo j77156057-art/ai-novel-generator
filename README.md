@@ -1,5 +1,7 @@
 # AI 小说生成器 · AI Novel Generator
 
+[![CI](https://github.com/j77156057-art/ai-novel-generator/actions/workflows/ci.yml/badge.svg)](https://github.com/j77156057-art/ai-novel-generator/actions/workflows/ci.yml)
+
 > **把「写一部长篇网文」拆成一套可工程化、可验证的流水线,并交给助理 agent 编排。**
 > A full-stack AI novel-generation engine: hybrid RAG retrieval, a knowledge-graph drift
 > guard, **bounded hierarchical context**, a **globally-shared style-distillation library**,
@@ -245,7 +247,7 @@ npm test               # = node --test tests/*.test.ts && vitest run
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/ -q              # 1,498 项用例（+ 9 项需外部语料/验收库才跳）
+python -m pytest tests/ -q              # 1,499 项用例（+ 9 项需外部语料/验收库才跳）
 ```
 
 主要端点(完整清单在 `docs/`):
@@ -307,7 +309,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **1,498** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `tests/` | **1,499** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：7 个纯逻辑文件（38 项，`node --test`）+ 3 个组件级文件（26 项，vitest + jsdom） |
 | `docs/` | 61 份设计文档与指南：架构怎么定的、判据为什么这么定 |
 | `ENGINEERING.md` | 工程纪律：每一条规矩背后都是一次真实踩坑 |
@@ -355,11 +357,21 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   （零 key、零配置、零手工干预）。
   这轮复验抓出并修掉三个真问题（venv 被全仓扫描、脚本式断言假绿、全局队列跨测试串味），
   详见 `ENGINEERING.md`「发布前体检」。
-- **规模** —— 后端 **1,498** 项测试(`pytest tests`)，前端 7 个纯逻辑测试文件（38 项）
+  **2026-10-27 又复跑了一遍**（改了生成引擎与风格判据之后）：干净导出 + 全新 venv，
+  后端 `pytest tests/` **0 failed**（9 项缺外部语料而 skip）、前端 `npm ci` **0 漏洞** +
+  64 项测试全绿 + `npm run build` 通过。
+- **CI** —— `.github/workflows/ci.yml`:每次 push / PR 跑**后端全量 pytest** 与
+  **前端测试 + 构建**（`npm test` + `npm run build`，后者自带 `vue-tsc` 类型检查）。
+  跑的就是 README「跑测试」那一节写的命令 —— 不给 CI 另写一套更严格的检查。
+- **规模** —— 后端 **1,499** 项测试(`pytest tests`)，前端 7 个纯逻辑测试文件（38 项）
   + 3 个组件级测试文件（26 项，vitest + jsdom）。**当前全绿**。此前长期红的 8 项已清零：7 项是断言滞后于设计变更(采样率 15%→30%、
   维度 14→16、采样加了「30 万字下限保护」)，1 项是模型清单三处不一致的真 bug;
   另有 1 处是测试自己的假 provider 少实现 `async_chat` 接口，导致计数失真
   (详见 `ENGINEERING.md`)。
+- **文档里的数字被机器守着** —— `tests/test_readme_test_count.py`:
+  README 写的用例数必须等于 `pytest` **实际收集到的**条数，且 README 里几处写法
+  必须彼此一致。⇒ 改了测试忘了改 README，这条测试就红
+  (上一轮正是靠人记着改，文档比实际多 **31** 条)。
 - **工程纪律** —— 见 `ENGINEERING.md`:每条规矩都对应一次真实踩坑,不是口号。
 
 ---

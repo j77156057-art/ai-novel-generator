@@ -2493,6 +2493,11 @@ README 从上到下三处都写「**1,492** 项 pytest 用例」。
 （本项目的踩坑姿势：`pytest --collect-only -q` 的输出**最后一行会被
 PowerShell 吞掉** ⇒ 改成**逐文件求和**，数字才是准的。）
 
+**这条教训后来变成了机器守着的常量**（2026-10-27 晚，见「空白机复检 + 上 CI」一节）：
+`tests/test_readme_test_count.py` —— README 写的用例数与**实际收集到的**条数必须相等，
+且 README 里几处写法必须彼此一致。⇒ 以后再改测试忘了改 README，那条测试直接红。
+（它第一次跑就抓到了自己：**加了它自己那条** ⇒ 实际 1,499、README 还写 1,498。）
+
 
 ### 还留着一处同形状的毛病（**重生成**路径）：本轮已改（2026-10-27 晚）
 
@@ -2694,6 +2699,64 @@ tree_stats = rebuild_summary_tree(db, project, provider)
 
 **首字延迟的代价**：93.9 秒里，首字要等**整段生成完**才出现。
 这是有意付的 —— 宁可慢，也不能让界面显示一份随后被推翻的稿子。
+
+## 空白机复检 + 上 CI（2026-10-27 晚）
+
+### 为什么这次又做一遍空白机体检
+
+上一轮做过一次（2026-10-26），抓出三个真问题。但这一轮**动了生成引擎**
+（`engine.py` 的重生成路径）与**风格判据**（`lead_in.py` 新增判据 7）——
+这正是「本机绿、空白机红」最容易发生的地方（多一个依赖、多一个路径假设、多一处编码）。
+
+**做法**（和上一轮同一套，不走捷径）：
+
+1. `git archive HEAD` → 干净目录（**不**用工作副本 —— 工作副本里有本地改动就等于没验）；
+2. 干净目录里 `python -m venv backend/.venv` + `pip install -r requirements.txt -r requirements-dev.txt`；
+3. 在**仓库根**跑 `pytest tests/`（注意：测试在根目录，不在 `backend/` 下 ——
+   第一版脚本 `cd backend` 后跑 `pytest tests/`，直接 `file or directory not found`）；
+4. 前端 `npm ci && npm test && npm run build`。
+
+**结果**：
+
+| | 结果 |
+|---|---|
+| 后端 | `pytest tests/` **EXIT=0**，0 failed，9 skip（缺外部语料/验收库） |
+| 前端 `npm ci` | 成功，**0 vulnerabilities** |
+| 前端 `npm test` | 38 纯逻辑 + 26 组件级 **全绿** |
+| 前端 `npm run build` | 通过（含 `vue-tsc --noEmit`） |
+
+⇒ 这次改动**没有**破坏发布卫生。
+
+### 为什么补 CI（`.github/workflows/ci.yml`）
+
+仓库里**本来没有 `.github/` 目录** —— 面试官 clone 下来只能手动跑，
+而 README 里「1,499 项」这种数字只能靠人记着改（上一轮就发现文档比实际多 31 条）。
+
+CI 跑的就是 README「跑测试」那一节写的命令：
+
+- 后端：Python 3.13 → `pip install -r backend/requirements.txt -r backend/requirements-dev.txt`
+  → `python -m pytest tests/ -q`（`pytest.ini` 已设 `pythonpath = backend`、`testpaths = tests`）；
+- 前端：Node 24 → `npm ci` → `npm test` → `npm run build`
+  （`package.json` 的 `build` 本身就是 `vue-tsc --noEmit && vite build`，类型检查**含在里面**）。
+
+**两条自律**：
+
+1. **不给 CI 另写一套更严格的检查** —— CI 跑的就是本地跑的那条命令。
+   两套命令会漂移，漂移了就等于没有 CI。
+2. **缺语料的那几条在 CI 里是 skip，不是失败** —— 那是「本机没有前置条件」，
+   不是「这条用例不存在」。CI 绿灯的含义因此是「**代码**是绿的」，
+   而语料相关的那几条仍需本机跑（本仓库不传语料）。
+
+### 顺手做的一次静态审计：有没有写死 Windows 路径
+
+`grep -E '[A-Za-z]:\\\\|[A-Za-z]:/|os\.name|sys\.platform'` 全仓扫：
+
+- **没有**写死的本机绝对路径（`C:\...` / `D:\...`）；
+- `tests/conftest.py` 自己把 SQLite 路径的 `\` 换成 `/`，跨平台 ✓；
+- 唯一一处 `sys.platform == "win32"` 在 `tests/qa6_assistant_browser_smoke.py`，
+  那是**端到端脚本**（文件名不以 `test_` 开头，pytest 不收集）✓。
+
+⇒ 前端侧也扫了一遍 `\\` / `C:` / `process.platform` / `win32`：**零命中**。
 
 
 
