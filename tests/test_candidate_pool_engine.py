@@ -24,18 +24,44 @@ from app.generation.engine import _candidate_pool_size, _generate_with_pool  # n
 
 
 class FakeProvider:
-    """按顺序返回预设文本，并记录调用次数。"""
+    """按顺序返回预设文本，并记录调用次数。
 
-    def __init__(self, outputs=None, fail_at=None):
+    ## 为什么要区分「采样」与「扩写」两种调用（2026-10-27）
+
+    段长闸门现在**在候选池内部**跑（打分之前）—— 闸门在字数不够时会
+    回灌让模型重写整段（`_enforce_length` 里 `text = grown`）。
+    ⇒ 池的一次采样可能带出**额外的扩写调用**，它也会调 `chat`。
+
+    原来的夹具把两种调用混在一起数（`self.calls` 一律递增），
+    于是扩写调用把「预置文本」的序号打乱 ⇒ 断言测到的东西变了
+    （测的是「第几次调用返回哪段文本」，不是「择优选谁」）。
+
+    现在：**采样**与**扩写**分开计数、分开取文本，
+    `fail_at` 也按**采样序号**判定（扩写不参与失败模拟）。
+    """
+
+    def __init__(self, outputs=None, fail_at=None, expansion=None):
         self.outputs = list(outputs or [])
         self.fail_at = fail_at
-        self.calls = 0
+        #: 闸门扩写时返回什么。默认 None ⇒ 返回空串
+        #: （模拟「扩写没帮上忙」⇒ 闸门保留原稿，候选仍是原来那份）。
+        self.expansion = expansion
+        self.calls = 0        # 总调用数（采样 + 扩写）
+        self.sample_calls = 0 # 采样调用数
+        self.expand_calls = 0 # 闸门扩写调用数
         self.seen = []
 
     def chat(self, system, user, constraints=None, stop_sequences=None, temperature=None):
-        idx = self.calls
         self.calls += 1
         self.seen.append((system, user))
+        # 闸门扩写的回灌提示里有这句（`_enforce_length` 里的 hint）
+        if "上一版长度不够" in (user or ""):
+            self.expand_calls += 1
+            if self.expansion is not None:
+                return self.expansion
+            return ""
+        idx = self.sample_calls
+        self.sample_calls += 1
         if self.fail_at is not None and idx in self.fail_at:
             raise RuntimeError(f"模拟第 {idx} 次失败")
         if not self.outputs:
@@ -99,7 +125,9 @@ def test_pool_picks_qualified_candidate():
     good = _mixed(6)
     p = FakeProvider([_bare(6), good])
     text, info = _generate_with_pool(p, "sys", "user", pool_size=2, profile=_profile(), target_chars=120)
-    assert p.calls == 2
+    # 采样 2 份（**采样次数**才是「采了几份」；总调用数还含闸门扩写调用 ——
+    # 闸门现在在池内跑，第一份偏短 ⇒ 额外一次扩写调用，见夹具说明）
+    assert p.sample_calls == 2
     assert info["applied"]
     assert text == good
     assert info["picked"] == 1
@@ -125,7 +153,8 @@ def test_pool_keeps_sampling_when_not_qualified():
     """不合格就继续采 —— 这是拒绝采样的另一半。"""
     p = FakeProvider([_bare(6), _bare(6), _mixed_long(6)])
     text, info = _generate_with_pool(p, "sys", "user", pool_size=3, profile=_profile(), target_chars=120)
-    assert p.calls == 3
+    # 采样 3 份才轮得到合格的那份（总调用数还含闸门扩写调用）
+    assert p.sample_calls == 3
     assert info["stopped_early"] is True
     assert text == _mixed_long(6)
 

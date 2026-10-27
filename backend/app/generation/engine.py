@@ -657,6 +657,43 @@ def _candidate_pool_size() -> int:
         return 1
 
 
+def _recheck_pool_verdict(pool_info: dict, text: str, *, profile: dict | None,
+                          target_chars: int | None) -> dict:
+    """落库前用**同一把尺**复判最终文本：择优的结论到末端还成立吗？
+
+    零模型调用（只量不算）。量的是**落库形态**（不再预演机械校正）——
+    落库的那份已经过了机械校正，再预演等于把它又合一次。
+
+    不合格**不阻断落库**（正文已经写出来了，硬拒会白扔一次生成），
+    但必须**留痕**：`pool_info["final_recheck"]` 里如实记着。
+    ⇒ 「择优的结论失效了」这件事从此**看得见**，而不是静默。
+
+    只有真的开了候选池才复判（池关着时根本没有「择优结论」可失效）。
+    """
+    if not pool_info or not pool_info.get("applied"):
+        return {}
+    try:
+        from app.generation.candidate import score_candidate
+
+        cand = score_candidate(text, profile=profile, baseline_chars=target_chars)
+    except Exception as exc:  # noqa: BLE001 —— 量不出来不算失效
+        result = {"checked": False, "reason": f"{type(exc).__name__}: {exc}"}
+        pool_info["final_recheck"] = result
+        return result
+    result = {
+        "checked": True,
+        "ok": bool(cand.ok),
+        "reject": cand.reject,
+        "score": None if cand.score == float("inf") else round(cand.score, 4),
+        "form": cand.form,
+    }
+    pool_info["final_recheck"] = result
+    if not result["ok"]:
+        logging.getLogger(__name__).warning(
+            "候选池的择优结论在末端已失效：%s（正文照落，但这条留痕）", result["reject"])
+    return result
+
+
 def _generate_with_pool(
     provider,
     system: str,
@@ -689,6 +726,31 @@ def _generate_with_pool(
     打分针对的是**校正后**的形态（机械校正能把「一行一句台词」掰成参考书形态），
     所以择优时用「预览变换」先并一遍再量 —— 但**返回的是原文**，
     真正的校正仍由流水线自己的那道工序做（它还有闸门与模式开关）。
+
+    ## 段长闸门在**池内**（2026-10-27 改）
+
+    闸门在字数不够时是**回灌让模型重写整段**（`_enforce_length` 里 `text = grown`，
+    整段替换）。它原来排在**打分之后** ⇒ 被择优认可的那份稿子会被当场换掉，
+    换上去的新稿子**从没被那把尺量过** —— 「择优形态 ≠ 落库形态」。
+
+    这不是边角情况：候选池守恒下限 = 目标 × 60%，闸门下限 = 目标 × 80%
+    ⇒ 落在 **[60%, 80%)** 的候选「池放行、闸门必然重写」
+    （实测 9 段真实正文：4/9 段落在这条缝里）。
+
+    ⇒ 现在**打分之前**先过闸门：**闸门这一道不再换掉被择优认可的稿子**。
+    代价：闸门对**每一份**候选跑（不是只对选中那份）⇒ 偏短的候选要多扩写一次
+    （实测 9 段真实正文里 4/9 段偏短），池开着时这项开销按候选数放大。
+
+    ⚠️ **别把这句读成「落库的那份一定就是池选中的那份」**：
+    闸门只是整段换稿的**一道**工序，后面还有场景审计、AI 味重写、去重、
+    文风改写、形态校正、beat 插入、照搬门禁 —— 它们**也都会改文本**
+    （真跑实测：池交出 2733 字 → 落库 2558 字，差 175 字）。
+    ⇒ 真正保证「末端那条形态线仍然成立」的是**末端复判**
+    （`_recheck_pool_verdict`，落库前用同一把尺量最终文本，失效就留痕），
+    不是「闸门挪进来了」这件事本身。
+
+    `pool_size = 1`（默认）时这条路径**根本不走**（直接返回第一次输出），
+    默认路径逐字节不变。
 
     ## 成本
 
@@ -731,6 +793,7 @@ def _generate_with_pool(
     # 多数情况第一份就合格。改成边采边判 ⇒ 多数情况成本 = 1 份。
     cands: list[str] = []
     scored: list = []
+    gates: list[dict] = []
     last_exc: Exception | None = None
     stopped_early = False
     for _i in range(pool_size):
@@ -744,6 +807,17 @@ def _generate_with_pool(
         t = _strip_thinking(raw)
         if not (t and t.strip()):
             continue
+        # —— 段长闸门挪进池内：打分之前先过 ⇒ 择优的对象 = 落库的对象 ——
+        # 闸门在字数不够时是**整段重写**，放在打分之后就会把「被认可的稿子」
+        # 当场换掉，而新稿没被量过（见函数 docstring 的实测数据）。
+        # 没有字数目标（target_chars 为空）就没法量 ⇒ 不跑闸门（也不假装跑过）。
+        if target_chars:
+            t, gate = _enforce_length(
+                provider, system, user, t, target_chars=target_chars,
+                constraints=constraints, stop_sequences=stop_sequences)
+        else:
+            gate = {}
+        gates.append(gate)
         cands.append(t)
         # 守恒判据的基准 = **外部的字数目标**（段长闸门用的那个），
         # **不是**同伴中位数 —— 候选之间长度天然不同（形态差的稿子往往更短），
@@ -776,6 +850,15 @@ def _generate_with_pool(
         "stopped_early": stopped_early,
         "score": (None if best_score == float("inf") else round(best_score, 4)),
         "reject": scored[best_idx].reject,
+        # 闸门已在池内跑过（打分之前）⇒ 上层**不要再扩写一遍**：
+        # 再跑一次会对同一份稿子发起第二次扩写调用（白花钱），而且两次扩写
+        # 的结果不同 ⇒ 落库的就不再是「池选中的那份」了。
+        #
+        # 注意 `gated` 必须**如实反映闸门真的跑过**：`target_chars` 为空时
+        # 没跑闸门（没法量字数），这时报 True 会让上层以为「已经闸过了」
+        # 而跳过长度管控 —— 那就是「假装跑过」。
+        "gated": bool(target_chars),
+        "length_report": (gates[best_idx] if best_idx < len(gates) else {}),
         "candidates": [
             {
                 "index": i,
@@ -2550,10 +2633,17 @@ def generate_next_segment(
     # 段长闸门：写完先量**汉字**数，不够就回灌让模型扩写（有界）。
     # 原来长度只是提示里的「软希望」——实测同一段要求 3000 汉字，模型交出 1900，
     # 系统照收不误。提示单位改成汉字之后，这道闸门才量得准。
-    text, length_report = _enforce_length(
-        provider, system, user, text, target_chars=max_chars,
-        constraints=ctx["constraints"], stop_sequences=get_section_stop_sequences(),
-        node_prompt=node_prompt)
+    #
+    # 候选池开着时，闸门**已经在池内跑过**（打分之前）⇒ 这里不能再跑一遍：
+    # 再跑一次 = 对同一份稿子发起第二次扩写调用（白花钱），而且两次扩写的
+    # 结果不同 ⇒ 落库的就不再是「池选中的那份」，口径差又回来了。
+    if pool_info.get("gated"):
+        length_report = pool_info.get("length_report") or {}
+    else:
+        text, length_report = _enforce_length(
+            provider, system, user, text, target_chars=max_chars,
+            constraints=ctx["constraints"], stop_sequences=get_section_stop_sequences(),
+            node_prompt=node_prompt)
     text, scene_audit = _audit_and_repair_scene(text, provider, reference_texts=[item.get("text", "") for item in (ctx.get("rag_items") or []) if isinstance(item, dict)])
     summary = provider.summarize(text)
 
@@ -2610,6 +2700,10 @@ def generate_next_segment(
     )
     if verbatim_info.get("rewritten"):
         summary = provider.summarize(text)
+
+    # 末端复判：择优的结论到落库这一刻还成立吗？（零模型调用，只量不算）
+    _recheck_pool_verdict(pool_info, text, profile=_style_profile(db, project),
+                          target_chars=max_chars)
 
     gen, segment_no = _commit_segment(db, project, text, summary)
     # 正文变了 → 上一版的整段验收**不再覆盖这一版**：义务换绑（不删除），
@@ -2778,7 +2872,7 @@ def generate_next_segment_stream(
     #
     # 候选池（Best-of-N / 拒绝采样）：流式路径**不能**边生成边择优
     # （择优要看到全貌），所以这里先非流式采 N 份、择优，再把选中那份**分块吐出来**。
-    # pool_size=1（默认）时走原来的流式路径，行为完全不变。
+    # pool_size=1（默认）时走下面的默认路径。
     _pool_size = _candidate_pool_size()
     if _pool_size > 1:
         _picked, _pool_info = _generate_with_pool(
@@ -2787,19 +2881,42 @@ def generate_next_segment_stream(
             stop_sequences=get_section_stop_sequences(),
             pool_size=_pool_size,
             profile=_style_profile(db, project),
+            # 目标字数：池内的段长闸门与守恒判据都要它（同步版一直传，
+            # 流式版以前漏了 ⇒ 池在流式路径上**不查字数**，与同步版口径不一致）。
+            target_chars=max_chars,
         )
         text = _strip_thinking(_picked)
         # 分块吐出去（前端按 chunk 增量渲染）
         for _i in range(0, len(text), 800):
             yield {"type": "chunk", "text": text[_i:_i + 800]}
+        length_report = _pool_info.get("length_report") or {}
     else:
-        pieces: list[str] = []
-        for piece in provider.stream_chat(system, user, constraints=ctx["constraints"],
-                                           stop_sequences=get_section_stop_sequences()):
-            pieces.append(piece)
-            yield {"type": "chunk", "text": piece}
-        text = _strip_thinking("".join(pieces))
+        # —— 默认路径（候选池关着）——
+        #
+        # ⚠️ **段长闸门在这里**（2026-10-27 改）：原来这条路径**一次都没跑过闸门**
+        # ⇒ 界面主流程（前端只调 `/api/generate-stream`）照收短段，
+        # 而同步接口与重生成接口都有闸门 ⇒ **两条路径口径不一致**。
+        # 实测验收库 9 段真实正文里 **5 段低于闸门下限**（目标 × 80%）。
+        #
+        # 为什么**不再边生成边吐**：闸门要**拿到整段**才能量字数，
+        # 而不够长时会**整段重写**（`text = grown`）——
+        # 边吐边量的话，先吐出去的那半截会被改写后的正文**推翻**，
+        # 界面就会显示「先一段、然后整段换掉」，比慢一点更糟。
+        # ⇒ 与候选池路径同一形状：**先非流式生成 + 过闸门，再分块吐出**。
+        #
+        # 代价（如实记下）：**牺牲「长文首字即显」** —— 首字延迟从秒级变成
+        # 「整段生成完」的时长。这是拿体验换「界面落库的段长与同步接口一致」。
+        raw = provider.chat(system, user, constraints=ctx["constraints"],
+                            stop_sequences=get_section_stop_sequences())
+        text = _strip_thinking(raw)
+        text, length_report = _enforce_length(
+            provider, system, user, text, target_chars=max_chars,
+            constraints=ctx["constraints"], stop_sequences=get_section_stop_sequences(),
+            node_prompt=node_prompt)
         _pool_info = {"applied": False, "reason": "候选池关闭"}
+        # 分块吐出去（前端按 chunk 增量渲染）
+        for _i in range(0, len(text), 800):
+            yield {"type": "chunk", "text": text[_i:_i + 800]}
     text, scene_audit = _audit_and_repair_scene(text, provider, reference_texts=[item.get("text", "") for item in (ctx.get("rag_items") or []) if isinstance(item, dict)])
     summary = provider.summarize(text)
 
@@ -2857,6 +2974,10 @@ def generate_next_segment_stream(
     if verbatim_info.get("rewritten"):
         summary = provider.summarize(text)
 
+    # 末端复判：择优的结论到落库这一刻还成立吗？（零模型调用，只量不算）
+    _recheck_pool_verdict(_pool_info, text, profile=_style_profile(db, project),
+                          target_chars=max_chars)
+
     gen, segment_no = _commit_segment(db, project, text, summary)
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
     node_judge = _judge_and_advance(db, project, provider, text, written)
@@ -2896,6 +3017,10 @@ def generate_next_segment_stream(
         "type": "done",
         "segment_no": segment_no,
         "chars": len(text),
+        # 段长报告（与重生成路径同款）：实际汉字数 / 目标 / 下限 / 是否达标。
+        # 流式路径接上闸门后，界面**能知道**这段到底多长、够不够下限。
+        "cjk": length_report.get("cjk"),
+        "length_report": length_report,
         "summary": summary,
         "summary_tree": tree_stats,
         "id": gen.id,
