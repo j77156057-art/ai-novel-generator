@@ -23,6 +23,24 @@
 
 配合 `tests/test_db_isolation.py` 的护栏测试（比对跑测前后真实库的
 mtime+size+sha256 不变），形成「机制 + 验证」双重保障。
+
+## ⚠️ 为什么**不能**沿用「继承来的 DATABASE_URL」（2026-10-27 踩过，只在 Linux 炸）
+
+原来 (b) 分支是「显式传入的库若落在已存在的目录里 → 沿用」。
+看起来是「尊重调用方」，但**子进程会继承父进程的 `DATABASE_URL`** ⇒
+
+    父进程 pytest（库 A）
+      └─ spawn 子进程 pytest（继承 DATABASE_URL=库 A）
+           └─ 子进程 conftest 沿用库 A → 子进程退出时 atexit **删掉库 A**
+
+⇒ 父进程后续所有用共享 engine 的用例全部炸，报
+`sqlite3.OperationalError: attempt to write a readonly database`
+（Linux 上 POSIX 允许 unlink 打开中的文件；**Windows 上删不掉**被打开的文件，
+PermissionError 被 `except OSError: pass` 吞掉 ⇒ **本机全绿，只有 Linux CI 红**）。
+
+⇒ 现在：**每个进程一个专属临时目录**（`tempfile.mkdtemp()`），
+继承来的 `DATABASE_URL` **只当安全检查**（指向真实开发库 ⇒ 拒绝），不再当位置来源。
+想指定目录用 `AI_NOVEL_TEST_DB_DIR`。
 """
 
 from __future__ import annotations
@@ -93,8 +111,15 @@ def _url_to_path(url: str) -> str | None:
     return os.path.abspath(path)
 
 
+#: 本进程专属的临时目录（库文件放在里面；退出时整个目录删掉）。
+#:
+#: ⚠️ 声明必须**在** `_force_isolated_database()` 调用之前 —— 否则模块加载到
+#: 那行「注解 + 赋值 None」时会把函数里刚设好的路径**重置**掉，清理就不删目录了。
+_TEMP_DB_DIR: str | None = None
+
+
 def _force_isolated_database() -> str:
-    """把测试库强制指向独立临时文件，返回最终使用的 URL。
+    """把测试库强制指向**本进程专属**的临时文件，返回最终使用的 URL。
 
     Raises:
         RuntimeError: 显式传入的 `DATABASE_URL` 指向真实开发库（拒绝执行）。
@@ -111,16 +136,24 @@ def _force_isolated_database() -> str:
             "或把它指向一个临时目录，切勿指向 novel_dev.db / novel_demo.db。"
         )
 
-    # (b) 允许的临时目标选择：
-    #     - 显式传入的库若落在已存在的目录里 → 沿用（尊重「用临时目录下的库」）；
-    #     - 否则退到 AI_NOVEL_TEST_DB_DIR，再退到系统临时目录。
-    if incoming_path and os.path.isdir(os.path.dirname(incoming_path)):
-        target = incoming_path
-    else:
-        base_dir = os.environ.get("AI_NOVEL_TEST_DB_DIR", "") or tempfile.gettempdir()
-        if not os.path.isdir(base_dir):
-            base_dir = tempfile.gettempdir()
+    # (b) 库的位置：**只看**显式的 AI_NOVEL_TEST_DB_DIR，否则每个进程开一个
+    #     **专属**临时目录。
+    #
+    #     ⚠️ 绝**不**沿用「继承来的 DATABASE_URL」—— 子进程会继承父进程的值，
+    #     沿用它就等于让子进程去动父进程的库（它退出时会把那个文件删掉）。
+    #     详见模块 docstring 里那节「为什么不能沿用继承来的 DATABASE_URL」。
+    global _TEMP_DB_DIR
+    base_dir = os.environ.get("AI_NOVEL_TEST_DB_DIR", "").strip()
+    if base_dir:
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+        except OSError:
+            base_dir = ""
+    if base_dir:
         target = os.path.join(base_dir, f"ai_novel_pytest_{os.getpid()}.db")
+    else:
+        _TEMP_DB_DIR = tempfile.mkdtemp(prefix="ai_novel_pytest_")
+        target = os.path.join(_TEMP_DB_DIR, "test.db")
 
     url = "sqlite:///" + target.replace("\\", "/")
     os.environ["DATABASE_URL"] = url
@@ -148,16 +181,19 @@ if _url_to_path(_bound) is None or os.path.abspath(
 
 
 def _cleanup_temp_db() -> None:
-    """会话结束：删掉临时库文件（连同可能产生的 -wal/-shm）。"""
+    """会话结束：删掉临时库文件（连同可能产生的 -wal/-shm）与专属临时目录。"""
     path = _url_to_path(_TEMP_DB_URL)
-    if not path:
-        return
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            if os.path.isfile(path + suffix):
-                os.remove(path + suffix)
-        except OSError:
-            pass
+    if path:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                if os.path.isfile(path + suffix):
+                    os.remove(path + suffix)
+            except OSError:
+                pass
+    if _TEMP_DB_DIR:
+        import shutil
+
+        shutil.rmtree(_TEMP_DB_DIR, ignore_errors=True)
 
 
 atexit.register(_cleanup_temp_db)

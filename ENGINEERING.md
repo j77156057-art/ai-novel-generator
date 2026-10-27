@@ -2730,7 +2730,7 @@ tree_stats = rebuild_summary_tree(db, project, provider)
 ### 为什么补 CI（`.github/workflows/ci.yml`）
 
 仓库里**本来没有 `.github/` 目录** —— 面试官 clone 下来只能手动跑，
-而 README 里「1,499 项」这种数字只能靠人记着改（上一轮就发现文档比实际多 31 条）。
+而 README 里「几千项用例」这种数字只能靠人记着改（上一轮就发现文档比实际多 31 条）。
 
 CI 跑的就是 README「跑测试」那一节写的命令：
 
@@ -2757,6 +2757,62 @@ CI 跑的就是 README「跑测试」那一节写的命令：
   那是**端到端脚本**（文件名不以 `test_` 开头，pytest 不收集）✓。
 
 ⇒ 前端侧也扫了一遍 `\\` / `C:` / `process.platform` / `win32`：**零命中**。
+
+### CI 的第一次运行就红：抓到一个**只在本机看不见**的缺陷（2026-10-27 晚）
+
+第一次 CI：**前端 job 绿**（Linux 上 `npm test` + `npm run build` 都过），
+**后端 job 红** —— 一批用例报
+`sqlite3.OperationalError: attempt to write a readonly database`，
+报错从本会话**第一个用到共享 engine 的用例**开始（`test_settings_roles.py:82`
+的 `Base.metadata.drop_all(bind=engine)`），后面 60 多条全红；
+本机 Windows 跑同一套**全绿**。
+
+### 根因（本机怎么都复现不出来）
+
+链路是这样的：
+
+1. 我新加了一条测试 `tests/test_readme_test_count.py`，它要数用例数 ⇒
+   **spawn 一个子进程**跑 `pytest --collect-only`；
+2. 子进程**继承**了父进程的 `DATABASE_URL`（父进程 conftest 设的临时库）；
+3. 子进程的 conftest 有一句「显式传入的库若落在已存在的目录里 → **沿用**」
+   ⇒ 子进程**用了父进程的那个库文件**；
+4. 子进程退出时，`atexit` 里的清理**把父进程的库文件删了**；
+5. 父进程后续要写那个库 ⇒ 炸。
+
+**为什么只有 Linux 红**：
+
+| | 文件被父进程打开时能不能删 |
+|---|---|
+| **Windows** | **不能**（`PermissionError`，被 `except OSError: pass` 吞掉）⇒ 父进程的库安然无恙 ⇒ **本机全绿** |
+| **Linux** | **能**（POSIX 允许 unlink 打开中的文件）⇒ 父进程的库被删 ⇒ 后续写它就报 readonly |
+
+Linux 上「被 unlink 的文件」的报错逐字就是 `attempt to write a readonly database`
+（用 5 行脚本在 WSL 上单独验过：父进程建表 → 子进程 unlink → 父进程再写 → 同一句话）。
+
+⇒ **这不是「Linux 兼容性问题」，是「本机全绿掩盖了一个真 bug」**：
+测试进程之间在**互相删对方的库**。任何 spawn 子 pytest 的测试都会踩到。
+
+### 修法（两层）
+
+1. **conftest**：库的位置**不再**取自「继承来的 `DATABASE_URL`」——
+   改成**每个进程一个专属临时目录**（`tempfile.mkdtemp()`），库放在里面，
+   退出时整个目录删掉。`DATABASE_URL` 只保留**安全检查**（指向真实开发库 ⇒ 拒绝跑）。
+   想指定目录用 `AI_NOVEL_TEST_DB_DIR`。
+2. **spawn 侧**：子进程的环境里**去掉** `DATABASE_URL` / `AI_NOVEL_TEST_DB_DIR`
+   ⇒ 子进程彻底独立（纵深防御：conftest 再变也踩不到）。
+
+**还加了一条护栏测试**（`tests/test_db_isolation.py`）：
+起一个**继承当前环境变量**的子进程，断言它**没有**选中本会话的库。
+⇒ 这类「进程之间互相踩」的问题以后会被当场抓住，而不是等 CI 红。
+
+### 一条方法论
+
+**「本机全绿」≠「平台无关」**。静态审计（有没有写死 Windows 路径）能挡住
+**路径硬依赖**，但挡不住**语义依赖**：同一段代码在两个平台上的行为不同
+（能不能删掉打开中的文件），本机恰好是「安全」的那一个。
+
+⇒ 能用**另一个平台**跑一遍（CI / WSL / 容器）就不要只在本机跑。
+这正是「上 CI」的真正价值：它第一次跑就抓到了本机**根本看不见**的缺陷。
 
 
 

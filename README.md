@@ -247,7 +247,7 @@ npm test               # = node --test tests/*.test.ts && vitest run
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/ -q              # 1,499 项用例（+ 9 项需外部语料/验收库才跳）
+python -m pytest tests/ -q              # 1,500 项用例（+ 9 项需外部语料/验收库才跳）
 ```
 
 主要端点(完整清单在 `docs/`):
@@ -309,7 +309,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **1,499** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `tests/` | **1,500** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：7 个纯逻辑文件（38 项，`node --test`）+ 3 个组件级文件（26 项，vitest + jsdom） |
 | `docs/` | 61 份设计文档与指南：架构怎么定的、判据为什么这么定 |
 | `ENGINEERING.md` | 工程纪律：每一条规矩背后都是一次真实踩坑 |
@@ -363,7 +363,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 - **CI** —— `.github/workflows/ci.yml`:每次 push / PR 跑**后端全量 pytest** 与
   **前端测试 + 构建**（`npm test` + `npm run build`，后者自带 `vue-tsc` 类型检查）。
   跑的就是 README「跑测试」那一节写的命令 —— 不给 CI 另写一套更严格的检查。
-- **规模** —— 后端 **1,499** 项测试(`pytest tests`)，前端 7 个纯逻辑测试文件（38 项）
+- **规模** —— 后端 **1,500** 项测试(`pytest tests`)，前端 7 个纯逻辑测试文件（38 项）
   + 3 个组件级测试文件（26 项，vitest + jsdom）。**当前全绿**。此前长期红的 8 项已清零：7 项是断言滞后于设计变更(采样率 15%→30%、
   维度 14→16、采样加了「30 万字下限保护」)，1 项是模型清单三处不一致的真 bug;
   另有 1 处是测试自己的假 provider 少实现 `async_chat` 接口，导致计数失真

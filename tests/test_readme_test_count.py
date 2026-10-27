@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -56,10 +57,19 @@ def _collected_count() -> int:
     **不用汇总行**：`pytest.ini` 里已有 `addopts = -ra -q`，再传一个 `-q` 会变成 `-qq`，
     汇总行（"N tests collected"）被**静默吞掉** ⇒ 改成**逐文件求和**
     （输出形如 `tests/test_x.py: 23`）。汇总行只当兜底。
+
+    ⚠️ 子进程**必须**与本进程彻底隔离：把 `DATABASE_URL` / `AI_NOVEL_TEST_DB_DIR`
+    从子进程环境里去掉。否则子进程会继承本会话的库路径，
+    而它的 conftest 退出时会**删掉那个库文件** ⇒ 本进程后续用例全炸
+    （Linux 上报 "attempt to write a readonly database"；
+    Windows 上删不掉被打开的文件 ⇒ 本机看不出来）。
     """
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DATABASE_URL", "AI_NOVEL_TEST_DB_DIR")}
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-p", "no:cacheprovider"],
         cwd=str(REPO), capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env,
     )
     per_file = re.findall(r"^tests/[^:]+\.py:\s*(\d+)\s*$", proc.stdout, re.M)
     if per_file:
