@@ -226,21 +226,33 @@ def corpus_vocabulary(corpus_text: str) -> set[str]:
 #:
 #: 为什么这条能防「新事实」：真书的 beat（动作/神态）**几乎不报数** ——
 #: 报了数就是新事实（新的数量、新的物件、新的地名距离）概率最高的地方。
-#: 这条**零误杀**（模型写纯动作不会带数字），且**正对目标**。
 #:
 #: ## 「半」不是数字（真跑踩到过）
 #: 「退后半步」「那半只黑蹄」里的「半」是**量词**，不是数量 ——
 #: 第一版把它当数字，误拒了两条本来合格的 beat（实测 6 个插入点只采纳 3 个，
 #: 其中 2 个是被「半」误杀的）。
 #: ⇒ 数字判据要排除**量词用法**。
+#:
+#: ## 单独的「一」也不是数字（2026-10-27 实测，误杀率 100%）
+#: 「眉头**一**皱」「目光停**一**瞬」「指尖轻轻**一**点」「脚步**一**顿」
+#: —— 这里的「一」是**副词**（表示动作短暂），不是数量。
+#: 实测 128 条真跑的引导语，这条判据拒掉 12 条，**逐条看全是误杀**。
+#: 「一封信」那种真数量确实分辨不出来（中文没词边界）——
+#: 按项目纪律「**判不准的别当场拒**」，单独的「一」**不判为数字**，
+#: 但「十/百/千/两/三…」这些**硬数量**照旧拒。
 _NUM_HINT = re.compile(r"[0-9０-９一二三四五六七八九十百千万两]+")
+
+#: 单独的「一」不算数量（副词用法）。跟着「十百千万两」的不算（那是硬数量）。
+_ONE_IS_SOFT = re.compile(r"一(?![十百千万两])")
 
 #: 量词/程度词里的「半」「几」「数」——不是数量，不算「新事实」。
 _NOT_A_COUNT = frozenset("半几数点些多")
 
 #: 「半」等字若**跟在名词后**（如「半步」「半只」）是量词；
 #: 若**单独成词**（「半斤八两」）另说 —— 两种都放过。
-_HALF_AS_MEASURE = re.compile(r"[半几数](?=[个只匹条张口口碗步声下])")
+#:
+#: 2026-10-27 补：「一半」也要放过（「布条缠到一半」是描写，不是新事实）。
+_HALF_AS_MEASURE = re.compile(r"[半几数](?=[个只匹条张口口碗步声下名位道把双份成块枚尊柄扇面根支顶身头尾])")
 
 
 def check_no_new_facts(
@@ -288,13 +300,12 @@ def check_no_new_facts(
         suspicious.append(f"专名:{n}")
 
     # 判据 2：数字
-    m = _NUM_HINT.search(beat or "")
+    # 「一」单独出现时是副词用法（眉头一皱/目光停一瞬），不判为数字。
+    probe = _HALF_AS_MEASURE.sub("", beat or "")
+    probe = _ONE_IS_SOFT.sub("", probe)
+    m = _NUM_HINT.search(probe)
     if m:
-        # 「半步」「半只」里的「半」是量词不是数量 → 先把它去掉再判
-        probe = _HALF_AS_MEASURE.sub("", beat or "")
-        m2 = _NUM_HINT.search(probe)
-        if m2:
-            suspicious.append(f"数字:{m2.group(0)}")
+        suspicious.append(f"数字:{m.group(0)}")
 
     return suspicious, False
 
@@ -364,19 +375,27 @@ def _clean_beat(raw: str) -> str:
     return t + "。" if t else ""
 
 
-#: 重复判定：两条 beat 的**公共前缀**到这个长度就算重复。
+#: 两条引导语算「重复」的门槛（2-gram Jaccard）。
 #:
-#: 真跑（完整流程，MiniMax-M3.1-Flash）实测：4 条采纳的 beat 里有 2 条几乎是同一句 ——
-#: 「他垂下眼，指尖在袖口边停了停。」/「他垂下眼，手指在袖口上停了停。」
-#: 公共前缀 4 字（「他垂下眼」）⇒ 4 是能抓住这种复用的长度。
+#: ## 为什么不用「公共前缀 ≥ 4」当主判据（2026-10-27 实测推翻）
+#: 前缀规则是早先按真跑定的（「他垂下眼，指尖在袖口边停了停。」/
+#: 「他垂下眼，手指在袖口上停了停。」公共前缀 4 字）。
+#: 但它**大量误杀**「同一开头、不同宾语」的正常引导语：
+#: 实测 128 条真跑里，它拒掉的 14 条中有 10 条是这种
+#: （「他抬手指向北面」vs「他抬手指向守卒」—— 前缀 5，其实是两句不同的话）。
 #:
-#: 中文里 4 个字相同已经是很强的复用信号；3 个字（如「陆长风…」/「陆崇…」）
-#: 还不足以判重复，所以阈值取 4。
-_DUP_PREFIX = 4
+#: ⇒ 改成**2-gram Jaccard**（看的是词组，不是字面开头）。
+#: 同一批数据上的分离度很清楚：
+#: - 真重复（该拒）：0.538 / 0.692 / 0.727
+#: - 误杀（该放）：0.120 ~ 0.357
+#: ⇒ 阈值取 **0.40**（真重复最低 0.538，误杀最高 0.357，两边都留了余量）。
+#: 同时保留「字符集 Jaccard ≥ 0.60」当第二条（结构一样、只换了个词）。
+#:
+#: **验算**：换成新规则后，被拒的 14 条只剩 4 条（确实重复的那 4 条），
+#: 而**已采纳的 96 条里 0 对**会被新规则误伤成重复。
+_DUP_2GRAM_JACCARD = 0.40
 
-#: 字符集合 Jaccard 相似度到这个值也算重复。
-#:
-#: 为什么要第二条：改了字但结构一样（「垂下眼」/「垂下头」）前缀就抓不到。
+#: 字符集合 Jaccard 到这个值也算重复（改了字但结构一样）。
 _DUP_JACCARD = 0.60
 
 #: 与**插入点上下文**的 2-gram 重合率到这个值就算重复。
@@ -444,32 +463,29 @@ def _too_similar_to_context(beat: str, context: list[str]) -> str | None:
 def _find_duplicate(beat: str, accepted: list[str]) -> str | None:
     """这条 beat 跟已采纳的哪一条重复了？返回那条（没重复返回 None）。
 
-    ## 为什么要有这道判据
-
-    模型给**不同**插入点写出来的句子很容易撞车（上下文相似 ⇒ 句子相似）。
-    真跑实测：4 条采纳里 2 条几乎一样，读起来像复读。
-
     ## 判据（两条任一成立即算重复）
 
-    1. 公共前缀 ≥ 4 个汉字；
-    2. 字符集合 Jaccard 相似度 ≥ 0.60。
+    1. **2-gram Jaccard ≥ 0.40**（看的是词组）；
+    2. 字符集合 Jaccard 相似度 ≥ 0.60（结构一样、只换了个词）。
+
+    早先还有一条「公共前缀 ≥ 4 个汉字」，2026-10-27 实测证明它**大量误杀**
+    「同一开头、不同宾语」的正常引导语 ⇒ 已撤掉（见 `_DUP_2GRAM_JACCARD` 的注释）。
     """
     a = _normalize_beat(beat)
     if not a:
         return None
     a_set = set(a)
+    a_bi = _bigrams(beat)
     for other in accepted:
         b = _normalize_beat(other)
         if not b:
             continue
-        common = 0
-        for x, y in zip(a, b):
-            if x != y:
-                break
-            common += 1
-        if common >= _DUP_PREFIX:
-            return other
         b_set = set(b)
+        b_bi = _bigrams(other)
+        if a_bi and b_bi:
+            union_bi = a_bi | b_bi
+            if union_bi and len(a_bi & b_bi) / len(union_bi) >= _DUP_2GRAM_JACCARD:
+                return other
         union = a_set | b_set
         if union and len(a_set & b_set) / len(union) >= _DUP_JACCARD:
             return other

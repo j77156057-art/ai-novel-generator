@@ -310,7 +310,7 @@ REWRITE_GATE_FEATURES = ("句长均值", "句号密度")
 
 
 def _strip_ws(text: str) -> str:
-    """去掉所有空白 —— 用来验证「只改了段落边界、内容一个字节没动」。"""
+    """去掉所有空白 —— 用来验证「只改了段落边界（和那一处标点形态）、内容一个字节没动」。"""
     return re.sub(r"\s+", "", text or "")
 
 #: 闸门判定的**最小文本长度**。太短的文本（试写、占位）统计噪声大，
@@ -564,32 +564,75 @@ def _maybe_correct_form(
             logging.getLogger(__name__).warning("形态校正异常，保留原文: %s", exc)
             return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
 
-    # —— 默认：机械校正（只改段落边界，不新增一个字）——
+    # —— 默认：机械校正（只改段落边界；唯一的内容改动是把并接处的句号改成冒号）——
     try:
         from app.style.form_merge import merge_bare_dialogue
         from app.style.stylometry import paragraphs as _paras
 
-        new_paras, info = merge_bare_dialogue(_paras(text), target["target"])
-        if not info.get("merged"):
-            return text, {"applied": False, "reason": info.get("reason", "没什么可并的"),
-                          "measured": measured, "target": target}
-        new_text = "\n".join(new_paras)
-        # 守恒检查：只允许改段落边界（内容与对白一个字节都不能动）
-        if _strip_ws(new_text) != _strip_ws(text):
-            return text, {"applied": False, "reason": "机械校正改动了内容，拒绝",
-                          "measured": measured, "target": target}
-        after = measure_form(new_text)
+        base_paras = _paras(text)
+        work_paras, minfo = merge_bare_dialogue(base_paras, target["target"])
+        sep = "\n\n" if "\n\n" in text else "\n"
+        if minfo.get("merged"):
+            # 守恒检查：**只允许改段落边界 + 把并接处的「。」改成「：」**。
+            # 「把冒号改回去」之后必须与原文逐字相同 —— 这比原来还严：
+            # 它证明除了那一处标点形态修正之外，一个字都没动。
+            revert = minfo.get("revert_paragraphs") or work_paras
+            if _strip_ws(sep.join(revert)) != _strip_ws(text):
+                return text, {"applied": False, "reason": "机械校正改动了内容，拒绝",
+                              "measured": measured, "target": target}
+            after_merge = measure_form(sep.join(work_paras))
+            if abs(after_merge["bare_ratio"] - target["target"]) >= abs(
+                    measured["bare_ratio"] - target["target"]):
+                work_paras = base_paras
+                after_merge = measured
+                minfo = {"merged": 0}
+        else:
+            after_merge = measured
+
+        # —— 第二步：机械路线到顶了 ⇒ 用模型补引导语 ——
+        #
+        # 机械合并只改段落边界，能把裸台词占比拉下来但**到不了目标**
+        # （实测 9 段真实产物：71.5% → 42.2%，参考书 22.7%）。
+        # 剩下的差距只能靠**新增内容**补 —— 而这一步**会新增文字**，
+        # 所以它跟机械合并不是一回事：**闸门相同、判据不同**。
+        # 只有「机械合并之后仍在带外」才付这次模型调用的钱。
+        lead_info = {"applied": False}
+        ratio_now = after_merge["bare_ratio"]
+        if not (target["p10"] <= ratio_now <= target["p90"]):
+            try:
+                from app.config import settings as _st2
+                lead_on = bool(getattr(_st2, "style_lead_in", False))
+            except Exception:  # noqa: BLE001
+                lead_on = False
+            if lead_on:
+                try:
+                    from app.style.lead_in import insert_lead_ins
+
+                    work_paras, lead_info = insert_lead_ins(
+                        work_paras, provider, target_ratio=target["target"],
+                        proper_nouns=_reference_proper_nouns(db, project, novel_ids),
+                    )
+                except Exception as exc:  # noqa: BLE001 —— 补写失败绝不能影响正文
+                    logging.getLogger(__name__).warning("引导语补写异常，保留机械结果: %s", exc)
+                    lead_info = {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+        final_text = sep.join(work_paras)
+        after = measure_form(final_text)
         if abs(after["bare_ratio"] - target["target"]) >= abs(measured["bare_ratio"] - target["target"]):
-            return text, {"applied": False, "reason": "机械校正没逼近目标",
+            return text, {"applied": False, "reason": "形态校正没逼近目标",
                           "measured": measured, "target": target}
         logging.getLogger(__name__).info(
-            "形态校正（机械）：纯台词段 %.0f%% → %.0f%%（目标 %.0f%%，并了 %d 段）",
+            "形态校正：纯台词段 %.0f%% → %.0f%%（目标 %.0f%%；机械并 %d 段"
+            "、改了 %d 处标点形态、补引导语 %d 处）",
             measured["bare_ratio"] * 100, after["bare_ratio"] * 100,
-            target["target"] * 100, info["merged"],
+            target["target"] * 100, minfo.get("merged", 0),
+            int(minfo.get("colon_fixed") or 0), int(lead_info.get("inserted") or 0),
         )
-        return new_text, {"applied": True, "mode": "merge",
-                          "before": measured, "after": after,
-                          "target": target, "merged": info["merged"]}
+        return final_text, {"applied": True, "mode": "merge",
+                            "before": measured, "after": after,
+                            "target": target, "merged": minfo.get("merged", 0),
+                            "colon_fixed": int(minfo.get("colon_fixed") or 0),
+                            "lead_in": lead_info}
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning("机械形态校正异常，保留原文: %s", exc)
         return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
@@ -841,6 +884,26 @@ def _reference_corpus_text(
         return ""
 
 
+def _reference_proper_nouns(db, project: Project, novel_ids: list[int] | None = None) -> set[str]:
+    """参考书的专名表（判据「不能造新事实」用）。
+
+    取不到就返回空集 —— 调用方据此**降级**（判据改成只查模型自报的专名）。
+    """
+    proper_nouns: set[str] = set()
+    try:
+        from app.style.entity_store import ensure_table, entity_entries
+
+        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+        for nid in ids[:2]:
+            try:
+                proper_nouns |= set(entity_entries(ensure_table(db, nid)))
+            except Exception:  # noqa: BLE001 —— 一本书的表取不到就跳过
+                continue
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("专名表取不到，判据降级: %s", exc)
+    return proper_nouns
+
+
 def _maybe_insert_beats(
     db,
     project: Project,
@@ -904,19 +967,7 @@ def _maybe_insert_beats(
         target = ref_ratio
 
     # 专名表（判据 3 用）：优先用参考书的专名表
-    proper_nouns: set[str] = set()
-    try:
-        from app.models import NovelChunk
-        from app.style.entity_store import ensure_table, entity_entries
-
-        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
-        for nid in ids[:2]:
-            try:
-                proper_nouns |= set(entity_entries(ensure_table(db, nid)))
-            except Exception:  # noqa: BLE001 —— 一本书的表取不到就跳过
-                continue
-    except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).warning("专名表取不到，beat 判据降级: %s", exc)
+    proper_nouns = _reference_proper_nouns(db, project, novel_ids)
 
     try:
         return _insert_beats(text, provider, target_ratio=target,
