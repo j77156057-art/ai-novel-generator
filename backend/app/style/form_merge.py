@@ -201,6 +201,39 @@ def _match_pairs(kinds: Sequence[str], direction: str = "both") -> list[tuple[in
     return pairs
 
 
+def _explain_no_pairs(kinds: Sequence[str], counts: dict) -> str:
+    """并 0 段时，**如实说出是哪一种成因**（诊断改进，不改任何行为）。
+
+    ## 为什么原来那句是误导的
+
+    原来统一报「找不到可并的叙述」。
+    但「找不到」有**两种完全不同的成因**，处置方式也相反：
+
+    | 成因 | 特征 | 该怎么办 |
+    |---|---|---|
+    | **真没有叙述** | `N = 0`（整段正文全是台词/混合段） | 没辙，形状本身就那样 |
+    | **有叙述但不相邻** | `N > 0`，却一个配对都找不到 | **混合段把链隔断了** —— 这是**可以救**的 |
+
+    第二种曾被误判成第一种：实测某轮真跑里 `N=15 / B=22 / M=32`，
+    报的是「找不到可并的叙述」⇒ 让人以为「这形状天生如此、没办法」；
+    而真相是 **M（混合段）占了 32 段、把 N 与 B 全隔开了**
+    ⇒ 叙述**有**，只是没有一对是邻居。
+
+    ⇒ 一句笼统的「找不到」会让人**顺着错的方向去修**。
+    这里把成因、计数都写进 reason。
+    """
+    n_narration = counts.get("N", 0)
+    n_bare = counts.get("B", 0)
+    n_mixed = counts.get("M", 0)
+    n_short = counts.get("n", 0)
+    if n_narration == 0:
+        return (f"没有可并的纯叙述段（裸台词 {n_bare} 段、混合 {n_mixed} 段、"
+                f"太短叙述 {n_short} 段）—— 纯叙述一个都没有")
+    return (f"有 {n_narration} 段纯叙述，但**没有一段与裸台词段相邻**"
+            f"（裸台词 {n_bare} 段、混合 {n_mixed} 段、太短叙述 {n_short} 段）"
+            f"—— 混合段/太短叙述把链隔断了，属可救的形状")
+
+
 def merge_bare_dialogue(
     paragraphs: Sequence[str],
     target_ratio: float,
@@ -215,7 +248,9 @@ def merge_bare_dialogue(
         merged     并了几段
         before/after  裸台词段占比（并之前/并之后）
         target     目标
-        reason     为什么没并（没得并 / 已达目标 / 找不到可并的叙述）
+        reason     为什么没并（没得并 / 已达目标 / 找不到可并的叙述
+                   —— 最后这句会**区分两种成因**，见 `_explain_no_pairs`）
+        counts     段落分类计数（N/n/B/M 各多少）—— 并 0 段时靠它定位成因
         colon_fixed  有几处把「。」改成了「：」
         backward   有几处是「向后并」（`“台词”叙述`）
         revert_paragraphs  **把冒号改回去**的段落列表 —— 调用方拿它跟原文
@@ -233,7 +268,14 @@ def merge_bare_dialogue(
     n = len(bare_idx)
     quote_n = sum(1 for p in paras if _has_quote(p))
     before = (n / quote_n) if quote_n else 0.0
-    info = {"before": before, "after": before, "target": target_ratio, "merged": 0}
+    # 分类计数随诊断一起返回：并 0 段时**光看 reason 猜不出原因**，
+    # 必须带上 N/B/M/n 各多少（见下面 `_explain_no_pairs`）。
+    counts = {
+        "N": kinds.count("N"), "n": kinds.count("n"),
+        "B": kinds.count("B"), "M": kinds.count("M"),
+    }
+    info = {"before": before, "after": before, "target": target_ratio, "merged": 0,
+            "counts": counts}
 
     if not n:
         info["reason"] = "没有纯台词段"
@@ -254,7 +296,7 @@ def merge_bare_dialogue(
     pairs.sort(key=lambda t: (t[2] != "F", -t[1]))
     pairs = pairs[:need]
     if not pairs:
-        info["reason"] = "找不到可并的叙述"
+        info["reason"] = _explain_no_pairs(kinds, counts)
         return paras, info
 
     # 从后往前并（前面的下标才不会被后面的并段影响）
@@ -303,6 +345,6 @@ def merge_bare_dialogue(
         "backward": backward,
         "revert_paragraphs": revert_paras,
         "after": (n_after / q_after) if q_after else 0.0,
-        "reason": "已并" if merged else "找不到可并的叙述",
+        "reason": "已并" if merged else _explain_no_pairs(kinds, counts),
     })
     return new_paras, info

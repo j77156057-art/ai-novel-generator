@@ -30,7 +30,7 @@ A 类也只降到 35%，采纳率还随量下降 ⇒ 那条路被否掉（`style
 采纳率 97% / 93%，正文字数 +7.0~7.1%，9 段共 135~165 秒（并发 6）。
 两轮的差别只来自模型采样（温度 0.2 不是 0）⇒ **单次数字不能当结论**。
 
-## 判据（六道，全过才采纳）
+## 判据（七道，全过才采纳）
 
 1. **长度** 10~30 字（真书引导语 p25~p75 = 7~27 字）；
 2. **不含引号** + **像叙述**（默认是叙述，只在明确是说理时才拒）；
@@ -42,6 +42,33 @@ A 类也只降到 35%，采纳率还随量下降 ⇒ 那条路被否掉（`style
    整段 Jaccard 会把短句跟长段比，相似度被稀释 ⇒ 漏检（实测漏掉 10/14）；
 6. **不与本段自身重复**（引导语 vs 本段引号外，2-gram Jaccard ≥ 0.20）——
    「管家点头，…：管家点头：“…”」这种硬伤就是漏在这里（实测 5/115）。
+7. **说话人一致**（2026-10-27 加）—— 见下面「说话人校验」一节。
+
+## 说话人校验（判据 7）
+
+引导语是**贴在台词前面**的动作叙述，它的主语会被读者当成说话人 ⇒
+主语点错人 = 读者把这句话记到别人头上。这是这条路的已知代价。
+
+做法：**让模型自报它认为的说话人**（`说话人：某某`，拿不准写 `说话人：不明`），
+服务端拿它跟两个**确定**的参照物比对：
+
+- **引导语自己的主语**（模型自报的专名里，出现在引导语**开头**的那个）；
+- **本段的归属语**（引号外点名的人 —— 本段明说谁在说）。
+
+判得死的三种冲突（其余一律放过，只留痕）：
+
+| # | 冲突 | 依据 |
+|---|---|---|
+| 1 | 声明「拿不准」，却把**主语**写成了某个角色 | 拿不准 ⇒ 不该安名字 |
+| 2 | 引导语开头的主语是角色表里的人，但不是声明的说话人 | 主语 ≠ 说话人 |
+| 3 | 本段归属语点了**唯一一个人**，声明的说话人却是别人 | 本段明说谁在说 |
+
+判不准的**放过**（误杀会堵死真活）：模型没声明、说话人写的是代词/泛称、
+归属语点了 ≥2 个人、说话人不在角色表里、**角色表拿不到**（三条都以角色名作锚）。
+
+⚠️ 「开头」和「角色表」这两个限定是**真跑逼出来的**：第一版没有它们，
+121 次候选里拒掉的 6 条**逐条看全是误杀**（代词主语 + 宾语里带人名、
+把物件当人、把泛称当人名）。详见 `_speaker_check` 的 docstring。
 
 ## 失败策略
 
@@ -196,6 +223,8 @@ def lead_in_user_prompt(before: str, dialogue: str, after: str) -> str:
 只输出这一句引导语，不要解释，不要加标题。
 如果句子里用到了人名/地名/物件的名称，在句子**后面**另起一行写
 `专名：甲、乙`（没有就不用写这一行）。
+另外再另起一行写 `说话人：某某` —— 写**这句台词是谁说的**（引导语的主语就该是他）；
+拿不准就写 `说话人：不明`，这时引导语里**不要**出现人名，只用「他/她/那人」这类指代。
 
 【上文】
 {before}
@@ -205,6 +234,110 @@ def lead_in_user_prompt(before: str, dialogue: str, after: str) -> str:
 
 【下文】
 {after}"""
+
+
+#: 模型自报「拿不准」的几种写法（都当「不明」处理）。
+_UNKNOWN_SPEAKERS = ("不明", "不知道", "不确定", "无人", "无", "待定")
+
+#: 代词 / 泛指 —— 拿它当说话人无法核对（判不准，放过）。
+_PRONOUN_SPEAKERS = ("他", "她", "它", "那人", "此人", "对方", "两人", "有人")
+
+
+def _split_declared_speaker(raw: str) -> tuple[str, str]:
+    """把模型输出拆成 (叙述句, 自报的说话人)。
+
+    模型被要求在句后另起一行写 `说话人：某某`（拿不准写 `说话人：不明`）——
+    这样「它以为是谁在说话」由**模型自己声明**，服务端拿它跟确定的东西比对，
+    **不用猜谁是说话人**（猜 = 判不准 = 误杀）。
+    """
+    text = (raw or "").strip()
+    speaker = ""
+    kept: list[str] = []
+    for ln in (x.strip() for x in text.split("\n")):
+        if not ln:
+            continue
+        m = re.match(r"^说话人[：:]\s*(.+)$", ln)
+        if m:
+            speaker = m.group(1).strip()
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip(), speaker
+
+
+def _speaker_check(
+    lead: str,
+    speaker: str,
+    declared_nouns: Sequence[str],
+    attribution: str,
+    context: str,
+    character_names: set[str] | None,
+) -> tuple[str | None, str | None]:
+    """判据 7：说话人一致。返回 **(冲突原因, 备注)**。
+
+    冲突原因非空 ⇒ 拒这一处引导语；备注非空 ⇒ 记进诊断（**不拦**）。
+
+    ## 判得死 ⇒ 拒（三种）
+
+    1. 声明「拿不准」，却把**主语**写成了某个角色 —— 拿不准就不该安名字；
+    2. 引导语**开头**的主语是角色表里的人，但不是声明的说话人；
+    3. 本段归属语点了**唯一一个人**，而声明的说话人是别人。
+
+    ## 判不准 ⇒ 放过（只记备注）
+
+    - 模型没声明说话人；说话人写的是代词/泛称；
+    - 归属语点了 ≥2 个人（不知道谁在说）；
+    - 说话人不在角色表里（可能是泛称，也可能是模型编的 —— 分不出来就不拦）；
+    - **角色表拿不到**（三条都失效 —— 它们全都以角色名作锚）。
+
+    ## 为什么「开头」和「角色表」这两个限定不能省
+
+    2026-10-27 第一次真跑（9 段真实正文、121 次候选）时，这两条限定还没有 ⇒
+    判据 7 拒掉的 6 条**逐条看全是误杀**：
+
+    - 「他抬眼看了沈铁山一下。」（说话人：不明）—— 主语是「他」，「沈铁山」是**被看的人**；
+    - 「那人抬起头，望向周郎中。」（说话人：不明）—— 同上；
+    - 「他垂下眼，目光落向盒子里。」（说话人：不明）—— 「盒子」是**物件**，不是人；
+    - 「门内的人举起油灯。」（说话人：门内的人）—— 「门内的人」是**泛称**，不是人名。
+
+    ⇒ 规则 1 改成「**开头**点了**角色表里的人**才算」；
+    「说话人不在场」**降级成备注** —— 泛称与编造的人名分不出来，
+    按项目纪律「判不准的别当场拒」，不拦、只留痕。
+    """
+    if not speaker:
+        return None, None                   # 没声明 ⇒ 判不准
+    speaker = speaker.strip()
+    roster = character_names or set()
+    nouns = [n for n in (declared_nouns or []) if n]
+
+    # 引导语**开头**的主语（模型自报的名字里，开头的那个）
+    subject = None
+    for n in nouns:
+        if (lead or "").startswith(n) and (subject is None or len(n) > len(subject)):
+            subject = n
+    subject_is_person = bool(subject) and subject in roster
+    speaker_is_person = speaker in roster
+
+    # 1. 拿不准却把主语安成了某个角色
+    if speaker in _UNKNOWN_SPEAKERS or speaker in _PRONOUN_SPEAKERS:
+        if subject_is_person:
+            return f"拿不准是谁在说，却把主语写成了 {subject}", None
+        return None, None
+
+    # 2. 主语是角色表里的人，但不是声明的说话人
+    if subject_is_person and subject != speaker:
+        return f"引导语写的是 {subject}，说话人却是 {speaker}", None
+
+    # 3. 本段归属语点了唯一一个人 ⇒ 那就是说话人
+    attr_names = {n for n in roster if n and n in (attribution or "")}
+    if len(attr_names) == 1 and speaker_is_person:
+        y = next(iter(attr_names))
+        if y != speaker:
+            return f"本段明说 {y} 在说，声明的说话人却是 {speaker}", None
+
+    # 判不准：说话人不在角色表里（泛称 or 模型编的）—— 只留痕，不拦
+    if roster and not speaker_is_person and speaker not in (context or ""):
+        return None, f"说话人 {speaker} 不在角色表里，也不在这一段里"
+    return None, None
 
 
 def pick_lead_in_slots(
@@ -242,6 +375,7 @@ def insert_lead_ins(
     target_ratio: float,
     proper_nouns: set[str] | None = None,
     corpus_text: str | None = None,
+    character_names: set[str] | None = None,
     max_lead_ins: int = MAX_LEAD_INS,
     concurrency: int = LEAD_IN_CONCURRENCY,
 ) -> tuple[list[str], dict]:
@@ -251,8 +385,14 @@ def insert_lead_ins(
 
     1. `pick_lead_in_slots` 选点（纯机械）；
     2. 并发调模型写引导语（低温）；
-    3. **逐条验收**（六道判据，见模块 docstring）；
+    3. **逐条验收**（七道判据，见模块 docstring）；
     4. 通过的并进那一段（冒号形态 `引导语：“台词”`）。
+
+    ## `character_names` 是干什么的
+
+    判据 7（说话人一致）要拿「角色表」当参照：说话人得是**这个故事里的人**，
+    归属语点了谁也要靠它认。拿不到（空集）⇒ 判据 7 的第 3/4 条自动失效，
+    只剩第 1/2 条（都是模型自报 vs 模型自报，不需要外部参照）。
 
     ## 为什么要并发，以及为什么验收仍然按顺序
 
@@ -318,6 +458,8 @@ def insert_lead_ins(
         before = ps[idx - 1] if idx > 0 else ""
         after = ps[idx + 1] if idx + 1 < len(ps) else ""
         dialogue = ps[idx]
+        # 先摘掉「说话人：」那行（_clean_beat 只认「专名：」那行）
+        raw, speaker = _split_declared_speaker(raw)
         lead, declared = _split_declared_nouns(raw)
         lead = _clean_beat(raw)
         n_cjk = sum(1 for ch in lead if "一" <= ch <= "鿿")
@@ -366,6 +508,21 @@ def insert_lead_ins(
                                      "reason": f"与本段重复（相似度 {self_jac:.2f}）",
                                      "text": lead[:40]})
             continue
+        # 判据 7：说话人一致
+        conflict, note = _speaker_check(
+            lead, speaker, declared,
+            _outside_of_paragraph(dialogue),
+            f"{before}\n{dialogue}\n{after}",
+            character_names,
+        )
+        if conflict:
+            info["rejected"].append({"index": idx,
+                                     "reason": f"说话人不对：{conflict}",
+                                     "text": lead[:40]})
+            continue
+        if note:
+            info.setdefault("notes", []).append({"index": idx, "note": note,
+                                                 "text": lead[:40]})
 
         accepted.append((idx, lead))
 

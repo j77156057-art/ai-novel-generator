@@ -612,6 +612,7 @@ def _maybe_correct_form(
                         work_paras, provider, target_ratio=target["target"],
                         proper_nouns=_reference_proper_nouns(db, project, novel_ids),
                         corpus_text=_reference_corpus_text(db, project, novel_ids) or None,
+                        character_names=_project_character_names(db, project),
                     )
                 except Exception as exc:  # noqa: BLE001 —— 补写失败绝不能影响正文
                     logging.getLogger(__name__).warning("引导语补写异常，保留机械结果: %s", exc)
@@ -986,6 +987,37 @@ def _reference_proper_nouns(db, project: Project, novel_ids: list[int] | None = 
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning("专名表取不到，判据降级: %s", exc)
     return proper_nouns
+
+
+def _project_character_names(db, project: Project) -> set[str]:
+    """本项目的**角色名表**（判据 7「说话人一致」用）。
+
+    取两处：知识图谱里的 character 实体 + `plot_bible` 里的角色。
+    取不到就返回空集 —— 调用方据此**降级**（判据 7 的第 3/4 条自动失效，
+    只剩模型自报 vs 模型自报那两条）。
+    """
+    names: set[str] = set()
+    try:
+        from app.models import KgEntity
+        from sqlalchemy import select
+
+        rows = db.scalars(
+            select(KgEntity).where(KgEntity.project_id == project.id)
+        ).all()
+        for e in rows:
+            if getattr(e, "kind", "") == "character" and e.canonical_name:
+                names.add(str(e.canonical_name).strip())
+    except Exception as exc:  # noqa: BLE001 —— 取不到就降级，不阻断
+        logging.getLogger(__name__).warning("角色表取不到，说话人判据降级: %s", exc)
+    try:
+        bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+        for item in (bible.get("characters") or []):
+            name = item.get("name") if isinstance(item, dict) else item
+            if name and str(name).strip():
+                names.add(str(name).strip())
+    except Exception:  # noqa: BLE001
+        pass
+    return {n for n in names if n}
 
 
 def _maybe_insert_beats(
@@ -3157,22 +3189,36 @@ def regenerate_segment_stream(
     # constraints 与正常续写同源（角色/伏笔的锁定名单不能因重生成而变），只算一次
     constraints = build_context(db, project, novel_ids=novel_ids, profile=profile)["constraints"]
 
-    pieces: list[str] = []
-    for piece in provider.stream_chat(system, user, constraints=constraints):
-        pieces.append(piece)
-        yield {"type": "chunk", "text": piece}
-
-    text = _strip_thinking("".join(pieces))
+    # —— 生成 + 段长闸门 + 分块吐出（与流式续写**同一形状**）——
+    #
     # 段长闸门：重生成与正常续写**同一把尺**。原来只有续写有闸门，重生成写多短
     # 都照收 —— 验收口径（每段 ≥3000 汉字）与产出口径对不上。
+    #
+    # ⚠️ **为什么不再边生成边吐**（2026-10-27 改，与流式续写同一理由）：
+    # 闸门要**拿到整段**才能量字数，而不够长时会**整段重写**（`text = grown`）
+    # ⇒ 边吐边量的话，先吐出去的那半截会被改写后的正文**推翻**，
+    # 界面就会显示「先一段、然后整段换掉」，比慢一点更糟。
+    # ⇒ 宁可慢，也不能让界面显示一份会被推翻的稿子。
+    #
+    # 代价（如实记下）：**牺牲「长文首字即显」** —— 首字延迟从秒级变成
+    # 「整段生成完」的时长。这是拿体验换「界面显示的与落库的**是同一份**」。
+    raw = provider.chat(system, user, constraints=constraints)
+    text = _strip_thinking(raw)
     text, length_report = _enforce_length(
         provider, system, user, text, target_chars=max_chars,
         constraints=constraints, node_prompt=node_prompt)
+    # 分块吐出去（前端按 chunk 增量渲染）
+    for _i in range(0, len(text), 800):
+        yield {"type": "chunk", "text": text[_i:_i + 800]}
     summary = provider.summarize(text)
 
     target.text = text
     target.summary = {"text": summary}
     target.chapter_range = f"段{segment_no}"
+    # **显式提交**：重写后的正文不能「蹭」摘要树重建的 commit。
+    # 原来正文能不能存下来，取决于 `rebuild_summary_tree` 有没有跑完 ——
+    # 它一旦抛错（摘要卷 LLM 请求失败等），整段重写就白付一次生成费用。
+    db.commit()
 
     # 重建整棵摘要树：该段所在的卷摘要与主线骨架都基于旧内容，不能续滚
     tree_stats = rebuild_summary_tree(db, project, provider)
