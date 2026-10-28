@@ -1568,8 +1568,12 @@ export interface RoleplaySource {
   chunk_id: number;
   chapter_no: number | null;
   idx: number | null;
-  /** 「亲历」= 他自己开过口 / 这件事记在他名下；「在场听到」= 别人在说，他在旁边。 */
-  origin: "亲历" | "在场听到";
+  /**
+   * 「亲历」= 他自己开过口 / 这件事记在他名下；
+   * 「在场听到」= 别人在说，他在旁边；
+   * 「只是被提到」= 文里写到了他，**不代表他在场、也不代表他知道**。
+   */
+  origin: "亲历" | "在场听到" | "只是被提到";
   /** 判据说明（人可复核）。 */
   basis: string;
   score: number;
@@ -1593,10 +1597,16 @@ export interface RoleplayMessage {
 export interface RoleplayCharactersResponse {
   /** 两组合并（项目里的在前）。 */
   characters: string[];
-  /** 这个项目里的角色（剧情圣经 + 图谱抽出来的）。数量少，默认展开。 */
+  /** 这个项目里的角色（剧情圣经 + 项目实体表里的）。数量少，默认展开。 */
   project: string[];
   /** 参考书里的角色（叙事档案的声音词典里有一整套）。折叠 + 可搜索。 */
   reference: string[];
+  /**
+   * 角色的别名（规范名 → 别名列表）。
+   *
+   * 别名**不单独占一格**：「沈砚的父亲」「他爹」这类指代铺开会让清单看着多了一倍角色。
+   */
+  aliases?: Record<string, string[]>;
   /** 后端当前认定的「被扮演角色」。 */
   current: string | null;
 }

@@ -45,6 +45,7 @@ const emit = defineEmits<{
 const characters = ref<string[]>([]);
 const projectChars = ref<string[]>([]);
 const referenceChars = ref<string[]>([]);
+const aliases = ref<Record<string, string[]>>({});
 const refQuery = ref("");
 const showReference = ref(false);
 const character = ref("");
@@ -67,12 +68,41 @@ onMounted(async () => {
     characters.value = chars.characters ?? [];
     projectChars.value = chars.project ?? [];
     referenceChars.value = chars.reference ?? [];
+    aliases.value = chars.aliases ?? {};
     if (chars.current) character.value = chars.current;
     novels.value = list ?? [];
+    await loadHistory();
   } catch (e) {
     error.value = `角色清单取不到：${(e as Error).message}`;
   }
 });
+
+/**
+ * 读回这个项目的对话记录。
+ *
+ * 为什么按角色分组（而不是一条平铺的列表）：
+ * 用户报过「切换角色以后还是在这个对话框」—— 原来 `messages` 是一维数组，
+ * 问完沈砚再问白狐儿脸，两段对话在界面上连成一段，像在跟同一个人说话。
+ * ⇒ 按角色分组，每段对话有自己的标题；切角色就切到那一段。
+ */
+async function loadHistory() {
+  try {
+    const res = await api.roleplayMessages(props.projectId);
+    messages.value = res.messages ?? [];
+  } catch {
+    // 历史读不到不该阻断提问（当前这轮照样能问）
+  }
+}
+
+/** 当前角色的那段对话（界面上只显示这一段）。 */
+const currentThread = computed(() =>
+  messages.value.filter((m) => m.character === character.value),
+);
+
+/** 别别的角色有几条对话（切过去时给个提示）。 */
+function otherThreadCount(name: string): number {
+  return messages.value.filter((m) => m.character === name).length;
+}
 
 watch(
   () => props.cutoffs,
@@ -114,9 +144,10 @@ async function send() {
   sending.value = true;
   error.value = null;
   const q = question.value.trim();
+  const asked = character.value;
   try {
     const res = await api.roleplayChat(props.projectId, {
-      character: character.value,
+      character: asked,
       question: q,
       novel_ids: props.novelIds,
     });
@@ -124,7 +155,9 @@ async function send() {
       ...messages.value,
       {
         id: res.id,
-        character: res.character,
+        // 归到**用户问的那个**角色名下：后端可能回一个规范名（别名归一），
+        // 但界面上这段对话是跟「asked」说的 —— 归错角色会让人以为在跟别人说话。
+        character: asked,
         question: q,
         answer: res.answer,
         sources: res.sources ?? [],
@@ -133,7 +166,7 @@ async function send() {
       },
     ];
     question.value = "";
-    emit("update:character", res.character);
+    emit("update:character", res.character || asked);
   } catch (e) {
     error.value = `没能问出答案：${(e as Error).message}`;
   } finally {
@@ -142,7 +175,22 @@ async function send() {
 }
 
 function originTag(s: RoleplaySource): string {
-  return s.origin === "亲历" ? "他亲历" : "他在场听到";
+  if (s.origin === "亲历") return "他亲历";
+  if (s.origin === "在场听到") return "他在场听到";
+  return "只是被提到";
+}
+
+/** 切角色：切到那个角色自己的那段对话。 */
+function pickCharacter(c: string) {
+  character.value = c;
+  emit("update:character", c);
+  const n = otherThreadCount(c);
+  if (n > 0) {
+    // 有历史就滚过去，让人看到自己切到了哪一段
+    requestAnimationFrame(() => {
+      document.getElementById(`rp-thread-${c}`)?.scrollIntoView({ block: "nearest" });
+    });
+  }
 }
 </script>
 
@@ -172,11 +220,21 @@ function originTag(s: RoleplaySource): string {
               class="rp-char"
               :class="{ on: character === c }"
               :aria-pressed="character === c"
-              @click="character = c; emit('update:character', c)"
+              @click="pickCharacter(c)"
             >
               {{ c }}
             </button>
           </div>
+          <!-- 别名折叠显示：不单独占一格（「沈砚的父亲」不是另一个人） -->
+          <p v-if="Object.keys(aliases).length" class="rp-alias">
+            <span
+              v-for="(als, name) in aliases"
+              :key="name"
+              class="rp-alias-item"
+            >
+              {{ name }}＝{{ als.join(" / ") }}
+            </span>
+          </p>
         </div>
         <div v-if="referenceChars.length" class="rp-ref">
           <button type="button" class="rp-ref-toggle" @click="showReference = !showReference">
@@ -198,7 +256,7 @@ function originTag(s: RoleplaySource): string {
                 class="rp-char"
                 :class="{ on: character === c }"
                 :aria-pressed="character === c"
-                @click="character = c; emit('update:character', c)"
+                @click="pickCharacter(c)"
               >
                 {{ c }}
               </button>
@@ -237,17 +295,28 @@ function originTag(s: RoleplaySource): string {
 
     <!-- ③ 问答 -->
     <div class="rp-block">
-      <div class="card-title" style="font-size: var(--fs-md)">问点什么</div>
+      <div class="card-title" style="font-size: var(--fs-md)">
+        问点什么
+        <span v-if="character" class="hint">正在和「{{ character }}」说话</span>
+      </div>
       <div v-if="!messages.length" class="empty">
         还没有对话。问一件只有他知道的事 —— 比如「你陪着他长大的，他小时候什么样？」
       </div>
-      <div v-for="m in messages" :key="m.id" class="rp-msg">
+      <div
+        v-for="m in currentThread"
+        :id="`rp-thread-${m.character}`"
+        :key="m.id"
+        class="rp-msg"
+      >
         <div class="rp-q">问：{{ m.question }}</div>
         <div class="rp-a">答：{{ m.answer }}</div>
         <details v-if="m.sources.length" class="rp-src">
           <summary>他依据的原文（{{ m.sources.length }} 段）</summary>
           <div v-for="(s, i) in m.sources" :key="i" class="rp-src-item">
-            <span class="rp-tag" :class="s.origin === '亲历' ? 'ok' : 'muted'">
+            <span
+              class="rp-tag"
+              :class="s.origin === '亲历' ? 'ok' : s.origin === '在场听到' ? 'muted' : 'faint'"
+            >
               {{ originTag(s) }}
             </span>
             <span class="faint">{{ s.basis }} · 第 {{ s.chapter_no ?? "?" }} 章</span>
@@ -255,12 +324,15 @@ function originTag(s: RoleplaySource): string {
           </div>
         </details>
       </div>
+      <p v-if="!currentThread.length && messages.length" class="muted rp-note">
+        「{{ character }}」还没有对话记录 —— 上面几段是跟别的角色聊的。
+      </p>
       <div class="row" style="margin-top: var(--gap)">
         <input
           v-model="question"
           class="input rp-input"
           type="text"
-          placeholder="问他一件事…"
+          :placeholder="character ? `问「${character}」一件事…` : '先选一个角色…'"
           :disabled="!character || sending"
           @keyup.enter="send"
         />
@@ -361,6 +433,11 @@ function originTag(s: RoleplaySource): string {
   background: var(--bg-sunken);
   color: var(--fg-muted);
 }
+.rp-tag.faint {
+  background: transparent;
+  color: var(--fg-faint);
+  border: 1px dashed var(--border);
+}
 .rp-input {
   flex: 1;
 }
@@ -368,6 +445,17 @@ function originTag(s: RoleplaySource): string {
   font-size: var(--fs-xs);
   color: var(--fg-faint);
   margin-bottom: 6px;
+}
+/* 别名：折叠成一行，不单独占一格 */
+.rp-alias {
+  margin: 8px 0 0;
+  font-size: var(--fs-xs);
+  color: var(--fg-faint);
+  line-height: 1.7;
+}
+.rp-alias-item {
+  margin-right: 12px;
+  white-space: nowrap;
 }
 .rp-ref {
   margin-top: 10px;

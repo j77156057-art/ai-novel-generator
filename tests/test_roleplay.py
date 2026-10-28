@@ -43,10 +43,29 @@ def test_origin_narration_only_is_heard():
 
 
 def test_origin_conservative_direction():
-    """漏判的方向必须是**保守**的：不会把别人的话算成他的记忆。"""
+    """漏判的方向必须是**保守**的：不会把别人的话算成他的记忆。
+
+    2026-10-28：加了第三档「只是被提到」——
+    「文里写到他」与「他在场」是两回事（用户问「老夫子性格怎么样」，
+    答案里出现了另一个老头，因为那一段只是写到了「老夫子」三个字）。
+    纯旁白提到他 ⇒ **只是被提到**（比「在场听到」更保守：他未必在场）。
+    """
     text = "陆长风站在城门前，看着老周离去的背影，想起了很多事。"
     origin, _basis = classify_origin(text, "老周")
+    assert origin == "只是被提到"
+
+
+def test_origin_mentioned_is_not_the_same_as_present():
+    """「文里提到他」不等于「他在场」—— 这是 2026-10-28 加的第三档。"""
+    # 纯叙述提到他（没有他开口、也没人跟他说话）⇒ 只是被提到
+    origin, _ = classify_origin("程白霜缓缓抬起头，看着老夫子离去的背影。", "老夫子")
+    assert origin == "只是被提到"
+    # 台词里**叫到了他的名字** ⇒ 他在场
+    origin, _ = classify_origin("苏酥道：“老夫子，你快些。”", "老夫子")
     assert origin == "在场听到"
+    # 自己开口 ⇒ 亲历
+    origin, _ = classify_origin("老夫子怒极，颤声道：“好一个丧家犬！”", "老夫子")
+    assert origin == "亲历"
 
 
 # ── 写法样板：从角色检索命中的块里取他的台词 ───────────────────────────

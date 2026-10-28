@@ -49,17 +49,35 @@ class RoleplayChatBody(BaseModel):
 def list_characters(project_id: int, db: Session = Depends(get_db)) -> dict:
     """可选的角色清单，**分两组**返回。
 
-    - `project` —— **这个项目里的角色**（剧情圣经 + 图谱抽出来的）。数量少，
+    - `project` —— **这个项目里的角色**（剧情圣经 + 项目实体表里的）。数量少，
       而且通常就是用户想扮演的那几个 ⇒ 默认展示这组。
     - `reference` —— **参考书里的角色**（叙事档案的「角色声音词典」里有全套）。
-      实测北荒刀歌一把就有 130+ 个 ⇒ 铺开一屏没法用，所以折叠 + 可搜索。
+      实测北荒刀歌一把就有 285 个 ⇒ 铺开一屏没法用，所以折叠 + 可搜索。
 
     两组都要给：只给一组，用户会觉得「书里明明有这个人却选不到」。
+
+    ## 为什么项目组不取 `kg_nodes`
+
+    2026-10-28 用户报「混进很多不是人的」。取证发现：那一组原先取自
+    `get_reminders(source="generated")` ⇒ `kg_nodes(type=character)`，
+    那是**抽取器的原始产物** —— 模型把「水下」「边缘」「颜色」这类非人称谓
+    也建成了 character 节点（实测 mentions 高达 47 次）。
+    同一份数据在 `kg_entities`（v3 归一化实体表）里 **19 个实体个个是人**。
+
+    ⇒ 改用 `kg_entities`（见 `app/roleplay/roster.py`）。别名折叠显示，不单独占格。
+
+    ## 参考组剔掉「作者感言」条目
+
+    声音词典里混进了**作者对读者说话**的样本（"面对读者时语气亲切随和""求月票"），
+    蒸馏时把台词里的某个词当成了角色名（「相当」「简单」…）。
+    只剔**强作者信号**（月票/请假/上架感言/订阅…）：实测零误伤。
     """
     project = _require_project(db, project_id)
     from app.generation.engine import _roleplay_character_name
+    from app.roleplay.roster import is_author_talk, project_characters
 
     project_chars: list[str] = []
+    aliases_by_name: dict[str, list[str]] = {}
     reference_chars: list[str] = []
     seen_p: set[str] = set()
     seen_r: set[str] = set()
@@ -78,6 +96,9 @@ def list_characters(project_id: int, db: Session = Depends(get_db)) -> dict:
         rules = method_rules(project.style_narrative or {})
         for item in (rules.get(CHARACTER_VOICE_DIMENSION) or []):
             raw = item.get("rule", "") if isinstance(item, dict) else str(item)
+            # 作者跟读者说话的那几条 ⇒ 不是书里的人物，剔掉
+            if is_author_talk(raw):
+                continue
             m = _VOICE_NAME_PREFIX_RE.match(raw)
             if m:
                 _add(reference_chars, seen_r, m.group(0).rstrip("：: ").strip())
@@ -89,13 +110,12 @@ def list_characters(project_id: int, db: Session = Depends(get_db)) -> dict:
     for c in (bible.get("characters") or []) if isinstance(bible, dict) else []:
         _add(project_chars, seen_p, str((c.get("name") if isinstance(c, dict) else c) or ""))
 
-    # ③ 图谱抽出来的
+    # ③ 这个项目的实体表（kg_entities）—— 归一化后的**人**
     try:
-        from app.kg.queries import get_reminders
-
-        rem = get_reminders(db, project.id, source="generated") or {}
-        for c in (rem.get("character_constraints") or []):
-            _add(project_chars, seen_p, str((c.get("name") if isinstance(c, dict) else c) or ""))
+        names, aliases = project_characters(db, project.id)
+        for nm in names:
+            _add(project_chars, seen_p, nm)
+        aliases_by_name.update(aliases)
     except Exception:  # noqa: BLE001
         pass
 
@@ -109,6 +129,7 @@ def list_characters(project_id: int, db: Session = Depends(get_db)) -> dict:
         "characters": project_chars + reference_chars,
         "project": project_chars,
         "reference": reference_chars,
+        "aliases": aliases_by_name,
         "current": current,
     }
 

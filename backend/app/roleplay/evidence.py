@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 #: 正则贪婪匹配会把「草的老周」当成名字（实测踩过）。
 #:
 #: 改成**倒着看**：找到说话动词，往前看一小段窗口，
-#: 角色名必须**紧贴**动词（中间最多 4 个字，如「挠挠头」）。
+#: 角色名必须**紧贴**动词（中间最多 8 个字，如「挠挠头」「忍不住破戒」）。
 #:
 #: 代价：「老周想了想，一脸为难道：」这种隔了逗号的写法会漏判成「在场听到」。
 #: 方向是**保守**的（不会把别人对他说的话当成他的记忆）—— 这个方向的错代价更小。
@@ -49,10 +49,12 @@ _SPEECH_TAIL = re.compile(
     r"道|说|问|答|喊|骂|唤|叫)(?:道)?[：:]"
 )
 
+#: 名字与说话动词之间最多能夹几个字（「忍不住破戒」= 5）。
 #: 名字与说话动词之间最多能夹几个字（「挠挠头」= 3）。
 _SPEAKER_GAP = 4
 #: 往前看的窗口大小。
 _SPEAKER_WINDOW = 8
+
 
 #: 台词里直接叫他的名字（说明他在场且被交涉）
 _QUOTE_RE = re.compile(r"[“「『]([^”」』]{1,400})[”」』]")
@@ -73,6 +75,8 @@ class RoleplaySource:
     score: float = 0.0
     #: 他明确知道的事实（来自 KG 角色已知情报）
     known_facts: list[str] = field(default_factory=list)
+    #: 这条证据是**关于谁**的（渲染时用它裁出「他自己开过口的行」）
+    character: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -92,7 +96,7 @@ def _speaker_lines(text: str, character: str) -> list[str]:
 
     两条判据（任一命中即算他说的）：
 
-    1. **强判据**：说话动词紧贴他的名字（中间最多 4 个字，如「老周挠挠头道」）。
+    1. **强判据**：说话动词紧贴他的名字（中间最多 8 个字，如「老夫子忍不住破戒说道」）。
     2. **行首判据**：这一行**以他的名字开头**，且行里有引号对白。
        —— 中文的段落常以说话人起笔（「老周摇头凝视着……乐呵呵道：“有趣得很”」），
        这种写法名字与说话动词之间隔着好几个字（还有逗号），强判据抓不到，
@@ -101,6 +105,16 @@ def _speaker_lines(text: str, character: str) -> list[str]:
        实测（子 agent 复核指出）：片段 2/4/5 明明含老周本人的对白，
        却因为强判据够不着而被标成「他在场听到」——那会让他把自己亲历的事
        说成「听人提起过」。
+
+    ## 两条排除规则（2026-10-28 加，都是实测踩出来的）
+
+    - **名字与说话动词之间跨了标点** ⇒ 主语换人了，那不是他说的。
+      （实测：「…横眉竖眼的老夫子，无奈道：」——「老夫子」在句中是**宾语**，
+      说话的是苏酥；而「…马草的老周挠挠头道：」里的「的」是**定语**，老周**就是**说话人。
+      两者的区别不是「的」，而是**跨不跨标点** ⇒ 只用标点规则，不用「的」规则。）
+    - **行首判据要求他紧跟一个说话动词**（中间不许跨标点）——
+      否则「徐凤年到底是身体疲乏，…徐骁远远站着，小心翼翼赔笑道：…」这种
+      （行以徐凤年开头、但说话的是徐骁）会被算成徐凤年开的口。
     """
     out: list[str] = []
     for line in (text or "").split("\n"):
@@ -132,11 +146,20 @@ def _mentioned_in_dialogue(text: str, character: str) -> bool:
 
 
 def classify_origin(text: str, character: str) -> tuple[str, str]:
-    """判定一段原文对角色而言是「亲历」还是「在场听到」。
+    """判定一段原文对角色而言是「亲历」「在场听到」还是「只是被提到」。
 
     返回 (origin, basis)：
-    - origin: "亲历" | "在场听到"
+    - origin: "亲历" | "在场听到" | "只是被提到"
     - basis: 命中的判据（人可复核）
+
+    ## 三档而不是两档（2026-10-28 实测加的）
+
+    用户问「老夫子性格怎么样」，答案里出现了**另一个老头**（程白霜/薛宋官那段）。
+    那一段里有「老夫子」三个字（其实说的是别人），旧判据判成「他在场听到」——
+    模型据此以为「老夫子在场听见了这段」。
+
+    ⇒ 现在把「文里提到他」与「他在场」分开：提到他**不代表他在场**，
+    更不代表他知道那件事。标出来，模型自己判断能不能当记忆说。
 
     ## 判据是**保守**的（方向很重要）
 
@@ -144,7 +167,7 @@ def classify_origin(text: str, character: str) -> tuple[str, str]:
     （「老周挠挠头道」「老周憨憨道」「老周摇头凝视着……乐呵呵道」「大少爷，这是……」），
     判据只认得住两种（说话人紧贴名字 / 行首就是他的名字 + 有引号）。
 
-    ⇒ **认不出就判「他在场听到」**。这个方向的错代价小得多：
+    ⇒ **认不出就判「他在场听到」或「只是被提到」**。这个方向的错代价小得多：
     - 误判成「亲历」⇒ 他会**知道**本不该知道的秘密（别人当着他面说破的）；
     - 漏判成「在场听到」⇒ 他把自己亲历的事说成「听人提起过」（显得生分，不骗人）。
     """
@@ -153,8 +176,8 @@ def classify_origin(text: str, character: str) -> tuple[str, str]:
     if _mentioned_in_dialogue(text, character):
         return "在场听到", "台词里叫到了他，但说话的不是他"
     if character and character in (text or ""):
-        return "在场听到", "文里提到了他，但这段里没认出他的对白"
-    return "在场听到", "仅提到其名，无对白可证"
+        return "只是被提到", "文里提到了他，但这段里没认出他的对白"
+    return "只是被提到", "仅提到其名，无对白可证"
 
 
 def known_facts_for(db, project_id: int, character: str) -> list[str]:
@@ -243,7 +266,42 @@ def gather_evidence(
                 basis=basis,
                 score=float(h.get("score") or 0.0),
                 known_facts=list(facts),
+                character=name,
             ))
+    return out
+
+
+#: 引号里的内容（中文小说里的台词）。
+_QUOTED = re.compile(r"[“「『]([^”」』]{1,400})[”」』]")
+
+
+def _own_quotes(text: str, character: str) -> list[str]:
+    """这一段里，**他名字所在那一行的引号内容**。
+
+    ## 判据只有一层机械规则：名字与引号**同行**
+
+    刻意**不判断谁在说** —— 那个判据调了七版，每版都被真实文本里的新反例推翻
+    （「老夫子怒极，颤声道」是并列谓语、「老夫子一拍桌子，道」是插入语、
+    「马草的老周」里的「的」是定语…）。规则越多越容易过拟合到例子里。
+
+    这里要的不是「谁说的」，而是「**哪几句是他的台词**」——
+    模型据此能引用自己的原话，比整段喂进去强得多
+    （实测：#8 的 6 段共 6297 字 → 这条规则能挑出他名字所在行的引号）。
+
+    代价：偶尔会混进同一行里别人的话（「老夫子怒极，颤声道：「好一个丧家犬！」」
+    前面那句其实是苏酥说的）。量级远小于整段，且提示词里已说明「引号里属于你的那几句」。
+    """
+    out: list[str] = []
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        if not s or character not in s:
+            continue
+        idx = s.find(character)
+        tail = s[idx + len(character):]
+        for q in _QUOTED.findall(tail):
+            q = q.strip()
+            if q:
+                out.append(q)
     return out
 
 
@@ -252,14 +310,36 @@ def render_evidence_block(sources: list[RoleplaySource]) -> str:
 
     模型据此判断「这件事能不能当作我自己的记忆说出口」：
     「亲历」的可以当亲历说；「在场听到」的只能说「我听人提起过」。
+
+    ## 「亲历」的段落额外列出**他亲口说过的话**
+
+    见 `_own_quotes` 的说明：整段喂进去，模型会把「别人在谈论他」当成他的素材，
+    然后用第三人称写人物小传（实测「老夫子么，读书人的脾气，未必好…」）。
+    额外列出他名字所在行的引号，模型就知道**自己的原话**是什么。
     """
     if not sources:
         return ""
-    lines = ["【你能回忆起的片段（每段都标了来源）】"]
+    lines = [
+        "【你能回忆起的片段（每段都标了来源）】",
+        "注意：这是**书里的片段**，不是你的传记。",
+        "大多数里面是**别人在说话**、关于你的话；",
+        "只有引号里**属于你的那几句**才是你亲口说的。",
+    ]
     for i, s in enumerate(sources, 1):
-        mark = "他亲历" if s.origin == "亲历" else "他在场听到"
+        mark = {
+            "亲历": "他亲历",
+            "在场听到": "他在场听到",
+        }.get(s.origin, "只是被提到")
+        body = s.text.strip()
+        if not body:
+            continue
         lines.append(f"（{i}）【{mark}·{s.basis}】")
-        lines.append(s.text.strip())
+        if s.origin == "亲历":
+            own = _own_quotes(s.text, s.character or "")
+            if own:
+                lines.append("你亲口说过的话：")
+                lines += [f"　{q}" for q in own[:8]]
+        lines.append(body)
         if s.known_facts:
             lines.append("（你明确知道的事：" + "；".join(s.known_facts[:5]) + "）")
     return "\n".join(lines)
