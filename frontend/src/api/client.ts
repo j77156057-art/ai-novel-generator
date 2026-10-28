@@ -67,6 +67,8 @@ import type {
   StyleDistillApplyRequest,
   StyleDistillDetail,
   StyleDistillListResponse,
+  StyleNarrativeConflictsResponse,
+  StyleNarrativeRepairResponse,
   SearchHit,
   UploadResult,
 } from "./types";
@@ -145,11 +147,29 @@ function safeJson(text: string): unknown {
   }
 }
 
+/**
+ * 构造一个 JSON 请求的 init。
+ *
+ * ## 为什么要「body 一起传进来」
+ *
+ * fetch 对**字符串 body** 不会自动带 `application/json` —— 浏览器会补
+ * `Content-Type: text/plain;charset=UTF-8`。FastAPI 收到 `text/plain` 的请求体
+ * **不会**把它当 JSON 解析 ⇒ 直接 422
+ * （实测：`{"distill_id": 3}` 被拒成「Input should be a valid dictionary」）。
+ *
+ * 之前 `jsonInit("POST")` 不带 body 时**不设 headers**，调用方再自己补
+ * `body: JSON.stringify(...)` ⇒ Content-Type 永远是 text/plain ⇒
+ * 「应用到本项目」这个按钮**一直是坏的**（真机点出来才发现，不是测试发现的）。
+ *
+ * 所以：**body 必须传进 `jsonInit`**，让它决定 headers。
+ * 用 `!== undefined` 而不是真值判断：body 可能是 `0` / `""` / `false` / `null`。
+ */
 function jsonInit(method: string, body?: unknown): RequestInit {
+  const hasBody = body !== undefined;
   return {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    headers: hasBody ? { "Content-Type": "application/json" } : undefined,
+    body: hasBody ? JSON.stringify(body) : undefined,
   };
 }
 
@@ -307,10 +327,36 @@ export const api = {
 
   /** 把蒸馏库某条目应用到本项目（复制其 style_narrative 进项目缓存）。 */
   applyStyleDistill: (projectId: number, distillId: number) =>
-    request<ProjectOut>(`/projects/${projectId}/style-distills/apply`, {
-      ...jsonInit("POST"),
-      body: JSON.stringify({ distill_id: distillId } satisfies StyleDistillApplyRequest),
-    }),
+    request<ProjectOut>(
+      `/projects/${projectId}/style-distills/apply`,
+      jsonInit("POST", { distill_id: distillId } satisfies StyleDistillApplyRequest),
+    ),
+
+  /**
+   * 查文风档案里的禁用词冲突（只读，不调模型）。
+   *
+   * 体检说「档案的禁用词与档案正文自相矛盾」时，生成会被挡住（409）。
+   * 这个端点把那几处列出来，界面上就能直接修 —— 不用重蒸馏（≈42 分钟）。
+   */
+  listStyleNarrativeConflicts: (projectId: number) =>
+    request<StyleNarrativeConflictsResponse>(
+      `/projects/${projectId}/style-narrative/conflicts`,
+    ),
+
+  /**
+   * 修档案里的禁用词冲突（**人点的**：agent 只能提卡、不能落库）。
+   *
+   * `preview=true` 只返回「将要改什么」，不落库；
+   * `preview=false` 落库并重跑体检，结果一起返回（当场自证修好了）。
+   */
+  repairStyleNarrative: (
+    projectId: number,
+    body: { word: string; mode: "remove_word" | "drop_rule" | "unban"; preview?: boolean },
+  ) =>
+    request<StyleNarrativeRepairResponse>(
+      `/projects/${projectId}/style-narrative/repair`,
+      jsonInit("POST", body),
+    ),
 
   buildKg: (projectId: number, novelId?: number | null) =>
     request<{ characters: number; plotholes: number; relationships: number }>(

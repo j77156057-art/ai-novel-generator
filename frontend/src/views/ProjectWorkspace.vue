@@ -13,6 +13,7 @@ import type {
   PlotBible,
   ProjectOut,
   StyleDistillSummary,
+  StyleNarrativeConflict,
 } from "@/api/types";
 import DistillProgress from "@/components/DistillProgress.vue";
 import RoleplayPanel from "@/components/RoleplayPanel.vue";
@@ -504,6 +505,69 @@ const styleDistillsLoading = ref(false);
 const styleDistillApplying = ref<number | null>(null);
 const styleDistillMsg = ref<string | null>(null);
 const styleDistillErr = ref<string | null>(null);
+
+// ── 文风档案检查（禁用词冲突）状态 ──
+/** 阻塞生成的冲突（档案正文在教模型用禁用词）。 */
+const styleConflicts = ref<StyleNarrativeConflict[]>([]);
+/** 不阻塞的：同一个禁用词，但用的是名词性写法。 */
+const styleAttributive = ref<StyleNarrativeConflict[]>([]);
+const styleCheckLoading = ref(false);
+/** 正在修的那一处（按钮禁用 + 文案用）。 */
+const styleRepairing = ref<string | null>(null);
+/** 检查结果的一句话说明（步骤①那块面板用）。 */
+const styleCheckMsg = ref<string | null>(null);
+/** 上一次修复的结果（生成控制台用 —— 那边不显示检查说明，只说改了什么）。 */
+const styleRepairMsg = ref<string | null>(null);
+const styleCheckErr = ref<string | null>(null);
+
+/** 检查文风档案：有没有禁用词与正文自相矛盾（只读，不调模型）。 */
+async function checkStyleConflicts() {
+  styleCheckLoading.value = true;
+  styleCheckMsg.value = null;
+  styleCheckErr.value = null;
+  try {
+    const r = await api.listStyleNarrativeConflicts(projectId);
+    styleConflicts.value = r.conflicts ?? [];
+    styleAttributive.value = r.attributive ?? [];
+    styleCheckMsg.value = r.note;
+  } catch (err) {
+    styleConflicts.value = [];
+    styleAttributive.value = [];
+    styleCheckErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    styleCheckLoading.value = false;
+  }
+}
+
+/**
+ * 修掉一处冲突。
+ *
+ * 修的是**本项目当前用的档案**（蒸馏库里的原件不动 —— 那是全局共享的）。
+ * 修完由后端重跑一遍检查，把结果带回来 —— 不自己判断「修好了没有」。
+ */
+async function repairStyle(mode: "remove_word" | "drop_rule", word: string) {
+  styleRepairing.value = word;
+  styleRepairMsg.value = null;
+  styleCheckMsg.value = null;
+  styleCheckErr.value = null;
+  try {
+    const r = await api.repairStyleNarrative(projectId, { word, mode });
+    await checkStyleConflicts();
+    const errs = r.audit?.errors ?? 0;
+    styleRepairMsg.value = errs
+      ? `已改动，但检查里还有 ${errs} 处阻塞项，请再看一眼。`
+      : `已改动 ${r.changes.length} 处，检查通过，现在生成不会再被挡住。`;
+    // 档案变了 ⇒ 本地项目态要跟着更新（否则界面还显示旧档案）。
+    if (project.value) {
+      const refreshed = await api.getProject(projectId);
+      project.value.style_narrative = refreshed.style_narrative ?? null;
+    }
+  } catch (err) {
+    styleCheckErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    styleRepairing.value = null;
+  }
+}
 
 const POLL_MS = 1500;
 
@@ -1312,6 +1376,8 @@ onMounted(async () => {
   void resumeDistillJob();
   // 蒸馏库列表：进工作台就拉，应用面板才有东西可选。
   void loadStyleDistills();
+  // 文风档案的禁用词冲突：只读、不调模型。生成控制台要靠它提醒「会被挡住」。
+  void checkStyleConflicts();
   // 模型徽标：失败静默（不影响主流程）
   try {
     llmConfig.value = await api.getLlmConfig();
@@ -1669,6 +1735,64 @@ onUnmounted(stopDistillPolling);
       <div v-if="styleDistillMsg" class="notice info distill-inline">{{ styleDistillMsg }}</div>
       <div v-if="styleDistillErr" class="notice err distill-inline">{{ styleDistillErr }}</div>
     </div>
+
+    <!-- ============ 文风档案检查（禁用词冲突） ============ -->
+    <div class="library-block">
+      <div class="card-title" style="font-size: var(--fs-md)">
+        文风档案检查<span class="hint">禁用词与正文自相矛盾 ⇒ 生成会被挡住</span>
+      </div>
+      <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
+        档案的规则正文如果写了禁用清单里的转折词（例如用「然而」串起两段），
+        提示词检查会判定档案自相矛盾，生成因此被挡住。
+        这里能直接看到是哪几处，并当场改掉 —— 不必重新蒸馏一遍。
+      </p>
+
+      <div class="row" style="gap: 10px; align-items: center">
+        <button class="btn sm" :disabled="styleCheckLoading" @click="checkStyleConflicts">
+          {{ styleCheckLoading ? "检查中…" : "检查文风档案" }}
+        </button>
+        <span v-if="styleCheckMsg" class="faint" style="font-size: var(--fs-sm)">{{ styleCheckMsg }}</span>
+      </div>
+      <div v-if="styleCheckErr" class="notice err distill-inline">{{ styleCheckErr }}</div>
+
+      <ul v-if="styleConflicts.length" class="lib-list" style="margin-top: var(--gap)">
+        <li v-for="(c, i) in styleConflicts" :key="'conflict-' + i" class="lib-item">
+          <div class="lib-meta">
+            <span class="tag err">阻塞生成</span>
+            <strong>{{ c.word }}</strong>
+            <span class="faint">{{ c.dimension }}／{{ c.rule_dimension }}</span>
+          </div>
+          <div class="muted" style="font-size: var(--fs-sm); margin: 4px 0">{{ c.rule_text }}</div>
+          <div class="lib-actions">
+            <button class="btn sm" :disabled="styleRepairing !== null" @click="repairStyle('remove_word', c.word)">
+              去掉这个词
+            </button>
+            <button class="btn sm ghost" :disabled="styleRepairing !== null" @click="repairStyle('drop_rule', c.word)">
+              删掉这条规则
+            </button>
+          </div>
+        </li>
+      </ul>
+
+      <ul v-if="styleAttributive.length" class="lib-list" style="margin-top: var(--gap)">
+        <li v-for="(c, i) in styleAttributive" :key="'attr-' + i" class="lib-item">
+          <div class="lib-meta">
+            <span class="tag">不阻塞</span>
+            <strong>{{ c.word }}</strong>
+            <span class="faint">{{ c.dimension }}／{{ c.rule_dimension }}</span>
+          </div>
+          <div class="muted" style="font-size: var(--fs-sm); margin: 4px 0">
+            这里是用作名词的写法（不是禁用清单要禁的转折用法），因此不影响生成；
+            模型仍可能照抄这个字串，想彻底干净可以顺手去掉。
+          </div>
+          <div class="lib-actions">
+            <button class="btn sm ghost" :disabled="styleRepairing !== null" @click="repairStyle('remove_word', c.word)">
+              去掉这个词
+            </button>
+          </div>
+        </li>
+      </ul>
+    </div>
   </section>
 
   <!-- ============ 步骤 2：类型 ============ -->
@@ -1986,6 +2110,31 @@ onUnmounted(stopDistillPolling);
         {{ streaming ? "续写中…" : `生成 ${chaptersPerGen} 段` }}
       </button>
       <button class="btn" :disabled="!generations.length" @click="runExport">导出 txt</button>
+    </div>
+
+    <!-- ---------- 文风档案的禁用词冲突：生成会被挡住，得在这儿就看见 ---------- -->
+    <div v-if="styleConflicts.length" class="notice err distill-inline" style="margin-top: var(--gap)">
+      <p style="margin: 0 0 6px">
+        文风档案的规则正文里用了禁用清单里的转折词
+        （<strong>{{ styleConflicts.map((c) => c.word).join("、") }}</strong>），
+        提示词检查会判档案自相矛盾，<strong>生成会被挡住</strong>。
+      </p>
+      <div class="row" style="gap: 8px">
+        <button
+          class="btn sm"
+          :disabled="styleRepairing !== null"
+          @click="repairStyle('remove_word', styleConflicts[0].word)"
+        >
+          去掉这个词
+        </button>
+        <button class="btn sm ghost" @click="goStep(1)">查看全部冲突</button>
+      </div>
+    </div>
+    <div v-else-if="styleCheckErr" class="notice err distill-inline" style="margin-top: var(--gap)">
+      文风档案检查没跑成：{{ styleCheckErr }}
+    </div>
+    <div v-else-if="styleRepairMsg" class="notice info distill-inline" style="margin-top: var(--gap)">
+      {{ styleRepairMsg }}
     </div>
 
     <!-- ---------- 前情预检：真正下发的那份前情长什么样 ---------- -->

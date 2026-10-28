@@ -486,4 +486,23 @@ class ExtractionStats:
     #: 实测（2026-10-28，验收库同一份数据）：KG 抽的 19 条伏笔里 **14 条**是对话碎片
     #: ⇒ 提示词侧会剔除它们，但账本原样保留（抽取层只做 warn，不做裁决）。
     foreshadows_suspect: int = 0
+    #: —— 伏笔的**落库口径**（2026-10-28 真机验收后拆开）——
+    #:
+    #: 原来只有一个 `foreshadows` 字段，记的是**模型吐出的条目数**，
+    #: 读的人会以为「新增了这么多条」。实测那次 note 写 11，
+    #: 账上实际是 **7 条同名复用、0 条新增**（模型在同一次响应里吐了重复的名字，
+    #: 落库按 `(project_id, name)` 去重，重复的落到已有行上）。
+    #:
+    #: 恒等式：`foreshadows == foreshadows_reused + foreshadows_duplicate_in_batch
+    #: + foreshadows_new`
+    #: （守门测试会断言这条恒等式 —— 口径漂了立刻红）。
+    #: 命中账上已有的名字（**同名复用**）——抽取契约生效的样子。
+    foreshadows_reused: int = 0
+    #: 同一次响应里**重复**的名字（模型自己吐了两遍）。
+    foreshadows_duplicate_in_batch: int = 0
+    #: 真正**新落库**的条数。
+    foreshadows_new: int = 0
+    #: 新落库中与某条老名字**高置信相似**的条数（`foreshadows_new` 的子集）。
+    #: 阈值与实测依据见 `app/kg/foreshadow_quality.py`。
+    foreshadows_near_variant: int = 0
     errors: list = field(default_factory=list)

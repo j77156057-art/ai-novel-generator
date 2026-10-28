@@ -30,6 +30,8 @@ KG 抽取的「未填伏笔」**19 条里 14 条是对话碎片**
 
 from __future__ import annotations
 
+from typing import Iterable
+
 #: 以这些符号开头 ⇒ 引号里是台词。
 _QUOTE_HEADS = ("“", "「", "『", "\"", "'")
 
@@ -115,3 +117,73 @@ def plausible_payoff_chapter(planned, planted=None) -> bool:
 def sanitize_payoff_chapter(planned, planted=None):
     """说得通就返回原值，说不通返回 None（**当作未知**，不猜一个数补上）。"""
     return planned if plausible_payoff_chapter(planned, planted) else None
+
+
+# ====================================================================
+# 近似变体：同一条线索的两种说法
+# ====================================================================
+
+#: 判定「近似变体」的相似度阈值（字符 bigram Jaccard）。
+#:
+#: ## 阈值是量出来的，不是拍的
+#:
+#: 拿账上 102 条真名字两两算相似度，高分对逐条看过：
+#:
+#: ```
+#: 0.889  断刀刀镡上的陌生姓氏   ||  断刀刀镡上的陌生姓          ← 同一件事
+#: 0.545  沈铁山临死前未说完的话 ||  沈铁山未说完的话            ← 同一件事
+#: ---- 以下就是另一档了（有的同一件、有的两件，不能一刀切）----
+#: 0.435  瘸腿男人、陈叔、周郎中与沈家在二十年前的旧事 || 周郎中与陈叔二十年前的旧事
+#: 0.429  沈铁山未说完的话 || 沈铁山未说完的师承与断刀来历
+#: 0.417  断刀刀鞘上的陌生刻痕 || 断刀刀镡上的陌生姓            ← 刻痕 ≠ 姓，两件事
+#: ...
+#: 0.278  沈铁山临死前未说完的话 || 沈铁山未说完的师承与断刀来历
+#: 0.167  断刀上的‘萧’字 || 断刀上的“柳”字与柳家往事           ← 一字之差，两件事
+#: ```
+#:
+#: ⇒ **0.435 与 0.545 之间是一段空档**（这一段里没有别的对），
+#: 阈值取 **0.50**：落在空档正中，把两对「同一件事」收进来，
+#: 把「刻痕 vs 姓」「萧 vs 柳」这类**两件事**挡在外面。
+#:
+#: 再往下（0.15~0.30）真同假混 ⇒ 宁可少报（放过），不可误报
+#: （把两条线索说成一条，比漏报更坏）。
+NEAR_VARIANT_THRESHOLD = 0.50
+
+
+def _bigrams(text: str) -> set[str]:
+    s = ''.join(ch for ch in (text or '') if not ch.isspace())
+    if len(s) < 2:
+        return {s} if s else set()
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def name_similarity(a: str, b: str) -> float:
+    """两个伏笔名的相似度（字符 bigram Jaccard，0~1）。
+
+    >>> round(name_similarity("断刀刀镡上的陌生姓", "断刀刀镡上的陌生姓氏"), 3)
+    0.889
+    >>> name_similarity("断刀上的萧字", "断刀上的柳字与柳家往事") < 0.3
+    True
+    """
+    ga, gb = _bigrams(a), _bigrams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+def nearest_existing_name(name: str, existing: Iterable[str]
+                          ) -> tuple[str, float] | None:
+    """在已有名字里找与 `name` 最像的那条。
+
+    返回 `(最像的名字, 相似度)`；没有一条达到 `NEAR_VARIANT_THRESHOLD` ⇒ 返回 `None`。
+    """
+    best: tuple[str, float] | None = None
+    for other in existing or []:
+        if not other or other == name:
+            continue
+        sim = name_similarity(name, other)
+        if sim < NEAR_VARIANT_THRESHOLD:
+            continue
+        if best is None or sim > best[1]:
+            best = (str(other), sim)
+    return best

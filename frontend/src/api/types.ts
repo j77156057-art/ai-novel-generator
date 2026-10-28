@@ -1340,6 +1340,64 @@ export interface StyleDistillListResponse {
   items: StyleDistillSummary[];
 }
 
+/**
+ * 文风档案里的一处禁用词冲突（GET /api/projects/{id}/style-narrative/conflicts）。
+ *
+ * 「冲突」= 档案正文在教模型用禁用清单里的转折词（生成会被挡住）；
+ * 「名词性用法」= 同一个字串，但被当名词用（不挡生成，只是模型可能照抄）。
+ */
+export interface StyleNarrativeConflict {
+  /** 命中的禁用词。 */
+  word: string;
+  /** 禁用分类（如「禁用转折词」）。 */
+  dimension: string;
+  /** 命中所在规则的维度（如「语序编排」）。 */
+  rule_dimension: string;
+  /** 上下文片段。 */
+  context: string;
+  /** 命中的那条规则原文。 */
+  rule_text: string;
+}
+
+/** GET /api/projects/{id}/style-narrative/conflicts 的响应。 */
+export interface StyleNarrativeConflictsResponse {
+  /** 这个项目有没有文风档案。 */
+  has_archive: boolean;
+  /** 冲突（error 级）：生成会被挡住。 */
+  conflicts: StyleNarrativeConflict[];
+  /** 名词性用法（warn 级）：不挡生成。 */
+  attributive: StyleNarrativeConflict[];
+  /** 现在生成会不会被体检挡住。 */
+  can_generate: boolean;
+  /** 一句话说明。 */
+  note: string;
+}
+
+/** 修档案时的改动明细。 */
+export interface StyleNarrativeRepairChange {
+  dimension: string;
+  before: string;
+  after: string;
+}
+
+/** POST /api/projects/{id}/style-narrative/repair 的响应。 */
+export interface StyleNarrativeRepairResponse {
+  ok: boolean;
+  mode: string;
+  word: string;
+  /** 是否已落库（preview 时为 false）。 */
+  applied: boolean;
+  changes: StyleNarrativeRepairChange[];
+  message: string;
+  /** 修完后重跑的体检结果。 */
+  audit?: {
+    issues: { id: string; severity: string; title: string; rule: string; suggestion: string }[];
+    errors: number;
+    warnings: number;
+    error?: string;
+  };
+}
+
 /** POST /api/projects/{id}/style-distills/apply 的请求体。 */
 export interface StyleDistillApplyRequest {
   distill_id: number;

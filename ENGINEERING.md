@@ -3556,3 +3556,188 @@ python -c "from app.style.form import measure_form, form_target; ..."
 > 前端 dev 的 5173 端口在这台机器上**已被另一个项目占用**（Agent Office 的 vite 开了
 > `--strictPort`）⇒ 我们的 vite 会落到 `::1`；换端口跑（`npx vite --port 5199 --strictPort`），
 > 并用 `API_TARGET` 指到后端端口。
+## 档案体检：判据改准 + 当场能修 + 抽取口径分账（2026-10-28）
+
+### 起因：真机验收撞上的那道坎
+
+上一节那次真机验收，第一次生成直接 409：
+
+```
+409 workflow_prompt_not_ready
+   文风档案还没过关（1 个问题，第一件：档案的禁用词与档案正文自相矛盾）
+```
+
+取证在 `backend/app/agents/prompt_audit.py` 的 `forbidden_conflict`：
+拿档案的**规则正文**（渲染块在 `FORBIDDEN_SECTION_MARKER` 之前的部分）
+比对档案自己的**禁用清单**，**子串命中即 error** ⇒ 挡住生成。
+
+命中的位置（真档案）：
+
+```
+禁用清单：禁用转折词 = [然而, 但是, 不过, 与此同时, 紧接着, 下一刻, …]
+规则正文：场景常先以人物当下一刻的细微反应或即时判断切入，再补环境与前因
+```
+
+这里的「下一刻」是**名词性状语**（"下一刻的细微反应" = 下一个时刻的反应），
+跟清单要禁的**转折连词**用法（「下一刻，X 发生了」）不是一回事。
+
+量化（不是孤例）：
+
+| 样本 | 命中 |
+|---|---|
+| 蒸馏库 4 份档案 | 2 份（id=2「紧接着」、id=4/当前档案「下一刻」） |
+| 验收库有档案的 2 个项目 | 2/2（同一份档案应用过去的） |
+| 蒸馏库 id=1 / id=3 | 0 |
+
+⇒ **真档案几乎必然被挡**。产品里现成的绕法是「换一份档案」（实测有效），
+但那不是解法：档案是蒸馏产物，重蒸馏一轮 ≈ 42 分钟 LLM，
+而体检明明已经把原因说清楚了（「从档案规则里删掉这些词」）——
+**产品里却没有让人动手的地方**。
+
+### 一、判据：按**语法角色**分，不再纯子串命中
+
+新模块 `backend/app/style/forbidden_usage.py`。判据只有一条：**看词后面紧跟什么**。
+
+| 情形 | 角色 | 判定 |
+|---|---|---|
+| 紧跟「的 / 地 / 得」 | **名词性用法**（词被当名词/状语修饰语用） | 不判冲突（降为 `warn`） |
+| 其它一切用法 | **连词/短语用法** | 判冲突（`error`，仍然挡住生成） |
+| 禁用项含标点、或长度 ≥ 7 字 | **整句/整段模板** | 一律按字面判 |
+
+第三条是必要的：清单里混着两类东西 ——「然而/下一刻」是**功能词**
+（同一字串在不同位置角色不同），「你知道吗？」「他终于明白了活着的意义。」是
+**整句模板**（出现即冲突，没有角色差别）。
+
+判据落在**助词**上而不是词表 ⇒ 与具体哪个词无关，换一本书、换一批禁用词、
+换一个模型蒸馏出来的档案，同样成立。
+
+### 二、自愈：冲突能当场改
+
+- `GET /api/projects/{id}/style-narrative/conflicts` —— 只读、不调模型：
+  列出冲突（词、禁用分类、所在维度、那条规则原文）+ `can_generate`。
+- `POST /api/projects/{id}/style-narrative/repair` —— `preview` 只看不改；
+  apply 则落库 + 留痕（`repair_history` 记改前原文，可回退）+ **重跑体检**当场自证。
+- 界面：项目工作台第 ① 步「文风蒸馏库」面板下面加一块「文风档案检查」。
+
+**为什么不做成助理的工具**：本项目的硬规矩是 **agent 只能提卡、不能落库**。
+修档案是改数据 ⇒ 它是**人点的按钮**；助理仍可用只读的 `audit_prompt` 报出冲突。
+
+### 三、抽取口径：把「模型吐了几条」和「落库了几条」分开
+
+原来只有 `stats.foreshadows`（= 模型吐出的条目数）。真机验收那次 note 写 **11**，
+账上实际是 **7 条同名复用、0 条新增**（模型在同一次响应里吐了重复的名字）。
+现在拆成：`extracted = reused + duplicate_in_batch + new`，另加 `near_variant`。
+
+「近似变体」的阈值 **0.50** 是量出来的（账上 102 条真名字两两算 bigram Jaccard）：
+**0.435 与 0.545 之间是一段空档**，落在空档正中。
+
+> 踩坑：第一次用「四舍五入到 0.05 的直方图」看，0.545 被归进「0.55~0.60」桶，
+> 差点把阈值定成 0.55 —— 结果那一对（0.545）刚好落在阈值下面，**该报的没报**。
+> 直方图是用来**找空档**的，阈值要用**原始数值**定。
+
+### 四、真跑证据（真实通道、真实档案）
+
+应用**会命中的那份档案**（蒸馏库 id=4）后：
+
+```
+GET  /style-narrative/conflicts → 200
+   can_generate = True
+   note = 档案正文里出现了禁用词，但用的是名词性写法 —— 不挡生成。
+   [不阻塞] 下一刻 [禁用转折词/语序编排] 场景常先以人物当下一刻的细微反应…
+
+POST /api/generate → 200   用时 152.3s
+   正文 2994 字（目标 3000），占位=False      ← 改判据前这一步是 409
+
+POST /style-narrative/repair（preview）→ 200   将要改动 1 处（还没落库）
+POST /style-narrative/repair（apply）  → 200
+   applied = True，改动 1 处；体检 errors=0 warnings=0
+GET  /style-narrative/conflicts → conflicts=[] attributive=[]
+```
+
+（同一份档案又跑了一遍，改判据前是 183.6s / 3389 字；两轮都通过。）
+
+真冲突**没有被放过**：蒸馏库 id=2 的「正文紧接着展开」仍判 `error`（连词用法），
+阳性对照把标准清单 11 个转折词的连词用法逐个测过 —— 全部仍判 `error`（尺先自证）。
+
+### 五、踩坑一：修复差点把**证据引文**改坏
+
+第一次真跑修复时，它把
+
+```
+（证据：下一刻，灰衣老者猛然停下身形）  →  （证据：，灰衣老者猛然停下身形）
+```
+
+也改了 —— 留下一个孤零零的逗号，还把语料原句改坏了。
+
+**为什么是错的**：规则尾部的「（证据：…）」是**语料原句**，渲染进提示词前会被
+`_strip_evidence` 剥掉 ⇒ 只出现在证据里的禁用词**模型根本看不见**，
+为它动手既没用又有害。
+
+改法：修复只动**规则正文**（`（证据：` 之前那半），证据引文一个字不动；
+只在证据里出现过的词 ⇒ 「没什么可修」（端点回 404）。
+
+### 五之二、踩坑二：**「应用到本项目」按钮一直是坏的**（Content-Type）
+
+在浏览器里点「去掉这个词」，网络面板显示 **422**；后端日志里那条 POST 压根没进业务逻辑。
+
+根因在 `frontend/src/api/client.ts`：
+
+```ts
+function jsonInit(method: string, body?: unknown): RequestInit {
+  return {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,   // ← body 为空 ⇒ 不设 headers
+    body: body ? JSON.stringify(body) : undefined,
+  };
+}
+
+// 调用点（原有写法）：
+request<ProjectOut>(url, { ...jsonInit("POST"), body: JSON.stringify({ distill_id: distillId }) })
+```
+
+`jsonInit("POST")` **不带 body** ⇒ `headers` 是 `undefined`；
+调用方再自己补 `body` ⇒ **Content-Type 一直是 `undefined`** ⇒
+浏览器对字符串 body 自动补 `Content-Type: text/plain;charset=UTF-8`
+⇒ FastAPI 不把它当 JSON 解析 ⇒ **422**
+（`{"distill_id": 3}` 被拒成「Input should be a valid dictionary or object to extract fields from」）。
+
+⇒ **已发布的「应用到本项目」按钮从来就没通过**（蒸馏库是「跨项目复用文风档案」的主力入口，
+它一坏，这个功能在界面上等于不存在）。这个 bug **不是测试发现的** ——
+后端接口一直是对的、前端类型检查一直过、CI 全绿；是**真机点出来**才发现的。
+
+改法：body 必须传进 `jsonInit`，让它决定 headers：
+
+```ts
+function jsonInit(method: string, body?: unknown): RequestInit {
+  const hasBody = body !== undefined;      // 用 !== undefined，不用真值判断
+  return {
+    method,
+    headers: hasBody ? { "Content-Type": "application/json" } : undefined,
+    body: hasBody ? JSON.stringify(body) : undefined,
+  };
+}
+```
+
+（真值判断还会把 `0` / `""` / `false` / `null` 当成「没有 body」。）
+
+守门测试：`frontend/tests/jsonBodyContentType.test.ts`（3 条）——
+带 body 的 POST 必须带 `application/json`；不带 body 的不该硬塞 Content-Type。
+
+### 六、改动清单
+
+- 新增 `backend/app/style/forbidden_usage.py`（角色判定 + 修档案方案）。
+- `backend/app/agents/prompt_audit.py`：查 3 改成角色判定；
+  连词用法仍 `error`，名词性用法改 `warn`（新 rule id `prompt_forbidden_word_in_rules`）。
+- `backend/app/routers/projects.py`：新增 `GET .../style-narrative/conflicts`
+  与 `POST .../style-narrative/repair`。
+- `backend/app/kg/foreshadow_quality.py`：新增 `name_similarity` /
+  `nearest_existing_name` / `NEAR_VARIANT_THRESHOLD=0.50`。
+- `backend/app/kg/extractor_v3.py`：`ExtractionStats` 拆出四个口径字段。
+- `backend/app/kg/batch_worker.py`：伏笔落库按「复用 / 批内重复 / 新增」分账，
+  新增的再判近似变体（只计数 + 警告，不改账本）。
+- 前端：`api/client.ts` + `api/types.ts` + `ProjectWorkspace.vue`
+  （文风蒸馏库面板下的「文风档案检查」＋ 生成控制台的冲突横幅）；
+  **另修 `jsonInit` 的 Content-Type bug**（见「踩坑二」——它让「应用到本项目」一直是坏的）。
+- 测试：`tests/test_style_prompt_audit_repair.py`（含阳性对照）、
+  `tests/test_kg_foreshadow_stats.py`（口径恒等式）、
+  `frontend/tests/jsonBodyContentType.test.ts`（Content-Type 守门）。

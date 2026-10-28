@@ -166,35 +166,75 @@ def run_prompt_audit(db: Any, project: Any, *, profile: str = 'original'
                                     snippet='原创模式的渲染块里含有【角色声音词典】', score=0.8),),
         ))
 
-    # —— 查 3：禁用词与**规则正文**自相矛盾（档案说不许出现 X，规则正文就在写 X）——
+    # —— 查 3：禁用词与**规则正文**自相矛盾（档案说不许用 X，正文就在教用 X）——
+    #
     # 比的对象是「规则正文」，不是整个渲染块。
     #
     # 为什么：渲染块**本身含禁用清单**
     # （`【禁用转折词】禁止使用：然而、但是、不过…`），拿整块去比等于
     # **禁用清单和自己匹配** —— 只要档案有禁用清单就恒真（实测：真书档案必误报）。
-    # 真正要抓的是：规则正文在教模型用某个词，而清单同时禁这个词。
+    #
+    # ## 角色怎么分（2026-10-28 真机验收后改的）
+    #
+    # 原来的判据是**纯子串命中**：清单里的词只要在正文里出现就判冲突（error ⇒
+    # 挡住生成）。实测这条判据把
+    #     「场景常先以人物当下一刻的细微反应或即时判断切入」
+    # 里的「下一刻」判成转折连词冲突 —— 这里它是**名词性状语**
+    # （"下一刻的细微反应" = 下一个时刻的反应），跟清单要禁的
+    # 「下一刻，X 发生了」不是一回事。
+    # 量化：蒸馏库 4 份档案 2 份命中、验收库 2/2 项目命中 ⇒ 真档案几乎必然被挡。
+    #
+    # 现在按**语法角色**分：
+    # - 连词/短语用法（词后面不是助词）⇒ 仍判 `error`（真冲突照样挡）；
+    # - 名词性用法（词后面紧跟「的/地/得」）⇒ 降为 `warn`：
+    #   不挡生成，但**不隐藏** —— 报出来，并给出「修档案」的入口。
+    #
+    # 详见 `docs/style-prompt-audit-repair.md` 与 `app/style/forbidden_usage.py`。
     if isinstance(narrative, dict) and narrative:
+        from app.style.forbidden_usage import analyze as _analyze_forbidden
         from app.style.narrative import FORBIDDEN_SECTION_MARKER
+
         rules_text = narrative_block.split(FORBIDDEN_SECTION_MARKER, 1)[0]
-        forbidden = (narrative.get('forbidden') or {})
-        hits: list[str] = []
-        for words in forbidden.values():
-            for word in (words or []):
-                if word and str(word) in rules_text:
-                    hits.append(str(word))
-        if hits:
+        analysis = _analyze_forbidden(narrative, rules_text)
+
+        if analysis.conflicts:
+            hits = sorted({u.word for u in analysis.conflicts})
+            where = sorted({u.rule_dimension for u in analysis.conflicts if u.rule_dimension})
             issues.append(_issue(
                 taken, issue_id='forbidden_conflict', issue_type='prompt_consistency',
                 severity='error',
                 title='档案的禁用词与档案正文自相矛盾',
                 claim=f'档案把这些词列为禁用（不得出现在正文里），但档案正文自己就写着它们：'
-                      f'{"、".join(sorted(set(hits))[:5])}。',
-                suggestion='从档案规则里删掉这些词，或从禁用清单里去掉（两者不能同时说）。',
+                      f'{"、".join(hits[:5])}。',
+                suggestion='用「修档案」把这个词从规则正文里去掉（词本身是转折连词，'
+                           '正文却在教模型用同一个词），或从禁用清单里去掉（两者不能同时说）。',
                 rule='prompt_forbidden_self_conflict',
                 evidence=(IssueEvidence(kind='novel', source=f'project:{project.id}',
                                         ref_id=f'project:{project.id}',
-                                        snippet='禁用词：' + '、'.join(sorted(set(hits))[:5]),
+                                        snippet='禁用词：' + '、'.join(hits[:5])
+                                        + (('（出现在「' + '、'.join(where[:3]) + '」维度）')
+                                           if where else ''),
                                         score=0.7),),
+            ))
+
+        if analysis.attributive:
+            hits = sorted({u.word for u in analysis.attributive})
+            where = sorted({u.rule_dimension for u in analysis.attributive if u.rule_dimension})
+            issues.append(_issue(
+                taken, issue_id='forbidden_word_in_rules', issue_type='prompt_consistency',
+                severity='warn',
+                title='档案正文里出现了禁用词，但用的是名词性写法',
+                claim=f'这些词在档案正文里是被当名词用的（{"、".join(hits[:5])}），'
+                      f'不是清单要禁的转折连词用法 —— 所以不算自相矛盾，不挡生成。'
+                      f'不过模型仍可能照抄这个字串。',
+                suggestion='不用管也能生成；想彻底干净就用「修档案」把这个词从规则里去掉。',
+                rule='prompt_forbidden_word_in_rules',
+                evidence=(IssueEvidence(kind='novel', source=f'project:{project.id}',
+                                        ref_id=f'project:{project.id}',
+                                        snippet='名词性用法的禁用词：' + '、'.join(hits[:5])
+                                        + (('（出现在「' + '、'.join(where[:3]) + '」维度）')
+                                           if where else ''),
+                                        score=0.4),),
             ))
 
     # —— 查 4：静态提示词过长（挤正文额度、也击穿缓存收益）——

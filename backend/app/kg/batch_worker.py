@@ -435,6 +435,20 @@ def _is_suspect_foreshadow(name: str | None) -> bool:
         return False
 
 
+def _nearest_existing_name(name: str, existing: list[str]) -> tuple[str, float] | None:
+    """新抽出的伏笔名，是不是账上某条老名字的**近似说法**？
+
+    只用于留痕（计数 + 警告），**不改账本** ——
+    阈值 0.55 的实测依据见 `app/kg/foreshadow_quality.py`。
+    """
+    try:
+        from app.kg.foreshadow_quality import nearest_existing_name
+
+        return nearest_existing_name(name, existing)
+    except Exception:  # noqa: BLE001 —— 判不出来就不留痕，绝不能因此挡住落库
+        return None
+
+
 def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[_QueueItem]):
     """把归一化后的抽取结果落 v3.0 表。幂等 upsert。"""
     from app.kg.extractor_v3 import ExtractionStats
@@ -596,33 +610,66 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         stats.state_changes += 1
 
     # —— 5. foreshadows upsert（name 唯一，状态机推进）——
+    #
+    # 口径（2026-10-28 真机验收后拆开）：原来只有一个 `foreshadows`，
+    # 记的是**模型吐出的条目数** —— 读的人会以为「新增了这么多条」。
+    # 实测那次 note 写 11，账上实际是 7 条同名复用、0 条新增
+    # （模型在同一次响应里吐了重复的名字）。现在拆成四个数：
+    #   reused + duplicate_in_batch + new == extracted
+    # 另加 near_variant：新落库的名字与某条老名字**高置信相似**
+    # （只计数 + 警告，不改账本 —— 改账本要人点头）。
+    existing_names: list[str] = []
+    try:
+        existing_names = [str(n) for n in db.scalars(
+            select(KgForeshadow.name).where(KgForeshadow.project_id == project_id)
+        ).all() if n]
+    except Exception:  # noqa: BLE001 —— 取不到就当没有（只影响近似变体计数）
+        existing_names = []
+    seen_names: set[str] = set()
     for f in result.get("foreshadows", []):
         # —— 只留痕，不裁决（2026-10-28）——
         # 抽出来的伏笔有相当一部分其实是**台词碎片**（实测 19 条里 14 条）。
         # 这里**只计数 + 警告**，账本原样保留（删数据要人点头）；
         # 提示词侧另有渲染层过滤（见 `generation/prompts.py`）。
+        name = str(f.get("name") or "")
         if _is_suspect_foreshadow(f.get("name")):
             stats.foreshadows_suspect += 1
             logging.getLogger(__name__).warning(
                 "伏笔疑似对话碎片（已入账、但不会进提示词约束）：%s", f.get("name"))
         fs = db.scalar(
             select(KgForeshadow).where(
-                KgForeshadow.project_id == project_id, KgForeshadow.name == f["name"]
+                KgForeshadow.project_id == project_id, KgForeshadow.name == name
             )
         )
+        if fs is None and name in seen_names:
+            # 同一次响应里重复的名字：不再插第二行（唯一约束会炸）。
+            stats.foreshadows_duplicate_in_batch += 1
+            stats.foreshadows += 1
+            continue
         if fs is None:
-            fs = KgForeshadow(project_id=project_id, name=f["name"],
+            fs = KgForeshadow(project_id=project_id, name=name,
                               status=f.get("status", "planted"),
                               planted_chapter=f.get("planted_chapter"),
                               planned_payoff_chapter=f.get("planned_payoff_chapter"))
             db.add(fs)
+            stats.foreshadows_new += 1
+            near = _nearest_existing_name(name, existing_names)
+            if near is not None:
+                stats.foreshadows_near_variant += 1
+                logging.getLogger(__name__).warning(
+                    "伏笔名与账上已有的近似（相似度 %.2f）：新名「%s」≈ 老名「%s」"
+                    "（只留痕，不改账本）", near[1], name, near[0])
+        elif name in seen_names:
+            stats.foreshadows_duplicate_in_batch += 1
         else:
+            stats.foreshadows_reused += 1
             # 状态机只前进不后退：paid_off 是终态倾向，planted→developing 可推进
             _ORDER = {"planted": 0, "developing": 1, "paid_off": 2, "expired": 3, "dropped": 4}
             if _ORDER.get(f.get("status", ""), 0) > _ORDER.get(fs.status, 0):
                 fs.status = f["status"]
             if f.get("planned_payoff_chapter"):
                 fs.planned_payoff_chapter = f["planned_payoff_chapter"]
+        seen_names.add(name)
         stats.foreshadows += 1
 
     # —— 6. mentions 反向索引（实体×段，context_window 原文片段）——
