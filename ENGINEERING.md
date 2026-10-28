@@ -4018,3 +4018,68 @@ DOM 查询能找到元素，说明渲染树是好的；那就是**样式**的事
 **界面上有的控件，后端就得真的用它。** 那个「故事进行到第几章」输入框存在、
 项目里也确实存了 `reference_cutoffs`，但只有续写路径读它 ——
 角色对话这条路径漏了。⇒ 凡是界面上承诺语义的控件，都要有一条「它真的生效」的测试。
+
+---
+
+## KG 批抽的作业行卡在 running：蒸馏有收割，批抽忘了（2026-10-29）
+
+### 症状
+
+知识图谱工作台的「Worker 状态」页长期显示 `running 30`，
+看着像还有 30 段在抽 —— 实际上一条都没人管。
+
+实测（冒烟库）：`agent_runs` 里 78 条 `kg_batch_extract` 行，
+30 条是 `running`、48 条 `success`；running 的**最早 2026-10-20，
+最新一条是当天 16:48 自己跑的那次**。
+
+### 根因：进程重启，队列没了，行还在
+
+批抽跑在**进程内线程**里（`WORKER_THREADS = 1`），队列在**内存 deque** 里：
+
+    段 commit → enqueue（写一行 AgentRun(role=kg_batch_extract, status=running)）
+             → 内存 deque 攒批 → worker 线程抽 → 批结束统一翻 success/failed
+
+进程一重启（uvicorn reload / 多 worker / 服务重启 / 容器被杀），
+**队列没了，但库里的 running 行还在** ⇒ 永远 running，而且**零报错**
+（没有任何错误信号，只有"还在跑"的假象）。
+
+**蒸馏任务早就有这个补丁**（`app/style/jobs.py::reap_stale_runs`，
+启动时把 pending/running 收成 failed），**批抽这边一直漏着** ⇒ 补上。
+
+### 第二个漏洞：批内异常会让整批的行留在 running
+
+`_run_batches` 里只有 `extract_batch` 抛错才会翻 failed；
+`_get_provider()` / `_persist_extraction()` 等在 for 循环**外**的异常会冒到
+`_worker_loop` 的 except（只记一行日志）⇒ **整批的行永远留在 running**。
+⇒ 整批包一层 try/except，保证任何异常都把该批的行翻成 failed。
+
+### 第三件事：被收割的行不能显示"跑了 3 天"
+
+收割时 `finished_at = now`，而 `started_at` 是几天前 ⇒ 前端算出 658822s（7 天）。
+它**根本没跑完**（队列丢了），不是"跑得慢"。
+⇒ note 里标 `interrupted`，`duration_ms` 给 `None`，界面显示"已中断"。
+
+### 修法（三处）
+
+| 位置 | 改了什么 |
+|---|---|
+| `batch_worker.reap_stale_runs` | 启动时收割 running 行 → failed + `interrupted` 标记 |
+| `batch_worker._mark_batch_failed` | 批内任何未捕获异常 ⇒ 该批的行翻 failed |
+| `main.lifespan` | 启动时调用批抽收割（与蒸馏收割同构，各自 try） |
+
+**只碰 running**：success / failed 是已经结束的结论，覆盖了就再也找不回来。
+**本进程启动后入队的行不碰**（`started_at >= 启动时刻` ⇒ 多 worker 部署时不会误收同伴的活）。
+
+### 真跑（重启一次后端）
+
+    收割前：running 30 · success 48
+    收割后：running  0 · failed 30 · success 48
+    note：{"segment_no": 6, "error": "服务重启时中断（队列已丢失）", "interrupted": true}
+
+界面：已完成 32 · 失败 18 · 进行中 0 · 已中断 0，失败行可勾选重捞。
+
+### 一条方法论
+
+**同一类后台任务，兜底逻辑要放在一起看。** 蒸馏有启动收割、批抽没有 —— 不是批抽特殊，
+是当初写蒸馏时想到了、写批抽时忘了。⇒ 加"进程内后台任务"这类机制时，
+先问一句「它被杀掉时，谁来收尾？」

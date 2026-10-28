@@ -46,6 +46,23 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:  # noqa: BLE001 —— 收割是增强，不是启动的前提
         logging.getLogger(__name__).warning("蒸馏任务启动收割失败（已忽略）：%s", exc)
+
+    # —— 收割被中断的 **KG 批抽**后台任务 ——
+    # 批抽同样跑在进程内线程里（队列在内存 deque），服务重启后线程没了、
+    # 队列没了，但它登记的 AgentRun(role=kg_batch_extract) 行还停在 running
+    # ⇒ Worker 页永远显示「在抽」（实测积压 30 条，最早一条是 8 天前）。
+    # 蒸馏那边有 reap_stale_runs，批抽这边原先漏了 ⇒ 同样的模式补上。
+    try:
+        from app.kg.batch_worker import reap_stale_runs as reap_kg_runs
+
+        with SessionLocal() as db:
+            reaped = reap_kg_runs(db)
+        if reaped:
+            logging.getLogger(__name__).info(
+                "启动收割：%s 条 KG 批抽任务因服务重启被标记为失败", reaped
+            )
+    except Exception as exc:  # noqa: BLE001 —— 收割是增强，不是启动的前提
+        logging.getLogger(__name__).warning("KG 批抽启动收割失败（已忽略）：%s", exc)
     yield
 
 

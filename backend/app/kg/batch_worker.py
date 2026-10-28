@@ -47,6 +47,17 @@ ROLE_KG_EXTRACT = "kg_batch_extract"
 STUCK_MINUTES = 30
 
 
+def _session_factory():
+    """批抽用的 session 工厂（默认 `SessionLocal`；测试可注入）。
+
+    为什么要留这个口子：批处理的异常兜底要验证「异常时那批的行被翻成 failed」，
+    而 worker 原本硬编码 `SessionLocal()` ⇒ 测试连不到自己的临时库。
+    """
+    from app.db import SessionLocal
+
+    return SessionLocal
+
+
 @dataclass
 class _QueueItem:
     """待抽取的一段。"""
@@ -202,7 +213,6 @@ def _run_batches(project_id: int) -> None:
     """
     from datetime import datetime, timezone
 
-    from app.db import SessionLocal
     from app.kg.extractor_v3 import extract_batch, ExtractionStats
 
     def _rows_for(batch: list[_QueueItem]) -> dict[int, AgentRun]:
@@ -224,64 +234,144 @@ def _run_batches(project_id: int) -> None:
         batch = _queue.take_batch(project_id)
         if not batch:
             return
-        db = SessionLocal()
+        db = _session_factory()()
         try:
-            rows = _rows_for(batch)
-            provider = _get_provider()
-            if provider is None:
-                # 无 provider：段直接落 v3.0 mention 索引（零 LLM 部分仍做）
-                _index_mentions_only(db, batch)
-                continue
-            texts = [(it.segment_no, it.text, it.chapter) for it in batch]
-            # 把账上已有的未回收伏笔名给抽取器，要求**同名复用**（2026-10-28）。
-            # 落库本来就按名字去重，但抽取器从前看不到已有的名字 ⇒ 每段给同一件事
-            # 重新起说法，账本无界增长（实测 9 段攒出 117 个名字，
-            # 切片把 97 条 active 全渲染进提示词 = 2,639 字）。
-            known_fores = _active_foreshadow_names(db, project_id)
-            last_exc: Exception | None = None
-            stats: ExtractionStats | None = None
-            # 探针：extract_batch 内部把 LLM 异常吞成空骨架（extract_segment 的
-            # 静默兜底），LLM 挂掉的异常永远到不了这里——会被记成「成功但 0 产出」。
-            # 每次尝试先用 1 次裸 chat 探活：provider 挂则本次尝试失败进重试；
-            # 探针过了才让整批文本进 LLM（省得挂着的 provider 白收 5 段长文）。
-            # 探针只探「连不连得上」，不探「抽不抽得出」——空骨架（可达但服从性
-            # 归零）走下面的 empty 标记，重试通常没用，暴露给人判断更诚实。
-            for _attempt in range(RETRY_LIMIT + 1):
-                try:
-                    provider.chat("连通性探针，请回复 ok", "ok")
-                    result = extract_batch(provider, texts, known_foreshadows=known_fores)
-                    stats = _persist_extraction(db, project_id, result, batch)
-                    last_exc = None
-                    break
-                except Exception as exc:  # noqa: BLE001 —— 重试吃掉本次异常
-                    db.rollback()
-                    last_exc = exc
-            now = datetime.now(timezone.utc)
-            if last_exc is None and stats is not None:
-                # 空骨架检测：真实小说文本几乎不可能整批 0 产出——大概率 LLM 挂了
-                empty = (stats.entities_upserted == 0 and stats.events_added == 0
-                         and stats.relations_upserted == 0)
-                note_extra: dict = {"batch_stats": stats.__dict__.copy()}
-                if empty:
-                    note_extra["empty"] = True
-                for row in rows.values():
-                    row.status = "success"
-                    row.finished_at = now
-                    row.model = "(empty)" if empty else None
-                    _merge_note(row, note_extra)
-                db.commit()
-            else:
-                err = str(last_exc)[:200] if last_exc else "unknown"
-                for row in rows.values():
-                    row.status = "failed"
-                    row.finished_at = now
-                    _merge_note(row, {"error": err})
-                db.commit()
+            rows: dict[int, AgentRun] = {}
+            try:
+                rows = _rows_for(batch)
+                provider = _get_provider()
+                if provider is None:
+                    # 无 provider：段直接落 v3.0 mention 索引（零 LLM 部分仍做）
+                    _index_mentions_only(db, batch)
+                    continue
+                texts = [(it.segment_no, it.text, it.chapter) for it in batch]
+                # 把账上已有的未回收伏笔名给抽取器，要求**同名复用**（2026-10-28）。
+                # 落库本来就按名字去重，但抽取器从前看不到已有的名字 ⇒ 每段给同一件事
+                # 重新起说法，账本无界增长（实测 9 段攒出 117 个名字，
+                # 切片把 97 条 active 全渲染进提示词 = 2,639 字）。
+                known_fores = _active_foreshadow_names(db, project_id)
+                last_exc: Exception | None = None
+                stats: ExtractionStats | None = None
+                # 探针：extract_batch 内部把 LLM 异常吞成空骨架（extract_segment 的
+                # 静默兜底），LLM 挂掉的异常永远到不了这里——会被记成「成功但 0 产出」。
+                # 每次尝试先用 1 次裸 chat 探活：provider 挂则本次尝试失败进重试；
+                # 探针过了才让整批文本进 LLM（省得挂着的 provider 白收 5 段长文）。
+                # 探针只探「连不连得上」，不探「抽不抽得出」——空骨架（可达但服从性
+                # 归零）走下面的 empty 标记，重试通常没用，暴露给人判断更诚实。
+                for _attempt in range(RETRY_LIMIT + 1):
+                    try:
+                        provider.chat("连通性探针，请回复 ok", "ok")
+                        result = extract_batch(provider, texts, known_foreshadows=known_fores)
+                        stats = _persist_extraction(db, project_id, result, batch)
+                        last_exc = None
+                        break
+                    except Exception as exc:  # noqa: BLE001 —— 重试吃掉本次异常
+                        db.rollback()
+                        last_exc = exc
+                now = datetime.now(timezone.utc)
+                if last_exc is None and stats is not None:
+                    # 空骨架检测：真实小说文本几乎不可能整批 0 产出——大概率 LLM 挂了
+                    empty = (stats.entities_upserted == 0 and stats.events_added == 0
+                             and stats.relations_upserted == 0)
+                    note_extra: dict = {"batch_stats": stats.__dict__.copy()}
+                    if empty:
+                        note_extra["empty"] = True
+                    for row in rows.values():
+                        row.status = "success"
+                        row.finished_at = now
+                        row.model = "(empty)" if empty else None
+                        _merge_note(row, note_extra)
+                    db.commit()
+                else:
+                    err = str(last_exc)[:200] if last_exc else "unknown"
+                    for row in rows.values():
+                        row.status = "failed"
+                        row.finished_at = now
+                        _merge_note(row, {"error": err})
+                    db.commit()
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "kg v3 批抽失败（项目 %s，%s 段）：%s", project_id, len(batch), err)
+            except Exception as exc:  # noqa: BLE001 —— 批内任何异常都要把这批的行翻成 failed
+                # 之前只有 extract_batch 抛错才会翻；_get_provider / _persist_extraction
+                # 等在 for 循环外的异常会冒到 _worker_loop ⇒ 整批的行永远留在 running。
+                _mark_batch_failed(db, rows, exc)
                 import logging
                 logging.getLogger(__name__).warning(
-                    "kg v3 批抽失败（项目 %s，%s 段）：%s", project_id, len(batch), err)
+                    "kg v3 批处理异常（项目 %s，%s 段）：%s", project_id, len(batch), exc)
         finally:
             db.close()
+
+
+def _mark_batch_failed(db: Session, rows: dict[int, AgentRun], exc: BaseException) -> None:
+    """把这一批的行全部翻成 failed（并写下错误原因）。
+
+    自身也不许向外抛（否则 finally 会被绕过）。
+    """
+    from datetime import datetime, timezone
+
+    try:
+        db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        now = datetime.now(timezone.utc)
+        err = f"{type(exc).__name__}: {exc}"[:200]
+        for row in rows.values():
+            row.status = "failed"
+            row.finished_at = now
+            _merge_note(row, {"error": err})
+        db.commit()
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).exception("批失败状态写回也失败了")
+
+
+def reap_stale_runs(db: Session) -> int:
+    """收割被进程重启打断的批抽行（role=kg_batch_extract, status=running）。
+
+    ## 为什么必须有
+
+    批抽跑在**进程内线程**（`WORKER_THREADS = 1`），队列在**内存 deque** 里。
+    进程一重启（uvicorn reload / 多 worker / 服务重启 / 容器被杀），
+    队列没了，但库里的 running 行还在 ⇒ 永远 running。
+
+    实测（2026-10-29）：30 条 running，最早 2026-10-20，
+    最新一条是**当天自己跑的那次**（服务被重启了）。
+
+    ## 为什么是 failed 而不是「继续跑」
+
+    后台线程已经没了，没人能接着跑完它；留成 running 等于撒谎。
+    诚实的做法是标记失败 + 说明原因 + 提示「重捞一次即可」（界面��有手动重捞的入口）。
+
+    ## 只碰 running
+
+    success / failed 是已经结束的结论，覆盖了就再也找不回来。
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    rows = db.scalars(select(AgentRun).where(
+        AgentRun.role == ROLE_KG_EXTRACT,
+        AgentRun.status == "running",
+    )).all()
+    n = 0
+    for row in rows:
+        started = row.started_at
+        if started is not None and started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        # 本进程启动后入队的行 started_at 一定晚于启动时刻 ⇒ 不得冒
+        if started is not None and started >= now:
+            continue
+        row.status = "failed"
+        row.finished_at = now
+        # interrupted 标记：**这不是"跑了很久才失败"**，是进程重启时队列丢了、它根本没跑完。
+        # 不标的话，前端会用 finished_at - started_at 算出「跑了 3 天」（实测 658822s）。
+        _merge_note(row, {"error": "服务重启时中断（队列已丢失）", "interrupted": True})
+        n += 1
+    if n:
+        db.commit()
+    return n
 
 
 def _merge_note(row: AgentRun, extra: dict) -> None:
@@ -333,13 +423,17 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
             note = {"raw": r.note}
         if note.get("empty"):
             summary["empty"] += 1
+        # 中断的行：它**根本没跑完**（进程重启、队列丢了），
+        # finished_at 是收割时刻 ⇒ 拿它减 started_at 会算出「跑了 3 天」（实测 658822s）⇒ 耗时不给。
+        interrupted = bool(note.get("interrupted"))
         items.append({
             "id": r.id,
             "segment_no": note.get("segment_no"),
             "status": r.status,
             "stuck": stuck,
+            "interrupted": interrupted,
             "empty": bool(note.get("empty")),
-            "duration_ms": duration_ms,
+            "duration_ms": None if interrupted else duration_ms,
             "batch_stats": note.get("batch_stats"),
             "error": note.get("error"),
             "started_at": started.isoformat() if started else None,

@@ -963,6 +963,8 @@ export const api = {
         segment_no: number | null;
         status: string;
         stuck: boolean;
+        /** 中断（进程重启、队列丢了）—— 不是「跑了很久才失败」，耗时不给。 */
+        interrupted?: boolean;
         empty: boolean;
         duration_ms: number | null;
         batch_stats: Record<string, unknown> | null;

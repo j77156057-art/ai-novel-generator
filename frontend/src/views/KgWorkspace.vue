@@ -198,6 +198,7 @@ type WorkerRun = {
   segment_no: number | null;
   status: string;
   stuck: boolean;
+  interrupted?: boolean;
   empty: boolean;
   duration_ms: number | null;
   batch_stats: Record<string, unknown> | null;
@@ -255,6 +256,19 @@ function fmtDur(ms: number | null): string {
   if (ms == null) return "—";
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * 一行批抽记录的状态（人话，不出现内部术语）。
+ *
+ * - 已中断（stuck）：进程重启/卡死后被收割的行 —— 不会自己好了，可以重捞。
+ */
+function runStatusText(r: WorkerRun): string {
+  if (r.stuck || r.interrupted) return "已中断";
+  if (r.status === "running") return "进行中";
+  if (r.status === "failed") return "失败";
+  if (r.status === "success") return r.empty ? "已完成（没抽到东西）" : "已完成";
+  return r.status;
 }
 
 // ---------- Tab 4 Judge 面板 ----------
@@ -935,8 +949,9 @@ function bucketChipStyle(bucket: string): Record<string, string> {
     <div class="card-title">
       批抽 Worker 状态
       <span class="hint" v-if="worker">
-        success {{ worker.summary.success }} · failed {{ worker.summary.failed }}
-        · running {{ worker.summary.running }} · stuck {{ worker.summary.stuck }} · empty {{ worker.summary.empty }}
+        已完成 {{ worker.summary.success }} · 失败 {{ worker.summary.failed }}
+        · 进行中 {{ worker.summary.running }} · 已中断 {{ worker.summary.stuck }}
+        · 没抽到 {{ worker.summary.empty }}
       </span>
       <button class="btn" @click="loadWorker">刷新</button>
     </div>
@@ -949,12 +964,12 @@ function bucketChipStyle(bucket: string): Record<string, string> {
         <div>
           <div class="card-title" style="font-size: var(--fs-md)">线程
             <span class="tag" :class="worker.worker_alive ? 'ok' : 'err'" style="margin-left: 8px">
-              {{ worker.worker_alive ? "alive" : "dead" }}
+              {{ worker.worker_alive ? "在跑" : "没在跑" }}
             </span>
           </div>
           <div class="faint" style="font-size: var(--fs-xs)">
-            dead ≠ 正常：worker 是 daemon 线程，进程重启后自动拉起；
-            显示 dead 通常意味着服务从未启动或进程刚退
+            「没在跑」不等于出错了：worker 是常驻线程，进程重启后会自动拉起；
+            一直显示「没在跑」通常意味着服务从没起来过，或刚刚退出
           </div>
         </div>
         <div>
@@ -962,7 +977,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
             内存队列积压 <span class="hint">{{ worker.pending }} 段</span>
           </div>
           <div class="faint" style="font-size: var(--fs-xs)">
-            进程重启即清零——持久状态看下方 recent_runs
+            进程重启即清零——已经落库的结果看下面那份记录
           </div>
         </div>
       </div>
@@ -994,12 +1009,12 @@ function bucketChipStyle(bucket: string): Record<string, string> {
             <div class="row tight" style="margin-bottom: 4px">
               <span
                 class="tag"
-                :class="r.status === 'failed' ? 'err' : r.status === 'running' ? 'warn' : r.stuck ? 'err' : 'ok'"
+                :class="r.status === 'failed' || r.stuck ? 'err' : r.status === 'running' ? 'warn' : 'ok'"
               >
-                {{ r.status }}{{ r.stuck ? " (stuck)" : "" }}
+                {{ runStatusText(r) }}
               </span>
-              <span class="tag mono">seg {{ r.segment_no ?? "?" }}</span>
-              <span v-if="r.empty" class="tag warn">empty</span>
+              <span class="tag mono">第 {{ r.segment_no ?? "?" }} 段</span>
+              <span v-if="r.empty" class="tag warn">没抽到东西</span>
               <span class="faint mono" style="font-size: var(--fs-xs)">{{ fmtDur(r.duration_ms) }}</span>
               <span class="faint mono" style="font-size: var(--fs-xs)">
                 {{ r.started_at ? new Date(r.started_at).toLocaleString() : "" }}
@@ -1009,9 +1024,9 @@ function bucketChipStyle(bucket: string): Record<string, string> {
               {{ r.error }}
             </div>
             <div v-else-if="r.batch_stats" class="faint" style="font-size: var(--fs-xs)">
-              entities {{ r.batch_stats.entities_upserted ?? 0 }} ·
-              events {{ r.batch_stats.events_added ?? 0 }} ·
-              relations {{ r.batch_stats.relations_upserted ?? 0 }}
+              人物 {{ r.batch_stats.entities_upserted ?? 0 }} ·
+              事件 {{ r.batch_stats.events_added ?? 0 }} ·
+              关系 {{ r.batch_stats.relations_upserted ?? 0 }}
             </div>
           </div>
           <input
