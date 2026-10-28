@@ -233,6 +233,11 @@ def _run_batches(project_id: int) -> None:
                 _index_mentions_only(db, batch)
                 continue
             texts = [(it.segment_no, it.text, it.chapter) for it in batch]
+            # 把账上已有的未回收伏笔名给抽取器，要求**同名复用**（2026-10-28）。
+            # 落库本来就按名字去重，但抽取器从前看不到已有的名字 ⇒ 每段给同一件事
+            # 重新起说法，账本无界增长（实测 9 段攒出 117 个名字，
+            # 切片把 97 条 active 全渲染进提示词 = 2,639 字）。
+            known_fores = _active_foreshadow_names(db, project_id)
             last_exc: Exception | None = None
             stats: ExtractionStats | None = None
             # 探针：extract_batch 内部把 LLM 异常吞成空骨架（extract_segment 的
@@ -244,7 +249,7 @@ def _run_batches(project_id: int) -> None:
             for _attempt in range(RETRY_LIMIT + 1):
                 try:
                     provider.chat("连通性探针，请回复 ok", "ok")
-                    result = extract_batch(provider, texts)
+                    result = extract_batch(provider, texts, known_foreshadows=known_fores)
                     stats = _persist_extraction(db, project_id, result, batch)
                     last_exc = None
                     break
@@ -399,6 +404,25 @@ def _get_provider():
         return get_llm_provider()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _active_foreshadow_names(db: Session, project_id: int) -> list[str]:
+    """账上**未回收**的伏笔名（给抽取器做同名复用，见 `extractor_v3.known_foreshadow_block`）。
+
+    只取 planted/developing —— 已回收/已丢弃的线索不该再要求模型沿用它的名字。
+    取不到就返回空名单：那等于回到「抽取器看不到已有名字」的旧行为，
+    提示词与从前逐字节相同（宁可不省，不能因此挡住落库）。
+    """
+    try:
+        rows = db.scalars(
+            select(KgForeshadow.name).where(
+                KgForeshadow.project_id == project_id,
+                KgForeshadow.status.in_(["planted", "developing"]),
+            ).order_by(KgForeshadow.planted_chapter, KgForeshadow.id)
+        ).all()
+        return [str(n) for n in rows if n]
+    except Exception:  # noqa: BLE001 —— 名单是优化项，取不到不该挡住抽取
+        return []
 
 
 def _is_suspect_foreshadow(name: str | None) -> bool:

@@ -30,12 +30,15 @@ def slice_for_prompt(
     *,
     window: int = 5,
     max_entities: int = 20,
+    max_foreshadows: int = 60,
     active_characters: list[str] | None = None,
 ) -> dict:
     """按当前剧情点取 KG 切片喂 prompt。
 
     window: 回溯最近 N 段的 mention
     max_entities: 实体清单上限（prompt 预算）
+    max_foreshadows: 未回收伏笔上限（安全阀；超了留最早埋下的那批，并把省略条数
+        放进 `foreshadows_omitted` 让渲染层如实说出）
     active_characters: 当前段涉及的角色名（用于取状态和情报）；None 则用本段全部
 
     返回：
@@ -43,6 +46,7 @@ def slice_for_prompt(
       "recent_entities": [{"name","kind","context","mention_count"}],
       "character_states": [{"character","state_type","new_value"}],
       "active_foreshadows": [{"name","status","planted_chapter","planned_payoff_chapter"}],
+      "foreshadows_omitted": int,    # 因上限被省略的条数（0 = 没省略）
       "known_facts": [{"character","knows"}],   # 当前角色知道什么
       "recent_events": [{"summary","event_type","in_story_date"}],
     }
@@ -105,19 +109,59 @@ def slice_for_prompt(
                 })
 
     # —— 3. active 伏笔（planted/developing）——
-    active_foreshadows = []
-    for fs in db.scalars(
+    #
+    # ## 为什么要**有界**（2026-10-28 加）
+    #
+    # 这一块从前是**没有上限**的：实测一个只写了 9 段的项目攒出 **117 条**伏笔
+    # （单段抽取只有 3~5 条，但后台对同一批段落**反复抽了很多轮**，
+    # 每轮都攒一批同义新名字）⇒ 切片把全部 97 条 active 一条不落地渲染出来
+    # ⇒ **2,639 字，占 user 提示词两成**。而本模块的文档一直写着「切片有界（budget）」——
+    # 那时只有实体有上限，伏笔没有。
+    #
+    # 上限只当**安全阀**：真实线索数不该有一百条，上限宽（默认 60）到通常不触发；
+    # **真触发了要如实说出省略了几条**（渲染层会写「另有 N 条未列出」），不静默隐藏。
+    #
+    # ## 超限时留哪一批
+    #
+    # 排序口径：**未超期优先**（本模块文档一直写着的口径：active 伏笔
+    # 「未超期优先」）—— 有**说得通**的回收章的先列（快该收的那条最该被看见），
+    # 按回收章升序；其余的按**埋下章升序**（越早埋的越容易被长提示词淹没，
+    # 越该被提醒；最近埋下的那些前情提要里刚写过，模型本来就看得见）。
+    #
+    # 实测两种固定顺序都有坏处：「最近优先」会把第 1~3 章的**全部**铺垫丢掉
+    # （对这个要写第 5 段的模型恰恰是最坏的丢法）；
+    # 所以上限只当**安全阀**（默认 60，真实线索数不该有一百条），
+    # **真触发了要如实说出省略了几条**，不静默隐藏。
+    active_all = list(db.scalars(
         select(KgForeshadow).where(
             KgForeshadow.project_id == project_id,
             KgForeshadow.status.in_(["planted", "developing"]),
-        ).order_by(KgForeshadow.planted_chapter)
-    ):
-        active_foreshadows.append({
+        )
+    ))
+    from app.kg.foreshadow_quality import plausible_payoff_chapter
+
+    def _order(fs):
+        payoff = fs.planned_payoff_chapter
+        has_payoff = plausible_payoff_chapter(payoff, fs.planted_chapter)
+        return (
+            0 if has_payoff else 1,          # 有可信回收章的先列
+            payoff if has_payoff else 0,     # 回收章升序（先收的先记着）
+            fs.planted_chapter is None,      # 埋下章未知的排后
+            fs.planted_chapter or 0,         # 埋下章升序
+            fs.id,                           # 同分按 id（截断结果可测）
+        )
+
+    active_all.sort(key=_order)
+    active_foreshadows = [
+        {
             "name": fs.name,
             "status": fs.status,
             "planted_chapter": fs.planted_chapter,
             "planned_payoff_chapter": fs.planned_payoff_chapter,
-        })
+        }
+        for fs in active_all[:max_foreshadows]
+    ]
+    foreshadows_omitted = max(0, len(active_all) - len(active_foreshadows))
 
     # —— 4. 当前角色此刻知道什么（entity_knowledge，三类 known_kind 全消费）——
     # entity → 实体名；event → 「事件：简述」（有 id 用库内 summary，降级用 known_text）；
@@ -166,6 +210,7 @@ def slice_for_prompt(
         "recent_entities": recent_entities,
         "character_states": char_states,
         "active_foreshadows": active_foreshadows,
+        "foreshadows_omitted": foreshadows_omitted,
         "known_facts": known_facts,
         "recent_events": recent_events,
     }
@@ -316,9 +361,29 @@ def format_slice_for_prompt(sl: dict) -> str:
             lines.append(f"- {s['character']}·{s['state_type']}: {s['new_value']}")
     if sl.get("active_foreshadows"):
         lines.append("【未回收伏笔】")
+        # ## 为什么这里**只列名字**（2026-10-28 改）
+        #
+        # 原来是 `- {名字}（{状态}{，计划第 N 章回收}）`，97 行 **2,639 字**。
+        # 压成只列名字后 **1,457 字（省 44%）**，而且**一条线索都不丢**
+        # —— 只是不再陪标状态与回收章。
+        #
+        # 丢的这两样都经不起查：
+        # - **状态**（planted/developing）：这一块**只会**列这两种状态
+        #   （查询就按 `status IN ('planted','developing')` 过滤），
+        #   所以「二者之一」对读者没有任何信息量。
+        # - **计划回收章**：实测 97 条里 **72 条是 0**（第 0 章不存在）、
+        #   **18 条是 50**（＝抽取提示 JSON 示例里的字面值，模型照抄的）
+        #   —— 只有 2 条说得通。**编出来的约束比没有约束更糟**：
+        #   把「计划第 50 章回收」喂给模型，就是给它一条假约束。
+        #
+        # ⇒ 回收章**不进提示词**（账本里还在，界面与诊断仍看得到）。
         for f in sl["active_foreshadows"]:
-            due = f"，计划第{f['planned_payoff_chapter']}章回收" if f.get("planned_payoff_chapter") else ""
-            lines.append(f"- {f['name']}（{f['status']}{due}）")
+            lines.append(f"- {f['name']}")
+        omitted = int(sl.get("foreshadows_omitted") or 0)
+        if omitted:
+            # 上限是安全阀 —— 触发了就**如实说出**省略了几条，不静默隐藏。
+            # 留的是哪一批见 slice_for_prompt 里的排序理由。
+            lines.append(f"（另有 {omitted} 条未列出）")
     if sl.get("known_facts"):
         lines.append("【角色已知情报】")
         for k in sl["known_facts"]:

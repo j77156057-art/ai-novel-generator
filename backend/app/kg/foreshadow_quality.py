@@ -71,3 +71,47 @@ def split_quality(texts: list[str]) -> tuple[list[str], list[str]]:
     for t in texts or []:
         (junk if looks_like_dialogue_fragment(t) else keep).append(t)
     return keep, junk
+
+
+#: 章号最小合法值（章从 1 开始）。
+_MIN_CHAPTER = 1
+
+
+def plausible_payoff_chapter(planned, planted=None) -> bool:
+    """这个「计划回收章」说得通吗？
+
+    判据是**与剧情无关的通用不变式**，不猜内容：
+
+    1. **章号必须 ≥ 1** —— `0` 不存在（实测 97 条 active 里 **72 条是 0**）。
+    2. **回收章必须晚于埋下章** —— 同一章回收等于没埋；
+       早于埋下章是不可能的。`planted` 未知时只判第 1 条。
+
+    ## 为什么非要判
+
+    实测这 97 条里只有 **2 条**说得通；另外 **18 条恰好等于抽取提示里
+    JSON 示例的字面值 50**（`docs/journey_glm_versions_compare.json` 里能直接看到
+    模型把示例整行照抄）。这些假值会经切片进提示词，变成
+    「计划第 50 章回收」这样一条**编出来的约束** —— 比没有约束更糟。
+
+    >>> plausible_payoff_chapter(0, 1)
+    False
+    >>> plausible_payoff_chapter(1, 1)
+    False
+    >>> plausible_payoff_chapter(50, 1)
+    True
+    >>> plausible_payoff_chapter(None, 1)
+    False
+    """
+    if not isinstance(planned, int) or isinstance(planned, bool):
+        return False
+    if planned < _MIN_CHAPTER:
+        return False
+    if isinstance(planted, int) and not isinstance(planted, bool):
+        if planned <= planted:
+            return False
+    return True
+
+
+def sanitize_payoff_chapter(planned, planted=None):
+    """说得通就返回原值，说不通返回 None（**当作未知**，不猜一个数补上）。"""
+    return planned if plausible_payoff_chapter(planned, planted) else None

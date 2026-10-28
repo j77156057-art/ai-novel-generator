@@ -141,13 +141,17 @@ def patch_extract_batch_with_mock():
             ],
         }
 
-    def mock_extract_batch(provider, items):
+    def mock_extract_batch(provider, items, *, known_foreshadows=None):
         """items: list[(segment_no, text, chapter)]
+
+        known_foreshadows: 账上已有的未回收伏笔名（2026-10-28 新契约）。
+        mock 记录每次调用收到的名单，用来断言「第二次抽取起，名单里已有前一次的伏笔」。
 
         返回 schema 与 normalize_extraction 同款（不分段嵌套，调用方
         _persist_extraction 从顶层读 entities/relations/events/...）。
         """
         call_log["count"] += 1
+        call_log.setdefault("known_lists", []).append(list(known_foreshadows or []))
         entities, relations, events, event_links, knowledge, states, fores = [], [], [], [], [], [], []
         for seg, _text, chapter in items:
             payload = _single_payload(seg, chapter or 1)
@@ -258,6 +262,13 @@ def test_six_step_journey_runs():
         check("kg_entities >= 2（林悠然+顾辰逸）", ents_n >= 2, True)
         check("kg_entity_knowledge >= 1", know_n >= 1, True)
         check("extractor 被调用 n 次（每段一次）", extract_log["count"], n_segments)
+        # —— 新契约（2026-10-28）：第二次起，抽取器要收到「账上已有的伏笔名」——
+        # 抽取器从前看不到已有的名字 ⇒ 每段给同一件事重新起名，账本无界增长。
+        known_lists = extract_log.get("known_lists") or []
+        check("第一次抽取没有名单（账本还空着）", known_lists[0] == [], True)
+        check("第二次抽取带上了已有的伏笔名",
+              "辰逸父亲身份" in (known_lists[1] if len(known_lists) > 1 else []),
+              True)
 
         # —— Step ④ Judge（落库 + 读侧）——
         for seg in range(1, n_segments + 1):

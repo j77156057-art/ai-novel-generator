@@ -29,6 +29,8 @@ def get_slice(
     segment_no: int = Query(..., description="当前段号（按此动态取窗口）"),
     window: int = Query(5, ge=1, le=50),
     max_entities: int = Query(20, ge=1, le=100),
+    max_foreshadows: int = Query(60, ge=1, le=200,
+                                 description="未回收伏笔上限（安全阀；超了留最早埋下的那批）"),
     characters: str | None = Query(None, description="逗号分隔的角色名，缺省用本段 mention"),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -39,6 +41,7 @@ def get_slice(
     chars = [c.strip() for c in characters.split(",")] if characters else None
     return slice_for_prompt(db, project_id, segment_no,
                             window=window, max_entities=max_entities,
+                            max_foreshadows=max_foreshadows,
                             active_characters=chars)
 
 
@@ -48,6 +51,8 @@ def get_slice_prompt(
     segment_no: int = Query(...),
     window: int = Query(5, ge=1, le=50),
     max_entities: int = Query(20, ge=1, le=100),
+    max_foreshadows: int = Query(60, ge=1, le=200,
+                                 description="未回收伏笔上限（安全阀；超了留最早埋下的那批）"),
     characters: str | None = Query(None, description="逗号分隔的角色名，缺省用本段 mention"),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -61,7 +66,8 @@ def get_slice_prompt(
 
     chars = [c.strip() for c in characters.split(",")] if characters else None
     sl = slice_for_prompt(db, project_id, segment_no, window=window,
-                          max_entities=max_entities, active_characters=chars)
+                          max_entities=max_entities, max_foreshadows=max_foreshadows,
+                          active_characters=chars)
     return {"text": format_slice_for_prompt(sl)}
 
 
