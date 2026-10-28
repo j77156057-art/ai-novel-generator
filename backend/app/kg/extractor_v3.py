@@ -408,4 +408,8 @@ class ExtractionStats:
     entity_knowledge_added: int = 0
     state_changes: int = 0
     foreshadows: int = 0
+    #: 抽出来**疑似对话碎片**的伏笔（只留痕，不删不改账本）。
+    #: 实测（2026-10-28，验收库同一份数据）：KG 抽的 19 条伏笔里 **14 条**是对话碎片
+    #: ⇒ 提示词侧会剔除它们，但账本原样保留（抽取层只做 warn，不做裁决）。
+    foreshadows_suspect: int = 0
     errors: list = field(default_factory=list)

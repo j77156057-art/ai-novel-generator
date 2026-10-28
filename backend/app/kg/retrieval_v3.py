@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import select, func
 
 from app.models import (
@@ -197,14 +199,117 @@ def _knowledge_label(db, k) -> str | None:
     return None
 
 
+#: 一个「完整句」：任意字符 + 句末标点 + 可选的收尾引号。
+#:
+#: 为什么单独写正则：中文的收尾引号在句号**之后**（`。”`）⇒ 按标点裸切会把
+#: 那个引号甩到下一段开头，切出一堆「”沈」这种碎片（第一版就是这么错的）。
+_SENT_RE = re.compile(r"[^。！？…]*[。！？…](?:[”’」』）】》\"])?")
+_CJK_RE = re.compile(r"[一-鿿]")
+
+#: **续句开头**：以这些字/符号起头的句子必然是上一句被切断的后半截
+#: （「了一眼街口，才把药箱放到柜上。」—— 句首的「看」被切掉了）。
+#: 只收**无歧义**的那些：了/着/的/和/与/及/跟 + 标点 + 收尾引号。
+#: 不用「被/就/都/也/还/又/才」——它们在口语里能正常起句。
+_CONTINUATION_HEADS = "了着的和与及跟，、；：！？…）】》”’」』"
+
+#: 从句边界（半句停在这里）：，、；：
+_CLAUSE_BREAKS = "，、；："
+
+
+def _squash(s: str) -> str:
+    """去掉空白与换行 —— 提示词里一行就是一行，别让原文的段落空行插进来。"""
+    return re.sub(r"\s+", "", s or "")
+
+
+def _trim_leading_clause(sent: str) -> str:
+    """砍掉句首那段**不完整的从句**。
+
+    窗口起点落在句中时，正则凑出来的「完整句」是上一句的后半截
+    （「看了一眼街口，才把药箱放到柜上。」⇒ 句首的「看」被切掉了）。
+    整句作废太狠（后半截「才把药箱放到柜上。」本身是能读的），
+    ⇒ 只砍掉第一个从句边界之前的那截残句。
+
+    没有从句边界可砍 ⇒ 这句没救了（返回空串）。
+    """
+    if not sent or sent[0] not in _CONTINUATION_HEADS:
+        return sent
+    idx = -1
+    for i, ch in enumerate(sent):
+        if ch in _CLAUSE_BREAKS:
+            idx = i
+            break
+    if idx < 0:
+        return ""
+    rest = sent[idx + 1:].strip()
+    return rest if len(rest) > 1 else ""
+
+
+def _compact_context(text: str, limit: int = 40) -> str:
+    """把原文碎片压成**一句完整的话**（≤ limit 字）。
+
+    ## 为什么
+
+    `context_window` 是从正文里**随机关**截出来的窗口 ⇒ 边界落在半句上。
+    实测（2026-10-28，验收库同一份数据）：**20 条里只有 1 条**以句末标点收尾，
+    15 条还带着原文的段落空行（「像有人在匣中敲了一）」「周郎中坐在柜台后，
+    正用麻布擦刀镡…」）。
+
+    半句既费 token、又**不可扫读**，还可能让模型照抄半截话
+    —— 它本来只是用来「说明这个名字指什么」的。
+
+    ⇒ 取窗口里**最后一个完整句**（以 。！？ 收尾，可带收尾引号），
+    **尾部那段残句直接丢掉**；窗口起点落在句中就砍掉开头那个残从句；
+    整窗都在一句长句里才退到「按从句边界截断 + 标…」。
+
+    ## 口径（宁可少给一句，不给半句）
+    - 完整句候选：含汉字、长度 > 1（滤掉纯标点与孤立引号）
+    - 候选以「续句开头」起头 ⇒ 砍掉开头残从句；砍完为空 ⇒ 整句作废
+    - 从**最近**的候选往前找第一条装得下 limit 的
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    # 完整句候选：必须含汉字、长度 > 1（滤掉纯标点与孤立引号）
+    cands = [m.group(0).strip() for m in _SENT_RE.finditer(s)]
+    cands = [c for c in cands if len(c) > 1 and _CJK_RE.search(c)]
+    # 起点落在句中 ⇒ 砍掉开头那段残从句（不是整句作废）
+    cands = [_trim_leading_clause(c) for c in cands]
+    cands = [c for c in cands if c]
+    if not cands:
+        # 整个窗口都在一句长句里 ⇒ 没有完整句可用
+        s2 = _trim_leading_clause(s) or s
+        cut = s2[:limit]
+        # 尽量断在从句边界上，别断在半截词中间
+        brk = max((cut.rfind(ch) for ch in _CLAUSE_BREAKS), default=-1)
+        if brk > 0:
+            cut = cut[:brk]
+        return _squash(cut.rstrip("，。！？、；：") + "…")
+    # 从最近的句子往前找第一条装得下的
+    for sent in reversed(cands):
+        if len(sent) <= limit:
+            return _squash(sent)
+    head = cands[0]
+    return _squash(head[:limit].rstrip("，。！？、；：") + "…")
+
+
 def format_slice_for_prompt(sl: dict) -> str:
     """把 slice 渲染成一段 prompt 文本（有血有肉的事实，带原文片段）。"""
     lines: list[str] = []
     if sl.get("recent_entities"):
         lines.append("【近期出场实体】")
+        lines.append("（名字清单：括号里是这个名字最近一次出现的**完整一句**，"
+                     "只作指代参考，不是要照抄的原文）")
+        # 同一句原文常被多个实体各带一遍（实测 20 个实体里有 **7 对**共享同一段原文）
+        # ⇒ 同一块里**只留第一处**，其余实体只留名字与类型。
+        seen_ctx: set[str] = set()
         for e in sl["recent_entities"]:
-            ctx = f"（{e['context']}）" if e.get("context") else ""
-            lines.append(f"- {e['name']}（{e['kind']}）{ctx}")
+            ctx = _compact_context(e.get("context") or "")
+            if ctx and ctx in seen_ctx:
+                ctx = ""
+            elif ctx:
+                seen_ctx.add(ctx)
+            suffix = f"（{ctx}）" if ctx else ""
+            lines.append(f"- {e['name']}（{e['kind']}）{suffix}")
     if sl.get("character_states"):
         lines.append("【角色当前状态】")
         for s in sl["character_states"]:

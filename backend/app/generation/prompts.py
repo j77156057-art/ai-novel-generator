@@ -19,6 +19,7 @@
   （这是本文件唯一的兼容底线，由 `tests/test_prompt_override_wiring.py` 钉住）。
 """
 
+import logging
 from typing import Any, Sequence
 
 
@@ -134,6 +135,20 @@ def merged_constraint_items(
     kg_chars = reminders.get("character_constraints") or []
     bible_fores = (plot_bible.get("foreshadowing") or []) if plot_bible else []
     kg_fores = [h.get("question") for h in (reminders.get("unresolved_plotholes") or [])]
+    # —— 只过滤 **KG 抽来的**伏笔里的对话碎片（2026-10-28）——
+    # 实测（验收库同一份数据）：KG 抽的 19 条伏笔里 **14 条是对话碎片**
+    # （“你把我当什么？”…）⇒ 它们照原样进了 system 提示的约束块：
+    # 白占位置，还可能让模型误以为那些是「要在后续慢慢推进的悬念」。
+    # **用户自己在剧情圣经里写的伏笔一个字都不动**（那是权威）。
+    if kg_fores:
+        from app.kg.foreshadow_quality import split_quality
+
+        _keep, _junk = split_quality([str(f) for f in kg_fores if f])
+        if _junk:
+            logging.getLogger(__name__).info(
+                "伏笔约束：剔除 %d 条疑似对话碎片的 KG 伏笔（保留 %d 条）",
+                len(_junk), len(_keep))
+        kg_fores = _keep
     if bible_chars and isinstance(bible_chars, list):
         declared: set[str] = set()
         for c in bible_chars:
@@ -495,14 +510,20 @@ def build_user_prompt(
         if conflicts:
             bible_lines.append("剧情冲突：" + "；".join(str(c) for c in conflicts))
         if relationships:
-            bible_lines.append(
-                "人物关系："
-                + "；".join(
-                    f"{r.get('a')}与{r.get('b')}——{r.get('relation')}"
-                    for r in relationships
-                    if isinstance(r, dict) and r.get("a")
-                )
-            )
+            # —— 空关系不渲染（2026-10-28）——
+            # 原实现 `f"{a}与{b}——{relation}"` 在 relation 为空时把字面量
+            # **None** 写进了提示词（实测：「人物关系：沈砚与沈铁山——None」）
+            # ⇒ 模型看到的是「没有关系」还是「没有关系」？—— 两种解读都可能，
+            # 而这条关系本来就没有信息量。空的就**整条不列**。
+            rel_lines = [
+                f"{r.get('a')}与{r.get('b')}——{str(r.get('relation')).strip()}"
+                for r in relationships
+                if isinstance(r, dict) and r.get("a")
+                and r.get("relation") and str(r.get("relation")).strip()
+                and str(r.get("relation")).strip().lower() != "none"
+            ]
+            if rel_lines:
+                bible_lines.append("人物关系：" + "；".join(rel_lines))
         if fores:
             bible_lines.append("持续伏笔（继续埋或隐晦呼应）：" + "；".join(str(f) for f in fores))
     bible_block = "\n".join(bible_lines) if bible_lines else "（暂无剧情圣经，凭前情与风格续写）"

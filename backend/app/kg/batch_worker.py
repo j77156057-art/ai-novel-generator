@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -400,6 +401,16 @@ def _get_provider():
         return None
 
 
+def _is_suspect_foreshadow(name: str | None) -> bool:
+    """这条抽出来的伏笔疑似**对话碎片**？（只用于留痕，不删不改账本）"""
+    try:
+        from app.kg.foreshadow_quality import looks_like_dialogue_fragment
+
+        return looks_like_dialogue_fragment(name)
+    except Exception:  # noqa: BLE001 —— 判不出来就不留痕，绝不能因此挡住落库
+        return False
+
+
 def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[_QueueItem]):
     """把归一化后的抽取结果落 v3.0 表。幂等 upsert。"""
     from app.kg.extractor_v3 import ExtractionStats
@@ -562,6 +573,14 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
 
     # —— 5. foreshadows upsert（name 唯一，状态机推进）——
     for f in result.get("foreshadows", []):
+        # —— 只留痕，不裁决（2026-10-28）——
+        # 抽出来的伏笔有相当一部分其实是**台词碎片**（实测 19 条里 14 条）。
+        # 这里**只计数 + 警告**，账本原样保留（删数据要人点头）；
+        # 提示词侧另有渲染层过滤（见 `generation/prompts.py`）。
+        if _is_suspect_foreshadow(f.get("name")):
+            stats.foreshadows_suspect += 1
+            logging.getLogger(__name__).warning(
+                "伏笔疑似对话碎片（已入账、但不会进提示词约束）：%s", f.get("name"))
         fs = db.scalar(
             select(KgForeshadow).where(
                 KgForeshadow.project_id == project_id, KgForeshadow.name == f["name"]
