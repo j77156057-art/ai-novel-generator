@@ -3741,3 +3741,118 @@ function jsonInit(method: string, body?: unknown): RequestInit {
 - 测试：`tests/test_style_prompt_audit_repair.py`（含阳性对照）、
   `tests/test_kg_foreshadow_stats.py`（口径恒等式）、
   `frontend/tests/jsonBodyContentType.test.ts`（Content-Type 守门）。
+
+## 角色个性：人写 + AI 帮着完善（2026-10-28 落地）
+
+### 一句话
+
+角色不再只有「身份 + 动机」两行干巴巴的标签，而是有**怎么说话 / 会怎么做 / 不会做什么 /
+决定他现在状态的事**四栏；这四栏**人可以自己写**，AI **只给补充建议**，采纳与否由人点。
+
+### 三种来源，优先级是写死的
+
+| 来源 | 什么时候来的 | 能不能被覆盖 |
+|---|---|---|
+| `bible`（想象版） | 合成剧情圣经时模型给的 | 能被反推覆盖 |
+| `derived`（实测版） | 从已写正文里反推出来的 | 能被人写的覆盖 |
+| `user`（人写的） | 人在界面上写的 | **谁都不许覆盖** |
+
+反推（`refresh_personas`）与 AI 完善都跳过 `来源=user` 的角色 —— 用户的字是权威。
+字段与 `app/style/character_profile.py` 同形，口径复用一套，不另立一套。
+
+### AI 只补不改、且不落库
+
+`complete_persona` 返回的是**建议**（`补充` + `说明`），**不写库**；界面上点「采纳」才把内容
+并进四栏，点「保存」才落库。合并规则：用户原文在前、AI 的追加在后，**AI 对用户原文的重述丢掉**
+（按整条相同去重）。
+
+为什么这么设计：模型对「这个人该怎么说话」的判断是**建议**，不是**事实**。
+让模型直接落库，等于把角色的性格交给一次采样；用户是作者，作者说了算。
+
+### 界面上踩的两个坑（都属于「DOM 里有、屏幕上没有」）
+
+1. **弹窗放错了层级** —— 原本放在「⑤ 构思剧情」那一节里，而个性面板在「⑥ 生成控制台」：
+   `personaOpen` 已经是 true，但组件在 step 6 根本不渲染。⇒ 弹窗挪到**根模板层**，
+   任何 step 都在。
+2. **CSS 少一个花括号** —— 见下一节，这是本轮最值钱的一个发现。
+
+### 真跑证据（真实通道 MiniMax-M3，不是子 agent 顶替）
+
+- 界面上手写「句子短，从不解释」→ 点「AI 帮我完善」→ 模型返回三条补充（行为倾向 / 底线 / 经历）
+  → 采纳 → 保存。库里核对：`来源` 仍是 `user`，条数 4→6 / 4→6 / 2→5，重复项被去掉。
+- 带个性重生成一段（3,196 字，70 句台词）：**全段 0 个感叹号**；
+  顾星河台词均长 5.1 字、最长 10 字（只给结论不解释）；伊芙琳短答（`我碰它。` `记不清。`）；
+  陆沉舟先问再推测、用词偏档案（`记录里没有这一条。` `依据？`）；白烬一句话带称谓（`神女。`）。
+- 提示词侧：改前 system 3,875 字里「说话 / 口头禅 / 口吻」出现 **0** 次；
+  改后角色行形如 `· 顾星河（…；动机：…）｜ 说话：… ｜ 会：… ｜ 不会：… ｜ 经历：…`。
+
+### 改动清单
+
+- 新增 `backend/app/generation/persona.py`（规整 / 渲染 / 反推 / 合并 / 完善）。
+- `backend/app/routers/wizard.py`：合成圣经时给 persona，缺人时补一轮（一次调用补所有人）。
+- `backend/app/routers/projects.py`：`GET/POST .../style-narrative/personas`、`POST .../personas/complete`。
+- `backend/app/generation/prompts.py`：`character_line` 渲染；
+  **没有 persona 时逐字节不变**（有单测守着）。
+- 前端：`api/client.ts` + `api/types.ts` + `ProjectWorkspace.vue`（生成控制台的「角色个性」面板 + 弹窗）。
+- 测试：`tests/test_character_persona.py`（19 项）。
+
+## CSS 少一个花括号 ⇒ 弹窗在 DOM 里、屏幕上却没有（2026-10-28 踩到）
+
+### 症状
+
+「写个性」点下去，`document.querySelector('.bible-modal-mask')` **找得到**，
+元素里也有正确的内容，但**截图里什么都没有**：没有遮罩、没有弹窗、没有提示框。
+console 无报错，`vue-tsc` 通过，`vite build` 通过，CI 全绿。
+
+### 根因：一个 `}` 引发 Chrome 的原生 CSS 嵌套
+
+样式里 `.bible-row .k {` **少了一个右花括号**：
+
+```css
+.bible-row .k {
+  font-size: var(--fs-xs);
+  color: var(--fg-faint);
+  /* 这里缺 } */
+
+/* ===== plot_bible 编辑模态 + 冲突 toast ===== */
+.bible-modal-mask { position: fixed; inset: 0; … }
+.bible-modal { … }
+.bible-toast { … }
+.bible-toast-card { … }
+  font-weight: 700;      /* 原本属于 .bible-row .k，被挤到了最后 */
+  padding-top: 2px;
+}                          /* 这个 } 才把 .bible-row .k 关上 */
+```
+
+浏览器不报错 —— 它把后面这些规则当成**嵌套规则**（Chrome 120+ 的原生 CSS 嵌套），
+于是 `.bible-modal-mask` 实际编译成 `.bible-row .k .bible-modal-mask`，
+**再也匹配不到任何元素**。元素退回普通文档流：点「写个性」后页面**变高了 590px**
+（弹窗内容被排在页面最底下，在视口之外），所以既看不见也点不着。
+
+一次吞掉了 **5 个**弹窗/卡片的样式：编辑剧情圣经、revision 历史、冲突 toast、角色个性、角色卡。
+⇒ 「编辑剧情圣经」这个功能其实**从来没显示过**，只是没人点过它。
+
+### 定位路径（可复用）
+
+1. 元素在 DOM 里 + 截图看不见 ⇒ 不是「没渲染」，是「**没画**」。
+2. 量页面高度：点开弹窗后 `pageHeight` 涨了 590px ⇒ 元素在**普通流**里 ⇒ `position: fixed` 没生效。
+3. `position: fixed` 不生效 ⇒ 样式规则没匹配上 ⇒ 去看选择器被改成了什么。
+4. 查选择器 ⇒ 发现规则变成了嵌套形式 ⇒ 回头查花括号配平。
+
+### 修法 + 守门
+
+- 修法：把 `}` 补回 `.bible-row .k`，把被挤到最后的 `font-weight / padding-top` 放回原位。
+- 守门：`frontend/tests/styleBlockBraces.test.ts` ——
+  扫 `frontend/src` 下所有 `.vue` / `.css` 的样式块，
+  ① 花括号必须配平；② **普通规则里不许出现嵌套**（`@media` / `@keyframes` 里的嵌套是合法的，放行）；
+  ③ 顶层不许散落声明。另外带一条阳性对照：故意少一个 `}` 必须被报出来。
+- 同样的扫描逻辑已经落进守门测试（`frontend/tests/styleBlockBraces.test.ts`），
+  在本轮扫过全前端：**只有这一处**。
+
+### 一条方法论
+
+**「元素在 DOM 里但屏幕上没有」先查 CSS 选择器有没有被改写**，别去查 Vue 的渲染或层级。
+DOM 查询能找到元素，说明渲染树是好的；那就是**样式**的事。
+而 CSS 少一个 `}` 是**静默**的：类型检查、构建、单测、CI 全绿，只有真机点开才看得见 ——
+这类缺陷只能靠「真跑 + 看截图」和一条结构守门来挡。
+

@@ -3263,6 +3263,23 @@ def _build_drift_prompt(chunks_info: list[tuple[str, str]], chunk_label: str) ->
     return system, user
 
 
+#: 蒸馏的进度阶段总数（**阶段化进度**：`(current, total)` 的语义是「已完成阶段 / 总阶段」）。
+#:
+#: 为什么不再用「块数」当分母（2026-10-28 实测）：块是**并发**跑的，
+#: 6 块在 0.6 秒内全部报完 ⇒ 百分比从 17% 直接跳到 100%，
+#: 而后面的角色声音 / L2 档案 / 漂移分析 / 汇总占了 24% 的时间，全程顶着 100%。
+#: 现在每一阶段都按同一定值推进，只有「蒸馏完成」那一步才是 100%。
+_DISTILL_TOTAL_PHASES = 6
+
+#: 各阶段序号（与 `_DISTILL_TOTAL_PHASES` 对应，改这里要同步改总数）。
+PH_PREPARE = 1        # ① 准备参考语料（含缺图补建）
+PH_SAMPLE = 2         # ② 采样切块
+PH_EXTRACT = 3        # ③ 提炼规则（块间并发）
+PH_VOICE = 4          # ④ 提取角色声音
+PH_L2 = 5             # ⑤ 提取 L2 角色档案
+PH_SUMMARY = 6        # ⑥ 漂移分析与汇总
+
+
 def resolve_distill_provider():
     """蒸馏链路用哪个 provider：**优先 distiller 角色**，没配则回落 Writer。
 
@@ -3428,7 +3445,7 @@ def _ensure_reference_graphs(
             continue
 
         if progress is not None:
-            progress(f"参考语料 {nid} 缺角色图谱，正在补建", 0, 0)
+            progress(f"① 准备参考语料：补建图谱（语料 {nid}）", PH_PREPARE - 1, _DISTILL_TOTAL_PHASES)
 
         try:
             from app.kg.build import build_graph
@@ -3624,7 +3641,7 @@ def extract_narrative_profile(
     est_total = 0
 
     if progress is not None:
-        progress("正在准备参考语料", 0, 0)
+        progress("① 准备参考语料", PH_PREPARE - 1, _DISTILL_TOTAL_PHASES)
 
     # —— 前置自检：参考语料图谱（v2.228）——
     # 角色声音维度依赖 KgNode(type="character", source=f"novel:{nid}")——
@@ -3680,10 +3697,10 @@ def extract_narrative_profile(
 
         if progress is not None:
             progress(
-                f"语料 {book_idx}/{total_books}：已采样 {len(sampled)} 章，"
-                f"切 {n_chunks} 块",
-                blocks_done,
-                est_total,
+                f"② 采样切块：已采样 {len(sampled)} 章，切 {n_chunks} 块"
+                + ("" if total_books == 1 else f"（语料 {book_idx}/{total_books}）"),
+                PH_SAMPLE - 1,
+                _DISTILL_TOTAL_PHASES,
             )
 
         # v2.227 (P2)：chunk 间并发 ——
@@ -3814,9 +3831,10 @@ def extract_narrative_profile(
 
             if progress is not None:
                 progress(
-                    f"语料 {book_idx}/{total_books}：提炼第 {ci + 1}/{n_chunks} 块",
-                    blocks_done + ci + 1,
-                    est_total,
+                    f"③ 提炼规则：第 {ci + 1}/{n_chunks} 块"
+                    + ("" if total_books == 1 else f"（语料 {book_idx}/{total_books}）"),
+                    PH_EXTRACT - 1,
+                    _DISTILL_TOTAL_PHASES,
                 )
 
             chapter_range = b["cr"]
@@ -4007,9 +4025,10 @@ def extract_narrative_profile(
         # —— v5：角色声音提取（针对性：每个角色检索出场最多的章节）——
         if progress is not None:
             progress(
-                f"语料 {book_idx}/{total_books}：提取角色声音",
-                blocks_done,
-                est_total,
+                f"④ 提取角色声音"
+                + ("" if total_books == 1 else f"（语料 {book_idx}/{total_books}）"),
+                PH_VOICE - 1,
+                _DISTILL_TOTAL_PHASES,
             )
         try:
             # v6.6：从图谱取规范角色名 + 语料自证的简称映射。
@@ -4068,9 +4087,10 @@ def extract_narrative_profile(
         # 在一个大 prompt 中互相稀释。L2 失败只影响该角色，不影响整本书其余维度。
         if progress is not None:
             progress(
-                f"语料 {book_idx}/{total_books}：提取 L2 角色档案",
-                blocks_done,
-                est_total,
+                f"⑤ 提取 L2 角色档案"
+                + ("" if total_books == 1 else f"（语料 {book_idx}/{total_books}）"),
+                PH_L2 - 1,
+                _DISTILL_TOTAL_PHASES,
             )
         try:
             # canonical 可能因角色声音阶段异常而未赋值，L2 必须自带兜底，
@@ -4098,9 +4118,10 @@ def extract_narrative_profile(
         # —— v3：文风漂移分析（第三轮，对比早晚期）——
         if progress is not None:
             progress(
-                f"语料 {book_idx}/{total_books}：文风漂移分析",
-                blocks_done,
-                est_total,
+                f"⑥ 文风漂移分析"
+                + ("" if total_books == 1 else f"（语料 {book_idx}/{total_books}）"),
+                PH_SUMMARY - 1,
+                _DISTILL_TOTAL_PHASES,
             )
         try:
             if len(chapters) >= 20:
@@ -4162,7 +4183,7 @@ def extract_narrative_profile(
             )
 
     if progress is not None:
-        progress("正在汇总提炼出的规则", blocks_done, max(blocks_done, 1))
+        progress("⑥ 汇总提炼出的规则", PH_SUMMARY - 1, _DISTILL_TOTAL_PHASES)
 
     return {
         "version": NARRATIVE_VERSION,

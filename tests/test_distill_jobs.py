@@ -173,8 +173,18 @@ def test_progress_callback_reports_stage_and_counters(
     # 结束时必须已经探明总数：0 会让前端永远显示不确定态
     last_stage, last_cur, last_total = calls[-1]
     assert last_total > 0, "结束时总数仍为 0 —— 进度条会卡在不确定态"
-    assert last_cur == last_total, "结束时应对齐到 100%"
     assert "汇总" in last_stage
+    # —— 进度改成**阶段化**之后（2026-10-28）——
+    # 分母是「阶段数」，不是块数：块是并发跑的，用块数当分母会 0.6 秒内
+    # 从 17% 跳到 100%，而后面的角色声音 / L2 档案 / 漂移 / 汇总占 24% 的时间
+    # 全程顶着 100%（实测）。
+    #
+    # 所以这里的断言是「最后一次上报已经是最后一个阶段」，
+    # 而不是「current 等于 total」—— 对齐到 100% 由 jobs.run_distill_job 收尾时做
+    # （一个「蒸馏完成」的作业不能以 83% 结束）。
+    assert last_cur == last_total - 1, (
+        "最后一次进度上报应当停在最后一个阶段的起点（收尾由 job 对齐）")
+    assert "⑥" in last_stage
 
 
 def test_progress_is_truly_optional_no_output_change(db_session, stub_llm):

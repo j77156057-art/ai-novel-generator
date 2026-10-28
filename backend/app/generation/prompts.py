@@ -116,6 +116,19 @@ def _merge_text(bible_items: list, kg_items: list) -> list:
     return merged
 
 
+def _character_constraint_line(c: dict) -> str:
+    """角色约束块里的一行。
+
+    带 `persona`（说话方式/行为倾向/性格底线/关键经历）时追加一句人话 ——
+    没有它的话，模型只有「他是谁、他要干什么」，写对白没有依据 ⇒ 全员一个腔调。
+
+    **没有 persona 时与改动前逐字节相同**（老项目的提示词不受影响）。
+    """
+    from app.generation.persona import character_line
+
+    return character_line(c)
+
+
 def merged_constraint_items(
     reminders: dict, plot_bible: dict | None
 ) -> tuple[list[dict], list[str]]:
@@ -317,8 +330,7 @@ def build_system_prompt(
 
     char_lines = (
         "\n".join(
-            f"  · {c.get('name')}（{c.get('role') or '角色'}"
-            f"{('；动机：' + c.get('motivation') + '）') if c.get('motivation') else '）'}"
+            _character_constraint_line(c)
             for c in chars
             if isinstance(c, dict) and c.get("name")
         )

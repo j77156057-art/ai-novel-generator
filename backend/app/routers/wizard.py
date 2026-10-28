@@ -5,12 +5,16 @@
 """
 
 import json
+import logging
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
+from typing import Any
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.db import get_db
 from app.config import settings
@@ -267,12 +271,20 @@ def build_bible(
                 "以及参考语料的风格样本，为这部小说构思一份「剧情圣经」。\n"
                 "严格输出 JSON：\n"
                 "{\"synopsis\": 完整剧情梗概(300字内), "
-                "\"characters\": [{\"name\":角色名,\"role\":身份设定,\"motivation\":核心动机}], "
+                "\"characters\": [{\"name\":角色名,\"role\":身份设定,\"motivation\":核心动机,"
+                "\"persona\":{\"说话方式\":\"自称/句长/语气/口头禅\","
+                "\"行为倾向\":[\"遇到什么情况→会怎么反应\"],"
+                "\"性格底线\":[\"不会做什么\",\"不会说什么\"],"
+                "\"关键经历\":[\"决定他现在状态的事\"]}}], "
                 "\"relationships\": [{\"a\":角色,\"b\":角色,\"relation\":关系描述}], "
                 "\"direction\": 后续走向概述, "
                 "\"conflicts\": [冲突1, 冲突2], "
                 "\"foreshadowing\": [伏笔1, 伏笔2]}\n"
-                "要求：角色名用中文；关系要具体；foreshadowing 是『暂不打烊的悬念』，不要在此兑现。"
+                "要求：角色名用中文；关系要具体；foreshadowing 是『暂不打烊的悬念』，不要在此兑现。\n"
+                "**每个主要角色都必须给出 persona 四项**（说话方式/行为倾向/性格底线/关键经历）："
+                "只有身份和动机的话，模型写对白时没有『这个人怎么说话』的依据，"
+                "所有角色会是一个腔调。行为倾向要给『情境→反应』而不是形容词；"
+                "性格底线要用否定式；关键经历要具体到事件。"
             )
             user_p = _genre_style_text(proj)
             if proj.premise:
@@ -314,6 +326,23 @@ def build_bible(
                 return _planning_failure(code, participated,
                                         details={'attempts': len(failures), 'failures': failures})
             bible_dict, copy_report = parsed
+            # —— 角色个性补齐（2026-10-28）——
+            # 只有身份+动机的话，模型写对白没有「这个人怎么说话」的依据 ⇒ 全员一个腔调。
+            # 模型没给齐的，这里补一轮（一次调用补所有人）；补不上也不阻断。
+            #
+            # **只对「真有角色缺 persona」的情况调**：模型一般在第一轮就给齐了，
+            # 这时不该白白多付一次调用（也会让重试次数多一次，测试抓得到）。
+            try:
+                from app.generation.persona import has_complete_personas
+
+                if not has_complete_personas(bible_dict):
+                    filled = _fill_missing_personas(
+                        provider, bible_dict,
+                        context=(str(proj.premise or "") + "\n" + str(sample or "")))
+                    if filled:
+                        logger.info("剧情圣经：补齐 %d 个角色的写作档案", filled)
+            except Exception:  # noqa: BLE001 —— 补齐失败不阻断圣经生成
+                pass
             bible = PlotBibleOut.model_validate({**bible_dict, "model_participated": True, "degraded": False,
                                                 "status": "bible_draft", "error": None,
                                                 "plot_structure_note": structure_note,
@@ -344,10 +373,76 @@ def _parse_bible(raw: str) -> dict:
         raise ValueError("missing story goals")
     if (not isinstance(bible.get("characters"), list) or not bible["characters"]
             or not all(isinstance(c, dict) and all(
-                isinstance(c.get(k), str) and c[k].strip() for k in ("name", "role", "motivation"))
+                isinstance(c.get(k), str) and c.get(k).strip() for k in ("name", "role", "motivation"))
                 for c in bible["characters"])):
         raise ValueError("missing character motivation")
+    # persona（说话方式/行为倾向/性格底线/关键经历）是**可选**的：
+    # 模型没给不算结构不合格（后面有补齐那一轮），但**给了就规整**，
+    # 免得半个字符串、三百字的数组直接进提示词。
+    from app.generation.persona import normalize_persona
+
+    for c in bible["characters"]:
+        if isinstance(c, dict) and c.get("persona") is not None:
+            normalized = normalize_persona(c.get("persona"))
+            if normalized:
+                c["persona"] = normalized
+            else:
+                c.pop("persona", None)
     return bible
+
+
+def _fill_missing_personas(provider: Any, bible: dict, context: str = "") -> int:
+    """给**没给 persona** 的角色补一轮（一次调用补齐所有人）。
+
+    为什么要有这一轮：角色个性是「有没有活人感」的总开关，
+    而模型不保证每个角色都给齐四项 ⇒ 缺了就问一次，而不是让那一段的角色扁平。
+    补齐失败**不阻断**圣经生成（fail open：没有 persona 也能写，只是会平一些）。
+    """
+    try:
+        from app.generation.persona import _safe_json, normalize_persona
+
+        chars = bible.get("characters") or []
+        missing = [c for c in chars
+                   if isinstance(c, dict) and c.get("name")
+                   and not (c.get("persona") or {}).get("说话方式")]
+        if not missing:
+            return 0
+        sys_p = (
+            "你给这些角色补『写作档案』，供后续续写保持同一个人。\n"
+            "只按已有的身份与动机推断，不要改名字、身份和动机。\n"
+            "要抽的四个字段：\n"
+            "1. **说话方式**：自称、句长倾向、语气底色、口头禅。\n"
+            "2. **行为倾向**：遇到具体情境他会怎么做——给「情境 → 反应」，不是形容词。\n"
+            "3. **性格底线**：什么事他不会做、什么话他不会说（否定式）。\n"
+            "4. **关键经历**：决定他现在状态的事。\n\n"
+            "输出 JSON：\n"
+            '{"characters": [{"name": "...", "说话方式": "...", "行为倾向": ["..."], '
+            '"性格底线": ["..."], "关键经历": ["..."]}]}'
+        )
+        user = ("已有角色设定：\n" + json.dumps(
+            [{"name": c.get("name"), "role": c.get("role"), "motivation": c.get("motivation")}
+             for c in missing], ensure_ascii=False)
+            + ("\n\n小说梗概：\n" + str(bible.get("synopsis") or "")[:600]
+               + ("\n\n故事走向：\n" + str(bible.get("direction") or "")[:400] if bible.get("direction") else "")
+               + (("\n\n补充信息：\n" + context[:600]) if context else "")))
+        raw = provider.chat(sys_p, user)
+        parsed = _safe_json(raw)
+        got = {str(c.get("name") or ""): c for c in (parsed.get("characters") or [])
+               if isinstance(c, dict)}
+        filled = 0
+        for c in missing:
+            src = got.get(str(c.get("name") or ""))
+            if not src:
+                continue
+            persona = normalize_persona(src)
+            if not persona:
+                continue
+            persona["来源"] = "model"
+            c["persona"] = persona
+            filled += 1
+        return filled
+    except Exception:  # noqa: BLE001 —— 补齐失败不阻断圣经生成
+        return 0
 
 
 def _planning_failure(code: str, participated: bool, exc: Exception | None = None,

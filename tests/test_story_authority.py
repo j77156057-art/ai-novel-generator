@@ -64,7 +64,7 @@ def test_position_never_reads_next_chapter():
 def test_project_api_visibility_validation():
     from app.schemas import ProjectCreate, ProjectPatch, ProjectOut
     from app.routers.projects import create_project, patch_project
-    from fastapi import HTTPException
+    from fastapi import BackgroundTasks, HTTPException
     import pytest
     db,p=fixture()
     body=ProjectCreate(title='API',reference_novel_ids=[1],story_authority='reference_anchor',reference_cutoffs=[{'novel_id':1,'chapter':5}])
@@ -72,8 +72,8 @@ def test_project_api_visibility_validation():
     assert ProjectOut.model_validate(created).reference_cutoffs==[{'novel_id':1,'chapter':5}]
     for updates in ({'story_authority':None},{'story_authority':'bad'},{'reference_cutoffs':[{'novel_id':2,'chapter':5}]},{'reference_cutoffs':[{'novel_id':1,'chapter':99}]},{'reference_cutoffs':[{'novel_id':1,'chapter':0}]},{'reference_novel_ids':[]},{'reference_cutoffs':[{'novel_id':1,'chapter':5}]*2}):
         with pytest.raises((HTTPException, ValueError)):
-            patch_project(created.id,ProjectPatch(**updates),db)
-    cleared=patch_project(created.id,ProjectPatch(reference_cutoffs=None),db)
+            patch_project(created.id,ProjectPatch(**updates),BackgroundTasks(),db)
+    cleared=patch_project(created.id,ProjectPatch(reference_cutoffs=None),BackgroundTasks(),db)
     assert cleared.reference_cutoffs is None
 
 

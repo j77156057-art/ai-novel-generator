@@ -126,9 +126,72 @@ export interface ProjectPatch {
   reference_cutoffs?: ReferenceCutoff[] | null;
 }
 
+/**
+ * 角色的**个性档案**（persona）。
+ *
+ * 为什么有它：只有「名字 + 身份 + 动机」时，模型写对白没有「这个人怎么说话」
+ * 的依据 ⇒ 所有角色一个腔调（2026-10-28 真跑实测）。
+ * 字段名与后端 `app/style/character_profile.py` 同形。
+ */
+export interface CharacterPersona {
+  /** 自称、句长倾向、语气底色、口头禅。 */
+  说话方式?: string;
+  /** 遇到什么情况 → 他会怎么反应。 */
+  行为倾向?: string[];
+  /** 什么事他不会做、什么话他不会说。 */
+  性格底线?: string[];
+  /** 决定他现在状态的事。 */
+  关键经历?: string[];
+  /** 来源：model=合成圣经时给的；derived=从已写正文反推的；user=用户自己写的。 */
+  来源?: "model" | "derived" | "user";
+  /** 反推依据的段号指纹（不是时间戳）。 */
+  更新于?: string;
+}
+
+/** GET /projects/{id}/style-narrative/personas 的一个角色。 */
+export interface PersonaItem {
+  name: string;
+  role?: string;
+  motivation?: string;
+  /** 用户写的个性档案（四字段，可能只有一部分）。 */
+  persona?: CharacterPersona;
+  /** 来源：model / derived / user（user = 用户自己写的，受保护）。 */
+  source?: string;
+}
+
+/** GET /projects/{id}/style-narrative/personas 的响应。 */
+export interface PersonaListResponse {
+  items: PersonaItem[];
+  has_bible: boolean;
+}
+
+/** POST /projects/{id}/style-narrative/personas 的请求体。 */
+export interface PersonaSaveRequest {
+  name: string;
+  persona: Record<string, unknown>;
+}
+
+/** POST /projects/{id}/style-narrative/personas/complete 的响应（**只是建议，没落库**）。 */
+export interface PersonaCompleteResponse {
+  ok: boolean;
+  name?: string;
+  /** AI 给的补充（可采纳）。 */
+  补充?: CharacterPersona;
+  /** AI 的一句话说明。 */
+  说明?: string;
+  /** 失败原因。 */
+  note?: string;
+}
+
 export interface PlotBible {
   synopsis?: string | null;
-  characters?: { name?: string; role?: string; motivation?: string }[];
+  characters?: {
+    name?: string;
+    role?: string;
+    motivation?: string;
+    /** 个性档案（2026-10-28 新增）。 */
+    persona?: CharacterPersona;
+  }[];
   relationships?: { a?: string; b?: string; relation?: string }[];
   direction?: string | null;
   conflicts?: string[];

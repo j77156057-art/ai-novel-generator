@@ -30,23 +30,33 @@ function job(p: Partial<DistillJob>): DistillJob {
 }
 
 describe("DistillProgress", () => {
-  it("运行中：文字状态 + 百分比 + 块计数", () => {
+  it("运行中：文字状态 + 百分比 + 阶段计数", () => {
+    // 后端报的是「已完成阶段数 / 总阶段数」（阶段化进度），不是块数：
+    // 块是并发跑的，用块数当分母会 0.6 秒内从 17% 跳到 100%（2026-10-28 实测）。
     const w = mount(DistillProgress, {
       props: { job: job({ status: "running", progress_current: 3, progress_total: 12, stage: "正在切分语料" }) },
     });
     const text = w.text();
     expect(text).toContain("运行中");
     expect(text).toContain("25%");
-    expect(text).toContain("3 / 12 块");
+    expect(text).toContain("第 3 / 12 步");
     expect(text).toContain("正在切分语料");
   });
 
-  it("总数没探明 → 不确定态：不显示百分比，只报已完成块数", () => {
+  it("运行中哪怕 backend 报满也不许显示 100%（早满晚完是最糟的体感）", () => {
+    const w = mount(DistillProgress, {
+      props: { job: job({ status: "running", progress_current: 6, progress_total: 6 }) },
+    });
+    expect(w.text()).toContain("99%");
+    expect(w.text()).not.toContain("100%");
+  });
+
+  it("总数没探明 → 不确定态：不显示百分比，只报已完成项数", () => {
     const w = mount(DistillProgress, {
       props: { job: job({ status: "running", progress_current: 5, progress_total: 0 }) },
     });
     const text = w.text();
-    expect(text).toContain("已完成 5 块");
+    expect(text).toContain("已完成 5 项");
     expect(text).not.toContain("%");
     // 进度条要标成不确定（aria-valuenow 留空）
     expect(w.find('[role="progressbar"]').attributes("aria-valuenow")).toBeUndefined();
@@ -95,7 +105,8 @@ describe("DistillProgress", () => {
     const w = mount(DistillProgress, {
       props: { job: job({ status: "running", progress_current: 13, progress_total: 12 }) },
     });
-    expect(w.text()).toContain("100%");
+    // 运行中封顶 99%；完成态才允许 100%（这条只要求「不越界」）
+    expect(w.text()).toContain("99%");
     expect(w.text()).not.toContain("108%");
   });
 });

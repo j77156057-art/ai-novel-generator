@@ -1492,6 +1492,28 @@ def rebuild_summary_tree(db, project: Project, provider) -> dict:
     return stats
 
 
+def _refresh_character_personas(db, project, provider) -> int:
+    """从已写正文反推角色个性并回写剧情圣经（**fail open**）。
+
+    为什么要放在生成前：角色个性是「有没有活人感」的总开关。
+    合成剧情圣经时给的是「想象版」，写了几段之后应该换成「实测版」——
+    模型自己写出来的台词怎么说话，比凭空想的更准。
+
+    任何失败都只记日志，绝不影响生成（没有 persona 也能写，只是会平一些）。
+    """
+    try:
+        from app.generation.persona import refresh_personas
+
+        n = refresh_personas(db, project, provider)
+        if n:
+            logging.getLogger(__name__).info(
+                "角色个性：从已写正文反推更新了 %d 个角色", n)
+        return n
+    except Exception as exc:  # noqa: BLE001 —— 反推失败绝不能挡住生成
+        logging.getLogger(__name__).warning("角色个性反推失败（忽略）: %s", exc)
+        return 0
+
+
 def build_context(
     db,
     project: Project,
@@ -2772,6 +2794,9 @@ def generate_next_segment(
             'message': '规划已写完：这一版的剧情点都写过了。要继续写，请先扩展规划'
                        '（否则新写的正文没有保存权威可核对）。',
             'written_segments': written})
+    # 角色个性：从已写正文反推一次（fail open）
+    # 没有它的话，角色约束块只有身份+动机 ⇒ 模型写对白没依据 ⇒ 全员一个腔调。
+    _refresh_character_personas(db, project, provider)
     _ov = _prompt_overrides(db, project.id)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
@@ -2980,6 +3005,9 @@ def generate_next_segment_stream(
     # —— 时间线：算出当前剧情点提示（与同步版同口径，db 用于落库）——
     written = _next_segment_no(db, project.id) - 1
     node_prompt = current_node_prompt(project, written, provider, db=db)
+    # 角色个性：从已写正文反推一次（fail open）
+    # 没有它的话，角色约束块只有身份+动机 ⇒ 模型写对白没依据 ⇒ 全员一个腔调。
+    _refresh_character_personas(db, project, provider)
     _ov = _prompt_overrides(db, project.id)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
@@ -3162,6 +3190,9 @@ def _build_generation_prompts(
         tree, budget_chars=budget_for_generation(project.generation_length)
     )
     ctx = build_context(db, project, novel_ids=novel_ids, profile=profile or "continuation")
+    # 角色个性：从已写正文反推一次（fail open）
+    # 没有它的话，角色约束块只有身份+动机 ⇒ 模型写对白没依据 ⇒ 全员一个腔调。
+    _refresh_character_personas(db, project, provider)
     _ov = _prompt_overrides(db, project.id)
     system = build_system_prompt(
         project.title, get_reminders(db, project.id, source="generated"),

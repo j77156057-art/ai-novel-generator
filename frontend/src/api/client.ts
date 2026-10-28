@@ -68,6 +68,9 @@ import type {
   StyleDistillDetail,
   StyleDistillListResponse,
   StyleNarrativeConflictsResponse,
+  PersonaCompleteResponse,
+  PersonaListResponse,
+  PersonaSaveRequest,
   StyleNarrativeRepairResponse,
   SearchHit,
   UploadResult,
@@ -355,6 +358,30 @@ export const api = {
   ) =>
     request<StyleNarrativeRepairResponse>(
       `/projects/${projectId}/style-narrative/repair`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * 列出角色的个性档案（用户自己写的那份也在里面，标 `source=user`）。
+   */
+  listPersonas: (projectId: number) =>
+    request<PersonaListResponse>(`/projects/${projectId}/style-narrative/personas`),
+
+  /**
+   * 保存**用户写的**角色个性（落库后标 `来源=user`，不会被反推覆盖）。
+   */
+  savePersona: (projectId: number, body: PersonaSaveRequest) =>
+    request<{ ok: boolean; name: string; persona: Record<string, unknown> }>(
+      `/projects/${projectId}/style-narrative/personas`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * AI 帮着完善角色个性 —— **只返回建议，不落库**（要不要采纳由人点）。
+   */
+  completePersona: (projectId: number, body: { name: string; persona?: Record<string, unknown>; note?: string }) =>
+    request<PersonaCompleteResponse>(
+      `/projects/${projectId}/style-narrative/personas/complete`,
       jsonInit("POST", body),
     ),
 

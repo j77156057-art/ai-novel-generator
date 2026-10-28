@@ -13,7 +13,13 @@ from app.models import Project
 from app.routers import projects, wizard
 
 BIBLE = {'synopsis': '雨夜查旧档', 'direction': '揭穿旧案',
-         'characters': [{'name': '沈砚', 'role': '修复员', 'motivation': '澄清责任'}],
+         # persona（说话方式等）是角色个性：有它，模型写对白才有依据。
+         # 这里给齐，是为了让「重试次数」这类测试不被「补齐 persona」那次调用干扰。
+         'characters': [{'name': '沈砚', 'role': '修复员', 'motivation': '澄清责任',
+                         'persona': {'说话方式': '句子短，只陈述核对到的事实',
+                                     '行为倾向': ['被追问时→先翻原件再回答'],
+                                     '性格底线': ['不会替人担责'],
+                                     '关键经历': ['三年前经手过同一批档案']}}],
          'relationships': [], 'conflicts': [], 'foreshadowing': []}
 NODES = [{'title': f'核对{i}', 'premise': '记录矛盾', 'motivation': '澄清责任',
           'action': '核对原件', 'result': '确定差错', 'cost': 'NA', 'time': '03:00',
@@ -221,3 +227,44 @@ def test_outline_also_retries(monkeypatch):
         assert r.status_code == 200
         assert r.json()['status'] in {'outline_draft', 'clarification_required'}
         assert calls['n'] == 2
+
+
+def test_bible_fills_missing_persona_in_one_extra_call(monkeypatch):
+    """模型没给角色个性时补一轮（一次调用补所有人），补上才算完。
+
+    为什么必须有：只有身份+动机的话，模型写对白没有「这个人怎么说话」的依据
+    ⇒ 所有角色一个腔调（2026-10-28 真跑实测）。
+    """
+    engine = create_engine('sqlite://', connect_args={'check_same_thread': False},
+                           poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        p = Project(title='测试', premise='雨夜查旧档', outline=[],
+                    plot_timeline={'sentinel': True})
+        db.add(p)
+        db.commit()
+        calls = {'persona_calls': 0}
+
+        class Writer:
+            def chat(self, system, user, **kw):
+                if '写作档案' in system:
+                    calls['persona_calls'] += 1
+                    return json.dumps({'characters': [{
+                        'name': '沈砚',
+                        '说话方式': '句子短，只陈述核对到的事实',
+                        '行为倾向': ['被追问时→先翻原件再回答'],
+                    }]}, ensure_ascii=False)
+                return json.dumps({
+                    'synopsis': '雨夜查旧档', 'direction': '揭穿旧案',
+                    'characters': [{'name': '沈砚', 'role': '修复员', 'motivation': '澄清责任'}],
+                    'relationships': [], 'conflicts': [], 'foreshadowing': []},
+                    ensure_ascii=False)
+
+        client = _client(db, monkeypatch, Writer())
+        r = client.post('/api/projects/%d/build-bible' % p.id, json={'preview': True})
+        assert r.status_code == 200
+        data = r.json()
+        assert data['status'] == 'bible_draft', data
+        assert calls['persona_calls'] == 1, '缺个性时应当补一轮（且只补一次）'
+        persona = (data['characters'][0] or {}).get('persona') or {}
+        assert persona.get('说话方式'), '补出来的个性要落进剧情圣经'

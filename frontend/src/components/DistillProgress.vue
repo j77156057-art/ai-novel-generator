@@ -54,22 +54,31 @@ const active = computed(
 const indeterminate = computed(() => !props.job.progress_total);
 
 /**
- * 百分比（0~100）。
+ * 后端报的是「**已完成阶段数 / 总阶段数**」（阶段化进度），不是「块数」。
  *
- * 刻意 **clamp 到 100**：后端对剩余未探明语料是按「已探明语料的平均块数」
- * 估算总数的，估算偶尔会略小于实际完成数，直接除会得到 103% 这种越界值。
+ * ## 为什么改成分母=阶段数
+ *
+ * 实测（2026-10-28，平衡档真跑）：块是**并发**跑的，6 块在 **0.6 秒内**全部报完
+ * ⇒ 进度条从 17% 直接跳到 100%；而随后的角色声音 / L2 档案 / 漂移分析 / 汇总
+ * 占了 24% 的时间，全程顶着 100%。用户看到的是「早早就满了，却还要等半天」。
+ *
+ * 现在后端按六个阶段推进，只有「蒸馏完成」那一步才是 100%。
  */
 const percent = computed(() => {
   const total = props.job.progress_total;
   if (!total) return 0;
+  // 完成态才允许 100%；运行中最高到「倒数一个阶段的起点」，
+  // 即使后端因为并发/估算把 current 报成了 total。
+  const running = props.job.status === "pending" || props.job.status === "running";
   const raw = (props.job.progress_current / total) * 100;
-  return Math.max(0, Math.min(100, Math.round(raw)));
+  const capped = running ? Math.min(raw, 99) : raw;
+  return Math.max(0, Math.min(100, Math.round(capped)));
 });
 
 /** 「第 5 / 12 块」——不确定态下只给已完成数，不编一个分母。 */
 const counterText = computed(() => {
-  if (indeterminate.value) return `已完成 ${props.job.progress_current} 块`;
-  return `${props.job.progress_current} / ${props.job.progress_total} 块`;
+  if (indeterminate.value) return `已完成 ${props.job.progress_current} 项`;
+  return `第 ${props.job.progress_current} / ${props.job.progress_total} 步`;
 });
 
 /** 阶段文字兜底：后端还没来得及写 stage 时也得有一句人话。 */

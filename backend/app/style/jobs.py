@@ -311,11 +311,11 @@ def run_distill_job(
             run.rule_count = sum(
                 len(v) for v in rules.values() if isinstance(v, list)
             )
-        # 收尾对齐：命中缓存时进度是 (1,1)，正常跑完时 total 可能大于 current
-        # （估算法会把未探明的余量算进去），统一收成 100% 免得显示 97% 却成功。
-        if not run.progress_total or run.progress_current < run.progress_total:
-            run.progress_total = max(run.progress_current, 1)
-            run.progress_current = run.progress_total
+        # 收尾对齐：进度改成**阶段化**之后，中间步骤上报的都是「阶段起点」
+        # （第 6 阶段报 6/6 之前是 5/6），所以成功时必须显式补最后一格，
+        # 否则会以 83% 结束。命中缓存时进度是 (1,1)，也走这里统一。
+        run.progress_total = max(int(run.progress_total or 0), 1)
+        run.progress_current = run.progress_total
         run.error = None
         db.commit()
     except Exception as exc:  # noqa: BLE001 —— 后台任务不得往外抛

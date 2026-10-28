@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "@/api/client";
 import type {
@@ -104,6 +104,152 @@ const questionNote = ref<string | null>(null);
 const answers = reactive<Record<string, string>>({});
 const buildingBible = ref(false);
 const bible = ref<PlotBible | null>(null);
+
+// ===== 角色个性：人写 + AI 帮着完善（2026-10-28） =====
+//
+// 「让用户自己写角色的性格，自己来决定角色应该有什么样的表现，再由 AI 帮忙完善」。
+// 三条规矩（与后端 app/generation/persona.py 一致）：
+// 1. 人写的标 `来源=user` ⇒ 之后的「从正文反推」不覆盖它；
+// 2. AI **只补不改**：只能在人写的内容后面追加；
+// 3. AI **不落库**：它给的是建议，采纳与否由人点。
+const personaOpen = ref(false);
+const personaChar = ref<{ name: string; role?: string; motivation?: string } | null>(null);
+/** 四栏的编辑值：文本框用字符串，多行项用数组（一行一条）。 */
+const personaForm = reactive<Record<string, string>>({
+  说话方式: "",
+  行为倾向: "",
+  性格底线: "",
+  关键经历: "",
+});
+/** 用户给 AI 的额外要求（可选）。 */
+const personaNote = ref("");
+/** AI 给的补充（还没采纳）。 */
+const personaAi = ref<Record<string, unknown> | null>(null);
+const personaAiNote = ref("");
+const personaBusy = ref(false);
+const personaErr = ref<string | null>(null);
+const personaMsg = ref<string | null>(null);
+/** 弹窗本身（AI 给完建议后要滚到底）。 */
+const personaModalEl = ref<HTMLElement | null>(null);
+/** AI 补充的字段名 → 人话标题（界面上不出现字段名）。 */
+const PERSONA_LABELS: Record<string, string> = {
+  说话方式: "他怎么说话",
+  行为倾向: "他会怎么做",
+  性格底线: "他不会做什么",
+  关键经历: "决定他现在状态的事",
+};
+
+function _lines(v: unknown): string {
+  if (Array.isArray(v)) return v.map((x) => String(x)).join("\n");
+  return v ? String(v) : "";
+}
+
+/** 打开某个角色的个性编辑框。 */
+function openPersona(c: { name?: string; role?: string; motivation?: string; persona?: any }) {
+  personaChar.value = { name: c.name || "", role: c.role, motivation: c.motivation };
+  const p = c.persona || {};
+  personaForm.说话方式 = String(p["说话方式"] || "");
+  personaForm.行为倾向 = _lines(p["行为倾向"]);
+  personaForm.性格底线 = _lines(p["性格底线"]);
+  personaForm.关键经历 = _lines(p["关键经历"]);
+  personaNote.value = "";
+  personaAi.value = null;
+  personaAiNote.value = "";
+  personaErr.value = null;
+  personaMsg.value = null;
+  personaOpen.value = true;
+}
+
+function closePersona() {
+  personaOpen.value = false;
+}
+
+/** 把四栏拼成 persona（多行项按行拆开）。 */
+function personaPayload(): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (personaForm.说话方式.trim()) out["说话方式"] = personaForm.说话方式.trim();
+  for (const k of ["行为倾向", "性格底线", "关键经历"]) {
+    const items = personaForm[k].split("\n").map((x) => x.trim()).filter(Boolean);
+    if (items.length) out[k] = items;
+  }
+  return out;
+}
+
+/** AI 帮着完善 —— 只拿建议，不落库。 */
+async function askAiCompletePersona() {
+  if (!personaChar.value) return;
+  personaBusy.value = true;
+  personaErr.value = null;
+  personaMsg.value = null;
+  try {
+    const r = await api.completePersona(projectId, {
+      name: personaChar.value.name,
+      persona: personaPayload(),
+      note: personaNote.value.trim(),
+    });
+    if (!r.ok || !r["补充"]) {
+      personaErr.value = r.note || "没能给出建议（模型不可用或限流）";
+      return;
+    }
+    personaAi.value = r["补充"] as Record<string, unknown>;
+    personaAiNote.value = r["说明"] || "";
+    // 建议在弹窗最下面，滚过去让人直接看到。
+    await nextTick();
+    const el = personaModalEl.value;
+    if (el) el.scrollTop = el.scrollHeight;
+  } catch (err) {
+    personaErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    personaBusy.value = false;
+  }
+}
+
+/** 采纳 AI 的补充（追加在已有内容后面，不替换）。 */
+function acceptAiPersona() {
+  const extra = personaAi.value;
+  if (!extra) return;
+  const mergeText = (a: string, b: unknown): string => {
+    const t = String(b ?? "").trim();
+    if (!t) return a;
+    if (!a) return t;
+    return a.includes(t) ? a : a + "；" + t;
+  };
+  const mergeLines = (a: string, b: unknown): string => {
+    const lines = a.split("\n").map((x) => x.trim()).filter(Boolean);
+    const extra = Array.isArray(b) ? b : (b ? [String(b)] : []);
+    for (const x of extra) {
+      const t = String(x).trim();
+      if (t && !lines.includes(t)) lines.push(t);
+    }
+    return lines.join("\n");
+  };
+  personaForm.说话方式 = mergeText(personaForm.说话方式, extra["说话方式"]);
+  personaForm.行为倾向 = mergeLines(personaForm.行为倾向, extra["行为倾向"]);
+  personaForm.性格底线 = mergeLines(personaForm.性格底线, extra["性格底线"]);
+  personaForm.关键经历 = mergeLines(personaForm.关键经历, extra["关键经历"]);
+  personaAi.value = null;
+  personaMsg.value = "AI 的补充已加到你的内容后面（没有覆盖你写的）—— 检查一下再保存。";
+}
+
+/** 保存用户写的个性（落库，标来源=user）。 */
+async function savePersona() {
+  if (!personaChar.value) return;
+  personaBusy.value = true;
+  personaErr.value = null;
+  try {
+    await api.savePersona(projectId, { name: personaChar.value.name, persona: personaPayload() });
+    // 本地 bible 同步（界面立刻能看到）
+    const fresh = await api.getProject(projectId);
+    project.value = fresh;
+    bible.value = (fresh.plot_bible as PlotBible) || null;
+    personaOpen.value = false;
+    personaMsg.value = "已保存。下一段就会按这份个性写这个角色。";
+  } catch (err) {
+    personaErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    personaBusy.value = false;
+  }
+}
 
 // ===== plot_bible 级联协议编辑（kg-cascade-protocol） =====
 // 用户在 bible 卡片点「编辑」→ JSON 模态 → apply 走新端点（写 revision +
@@ -1945,7 +2091,24 @@ onUnmounted(stopDistillPolling);
       <div class="bible-row" v-if="bible.characters?.length">
         <span class="k">角色</span>
         <span class="v">
-          <span v-for="c in bible.characters" :key="c.name" class="tag accent">{{ c.name }} · {{ c.role }}</span>
+          <!-- 角色要能看见「这个人怎么说话」：只有名字+身份的话，
+               写出来的人都是一个腔调（2026-10-28 真跑实测）。
+               有个性档案的展开显示，没有的就只显示一行。 -->
+          <span v-for="c in bible.characters" :key="c.name" class="role-chip">
+            <span class="row tight" style="gap: 6px">
+              <span class="tag accent">{{ c.name }} · {{ c.role }}</span>
+              <button class="link-btn" @click="openPersona(c)">写个性</button>
+            </span>
+            <span v-if="c.persona" class="role-persona">
+              <span v-if="c.persona['说话方式']">
+                说话：{{ c.persona["说话方式"] }}
+              </span>
+              <span v-if="c.persona['性格底线']?.length">
+                不会：{{ c.persona["性格底线"].join("；") }}
+              </span>
+              <span v-if="c.persona['来源'] === 'user'" class="faint">你写的（不会被自动改）</span>
+            </span>
+          </span>
         </span>
       </div>
       <div class="bible-row" v-if="bible.relationships?.length">
@@ -2132,6 +2295,39 @@ onUnmounted(stopDistillPolling);
     </div>
     <div v-else-if="styleCheckErr" class="notice err distill-inline" style="margin-top: var(--gap)">
       文风档案检查没跑成：{{ styleCheckErr }}
+    </div>
+
+    <!-- ---------- 角色个性：生成前就能改（人写优先，AI 只补） ---------- -->
+    <div v-if="bible?.characters?.length" class="persona-panel">
+      <div class="card-title" style="font-size: var(--fs-sm)">
+        角色个性<span class="hint">决定每个人说话与做事的分寸 —— 可以自己写，AI 也能帮着补</span>
+      </div>
+      <ul class="persona-list">
+        <li v-for="c in bible.characters" :key="c.name" class="persona-item">
+          <div class="row tight" style="gap: 8px">
+            <strong>{{ c.name }}</strong>
+            <span class="faint">{{ c.role }}</span>
+            <button class="link-btn" @click="openPersona(c)">写个性</button>
+          </div>
+          <div v-if="c.persona" class="persona-detail">
+            <span v-if="c.persona['说话方式']">说话：{{ c.persona["说话方式"] }}</span>
+            <span v-if="c.persona['行为倾向']?.length">
+              会：{{ c.persona["行为倾向"].join("；") }}
+            </span>
+            <span v-if="c.persona['性格底线']?.length">
+              不会：{{ c.persona["性格底线"].join("；") }}
+            </span>
+            <span class="faint">{{
+              c.persona["来源"] === "user" ? "你写的（不会被自动改）"
+                : c.persona["来源"] === "derived" ? "从已写正文里归纳的"
+                : ""
+            }}</span>
+          </div>
+          <div v-else class="faint" style="font-size: var(--fs-xs)">
+            还没写 —— 写清他怎么说话、怎么反应，生成时才会是这个人而不是一个腔调。
+          </div>
+        </li>
+      </ul>
     </div>
     <div v-else-if="styleRepairMsg" class="notice info distill-inline" style="margin-top: var(--gap)">
       {{ styleRepairMsg }}
@@ -2543,6 +2739,69 @@ onUnmounted(stopDistillPolling);
       <button class="btn ghost" @click="goStep(6)">← 返回生成</button>
     </div>
   </section>
+    <!-- ===== 角色个性编辑（人写 + AI 完善）===== -->
+    <div v-if="personaOpen" class="bible-modal-mask" @click.self="closePersona">
+      <div ref="personaModalEl" class="bible-modal persona-modal">
+        <div class="card-title">
+          写这个角色{{ personaChar?.name ? `「${personaChar.name}」` : "" }}的个性
+          <span class="hint">你写的优先；AI 只在你后面补充，不替你决定</span>
+        </div>
+
+        <p class="muted" style="font-size: var(--fs-xs); margin-bottom: 10px">
+          身份：{{ personaChar?.role || "—" }}　｜　动机：{{ personaChar?.motivation || "—" }}
+        </p>
+
+        <div class="field">
+          <label>他怎么说话（自称、句长、语气、口头禅）</label>
+          <textarea class="input" rows="3" v-model="personaForm.说话方式"
+            placeholder="例：自称「我」，句子短，从不解释只给结论"></textarea>
+        </div>
+        <div class="field">
+          <label>他会怎么做（一行一条：遇到什么情况 → 怎么反应）</label>
+          <textarea class="input" rows="4" v-model="personaForm.行为倾向"
+            placeholder="例：被质疑守灯职责时→先沉默三秒，再反问一句"></textarea>
+        </div>
+        <div class="field">
+          <label>他不会做什么（一行一条）</label>
+          <textarea class="input" rows="3" v-model="personaForm.性格底线"
+            placeholder="例：不会当着陌生人承认自己的身份"></textarea>
+        </div>
+        <div class="field">
+          <label>决定他现在状态的事（一行一条）</label>
+          <textarea class="input" rows="3" v-model="personaForm.关键经历"
+            placeholder="例：七年前那一夜，他是唯一活下来的执灯人"></textarea>
+        </div>
+
+        <div class="field">
+          <label>给 AI 的补充要求（可选）</label>
+          <input class="input" v-model="personaNote" placeholder="例：我想让他更冷一点，别用感叹句" />
+        </div>
+        <div class="row" style="gap: 8px; margin-top: 4px">
+          <button class="btn" :disabled="personaBusy" @click="askAiCompletePersona">
+            {{ personaBusy ? "AI 正在补…" : "AI 帮我完善" }}
+          </button>
+          <button class="btn primary" :disabled="personaBusy" @click="savePersona">
+            保存
+          </button>
+          <button class="btn ghost" @click="closePersona">取消</button>
+          <span v-if="personaErr" class="notice err" style="display: inline">{{ personaErr }}</span>
+          <span v-else-if="personaMsg" class="notice info" style="display: inline">{{ personaMsg }}</span>
+        </div>
+
+        <div v-if="personaAi" class="notice info" style="margin-top: 10px">
+          <p style="margin: 0 0 6px"><strong>AI 的补充</strong>：{{ personaAiNote }}</p>
+          <div v-for="(val, key) in personaAi" :key="key" class="ai-line">
+            <span class="tag">{{ PERSONA_LABELS[key] || key }}</span>
+            <span>{{ Array.isArray(val) ? val.join("；") : val }}</span>
+          </div>
+          <div class="row" style="gap: 8px; margin-top: 6px">
+            <button class="btn sm" @click="acceptAiPersona">采纳（加在你写的后面）</button>
+            <button class="btn sm ghost" @click="personaAi = null">不用</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </template>
 </template>
 
@@ -3019,6 +3278,9 @@ onUnmounted(stopDistillPolling);
 .bible-row .k {
   font-size: var(--fs-xs);
   color: var(--fg-faint);
+  font-weight: 700;
+  padding-top: 2px;
+}
 
 /* ===== plot_bible 编辑模态 + 冲突 toast（kg-cascade-protocol）===== */
 .bible-modal-mask {
@@ -3031,6 +3293,51 @@ onUnmounted(stopDistillPolling);
   z-index: 100;
   padding-top: 6vh;
 }
+/* 角色：名字 + 身份一行，下面挂「这个人怎么说话 / 不会做什么」。 */
+/* 角色个性面板（生成控制台） */
+.persona-panel {
+  margin-top: var(--gap);
+  padding: 12px 14px;
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+}
+.persona-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.persona-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.persona-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  max-width: 720px;
+}
+.role-chip {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 10px 10px 0;
+  vertical-align: top;
+}
+.role-persona {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  max-width: 460px;
+}
 .bible-modal {
   background: var(--bg-elev);
   border: var(--border-w) solid var(--border);
@@ -3041,6 +3348,23 @@ onUnmounted(stopDistillPolling);
   max-height: 80vh;
   overflow: auto;
   box-shadow: var(--shadow-md);
+}
+/* 角色个性弹窗：四栏内容比别的弹窗长，用更宽的框、更多的高度。 */
+.persona-modal {
+  max-width: 820px;
+  max-height: 86vh;
+}
+/* AI 给的补充：一行一条，带个小标题标签。 */
+.ai-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+}
+.ai-line .tag {
+  flex: 0 0 auto;
 }
 .bible-textarea {
   resize: vertical;
@@ -3066,9 +3390,6 @@ onUnmounted(stopDistillPolling);
   max-height: 80vh;
   overflow: auto;
   box-shadow: var(--shadow-md);
-}
-  font-weight: 700;
-  padding-top: 2px;
 }
 .bible-row .v {
   display: flex;

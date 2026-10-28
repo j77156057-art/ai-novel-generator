@@ -569,6 +569,123 @@ class StyleNarrativeRepairRequest(StrictRequest):
     preview: bool = False
 
 
+# ====================================================================
+# 角色个性：人写 + AI 帮着完善（2026-10-28）
+# ====================================================================
+
+
+class PersonaSaveRequest(StrictRequest):
+    """`POST /api/projects/{id}/style-narrative/personas` 的请求体。"""
+
+    #: 角色名（要改的那个角色）。
+    name: str
+    #: 用户写的个性档案（四个字段的子集；给空串表示清空这个角色的个性）。
+    persona: dict
+
+
+class PersonaCompleteRequest(StrictRequest):
+    """`POST /api/projects/{id}/style-narrative/personas/complete` 的请求体。"""
+
+    #: 角色名。
+    name: str
+    #: 用户已经写好的部分（可选）——AI 只能在它**后面**补充。
+    persona: dict = {}
+    #: 用户的额外要求（可选，如「我想让他更冷一点」）。
+    note: str = ""
+
+
+@router.get("/{project_id}/style-narrative/personas")
+def list_personas(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """列出本项目所有角色的个性档案（含来源标记）。
+
+    来源：`model`=合成圣经时模型给的；`derived`=从已写正文反推的；
+    `user`=用户自己写的（**受保护**：反推不会覆盖它）。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    bible = proj.plot_bible
+    if isinstance(bible, str):
+        try:
+            import json as _json
+
+            bible = _json.loads(bible)
+        except Exception:  # noqa: BLE001
+            bible = {}
+    if not isinstance(bible, dict):
+        bible = {}
+    out = []
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        persona = c.get("persona") if isinstance(c.get("persona"), dict) else {}
+        out.append({
+            "name": c.get("name"),
+            "role": c.get("role"),
+            "motivation": c.get("motivation"),
+            "persona": persona,
+            "source": persona.get("来源") or "",
+        })
+    return {"items": out, "has_bible": bool(bible)}
+
+
+@router.post("/{project_id}/style-narrative/personas")
+def save_persona(
+    project_id: int, body: PersonaSaveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存**用户写的**角色个性（只动 persona，不碰 name/role/motivation）。
+
+    落库后标 `来源=user` ⇒ 之后的「从正文反推」不会覆盖它。
+    """
+    from app.generation.persona import save_persona as _save
+
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    saved = _save(db, proj, body.name, body.persona or {})
+    if not saved:
+        raise HTTPException(status_code=404, detail="角色不存在，或没有可保存的内容")
+    return {"ok": True, "name": body.name, "persona": saved}
+
+
+@router.post("/{project_id}/style-narrative/personas/complete")
+def complete_persona(
+    project_id: int, body: PersonaCompleteRequest, db: Session = Depends(get_db)
+) -> dict:
+    """AI 帮着完善角色个性 —— **只返回建议，不落库**。
+
+    人写的内容优先：模型被要求只能在用户已写的内容**后面**补充，不得推翻；
+    要不要采纳由用户在界面上点。采纳时调 `POST .../style-narrative/personas` 落库。
+    """
+    from app.generation.persona import complete_persona as _complete
+    from app.llm.provider import get_llm_provider
+
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    bible = proj.plot_bible
+    if isinstance(bible, str):
+        try:
+            import json as _json
+
+            bible = _json.loads(bible)
+        except Exception:  # noqa: BLE001
+            bible = {}
+    if not isinstance(bible, dict):
+        bible = {}
+    character = None
+    for c in (bible.get("characters") or []):
+        if isinstance(c, dict) and str(c.get("name") or "") == str(body.name or ""):
+            character = c
+            break
+    if character is None:
+        raise HTTPException(status_code=404, detail="角色不存在")
+    provider = get_llm_provider()
+    result = _complete(provider, character, body.persona or {}, body.note or "")
+    if not result:
+        return {"ok": False, "note": "没能给出建议（模型不可用或限流）—— 你写的内容不受影响"}
+    return {"ok": True, "name": body.name, **result}
+
 @router.get("/{project_id}/style-narrative/conflicts")
 def style_narrative_conflicts(project_id: int, db: Session = Depends(get_db)) -> dict:
     """查这个项目的文风档案里有没有「禁用词与正文自相矛盾」（**只读**）。
@@ -747,9 +864,54 @@ def get_project(project_id: int, db: Session = Depends(get_db)) -> Project:
     return proj
 
 
+def _build_reference_graphs_bg(project_id: int, novel_ids: list[int]) -> None:
+    """后台给参考语料建图（零 LLM 规则抽取，幂等；**失败只记日志**）。
+
+    为什么要提前建：`project_narrative` 开头会同步补建这张图，
+   实测 1177 章的语料要 **48.2 秒**（纯 CPU、不调模型），而它只服务
+   「参考书角色」相关的产物 —— 也就是说用户在「准备参考语料」上白等 50 秒。
+    代价：这一步要在用户选完语料时就付掉（后台付），而不是在点「开始蒸馏」时。
+
+    口径不变：每本语料在每个项目下**各自成图**（source=f"novel:{id}"，不混）。
+    """
+    import logging
+
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        from sqlalchemy import func, select
+
+        from app.kg.build import build_graph
+        from app.models import KgNode
+
+        for nid in novel_ids:
+            try:
+                existing = db.scalar(
+                    select(func.count()).select_from(KgNode).where(
+                        KgNode.project_id == project_id,
+                        KgNode.type == "character",
+                        KgNode.source == f"novel:{nid}",
+                    )
+                )
+                if existing:
+                    continue
+                built = build_graph(db, project_id, novel_id=nid)
+                logging.getLogger(__name__).info(
+                    "后台建参考图谱：项目 %s 语料 %s → %s 个角色",
+                    project_id, nid, built.get("characters"))
+            except Exception as exc:  # noqa: BLE001 —— 建图失败不阻断任何主流程
+                logging.getLogger(__name__).warning(
+                    "后台建参考图谱失败（项目 %s 语料 %s）: %s", project_id, nid, exc)
+    finally:
+        db.close()
+
+
 @router.patch("/{project_id}", response_model=ProjectOut)
 def patch_project(
-    project_id: int, body: ProjectPatch, db: Session = Depends(get_db)
+    project_id: int, body: ProjectPatch,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
 ) -> Project:
     """分步更新项目字段（向导每步调一次）。
 
@@ -786,10 +948,18 @@ def patch_project(
     if "outline" in updates and updates["outline"] != proj.outline:
         proj.plot_timeline = None
         updates["status"] = "needs_planning"
+    # 参考语料变了 ⇒ 后台把它们的图谱建起来（零 LLM、幂等）。
+    # 建图只服务「参考书角色」相关产物，跟蒸馏结果无关，不该压在蒸馏的关键路径上：
+    # 实测 1177 章要 48.2 秒，用户在「准备参考语料」上白等。
+    _ids_before = set(getattr(proj, "reference_novel_ids", None) or [])
     for field, value in updates.items():
         setattr(proj, field, value)
     db.commit()
     db.refresh(proj)
+    _ids_after = set(proj.reference_novel_ids or [])
+    _new_ids = sorted(int(i) for i in (_ids_after - _ids_before))
+    if _new_ids:
+        background_tasks.add_task(_build_reference_graphs_bg, int(proj.id), _new_ids)
     return proj
 
 
