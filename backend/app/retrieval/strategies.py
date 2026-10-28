@@ -34,6 +34,7 @@ _CHAR_MIN_SCORE = 0.0
 
 def retrieve_for_character(
     db, novel_id: int, character_name: str, k: int = 6,
+    max_chapter: int | None = None,
 ) -> list[dict]:
     """角色定向检索：这个角色**自己出现过**的原文片段。
 
@@ -64,11 +65,11 @@ def retrieve_for_character(
     if not name:
         return []
 
-    chunks = db.scalars(
-        select(NovelChunk)
-        .where(NovelChunk.novel_id == novel_id)
-        .order_by(NovelChunk.chapter_no, NovelChunk.idx)
-    ).all()
+    q = select(NovelChunk).where(NovelChunk.novel_id == novel_id)
+    if max_chapter is not None:
+        # 「故事进行到第几章」的边界：只看那之前的章（防剧透）
+        q = q.where(NovelChunk.chapter_no <= max_chapter)
+    chunks = db.scalars(q.order_by(NovelChunk.chapter_no, NovelChunk.idx)).all()
     if not chunks:
         return []
 
@@ -223,6 +224,7 @@ def render_retrieval_blocks(hits: list[dict]) -> list[tuple[str, str]]:
 
 def retrieve_for_character_auto(
     db, project, novel_ids: list[int] | None, character_name: str, k: int = 6,
+    cutoffs: dict[int, int] | None = None,
 ) -> list[dict]:
     """角色检索：自动判断这个角色该查哪个库。
 
@@ -265,17 +267,26 @@ def retrieve_for_character_auto(
         return []
 
     # 1) 参考语料里有没有这个人
+    #    「边界内」有没有（边界后面出现的人在边界内算没出现）
+    cutoffs = cutoffs or {}
     n_ref = 0
     for nid in (novel_ids or []):
+        limit = cutoffs.get(nid)
+        if limit is None:
+            continue          # 无边界 ⇒ 整本挡掉（fail closed）
         n_ref += db.scalar(
             select(func.count()).select_from(NovelChunk)
-            .where(NovelChunk.novel_id == nid, NovelChunk.text.contains(name))
+            .where(NovelChunk.novel_id == nid, NovelChunk.text.contains(name),
+                   NovelChunk.chapter_no <= limit)
         ) or 0
 
     if n_ref > 0:
         out: list[dict] = []
         for nid in (novel_ids or []):
-            for h in retrieve_for_character(db, nid, name, k=k):
+            limit = cutoffs.get(nid)
+            if limit is None:
+                continue
+            for h in retrieve_for_character(db, nid, name, k=k, max_chapter=limit):
                 h["source"] = "reference"
                 out.append(h)
             if len(out) >= k:

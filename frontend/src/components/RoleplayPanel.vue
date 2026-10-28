@@ -310,6 +310,9 @@ function pickCharacter(c: string) {
       >
         <div class="rp-q">问：{{ m.question }}</div>
         <div class="rp-a">答：{{ m.answer }}</div>
+        <p v-if="!m.sources.length" class="rp-note rp-noev">
+          他在这个时间点还不知道这件事 —— 把「故事进行到第几章」往后调，他才知道得更多。
+        </p>
         <details v-if="m.sources.length" class="rp-src">
           <summary>他依据的原文（{{ m.sources.length }} 段）</summary>
           <div v-for="(s, i) in m.sources" :key="i" class="rp-src-item">
@@ -388,6 +391,10 @@ function pickCharacter(c: string) {
 .rp-note {
   font-size: var(--fs-sm);
   margin-top: 4px;
+}
+.rp-noev {
+  color: var(--fg-faint);
+  font-size: var(--fs-xs);
 }
 .rp-msg {
   padding: 10px 12px;

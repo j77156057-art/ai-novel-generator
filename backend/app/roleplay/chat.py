@@ -104,6 +104,10 @@ SYSTEM_TEMPLATE = """你现在扮演《{book_title}》里的{character}。
 - 标「只是被提到」的，**只是文里写到了他，不代表他在场、也不代表他知道这件事** ——
   别拿它当自己的记忆。
 
+【你知道到哪一章为止】
+你只知道**到这一章为止**发生的事。后面章节的事你压根不知道，
+别提到、别暗示、别猜 —— 用户还没读到。
+
 【规矩】
 1. **只说你知道的事。** 你不知道的，直说不知道 —— 不要编。
    编出来的细节比「不知道」更像谎话。
@@ -146,6 +150,34 @@ def build_user(question: str, evidence_block: str) -> str:
         parts.append(evidence_block)
     parts.append("【对方问你】\n" + (question or "").strip())
     return "\n\n".join(parts)
+
+
+#: 零证据时的兜底回答（**服务端给，不调模型**）。
+#:
+#: 为什么不让模型自己答：实测（2026-10-28）边界=第 1 章、证据 0 段时，
+#: 模型仍答出「认得。他曾在我门下听学…」—— 那是它**训练里的世界知识**，
+#: 不是书里这一章的证据。产品承诺是「他只知道自己经历过的事」，
+#: 零证据时唯一安全的回答就是「不知道」。
+NO_EVIDENCE_ANSWER = (
+    "……这我倒说不上来。\n"
+    "（他在这个时间点还没有相关经历 —— 把「故事进行到第几章」往后调，他才知道得更多。）"
+)
+
+
+def _project_cutoffs(project, novel_ids: list[int]) -> dict[int, int]:
+    """项目里用户设的「故事进行到第几章」边界。
+
+    返回 {novel_id: 第几章}；**没有边界的书不在这里——整本挡掉**（fail closed）。
+    """
+    out: dict[int, int] = {}
+    wanted = set(novel_ids or [])
+    for item in (getattr(project, "reference_cutoffs", None) or []):
+        if not isinstance(item, dict):
+            continue
+        nid, ch = item.get("novel_id"), item.get("chapter")
+        if type(nid) is int and type(ch) is int and ch >= 1 and nid in wanted:
+            out[nid] = ch
+    return out
 
 
 #: 没配模型时给用户看的话（不是角色的回答，是环境状态）。
@@ -202,7 +234,11 @@ def run_chat(
         novel_ids = list(getattr(project, "reference_novel_ids", None) or [])
     novel_ids = list(novel_ids)
 
-    sources = gather_evidence(db, project, novel_ids, name, k=k)
+    # 「故事进行到第几章」的边界（防剧透）——
+    # 项目的 reference_cutoffs 是唯一来源；没有边界的书整本挡掉。
+    cutoffs = _project_cutoffs(project, novel_ids)
+
+    sources = gather_evidence(db, project, novel_ids, name, k=k, cutoffs=cutoffs)
     evidence_block = render_evidence_block(sources)
 
     # —— 他经历过的事（机械层，零模型调用）——
@@ -214,7 +250,8 @@ def run_chat(
         _nids = list(novel_ids or [])
         _tl: list[dict] = []
         for _nid in _nids:
-            _tl = character_timeline(db, _nid, name)
+            # 同一条边界：时间线挑的是「他在场的事」，越界也是剧透
+            _tl = character_timeline(db, _nid, name, max_chapter=cutoffs.get(_nid))
             if _tl:
                 break
         timeline_block = render_timeline(_tl)
@@ -236,6 +273,22 @@ def run_chat(
         timeline_block=timeline_block,
     )
     user = build_user(question, evidence_block)
+
+    # —— 零证据 ⇒ 服务端兜底，不让模型编 ——
+    #
+    # 实测（2026-10-28）：边界=第 1 章时证据 0 段，模型仍答出
+    # 「认得。他曾在我门下听学…」—— 那是它**训练里的世界知识**，
+    # 不是书里这一章的证据。产品承诺是「他只知道自己经历过的事」，
+    # 所以零证据时**不调模型**，直接给一句「不知道」。
+    if not sources:
+        return {
+            "character": name,
+            "question": question,
+            "answer": NO_EVIDENCE_ANSWER,
+            "sources": [],
+            "elapsed": 0.0,
+            "has_evidence": False,
+        }
 
     if provider is None:
         # 用**写手**通道,不用助理通道 ——

@@ -101,6 +101,7 @@ def character_timeline(
     character: str,
     *,
     max_chapters: int = DEFAULT_MAX_CHAPTERS,
+    max_chapter: int | None = None,
 ) -> list[dict]:
     """按章挑出这个角色**在场**的事件句。
 
@@ -111,12 +112,11 @@ def character_timeline(
     name = (character or "").strip()
     if not name:
         return []
-    rows = (
-        db.query(NovelChunk)
-        .filter(NovelChunk.novel_id == novel_id)
-        .order_by(NovelChunk.chapter_no, NovelChunk.idx)
-        .all()
-    )
+    q = db.query(NovelChunk).filter(NovelChunk.novel_id == novel_id)
+    if max_chapter is not None:
+        # 「故事进行到第几章」的边界：时间线也不能越界（防剧透）
+        q = q.filter(NovelChunk.chapter_no <= max_chapter)
+    rows = q.order_by(NovelChunk.chapter_no, NovelChunk.idx).all()
     by_chapter: dict[int, list[str]] = {}
     for r in rows:
         ch = int(r.chapter_no or 0)

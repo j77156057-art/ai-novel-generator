@@ -229,13 +229,24 @@ def gather_evidence(
     character: str,
     *,
     k: int = 6,
+    cutoffs: dict[int, int] | None = None,
 ) -> list[RoleplaySource]:
     """取这个角色**自己出场/说过**的原文片段，每条带来源标注。
 
     检索用 BM25 按角色名 + 子串硬约束（`retrieve_for_character`）：
     中文人名当关键词比向量准 —— 实测向量检索会把 8 万字的最长章排到第一。
+
+    ## 「故事进行到第几章」的边界（fail closed）
+
+    `cutoffs` = {novel_id: 第几章}（来自项目的 `reference_cutoffs`）：
+
+    - 有边界 ⇒ 只检索那之前的章（**防剧透**）；
+    - 没有边界 ⇒ 整本挡掉（与界面上写的「没有边界就等于整本不可见」一致）。
+
+    实测（2026-10-28）：项目 #1 填了「第 1 章」，而证据来自第 290/791/981 章
+    ⇒ 角色知道了用户还没读到的剧情。
     """
-    from app.retrieval.strategies import retrieve_for_character
+    from app.retrieval.strategies import retrieve_for_character_auto
 
     name = (character or "").strip()
     if not name:
@@ -245,30 +256,35 @@ def gather_evidence(
 
     out: list[RoleplaySource] = []
     seen_chunks: set[int] = set()
-    for nid in novel_ids or []:
-        try:
-            hits = retrieve_for_character(db, nid, name, k=k)
-        except Exception:  # noqa: BLE001 —— 单本失败不阻断其余
+    # 一质走「参考语料 / 用户自己写的正文」分流：
+    # 边界只约束**参考语料那一侧**（用户自己写的正文不受影响）。
+    try:
+        hits = retrieve_for_character_auto(db, project, novel_ids, name, k=k, cutoffs=cutoffs or {})
+    except Exception:  # noqa: BLE001 —— 取不到证据不阻断对话
+        hits = []
+    for h in hits:
+        cid = h.get("chunk_id")
+        if cid is not None and cid in seen_chunks:
             continue
-        for h in hits:
-            cid = h.get("chunk_id")
-            if cid in seen_chunks:
-                continue
+        if cid is not None:
             seen_chunks.add(cid)
-            text = h.get("text") or ""
-            origin, basis = classify_origin(text, name)
-            out.append(RoleplaySource(
-                chunk_id=cid,
-                chapter_no=h.get("chapter_no"),
-                idx=h.get("idx"),
-                text=text,
-                origin=origin,
-                basis=basis,
-                score=float(h.get("score") or 0.0),
-                known_facts=list(facts),
-                character=name,
-            ))
+        text = h.get("text") or ""
+        origin, basis = classify_origin(text, name)
+        out.append(RoleplaySource(
+            chunk_id=cid,
+            chapter_no=h.get("chapter_no"),
+            idx=h.get("idx"),
+            text=text,
+            origin=origin,
+            basis=basis,
+            score=float(h.get("score") or 0.0),
+            known_facts=list(facts),
+            character=name,
+        ))
     return out
+
+
+
 
 
 #: 引号里的内容（中文小说里的台词）。
