@@ -44,7 +44,12 @@ jobs:
         # 所以在仓库根跑 `pytest tests/` 就行。
         # 缺外部语料/验收库的那几条会 **skip**（不是失败）——
         # 那是「本机没有前置条件」，不是「这条用例不存在」。
-        run: python -m pytest tests/ -q
+        #
+        # ⚠️ **这里不要再加 `-q`**：pytest.ini 的 `addopts` 里已经有 `-q`，
+        # 命令行再加一个 ⇒ 变成 `-qq` ⇒ **结尾的汇总行被静默吞掉**
+        # （CI 日志里只剩一串点和 SKIPPED 列表，看不到「1549 passed ... in 123s」）。
+        # 这条命令与 README「跑测试」那一节**保持一致**。
+        run: python -m pytest tests/
 
   frontend:
     name: frontend · test + build

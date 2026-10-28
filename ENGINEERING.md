@@ -14,7 +14,7 @@ AI 小说生成器（后端 `backend/` FastAPI + 前端 `frontend/`）。
 
 ## 硬规矩
 
-1. **改策略类代码（清洗 / 检测 / 阈值 / 判定口径）后必须跑全量** `python -m pytest tests/ -q`。
+1. **改策略类代码（清洗 / 检测 / 阈值 / 判定口径）后必须跑全量** `python -m pytest tests/`。
    仓库自带的定向回归脚本 ≠ 全量测试，既有契约常在定向脚本覆盖不到的文件里。
 2. **全量测试当前全绿**（1,300 项）。曾经长期红的 8 项已在 2026-10-26 清零，
    教训有三条，比那 8 项本身更值钱：
@@ -40,7 +40,7 @@ AI 小说生成器（后端 `backend/` FastAPI + 前端 `frontend/`）。
 ## 常用命令
 
 ```bash
-python -m pytest tests/ -q                 # 全量（改动后必跑）
+python -m pytest tests/                     # 全量（改动后必跑）
 python -m pytest tests/ -m "not slow"      # 跳过真实语料上的重型回归
 ```
 
@@ -1619,7 +1619,7 @@ pip 会退回源码编译，然后要本机有 `pg_config`（PostgreSQL 开发�
 
     git archive HEAD | tar -x -C <干净目录>     # 导出**已发布**的那棵树
     python -m venv .venv && .venv/Scripts/python -m pip install -r backend/requirements.txt
-    .venv/Scripts/python -m pytest tests/ -q
+    .venv/Scripts/python -m pytest tests/
     .venv/Scripts/python -m uvicorn app.main:app --port 8899   # 打真实 HTTP
     cd frontend && npm ci && npm run build
 
@@ -2856,7 +2856,7 @@ tree_stats = rebuild_summary_tree(db, project, provider)
 CI 跑的就是 README「跑测试」那一节写的命令：
 
 - 后端：Python 3.13 → `pip install -r backend/requirements.txt -r backend/requirements-dev.txt`
-  → `python -m pytest tests/ -q`（`pytest.ini` 已设 `pythonpath = backend`、`testpaths = tests`）；
+  → `python -m pytest tests/`（`pytest.ini` 已设 `pythonpath = backend`、`testpaths = tests`）；
 - 前端：Node 24 → `npm ci` → `npm test` → `npm run build`
   （`package.json` 的 `build` 本身就是 `vue-tsc --noEmit && vite build`，类型检查**含在里面**）。
 
@@ -2961,12 +2961,16 @@ SQLite 连接 ⇒ `os.remove` 被 `except OSError` 吞掉、`rmtree` 靠
 
 ⇒ 「本机绿 + CI 红」这个组合，现在是**本机绿 ⇒ CI 绿**。
 
-### 一条读日志的坑：CI 日志里**看不到**结尾那行汇总
+### 一条读日志的坑：CI 日志里**看不到**结尾那行汇总 —— 已修（2026-10-28）
 
 `gh run view --log` 取回来的后端 job 日志，最后一行
 「N passed, M skipped in …」**不在里面**（只剩下短摘要里的 SKIPPED 条目）。
 所以**判「过没过」只能看退出码**，不能看日志里有没有 "passed" ——
 被截断的日志会让人误判成「没跑」。
+
+> ⚠️ 上面这段是**当时的判断**，后来查清楚了：**不是日志被截断**，
+> 根因是**命令多带了一个 `-q`**（2026-10-28 修，详见下面那节）。
+> 教训：遇到「日志里少一行」先查**命令本身**，别先怪输出通道。
 
 条数则不信日志，信两样东西：仓库自己的守门测试（README 写的数 == 实际收集到的数）
 与本地逐文件求和。CI 的职责是把「代码在另一个平台上能不能过」这件事答清楚。
@@ -3386,4 +3390,66 @@ cache_control），所以把名单放进 system **零缓存代价**。
 - **不给抽取 prompt 加硬性条数上限**：那等于让模型为了凑数而丢真线索。
 - **重抽仍会长一点**（实测 +3 条/轮）：模型判断「是不是同一件事」本来就有误差。
   没做语义合并是**有意的取舍**，不是没看见。
+
+## CI 日志的结尾汇总行：不是被截断，是命令多带了一个 `-q`（2026-10-28）
+
+### 先取证，别先归因
+
+前一轮记的是「CI 日志里看不到结尾那行汇总 ⇒ 只能看退出码 ⇒ 怀疑日志被截断」。
+这一轮**把 CI 的真实日志拉下来**看（`/repos/{owner}/{repo}/actions/jobs/{id}/logs`）：
+
+```
+… SKIPPED [1] tests/test_watermark_detection.py:63: 本机无《焚天录》原文
+Post job cleanup.
+```
+
+日志里 `"passed"` **一次都没出现**（用 `grep` 数的，不是印象）。
+
+⇒ **不是截断**：那条汇总行**根本没被打印出来**。
+
+### 根因：`-q` 叠成了 `-qq`
+
+`pytest.ini` 的 `addopts` 里**已经有** `-q`：
+
+```ini
+addopts = -ra -q
+```
+
+而 CI 跑的是 `python -m pytest tests/ -q` ⇒ 命令行的 `-q` 与 addopts 的叠加
+⇒ 实际是 **`-qq`** ⇒ pytest **静默吞掉结尾的汇总行**。
+
+本机对照（同一个测试文件）：
+
+| 命令 | 输出结尾 |
+|---|---|
+| `pytest tests/test_x.py -q`（= `-qq`） | `............... [100%]` —— **没有汇总行** |
+| `pytest tests/test_x.py`（沿用 addopts 的 `-q`） | `15 passed in 0.12s` ✓ |
+
+### 改了三处
+
+1. **CI**：`.github/workflows/ci.yml` 的命令去掉多余的 `-q` ⇒ `python -m pytest tests/`。
+2. **文档**：README「跑测试」那一节、`ENGINEERING.md` 的命令清单、
+   `backend/requirements-dev.txt` 的注释 —— 统一成同一条命令
+   （CI 的注释写着「跑的就是 README 那一节的命令」，两边不许分叉）。
+3. **`pytest.ini`**：在 `addopts` 旁边写清这个坑（`-q` 不能加第二个），
+   并说明**不能**把 `addopts` 里的 `-q` 删掉 ——
+   那个 `-q` 还负责 `--collect-only` 的**逐文件计数**格式
+   （`tests/test_x.py: 23`），`tests/test_readme_test_count.py` 靠它数用例
+   （删了之后 `--collect-only` 只剩 `collected N items`，
+   与那条守门测试的正则对不上 ⇒ 守门测试自己先炸）。
+
+### 加了一条机器守门
+
+`tests/test_ci_pytest_command.py`（4 条）钉住：
+CI 的 pytest 命令**不许**多带 `-q`；CI 与 README 的命令**必须一致**；
+`pytest.ini` 的 `addopts` 里**必须**留着 `-q`。
+⇒ 以后谁改回 `pytest tests/ -q`，这条测试就红。
+
+### 教训
+
+「日志里少一行」的第一反应应该是查**命令本身**，不是怪输出通道 ——
+本轮一开始差点把「日志被截断」当成结论写进文档（那节现在加了更正说明）。
+取证的方式也值得记：CI 日志可以直接用
+`GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs` 拉**原始文本**，
+比 `gh run view --log` 更好用（后者还会再格式化一遍）。
 
