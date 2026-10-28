@@ -3445,6 +3445,18 @@ CI 的 pytest 命令**不许**多带 `-q`；CI 与 README 的命令**必须一�
 `pytest.ini` 的 `addopts` 里**必须**留着 `-q`。
 ⇒ 以后谁改回 `pytest tests/ -q`，这条测试就红。
 
+### 闭环验证：CI 日志里那行**真的出现了**
+
+改完之后拿同一套办法（拉 run `40636023925` 的 backend job **原始日志**）回看：
+
+```
+2026-10-28T05:07:58Z  1544 passed, 9 skipped, 1 warning, 2 subtests passed in 85.66s (0:01:25)
+```
+
+⇒ 汇总行回来了（改前那行**一次都没出现过**），
+而且 **1544 + 9 skip = 1553** 与 README 写的数**对得上**。
+两个 job：backend · pytest **success** / frontend · test + build **success**。
+
 ### 教训
 
 「日志里少一行」的第一反应应该是查**命令本身**，不是怪输出通道 ——
