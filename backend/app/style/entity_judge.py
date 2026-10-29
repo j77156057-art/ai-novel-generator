@@ -113,6 +113,58 @@ def _judge_batch(provider, words: list[str]) -> dict[str, str | None]:
     return out
 
 
+def judge_proper_nouns(
+    words: list[str],
+    provider,
+    *,
+    cache_path: Path | None = None,
+    batch_size: int = BATCH_SIZE,
+    log=None,
+) -> dict[str, str | None]:
+    """判定一批候选词是不是**专有名词**（纯判定，不做召回）。
+
+    与 `build_entity_table` 的第 2 步**同源**（同一提示词、同一套类别），
+    但**不做 PMI 召回** —— 召回口径由调用方决定。
+
+    为什么要单独暴露：盲评包的脱敏要按**自己的口径**召回
+    （只判「落在样本里」的候选，省判定成本），不能被建表流程的召回参数绑住。
+
+    返回 ``{词: 类别 or None}``。判定不出的词记 None（不是「不是专名」，
+    是「没判出来」）—— 调用方据此决定要不要保守处理。
+    """
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    verdicts: dict[str, str | None] = {}
+    if cache_path and cache_path.exists():
+        try:
+            verdicts = json.loads(cache_path.read_text(encoding="utf-8"))
+            _log(f"复用判定缓存 {len(verdicts)} 条")
+        except Exception:  # noqa: BLE001
+            verdicts = {}
+
+    pending = [w for w in words if w not in verdicts]
+    _log(f"待审 {len(pending)} 个（已缓存 {len(words) - len(pending)} 个）")
+
+    nb = (len(pending) + batch_size - 1) // batch_size
+    for i in range(0, len(pending), batch_size):
+        batch = pending[i:i + batch_size]
+        got = _judge_batch(provider, list(batch))
+        for w in batch:
+            # 未返回的也记 None：避免下次重复问同一个词
+            verdicts[w] = got.get(w)
+        _log(f"批 {i // batch_size + 1}/{nb} 判出专名 {sum(1 for v in got.values() if v)} 个")
+        if cache_path:
+            try:
+                cache_path.write_text(
+                    json.dumps(verdicts, ensure_ascii=False), encoding="utf-8"
+                )
+            except Exception:  # noqa: BLE001 - 缓存失败不影响主流程
+                pass
+    return {w: verdicts.get(w) for w in words}
+
+
 def build_entity_table(
     text: str,
     provider,

@@ -133,8 +133,8 @@ def test_reject_lead_in_duplicating_its_own_paragraph():
 
 def test_reject_lead_in_duplicating_context():
     """引导语不能跟上下文刚写过的动作重复。"""
-    paras = ["徐凤年揉了下鼻梁：“得看什么账。”", "“我不是来讨债。”"]
-    provider = _Provider(["徐凤年揉着鼻梁的手微微一顿。"])
+    paras = ["赵长安揉了下鼻梁：“得看什么账。”", "“我不是来讨债。”"]
+    provider = _Provider(["赵长安揉着鼻梁的手微微一顿。"])
     out, info = insert_lead_ins(paras, provider, target_ratio=0.0)
     assert info["applied"] is False
     assert "上下文" in info["rejected"][0]["reason"], info

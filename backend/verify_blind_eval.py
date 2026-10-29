@@ -100,12 +100,30 @@ def main() -> int:
     sheet_path = Path(args.sheet)
     key_path = Path(args.key)
     rows = parse_sheet(sheet_path)
-    key_items = {it["sample_id"]: it for it in
-                 json.loads(key_path.read_text(encoding="utf-8"))["items"]}
+    key_obj = json.loads(key_path.read_text(encoding="utf-8"))
+    key_items = {it["sample_id"]: it for it in key_obj["items"]}
 
     print("=" * 78)
     print("盲评判定")
     print("=" * 78)
+
+    # —— 先看这个包**是不是盲评** ——
+    # 密封文件里 `blind=false` 说明生成时检出这个包不满足盲评条件
+    # （题材/年代跨代、或脱敏痕迹密度差得出来）
+    # ⇒ 评者不看内容就能分出哪边是人写的 ⇒ **不能做统计判定**。
+    if key_obj.get("blind") is False:
+        print("⚠️ 这个包**不是盲评包**（密封文件里 blind=false）。")
+        for reason in (key_obj.get("blind_reasons") or []):
+            print(f"   · {reason}")
+        ev = (key_obj.get("evidence") or {})
+        if ev.get("era_profiles"):
+            print(f"   年代标记密度：{ev['era_profiles']}")
+        if ev.get("mask_density"):
+            print(f"   脱敏痕迹密度：{ev['mask_density']}")
+        print("   ⇒ **不出统计结论**。要出结论，得用**同题材的人类语料**重出包。")
+        print(f"   （人类语料来源：{key_obj.get('human_corpus')}）")
+        return 2
+
     if not rows:
         print("作答表里没有可用的行（sample 列要形如 s01）")
         return 1

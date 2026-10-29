@@ -74,10 +74,13 @@ from acceptance_lib import (  # noqa: E402
     PLOT_BIBLE,
     SEED_CHARS,
     baseline_corpus_spec,
+    blind_verdict,
     corpus_texts,
     grams,
     human_baseline,
     jaccard,
+    mask_density,
+    mask_side,
     metaphor_per100,
     pctl,
     sent_cv,
@@ -477,31 +480,104 @@ def sample_positions(n_segments: int) -> list[int]:
 
 
 def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir: Path,
-                       n_snips: int = 6, chars: int = 400) -> dict:
+                       provider=None, n_snips: int = 6, chars: int = 400) -> dict:
+    """生成盲评包。
+
+    ⚠️ **这版有四条硬约束**（2026-10-30，主人一句话点破了第一版）：
+    「光是看到主角叫啥我就知道是不是人写的了」。
+
+    1. **两侧同等脱敏**：第一版的人类样本取自一部知名小说，人物名一出来
+       就等于举牌 ⇒ 现在两侧的专名都换成**等长占位符**，
+       两侧用**同一套**召回 + 判定 + 替换流程（`acceptance_lib.mask_side`），
+       评者既认不出出处，两边的处理痕迹也一致。
+    2. **取样口径对称**：第一版我们取「段首 400 字」、人类取「随机 400 字」，
+       引号密度差 2.3 倍 —— **取样位置本身就是泄露线索**。现在两侧都随机取。
+    3. **题材/年代自检（整包级别）**：一古一今两侧，评者不看内容就能分出
+       哪边是哪边 ⇒ 那个包**不是盲评**。现在会检出这种情况，
+       把密封文件里的 `blind` 置 false ⇒ **判定脚本拒绝给统计结论**。
+    4. **脱敏痕迹密度对称**：两侧占位符密度差太远 ⇒ 数井号就能认出
+       出版物那一侧，同样判为不是盲评。
+
+    另外：**人类语料身份记在密封文件里**（不进题面），事后能追溯样本来源。
+    """
     ok_rows = [r for r in rows if not r.get("error") and r.get("text")]
     if not ok_rows:
         return {}
     positions = sample_positions(len(ok_rows))
-    ours = [(r["seg"], r["text"][:chars]) for r in ok_rows
-            if r["seg"] in positions][:n_snips]
-    if len(ours) < n_snips:
+    picked = [r for r in ok_rows if r["seg"] in positions][:n_snips]
+    if len(picked) < n_snips:
         return {}
 
-    # 人类片段：从同题材语料里随机切 400 字（避开开头结尾的残句）
-    pool = []
-    for _name, text in corpus:
-        if len(text) < chars * 3:
+    # —— 取样：两侧都用**随机位置**，口径一致（段首 vs 随机本身就是线索）——
+    rng = random.Random()
+    ours: list[str] = []
+    for r in picked:
+        t = r["text"]
+        if len(t) <= chars:
+            ours.append(t)
             continue
-        pool.append(text)
+        st = rng.randrange(0, len(t) - chars)
+        ours.append(t[st:st + chars].replace("\n", ""))
+
+    pool = [text for _name, text in corpus if len(text) >= chars * 3]
     human: list[str] = []
     if pool:
-        rng = random.Random()
         for _ in range(n_snips):
             src = rng.choice(pool)
             start = rng.randrange(0, max(1, len(src) - chars))
-            human.append(src[start:start + chars].replace("\n", "").strip())
+            human.append(src[start:start + chars].replace("\n", ""))
     else:
         human = ["（没有语料可取人类片段）"] * n_snips
+
+    # —— 两侧同等脱敏（同一套流程：召回 → LLM 判定 → 残片剔除 → 等长占位符）——
+    ours_anon, ours_masked = ours, []
+    human_anon, human_masked = human, []
+    mask_fail: list[str] = []
+    if provider is None:
+        mask_fail.append("没有 provider（判定专名要用模型）")
+    else:
+        try:
+            ours_anon, ours_masked = mask_side(
+                ours, "\n".join(r["text"] for r in ok_rows), provider,
+                cache_path=out_dir / "blind_names_ours.json",
+                log=lambda m: print(f"     [我们侧脱敏] {m}"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ 我们侧脱敏失败（{exc}）⇒ 两侧痕迹不对称，包不作数")
+            mask_fail.append(f"我们侧脱敏失败（{exc}）")
+        try:
+            human_anon, human_masked = mask_side(
+                human, "\n".join(t for _n, t in corpus), provider,
+                cache_path=out_dir / "blind_names_human.json",
+                log=lambda m: print(f"     [人类侧脱敏] {m}"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ 人类侧脱敏失败（{exc}）⇒ 两侧痕迹不对称，包不作数")
+            mask_fail.append(f"人类侧脱敏失败（{exc}）")
+
+    if ours_masked:
+        print(f"  我们侧遮掉 {len(ours_masked)} 个专名：{ours_masked[:12]}")
+    if human_masked:
+        print(f"  人类侧遮掉 {len(human_masked)} 个专名：{human_masked[:12]}")
+
+    # —— 自检：题材/年代 + 脱敏痕迹密度（**整包级别**）——
+    dens_ours = mask_density("\n".join(ours_anon))
+    dens_human = mask_density("\n".join(human_anon))
+    verdict = blind_verdict("\n".join(ours_anon), "\n".join(human_anon),
+                            dens_ours, dens_human,
+                            ours_full="\n".join(r["text"] for r in ok_rows),
+                            human_full="\n".join(t for _n, t in corpus))
+    blind = verdict["blind"]
+    # ⚠️ 脱敏没跑成 ⇒ 题面里留着**没脱敏的原文**（专名直接暴露出处）。
+    #    这种包绝不能被判成盲评 —— 哪怕年代与密度都看不出来。
+    if mask_fail:
+        verdict["reasons"] = list(verdict["reasons"]) + [
+            "脱敏没跑成，题面里留着没脱敏的原文：" + "；".join(mask_fail)]
+        verdict["blind"] = False
+        blind = False
+    if not blind:
+        print("  ⚠️ 自检：这个包**不是盲评包**")
+        for reason in verdict["reasons"]:
+            print(f"     · {reason}")
+        print("     ⇒ 题面会写明这一点，判定脚本也会拒绝给统计结论。")
 
     # 随机化：每一对用抛硬币决定谁是 A
     rng = random.Random()
@@ -513,23 +589,53 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
         slot_b = "ours" if flip else "human"
         items.append({"id": f"s{i + 1:02d}", "A": slot_a, "B": slot_b})
         key.append({"sample_id": f"s{i + 1:02d}", "slot_A": slot_a, "slot_B": slot_b,
-                    "our_segment_no": ours[i][0]})
+                    "our_segment_no": picked[i]["seg"]})
     order = list(range(n_snips))
     rng.shuffle(order)
 
-    lines = ["# 盲评题面（**只有 A/B，没有标签**）", "",
-             f"每题两段各约 {chars} 字，一段来自本项目的产出，一段来自人类作品。",
-             "请只凭文本判断，不要猜来源。四题**二选一**，不许「差不多」。", ""]
+    lines = ["# 盲评题面（**只有 A/B，没有标签**）", ""]
+    if not blind:
+        lines += [
+            "> ⚠️ **本包不是盲评包**：两侧文本不满足盲评条件"
+            "（见下）。",
+            "> 评者不看内容就能分出哪边是哪边 ⇒ **不能用它做统计判定**。",
+            "> 它的用途是**上界对照**：请只当「我们这段与出版物的差距」来读。",
+            ">",
+        ]
+        for reason in verdict["reasons"]:
+            lines.append(f"> - {reason}")
+        lines.append("")
+    else:
+        lines += [
+            f"每题两段各约 {chars} 字，一段来自本项目的产出，一段来自人类作品。",
+            "**两侧的专名都已替换成等长占位符（＃＃）** —— 处理痕迹两边一样。",
+            "请只凭文本判断，不要猜来源。**二选一**，不许「差不多」。", "",
+        ]
     for n, idx in enumerate(order, 1):
-        a_text = ours[idx][1] if items[idx]["A"] == "ours" else human[idx]
-        b_text = ours[idx][1] if items[idx]["B"] == "ours" else human[idx]
+        a_text = ours_anon[idx] if items[idx]["A"] == "ours" else human_anon[idx]
+        b_text = ours_anon[idx] if items[idx]["B"] == "ours" else human_anon[idx]
         lines += [f"## 第 {n} 题（{items[idx]['id']}）", "", "**A**", "", "> " + a_text.replace("\n", "\n> "), "",
                   "**B**", "", "> " + b_text.replace("\n", "\n> "), ""]
-    (out_dir / "blind_samples.md").write_text("\n".join(lines), encoding="utf-8")
 
     (out_dir / "blind_key.json").write_text(
-        json.dumps({"note": "密封文件：谁是我们生成的。不要和题面一起给评者。",
+        json.dumps({"note": "密封文件：谁是我们生成的、人类语料是谁、两侧是否同题材。"
+                             "不要和题面一起给评者。",
+                    "blind": blind,
+                    "blind_reasons": verdict["reasons"],
+                    "evidence": verdict["evidence"],
+                    "masked_names": {"ours": ours_masked, "human": human_masked},
+                    "human_corpus": [name for name, _t in corpus],
                     "items": key}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 脱敏没跑成 ⇒ 题面里留着**没脱敏的原文**（专名直接暴露出处）
+    # ⇒ **不发题面**，只留密封文件作追溯用。
+    if mask_fail:
+        print("  ⛔ 脱敏没跑成 ⇒ **不出题面**（blind_samples.md / blind_sheet.md 不生成）")
+        return {"positions": [r["seg"] for r in picked], "n": n_snips, "blind": False,
+                "reasons": verdict["reasons"], "emitted": False,
+                "mask_density": {"ours": dens_ours, "human": dens_human}}
+
+    (out_dir / "blind_samples.md").write_text("\n".join(lines), encoding="utf-8")
 
     sheet = ["# 盲评记录表", "",
              "| sample | 更像人写 | 主线更清 | 有 AI 腔 | 猜 AI | 备注 |",
@@ -540,7 +646,9 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
               "- 评者人数 = ____（题面每份独立作答，互不通气）",
               "- 判定 n = 评者人数 × 6"]
     (out_dir / "blind_sheet.md").write_text("\n".join(sheet), encoding="utf-8")
-    return {"positions": [s for s, _ in ours], "n": n_snips}
+    return {"positions": [r["seg"] for r in picked], "n": n_snips, "blind": blind,
+            "reasons": verdict["reasons"], "emitted": True,
+            "mask_density": {"ours": dens_ours, "human": dens_human}}
 
 
 # --------------------------------------------------------------------------- #
@@ -619,11 +727,18 @@ def main() -> int:
                 baseline_corpus_spec()) else []
         except Exception:  # noqa: BLE001
             corpus = []
-        info = build_blind_packet(rows, corpus, out_dir)
+        info = build_blind_packet(rows, corpus, out_dir, provider=provider)
         if info:
-            print(f"  已生成：blind_samples.md（题面）/ blind_key.json（密封）/ blind_sheet.md（记录表）")
             print(f"  取样段：{info['positions']}")
-            print("  ⚠️ 题面给评者时**不要**同时给 blind_key.json")
+            print(f"  脱敏痕迹密度（井号/百字）：我们 {info['mask_density']['ours']:.2f} / "
+                  f"人类 {info['mask_density']['human']:.2f}")
+            print(f"  自检：{'是盲评包' if info['blind'] else '**不是盲评包**'}"
+                  + ("" if info["blind"] else f" —— {info['reasons']}"))
+            if info.get("emitted") is False:
+                print("  ⛔ **没出题面**（脱敏没跑成）—— 只留了密封文件作追溯。")
+            else:
+                print("  已生成：blind_samples.md（题面）/ blind_key.json（密封）/ blind_sheet.md（记录表）")
+                print("  ⚠️ 题面给评者时**不要**同时给 blind_key.json")
         else:
             warn("盲评包没生成", "可用段落不足")
 

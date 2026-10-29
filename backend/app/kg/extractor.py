@@ -379,6 +379,141 @@ def _valid_name(w: str) -> bool:
     return all(c in _NAME_CHARS for c in w)
 
 
+#: 末字停用表：这些字**不会出现在人名的末尾**（动词/助词/连词/代词）。
+#:
+#: 用途：放宽三字名召回时（见 `_relaxed_surname_lead`），
+#: 只放宽「末字必须是人名用字」这一条，**不放宽「末字不是动词」** ——
+#: 否则「林夜说」「赵长安站」这种「名 + 动词」的切法也会被召回，
+#: 判定一旦失手，替换时就会把动词一起吃掉。
+#:
+#: 刻意**不收**「子/生/白/明/和」这类：它们能正常出现在人名末尾。
+_NAME_TAIL_STOP = set(
+    "说道问答笑喊骂吼想看听走跑跳坐站立把拿放收打抓推拉挥指按摸找"
+    "与就也才又便却只还再让被给对从向往到在是有没不了着过的来去"
+    "出开上下里中个些们你我他她它这那些么呢吧啊呀并及或但因为所以"
+)
+
+
+#: 首字停用表：这些字**不会出现在多字专名的开头**（功能词/虚词）。
+#:
+#: 用途：切出来的 n-gram 常常把前面的虚词一起吃进来 ——
+#: 「从上苍梧山下来」切出「上苍梧山」，替换时会把「上」也遮掉。
+#: 只对 **3 字以上**的候选生效（2 字专名里「向晚」「和珅」这类是合理的）。
+_NAME_LEAD_FUNC_STOP = set(
+    "上下来去在把被给让对向往到从与和及或但却就也还又便才其之而以且"
+    "这那哪每各该所因为是有无不没并则若虽因使即若既"
+)
+
+
+def _relaxed_surname_lead(w: str) -> bool:
+    """「姓首字 + 2 字」的三字人名候选 —— 放宽 `_valid_name` 的末字限制。
+
+    ## 为什么需要
+
+    `_valid_name` 对 3 字名要求**末字必须是人名用字**（`_NAME_CHARS`），
+    理由是防「林深坐 / 林夜说 / 凤姐笑」这类把动词吃进名字。
+    但这条规矩也把**末字是常用字**的真名一起挡掉了 ——
+    实测「赵长安」的「年」不在 `_NAME_CHARS` 里 ⇒ 整名召不回，
+    只召回了截断形态「赵长」（KG 抽取器的三字名截断就是这么来的）。
+
+    对**脱敏**来说，漏掉真名比多几个噪声候选严重得多：
+    漏了 ⇒ 名字留在题面里 ⇒ 盲评直接作废；
+    多了 ⇒ LLM 判定会把它判成 null（判据是「能否脱离本书语境独立成立」）。
+
+    所以这里放宽**召回**，把精度交给判定；
+    但**末字是动词/助词的一律不收**（`_NAME_TAIL_STOP`），
+    免得「名 + 动词」的切法混进来。
+    """
+    if len(w) != 3:
+        return False
+    if not all("一" <= c <= "鿿" for c in w):
+        return False
+    if w[0] not in _SURNAME_CHARS:
+        return False
+    if w[2] in _NAME_TAIL_STOP:
+        return False
+    if w in _CHAR_STOP or w in _DESC_STOP or w in _FUNC_STOP:
+        return False
+    if w in _NAME_WORD_STOP or w in _SURNAME_WORD_STOP:
+        return False
+    if w[0] in "那这哪每各该" or w[0] in _NAME_LEAD_STOP:
+        return False
+    if any(c in "的一了着过吗呢吧啊哦呀呐" for c in w):
+        return False
+    return len(set(w)) == len(w)
+
+
+def trim_cut_artifact(w: str) -> str:
+    """把切串残渣削成核心部分：「上苍梧山」→「苍梧山」。
+
+    为什么不能只是**丢掉**这个候选：丢掉就等于把真名留在题面里 ——
+    比多遮一个字严重得多。所以削掉切歪的部分，遮核心。
+    """
+    if len(w) < 3:
+        return w
+    core = w
+    while len(core) >= 3 and core[0] in _NAME_LEAD_FUNC_STOP:
+        core = core[1:]
+    while len(core) >= 3 and core[-1] in _NAME_TAIL_STOP:
+        core = core[:-1]
+    return core
+
+
+def looks_like_cut_artifact(w: str) -> bool:
+    """这个候选像是**切串的残渣**（把虚词/动词一起切进来了）吗？
+
+    用于**替换前的最后一道护栏**：召回阶段已经滤过一遍，
+    但 PMI 召回、LLM 判定都可能给出「上苍梧山」这种首字是功能词的词 ——
+    替换时它会把「上」也一起遮掉。
+
+    只对 3 字以上生效（2 字专名里「向晚」「和珅」是合理的）。
+    """
+    if len(w) < 3:
+        return False
+    return w[0] in _NAME_LEAD_FUNC_STOP or w[-1] in _NAME_TAIL_STOP
+
+
+def name_shape_candidates(text: str, sizes: tuple[int, ...] = (2, 3, 4)) -> set[str]:
+    """文本里所有**人名形状**的候选（`_valid_name` 通过的 n-gram）。
+
+    这是**纯召回**，不做判定 —— 命中的是「长得像人名」，不是「就是人名」。
+    判定（是不是专名）交给 LLM，见 `app.style.entity_judge`。
+
+    ## 为什么需要它
+
+    `app.style.entities.pmi_candidates` 按**绝对频次**召回，阈值一压（min_count=20），
+    在整本书/整批段落上很准，但**单看一个 400 字片段**就召不回名字 ——
+    片段里出现 1 次的词，频次达不到阈值（实测片段级召回 0 个）。
+    盲评脱敏恰恰是「片段级」场景：只遮片段里出现的名字。
+
+    于是两类召回互补：
+    - PMI（整本频次）⇒ 抓得住「全书高频」的主配角名（漏不掉主角）
+    - 形状候选（片段级）⇒ 抓得住「在这段里出现过一次」的次要角色名
+    两边合并再交给 LLM 判定，判定不出的当作不是专名。
+
+    3 字名额外走 `_relaxed_surname_lead`（放宽末字限制），
+    否则「赵长安」这类末字是常用字的真名会被漏掉。
+    """
+    out: set[str] = set()
+    n = len(text)
+    for i in range(n):
+        for size in sizes:
+            w = text[i:i + size]
+            if len(w) < size:
+                continue
+            # 3 字以上、末字是动词/助词的，是「名 + 动词」的切法，不是名字
+            # （「赵长安站」「林夜说」）—— 判定失手就会把动词一起吃掉。
+            if size >= 3 and w[-1] in _NAME_TAIL_STOP:
+                continue
+            # 3 字以上、首字是功能词的，是把前面的虚词一起切进来了
+            # （「从上苍梧山」切出「上苍梧山」）—— 替换时会把虚词也遮掉。
+            if size >= 3 and w[0] in _NAME_LEAD_FUNC_STOP:
+                continue
+            if _valid_name(w) or _relaxed_surname_lead(w):
+                out.add(w)
+    return out
+
+
 def _leading_name(sentence: str) -> str | None:
     """取分句首 N 字作主语候选；尾部虚字（又/便/就/也/而…）需剥除。
 

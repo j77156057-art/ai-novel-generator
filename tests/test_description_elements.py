@@ -66,7 +66,7 @@ from app.generation.description_elements import (  # noqa: E402
 def test_心理判据认得真书写法():
     """判据必须认得参考书里的心理描写（否则量出来的差距是假的）。"""
     # 这四句都来自参考书原文
-    assert count_psych("徐骁心中轻轻叹息，黄蛮儿若能稍稍聪慧一些") >= 1
+    assert count_psych("赵北山心中轻轻叹息，黄小满若能稍稍聪慧一些") >= 1
     assert count_psych("老道士闻言，笑容古怪，心中咂舌") >= 1
     assert count_psych("起先她以为是自己胆小，但越长大胆子越大") >= 1
     assert count_psych("强忍揍人的念头") >= 1

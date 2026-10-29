@@ -61,7 +61,7 @@ def test_origin_mentioned_is_not_the_same_as_present():
     origin, _ = classify_origin("程白霜缓缓抬起头，看着老夫子离去的背影。", "老夫子")
     assert origin == "只是被提到"
     # 台词里**叫到了他的名字** ⇒ 他在场
-    origin, _ = classify_origin("苏酥道：“老夫子，你快些。”", "老夫子")
+    origin, _ = classify_origin("苏禾道：“老夫子，你快些。”", "老夫子")
     assert origin == "在场听到"
     # 自己开口 ⇒ 亲历
     origin, _ = classify_origin("老夫子怒极，颤声道：“好一个丧家犬！”", "老夫子")

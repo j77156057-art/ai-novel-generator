@@ -171,7 +171,7 @@ def test_original_character_evidence_ignores_reference_cutoff():
         reference_cutoffs = [{"novel_id": 1, "chapter": 1}]
 
     provider = _Provider()
-    out = run_chat(None, _P(), "老夫子", "你认得徐凤年吗？", novel_ids=[1], k=6, provider=provider)
+    out = run_chat(None, _P(), "老夫子", "你认得赵长安吗？", novel_ids=[1], k=6, provider=provider)
     assert provider.called is False, "零证据时不该调模型"
     assert out["has_evidence"] is False
     assert out["answer"] == NO_EVIDENCE_ANSWER
