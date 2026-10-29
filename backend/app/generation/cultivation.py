@@ -282,11 +282,18 @@ def parse_route(raw: Any) -> dict:
     return out
 
 
-def plan_route(provider: Any, profile: dict, system: dict) -> dict:
+def plan_route(provider: Any, profile: dict, system: dict,
+               raise_errors: bool = False) -> dict:
     """让模型规划路线。**只返回建议，不落库。**
 
     失败返回 `{}`；`raise_errors=True` 时把渠道异常往上抛（端点要区分
     「渠道不通」和「模型没给出可用路线」）。
+
+    ⚠️ 2026-10-30 修：签名里原来**没有** `raise_errors` 这个参数，
+    而调用方（`routers/projects.py` 的路线规划端点）就是按 `raise_errors=True`
+    调的 ⇒ 每次调用都 TypeError，端点 100% 失败；
+    而函数体里那句 `if raise_errors:` 又是个未定义名 ⇒ 就算不 TypeError，
+    走到异常分支也会 NameError。docstring 承诺的语义这次才算真的兑现。
     """
     if not provider or not isinstance(profile, dict):
         return {}

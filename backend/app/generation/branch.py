@@ -32,6 +32,10 @@ from __future__ import annotations
 import json as _json
 import re as _re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover —— 只给类型检查器看，运行时不导入
+    from app.generation.timeline import PlotNode, TimelineState
 
 
 #: 两次切支线之间最少间隔段数（节流：避免连续切支线导致主线停滞）

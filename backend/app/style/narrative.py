@@ -37,10 +37,13 @@ import re
 from datetime import datetime, timezone
 
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+if TYPE_CHECKING:  # pragma: no cover —— 只给类型检查器看，运行时不导入
+    from app.models import StyleDistill
 
 #: 进度回调签名：`(阶段人话文本, 已完成数, 总数)`。
 #:
@@ -4582,7 +4585,7 @@ def find_style_distill(
     tier_key: str,
     tier_signature: str,
     content_hash: str,
-) -> "StyleDistillType | None":
+) -> "StyleDistill | None":
     """在蒸馏库里找一条**可复用**的档案（active 态，四键全中）。
 
     命中即代表「同样语料 + 同样档位 + 同样正文」曾经蒸馏过，可以直接复用，
@@ -5127,6 +5130,13 @@ def describe_narrative(
     if not rules and not forbidden:
         return ""
     forbidden = _strip_forbidden_evidence(forbidden)
+
+    # 「心理写法占比」（直陈心理为主 / 身体反应为主 / 两者并重）。
+    # ⚠️ 2026-10-30 修：这里原来直接用 `psych_ratio`，而本函数**从没取过**它
+    #   ⇒ 档案里只要有「心理描写手法」这一维，渲染就抛 NameError
+    #   （而且只在 `dim == "心理描写手法"` 时才炸 ⇒ 别的维度都测不出来）。
+    #   占比存在档案产物顶层（`psych_ratio`），见本文件 distill 返回处。
+    psych_ratio = str((profile or {}).get("psych_ratio") or "").strip()
 
     # 参考语料的人物名：角色声音词典的每条都以「名字：」开头，前缀就是人物名。
     # 这份名单不需要访问图谱，自给自足。渲染完统一把这些人名涂掉——

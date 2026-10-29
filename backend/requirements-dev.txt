@@ -9,3 +9,8 @@
 # 测试额外要 pytest，而 httpx（TestClient 的硬依赖）已经在 requirements.txt 里了。
 -r requirements.txt
 pytest==9.1.1
+# 静态查「未定义名」：真模型验收跑一次就抓到三个这一类的洞
+# （每第 10 段 NameError / 参数签名缺参 / 渲染时用了没取过的变量）——
+# 它们躲过了类型检查与单测，因为只在特定路径上才被执行到。
+# 闸门见 tests/test_undefined_names.py（只看 undefined name 一类）。
+pyflakes==4.1.0

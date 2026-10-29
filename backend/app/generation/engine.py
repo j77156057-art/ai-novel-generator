@@ -7,6 +7,7 @@
 
 import logging
 import copy
+import json
 import re
 
 from sqlalchemy import select
@@ -2849,16 +2850,37 @@ def generate_next_segment(
             novel_ids=novel_ids, style_rewrite=style_rewrite,
         )
     else:
-        raw = provider.chat(system, user, constraints=ctx["constraints"],
-                            stop_sequences=get_section_stop_sequences())
-        text = _strip_thinking(raw)
-        # 段长闸门：写完先量**汉字**数，不够就回灌让模型扩写（有界）。
-        # 原来长度只是提示里的「软希望」——实测同一段要求 3000 汉字，模型交出 1900，
-        # 系统照收不误。提示单位改成汉字之后，这道闸门才量得准。
-        text, length_report = _enforce_length(
-            provider, system, user, text, target_chars=max_chars,
-            constraints=ctx["constraints"], stop_sequences=get_section_stop_sequences(),
-            node_prompt=node_prompt)
+        # —— 空正文自愈：思考型模型偶发「预算被思考吃光 ⇒ content 为空」——
+        # 真模型验收跑实测到过：一次调用 8 秒返回空串，段长闸门回灌扩写也拿回空串，
+        # 结果**空段落照样落库**（小说多一页空白，摘要链被污染，界面看着像写了）。
+        # 这里按项目既有约定「门槛 + 回灌自愈」处理：重来一次；仍为空就**不落库**，
+        # 直接报错让人重试 —— 绝不把空白页写进用户的书。
+        text = ""
+        length_report: dict = {}
+        for attempt in range(2):
+            raw = provider.chat(system, user, constraints=ctx["constraints"],
+                                stop_sequences=get_section_stop_sequences())
+            text = _strip_thinking(raw)
+            # 段长闸门：写完先量**汉字**数，不够就回灌让模型扩写（有界）。
+            # 原来长度只是提示里的「软希望」——实测同一段要求 3000 汉字，模型交出 1900，
+            # 系统照收不误。提示单位改成汉字之后，这道闸门才量得准。
+            text, length_report = _enforce_length(
+                provider, system, user, text, target_chars=max_chars,
+                constraints=ctx["constraints"], stop_sequences=get_section_stop_sequences(),
+                node_prompt=node_prompt)
+            if text.strip():
+                break
+            logging.getLogger(__name__).warning(
+                "第 %s 段拿到空正文（reasoning 吃光预算？），重试一次", written + 1)
+        if not text.strip():
+            from fastapi import HTTPException
+            raise HTTPException(status_code=502, detail={
+                'status': 'empty_segment',
+                'message': '这一段模型没有给出正文（重试仍为空），没有写入。'
+                           '可以再点一次生成，或换个模型试试。',
+                'written_segments': written,
+                'length_report': length_report,
+            })
         pool_info = {"applied": False, "reason": "候选池关闭"}
         # 落库前的全部改文本工序（抽成独立函数：末端择优要对多份候选重复跑它）
         text, summary, chain = _run_text_chain(
@@ -2870,6 +2892,17 @@ def generate_next_segment(
     form_info = chain["form_info"]
     beat_info = chain["beat_info"]
     verbatim_info = chain["verbatim_info"]
+
+    # —— 落库前的最后一道闸：空正文**绝不进库** ——
+    # 覆盖所有路径（候选池 / 改写 / 形态校正都可能把正文清空）。
+    if not (text or "").strip():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail={
+            'status': 'empty_segment',
+            'message': '这一段模型没有给出正文，没有写入。可以再点一次生成，'
+                       '或换个模型试试。',
+            'written_segments': written,
+        })
 
     gen, segment_no = _commit_segment(db, project, text, summary)
     # 正文变了 → 上一版的整段验收**不再覆盖这一版**：义务换绑（不删除），
@@ -2920,12 +2953,15 @@ def generate_next_segment(
             from app.style import append_style_warning
             append_style_warning(db, project, segment_no, style_warning)
         except Exception:  # noqa: BLE001 —— 落库失败绝不能阻断生成主流程
-            import logging
             logging.getLogger(__name__).warning(
                 "style_warning 落库失败 (seg %s): %s", segment_no, style_warning, exc_info=True)
     # v2.1：每 AUTO_AUDIT_INTERVAL 段异步触发 audit_kg（不阻塞 generate）
     if segment_no and segment_no % AUTO_AUDIT_INTERVAL == 0:
-        _schedule_async_audit_kg(db, project_id)
+        # ⚠️ 2026-10-30 修：这里原来写的是 `project_id`，而本函数里**没有**这个名字
+        #   （只有 `project`）⇒ 每第 10 段生成必抛 NameError，
+        #   而异常发生在 commit 之后 ⇒ 段落已落库、调用方却收到 500。
+        #   离线验收跑（30 段）在第 10 段当场炸掉才把它暴露出来（docs/real-model-acceptance.md）。
+        _schedule_async_audit_kg(db, project.id)
 
     # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换（旁路观测）
     # 启发式会有假阳性（普通词组也报），调用方拿到列表后可聚合展示
@@ -2936,7 +2972,6 @@ def generate_next_segment(
     )
     unlisted = detect_unlisted_characters(text, _allowed)
     if unlisted:
-        import logging
         logging.getLogger(__name__).warning(
             "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
             len(unlisted), unlisted[:10],  # 最多打 10 个，避免日志爆
@@ -3080,6 +3115,24 @@ def generate_next_segment_stream(
             provider, system, user, text, target_chars=max_chars,
             constraints=ctx["constraints"], stop_sequences=get_section_stop_sequences(),
             node_prompt=node_prompt)
+        # —— 空正文自愈（与同步路径同一口径）——
+        # 思考型模型偶发「预算被思考吃光 ⇒ content 为空」；空段**不落库**。
+        if not text.strip():
+            logging.getLogger(__name__).warning(
+                "第 %s 段拿到空正文，重试一次", written + 1)
+            raw = provider.chat(system, user, constraints=ctx["constraints"],
+                                stop_sequences=get_section_stop_sequences())
+            text = _strip_thinking(raw)
+            text, length_report = _enforce_length(
+                provider, system, user, text, target_chars=max_chars,
+                constraints=ctx["constraints"], stop_sequences=get_section_stop_sequences(),
+                node_prompt=node_prompt)
+        if not text.strip():
+            # 流式路径用 SSE 事件报错（不抛异常）—— 前端能直接显示这句话。
+            yield {"type": "error", "status": "empty_segment",
+                   "message": "这一段模型没有给出正文，没有写入。"
+                              "可以再点一次生成，或换个模型试试。"}
+            return
         _pool_info = {"applied": False, "reason": "候选池关闭"}
         # 分块吐出去（前端按 chunk 增量渲染）
         for _i in range(0, len(text), 800):
@@ -3094,6 +3147,13 @@ def generate_next_segment_stream(
     form_info = chain["form_info"]
     beat_info = chain["beat_info"]
     verbatim_info = chain["verbatim_info"]
+
+    # —— 落库前的最后一道闸：空正文**绝不进库**（覆盖候选池路径）——
+    if not (text or "").strip():
+        yield {"type": "error", "status": "empty_segment",
+               "message": "这一段模型没有给出正文，没有写入。"
+                          "可以再点一次生成，或换个模型试试。"}
+        return
 
     gen, segment_no = _commit_segment(db, project, text, summary)
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
@@ -3124,7 +3184,6 @@ def generate_next_segment_stream(
     )
     unlisted = detect_unlisted_characters(text, _allowed)
     if unlisted:
-        import logging
         logging.getLogger(__name__).warning(
             "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
             len(unlisted), unlisted[:10],
