@@ -366,6 +366,15 @@ def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
 
     判据：status ∈ {planted, developing} 且 planned_payoff_chapter < current_chapter。
     current_chapter 缺省用 events 的最大 chapter 估算。
+
+    ## ⚠️ 回收章必须先过判据（2026-10-29）
+
+    `planned_payoff_chapter = 0`（第 0 章不存在）比任何 current_chapter 都小
+    ⇒ 直接命中「已超期」。实测老账本里这样的行有 **84 条**，
+    报出来的是「计划第 0 章回收，已超期 9 章仍未揭晓」——**纯噪音**。
+
+    ⇒ 告警前先问「这个回收章**说得通吗**」（数值不变式 + 正文证据，
+    判据见 `app/kg/foreshadow_quality.py`）。说不通的 ⇒ **当未知，不报**。
     """
     findings: list[JudgeFinding] = []
     if current_chapter is None:
@@ -374,6 +383,25 @@ def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
         current_chapter = db.scalar(
             select(func.max(KgEvent.chapter)).where(KgEvent.project_id == project_id)
         ) or 0
+    # 回收章证据：取不到正文就当没有 ⇒ 不放行任何章号（宁可不报，不报假的）。
+    _text = ""
+    try:
+        from app.kg.foreshadow_cleanup import project_written_text
+
+        _text = project_written_text(db, project_id)
+    except Exception:  # noqa: BLE001 —— 取不到证据就当没有
+        _text = ""
+
+    def _payoff_of(fs):
+        try:
+            from app.kg.foreshadow_quality import sanitize_payoff_chapter
+
+            return sanitize_payoff_chapter(
+                fs.planned_payoff_chapter, fs.planted_chapter, _text
+            )
+        except Exception:  # noqa: BLE001 —— 判不出来就当未知
+            return None
+
     for fs in db.scalars(
         select(KgForeshadow).where(
             KgForeshadow.project_id == project_id,
@@ -381,15 +409,19 @@ def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
             KgForeshadow.planned_payoff_chapter.isnot(None),
         )
     ):
-        if fs.planned_payoff_chapter < current_chapter:
-            overdue = current_chapter - fs.planned_payoff_chapter
+        payoff = _payoff_of(fs)
+        if payoff is None:
+            # 回收章说不通（`0` / 不晚于埋下章 / 正文无证据）⇒ 当未知，不报。
+            continue
+        if payoff < current_chapter:
+            overdue = current_chapter - payoff
             findings.append(JudgeFinding(
                 rule="foreshadow_expiry",
                 severity="warn",
                 entity=fs.name,
-                message=f"伏笔「{fs.name}」计划第 {fs.planned_payoff_chapter} 章回收，"
+                message=f"伏笔「{fs.name}」计划第 {payoff} 章回收，"
                         f"已超期 {overdue} 章仍未揭晓",
-                evidence=[f"planted@{fs.planted_chapter}", f"planned_payoff@{fs.planned_payoff_chapter}", f"now@{current_chapter}"],
+                evidence=[f"planted@{fs.planted_chapter}", f"planned_payoff@{payoff}", f"now@{current_chapter}"],
             ))
     return findings
 

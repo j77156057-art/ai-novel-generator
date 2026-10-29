@@ -79,7 +79,8 @@ def split_quality(texts: list[str]) -> tuple[list[str], list[str]]:
 _MIN_CHAPTER = 1
 
 
-def plausible_payoff_chapter(planned, planted=None) -> bool:
+def plausible_payoff_chapter(planned, planted=None, text=None, *,
+                             closed: bool = False) -> bool:
     """这个「计划回收章」说得通吗？
 
     判据是**与剧情无关的通用不变式**，不猜内容：
@@ -87,20 +88,50 @@ def plausible_payoff_chapter(planned, planted=None) -> bool:
     1. **章号必须 ≥ 1** —— `0` 不存在（实测 97 条 active 里 **72 条是 0**）。
     2. **回收章必须晚于埋下章** —— 同一章回收等于没埋；
        早于埋下章是不可能的。`planted` 未知时只判第 1 条。
+    3. **正文证据** —— 这个章号得**在正文里真的出现过**
+       （「第 N 章」/「第 N 节」）。挡住「数值合法但凭空来」的值。
 
-    ## 为什么非要判
+    ## `closed=True`：已收尾的行只判第 1 条
 
-    实测这 97 条里只有 **2 条**说得通；另外 **18 条恰好等于抽取提示里
-    JSON 示例的字面值 50**（`docs/journey_glm_versions_compare.json` 里能直接看到
-    模型把示例整行照抄）。这些假值会经切片进提示词，变成
-    「计划第 50 章回收」这样一条**编出来的约束** —— 比没有约束更糟。
+    `closed` = `paid_off`（已回收）/ `dropped`（已丢弃）——
+    回收章记的是**当时的计划**，是**历史记录**：
+
+    - `paid_off`：`pf == planted`（同章埋了又收）是**合法**的
+      （实测 #91 `pf=1/planted=1`、#43 `pf=4/planted=4`）⇒ 不重新裁决；
+    - `dropped`：线索被废弃、从未回收，没有「同章回收」这层语义。
+
+    ⇒ 对 `closed` 行**只判「章号 ≥ 1」**（`0` 不是章号，别的照旧留着），
+    不拿现在的正文去重新裁决历史。
+
+    ## ⚠️ 为什么**没有**「回收章不能超过已写章数」这条上界
+
+    想过加（`pf ≤ 已写段数`），量过之后**否掉了**：
+
+    `planned_payoff_chapter` 是「**计划**回收章」——作者对**将来**的规划。
+    「埋@3 → 计划第 60 章」是**合法且有用**的路线图信息（长篇里伏笔几十章后
+    才收是常态）。用「已写章数」当上界会把这条功能直接杀掉：
+    用户才写 9 章就想规划第 60 章回收，也会被判成非法。
+
+    ⇒ 上界改用**证据**判：这个章号正文里说过没有。
+    实测（发布版冒烟库 140 条）：生成正文里「第 N 章」**零命中**，
+    而参考书语料 151 处命中 ⇒ **阳性对照自证**：匹配器能命中真章号，
+    所以生成正文的零命中是**真阴性**。所有脏值（`0`/`50`/`30`/`12`）
+    在正文里都没有任何证据。
 
     >>> plausible_payoff_chapter(0, 1)
     False
     >>> plausible_payoff_chapter(1, 1)
     False
-    >>> plausible_payoff_chapter(50, 1)
+    >>> plausible_payoff_chapter(60, 1)
     True
+    >>> plausible_payoff_chapter(60, 1, text="（第一章。）")
+    False
+    >>> plausible_payoff_chapter(1, 1, text="（第一章。）")
+    True
+    >>> plausible_payoff_chapter(1, 1, closed=True)
+    True
+    >>> plausible_payoff_chapter(0, 1, closed=True)
+    False
     >>> plausible_payoff_chapter(None, 1)
     False
     """
@@ -108,15 +139,26 @@ def plausible_payoff_chapter(planned, planted=None) -> bool:
         return False
     if planned < _MIN_CHAPTER:
         return False
+    if closed:
+        # 历史记录：不拿现在的正文/埋下章去重新裁决它。
+        return True
     if isinstance(planted, int) and not isinstance(planted, bool):
         if planned <= planted:
+            return False
+    if text is not None:
+        # 正文证据：章号没在正文里出现过 ⇒ 不采信。
+        # ⚠️ `text=""`（正文取不到）与 `text=None`（不做证据判）不同：
+        # 空串 ⇒ 证据判**不放行**任何章号（宁可置空，也不让凭空来的值进账）。
+        from app.kg.chapter_evidence import payoff_chapter_in_text
+
+        if not payoff_chapter_in_text(planned, text):
             return False
     return True
 
 
-def sanitize_payoff_chapter(planned, planted=None):
+def sanitize_payoff_chapter(planned, planted=None, text=None, *, closed: bool = False):
     """说得通就返回原值，说不通返回 None（**当作未知**，不猜一个数补上）。"""
-    return planned if plausible_payoff_chapter(planned, planted) else None
+    return planned if plausible_payoff_chapter(planned, planted, text, closed=closed) else None
 
 
 # ====================================================================

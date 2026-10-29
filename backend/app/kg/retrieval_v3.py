@@ -140,9 +140,32 @@ def slice_for_prompt(
     ))
     from app.kg.foreshadow_quality import plausible_payoff_chapter
 
+    # —— 回收章过一遍判据（2026-10-29）——
+    # 老账本里有一批**编造的**回收章（实测 140 条里 108 条：`0`/`50`/`30`/`12`）。
+    # 读取层再过一遍 ⇒ **不必等存量清理**，脏值就不会进提示词/界面。
+    # 取不到正文证据时**不放行**（当未知）——宁可少一条计划，不给假计划。
+    _text = ""
+    try:
+        from app.kg.foreshadow_cleanup import project_written_text
+
+        _text = project_written_text(db, project_id)
+    except Exception:  # noqa: BLE001 —— 取不到证据就当没有（不放行）
+        _text = ""
+
+    def _payoff_of(fs):
+        """这条伏笔的回收章说得通吗？说不通 ⇒ None（当未知）。"""
+        try:
+            from app.kg.foreshadow_quality import sanitize_payoff_chapter
+
+            return sanitize_payoff_chapter(
+                fs.planned_payoff_chapter, fs.planted_chapter, _text
+            )
+        except Exception:  # noqa: BLE001 —— 判不出来就当未知
+            return None
+
     def _order(fs):
-        payoff = fs.planned_payoff_chapter
-        has_payoff = plausible_payoff_chapter(payoff, fs.planted_chapter)
+        payoff = _payoff_of(fs)
+        has_payoff = payoff is not None
         return (
             0 if has_payoff else 1,          # 有可信回收章的先列
             payoff if has_payoff else 0,     # 回收章升序（先收的先记着）
@@ -157,7 +180,8 @@ def slice_for_prompt(
             "name": fs.name,
             "status": fs.status,
             "planted_chapter": fs.planted_chapter,
-            "planned_payoff_chapter": fs.planned_payoff_chapter,
+            # 只送**说得通**的回收章（脏值当未知，不送）。
+            "planned_payoff_chapter": _payoff_of(fs),
         }
         for fs in active_all[:max_foreshadows]
     ]

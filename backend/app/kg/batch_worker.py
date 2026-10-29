@@ -529,6 +529,23 @@ def _is_suspect_foreshadow(name: str | None) -> bool:
         return False
 
 
+def _sanitize_payoff_chapter(planned, planted, text: str, *, closed: bool = False):
+    """回收章过关才返回原值，否则 None（**当作未知**）。
+
+    判据在 `app/kg/foreshadow_quality.plausible_payoff_chapter`：
+    章号 ≥ 1、晚于埋下章、**且在正文里真的出现过**。
+    `closed=True`（已回收/已丢弃）⇒ 只判「章号 ≥ 1」（历史记录不重新裁决）。
+    判不出来（异常）⇒ **不放行**（返回 None）：宁可当未知，
+    也不让一个凭空来的值进账。
+    """
+    try:
+        from app.kg.foreshadow_quality import sanitize_payoff_chapter
+
+        return sanitize_payoff_chapter(planned, planted, text, closed=closed)
+    except Exception:  # noqa: BLE001 —— 判不出来就当未知，绝不能挡住落库
+        return None
+
+
 def _nearest_existing_name(name: str, existing: list[str]) -> tuple[str, float] | None:
     """新抽出的伏笔名，是不是账上某条老名字的**近似说法**？
 
@@ -720,6 +737,12 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
     except Exception:  # noqa: BLE001 —— 取不到就当没有（只影响近似变体计数）
         existing_names = []
     seen_names: set[str] = set()
+    # —— 回收章的正文证据（2026-10-29）——
+    # 判据见 `app/kg/foreshadow_quality.plausible_payoff_chapter`：
+    # 章号 ≥ 1、晚于埋下章、**且在正文里真的出现过**。
+    # 没有证据的回收章 ⇒ 置空（当作未知），不写进账。
+    # ⚠️ 「第 N 回」**不算**章号（「第一回」= 第一次）——见 `app.kg.chapter_evidence`。
+    _batch_text = "\n".join(str(it.text or "") for it in (batch or []))
     for f in result.get("foreshadows", []):
         # —— 只留痕，不裁决（2026-10-28）——
         # 抽出来的伏笔有相当一部分其实是**台词碎片**（实测 19 条里 14 条）。
@@ -730,6 +753,22 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             stats.foreshadows_suspect += 1
             logging.getLogger(__name__).warning(
                 "伏笔疑似对话碎片（已入账、但不会进提示词约束）：%s", f.get("name"))
+        # —— 回收章过关才写（2026-10-29）——
+        # 实测老账本 140 条里 **108 条**的回收章是编的（`0`/`50`/`30`/`12`），
+        # 它们会让 judge 报出 **83 条假「伏笔超期」告警**，并在界面上显示
+        # 「计划第 50 章回收」这种假计划。⇒ 源头拦住，不再写脏值。
+        _status = f.get("status", "planted")
+        _closed = _status in ("paid_off", "dropped")
+        _payoff = _sanitize_payoff_chapter(
+            f.get("planned_payoff_chapter"),
+            f.get("planted_chapter"),
+            _batch_text,
+            closed=_closed,
+        )
+        if f.get("planned_payoff_chapter") is not None and _payoff is None:
+            stats.foreshadows_bad_payoff += 1
+            logging.getLogger(__name__).info(
+                "伏笔回收章无正文证据，置空（当未知）：%s", f.get("name"))
         fs = db.scalar(
             select(KgForeshadow).where(
                 KgForeshadow.project_id == project_id, KgForeshadow.name == name
@@ -742,9 +781,9 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             continue
         if fs is None:
             fs = KgForeshadow(project_id=project_id, name=name,
-                              status=f.get("status", "planted"),
+                              status=_status,
                               planted_chapter=f.get("planted_chapter"),
-                              planned_payoff_chapter=f.get("planned_payoff_chapter"))
+                              planned_payoff_chapter=_payoff)
             db.add(fs)
             stats.foreshadows_new += 1
             near = _nearest_existing_name(name, existing_names)
@@ -761,8 +800,11 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             _ORDER = {"planted": 0, "developing": 1, "paid_off": 2, "expired": 3, "dropped": 4}
             if _ORDER.get(f.get("status", ""), 0) > _ORDER.get(fs.status, 0):
                 fs.status = f["status"]
-            if f.get("planned_payoff_chapter"):
-                fs.planned_payoff_chapter = f["planned_payoff_chapter"]
+            # —— 复用行也只写**过关**的回收章（2026-10-29）——
+            # 无证据的值**不覆盖**老值（老值可能合法）：宁可不更新，
+            # 也不拿一个编出来的值把账上已有的计划改掉。
+            if _payoff is not None and _payoff != fs.planned_payoff_chapter:
+                fs.planned_payoff_chapter = _payoff
         seen_names.add(name)
         stats.foreshadows += 1
 

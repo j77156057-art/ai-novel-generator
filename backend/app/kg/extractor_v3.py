@@ -505,4 +505,9 @@ class ExtractionStats:
     #: 新落库中与某条老名字**高置信相似**的条数（`foreshadows_new` 的子集）。
     #: 阈值与实测依据见 `app/kg/foreshadow_quality.py`。
     foreshadows_near_variant: int = 0
+    #: 抽出来的**回收章没有正文证据**（章号在正文里从没出现过）⇒ 置空的条数。
+    #: 实测（2026-10-29，发布版冒烟库 140 条）：**108 条**的回收章是编的
+    #: （`0`/`50`/`30`/`12`），会让 judge 报出 **83 条假「伏笔超期」告警**。
+    #: 只留痕（计数 + 日志），账本里写的是置空后的值。
+    foreshadows_bad_payoff: int = 0
     errors: list = field(default_factory=list)

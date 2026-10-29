@@ -1,26 +1,38 @@
 """AI 小说生成器 · M1 数据层入口。"""
 
+import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-import logging
+# —— 日志级别（2026-10-29）——
+# 本应用**从未配置过日志** ⇒ 根 logger 停在默认的 WARNING，
+# 所有 `info` 全被吞掉。后果是启动时的三个「留痕」动作**实际无声**：
+#   蒸馏收割 / KG 批抽收割 / 伏笔脏回收章清理
+# 实测：清理真的跑了（库里 108 条脏值清了），但启动日志里**一个字都没有**
+# ⇒ 与「清理必须留痕」的纪律相悖。
+# 默认开 INFO（全仓 info 只有 20 余处，量很小）；要静默就把 LOG_LEVEL 设成 WARNING。
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
-from app.db import init_db, SessionLocal
-from app.routers import novels
-from app.routers import projects
-from app.routers import generation
-from app.routers import wizard
-from app.routers import settings as settings_router
-from app.routers import assistant as assistant_router
-from app.routers import assistant_proposals as assistant_proposals_router
-from app.routers import assistant_audit as assistant_audit_router
-from app.routers import assistant_probe as assistant_probe_router
-from app.routers import assistant_generation as assistant_generation_router
-from app.routers import assistant_clean as assistant_clean_router
-from app.routers import kg_v3 as kg_v3_router
-from app.routers import roleplay as roleplay_router
+from app.db import init_db, SessionLocal  # noqa: E402
+from app.routers import novels  # noqa: E402
+from app.routers import projects  # noqa: E402
+from app.routers import generation  # noqa: E402
+from app.routers import wizard  # noqa: E402
+from app.routers import settings as settings_router  # noqa: E402
+from app.routers import assistant as assistant_router  # noqa: E402
+from app.routers import assistant_proposals as assistant_proposals_router  # noqa: E402
+from app.routers import assistant_audit as assistant_audit_router  # noqa: E402
+from app.routers import assistant_probe as assistant_probe_router  # noqa: E402
+from app.routers import assistant_generation as assistant_generation_router  # noqa: E402
+from app.routers import assistant_clean as assistant_clean_router  # noqa: E402
+from app.routers import kg_v3 as kg_v3_router  # noqa: E402
+from app.routers import roleplay as roleplay_router  # noqa: E402
 
 
 @asynccontextmanager
@@ -63,6 +75,26 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:  # noqa: BLE001 —— 收割是增强，不是启动的前提
         logging.getLogger(__name__).warning("KG 批抽启动收割失败（已忽略）：%s", exc)
+
+    # —— 清理伏笔的**脏回收章**（2026-10-29）——
+    # 老账本里有一批**编造的**「计划回收章」（实测 140 条里 108 条：`0`/`50`/`30`/`12`）：
+    # - `pf=0` ⇒ judge 报「计划第 0 章回收，已超期 9 章」——**83 条假告警**；
+    # - `pf=50/30/12` ⇒ 界面上显示「计划第 50 章回收」这种**假计划**。
+    # 判据是**确定性**的（数值不变式 + 正文证据，零误伤），置空的方向是
+    # 「不知道」而不是「猜一个数」⇒ 可逆、零损失 ⇒ 启动时自动清 + 记条数。
+    # 放在自己的 try 里：清理失败不该拖垮启动（最坏是界面还显示旧值）。
+    try:
+        from app.kg.foreshadow_cleanup import clean_all_foreshadows
+
+        with SessionLocal() as db:
+            st = clean_all_foreshadows(db)
+        if st.get("cleaned"):
+            logging.getLogger(__name__).info(
+                "启动清理：%d 条伏笔的回收章无正文证据，已置空（保留 %d 条合法值）",
+                st["cleaned"], st["kept"],
+            )
+    except Exception as exc:  # noqa: BLE001 —— 清理是增强，不是启动的前提
+        logging.getLogger(__name__).warning("伏笔回收章启动清理失败（已忽略）：%s", exc)
     yield
 
 
