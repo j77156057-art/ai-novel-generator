@@ -1753,6 +1753,119 @@ def generate_power_system(
     return {"ok": True, "体系": systems}
 
 
+class BackgroundSaveRequest(StrictRequest):
+    """`POST /api/projects/{id}/background` 的请求体。"""
+
+    #: 作者写的背景组（可空 —— 空表示清空这一块）。
+    background: dict = {}
+
+
+class BackgroundGenerateRequest(StrictRequest):
+    """`POST /api/projects/{id}/background/generate` 的请求体。"""
+
+    #: 作者给 AI 的额外要求（可选，如「硬规则里加上灵石稀缺」）。
+    note: str = ""
+
+
+@router.get("/{project_id}/background")
+def get_background(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """取本项目的世界背景与硬规则。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.generation.background import background_of
+
+    return {"background": background_of(_ps_bible(proj))}
+
+
+@router.post("/{project_id}/background")
+def save_background(
+    project_id: int, body: BackgroundSaveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存**作者写**的世界背景与硬规则。
+
+    写进 `plot_bible["background"]`（与体系/角色卡同一条路：
+    合并进现有 bible 再整体写回 + `flag_modified` 标脏）。
+
+    传空组 ⇒ 清空这一块（提示词里那一整块会消失）。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+
+    from app.generation.background import normalize_background
+    from sqlalchemy.orm.attributes import flag_modified
+
+    bible = _ps_bible(proj)
+    normalized = normalize_background(body.background)
+    if normalized:
+        bible["background"] = normalized
+    else:
+        bible.pop("background", None)
+    proj.plot_bible = bible
+    flag_modified(proj, "plot_bible")
+    db.commit()
+    return {"ok": True, "background": normalized}
+
+
+@router.post("/{project_id}/background/generate")
+def generate_background(
+    project_id: int, body: BackgroundGenerateRequest, db: Session = Depends(get_db)
+) -> dict:
+    """AI 补一份世界背景与硬规则（**只建议，不落库**）。
+
+    纪律与体系、角色卡一致：AI 的东西要人点「采纳」才写进去。
+    老项目（合成圣经时模型没给 background）用这条补上。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    from app.generation.background import normalize_background
+    from app.generation.persona import _safe_json
+
+    bible = _ps_bible(proj)
+    premise = str(proj.premise or "")
+    synopsis = str(bible.get("synopsis") or "")
+    parts = []
+    if proj.genre or proj.style:
+        parts.append(f"类型：{proj.genre or ''}\n风格平台：{proj.style or ''}")
+    if premise:
+        parts.append(f"小说大概内容（用户写的，其中可能混有剧情走向，"
+                     f"**只从中提取世界设定，不要保留走向**）：\n{premise[:800]}")
+    if synopsis:
+        parts.append(f"故事梗概（同样只取其中的世界设定）：\n{synopsis[:600]}")
+    if body.note.strip():
+        parts.append(f"作者的额外要求：\n{body.note.strip()[:400]}")
+    if not parts:
+        return {"ok": False, "detail": "还没有可参考的信息（先填小说大概内容或故事梗概）"}
+
+    sys_p = (
+        "你是网文世界观编辑。根据给的信息，写出这个故事的「世界背景」。\n"
+        "要写的是**世界长什么样**，不是**故事往哪走**。\n"
+        "输出 JSON：\n"
+        '{"一句话世界": "这个世界的根本处境（80字内）", '
+        '"硬规则": ["世界不可违背的规则", "..."], '
+        '"势力与地点": ["名称——它是什么", "..."]}\n'
+        "硬规则给 2-5 条（世界的硬约束：什么不可能、什么有代价、什么稀缺）；"
+        "势力与地点给 2-6 个（已有或可合理存在的关键地点与势力）。\n"
+        "**禁止**写主角命运、剧情走向、结局、章节安排 —— 那些不属于背景。"
+    )
+    raw = _model_call("生成世界背景", lambda: provider.chat(sys_p, "\n\n".join(parts)))
+    parsed = _safe_json(raw)
+    normalized = normalize_background(parsed if isinstance(parsed, dict) else None)
+    # 闸门：一句话世界 + 至少一条硬规则。少了就是「这不是背景组」，
+    # 别让一个空壳子覆盖作者已经写好的内容。
+    if not normalized.get("一句话世界") or not normalized.get("硬规则"):
+        return {"ok": False,
+                "detail": "AI 回了内容但不像一组世界背景（一句话世界 + 硬规则都要有）",
+                "原文": (raw or "")[:2000]}
+    return {"ok": True, "background": normalized}
+
+
 @router.post("/{project_id}/power-system/tiers/generate")
 def generate_tiers(
     project_id: int, body: TierGenerateRequest, db: Session = Depends(get_db)

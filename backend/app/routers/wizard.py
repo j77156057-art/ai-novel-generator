@@ -279,12 +279,18 @@ def build_bible(
                 "\"relationships\": [{\"a\":角色,\"b\":角色,\"relation\":关系描述}], "
                 "\"direction\": 后续走向概述, "
                 "\"conflicts\": [冲突1, 冲突2], "
-                "\"foreshadowing\": [伏笔1, 伏笔2]}\n"
+                "\"foreshadowing\": [伏笔1, 伏笔2], "
+                "\"background\": {\"一句话世界\": 这个世界的根本处境(80字内), "
+                "\"硬规则\": [\"世界不可违背的规则1\", \"规则2\"], "
+                "\"势力与地点\": [\"名称——它是什么\"]}}\n"
                 "要求：角色名用中文；关系要具体；foreshadowing 是『暂不打烊的悬念』，不要在此兑现。\n"
                 "**每个主要角色都必须给出 persona 四项**（说话方式/行为倾向/性格底线/关键经历）："
                 "只有身份和动机的话，模型写对白时没有『这个人怎么说话』的依据，"
                 "所有角色会是一个腔调。行为倾向要给『情境→反应』而不是形容词；"
-                "性格底线要用否定式；关键经历要具体到事件。"
+                "性格底线要用否定式；关键经历要具体到事件。\n"
+                "**background 是「这个世界长什么样」，不是「故事往哪走」**："
+                "写根本处境、世界规则、已知势力与地点；"
+                "**不要**写主角命运、剧情走向、结局（那些属于 direction）。"
             )
             user_p = _genre_style_text(proj)
             if proj.premise:
@@ -343,6 +349,29 @@ def build_bible(
                         logger.info("剧情圣经：补齐 %d 个角色的写作档案", filled)
             except Exception:  # noqa: BLE001 —— 补齐失败不阻断圣经生成
                 pass
+            # —— 背景组补齐（2026-10-30）——
+            # 与 persona 补齐同一套范式：模型**可能不给** background
+            # （第一轮提示词里它是可选的），缺了就问一次，而不是让整个项目
+            # 永远没有世界背景 ⇒ 模型每段自己现编。
+            #
+            # **只对真缺的情况调**（同上，避免白白多付一次调用）。
+            # 补不上也不阻断（fail open：没有背景照样能写，只是世界观会飘）。
+            try:
+                from app.generation.background import background_of
+
+                if not background_of(bible_dict):
+                    filled_bg = _fill_missing_background(
+                        provider,
+                        premise=str(proj.premise or ""),
+                        genre=proj.genre or "",
+                        style=proj.style or "",
+                        synopsis=str(bible_dict.get("synopsis") or ""),
+                    )
+                    if filled_bg:
+                        bible_dict["background"] = filled_bg
+                        logger.info("剧情圣经：补齐世界背景组")
+            except Exception:  # noqa: BLE001 —— 补齐失败不阻断圣经生成
+                pass
             bible = PlotBibleOut.model_validate({**bible_dict, "model_participated": True, "degraded": False,
                                                 "status": "bible_draft", "error": None,
                                                 "plot_structure_note": structure_note,
@@ -388,6 +417,18 @@ def _parse_bible(raw: str) -> dict:
                 c["persona"] = normalized
             else:
                 c.pop("persona", None)
+    # —— 背景组（世界背景与硬规则）——
+    # **可选**：模型没给不算结构不合格（下面有补齐那一轮），
+    # 但**给了就归一化** —— 免得「硬规则」塞成一段 500 字散文、
+    # 或者一个 dict 直接进提示词。
+    from app.generation.background import normalize_background
+
+    if bible.get("background") is not None:
+        normalized_bg = normalize_background(bible.get("background"))
+        if normalized_bg:
+            bible["background"] = normalized_bg
+        else:
+            bible.pop("background", None)
     return bible
 
 
@@ -443,6 +484,65 @@ def _fill_missing_personas(provider: Any, bible: dict, context: str = "") -> int
         return filled
     except Exception:  # noqa: BLE001 —— 补齐失败不阻断圣经生成
         return 0
+
+
+def _fill_missing_background(
+    provider: Any,
+    *,
+    premise: str,
+    genre: str,
+    style: str,
+    synopsis: str = "",
+) -> dict:
+    """让模型补一份「世界背景与硬规则」（一次调用）。
+
+    与 `_fill_missing_personas` 同一套范式：**只建议、不落库**（返回给调用方
+    决定），失败返回空 dict（fail open —— 没有背景照样能写，只是世界观会飘）。
+
+    ## 为什么单独有一轮
+
+    圣经第一轮的提示词里 `background` 是**可选**的，模型经常不给。
+    而「这个世界是什么样」是**跨段必须一致**的东西：没有它，
+    模型每段自己现编一套（城名、规则、势力各写各的）。
+
+    ## 提示词口径
+
+    明确要求「写世界，不写走向」：走向归 direction，背景组里出现
+    「主角最终…」这类内容就是跑偏了 —— 那会让背景块变成第二个走向通道，
+    时间线模式注入它就等于把结局提前给模型（正是 node_prompt 要防的事）。
+    """
+    try:
+        from app.generation.background import normalize_background
+        from app.generation.persona import _safe_json
+
+        sys_p = (
+            "你是网文世界观编辑。根据给的信息，写出这个故事的「世界背景」。\n"
+            "要写的是**世界长什么样**，不是**故事往哪走**。\n"
+            "输出 JSON：\n"
+            '{"一句话世界": "这个世界的根本处境（80字内）", '
+            '"硬规则": ["世界不可违背的规则", "..."], '
+            '"势力与地点": ["名称——它是什么", "..."]}\n'
+            "硬规则给 2-5 条（世界的硬约束：什么不可能、什么有代价、什么稀缺）；"
+            "势力与地点给 2-6 个（已有或可合理存在的关键地点与势力）。\n"
+            "**禁止**写主角命运、剧情走向、结局、章节安排 —— 那些不属于背景。"
+        )
+        parts = []
+        if genre or style:
+            parts.append(f"类型：{genre}\n风格平台：{style}")
+        if premise:
+            parts.append(f"小说大概内容（用户写的，其中可能混有剧情走向，"
+                         f"**只从中提取世界设定，不要保留走向**）：\n{premise[:800]}")
+        if synopsis:
+            parts.append(f"故事梗概（同样只取其中的世界设定）：\n{synopsis[:600]}")
+        if not parts:
+            return {}
+        raw = provider.chat(sys_p, "\n\n".join(parts))
+        parsed = _safe_json(raw)
+        if not isinstance(parsed, dict):
+            return {}
+        return normalize_background(parsed)
+    except Exception:  # noqa: BLE001 —— 补齐失败不阻断圣经生成
+        return {}
 
 
 def _planning_failure(code: str, participated: bool, exc: Exception | None = None,

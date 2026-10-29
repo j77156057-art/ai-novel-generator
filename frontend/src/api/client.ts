@@ -70,6 +70,7 @@ import type {
   StyleNarrativeConflictsResponse,
   PersonaCompleteResponse,
   CardsBatchResponse,
+  StoryBackground,
   TierLayer,
   ScaleListResponse,
   PowerSystemResponse,
@@ -253,6 +254,29 @@ export const api = {
   listBibleRevisions: (projectId: number, limit = 20) =>
     request<{ revisions: KgBibleRevisionListItem[] }>(
       `/projects/${projectId}/bible/revisions?limit=${limit}`,
+    ),
+
+  // ---------- 世界背景与硬规则 ----------
+
+  /** 取本项目的世界背景与硬规则。 */
+  getBackground: (projectId: number) =>
+    request<{ background: StoryBackground }>(`/projects/${projectId}/background`),
+
+  /** 保存作者写的世界背景与硬规则（传空组 = 清空）。 */
+  saveBackground: (projectId: number, background: StoryBackground) =>
+    request<{ ok: boolean; background: StoryBackground }>(
+      `/projects/${projectId}/background`,
+      jsonInit("POST", { background }),
+    ),
+
+  /**
+   * AI 补一份世界背景与硬规则 —— **只返回，不落库**。
+   * 要不要采纳由人点（与体系、角色卡同一纪律）。
+   */
+  generateBackground: (projectId: number, note?: string) =>
+    request<{ ok: boolean; background?: StoryBackground; detail?: string; 原文?: string }>(
+      `/projects/${projectId}/background/generate`,
+      jsonInit("POST", { note: note ?? "" }),
     ),
 
   /**

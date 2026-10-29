@@ -12,6 +12,7 @@ import type {
   NovelOut,
   PlotBible,
   ProjectOut,
+  StoryBackground,
   StyleDistillSummary,
   StyleNarrativeConflict,
 } from "@/api/types";
@@ -104,6 +105,128 @@ const questionNote = ref<string | null>(null);
 const answers = reactive<Record<string, string>>({});
 const buildingBible = ref(false);
 const bible = ref<PlotBible | null>(null);
+
+// ===== 世界背景与硬规则（2026-10-30） =====
+//
+// 「这个世界长什么样」—— 一句话世界 / 硬规则 / 势力与地点。
+//
+// 它与剧情走向严格分开：走向（梗概、后续走向）在时间线模式下会被剔掉
+// （避免第一段就奔结局），而世界设定**不会**被剔 —— 它不含走向，
+// 而且跨段必须一致。少了它，模型每段自己现编一套世界观。
+//
+// 规矩与体系、角色卡一致：AI 只给建议，采纳要人点保存。
+const bgOpen = ref(false);
+const bgBusy = ref(false);
+const bgMsg = ref<string | null>(null);
+const bgErr = ref<string | null>(null);
+/** 生成失败时模型回的内容 —— 让人能自己判断是模型写歪了还是格式没认出来。 */
+const bgRaw = ref<string | null>(null);
+const bgForm = reactive({
+  一句话世界: "",
+  硬规则: [] as string[],
+  势力与地点: [] as string[],
+});
+const bgNote = ref("");
+/** AI 补全的建议（还没进表单，等人点「填入」）。 */
+const bgSuggest = ref<StoryBackground | null>(null);
+
+/** 把背景组灌进编辑表单（打开面板时调用）。 */
+function fillBgForm(bg: StoryBackground | null | undefined) {
+  bgForm.一句话世界 = bg?.一句话世界 || "";
+  bgForm.硬规则 = [...(bg?.硬规则 || [])];
+  bgForm.势力与地点 = [...(bg?.势力与地点 || [])];
+}
+
+function openBgPanel() {
+  bgOpen.value = !bgOpen.value;
+  if (bgOpen.value) {
+    fillBgForm(bible.value?.background);
+    bgMsg.value = null;
+    bgErr.value = null;
+    bgRaw.value = null;
+    bgSuggest.value = null;
+  }
+}
+
+/** 当前项目里的背景组（展示用）。 */
+const bgData = computed<StoryBackground>(() => bible.value?.background || {});
+
+/** 背景组有没有内容（决定要不要显示这一块）。 */
+const bgHasContent = computed(() => {
+  const b = bgData.value;
+  return Boolean(
+    (b.一句话世界 && b.一句话世界.trim()) ||
+      (b.硬规则 && b.硬规则.length) ||
+      (b.势力与地点 && b.势力与地点.length),
+  );
+});
+
+/** 从当前表单收集一份背景组（空项丢掉）。 */
+function collectBg(): StoryBackground {
+  const out: StoryBackground = {};
+  const summary = bgForm.一句话世界.trim();
+  if (summary) out.一句话世界 = summary;
+  const rules = bgForm.硬规则.map((x) => x.trim()).filter(Boolean);
+  if (rules.length) out.硬规则 = rules;
+  const factions = bgForm.势力与地点.map((x) => x.trim()).filter(Boolean);
+  if (factions.length) out.势力与地点 = factions;
+  return out;
+}
+
+async function saveBg() {
+  if (!project.value) return;
+  bgBusy.value = true;
+  bgErr.value = null;
+  bgMsg.value = null;
+  try {
+    const payload = collectBg();
+    const r = await api.saveBackground(project.value.id, payload);
+    // 后端返回的是归一化后的结果 —— 用它覆盖本地（作者写的和后端归一后的可能有出入）。
+    bible.value = { ...(bible.value || {}), background: r.background || null };
+    if (project.value) {
+      project.value = { ...project.value, plot_bible: bible.value as PlotBible };
+    }
+    fillBgForm(r.background);
+    bgMsg.value = Object.keys(r.background || {}).length
+      ? "世界背景已保存 —— 之后每段正文都会带上它"
+      : "已清空世界背景";
+  } catch (e: any) {
+    bgErr.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    bgBusy.value = false;
+  }
+}
+
+async function askAiBg() {
+  if (!project.value) return;
+  bgBusy.value = true;
+  bgErr.value = null;
+  bgMsg.value = null;
+  bgRaw.value = null;
+  bgSuggest.value = null;
+  try {
+    const r = await api.generateBackground(project.value.id, bgNote.value);
+    if (!r.ok) {
+      bgErr.value = r.detail || "AI 没给出可用的世界背景";
+      bgRaw.value = r.原文 || null;
+      return;
+    }
+    bgSuggest.value = r.background || null;
+    bgMsg.value = "AI 给了一份 —— 点「填入」看看合不合适";
+  } catch (e: any) {
+    bgErr.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    bgBusy.value = false;
+  }
+}
+
+/** 把 AI 的建议填进表单（还没落库，要人再点保存）。 */
+function applyBgSuggest() {
+  if (!bgSuggest.value) return;
+  fillBgForm(bgSuggest.value);
+  bgSuggest.value = null;
+  bgMsg.value = "已填入 —— 检查一下再保存";
+}
 
 // ===== 角色卡：身份/能力（武器·功法·能力）/声纹/关系（2026-10-29） =====
 //
@@ -2760,6 +2883,98 @@ onUnmounted(stopDistillPolling);
         <span class="k">伏笔</span>
         <span class="v"><span v-for="f in bible.foreshadowing" :key="f" class="tag">{{ f }}</span></span>
       </div>
+
+      <!-- ===== 世界背景与硬规则（2026-10-30）===== -->
+      <div class="bible-row">
+        <span class="k">世界</span>
+        <span class="v">
+          <span v-if="bgHasContent">
+            <span v-if="bgData.一句话世界" class="prose">{{ bgData.一句话世界 }}</span>
+            <span v-if="bgData.硬规则?.length" class="row tight" style="gap: 6px; margin-top: 4px">
+              <span v-for="(r, i) in bgData.硬规则" :key="i" class="tag info">{{ r }}</span>
+            </span>
+            <span v-if="bgData.势力与地点?.length" class="row tight" style="gap: 6px; margin-top: 4px">
+              <span v-for="(f, i) in bgData.势力与地点" :key="i" class="tag">{{ f }}</span>
+            </span>
+          </span>
+          <span v-else class="faint">还没写 —— 模型会自己现编一套世界观</span>
+        </span>
+      </div>
+
+      <div class="row tight" style="gap: 8px; margin-top: 8px">
+        <button class="link-btn" @click="openBgPanel">
+          {{ bgOpen ? "收起世界背景" : "写世界背景与硬规则" }}
+        </button>
+      </div>
+
+      <div v-if="bgOpen" class="persona-panel" style="margin-top: 8px">
+        <div v-if="bgErr" class="notice err">{{ bgErr }}</div>
+        <div v-else-if="bgMsg" class="notice info">{{ bgMsg }}</div>
+
+        <details v-if="bgRaw" class="faint" style="font-size: var(--fs-xs); margin-top: 6px">
+          <summary>看模型回的内容</summary>
+          <pre
+            style="white-space: pre-wrap; word-break: break-word; margin-top: 6px;
+                   max-height: 320px; overflow: auto"
+          >{{ bgRaw }}</pre>
+        </details>
+
+        <div class="field" style="margin-top: 10px">
+          <label>一句话世界</label>
+          <textarea
+            class="input"
+            rows="2"
+            v-model="bgForm.一句话世界"
+            placeholder="例：末法时代灵气枯竭，修行靠残存矿脉活着"
+          ></textarea>
+        </div>
+
+        <div class="field">
+          <label>硬规则（世界不可违背的约束）</label>
+          <div v-for="(_, i) in bgForm.硬规则" :key="i" class="row tight" style="gap: 6px; margin-bottom: 4px">
+            <input
+              class="input"
+              v-model="bgForm.硬规则[i]"
+              :placeholder="`例：灵力只在夜间可用`"
+              style="flex: 1"
+            />
+            <button class="link-btn" @click="bgForm.硬规则.splice(i, 1)">删除</button>
+          </div>
+          <button class="link-btn" @click="bgForm.硬规则.push('')">+ 加一条</button>
+        </div>
+
+        <div class="field">
+          <label>势力与地点</label>
+          <div v-for="(_, i) in bgForm.势力与地点" :key="i" class="row tight" style="gap: 6px; margin-bottom: 4px">
+            <input
+              class="input"
+              v-model="bgForm.势力与地点[i]"
+              :placeholder="`例：矿盟——三家联合垄断残存矿脉`"
+              style="flex: 1"
+            />
+            <button class="link-btn" @click="bgForm.势力与地点.splice(i, 1)">删除</button>
+          </div>
+          <button class="link-btn" @click="bgForm.势力与地点.push('')">+ 加一条</button>
+        </div>
+
+        <div class="field">
+          <label>给 AI 的补充要求（可选）</label>
+          <input class="input" v-model="bgNote" placeholder="例：硬规则里补上「灵石稀缺」" />
+        </div>
+
+        <div v-if="bgSuggest" class="notice info" style="margin-bottom: 8px">
+          AI 给了一份：
+          <button class="link-btn" @click="applyBgSuggest">填入</button>
+        </div>
+
+        <div class="row" style="gap: 8px; margin-top: 4px">
+          <button class="btn" :disabled="bgBusy" @click="askAiBg">
+            {{ bgBusy ? "AI 正在写…" : "AI 帮我补全" }}
+          </button>
+          <button class="btn primary" :disabled="bgBusy" @click="saveBg">保存</button>
+        </div>
+      </div>
+
       <div v-if="bible.note" class="notice warn" style="margin-top: 12px">{{ bible.note }}</div>
     </div>
 

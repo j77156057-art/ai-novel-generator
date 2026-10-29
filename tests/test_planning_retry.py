@@ -20,7 +20,12 @@ BIBLE = {'synopsis': '雨夜查旧档', 'direction': '揭穿旧案',
                                      '行为倾向': ['被追问时→先翻原件再回答'],
                                      '性格底线': ['不会替人担责'],
                                      '关键经历': ['三年前经手过同一批档案']}}],
-         'relationships': [], 'conflicts': [], 'foreshadowing': []}
+         'relationships': [], 'conflicts': [], 'foreshadowing': [],
+         # 世界背景（2026-10-30 新增）：同理给齐 —— 缺了会触发「补齐背景组」
+         # 那一次额外调用，把「重试次数」这类断言带偏。
+         'background': {'一句话世界': '旧城雨夜，靠档案与旧物追查真相',
+                        '硬规则': ['真相只存在于原始记录里'],
+                        '势力与地点': ['修复局——负责旧物修复与归档']}}
 NODES = [{'title': f'核对{i}', 'premise': '记录矛盾', 'motivation': '澄清责任',
           'action': '核对原件', 'result': '确定差错', 'cost': 'NA', 'time': '03:00',
           'location': '档案室', 'participants': ['沈砚'],

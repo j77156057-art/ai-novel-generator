@@ -615,6 +615,20 @@ def build_user_prompt(
             tlines.append(f"后续项（严禁提前写进本节）：第 {cur_idx + 2} 项：{nxt}")
         outline_target = "\n".join(tlines)
 
+    # —— 世界背景（作者手写：这个世界是什么样）——
+    # **时间线模式也注入**（与下面 plot_bible 的处理相反）。
+    #
+    # 为什么单独拎出来：plot_bible 里 synopsis/direction 讲的是「故事往哪走」，
+    # 走向必须剔（否则第一段就奔结局）；而「这个世界是什么样」**不含走向**，
+    # 剔掉它只会让模型每段自己现编一套（城名、规则、势力各写各的）。
+    # 两者混在同一个 plot_bible 里一起剔，是「世界观前后不一致」的根因。
+    #
+    # 背景组里没有走向 ⇒ 注入它不会破坏节点粒度。
+    # 没写背景 ⇒ **整块不输出**（空块是负面暗示：等于告诉模型「这个世界没有设定」）。
+    from app.generation.background import render_background
+
+    background_text = render_background(plot_bible.get("background") if isinstance(plot_bible, dict) else None)
+
     # —— 动态剧情指引（来自剧情圣经，随构思更新；不污染静态系统层）——
     # 时间线模式（传了 node_prompt）下，**剔除整个 plot_bible**——它里边的
     # synopsis/direction/relationships/foreshadowing/conflicts 任意一项都可能
@@ -624,6 +638,9 @@ def build_user_prompt(
     # plot_bible 在时间线模式下的价值由 §7.3 节点规划阶段吸收——不需要再
     # 在生成 prompt 里二次注入。
     # 保留理由（向后兼容）：非时间线模式仍按原逻辑注所有 plot_bible 字段。
+    #
+    # 注意：**世界背景不在此列**（上面已单独渲染）——它是「世界长什么样」，
+    # 不是「故事往哪走」。剔除规则因此只针对走向，不针对背景。
     bible_lines: list[str] = []
     if plot_bible and not node_prompt:
         synopsis = plot_bible.get("synopsis")
@@ -737,6 +754,19 @@ def build_user_prompt(
         "【前情提要】",
         prior,
         "",
+    ]
+    # —— 世界背景放在「剧情圣经·动态指引」**之前** ——
+    # 顺序有理由：背景是**恒定设定**（这一段和后面每一段都一样），
+    # 动态指引是**会变的**（伏笔继续埋、冲突升级）。
+    # 先恒定后变化，模型读到最后时记忆里最靠前的是背景 ⇒ 不容易随剧情漂移。
+    # 没有背景组 ⇒ 整块不出现（不留空标题）。
+    if background_text:
+        blocks += [
+            "【世界背景（作者设定，全书一致，不得与之矛盾）】",
+            background_text,
+            "",
+        ]
+    blocks += [
         "【剧情圣经·动态指引】",
         bible_block,
     ]
@@ -745,6 +775,18 @@ def build_user_prompt(
     # premise：用户给的故事大概，**时间线模式下剔除**（同 plot_bible 一样
     # 携带整条故事走向，与 node_prompt 职责重复）。非时间线模式保留作
     # "基调锚点"。
+    #
+    # —— 剔除规则的精确口径（2026-10-30）——
+    # 剔的是 premise 里的**走向部分**，不是它的全部内容。
+    # premise 是用户写的自由文本，世界设定与剧情走向**混在一起**
+    # （"末法时代灵气枯竭，主角在矿盟废墟上拜师" —— 前半句是背景，
+    # 后半句是走向）。整块剔掉 ⇒ 连背景一起丢，模型只好自己现编世界观。
+    #
+    # **不在提示词层做句子级切分**（脆弱、静默丢内容）：
+    # 拆分改在**合成剧情圣经**时做一次——模型额外产出 `background`
+    # （世界设定，走 background 通道），premise 留在走向通道。
+    # 于是这里剔 premise = 剔它的走向部分，而世界设定从 background 通道进。
+    # 老项目（没 background）可用「AI 帮我补全」从 premise 抽一份补上。
     if premise and not node_prompt:
         blocks += ["", "【小说大概内容（用户给定，作为基调锚点）】", premise]
     # v2.276：空检索上下文时**整块不输出**。

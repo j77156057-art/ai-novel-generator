@@ -158,6 +158,12 @@ class PlotBibleOut(BaseModel):
     # 剧情结构参考 + 照搬检测：学结构可以，抄具体情节不行（机制级校验，不是提示层约束）。
     plot_structure_note: Optional[str] = None
     structure_copy_check: Optional[dict] = None
+    # 世界背景与硬规则（作者手写）：一句话世界 / 硬规则 / 势力与地点。
+    #
+    # **必须显式声明**（2026-10-30）：PlotBibleOut 走 pydantic，
+    # 未声明的字段会被 model_dump() **静默丢弃** —— 模型给了 background
+    # 也会在落库前消失，而且不报错（与 StrictRequest 那条同源的坑）。
+    background: Optional[dict] = None
 
 
 class PremiseProposalOut(BaseModel):

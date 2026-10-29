@@ -197,7 +197,24 @@ export interface PlotBible {
   conflicts?: string[];
   foreshadowing?: string[];
   note?: string | null;
+  /** 世界背景与硬规则（2026-10-30 新增）：作者手写的「这个世界长什么样」。 */
+  background?: StoryBackground | null;
   [key: string]: unknown;  // 实际是 free-form dict；脚本/runtime 扩展字段自由
+}
+
+/**
+ * 世界背景与硬规则 —— 作者手写的那块「这个世界是什么样」。
+ *
+ * 与剧情走向（synopsis/direction）严格分开：走向在时间线模式下会被剔掉
+ * （避免第一段就奔结局），而世界设定不会 —— 它不含走向，且跨段必须一致。
+ */
+export interface StoryBackground {
+  /** 一句话世界：根本处境。 */
+  一句话世界?: string;
+  /** 硬规则：世界不可违背的约束。 */
+  硬规则?: string[];
+  /** 势力与地点：已知的关键势力与地点。 */
+  势力与地点?: string[];
 }
 
 // ============================================================
