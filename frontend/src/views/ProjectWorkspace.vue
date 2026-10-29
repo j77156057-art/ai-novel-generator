@@ -597,6 +597,7 @@ function openScaleEdit(c: any) {
   scAi.value = null;
   scAiMsg.value = null;
   pwErr.value = null;
+  pwMsg.value = null;
 }
 
 function closeScaleEdit() {
@@ -667,6 +668,8 @@ async function openCultivation(c: any) {
   cultNote.value = "";
   cultAi.value = null;
   cultAiMsg.value = null;
+  pwErr.value = null;
+  pwMsg.value = null;
   cultOpen.value = true;
 }
 
@@ -3315,6 +3318,7 @@ onUnmounted(stopDistillPolling);
           {{ scAiMsg }}
           <button v-if="scAi" class="link-btn" @click="applyScaleAi">填入</button>
         </div>
+        <div v-if="pwErr" class="notice err" style="margin-bottom: 8px">{{ pwErr }}</div>
         <div class="row" style="gap: 8px">
           <button class="btn" :disabled="pwBusy" @click="askAiScale">
             {{ pwBusy ? "AI 正在想…" : "AI 帮我定" }}
@@ -3779,6 +3783,7 @@ onUnmounted(stopDistillPolling);
           {{ cultAiMsg }}
           <button v-if="cultAi" class="link-btn" @click="applyCultivationAi">填入空缺</button>
         </div>
+        <div v-if="pwErr" class="notice err" style="margin-bottom: 8px">{{ pwErr }}</div>
         <div class="row" style="gap: 8px">
           <button class="btn" :disabled="pwBusy" @click="planCultivationRoute">
             {{ pwBusy ? "AI 正在规划…" : "AI 规划路线" }}

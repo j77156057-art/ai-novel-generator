@@ -316,7 +316,7 @@ npm test               # = node --test tests/*.test.ts && vitest run
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/                  # 1,737 项用例（+ 9 项需外部语料/验收库才跳）
+python -m pytest tests/                  # 1,751 项用例（+ 9 项需外部语料/验收库才跳）
 ```
 
 > 结尾会有一行 `1616 passed, 9 skipped in ...` —— **别再给这条命令加 `-q`**：
@@ -382,9 +382,9 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **1,737** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `tests/` | **1,751** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：9 个纯逻辑文件（43 项，`node --test`）+ 3 个组件级文件（27 项，vitest + jsdom） |
-| `docs/` | 64 份设计文档与指南：架构怎么定的、判据为什么这么定 |
+| `docs/` | 69 份设计文档与指南：架构怎么定的、判据为什么这么定 |
 | `ENGINEERING.md` | 工程纪律：每一条规矩背后都是一次真实踩坑 |
 | `data/seed/` | 语料**投放区**（空目录 + 投放说明） |
 
@@ -439,7 +439,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   **在 Linux 上绿**（不是只有本机绿）。
   第一次跑就红过一次，抓到的是本机**看不见**的缺陷（测试子进程把父进程的 SQLite
   文件删了 —— Windows 删不掉打开中的文件，所以本机全绿）：详见 `ENGINEERING.md`。
-- **规模** —— 后端 **1,737** 项测试(`pytest tests`)，前端 9 个纯逻辑测试文件（43 项）
+- **规模** —— 后端 **1,751** 项测试(`pytest tests`)，前端 9 个纯逻辑测试文件（43 项）
   + 3 个组件级测试文件（27 项，vitest + jsdom）。**当前全绿**。此前长期红的 8 项已清零：7 项是断言滞后于设计变更(采样率 15%→30%、
   维度 14→16、采样加了「30 万字下限保护」)，1 项是模型清单三处不一致的真 bug;
   另有 1 处是测试自己的假 provider 少实现 `async_chat` 接口，导致计数失真

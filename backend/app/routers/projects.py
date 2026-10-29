@@ -1425,8 +1425,11 @@ def generate_character_card(
     char.setdefault("_genre", story["genre"])
     char.setdefault("_premise", story["premise"])
 
-    result = complete_card(provider, char, body.card or char.get("card") or {},
-                           body.note or "")
+    result = _model_call(
+        "补全角色卡",
+        lambda: complete_card(provider, char, body.card or char.get("card") or {},
+                              body.note or "", raise_errors=True),
+    )
     if not result:
         return {"ok": False, "detail": "AI 没给出可用结果（可重试或改写要求）"}
     return {
@@ -1460,8 +1463,12 @@ def generate_character_cards_batch(
         raise HTTPException(status_code=503, detail="LLM 渠道未配置")
 
     bible = _bible_of(proj)
-    result = generate_cards(provider, _story_of(proj), wants,
-                            already=_existing_voices(bible), note=body.note or "")
+    result = _model_call(
+        "批量生成角色卡",
+        lambda: generate_cards(provider, _story_of(proj), wants,
+                               already=_existing_voices(bible), note=body.note or "",
+                               raise_errors=True),
+    )
     return {
         "ok": bool(result.get("角色")),
         "角色": result.get("角色") or {},
@@ -1500,6 +1507,56 @@ def _provider_or_none():
         return get_llm_provider()
     except Exception:  # noqa: BLE001 —— 渠道没配只是这个端点不可用
         return None
+
+#: 渠道失败 → 给人看的话。**判断顺序有意义**：先认限流，再认鉴权，最后才认超时
+#: （「HTTP Error 429」里没有 timeout 字样，但反过来会误伤）。
+_MODEL_FAILURE_HINTS = (
+    ("429", "模型渠道限流或额度已用尽"),
+    ("too many requests", "模型渠道限流或额度已用尽"),
+    ("freeusagelimit", "模型渠道额度已用尽"),
+    ("insufficient", "模型渠道额度已用尽"),
+    ("quota", "模型渠道额度已用尽"),
+    ("401", "模型渠道鉴权失败"),
+    ("403", "模型渠道鉴权失败"),
+    ("unauthorized", "模型渠道鉴权失败"),
+    ("timed out", "模型渠道超时"),
+    ("timeout", "模型渠道超时"),
+)
+
+
+def _model_failure_detail(what: str, exc: BaseException) -> str:
+    """把渠道异常翻成一句**能照着做**的话。
+
+    界面上不放整段栈（看不懂），但也不吞掉原话 —— 原话是判断「重试还是充值」
+    的唯一线索，截到 200 字放进末尾。
+    """
+    raw = " ".join(str(exc or "").split())
+    low = raw.lower()
+    why = next((text for needle, text in _MODEL_FAILURE_HINTS if needle in low), "")
+    if not why:
+        why = "模型渠道调用失败"
+    if len(raw) > 200:
+        raw = raw[:200] + "…"
+    head = f"{what}没做成：{why}。"
+    return head + (f"渠道原话：{raw}" if raw else "")
+
+
+def _model_call(what: str, fn):
+    """跑一次模型调用；渠道异常换成 502 + 可读原因。
+
+    为什么不是 500：500 的含义是「本站写错了」，而渠道限流/超时/欠费是**外部
+    状态**，人应该看到「等会儿再试」还是「去配额度」。`what` 用**这件事的名字**
+    （如「生成修炼体系」），它直接进界面。
+    """
+    try:
+        return fn()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 渠道故障不是本站 bug，要说清原因
+        raise HTTPException(
+            status_code=502, detail=_model_failure_detail(what, exc)
+        ) from exc
+
 
 # ====================================================================
 # 修炼体系 / 档位分层 / 角色修炼档案（2026-10-29）
@@ -1647,11 +1704,12 @@ def generate_power_system(
 
     from app.generation.power_system_gen import build_system_prompt, parse_systems
 
-    raw = provider.chat(
-        "你在为一本中文小说设计**修炼体系**。",
-        build_system_prompt(body.genre or getattr(proj, "genre", "") or "",
-                            body.tone or getattr(proj, "style", "") or "",
-                            body.note or ""),
+    prompt = build_system_prompt(body.genre or getattr(proj, "genre", "") or "",
+                                 body.tone or getattr(proj, "style", "") or "",
+                                 body.note or "")
+    raw = _model_call(
+        "生成修炼体系",
+        lambda: provider.chat("你在为一本中文小说设计**修炼体系**。", prompt),
     )
     systems = parse_systems(raw)
     if not systems:
@@ -1680,8 +1738,8 @@ def generate_tiers(
     systems = systems_of(bible)
     if not systems:
         raise HTTPException(status_code=400, detail="还没有修炼体系，先建体系")
-    raw = provider.chat("你为群像设计档位分层。",
-                        build_tier_prompt(systems[0]) + (f"\n\n{body.note}" if body.note else ""))
+    prompt = build_tier_prompt(systems[0]) + (f"\n\n{body.note}" if body.note else "")
+    raw = _model_call("生成档位分层", lambda: provider.chat("你为群像设计档位分层。", prompt))
     tiers = filter_tiers_by_bands(parse_tiers(raw), systems[0])
     if not tiers:
         return {"ok": False, "detail": "AI 没给出可用分层（可重试或改要求）"}
@@ -1755,7 +1813,10 @@ def plan_cultivation_route(
     if not profile:
         raise HTTPException(status_code=400, detail="这个角色还没有修炼档案")
 
-    route = plan_route(provider, profile, systems[0])
+    route = _model_call(
+        "规划修炼路线",
+        lambda: plan_route(provider, profile, systems[0], raise_errors=True),
+    )
     if not route:
         return {"ok": False, "detail": "AI 没给出可用路线（可重试或改要求）"}
     merged = {**profile, **route}
@@ -1870,9 +1931,9 @@ def generate_scale(
     if not char:
         raise HTTPException(status_code=404, detail="这个角色不存在")
 
-    raw = provider.chat(
-        "你在为小说角色定「量级」。",
-        build_scale_prompt(char, bible, note=body.note or ""))
+    prompt = build_scale_prompt(char, bible, note=body.note or "")
+    raw = _model_call("给角色定量级",
+                      lambda: provider.chat("你在为小说角色定「量级」。", prompt))
     scale = parse_scale(raw)
     if not scale:
         return {"ok": False, "detail": "AI 没给出可用量级（可重试或改要求）"}

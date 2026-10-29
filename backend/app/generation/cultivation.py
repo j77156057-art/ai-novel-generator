@@ -285,13 +285,16 @@ def parse_route(raw: Any) -> dict:
 def plan_route(provider: Any, profile: dict, system: dict) -> dict:
     """让模型规划路线。**只返回建议，不落库。**
 
-    失败返回 `{}`。
+    失败返回 `{}`；`raise_errors=True` 时把渠道异常往上抛（端点要区分
+    「渠道不通」和「模型没给出可用路线」）。
     """
     if not provider or not isinstance(profile, dict):
         return {}
     try:
         raw = provider.chat(build_route_prompt(profile, system), "按上述 JSON 输出。")
     except Exception:  # noqa: BLE001 —— 规划失败不该阻断任何主链
+        if raise_errors:
+            raise
         return {}
     if isinstance(raw, str):
         try:

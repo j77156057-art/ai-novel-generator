@@ -4469,3 +4469,36 @@ project 5 五个角色的平均台词长度：7.5 / 7.0 / 8.3 / 7.8 / 8.6 字
 
 ⇒ 蒸馏完要**对生成产物量密度**，与参考书同口径对比；
 只看「规则条数」「证据通过率」看不出这个问题。
+
+## 模型渠道失败时，界面上要说真话（2026-10-29 真机点出来）
+
+在浏览器里点「生成体系」，面板只回一句 `Internal Server Error`；后端栈是
+`RuntimeError: MiniMax chat 调用失败: HTTP Error 429: Too Many Requests`
+—— **渠道限流被当成了本站 500**。
+
+单测、`vue-tsc`、`npm run build`、CI 全绿都发现不了：**成功路径是通的**，
+出问题的只是「模型这次没回来」那个出口，而它从没被走过。这个项目里同类
+教训已有两次（「应用到本项目」漏 `Content-Type`、「编辑剧情圣经」少一个花括号）。
+
+### 两层根因
+
+1. **端点没有异常出口** —— 6 个「AI 生成」端点直接 `provider.chat(...)`，
+   渠道一抖就是裸 500（补全角色卡 / 批量角色卡 / 体系 / 档位分层 / 修炼路线 / 量级）。
+2. **生成器把渠道故障说成模型不听话** —— `complete_card` 的
+   `except Exception: return {}`（初衷是「完善失败不该让用户写的东西丢掉」）
+   把 429 一起吞了，端点于是回「AI 没给出可用结果（可重试或改写要求）」。
+   人会照着一直改要求，改到天荒地老也不会好。
+
+### 修法
+
+- `_model_call(what, fn)` 统一收口：渠道异常 → **502**（不是 500：500 是
+  「本站写错了」，限流/超时/欠费是**外部状态**），`what` 是这件事的名字，直接进界面；
+- `_model_failure_detail` 把报错翻成能照着做的话 + 渠道原话（截 200 字）：
+  429/Too Many Requests → 限流或额度用尽；FreeUsageLimit/insufficient/quota → 额度用尽；
+  401/403 → 鉴权失败；timeout → 超时；其它 → 调用失败；
+- 端点内部自己抛的 `HTTPException` **不被改写**（400「还没建体系」不能变 502）；
+- 三个生成器加 `raise_errors=False`（默认行为一个字不变）：端点传 `True` 才抛；
+  后台/可选路径继续吞 —— 那里的诉求确实是「别阻断主链」；
+- **结构守门测试**：`projects.py` 里任何 `provider.chat(` 都必须裹在 `_model_call(...)` 里。
+
+详见 `docs/model-failure-surface.md`；测试 `tests/test_model_call_error_surface.py`（14 项）。

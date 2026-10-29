@@ -182,10 +182,15 @@ def style_or(story: dict) -> str:
 # ------------------------------------------------------------------ #
 
 def complete_card(provider: Any, character: dict, user_card: Any = None,
-                  note: str = "") -> dict:
+                  note: str = "", raise_errors: bool = False) -> dict:
     """给**一个已存在的角色**补全档案。只返回建议，不落库。
 
     用户已经写的内容**一个字都不改**（与 `persona.complete_persona` 同一条纪律）。
+
+    Args:
+        raise_errors: 渠道异常要不要往上抛。默认 False（吞掉、返回空）——
+            「完善失败不该让用户写的东西丢掉」；用户**亲手点了按钮**的端点
+            传 True，好把「渠道 429」和「模型没给出可用结果」区分开。
     """
     if not provider:
         return {}
@@ -221,6 +226,8 @@ def complete_card(provider: Any, character: dict, user_card: Any = None,
         merged = merge_card(existing, card)
         return {"补充": merged, "说明": "已按作者写的内容补充空缺字段"}
     except Exception:  # noqa: BLE001 —— 完善失败不该让用户写的东西丢掉
+        if raise_errors:
+            raise
         return {}
 
 
@@ -274,7 +281,7 @@ def merge_card(user_card: Any, ai_card: Any) -> dict:
 
 def generate_cards(provider: Any, story: dict, wants: list[str],
                    already: dict[str, Any] | None = None,
-                   note: str = "") -> dict:
+                   note: str = "", raise_errors: bool = False) -> dict:
     """一次生成**一批**新角色的卡，彼此拉开距离。
 
     Args:
@@ -284,6 +291,8 @@ def generate_cards(provider: Any, story: dict, wants: list[str],
         already: 已有角色的声纹签名 `{名: {自称/句长/句末/语气底色/口头禅}}`，
             成批生成时用来避让（也包括本批已经出来的）。
         note: 作者额外要求。
+        raise_errors: 渠道异常要不要往上抛（默认吞掉、返回空）。端点亲手触发时
+            传 True —— 否则「渠道 429」会被说成「模型没给出可用结果」。
 
     Returns:
         `{"角色": {名: 卡}, "冲突": [...], "轮次": n}`；
@@ -316,6 +325,8 @@ def generate_cards(provider: Any, story: dict, wants: list[str],
                     n: (c.get("声纹") or {}) for n, c in cards.items()}}, note),
             )
         except Exception:  # noqa: BLE001 —— 生成失败不阻断
+            if raise_errors:
+                raise
             break
         parsed = _safe_json(raw)
         got = (parsed or {}).get("characters") or []
