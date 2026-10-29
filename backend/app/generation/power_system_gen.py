@@ -323,6 +323,31 @@ def _parse_systems_from_headings(text: str) -> list[dict]:
     return [system]
 
 
+#: 明显是**表头/说明**的词 —— 出现在境界名里说明抓错了行。
+_NOT_REALM_WORDS = ("层次", "表现", "说明", "名称", "本质", "备注", "序号", "备注栏")
+
+
+def plausible_systems(systems: list[dict]) -> bool:
+    """解析结果像不像一套体系（决定要不要重试）。
+
+    为什么要有：只判「解析不出」不够。实测有一轮解析**成功**了 ——
+    10 个境界、有档位、能渲染 —— 但那 10 个里 4 个是大阶段、6 个是子阶，
+    还混进一个表头词「层次」。这种结果会直接落库，比解析失败更危险。
+    """
+    if not systems:
+        return False
+    realms = (systems[0] or {}).get("境界") or []
+    if len(realms) < 2:
+        return False
+    for realm in realms:
+        name = str(realm.get("名称") or "").strip()
+        if not name or len(name) > 12:
+            return False
+        if any(w in name for w in _NOT_REALM_WORDS):
+            return False
+    return True
+
+
 def _realm_count(systems: list[dict]) -> int:
     """这组解析结果里第一个体系有几个境界（0 表示没有）。"""
     if not systems:
@@ -452,18 +477,34 @@ def _strip_md(s: str) -> str:
 
 
 def _table_rows(text: str) -> list[list[str]]:
-    """从文本里抽出 Markdown 表格的数据行（跳过表头与分隔行）。"""
-    rows: list[list[str]] = []
+    """抽出一张 Markdown 表格（含表头行，已跳过 `---` 分隔行）。
+
+    ⚠️ **只取一张**。实测（2026-10-29 真机第三轮）同一篇里常有好几张表：
+    四阶总表 + 修行者子阶表 + 对照表。旧实现把所有 `|` 行拼成一张 ⇒
+    第二张表的表头（「层次 / 表现」）变成了境界名，4 个大阶段和 6 个子阶
+    混成 10 境 —— **解析成功但内容全错**，比解析失败更难发现。
+
+    取**行数最多**的那张：境界阶梯表通常就是最长的那张。
+    """
+    blocks: list[list[list[str]]] = []
+    cur: list[list[str]] = []
     for line in (text or "").split("\n"):
-        line = line.strip()
-        if not line.startswith("|"):
+        s = line.strip()
+        if not s.startswith("|"):
+            if cur:
+                blocks.append(cur)
+                cur = []
             continue
-        cells = [_strip_md(c) for c in line.strip("|").split("|")]
+        cells = [_strip_md(c) for c in s.strip("|").split("|")]
         # 分隔行（全是 --- 或 :--:）
         if all(set(c) <= set("-: ") and c for c in cells):
             continue
-        rows.append(cells)
-    return rows
+        cur.append(cells)
+    if cur:
+        blocks.append(cur)
+    if not blocks:
+        return []
+    return max(blocks, key=len)
 
 
 #: 像「序号」的列（第一列常是「第N境/第N关/一/壹/1」）。

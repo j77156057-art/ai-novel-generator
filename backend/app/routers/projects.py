@@ -1702,7 +1702,9 @@ def generate_power_system(
     if provider is None:
         raise HTTPException(status_code=503, detail="LLM 渠道未配置")
 
-    from app.generation.power_system_gen import build_system_prompt, parse_systems
+    from app.generation.power_system_gen import (
+        build_system_prompt, parse_systems, plausible_systems,
+    )
 
     prompt = build_system_prompt(body.genre or getattr(proj, "genre", "") or "",
                                  body.tone or getattr(proj, "style", "") or "",
@@ -1710,7 +1712,7 @@ def generate_power_system(
     system = "你在为一本中文小说设计**修炼体系**。"
     raw = _model_call("生成修炼体系", lambda: provider.chat(system, prompt))
     systems = parse_systems(raw)
-    if not systems:
+    if not plausible_systems(systems):
         # 解析不出来 ⇒ 带一句「只输出 JSON」重试一次。
         #
         # 实测同一天三种形态：`#### 1. 开脉境` 标题 + 正文、Markdown 表格、
@@ -1725,7 +1727,7 @@ def generate_power_system(
             ),
         )
         systems = parse_systems(raw)
-    if not systems:
+    if not plausible_systems(systems):
         return {"ok": False,
                 "detail": "AI 回了内容但格式认不出（已按「只输出 JSON」重试一次）"}
     return {"ok": True, "体系": systems}

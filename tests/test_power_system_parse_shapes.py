@@ -163,6 +163,26 @@ LIST_SHAPE = """## 修炼体系：九境九重法
 """
 
 
+#: 同一篇里有**两张表**（真机第三轮：四阶总表 + 修行者子阶表）
+TWO_TABLES = """## 一、总纲：四阶不是等差
+
+| 大阶段 | 本质 | 内部层次 |
+|---|---|---|
+| 凡人 | 血肉、技艺、组织 | 常人/有艺者/近道者 |
+| 修行者 | 借天地之气 | 开脉/引气/凝罡 |
+| 圣人 | 以道统改世 | 贤者/大圣 |
+| 神明 | 权柄、祭祀 | 地祇/小神 |
+
+## 二、修行者细表
+
+| 阶 | 名 | 表现 | 战力 |
+|---|---|---|---|
+| 一 | 开脉 | 打通经脉，气力略强 | 约两个常人 |
+| 二 | 引气 | 引气入体，可短时爆发 | 可敌十数人 |
+| 三 | 凝罡 | 气成罡，能破小城 | 百人敌 |
+"""
+
+
 def test_细分型_标题加正文加小境界列表():
     systems = parse_systems(FINE)
     assert len(systems) == 1, systems
@@ -232,3 +252,29 @@ def test_正文里的长句子列表不算小境界():
         for st in (r.get("小境界") or []):
             assert any(h in st["名称"] for h in
                        ("重", "层", "期", "阶", "品", "级", "段", "第")), st
+
+
+def test_多张表只取一张_表头不会混进境界名():
+    """真机第三轮：4 个大阶段 + 6 个子阶被拼成 10 境，「层次」成了境界名。"""
+    systems = parse_systems(TWO_TABLES)
+    assert systems, "至少要解析出一套"
+    names = [r["名称"] for r in systems[0]["境界"]]
+    assert "层次" not in names, names
+    assert "表现" not in names, names
+    # 不能同时包含两张表的行（4 + 3 = 7 说明跨表合并了）
+    assert len(names) <= 4, names
+
+
+def test_结果校验拦住表头词和长句():
+    """`plausible_systems` 是重试的判据：解析成功但内容错也要拦。"""
+    from app.generation.power_system_gen import plausible_systems
+
+    assert plausible_systems([]) is False
+    assert plausible_systems([{"境界": [{"名称": "凡人"}]}]) is False, "只有一境不算体系"
+    assert plausible_systems([{"境界": [{"名称": "凡人"}, {"名称": "层次"}]}]) is False
+    assert plausible_systems(
+        [{"境界": [{"名称": "凡人"}, {"名称": "打通经脉，气力、感官略强，能夜视耐寒"}]}]
+    ) is False, "长句当境界名说明抓错列了"
+    assert plausible_systems(
+        [{"境界": [{"名称": "凡人"}, {"名称": "修行者"}, {"名称": "圣人"}]}]
+    ) is True
