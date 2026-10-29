@@ -385,10 +385,10 @@ npm test               # = node --test tests/*.test.ts && vitest run
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/                  # 1,804 项用例（+ 9 项需外部语料/验收库才跳）
+python -m pytest tests/                  # 1,817 项用例（+ 9 项需外部语料/验收库才跳）
 ```
 
-> 结尾会有一行 `1795 passed, 9 skipped in ...` —— **别再给这条命令加 `-q`**：
+> 结尾会有一行 `1809 passed, 8 skipped in ...` —— **别再给这条命令加 `-q`**：
 > `pytest.ini` 的 `addopts` 里已经有 `-q`，两个叠起来变成 `-qq`，
 > pytest 会**静默吞掉那行汇总**。CI 跑的就是这一条命令。
 
@@ -451,9 +451,9 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **1,804** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `tests/` | **1,817** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：9 个纯逻辑文件（43 项，`node --test`）+ 3 个组件级文件（27 项，vitest + jsdom） |
-| `docs/` | 72 份设计文档与指南：架构怎么定的、判据为什么这么定 |
+| `docs/` | 73 份设计文档与指南：架构怎么定的、判据为什么这么定 |
 | `ENGINEERING.md` | 工程纪律：每一条规矩背后都是一次真实踩坑 |
 | `data/seed/` | 语料**投放区**（空目录 + 投放说明） |
 
@@ -491,6 +491,19 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 - **对抗性验证** —— `tests/qa4_verify_deep_attacks.py`(深度攻击)、
   `tests/qa4_verify_proposal_write_path.py`(提案写路径)、
   `tests/qa6_assistant_browser_smoke.py`(真实浏览器端到端)。
+- **四轴验收能真跑** —— 离线跑(无模型,验闭环与记忆系统)与**真模型跑**(30 段,
+  验文风与漂移的机器侧证据)用**同一把尺、同一份种子设定**;阈值取自真实语料的分位数,
+  不是拍的。真模型跑还会产出盲评材料(题面/密封映射/记录表)与二项检验判定脚本,
+  让人评那一段也能算成判定。
+  2026-10-30 那次真跑抓到并修掉三个**单测与 CI 全绿也抓不到**的缺陷
+  (每第 10 段生成必崩 / 路线规划端点参数不匹配 / 心理维度渲染未定义名)——
+  这类洞只有真跑能逼出来,验收跑因此是定期要重跑的,不是一次性证据。
+  真跑也量出了**文风上的硬伤**:比喻密度中位 0.30/百字,而同题材人类网文
+  的 p90 只有 0.115(28/30 段超标)。但要说清这次测的是**谁的腔**:
+  那一跑的项目**没投参考语料、也没蒸馏档案** ⇒ 形态校正/文风改写/照搬闸门
+  三道工序全程没启用 ⇒ 量到的是「**没有档案时模型默认腔**」。
+  系统本来就有可执行的比喻上限带(会随档案进提示词),下一步是
+  **投语料 + 蒸馏档案后再跑一遍**,看风格迁移到底压不压得住。
 - **构建闸门** —— 前端要 `vue-tsc --noEmit` + `vite build` 都过;后端有真实 `uvicorn` HTTP 冒烟。
 - **空白机自检** —— 仓库**已发布的那棵树**(`git archive HEAD` 导到干净目录)真跑过一遍:
   新建 venv → `pip install -r backend/requirements.txt` → `pytest tests/` 全绿 →
@@ -503,7 +516,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   跑的就是 README「跑测试」那一节写的命令 —— 不给 CI 另写一套更严格的检查。
   **在 Linux 上绿,不只是本机绿** —— 流水线能在 Linux 上抓出本机看不见的缺陷
   (测试子进程删掉父进程的 SQLite 文件:Windows 删不掉打开中的文件,本机因此全绿)。
-- **规模** —— 后端 **1,804** 项测试(`pytest tests`),前端 9 个纯逻辑测试文件(43 项)
+- **规模** —— 后端 **1,817** 项测试(`pytest tests`),前端 9 个纯逻辑测试文件(43 项)
   + 3 个组件级测试文件(27 项,vitest + jsdom),**当前全绿**。
 - **文档里的数字被机器守着** —— `tests/test_readme_test_count.py`:
   README 写的用例数必须等于 `pytest` **实际收集到的**条数,且 README 里几处写法
@@ -526,6 +539,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 | **伏笔账本** | 埋点 / 回收章 / 超期告警 | 回收章必须有正文证据,编造的不入账 |
 | **助理 agent** | 28 个工具全部只读,只提卡不落库 | 非只读工具注册时硬拒;落库走人批闸门 |
 | **渠道与失败** | 多渠道模型,写手 / 辅助 / 嵌入各配各的 | 外部状态返 502 而非 500,错误说人话并显示在人看得见的地方 |
+| **四轴验收** | 离线跑验闭环与记忆,真模型跑验文风与漂移,盲评包交人评 | 同一把尺 + 同一份种子;阈值取自真实语料分位数;真跑抓到过单测抓不到的缺陷 |
 | **界面** | Vue 3 创作三板块 + 助理工作台 + 模型设置 | `vue-tsc` + `vite build` 是闸门,前端有组件级测试 |
 
 逐项细节见上面「✨ 能力 / Capabilities」一节;每项的判据与取舍写在 `docs/`,
@@ -563,3 +577,6 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   上限 60 条当安全阀、**触发了就如实写出省略了几条**。
 - **本仓库不含版权正文** —— 参考书原文与模型跑出来的验收产物被 git 忽略,
   语料只在本机投放(见 `data/seed/README-投放真实语料.md`)。
+- **默认不带浏览器 UA** —— provider 的请求头只带 Authorization 与 Content-Type。
+  指向走 Cloudflare 的 OpenAI 兼容端点(例如某些订阅通道)会被拦成 **403**,
+  错误是「Forbidden」而不是原因。自定义请求头还没做,这是已知边界。

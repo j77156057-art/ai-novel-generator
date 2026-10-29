@@ -278,8 +278,17 @@ def run_segments(segments: int, provider, out_dir: Path, resume: bool) -> tuple[
                 prev_g = set(prev.get("_grams") or [])
                 continue
             # 上一轮**失败**的那段：重跑（而不是跳过）——
-            # 失败段没有落库，故事里就缺这一段；只补不重跑会让正文断档。
-            rows = rows[:i - 1]
+            # 失败段没有落库，故事里就缺这一段。
+            #
+            # ⚠️ 只**替换这一行**，不截断后面的行：后面那些行在上一轮已经
+            #    落过库了（它们是故事的一部分），重跑一遍会让**同一段故事
+            #    在库里出现两份**（实测踩过：截断式续跑把已提交的段又生成了一遍，
+            #    库里多出重复段落，故事连续性被污染）。
+            #    重跑出来的这一段会落在故事**末尾**（段号是按提交顺序给的），
+            #    这点如实记在报告里，不假装它是「补在原位」。
+            rerun_failed = True
+        else:
+            rerun_failed = False
         t0 = time.time()
         try:
             ctx = build_context(db, proj)
@@ -330,7 +339,11 @@ def run_segments(segments: int, provider, out_dir: Path, resume: bool) -> tuple[
                 "rep": 0.0, "meta": 0.0, "cv": None, "text": "", "_grams": [],
                 "sent_findings": [],
             }
-        rows.append(row)
+        if rerun_failed and len(rows) >= i:
+            # 替换掉上一轮那条失败行（不追加 —— 追加会让同一段在报告里出现两次）
+            rows[i - 1] = row
+        else:
+            rows.append(row)
         prev_g = set(row.get("_grams") or [])
         show = f"{row['cv']:.3f}" if row.get("cv") is not None else "  —  "
         err_txt = row.get("error", "")
