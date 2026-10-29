@@ -29,9 +29,6 @@
 import argparse
 import collections
 import os
-import re
-import sqlite3
-import statistics
 import sys
 import tempfile
 
@@ -90,92 +87,36 @@ def section(title: str) -> None:
 
 # --------------------------------------------------------------------------- #
 # 指标实现（纯函数）
+#
+# 2026-10-30：指标与种子抽到 `acceptance_lib.py`，因为真模型跑
+# （`verify_acceptance_real.py`）必须与本轮用**同一把尺、同一份阈值** ——
+# 两轮的数字放在一起才有意义。指标本身逐字未改，只是搬家。
 # --------------------------------------------------------------------------- #
 
-_WS = re.compile(r"\s+")
-
-
-def _clean(text: str) -> str:
-    """去掉空白与换行：中文正文统计不该被排版空行影响。"""
-    return _WS.sub("", text or "")
-
-
-def grams(text: str, n: int = 3) -> set[str]:
-    t = _clean(text)
-    if len(t) < n:
-        return set()
-    return {t[i:i + n] for i in range(len(t) - n + 1)}
-
-
-def jaccard(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
-
-
-# 比喻是 AI 腔最稳的硬特征之一：真人写得再花，也不会每百字挂一个「像…」
-_METAPHOR = re.compile(r"(像[^，。！？；：]{1,12}|如同|宛如|仿佛|彷佛)")
-
-
-def metaphor_per100(text: str) -> float:
-    t = _clean(text)
-    if not t:
-        return 0.0
-    return 100.0 * len(_METAPHOR.findall(t)) / len(t)
-
-
-_SENT_SPLIT = re.compile(r"[。！？…]+")
-
-
-def sent_cv(text: str) -> float | None:
-    """句长变异系数：AI 腔句子长度往往过于整齐，真人散文起伏更大。
-
-    方向是「越大越像人」——所以阈值是**下界**（不得低于人类 p10）。
-    句子太少时返回 None（不参与判定），而不是硬算一个噪音值。
-    """
-    sents = [s for s in _SENT_SPLIT.split(_clean(text)) if len(s) >= 4]
-    if len(sents) < 5:
-        return None
-    m = statistics.mean(len(s) for s in sents)
-    if m <= 0:
-        return None
-    return statistics.pstdev(len(s) for s in sents) / m
-
-
-def pctl(values: list[float], q: float) -> float:
-    s = sorted(values)
-    if not s:
-        return 0.0
-    if len(s) == 1:
-        return s[0]
-    pos = q * (len(s) - 1)
-    lo = int(pos)
-    hi = min(lo + 1, len(s) - 1)
-    return s[lo] * (1 - (pos - lo)) + s[hi] * (pos - lo)
+from acceptance_lib import (  # noqa: E402
+    PLOT_BIBLE,
+    SEED_CHARS,
+    SEED_FORES,
+    SEED_REALMS,
+    _clean,
+    baseline_corpus_spec,
+    corpus_texts,
+    grams,
+    human_baseline as _human_baseline,
+    jaccard,
+    metaphor_per100,
+    pctl,
+    sent_cv,
+    thresholds as _thresholds,
+)
 
 
 # --------------------------------------------------------------------------- #
 # 种子：一个够长的短篇设定，逐段续写
+#
+# 2026-10-30：种子定义搬到 `acceptance_lib.py`（与真模型跑共用同一份设定），
+# 名字由上面的 import 带进来，这里不再重复定义。
 # --------------------------------------------------------------------------- #
-
-SEED_CHARS = [
-    {"name": "林夜", "role": "主角", "trait": "手指会发光；记不清自己是怎么倒下的"},
-    {"name": "苏晚", "role": "接线人", "trait": "冷静，话短，先给选择再给解释"},
-    {"name": "陆见微", "role": "对手", "trait": "总是笑着说话，目的不明"},
-]
-SEED_FORES = ["那道金光到底是什么", "陆见微为何认得这枚铜钥匙"]
-SEED_REALMS = ["炼气", "筑基", "金丹", "元婴"]
-
-PLOT_BIBLE = {
-    "synopsis": "林夜在巷口醒来，霓虹的余光还黏在视网膜上。他记不清自己是怎么倒下的，"
-                "只记得胸口那道凉意。他的手指正在发光，像没调好的灯管。",
-    "direction": "三卷：巷口 → 接线人 → 锚。第一卷弄清金光来历，第二卷被迫站队。",
-    "characters": SEED_CHARS,
-    "foreshadowing": SEED_FORES,
-    "conflicts": ["林夜要弄清金光的来历", "陆见微在利用他，而他还没察觉"],
-    "relationships": [{"from": "林夜", "to": "苏晚", "type": "同路人"}],
-    "realm_order": SEED_REALMS,
-}
 
 
 # --------------------------------------------------------------------------- #
@@ -183,48 +124,29 @@ PLOT_BIBLE = {
 # --------------------------------------------------------------------------- #
 
 def human_baseline(chunk_chars: int = 3000) -> dict:
-    """在三本真实网文上算同样的三个指标，作为阈值来源。
+    """在真实语料上算同样的三个指标，作为阈值来源。
 
     切法与 `verify_sentinel.py` H 段一致（3000 字一段），避免两处口径不同
     导致「基线」和「被测对象」其实不是一回事。
+
+    2026-10-30：语料来源改为可配（`ACCEPTANCE_CORPUS` 环境变量，默认开发库
+    `backend/novel_dev.db`）；实现搬到 `acceptance_lib.human_baseline`，
+    与真模型跑共用。找不到语料时返回空 dict（调用方按「基线缺失」处理）。
     """
-    con = sqlite3.connect(NOVEL_DB)
-    rows = con.execute(
-        "select novel_id, text from novel_chunks order by novel_id, chapter_no, idx"
-    ).fetchall()
-    con.close()
-
-    by_novel: dict[int, list[str]] = {}
-    for nid, t in rows:
-        by_novel.setdefault(nid, []).append(t)
-
-    reps: list[float] = []
-    metas: list[float] = []
-    cvs: list[float] = []
-    n_chars = 0
-    n_segs = 0
-    for parts in by_novel.values():
-        text = "".join(parts)
-        segs = [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)]
-        n_chars += len(text)
-        n_segs += len(segs)
-        gs = [grams(s) for s in segs]
-        reps.extend(jaccard(a, b) for a, b in zip(gs, gs[1:]))
-        for s in segs:
-            metas.append(metaphor_per100(s))
-            c = sent_cv(s)
-            if c is not None:
-                cvs.append(c)
-    return {
-        "novels": len(by_novel), "chars": n_chars, "segs": n_segs,
-        "rep": reps, "meta": metas, "cv": cvs,
-    }
+    spec = baseline_corpus_spec()
+    try:
+        texts = corpus_texts(spec)
+    except FileNotFoundError:
+        return {}
+    if not texts:
+        return {}
+    return _human_baseline(texts, chunk_chars=chunk_chars)
 
 
 def section_a(base: dict | None) -> dict | None:
     section("A. 人类散文基线（阈值的来源，不是拍出来的）")
-    if base is None:
-        print("  开发库里没有 novel_chunks，跳过基线（相关阈值改为不确定）")
+    if not base:
+        print("  没有基线语料，跳过基线（相关阈值改为不确定）")
         return None
 
     print(f"  语料：{base['novels']} 本真实网文 / {base['chars']:,} 字 / "
@@ -419,25 +341,17 @@ def section_c() -> dict:
 
     try:
         from app.kg.build import extract_from_text
-        con = sqlite3.connect(NOVEL_DB)
-        rows = con.execute(
-            "select nc.novel_id, rn.title, nc.text from novel_chunks nc "
-            "join raw_novels rn on rn.id = nc.novel_id "
-            "order by nc.novel_id, nc.chapter_no, nc.idx"
-        ).fetchall()
-        con.close()
+        texts = corpus_texts(baseline_corpus_spec())
     except Exception as exc:  # noqa: BLE001
         print(f"  跳过：{exc}")
         return {}
 
-    if not rows:
+    if not texts:
         print("  章节库为空，跳过（不作 PASS/FAIL 计）")
         return {}
 
-    first_novel = rows[0][0]
-    book = [r for r in rows if r[0] == first_novel]
-    title = book[0][1]
-    text = "".join(r[2] for r in book)
+    # 一本真实网文逐段跑抽取（第一本源语料）
+    title, text = texts[0]
     segs = [text[i:i + 3000] for i in range(0, len(text), 3000)]
 
     # 一趟抽完，同时得到「累计曲线」与「按首次出现排序的名字表」——
@@ -673,11 +587,14 @@ def main() -> int:
     print("声明：本跑验**闭环与记忆系统**，不验模型文笔 —— 后者需要真模型 + 人工盲评。")
 
     base = None
-    if os.path.exists(NOVEL_DB):
+    corpus_spec = baseline_corpus_spec()
+    if os.path.exists(corpus_spec):
         try:
             base = human_baseline()
         except Exception as exc:  # noqa: BLE001
             print(f"  基线计算失败：{exc}")
+    else:
+        print(f"  基线语料不存在（{corpus_spec}）—— 本轮不设阈值")
     thr = section_a(base)
     b = section_b(args.segments, thr)
     c = section_c()
