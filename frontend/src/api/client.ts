@@ -70,6 +70,12 @@ import type {
   StyleNarrativeConflictsResponse,
   PersonaCompleteResponse,
   CardsBatchResponse,
+  TierLayer,
+  ScaleListResponse,
+  PowerSystemResponse,
+  PowerSystemEntry,
+  PowerScale,
+  CultivationProfile,
   CharacterCard,
   CharacterCardListResponse,
   VoiceCollision,
@@ -421,6 +427,81 @@ export const api = {
       jsonInit("POST", body),
     ),
 
+
+  /**
+   * 取修炼体系与档位分层。
+   */
+  getPowerSystem: (projectId: number) =>
+    request<PowerSystemResponse>(`/projects/${projectId}/power-system`),
+
+  /**
+   * 保存修炼体系与档位分层（档位不在体系里的层会被丢掉）。
+   */
+  savePowerSystem: (projectId: number, body: { power_system: object; tiers: TierLayer[] }) =>
+    request<{ ok: boolean; power_system: object; tiers: TierLayer[] }>(
+      `/projects/${projectId}/power-system`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * AI 生成一套修炼体系 —— **只返回建议，不落库**。
+   */
+  generatePowerSystem: (projectId: number, body: { genre?: string; tone?: string; note?: string }) =>
+    request<{ ok: boolean; 体系?: PowerSystemEntry[]; detail?: string }>(
+      `/projects/${projectId}/power-system/generate`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * AI 生成档位分层（群像用）—— **只返回建议，不落库**。
+   */
+  generateTiers: (projectId: number, body: { note?: string }) =>
+    request<{ ok: boolean; 档位层?: TierLayer[]; detail?: string }>(
+      `/projects/${projectId}/power-system/tiers/generate`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * 保存角色的修炼档案。
+   */
+  saveCultivation: (projectId: number, body: { name: string; profile: CultivationProfile }) =>
+    request<{ ok: boolean; name: string }>(
+      `/projects/${projectId}/cultivation`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * AI 规划修炼路线 —— **只返回建议，不落库**。
+   */
+  planCultivationRoute: (projectId: number, body: { name: string; note?: string }) =>
+    request<{ ok: boolean; 路线?: CultivationProfile; 处境?: string; detail?: string }>(
+      `/projects/${projectId}/cultivation/plan`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * 列出所有角色的量级。
+   */
+  listScales: (projectId: number) =>
+    request<ScaleListResponse>(`/projects/${projectId}/scale`),
+
+  /**
+   * 保存角色的量级。
+   */
+  saveScale: (projectId: number, body: { name: string; scale: PowerScale }) =>
+    request<{ ok: boolean; name: string }>(
+      `/projects/${projectId}/scale`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * AI 帮角色定量级 —— **只返回建议，不落库**。
+   */
+  generateScale: (projectId: number, body: { name: string; note?: string }) =>
+    request<{ ok: boolean; 量级?: PowerScale; detail?: string }>(
+      `/projects/${projectId}/scale/generate`,
+      jsonInit("POST", body),
+    ),
 
   buildKg: (projectId: number, novelId?: number | null) =>
     request<{ characters: number; plotholes: number; relationships: number }>(

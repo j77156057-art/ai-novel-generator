@@ -413,6 +413,323 @@ async function adoptBatchCard(name: string) {
   }
 }
 
+// ===== 修炼体系 / 档位分层 / 角色量级（2026-10-29） =====
+//
+// 三块内容：
+// 1. **体系**：境界阶梯（可配），带「类型」—— 细分型 / 序列型 / 粗放型；
+//    类型决定这套体系的边界有多硬（粗放型不能假设等差）。
+// 2. **档位分层**：群像用（路人按层归类，不逐个建档）。
+// 3. **角色量级**：他出手能造成什么后果 —— 这是「神明之战不像街头斗殴」的解药。
+//
+// 纪律：AI 生成的结果**不落库**，要人点「采纳」。
+const pwOpen = ref(false);
+const pwBusy = ref(false);
+const pwMsg = ref<string | null>(null);
+const pwErr = ref<string | null>(null);
+const pwSystems = ref<any[]>([]);
+const pwTiers = ref<any[]>([]);
+const pwType = ref("序列型");
+const pwGenNote = ref("");
+const pwGenResult = ref<any[] | null>(null);
+const tierGenResult = ref<any[] | null>(null);
+
+const scOpen = ref(false);
+const scList = ref<any[]>([]);
+const scEdit = ref<any>(null);
+const scForm = reactive({ 量级: "", 出手规模: "", 压制: "" });
+const scNote = ref("");
+const scAi = ref<any | null>(null);
+const scAiMsg = ref<string | null>(null);
+
+const cultOpen = ref(false);
+const cultChar = ref<any>(null);
+const cultForm = reactive({
+  当前境界: "", 当前小境界: "", 天赋: "", 瓶颈: "", 目标境界: "", 路线: "", 代价: "",
+});
+const cultNote = ref("");
+const cultAi = ref<any | null>(null);
+const cultAiMsg = ref<string | null>(null);
+
+const PW_TYPES = [
+  { v: "细分型", d: "境界分明，每境内还分初期/中期/大圆满、第几重" },
+  { v: "序列型", d: "有明确境界但不细分（序列式）" },
+  { v: "粗放型", d: "只有几个大阶段，边界模糊，阶段差距不一定均匀" },
+];
+
+async function loadPowerSystem() {
+  if (!project.value) return;
+  pwBusy.value = true;
+  pwErr.value = null;
+  try {
+    const r = await api.getPowerSystem(project.value.id);
+    pwSystems.value = r.power_system?.体系 || [];
+    pwTiers.value = r.tiers || [];
+    if (pwSystems.value[0]?.类型) pwType.value = pwSystems.value[0].类型;
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+/** 重新取项目并把 plot_bible 同步到本地（各面板保存后都要刷新）。 */
+async function refreshBible() {
+  if (!project.value) return;
+  try {
+    const fresh = await api.getProject(project.value.id);
+    project.value = fresh;
+    bible.value = (fresh.plot_bible as PlotBible) || null;
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  }
+}
+
+async function openPowerPanel() {
+  pwOpen.value = !pwOpen.value;
+  if (pwOpen.value) await loadPowerSystem();
+}
+
+async function generatePowerSystem() {
+  if (!project.value) return;
+  pwBusy.value = true;
+  pwErr.value = null;
+  pwMsg.value = null;
+  pwGenResult.value = null;
+  try {
+    const r = await api.generatePowerSystem(project.value.id, {
+      genre: (bible.value as any)?.genre || "",
+      tone: (bible.value as any)?.style || "",
+      note: pwGenNote.value,
+    });
+    if (!r.ok) {
+      pwErr.value = r.detail || "AI 没给出可用体系";
+      return;
+    }
+    pwGenResult.value = r.体系 || [];
+    pwMsg.value = "AI 给了一套体系 —— 满意就点「采纳」写进去";
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+async function adoptPowerSystem() {
+  if (!project.value || !pwGenResult.value?.length) return;
+  pwBusy.value = true;
+  try {
+    await api.savePowerSystem(project.value.id, {
+      power_system: { 体系: pwGenResult.value },
+      tiers: pwTiers.value,
+    });
+    pwMsg.value = "体系已保存";
+    pwGenResult.value = null;
+    await loadPowerSystem();
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+async function generateTiers() {
+  if (!project.value) return;
+  pwBusy.value = true;
+  pwErr.value = null;
+  tierGenResult.value = null;
+  try {
+    const r = await api.generateTiers(project.value.id, { note: pwGenNote.value });
+    if (!r.ok) {
+      pwErr.value = r.detail || "AI 没给出可用分层";
+      return;
+    }
+    tierGenResult.value = r.档位层 || [];
+    pwMsg.value = `AI 给了 ${tierGenResult.value.length} 层 —— 满意就点「采纳」`;
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+async function adoptTiers() {
+  if (!project.value || !tierGenResult.value) return;
+  pwBusy.value = true;
+  try {
+    await api.savePowerSystem(project.value.id, {
+      power_system: { 体系: pwSystems.value },
+      tiers: tierGenResult.value,
+    });
+    pwTiers.value = tierGenResult.value;
+    tierGenResult.value = null;
+    pwMsg.value = "分层已保存";
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+async function openScalePanel() {
+  scOpen.value = !scOpen.value;
+  if (scOpen.value) await loadScales();
+}
+
+async function loadScales() {
+  if (!project.value) return;
+  pwBusy.value = true;
+  try {
+    const r = await api.listScales(project.value.id);
+    scList.value = r.characters || [];
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+function openScaleEdit(c: any) {
+  scEdit.value = c;
+  scForm.量级 = c.scale?.量级 || "";
+  scForm.出手规模 = c.scale?.出手规模 || "";
+  scForm.压制 = c.scale?.压制 || "";
+  scNote.value = "";
+  scAi.value = null;
+  scAiMsg.value = null;
+  pwErr.value = null;
+}
+
+function closeScaleEdit() {
+  scEdit.value = null;
+}
+
+async function askAiScale() {
+  if (!project.value || !scEdit.value) return;
+  pwBusy.value = true;
+  pwErr.value = null;
+  scAiMsg.value = null;
+  try {
+    const r = await api.generateScale(project.value.id, {
+      name: scEdit.value.name,
+      note: scNote.value,
+    });
+    if (!r.ok) {
+      pwErr.value = r.detail || "AI 没给出可用量级";
+      return;
+    }
+    scAi.value = r.量级 || null;
+    scAiMsg.value = "AI 给了量级 —— 确认后点保存";
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+function applyScaleAi() {
+  const s = scAi.value;
+  if (!s) return;
+  if (!scForm.量级 && s.量级) scForm.量级 = s.量级;
+  if (!scForm.出手规模 && s.出手规模) scForm.出手规模 = s.出手规模;
+  if (!scForm.压制 && s.压制) scForm.压制 = s.压制;
+  scAi.value = null;
+  scAiMsg.value = "已填入（你写过的没动）";
+}
+
+async function saveScale() {
+  if (!project.value || !scEdit.value) return;
+  pwBusy.value = true;
+  try {
+    await api.saveScale(project.value.id, {
+      name: scEdit.value.name,
+      scale: { 量级: scForm.量级, 出手规模: scForm.出手规模, 压制: scForm.压制 },
+    });
+    pwMsg.value = `「${scEdit.value.name}」的量级已保存`;
+    closeScaleEdit();
+    await loadScales();
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+async function openCultivation(c: any) {
+  cultChar.value = c;
+  const p = (c?.card?.修炼) || {};
+  cultForm.当前境界 = p.当前境界 || "";
+  cultForm.当前小境界 = p.当前小境界 || "";
+  cultForm.天赋 = p.天赋 || "";
+  cultForm.瓶颈 = p.瓶颈 || "";
+  cultForm.目标境界 = p.目标境界 || "";
+  cultForm.路线 = Array.isArray(p.路线) ? p.路线.join("\n") : (p.路线 || "");
+  cultForm.代价 = p.代价 || "";
+  cultNote.value = "";
+  cultAi.value = null;
+  cultAiMsg.value = null;
+  cultOpen.value = true;
+}
+
+async function planCultivationRoute() {
+  if (!project.value || !cultChar.value) return;
+  pwBusy.value = true;
+  pwErr.value = null;
+  cultAiMsg.value = null;
+  try {
+    const r = await api.planCultivationRoute(project.value.id, {
+      name: cultChar.value.name,
+      note: cultNote.value,
+    });
+    if (!r.ok) {
+      pwErr.value = r.detail || "AI 没给出可用路线";
+      return;
+    }
+    cultAi.value = r.路线 || null;
+    cultAiMsg.value = r.处境 ? `AI 给了路线 —— ${r.处境}` : "AI 给了路线";
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
+function applyCultivationAi() {
+  const r = cultAi.value;
+  if (!r) return;
+  if (!cultForm.目标境界 && r.目标境界) cultForm.目标境界 = r.目标境界;
+  if (!cultForm.瓶颈 && r.瓶颈) cultForm.瓶颈 = r.瓶颈;
+  if (!cultForm.代价 && r.代价) cultForm.代价 = r.代价;
+  if (!cultForm.路线 && r.路线?.length) cultForm.路线 = r.路线.join("\n");
+  cultAi.value = null;
+  cultAiMsg.value = "已填入（你写过的没动）";
+}
+
+async function saveCultivation() {
+  if (!project.value || !cultChar.value) return;
+  pwBusy.value = true;
+  try {
+    await api.saveCultivation(project.value.id, {
+      name: cultChar.value.name,
+      profile: {
+        当前境界: cultForm.当前境界,
+        当前小境界: cultForm.当前小境界,
+        天赋: cultForm.天赋,
+        瓶颈: cultForm.瓶颈,
+        目标境界: cultForm.目标境界,
+        路线: cultForm.路线 ? cultForm.路线.split("\n").map((x: string) => x.trim()).filter(Boolean) : [],
+        代价: cultForm.代价,
+      },
+    });
+    pwMsg.value = `「${cultChar.value.name}」的修炼档案已保存`;
+    cultOpen.value = false;
+    await refreshBible();
+  } catch (e: any) {
+    pwErr.value = String(e?.message || e);
+  } finally {
+    pwBusy.value = false;
+  }
+}
+
 // ===== 角色个性：人写 + AI 帮着完善（2026-10-28） =====
 //
 // 「让用户自己写角色的性格，自己来决定角色应该有什么样的表现，再由 AI 帮忙完善」。
@@ -2848,6 +3165,165 @@ onUnmounted(stopDistillPolling);
         </div>
       </div>
     </div>
+    <!-- ---------- 修炼体系 / 档位分层 / 角色量级（2026-10-29） ---------- -->
+    <div v-if="bible?.characters?.length" class="persona-panel">
+      <div class="card-title" style="font-size: var(--fs-sm)">
+        修炼体系与量级<span class="hint">境界怎么分、谁压谁 —— 决定打斗有没有张力</span>
+        <button class="link-btn" @click="openPowerPanel">
+          {{ pwOpen ? "收起" : "查看/编辑" }}
+        </button>
+      </div>
+
+      <template v-if="pwOpen">
+        <div class="row tight" style="gap: 8px; margin-bottom: 6px">
+          <button class="link-btn" @click="openScalePanel">
+            {{ scOpen ? "收起角色量级" : "角色量级（出手能造成什么后果）" }}
+          </button>
+        </div>
+
+        <div v-if="pwErr" class="notice err">{{ pwErr }}</div>
+        <div v-else-if="pwMsg" class="notice info">{{ pwMsg }}</div>
+
+        <!-- 体系 -->
+        <div class="row tight" style="gap: 8px; margin: 8px 0">
+          <strong style="font-size: var(--fs-sm)">体系</strong>
+          <span class="faint" style="font-size: var(--fs-xs)">
+            现有：{{ pwSystems.length ? pwSystems.map((s: any) => s.名称 + "（" + (s.类型 || "") + "）").join("、") : "还没建" }}
+          </span>
+        </div>
+        <div v-for="s in pwSystems" :key="s.名称" class="persona-item">
+          <div class="row tight" style="gap: 8px">
+            <strong>{{ s.名称 }}</strong>
+            <span class="tag info">{{ s.类型 || "序列型" }}</span>
+          </div>
+          <div class="faint" style="font-size: var(--fs-xs); margin-top: 4px">
+            <div v-for="r in s.境界" :key="r.名称">
+              {{ r.名称 }}<span v-if="r.档位">（{{ r.档位 }}）</span>
+              <span v-if="r.小境界?.length">　{{ r.小境界.map((x: any) => x.名称).join("、") }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 档位分层（群像） -->
+        <div class="row tight" style="gap: 8px; margin: 10px 0 4px">
+          <strong style="font-size: var(--fs-sm)">档位分层</strong>
+          <span class="faint" style="font-size: var(--fs-xs)">路人按层归类，不逐个建档</span>
+        </div>
+        <div v-for="t in pwTiers" :key="t.名称" class="persona-item">
+          <div class="row tight" style="gap: 8px">
+            <strong>{{ t.名称 }}</strong>
+            <span class="tag info">{{ t.档位 }}</span>
+            <span class="faint" style="font-size: var(--fs-xs)">{{ t.人数 }}人</span>
+          </div>
+          <div class="faint" style="font-size: var(--fs-xs)">{{ t.特征 }}</div>
+        </div>
+        <div v-if="!pwTiers.length" class="faint" style="font-size: var(--fs-xs)">
+          还没分层 —— 分了层，路人才不用一个个建档。
+        </div>
+
+        <!-- 生成 -->
+        <div class="field" style="margin-top: 10px">
+          <label>给 AI 的要求（可选）</label>
+          <input class="input" v-model="pwGenNote" placeholder="例：境界之间差距不要等差，修行者未必强过凡人" />
+          <div class="row tight" style="gap: 8px">
+            <button class="btn" :disabled="pwBusy" @click="generatePowerSystem">
+              {{ pwBusy ? "AI 正在生成…" : "生成体系" }}
+            </button>
+            <button class="btn" :disabled="pwBusy" @click="generateTiers">生成分层</button>
+          </div>
+        </div>
+
+        <div v-if="pwGenResult?.length" class="notice info" style="margin-top: 8px">
+          <div class="faint" style="font-size: var(--fs-xs); margin-bottom: 6px">
+            AI 建议（还没写进去）：
+          </div>
+          <div v-for="s in pwGenResult" :key="s.名称" class="persona-item">
+            <div class="row tight" style="gap: 8px">
+              <strong>{{ s.名称 }}</strong>
+              <span class="tag info">{{ s.类型 }}</span>
+            </div>
+            <div class="faint" style="font-size: var(--fs-xs)">
+              <div v-for="r in s.境界" :key="r.名称">
+                {{ r.名称 }}<span v-if="r.档位">（{{ r.档位 }}）</span>
+                <span v-if="r.小境界?.length">　{{ r.小境界.map((x: any) => x.名称).join("、") }}</span>
+              </div>
+            </div>
+          </div>
+          <button class="link-btn" @click="adoptPowerSystem">采纳这套体系</button>
+        </div>
+
+        <div v-if="tierGenResult?.length" class="notice info" style="margin-top: 8px">
+          <div class="faint" style="font-size: var(--fs-xs); margin-bottom: 6px">
+            AI 建议的档位分层：
+          </div>
+          <div v-for="t in tierGenResult" :key="t.名称" class="persona-item">
+            <strong>{{ t.名称 }}</strong>
+            <span class="faint" style="font-size: var(--fs-xs)">{{ t.档位 }}｜{{ t.人数 }}人｜{{ t.特征 }}</span>
+          </div>
+          <button class="link-btn" @click="adoptTiers">采纳这套分层</button>
+        </div>
+      </template>
+    </div>
+
+    <!-- ===== 角色量级编辑 ===== -->
+    <div v-if="scOpen" class="persona-panel" style="margin-top: 6px">
+      <div class="card-title" style="font-size: var(--fs-xs)">
+        角色量级<span class="hint">他出手能造成什么后果 —— 写打斗时按这个来</span>
+      </div>
+      <ul class="persona-list">
+        <li v-for="c in scList" :key="c.name" class="persona-item">
+          <div class="row tight" style="gap: 8px">
+            <strong>{{ c.name }}</strong>
+            <span class="faint">{{ c.role }}</span>
+            <button class="link-btn" @click="openScaleEdit(c)">定量级</button>
+          </div>
+          <div v-if="c.scale?.量级" class="persona-detail">
+            <span>{{ c.scale.量级 }}</span>
+            <span v-if="c.scale.出手规模">{{ c.scale.出手规模 }}</span>
+          </div>
+          <div v-else class="faint" style="font-size: var(--fs-xs)">还没定量级</div>
+        </li>
+      </ul>
+    </div>
+
+    <!-- ===== 量级编辑弹窗 ===== -->
+    <div v-if="scEdit" class="bible-modal-mask" @click.self="closeScaleEdit">
+      <div class="bible-modal persona-modal">
+        <div class="card-title">
+          「{{ scEdit.name }}」的量级
+          <span class="hint">写的是「出手能造成什么后果」，不是战斗力数值</span>
+        </div>
+        <div class="field">
+          <label>量级档</label>
+          <input class="input" v-model="scForm.量级" placeholder="凡人级 / 伤人级 / 毁物级 / 毁城级 / 灭世级" />
+        </div>
+        <div class="field">
+          <label>出手规模（具体一句，会进提示词）</label>
+          <textarea class="input" rows="3" v-model="scForm.出手规模"
+            placeholder="例：抬手能让半座雾港沉进海里，海水倒卷着撞碎灯塔石阶"></textarea>
+        </div>
+        <div class="field">
+          <label>压制（他压得住什么、压不住什么）</label>
+          <input class="input" v-model="scForm.压制"
+            placeholder="例：能压住海里爬上岸的东西，压不住弑神者那盏灯" />
+        </div>
+        <div class="field">
+          <label>给 AI 的要求（可选）</label>
+          <input class="input" v-model="scNote" placeholder="例：他是凡人，别给高了" />
+        </div>
+        <div v-if="scAiMsg" class="notice info" style="margin-bottom: 8px">
+          {{ scAiMsg }}
+          <button v-if="scAi" class="link-btn" @click="applyScaleAi">填入</button>
+        </div>
+        <div class="row" style="gap: 8px">
+          <button class="btn" :disabled="pwBusy" @click="askAiScale">
+            {{ pwBusy ? "AI 正在想…" : "AI 帮我定" }}
+          </button>
+          <button class="btn primary" :disabled="pwBusy" @click="saveScale">保存</button>
+          <button class="btn ghost" @click="closeScaleEdit">取消</button>
+        </div>
+      </div>
+    </div>
     <div v-else-if="styleRepairMsg" class="notice info distill-inline" style="margin-top: var(--gap)">
       {{ styleRepairMsg }}
     </div>
@@ -3258,6 +3734,61 @@ onUnmounted(stopDistillPolling);
       <button class="btn ghost" @click="goStep(6)">← 返回生成</button>
     </div>
   </section>
+    <!-- ===== 修炼档案编辑弹窗 ===== -->
+    <div v-if="cultOpen" class="bible-modal-mask" @click.self="cultOpen = false">
+      <div class="bible-modal persona-modal">
+        <div class="card-title">
+          「{{ cultChar?.name }}」的修炼档案
+          <span class="hint">境界、天赋、卡在哪、代价 —— 路线由 AI 建议，你点采纳</span>
+        </div>
+        <div class="field">
+          <label>当前境界</label>
+          <input class="input" v-model="cultForm.当前境界" placeholder="例：炼气三层" />
+        </div>
+        <div class="field">
+          <label>当前小境界</label>
+          <input class="input" v-model="cultForm.当前小境界" placeholder="例：炼气三层" />
+        </div>
+        <div class="field">
+          <label>修炼天赋（体质 / 灵根 / 根骨…）</label>
+          <input class="input" v-model="cultForm.天赋" placeholder="例：筋骨好，但经脉有旧伤，阴雨天作痛" />
+        </div>
+        <div class="field">
+          <label>卡在哪（瓶颈）</label>
+          <input class="input" v-model="cultForm.瓶颈" placeholder="例：炼气七层，经脉承受不住" />
+        </div>
+        <div class="field">
+          <label>目标境界</label>
+          <input class="input" v-model="cultForm.目标境界" placeholder="例：筑基" />
+        </div>
+        <div class="field">
+          <label>路线（一行一步，写清代价）</label>
+          <textarea class="input" rows="4" v-model="cultForm.路线"
+            placeholder="例：炼气三层 → 炼气四层：靠苦修，耗三年&#10;炼气四层 → 炼气五层：卡在经脉，需一枚洗髓丹"></textarea>
+        </div>
+        <div class="field">
+          <label>已经付出的代价（掉境界 / 燃烧寿命 / 隐患…）</label>
+          <input class="input" v-model="cultForm.代价"
+            placeholder="例：为压制伤势服过压境界的丹药，短期爆发后跌回炼气二层" />
+        </div>
+        <div class="field">
+          <label>给 AI 的要求（可选）</label>
+          <input class="input" v-model="cultNote" placeholder="例：让他卡在瓶颈久一点，别太顺" />
+        </div>
+        <div v-if="cultAiMsg" class="notice info" style="margin-bottom: 8px">
+          {{ cultAiMsg }}
+          <button v-if="cultAi" class="link-btn" @click="applyCultivationAi">填入空缺</button>
+        </div>
+        <div class="row" style="gap: 8px">
+          <button class="btn" :disabled="pwBusy" @click="planCultivationRoute">
+            {{ pwBusy ? "AI 正在规划…" : "AI 规划路线" }}
+          </button>
+          <button class="btn primary" :disabled="pwBusy" @click="saveCultivation">保存</button>
+          <button class="btn ghost" @click="cultOpen = false">取消</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ===== 角色个性编辑（人写 + AI 完善）===== -->
     <div v-if="personaOpen" class="bible-modal-mask" @click.self="closePersona">
       <div ref="personaModalEl" class="bible-modal persona-modal">

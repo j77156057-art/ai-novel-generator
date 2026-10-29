@@ -52,6 +52,13 @@ from app.generation.character_card import (
 MAX_RETRY = 2
 
 
+def _scale_menu() -> str:
+    """量级档位清单（给模型闭集选）。"""
+    from app.generation.power_scale import SCALE_HINTS, SCALE_LEVELS
+
+    return "\n".join(f"- {name}：{SCALE_HINTS.get(name, '')}" for name in SCALE_LEVELS)
+
+
 def _anchor_menu() -> str:
     """把可选项列给模型 —— 让它在**有限档位**里选，而不是自由发挥。
 
@@ -114,6 +121,16 @@ _SYSTEM = """你在为一个中文小说项目设计**角色档案**。作者要
 
 - 身份：性别 / 年龄 / 外貌 / 身份职业 / 出身背景（每个角色都要有）
 - 能力：武器 / 功法 / 能力 / 能力上限
+- **量级**：他出手能造成什么后果（见下面的档位）
+
+  量级档（**必选其一**，跨体系通用，不要预设是武侠还是修仙）：
+{scales}
+
+  - `量级`：五档里选一个
+  - `出手规模`：**具体的一句**，写他能造成什么后果
+    （例「抬手能让半座雾港沉进海里」）。**不要写**「威力极大」这种空话 ——
+    这句会原样进提示词，模型照着它写场面。
+  - `压制`：他能压住什么、压不住什么（一句话）
   - 武器、功法、能力写成 `{{"名称": "...", "说明": "..."}}`
   - **能力上限**写他**做不到**的事（2~4 条）——这是防止角色越写越强的关键
 - 关系：`{{"对象名": "称呼；态度"}}`，只写与本次新建角色或已知角色的关系
@@ -126,7 +143,8 @@ _SYSTEM = """你在为一个中文小说项目设计**角色档案**。作者要
 "能力": {{"武器": [{{"名称": "...", "说明": "..."}}], "功法": [], "能力": [], \
 "能力上限": ["..."]}}, "声纹": {{"自称": "...", "称呼他人": ["..."], "句长": "短", \
 "句末": "直陈收尾（不用语气词）", "口头禅": ["..."], "禁用词": ["..."], \
-"语气底色": "..."}}, "关系": {{"某人": "称呼；态度"}}}}]}}"""
+"语气底色": "..."}}, "量级": {{"量级": "毁城级", "出手规模": "...", "压制": "..."}}, \
+"关系": {{"某人": "称呼；态度"}}}}]}}"""
 
 
 def _build_user(story: dict, wants: list[str], already: dict[str, Any],
@@ -176,7 +194,7 @@ def complete_card(provider: Any, character: dict, user_card: Any = None,
         return {}
     existing = normalize_card(user_card) if user_card else {}
     try:
-        sys_p = _SYSTEM.format(menu=_anchor_menu())
+        sys_p = _SYSTEM.format(menu=_anchor_menu(), scales=_scale_menu())
         user = (
             "## 项目设定\n"
             + json.dumps({
@@ -293,7 +311,7 @@ def generate_cards(provider: Any, story: dict, wants: list[str],
         rounds = attempt + 1
         try:
             raw = provider.chat(
-                _SYSTEM.format(menu=_anchor_menu()),
+                _SYSTEM.format(menu=_anchor_menu(), scales=_scale_menu()),
                 _build_user(story, wants, {**fixed, **{
                     n: (c.get("声纹") or {}) for n, c in cards.items()}}, note),
             )

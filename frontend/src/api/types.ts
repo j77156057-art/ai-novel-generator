@@ -1693,3 +1693,64 @@ export interface CardsBatchResponse {
   轮次: number;
   detail?: string;
 }
+
+// ====================================================================
+// 修炼体系 / 档位分层 / 量级（2026-10-29）
+// ====================================================================
+
+/** 修炼体系里的一个境界（可含小境界与档位）。 */
+export interface RealmEntry {
+  名称: string;
+  说明?: string;
+  /** 档位：分层群像的抓手（少数几档，会同时覆盖好几境）。 */
+  档位?: string;
+  /** 小境界（如「炼气三层」）。 */
+  小境界?: { 名称: string; 说明?: string }[];
+}
+
+/** 一套修炼体系。 */
+export interface PowerSystemEntry {
+  名称: string;
+  说明?: string;
+  境界: RealmEntry[];
+}
+
+/** 档位分层的一层（群像：路人按层归类，不逐个建档）。 */
+export interface TierLayer {
+  名称: string;
+  档位?: string;
+  人数?: string;
+  特征?: string;
+}
+
+/** 角色的修炼档案。 */
+export interface CultivationProfile {
+  当前境界?: string;
+  当前小境界?: string;
+  档位?: string;
+  天赋?: string;
+  瓶颈?: string;
+  目标境界?: string;
+  路线?: string[];
+  代价?: string;
+  来历?: string;
+}
+
+/** 角色的量级（相对标尺：他出手能造成什么后果）。 */
+export interface PowerScale {
+  量级?: string;
+  出手规模?: string;
+  压制?: string;
+  来源?: string;
+}
+
+/** GET /projects/{id}/power-system 的响应。 */
+export interface PowerSystemResponse {
+  power_system: { 体系: PowerSystemEntry[] };
+  tiers: TierLayer[];
+}
+
+/** GET /projects/{id}/scale 的响应。 */
+export interface ScaleListResponse {
+  characters: { name: string; role: string; scale: PowerScale }[];
+}

@@ -180,6 +180,12 @@ NARRATIVE_DIMENSIONS = [
     # 提到兵器/打斗情节。不同作者写战斗差别极大——一招一式拆解、蒙太奇快切、
     # 环境破坏、旁观者侧写、心理博弈——这些差异现有维度抓不住。
     "战斗描写",
+    # —— 2026-10-29 新增：心理描写手法 ——
+    # 实测缺口：生成文本的直陈心理只有参考书的 1/3，而身体反应是参考书的 6.7 倍
+    # ⇒ 蒸馏蒸出的「人物描写手法」教的是「用动作暗示心理，不直接写内心独白」，
+    #    而真书作者**既**用动作暗示**也**直陈心理（1250:189）⇒ 蒸馏漏了「也写心理」
+    #    那一面，生成时模型被教着不写心理 ⇒ 内心几乎绝迹。
+    "心理描写手法",
     # —— v2.283 新增：语序编排 ——
     # 现有维度讲「句子怎么写」（句长/节奏/段长），没有一个讲「信息按什么顺序给」。
     # 而顺序是比句长更本质的文风特征：同样一段场景，先写环境还是先写人、
@@ -231,6 +237,7 @@ DIM_LABELS: dict[str, str] = {
     "潜台词模式": "潜台词",
     "战斗描写": "打斗",
     "语序编排": "语序",
+    "心理描写手法": "心理",
 }
 
 #: 每个维度在提示词里的最大字数。超过就按句截断——
@@ -1007,6 +1014,9 @@ def _build_word_order_prompt(chunk_text: str, chunk_label: str) -> tuple[str, st
 #: 「拆解粒度」「节奏」「视角」这类分类标签**保留**，它们说明规则讲的是哪个方面。
 _COMBAT_NOISE_PREFIX_RE = re.compile(r"^(?:规则描述|规则内容|规则|写法)[：:]\s*")
 
+#: 心理描写规则里的同款噪声前缀（模型照抄 prompt 模板留下的）。
+_PSYCH_NOISE_PREFIX_RE = re.compile(r"^(?:规则描述|规则内容|规则|写法)[：:]\s*")
+
 
 def _build_combat_prompt(chunk_text: str, chunk_label: str) -> tuple[str, str]:
     """构造「战斗描写」提取 prompt（v2.292 新增维度）。
@@ -1098,6 +1108,106 @@ def _build_combat_prompt(chunk_text: str, chunk_label: str) -> tuple[str, str]:
     )
     return system, user
 
+
+
+def _build_psych_prompt(chunk_text: str, chunk_label: str) -> tuple[str, str]:
+    """构造「心理描写手法」提取 prompt（2026-10-29 新增维度）。
+
+    ## 为什么要这一维（这是**根因**，不是补缺）
+
+    实测（发布版冒烟库，参考书语料 vs 生成文本，每千字）：
+
+        直陈心理   参考书 3.06 ／ 生成 1.03
+        身体反应   参考书 0.46 ／ 生成 3.10
+
+    生成文本把参考书的心理**全部替换成了身体反应**。
+
+    根因不是「提示词没要求写心理」，而是**蒸馏教了模型「不写心理」**：
+
+        人物描写手法: ["用动作和神态暗示情绪，不直接写'害怕/紧张'（证据：指尖不自觉收紧）"]
+
+    这条规则**有原文证据、过了证据闸门**，于是被当成「作者的手法」注入生成。
+    但真书里作者**既**用动作暗示**也**直陈心理（1250 : 189 ≈ 6.7 : 1）——
+    蒸馏只抽到了「不写心理」那一面，把作者「也写心理」漏了。
+
+    ⇒ 缺的不是「写心理」的要求，而是**一个专门讲心理描写的维度**，
+    让「作者怎么写内心」被显式地蒸出来。
+
+    ## 两条硬要求
+
+    1. **必须写出并存的两面**：直陈心理（心中叹息 / 以为是自己胆小）**与**
+       身体反应（指节发白 / 喉结一动）—— 只写一面就是漏了作者的写法。
+    2. **必须给出占比**：哪一面是主、哪一面是辅。
+       ⇒ 生成时才知道该写多密，而不是一律照搬「不写心理」。
+
+    ## 约束（与战斗描写维度一致）
+
+    只写**手法结构**，不写具体内容：不写人名地名、不复述剧情、
+    每条必须可迁移（换一组人物依然成立）。
+    """
+    system = (
+        "你是一位资深中文网文编辑，专精**心理描写写法**分析。\n\n"
+        "你要回答的是「作者怎么写人物的内心」，不是「这个人心里想什么」。\n\n"
+        "## 关键约束：只写写法，不写内容\n\n"
+        "你的输出会被用来指导**另一本小说**，那本书的人物、情节全都不同。所以：\n"
+        "- 不要写具体人名、地名、门派名\n"
+        "- 不要复述这段文字里谁想什么、发生了什么\n"
+        "- 每条规则必须**可迁移**：换一组人物、换一个场景依然成立\n"
+        "- 用「作者」作主语\n\n"
+        "## ⚠️ 最关键的一条：必须写出**并存的两面**\n\n"
+        "写内心有两大类手法，作者**通常同时用**：\n\n"
+        "  **A. 直陈心理** —— 直接写出心里的念头：\n"
+        "     「心中轻轻叹息」「心里一沉」「以为是自己胆小」"
+        "「只觉得那眼神偏了半分」「盘算着这笔买卖划不划算」\n\n"
+        "  **B. 身体反应** —— 不写念头，只写身体的变化：\n"
+        "     「指节捏得发白」「喉结动了一下」「呼吸粗了半拍」\n\n"
+        "⚠️ **只写一面就是漏了作者的写法** —— 之前蒸馏就是漏了「作者也直陈心理」"
+        "这一面，结果生成出来的文字里内心几乎绝迹（实测直陈心理只有参考书的 1/3，"
+        "而身体反应是参考书的 6.7 倍）。\n\n"
+        "⇒ 你必须分别说明：A 怎么写、B 怎么写，**并且给出哪一面是主**"
+        "（作者用得更多的是哪一面）。\n\n"
+        "## 要回答的六个问题\n\n"
+        "1. **直陈心理的句式**：怎么引出内心？"
+        "（用「心中/心里/心头」这类容器词？还是直接用「以为/觉得/想起」这类动词"
+        "？还是不加引导直接写想法？）\n"
+        "2. **内心内容的粒度**：写的是**具体念头**（他在盘算什么、他想起了谁），"
+        "还是只写情绪类别（他很难过）？\n"
+        "3. **内心与身体反应的配比**：作者更爱写哪一个？"
+        "两者是交替出现，还是一个段只出一种？\n"
+        "4. **心理出现的时机**：在哪写？"
+        "（对话之后？动作之前？段尾收束？冲突爆发的一瞬？独处时？）\n"
+        "5. **长度**：内心通常多长？一个短句？还是一整段回忆？\n"
+        "6. **与回忆的关系**：作者会不会用回忆插进来打断当下？"
+        "回忆占多长？\n\n"
+        "## 正反例\n\n"
+        "**正确的规则**（描述写法，可迁移）：\n"
+        "  内心活动以短句插入，常跟在对方台词之后，用「心中/心头」这类容器词起头\n"
+        "  内心只写**具体的盘算与判断**，不写情绪类别词\n"
+        "  直陈心理与身体反应交替出现，一段之内不连续用同一面\n"
+        "  回忆以一句闪回插进当下，不展开成整段\n"
+        "  心理多出现在段落收束处，一段只写一处\n\n"
+        "**错误的规则**（含具体内容，严禁）：\n"
+        "  徐凤年心中叹息，想起黄蛮儿年幼时的模样\n"
+        "  她觉得那眼神不对，心里害怕\n\n"
+        "## 输出格式（JSON）\n\n"
+        '{\n'
+        '  "心理描写手法": [\n'
+        '    "规则描述（证据：原文引用 ≤20 字）",\n'
+        '    ...\n'
+        '  ],\n'
+        '  "心理写法占比": "直陈心理为主" | "身体反应为主" | "两者并重"\n'
+        '}\n'
+        "每题给 1 条，总数 4-6 条。证据只用来证明这条规则存在，"
+        "它本身不是规则内容。"
+    )
+    user = (
+        f"以下是《{chunk_label}》的片段，请分析作者写人物内心的手法：\n\n"
+        f"{chunk_text}\n\n"
+        "请按上述格式输出 JSON。**只写写法，不要复述这段文字里谁想什么；"
+        "不要出现具体人名地名。**"
+        "**必须分别写清「直陈心理」与「身体反应」两面，并给出哪一面是主。**"
+    )
+    return system, user
 
 def _build_extract_structure_prompt(
     chunk_text: str, chunk_label: str,
@@ -3622,6 +3732,11 @@ def extract_narrative_profile(
     all_rules: dict[str, list[dict]] = {
         dim: [] for dim in tier_dims + ["文风漂移分析"]
     }
+    #: 「心理写法占比」的取值集合（直陈心理为主 / 身体反应为主 / 两者并重）。
+    #: ⚠️ 只在**心理描写手法**这一维有意义，但容器放在通用位置 ——
+    #: 它的消费者是渲染层（挂在维度标签后面），不该塞进 rules 列表
+    #: （rules 里每条都带原文证据，占比没有证据可挂）。
+    psych_ratios: list[str] = []
     all_forbidden: dict[str, list[str]] = {dim: [] for dim in FORBIDDEN_DIMENSIONS}
     rejected = 0
     #: v2.265 角色名审计结果（只标记不删除，供人工复核）
@@ -3777,6 +3892,11 @@ def extract_narrative_profile(
                 cb_system, cb_user = _build_combat_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
                 chunk_prompts.append((cb_system, cb_user, None))
                 chunk_prompt_kinds.append("combat")
+
+            if "心理描写手法" in has_dim:
+                ps_system, ps_user = _build_psych_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
+                chunk_prompts.append((ps_system, ps_user, None))
+                chunk_prompt_kinds.append("psych")
 
             # 「人物塑造模板」**不在这里抽** —— 它是独立产物（按档位单独存放），
             # 抽它不必重蒸整本档案。见 app.style.character_template.extract_character_template。
@@ -3952,6 +4072,44 @@ def extract_narrative_profile(
                                 "novel_id": nid,
                                 "chapter_no": chunk[0][0],
                             })
+
+            # —— 2026-10-29：心理描写手法提取 ——
+            # 与战斗描写同构：字符串列表，过证据验证 + 逐字复制检测。
+            #
+            # ⚠️ 另有一项「心理写法占比」（直陈心理为主 / 身体反应为主 / 两者并重）——
+            # 它是**这一维的关键**：只写「作者怎么写心理」而不说占比，
+            # 生成时模型仍会照搬旧的「不写心理」那一条
+            # （实测生成文本直陈心理只有参考书的 1/3、身体反应是 6.7 倍）。
+            # 占比**单独存**（不进 rules 列表 —— 那里每条都带原文证据，
+            # 占比没有证据可挂），渲染时挂在维度标签后面。
+            ps_raw = _raw_for("psych")
+            if ps_raw is not None:
+                ps_parsed = _parse_extract_result(ps_raw)
+                if isinstance(ps_parsed, dict):
+                    ps_items = ps_parsed.get("心理描写手法") or []
+                    if isinstance(ps_items, list):
+                        for rule in ps_items:
+                            if not isinstance(rule, str) or not rule.strip():
+                                continue
+                            if not _validate_evidence(rule, chunk_text):
+                                rejected += 1
+                                continue
+                            if _is_verbatim_copy(rule, chunk_text):
+                                rejected += 1
+                                continue
+                            cleaned = _PSYCH_NOISE_PREFIX_RE.sub("", rule.strip())
+                            if not cleaned:
+                                continue
+                            all_rules["心理描写手法"].append({
+                                "rule": cleaned,
+                                "novel_id": nid,
+                                "chapter_no": chunk[0][0],
+                            })
+                    _ratio = ps_parsed.get("心理写法占比")
+                    if isinstance(_ratio, str) and _ratio.strip():
+                        _ratio = _ratio.strip()
+                        if _ratio not in psych_ratios:
+                            psych_ratios.append(_ratio)
 
             # —— 反向禁忌提取 ——
             f_raw = _raw_for("forbidden")
@@ -4194,6 +4352,9 @@ def extract_narrative_profile(
         "tier_dimensions": tier_dims,
         "n_chapters": total_chapters,
         "rules": all_rules,
+        # 「心理写法占比」：这一维的关键（直陈心理为主 / 身体反应为主 / 两者并重）。
+        # ⚠️ 单独存，不塞进 rules —— rules 里每条都带原文证据，占比没有证据可挂。
+        "psych_ratio": (psych_ratios[0] if psych_ratios else ""),
         "characters": character_profiles,
         "l2_audit": l2_audit,
         "forbidden": all_forbidden,
@@ -5039,7 +5200,11 @@ def describe_narrative(
             rendered.append(t)
         if not rendered:
             continue
-        phrases.append(f"{label}——" + "；".join(rendered))
+        line = f"{label}——" + "；".join(rendered)
+        # 心理写法占比挂在**心理**那一维后面（这是让生成不再「一律不写心理」的关键）。
+        if dim == "心理描写手法" and psych_ratio:
+            line += f"（{psych_ratio}）"
+        phrases.append(line)
 
     # 节拍骨架单独保留（「铺垫 → 升温 → 爆发」是顺序信息，揉进散文会丢）
     beat = ""

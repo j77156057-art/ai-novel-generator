@@ -169,6 +169,10 @@ def normalize_card(raw: Any) -> dict:
     # ⇒ 分组形态全丢，整张卡变成 {}（实测：假 provider 返回合法 JSON，
     # 解析出来仍然是 0 张卡）。这里统一摊平后再走同一套逻辑。
     flat: dict[str, Any] = {}
+    # ⚠️「量级」**既不摊平、也不进 flat**：它是纯分组（量级/出手规模/压制）。
+    # `raw = flat` 之后 raw 里就没有它了 ⇒ 量级组永远是 None（实测踩过两次）。
+    # ⇒ 提前单独取出，后面直接用。
+    _raw_scale = raw.get("量级")
     for grp in ("身份", "能力", "声纹"):
         g = raw.get(grp)
         if isinstance(g, dict):
@@ -177,6 +181,9 @@ def normalize_card(raw: Any) -> dict:
                     flat[k] = v
     for k, v in raw.items():
         if k in ("身份", "声纹", "关系", "来源"):
+            continue
+        if k == "量级":
+            # 量级要么是分组 dict，要么是单个档位字符串（都保留原样）
             continue
         # ⚠️「能力」既是**分组名**又是**字段名**（能力/异能）：
         # 传进来的是 dict ⇒ 它是分组，已经展开过，跳过；
@@ -221,6 +228,18 @@ def normalize_card(raw: Any) -> dict:
                 voice[f] = v
     if voice:
         card["声纹"] = voice
+
+    scale = _raw_scale
+    if isinstance(scale, dict) and scale:
+        sc = {}
+        for f in ("量级", "出手规模", "压制"):
+            v = _as_text(scale.get(f))
+            if v:
+                sc[f] = v
+        if sc:
+            card["量级"] = sc
+    elif isinstance(scale, str) and scale.strip():
+        card["量级"] = {"量级": scale.strip()}
 
     rel = raw.get("关系")
     if isinstance(rel, dict) and rel:
@@ -305,10 +324,14 @@ def voice_collisions(cards: dict[str, Any], *, min_shared: int = 3) -> list[dict
     return out
 
 
-def render_card(card: Any, *, max_items: int = 3) -> str:
+def render_card(card: Any, *, max_items: int = 3,
+                include_scale: bool = False) -> str:
     """把角色卡渲染成一行人话（进提示词）。
 
     形态：`性别…｜职业…｜武器：断刀（锈）｜功法：换气｜上限：不会水｜声纹：…`
+
+    ⚠️ **量级默认不渲染**：提示词里量级由「量级对照块」统一渲染（带本场对照），
+    这里再写一遍是重复。界面要用时传 `include_scale=True`。
 
     为什么压成一行：35 个角色的卡各占五行就是 175 行，
     会把提示词挤爆（实测伏笔块 97 行 2,639 字就占了两成）。
@@ -341,6 +364,15 @@ def render_card(card: Any, *, max_items: int = 3) -> str:
         cap = _as_list(ability.get("能力上限"), limit=3)
         if cap:
             parts.append("做不到：" + "；".join(cap))
+
+    # —— 量级（默认不渲染：提示词里由「量级对照块」统一渲染）——
+    if include_scale:
+        scale = card.get("量级")
+        if isinstance(scale, dict):
+            lv = _as_text(scale.get("量级"))
+            scope = _as_text(scale.get("出手规模"))
+            if lv:
+                parts.append(f"量级{lv}" + (f"：{scope}" if scope else ""))
 
     voice = card.get("声纹") or {}
     if isinstance(voice, dict):

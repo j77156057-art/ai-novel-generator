@@ -176,6 +176,114 @@ def merged_constraint_items(
     return _merge_named(bible_chars, kg_chars), _merge_text(bible_fores, kg_fores)
 
 
+def _description_guides() -> str:
+    """心理描写 + 场景描写的**可执行**指引（2026-10-29）。
+
+    ## 为什么需要（实测，不是猜测）
+
+    发布版冒烟库三个项目的**真实提示词**里，角色约束块
+    写满了「失落神女」「窃取太阳权柄的旧神」这类身份描述，
+    却没有一个字说明「他内心怎么想」「这个地方长什么样」。
+
+    实测生成文本 vs 参考书（每千字）：
+
+        直陈心理   生成 1.03 ／ 参考 3.06   ← 缺 2/3
+        身体反应   生成 3.10 ／ 参考 0.46   ← 多 6.7 倍
+        语言提示语  生成 11.9 ／ 参考 18.5   ← 缺 35%
+
+    ⇒ 生成文本把「心理」全部替换成了「身体反应」。
+    根因之一是**蒸馏教了「不写心理」**（已在新维度里修），
+    但提示词侧也要给出**可执行的目标**，否则模型没有依据。
+
+    ## 与「禁止情绪直陈」的边界（关键，别打架）
+
+    现有规则禁止「眼神里露出悲凉」「瞳孔骤缩」这类**贴标签式的情绪形容**。
+    那条规则本身没错，但模型把它理解成了「不许写内心」⇒ 心理绝迹。
+
+    ⇒ 这里显式划清：禁止的是**形容词贴标签**，鼓励的是**具体的心理活动**
+    （他在盘算什么、他以为是什么、他想起了谁）—— 那是内容，不是形容。
+
+    ## 频次对齐参考书（实测）
+
+    参考书心理密度 3.06 处/千字。A/B 实测「每段至少一处」会写到 9.73
+    （参考书的 3 倍，写滥）⇒ 改成「每 2~3 段一处」。
+    """
+    try:
+        from app.generation.description_elements import (
+            render_psych_guide, render_scene_guide,
+        )
+
+        return "\n" + render_psych_guide() + "\n" + render_scene_guide() + "\n"
+    except Exception:  # noqa: BLE001 —— 指引渲染失败不该让整段提示词丢
+        return ""
+
+
+def _psych_scene_boundary() -> str:
+    """「禁止情绪直陈」与「要写心理」的边界说明（必须紧跟在那条禁令后面）。"""
+    return (
+        "（注意：上面禁的是「眼神里露出悲凉」这种**贴标签式的情绪形容**；"
+        "**不禁止**写具体的心理活动 —— 他在盘算什么、他以为是什么、他想起了谁，"
+        "这些是**内容**，该写就写。参考作者的内心描写约占三十分之一段，"
+        "每 2~3 段出现一处即可，不要一段里连写好几处。）\n"
+    )
+
+
+def _scale_contrast_block(plot_bible: dict | None,
+                          character_names: list[str] | None) -> str:
+    """**量级对照块**（2026-10-29）。
+
+    ## 为什么要有这个
+
+    实测（发布版冒烟库三个项目的**真实提示词**）：角色约束块里
+    「这一击能有多大」类信号词 **0 次** —— 1930 字里写满了
+    「失落神女」「窃取太阳权柄的旧神阵营首领」这些**身份描述**，
+    却没有一个字说明**他出手是什么规模**。
+
+    ⇒ 模型只能按它最熟悉的物理尺度（刀/门板/石阶）去写，
+    于是「旧神的一击」写成了「黑刃骤然穿过木门」。
+
+    实测 A/B（同一世界观、同一场景、同一模型，只差这个块）：
+    **高量级动作 A 组 0 次 / B 组 7 次**
+    （沉进/化成/倒卷/退开/往上提…），
+    且 B 组自发写出「她能烧我一里，我就退一里。可她站的地方，只有一里」
+    ——**量级差进了对话**。
+
+    ## 纪律
+
+    - **只给本段在场的人**（其余角色的量级对这场戏没用，只占地方）；
+    - **成对比较**（谁压谁）—— 模型最需要的不是「每个人多强」，
+      而是「这两个打起来会怎样」；
+    - 没有量级数据 ⇒ **整块不出现**（老项目提示词逐字节不变）。
+    """
+    try:
+        from app.generation.power_scale import render_scale_contrast
+        from app.generation.power_system import systems_of
+    except Exception:  # noqa: BLE001 —— 渲染失败不该让整段提示词丢
+        return ""
+    if not plot_bible or not character_names:
+        return ""
+    chars = plot_bible.get("characters")
+    if not isinstance(chars, list) or not chars:
+        return ""
+    wanted = {str(n).strip() for n in character_names if str(n).strip()}
+    casts = []
+    for c in chars:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()
+        if not name or (wanted and name not in wanted):
+            continue
+        casts.append({"名字": name, "身份": c.get("role") or "",
+                      "card": c.get("card") or {}})
+    if not casts:
+        return ""
+    try:
+        block = render_scale_contrast(casts, systems=systems_of(plot_bible))
+    except Exception:  # noqa: BLE001
+        return ""
+    return f"{block}\n\n" if block else ""
+
+
 def _character_profile_block(
     style_narrative: dict | None,
     *,
@@ -337,6 +445,11 @@ def build_system_prompt(
         or "  · 暂无锁定角色（自由发挥，但保持已写人物一致）"
     )
 
+    # —— 量级对照（2026-10-29）——
+    # 「这一击能有多大」不进提示词 ⇒ 模型把神明之战写成贴身短刃尺度
+    # （实测高量级动作 A 组 0 次 vs B 组 7 次）。没有量级数据就整块不出现。
+    _scale_block = _scale_contrast_block(plot_bible, character_names)
+
     hole_lines = (
         "\n".join(f"  · {f}" for f in fores if f)
         or "  · 暂无伏笔"
@@ -364,12 +477,14 @@ def build_system_prompt(
         f"{_narrative_block(style_narrative, include_voice=_profile_rules.get('include_voice', True), dims=_profile_rules.get('narrative_dims'), voice_character=_voice_character_for(profile, character_names), entity_table=entity_table)}"
         f"{_character_template_block(style_narrative, enabled=bool(_profile_rules.get('include_character_template')))}"
         f"{_character_profile_block(style_narrative, profile=profile, character_names=character_names)}"
+        f"{_scale_block}"
         "【文风要求：真人小说感，忌 AI 腔】"
         "- 禁止金句化台词：人物不许说出格言式总结或口号（如「不被遗忘本身就是最贵的代价」）；"
         "台词要像真人说话，可有停顿、改口、答非所问、言外之意。\n"
         "- 禁止段尾升华：不要在段落结尾习惯性地总结、拔高、抒情。\n"
         "- 禁止情绪直陈：不用「眼神里露出悲凉」「瞳孔骤缩」这类贴标签式的情绪描写，"
         "改用动作、姿态、语气、沉默来承载情绪。\n"
+        f"{_psych_scene_boundary()}"
         "- 对话不承担设定讲解：人物不互相解释世界观或概念，读者靠情节自行理解。\n"
         "- 具体优于形容：少堆形容词，多写可感知的具体物件、动作、气味声响。\n"
         "- 允许留白：信息不必解释完，场景不必交代清，段落可以以一个动作或物件收住。\n"
@@ -377,7 +492,8 @@ def build_system_prompt(
         "用「，」「。」「——」承担语气停顿，不要让省略号成为情感拐杖。\n"
         "- 避免堆叠四字格：连续使用四字成语/对仗句会显得机械、像 AI 生成的「金句段」；\n"
         "人物对话和叙事以自然口语/长短句为主，四字格用一处即止。\n"
-        "- 贴近真实节奏：长短句交错，不要每段都同样长度、不要句句工整。\n\n"
+        "- 贴近真实节奏：长短句交错，不要每段都同样长度、不要句句工整。\n"
+        f"{_description_guides()}\n"
         "【续写纪律】只输出正文；保持与上一段的连贯；不要重复已写过的内容；"
         "每一轮都是「连载的一节」，不是一篇独立完整的短篇小说——"
         "结尾必须停在某个仍未解决的冲突、悬念或动作中途（为下一节留钩子），"
