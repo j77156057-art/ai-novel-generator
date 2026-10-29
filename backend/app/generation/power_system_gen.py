@@ -78,18 +78,52 @@ _SYSTEM_PROMPT = """你在为一本中文小说设计**修炼体系**。
 """
 
 
-def build_system_prompt(genre: str, tone: str, note: str = "") -> str:
-    """构造体系生成提示词。"""
+def build_system_prompt(genre: str, tone: str, note: str = "",
+                        want_type: str = "") -> str:
+    """构造体系生成的 **user 段**提示词（system 段是 `_SYSTEM_PROMPT`）。
+
+    `want_type` 是**作者指定的体系类型**（可空）：
+    给了就写进要求里，解析后再用它核对 AI 给的类型对不对
+    （类型一直是模型自己说的 —— 实测要「粗放型」时它给了一套细分阶梯）。
+    """
     extra = ""
     if note.strip():
         extra = f"\n\n## 作者的要求\n{note.strip()[:600]}"
+    type_line = ""
+    if want_type.strip():
+        from app.generation.power_system_type import SYSTEM_TYPE_HINTS, normalize_system_type
+        t = normalize_system_type(want_type)
+        type_line = (f"\n- 体系类型：**{t}**（作者指定，必须是这个类型）"
+                     f"\n  - {SYSTEM_TYPE_HINTS.get(t, '')}")
     return (
         f"## 这本书的设定\n\n"
         f"- 类型：{genre or '（未指定）'}\n"
         f"- 调子：{tone or '（未指定）'}"
+        f"{type_line}"
         f"{extra}\n\n"
         f"按上述要求给出这一套体系。"
     )
+
+
+def type_mismatch_issues(systems: list[dict], want_type: str) -> list[str]:
+    """AI 给的体系类型与**作者要的类型**不一致 ⇒ 记一条问题。
+
+    为什么要有：类型一直是**模型自己说的**。实测（App 自己的 MiniMax 通道）：
+    要「粗放型」（凡人→修行者→圣人→神明），模型给了一套细分阶梯
+    （开府/铸脉/…）并自判「细分型」—— 不一致时，只有作者知道要的是什么。
+
+    ⇒ 这条问题会被**回灌给模型**（见 `retry_instructions`），
+    让它按要求重做，而不是把错的类型塞进体系里。
+    """
+    if not (want_type or "").strip():
+        return []
+    from app.generation.power_system_type import normalize_system_type
+
+    want = normalize_system_type(want_type)
+    got = normalize_system_type((systems[0] or {}).get("类型")) if systems else ""
+    if got == want:
+        return []
+    return [f"体系类型不对：作者要的是「{want}」，你给的是「{got}」"]
 
 
 # ------------------------------------------------------------------ #
@@ -324,28 +358,133 @@ def _parse_systems_from_headings(text: str) -> list[dict]:
 
 
 #: 明显是**表头/说明**的词 —— 出现在境界名里说明抓错了行。
-_NOT_REALM_WORDS = ("层次", "表现", "说明", "名称", "本质", "备注", "序号", "备注栏")
+#:
+#: 实测：粗放型那轮的第一行「凡人的四个阶段」被当成了境界名 ——
+#: 「阶段」是表头词，不是境界的一部分。
+_NOT_REALM_WORDS = ("层次", "表现", "说明", "名称", "本质", "备注", "序号", "备注栏",
+                    "阶段", "档次", "定位", "位置")
+
+#: 境界个数上限。超过 ⇒ 不合格。
+#:
+#: 为什么有上限：实测细分型那轮，模型把**每一层**都摊成了一行 ——
+#: 90 个境界（感息/纳气/通脉/聚气…），类型还自判成「序列型」。
+#: 名字全都合法、不重名 ⇒ 靠「重名」那条判据拦不住。
+#:
+#: 两条理由合起来：
+#: 1. 超过这个量级，**几乎必然**是把小境界摊平成了行；
+#: 2. 这种体系没法落进角色卡（90 阶没法记），写得出来也用不上。
+#:
+#: 40 是留了余量的：诡秘式 22 条序列是合法上限附近的样本。
+MAX_REALMS = 40
+
+#: 境界名里出现的这些前缀 ⇒ 模型把**表头**写进了名字。
+#:
+#: 实测（App 自己的 MiniMax 通道，序列型那轮）：境界名是「列：见隙」「列：识烬」——
+#: 前缀「列」是表头，不是境界的一部分。这样的名字进了库，界面上一眼看不出错，
+#: 但它说明**列名认错了**。
+_HEADER_PREFIXES = (
+    "列", "序列", "阶", "境", "层", "段", "级", "品", "期", "重", "序", "序号",
+    "名称", "说明", "层次", "表现", "阶段", "档次", "定位", "位置", "等级",
+)
+
+
+def _header_prefixed_name(name: str) -> str:
+    """名字里带「表头：」这种前缀 ⇒ 返回前缀（没有则空串）。"""
+    m = re.match(r"^\s*([^\s：:]{1,3})\s*[：:]\s*\S", name or "")
+    if not m:
+        return ""
+    head = m.group(1)
+    return head if head in _HEADER_PREFIXES else ""
+
+
+def system_quality_issues(systems: list[dict]) -> list[str]:
+    """解析结果有哪些**实质问题**（空列表 = 合格）。
+
+    为什么要有这个函数：只判「解析不出」不够。实测（App 自己的 MiniMax 通道）
+    有一轮解析**成功**了 —— 类型对、能渲染、29 个境界 —— 但境界名是
+    「初期 / 中期 / 大圆满」**反复出现**：模型把层级摊平成了行。
+    这种结果会直接落库，比解析失败危险得多。
+
+    返回**人能读懂的原因**，是为了能把它回灌给模型让它自己改
+    （而不是只说「格式不对」让它重猜）。
+    """
+    if not systems:
+        return ["没有解析出任何体系"]
+    realms = (systems[0] or {}).get("境界") or []
+    if len(realms) < 2:
+        return [f"只解析出 {len(realms)} 个境界（至少要 2 个）"]
+    if len(realms) > MAX_REALMS:
+        issues = [f"解析出 {len(realms)} 个境界（上限 {MAX_REALMS}）—— "
+                  f"多半是把小境界摊平成了行，每个境界应该只占一条"]
+    else:
+        issues = []
+    # 类型与小境界对不上（模型标了「粗放型」却给了每境的细分）——
+    # 小境界已经按约定被剥掉了，但**冲突要报出来**，让模型自己改。
+    if (systems[0] or {}).get("类型与小境界不符"):
+        from app.generation.power_system_type import normalize_system_type
+        issues.append(
+            f"体系类型是「{normalize_system_type((systems[0] or {}).get('类型'))}」"
+            f"，但每一境还带了小境界 —— 小境界只属于细分型；"
+            f"要么去掉小境界，要么把类型改成「细分型」"
+        )
+    counts: dict[str, int] = {}
+    for realm in realms:
+        name = str(realm.get("名称") or "").strip()
+        if not name:
+            issues.append("有境界没有名字")
+            continue
+        if len(name) > 12:
+            issues.append(f"境界名过长（{len(name)} 字）：{name[:20]}")
+            continue
+        hit = next((w for w in _NOT_REALM_WORDS if w in name), "")
+        if hit:
+            issues.append(f"境界名里混进了表头词「{hit}」：{name}")
+            continue
+        head = _header_prefixed_name(name)
+        if head:
+            issues.append(f"境界名带表头前缀「{head}：」：{name}")
+            continue
+        counts[name] = counts.get(name, 0) + 1
+    for name, n in counts.items():
+        if n >= 2:
+            issues.append(
+                f"境界名「{name}」重复出现 {n} 次 —— 同名境界说明层级被摊平成了行，"
+                f"每个境界应该只占一条"
+            )
+    return issues
 
 
 def plausible_systems(systems: list[dict]) -> bool:
     """解析结果像不像一套体系（决定要不要重试）。
 
-    为什么要有：只判「解析不出」不够。实测有一轮解析**成功**了 ——
-    10 个境界、有档位、能渲染 —— 但那 10 个里 4 个是大阶段、6 个是子阶，
-    还混进一个表头词「层次」。这种结果会直接落库，比解析失败更危险。
+    判据全部在 `system_quality_issues` 里 —— 这里是它的布尔外壳。
     """
-    if not systems:
-        return False
-    realms = (systems[0] or {}).get("境界") or []
-    if len(realms) < 2:
-        return False
-    for realm in realms:
-        name = str(realm.get("名称") or "").strip()
-        if not name or len(name) > 12:
-            return False
-        if any(w in name for w in _NOT_REALM_WORDS):
-            return False
-    return True
+    return not system_quality_issues(systems)
+
+
+def retry_instructions(issues: list[str], want_type: str = "") -> str:
+    """重试时回灌给模型的「上一版错在哪 + 这次怎么写」。
+
+    为什么这么写：只说「格式不对」等于让模型重猜；把**具体哪一境界重名、
+    哪个表头混进来了**给它，它才有机会一次改对。
+    """
+    lines = [
+        "\n\n## 输出格式（硬要求）",
+        "只输出一个 JSON 对象，不要 Markdown 标题、表格、列表或说明文字。",
+        "每个境界只占一条；同一个体系里**境界名不能重名**；"
+        "境界名只写境界本身，不带「列：」「序列：」这类表头前缀。",
+        "如果某个境界还有细分（小境界），把它们放进该境界的「小境界」字段，"
+        "不要摊成一行一个境界。",
+    ]
+    if (want_type or "").strip():
+        from app.generation.power_system_type import normalize_system_type
+        t = normalize_system_type(want_type)
+        lines.append(f"体系类型必须是「{t}」。")
+    if issues:
+        lines.append("\n## 上一版的问题（必须改掉）")
+        for issue in issues[:5]:
+            lines.append(f"- {issue}")
+    return "\n".join(lines)
 
 
 def _realm_count(systems: list[dict]) -> int:
@@ -442,8 +581,15 @@ def _consolidate_all(systems: list[dict]) -> list[dict]:
     for s in systems:
         t = normalize_system_type(s.get("类型"))
         s["类型"] = t
-        # 非细分型不该有小境界（模型给了说明类型选错了 ⇒ 去掉，别让它进账）
+        # 非细分型不该有小境界（模型给了说明类型选错了 ⇒ 去掉，别让它进账）。
+        #
+        # ⚠️ 但**不要在这里改类型**：类型是「这套体系有多硬」的约定，
+        # 模型的标签与结构冲突时，剥掉多余的、保留作者/模型给的类型，
+        # 再把冲突**记成一条问题**回灌给模型（见 `system_quality_issues`）。
         if t != "细分型":
+            conflict = any(r.get("小境界") for r in s.get("境界") or [])
+            if conflict:
+                s["类型与小境界不符"] = True
             for realm in s.get("境界") or []:
                 if realm.get("小境界"):
                     realm["小境界"] = []

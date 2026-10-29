@@ -445,9 +445,14 @@ export const api = {
 
   /**
    * AI 生成一套修炼体系 —— **只返回建议，不落库**。
+   *
+   * 失败时 `detail` 说明白问题，`原文` 是模型回的内容（让人能自己判断
+   * 是模型写歪了、还是格式没认出来）。
    */
-  generatePowerSystem: (projectId: number, body: { genre?: string; tone?: string; note?: string }) =>
-    request<{ ok: boolean; 体系?: PowerSystemEntry[]; detail?: string }>(
+  generatePowerSystem: (projectId: number, body: {
+    genre?: string; tone?: string; note?: string; system_type?: string;
+  }) =>
+    request<{ ok: boolean; 体系?: PowerSystemEntry[]; detail?: string; 原文?: string }>(
       `/projects/${projectId}/power-system/generate`,
       jsonInit("POST", body),
     ),

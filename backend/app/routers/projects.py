@@ -1588,6 +1588,12 @@ class PowerSystemGenerateRequest(StrictRequest):
     genre: str = ""
     tone: str = ""
     note: str = ""
+    #: 作者指定的体系类型（细分型 / 序列型 / 粗放型）；空 = 让 AI 自己定。
+    #:
+    #: 为什么要有：类型一直是**模型自己说的** —— 实测要「粗放型」时，
+    #: 模型给了一套细分阶梯并自判「细分型」。作者能说清要哪种时，
+    #: 就该由作者说了算（不合就带原因重试）。
+    system_type: str = ""
 
 
 class TierGenerateRequest(StrictRequest):
@@ -1703,33 +1709,47 @@ def generate_power_system(
         raise HTTPException(status_code=503, detail="LLM 渠道未配置")
 
     from app.generation.power_system_gen import (
-        build_system_prompt, parse_systems, plausible_systems,
+        _SYSTEM_PROMPT, build_system_prompt, parse_systems, retry_instructions,
+        system_quality_issues, type_mismatch_issues,
     )
 
+    want_type = (body.system_type or "").strip()
     prompt = build_system_prompt(body.genre or getattr(proj, "genre", "") or "",
                                  body.tone or getattr(proj, "style", "") or "",
-                                 body.note or "")
-    system = "你在为一本中文小说设计**修炼体系**。"
-    raw = _model_call("生成修炼体系", lambda: provider.chat(system, prompt))
+                                 body.note or "", want_type)
+    # ⚠️ system 段必须是 `_SYSTEM_PROMPT`（含三型说明、硬要求、输出 JSON 的格式）——
+    # 之前这里只发了一行「你在为一本中文小说设计修炼体系。」，
+    # **那份写着全部要求的提示词定义了却从没发出去** ⇒ 模型不知道要输出 JSON、
+    # 不知道三型怎么选、也不知道档位怎么分层（实测因此回表格、回标题、
+    # 把类型猜错、把细分摊平成 90 行）。
+    raw = _model_call("生成修炼体系", lambda: provider.chat(_SYSTEM_PROMPT, prompt))
     systems = parse_systems(raw)
-    if not plausible_systems(systems):
-        # 解析不出来 ⇒ 带一句「只输出 JSON」重试一次。
+    issues = system_quality_issues(systems)
+    issues += type_mismatch_issues(systems, want_type)
+    if issues:
+        # 解析不出来 **或** 解析出来的不像一套体系 ⇒ 带一句硬要求 + **具体错在哪**
+        # 重试一次。
         #
-        # 实测同一天三种形态：`#### 1. 开脉境` 标题 + 正文、Markdown 表格、
-        # 有序列表。解析器追不完，但**回灌一句硬要求**通常一次就够 ——
+        # 实测同一天多种形态：`#### 1. 开脉境` 标题 + 正文、Markdown 表格、
+        # 有序列表；App 自己的 MiniMax 通道还回过**层级被摊平**的一版
+        # （29 个境界，名字是「初期/中期/大圆满」反复出现）。
+        # 解析器追不完，但**回灌一句硬要求 + 指出上一版错在哪**通常一次就够 ——
         # 这是「门槛 + 让执行方自己改」，比无限加形态支持稳。
         raw = _model_call(
             "生成修炼体系（重试）",
-            lambda: provider.chat(
-                system,
-                prompt + "\n\n## 输出格式（硬要求）\n"
-                         "只输出一个 JSON 对象，不要 Markdown 标题、表格、列表或说明文字。",
-            ),
+            lambda: provider.chat(system=_SYSTEM_PROMPT,
+                                  user=prompt + retry_instructions(issues, want_type)),
         )
         systems = parse_systems(raw)
-    if not plausible_systems(systems):
+        issues = system_quality_issues(systems)
+        issues += type_mismatch_issues(systems, want_type)
+    if issues:
+        # 失败时把**模型原文**带出去：只说「认不出」等于让人干瞪眼，
+        # 看到原文才知道是模型写歪了、还是解析器没认出来（这两者的修法完全不同）。
         return {"ok": False,
-                "detail": "AI 回了内容但格式认不出（已按「只输出 JSON」重试一次）"}
+                "detail": "AI 回了内容但认不出是一套体系：" + "；".join(issues[:3])
+                          + "（已按格式要求重试一次）",
+                "原文": (raw or "")[:2000]}
     return {"ok": True, "体系": systems}
 
 

@@ -430,8 +430,12 @@ const pwSystems = ref<any[]>([]);
 const pwTiers = ref<any[]>([]);
 const pwType = ref("序列型");
 const pwGenNote = ref("");
+/** 生成体系时作者指定的体系类型（空 = 由 AI 自行决定）。 */
+const pwGenType = ref("");
 const pwGenResult = ref<any[] | null>(null);
 const tierGenResult = ref<any[] | null>(null);
+/** 生成失败时模型回的内容 —— 让人能自己判断是模型写歪了还是格式没认出来。 */
+const pwRaw = ref<string | null>(null);
 
 const scOpen = ref(false);
 const scList = ref<any[]>([]);
@@ -495,14 +499,17 @@ async function generatePowerSystem() {
   pwErr.value = null;
   pwMsg.value = null;
   pwGenResult.value = null;
+  pwRaw.value = null;
   try {
     const r = await api.generatePowerSystem(project.value.id, {
       genre: (bible.value as any)?.genre || "",
       tone: (bible.value as any)?.style || "",
       note: pwGenNote.value,
+      system_type: pwGenType.value,
     });
     if (!r.ok) {
       pwErr.value = r.detail || "AI 没给出可用体系";
+      pwRaw.value = r.原文 || null;
       return;
     }
     pwGenResult.value = r.体系 || [];
@@ -3187,6 +3194,14 @@ onUnmounted(stopDistillPolling);
         <div v-if="pwErr" class="notice err">{{ pwErr }}</div>
         <div v-else-if="pwMsg" class="notice info">{{ pwMsg }}</div>
 
+        <details v-if="pwRaw" class="faint" style="font-size: var(--fs-xs); margin-top: 6px">
+          <summary>看模型回的内容</summary>
+          <pre
+            style="white-space: pre-wrap; word-break: break-word; margin-top: 6px;
+                   max-height: 320px; overflow: auto"
+          >{{ pwRaw }}</pre>
+        </details>
+
         <!-- 体系 -->
         <div class="row tight" style="gap: 8px; margin: 8px 0">
           <strong style="font-size: var(--fs-sm)">体系</strong>
@@ -3225,6 +3240,16 @@ onUnmounted(stopDistillPolling);
         </div>
 
         <!-- 生成 -->
+        <div class="field" style="margin-top: 10px">
+          <label>体系类型</label>
+          <select class="input" v-model="pwGenType">
+            <option value="">由 AI 自行决定</option>
+            <option v-for="t in PW_TYPES" :key="t.v" :value="t.v">{{ t.v }} —— {{ t.d }}</option>
+          </select>
+          <div class="faint" style="font-size: var(--fs-xs); margin-top: 4px">
+            选定后按这一类生成；不符合会带着原因让 AI 重做。
+          </div>
+        </div>
         <div class="field" style="margin-top: 10px">
           <label>给 AI 的要求（可选）</label>
           <input class="input" v-model="pwGenNote" placeholder="例：境界之间差距不要等差，修行者未必强过凡人" />
