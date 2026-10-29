@@ -92,6 +92,244 @@ def build_system_prompt(genre: str, tone: str, note: str = "") -> str:
     )
 
 
+# ------------------------------------------------------------------ #
+# 标题结构（真实模型最常回的形态）
+# ------------------------------------------------------------------ #
+#
+# 实测原文（2026-10-29 真机，细分型）：
+#
+#     ## 修炼体系：九境九重制
+#     ### 一、总则
+#     ### 二、九境细分
+#     #### 1. 开脉境
+#     引灵气入体，开人体九条主脉。
+#     - **一至三重初期**：开第一至第三主脉，气感初成。
+#     ...
+#
+# 粗放型那篇是 `## 一、凡人（在）` / `## 二、修行者（借）`，
+# 而「修行者」小节里还嵌着一张子表 —— 只认表格就会抓到那张子表。
+
+#: 明显不是境界的标题词（章节名 / 说明段落 / 列表标题 / 疑问句）。
+_NOT_REALM_HINTS = (
+    "总则", "总纲", "概述", "概览", "说明", "规则", "要点", "注意", "附录",
+    "总结", "命名", "称呼", "细分", "列表", "使用", "示例", "补充", "体系",
+    "目录", "前言", "背景", "核心", "原则", "进阶", "晋升", "压制", "突破",
+    "对比", "对照", "门槛", "代价", "写法",
+    # 实测「五、为什么不能假设等差」「六、几条可以直接用的场面」都被当成了境界
+    "为什么", "怎么", "如何", "不能", "可以", "直接", "场面", "等差", "用处",
+)
+
+#: 标题里的序号（`一、` `2.` `（三）`）。**只在标题这条路上用** ——
+#: `_strip_ordinal_prefix` 是表格解析共用的，改它会动「整列都是序号」的判据。
+_HEADING_ORDINAL_RE = re.compile(
+    r"^(?:[（(]?[0-9一二三四五六七八九十]{1,3}[）)]\s*[、.．:：]?\s*"
+    r"|[0-9]{1,3}\s*[.、．:：]\s*"
+    r"|[一二三四五六七八九十]{1,3}\s*[、.．]\s*)"
+)
+
+#: 小境界的列表行（`- **一至三重初期**：开第一至第三主脉`）。
+_BULLET_RE = re.compile(r"^\s*[-*+]\s+(.*\S)\s*$")
+
+#: 小境界的名字里必须带这些层级词。
+#:
+#: ⚠️ 不能把正文里的**任何**列表都当小境界：实测粗放型那篇的正文列表是
+#: 要点（「体魄未必强于凡人武师」「怕弓弩、毒、围杀」），全被当成小境界后
+#: 「有小境界 ⇒ 细分型」误判，10 个境界挂上了假小境界。
+_STAGE_HINTS = ("重", "层", "期", "阶", "品", "级", "段", "第",
+                "初期", "中期", "后期", "大圆满")
+
+
+def _looks_like_stage(name: str) -> bool:
+    """这个名字像不像一个小境界（`一至三重初期` / `第九重`）。"""
+    t = str(name or "").strip()
+    if not t or len(t) > 12:
+        return False
+    return any(h in t for h in _STAGE_HINTS)
+
+
+def _clean_heading_name(title: str) -> str:
+    """标题 → 境界名：去序号、去加粗、去末尾括注。"""
+    t = _strip_md(title or "").strip()
+    t = _HEADING_ORDINAL_RE.sub("", t, count=1).strip()
+    t = _strip_ordinal_prefix(t)
+    t = re.sub(r"[（(][^）)]{0,12}[）)]\s*$", "", t).strip()
+    return t
+
+
+def _looks_like_realm(title: str) -> bool:
+    """这个标题像不像一个境界名（短、不是句子、不是章节名）。"""
+    t = _clean_heading_name(title)
+    if not t or len(t) > 12:
+        return False
+    if any(h in t for h in _NOT_REALM_HINTS):
+        return False
+    if re.search(r"[。！？；，、]", t):
+        return False
+    return True
+
+
+def _squash(text: str, limit: int = 160) -> str:
+    """把一段正文压成一句（去加粗/多余空白，截断）。"""
+    t = _strip_md(text or "")
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > limit:
+        t = t[:limit].rstrip("，、；： ") + "…"
+    return t
+
+
+def _bullets_of(body_lines: list[str]) -> list[dict]:
+    """正文里的列表 → 小境界（`名称：说明`）。"""
+    out: list[dict] = []
+    for line in body_lines:
+        m = _BULLET_RE.match(line)
+        if not m:
+            continue
+        item = _strip_md(m.group(1)).strip()
+        if not item or len(item) > 60:
+            continue
+        head, _, tail = item.partition("：")
+        if not tail:
+            head, _, tail = item.partition(":")
+        name = _squash(head, 24)
+        if not _looks_like_stage(name):
+            continue
+        entry = {"名称": name}
+        desc = _squash(tail, 80)
+        if desc:
+            entry["说明"] = desc
+        out.append(entry)
+    return out
+
+
+#: 有序列表项（`1. **炼气境**` / `2、筑基境`）。
+_NUM_ITEM_RE = re.compile(r"^\s*([0-9]{1,2})\s*[.、．]\s*(?:\*\*)?(.+?)(?:\*\*)?\s*$")
+
+
+def _parse_systems_from_list(text: str) -> list[dict]:
+    """从**有序列表**还原体系（`1. **炼气境**` + 缩进小境界）。
+
+    实测（2026-10-29 真机第二轮）：同一个提示词，模型这次回的是有序列表，
+    既没有 `#` 标题也没有表格 —— 只认标题和表格就又「解析不出体系」。
+    """
+    lines = str(text or "").splitlines()
+    items: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        m = _NUM_ITEM_RE.match(line)
+        if not m:
+            continue
+        title = _strip_md(m.group(2)).strip()
+        if not _looks_like_realm(title):
+            continue
+        items.append((i, title))
+    if len(items) < 3:
+        return []
+
+    realms: list[dict] = []
+    for k, (i, title) in enumerate(items):
+        end = items[k + 1][0] if k + 1 < len(items) else len(lines)
+        body = lines[i + 1:end]
+        name = _clean_heading_name(title)
+        if not name:
+            continue
+        realm: dict[str, Any] = {"名称": name}
+        prose = [
+            ln for ln in body
+            if ln.strip() and not _BULLET_RE.match(ln) and not ln.lstrip().startswith("#")
+        ]
+        desc = _squash(" ".join(prose))
+        if desc:
+            realm["说明"] = desc
+        stages = _bullets_of(body)
+        if stages:
+            realm["小境界"] = stages
+        realms.append(realm)
+    if len(realms) < 3:
+        return []
+
+    title0 = ""
+    for line in lines:
+        m = re.match(r"^#{1,2}\s+(.*\S)\s*$", line)
+        if m:
+            title0 = _strip_md(m.group(1)).strip()
+            break
+    wrapped = title0.strip("《》「」【】")
+    if wrapped and wrapped != title0:
+        sys_name = wrapped.strip()
+    elif title0:
+        sys_name = re.split(r"[：:]", title0)[-1].strip() or title0
+    else:
+        sys_name = "（未命名体系）"
+    return [{"名称": _squash(sys_name, 24), "境界": realms}]
+
+
+def _parse_systems_from_headings(text: str) -> list[dict]:
+    """从标题结构还原体系。凑不出 ≥3 个境界就返回空（交给表格那条路）。"""
+    lines = str(text or "").splitlines()
+    heads: list[tuple[int, int, str]] = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^(#{1,4})\s+(.*\S)\s*$", line)
+        if m:
+            heads.append((len(m.group(1)), i, m.group(2)))
+    if not heads:
+        return []
+
+    by_level: dict[int, list[tuple[int, str]]] = {}
+    for level, i, title in heads:
+        by_level.setdefault(level, []).append((i, title))
+
+    # 哪一层的「像境界的标题」最多就用哪一层（细分型在 h4，粗放型在 h2）
+    best: list[tuple[int, str]] = []
+    for level in sorted(by_level):
+        cand = [(i, t) for i, t in by_level[level] if _looks_like_realm(t)]
+        if len(cand) > len(best):
+            best = cand
+    if len(best) < 3:
+        return []
+
+    realms: list[dict] = []
+    for i, title in best:
+        name = _clean_heading_name(title)
+        if not name:
+            continue
+        end = len(lines)
+        for _level, j, _t in heads:
+            if j > i:
+                end = j
+                break
+        body = lines[i + 1:end]
+        realm: dict[str, Any] = {"名称": name}
+        prose = [ln for ln in body if ln.strip() and not _BULLET_RE.match(ln)]
+        desc = _squash(" ".join(prose))
+        if desc:
+            realm["说明"] = desc
+        stages = _bullets_of(body)
+        if stages:
+            realm["小境界"] = stages
+        realms.append(realm)
+    if len(realms) < 3:
+        return []
+
+    # 体系名：取最靠前的那个标题，去掉「修炼体系：」这类前缀
+    title0 = _strip_md(heads[0][2]).strip()
+    # 《缄默名录》《四境：在、借、有、是》 —— 书名号里就是体系名，
+    # 别再按冒号切（切了会剩「在、借、有、是》」这种半截）
+    wrapped = title0.strip("《》「」【】")
+    if wrapped != title0:
+        sys_name = wrapped.strip()
+    else:
+        sys_name = re.split(r"[：:]", title0)[-1].strip() or title0
+    sys_name = _squash(sys_name, 24)
+    system: dict[str, Any] = {"名称": sys_name, "境界": realms}
+    return [system]
+
+
+def _realm_count(systems: list[dict]) -> int:
+    """这组解析结果里第一个体系有几个境界（0 表示没有）。"""
+    if not systems:
+        return 0
+    return len((systems[0] or {}).get("境界") or [])
+
+
 def parse_systems(raw: Any) -> list[dict]:
     """解析体系生成结果。
 
@@ -105,10 +343,22 @@ def parse_systems(raw: Any) -> list[dict]:
         systems = normalize_power_system(raw_systems)["体系"]
         if systems:
             return _consolidate_all(systems)
-    # JSON 拿不到 ⇒ 试 Markdown 表格
-    systems = _parse_systems_from_table(str(raw or ""))
-    # 表格解析没有「类型」字段 ⇒ 从内容推断（粗放型的标志）
+    # ② 两条路都跑，**谁给出的境界更多就用谁**。
+    #
+    # 为什么不是「标题优先」就完事：实测序列型那篇正文里有 3 个短章节标题
+    # （承名 / 序列内部无小境界 / 名债与畸变），真正的阶梯却是那张 22 行的表；
+    # 反过来粗放型那篇的真境界是 4 个 `##` 标题，文档里还嵌着一张 3 行子表。
+    # 两种错法都见过 ⇒ 只能比数量。相同则标题优先（结构证据比猜表强）。
     _text = str(raw or "")
+    # 三条路都跑，取境界最多的那个（相同则按下面的顺序优先）：
+    #   标题结构 → 有序列表 → 表格
+    candidates = [
+        _parse_systems_from_headings(_text),
+        _parse_systems_from_list(_text),
+        _parse_systems_from_table(_text),
+    ]
+    systems = max(candidates, key=_realm_count) if any(candidates) else []
+    # 解析结果都没有「类型」字段 ⇒ 从内容推断（粗放型的标志）
     for s in systems:
         if not s.get("类型"):
             s["类型"] = _infer_system_type(s, _text)
@@ -140,11 +390,19 @@ def _infer_system_type(system: dict, source_text: str = "") -> str:
     names = [str(r.get("名称") or "") for r in (system or {}).get("境界") or []]
     if names and all(any(h in n for h in _SOFT_REALM_HINTS) for n in names):
         return "粗放型"
-    # 正文里明说「不细分 / 边界模糊 / 不一定均匀」⇒ 粗放型
-    if source_text and any(k in source_text for k in
-                            ("不细分", "边界模糊", "不一定均匀", "不能假设等差",
-                             "跨度", "阶段只决定")):
-        return "粗放型"
+    # 每境再分小境界 ⇒ **按定义**就是细分型。
+    #
+    # 提示词里写死「只有细分型才给小境界」；少了这条，默认类型会落到
+    # 序列型，随后 `_consolidate_all` 会把小境界整段抹掉（实测：细分型
+    # 的九重细分解析出来后又变空）。
+    if any(r.get("小境界") for r in (system or {}).get("境界") or []):
+        return "细分型"
+    # ⚠️ 这里**故意不再看正文关键词**。
+    #
+    # 实测（2026-10-29）：序列型那篇里有一句「序列内**不细分**小境界」，
+    # 命中关键词「不细分」⇒ 整篇被判成粗放型 —— 那句话的含义恰好相反。
+    # 散文里的词只能当线索，不能当判据；结构（有没有小境界、有没有
+    # 内部跨度列、境界名是不是大阶段词）才可靠。
     return given
 
 
@@ -300,19 +558,33 @@ def _parse_systems_from_table(text: str) -> list[dict]:
     header = rows[0]
     body = rows[1:]
     # 表头行必须是「有内容的列名」，且至少认出一列名称
-    idx: dict[str, int] = {}
-    for field, aliases in _COL_ALIASES.items():
-        for i, h in enumerate(header):
-            if h and h in aliases and field not in idx:
-                idx[field] = i
-    if "名称" not in idx:
+    # ① **先**定「名称」列：别名优先，认不出就按位置推断。
+    name_col: int | None = None
+    for i, h in enumerate(header):
+        if h and h in _COL_ALIASES["名称"]:
+            name_col = i
+            break
+    if name_col is None:
         # —— 兜底 1：按位置推断（别名表追不上模型的自创列名）——
         name_col = _guess_name_column(header)
-        if name_col is None:
-            return []
-        idx["名称"] = name_col
-    else:
-        name_col = idx["名称"]
+    if name_col is None:
+        return []
+
+    # ② 其余列：**排除名称列**。
+    #
+    # 实测（2026-10-29 真机录制原文）：表头是「阶段/契约对象/力量来源/…」，
+    # 「阶段」在档位别名里 ⇒ 第一列既被当境界名、又被当档位；随后
+    # 「档位值 == 境界名 ⇒ 不当档位」的守卫把它丢掉，整列作废、
+    # 档位全空。同一列不该身兼两职。
+    idx: dict[str, int] = {"名称": name_col}
+    for field, aliases in _COL_ALIASES.items():
+        if field == "名称":
+            continue
+        for i, h in enumerate(header):
+            if i == name_col:
+                continue
+            if h and h in aliases and field not in idx:
+                idx[field] = i
     realms: list[dict] = []
     for row in body:
         ni = idx.get("名称")
@@ -340,6 +612,16 @@ def _parse_systems_from_table(text: str) -> list[dict]:
                 if k:
                     realm[key] = k
                     desc_parts.append(f"{key}：{k}")
+        if not desc_parts:
+            # 认不出「说明」列 ⇒ 把**没被用作名称/档位**的其它列拼起来。
+            # 实测列名是「实际战力 / 弱点」，任何别名表都追不上；
+            # 没有说明的境界渲染进提示词后等于空话。
+            used = {idx.get("名称"), idx.get("档位")}
+            extra = [
+                _strip_md(cell) for i, cell in enumerate(row)
+                if i not in used and _strip_md(cell)
+            ]
+            desc_parts.extend(extra[:3])
         if desc_parts:
             realm["说明"] = "；".join(desc_parts)
         bi = idx.get("档位")

@@ -247,6 +247,32 @@ _FALLBACK_BAND_NAMES: tuple[str, ...] = (
 )
 
 
+def _derive_bands(system: dict) -> dict:
+    """体系里**一个档位都没有**时，按境界顺序派生出少数几档。
+
+    为什么要有（2026-10-29 真机录制取证）：真实模型常回 Markdown 表格，
+    而表格里往往没有档位列（实测表头是「阶段 / 契约对象 / 力量来源 /
+    强项 / 死穴 / 内部跨度」）⇒ `bands_of` 为空 ⇒「档位分层」这个
+    群像抓手落空：路人甲没有档次可归，只能一个个建档。
+
+    纪律：
+    - 派生只做**分层**，不做**强弱比较** —— 档位名取中性闭集，
+      粗放型照样不参与序数比较（`realm_rank` 仍返 None）；
+    - 只在**完全没有**档位时动手；模型给了档位就一个字都不改。
+    """
+    realms = system.get("境界") or []
+    n = len(realms)
+    if n < 2:
+        return system
+    groups = min(MAX_BANDS, n)
+    for i, realm in enumerate(realms):
+        idx = i * groups // n
+        realm["档位"] = _FALLBACK_BAND_NAMES[
+            min(idx, len(_FALLBACK_BAND_NAMES) - 1)]
+    system["境界"] = realms
+    return system
+
+
 def consolidate_bands(system: dict) -> dict:
     """档位过多时，按境界顺序**归纳**成少数几档。
 
@@ -262,6 +288,9 @@ def consolidate_bands(system: dict) -> dict:
     if not realms:
         return system
     bands = bands_of(system)
+    if not bands:
+        # 一个档位都没有（表格形态常见）⇒ 派生，别让分层抓手落空
+        return _derive_bands(system)
     if len(bands) <= MAX_BANDS and all(
             len(str(r.get("档位") or "")) <= 8 for r in realms):
         return system

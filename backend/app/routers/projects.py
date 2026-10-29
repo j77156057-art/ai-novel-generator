@@ -1707,13 +1707,27 @@ def generate_power_system(
     prompt = build_system_prompt(body.genre or getattr(proj, "genre", "") or "",
                                  body.tone or getattr(proj, "style", "") or "",
                                  body.note or "")
-    raw = _model_call(
-        "生成修炼体系",
-        lambda: provider.chat("你在为一本中文小说设计**修炼体系**。", prompt),
-    )
+    system = "你在为一本中文小说设计**修炼体系**。"
+    raw = _model_call("生成修炼体系", lambda: provider.chat(system, prompt))
     systems = parse_systems(raw)
     if not systems:
-        return {"ok": False, "detail": "AI 没给出可用体系（可重试或改要求）"}
+        # 解析不出来 ⇒ 带一句「只输出 JSON」重试一次。
+        #
+        # 实测同一天三种形态：`#### 1. 开脉境` 标题 + 正文、Markdown 表格、
+        # 有序列表。解析器追不完，但**回灌一句硬要求**通常一次就够 ——
+        # 这是「门槛 + 让执行方自己改」，比无限加形态支持稳。
+        raw = _model_call(
+            "生成修炼体系（重试）",
+            lambda: provider.chat(
+                system,
+                prompt + "\n\n## 输出格式（硬要求）\n"
+                         "只输出一个 JSON 对象，不要 Markdown 标题、表格、列表或说明文字。",
+            ),
+        )
+        systems = parse_systems(raw)
+    if not systems:
+        return {"ok": False,
+                "detail": "AI 回了内容但格式认不出（已按「只输出 JSON」重试一次）"}
     return {"ok": True, "体系": systems}
 
 
