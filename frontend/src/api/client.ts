@@ -69,6 +69,10 @@ import type {
   StyleDistillListResponse,
   StyleNarrativeConflictsResponse,
   PersonaCompleteResponse,
+  CardsBatchResponse,
+  CharacterCard,
+  CharacterCardListResponse,
+  VoiceCollision,
   PersonaListResponse,
   PersonaSaveRequest,
   StyleNarrativeRepairResponse,
@@ -384,6 +388,39 @@ export const api = {
       `/projects/${projectId}/style-narrative/personas/complete`,
       jsonInit("POST", body),
     ),
+  /**
+   * 列出所有角色的卡（含声纹撞车提示）。
+   */
+  listCharacterCards: (projectId: number) =>
+    request<CharacterCardListResponse>(`/projects/${projectId}/character-cards`),
+
+  /**
+   * 保存**用户编辑过**的卡（落库后标 `来源=user`，自动流程不覆盖）。
+   */
+  saveCharacterCard: (projectId: number, body: { name: string; card: CharacterCard }) =>
+    request<{ ok: boolean; name: string; card: CharacterCard }>(
+      `/projects/${projectId}/character-cards`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * 给一个已有角色补全卡 —— **只返回建议，不落库**。
+   */
+  generateCharacterCard: (projectId: number, body: { name: string; card?: CharacterCard; note?: string }) =>
+    request<{ ok: boolean; name?: string; 补充?: CharacterCard; 说明?: string; voice_collisions?: VoiceCollision[]; detail?: string }>(
+      `/projects/${projectId}/character-cards/generate`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * **批量**新建角色卡（互相避让；撞了就重写）—— **只返回建议，不落库**。
+   */
+  generateCharacterCardsBatch: (projectId: number, body: { wants: string[]; note?: string }) =>
+    request<CardsBatchResponse>(
+      `/projects/${projectId}/character-cards/batch`,
+      jsonInit("POST", body),
+    ),
+
 
   buildKg: (projectId: number, novelId?: number | null) =>
     request<{ characters: number; plotholes: number; relationships: number }>(

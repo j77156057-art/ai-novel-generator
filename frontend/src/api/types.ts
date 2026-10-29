@@ -1621,3 +1621,75 @@ export interface RoleplayChatResult {
   has_evidence: boolean;
   elapsed: number;
 }
+
+// ====================================================================
+// 角色卡（2026-10-29）：身份 / 能力（武器·功法·能力）/ 声纹 / 关系
+// ====================================================================
+
+/** 武器/功法/能力的一条。 */
+export interface CardAbilityItem {
+  名称: string;
+  说明?: string;
+}
+
+/** 角色卡的「能力」组。 */
+export interface CardAbility {
+  武器?: CardAbilityItem[];
+  功法?: CardAbilityItem[];
+  能力?: CardAbilityItem[];
+  /** 他做不到什么 —— 防止角色越写越强。 */
+  能力上限?: string[];
+}
+
+/** 角色卡的「声纹」组 —— **可执行锚点**，不是形容词。 */
+export interface CardVoice {
+  自称?: string;
+  称呼他人?: string[];
+  句长?: string;
+  句末?: string;
+  口头禅?: string[];
+  禁用词?: string[];
+  语气底色?: string;
+}
+
+/** 角色卡。 */
+export interface CharacterCard {
+  身份?: Record<string, string>;
+  能力?: CardAbility;
+  声纹?: CardVoice;
+  关系?: Record<string, string>;
+  来源?: string;
+}
+
+/** GET /projects/{id}/character-cards 的一项。 */
+export interface CharacterCardItem {
+  name: string;
+  role: string;
+  motivation: string;
+  card: CharacterCard;
+  card_source: string;
+  persona: Record<string, unknown>;
+  persona_source: string;
+}
+
+/** 声纹撞车（「这几个人说话太像」）。 */
+export interface VoiceCollision {
+  人物: string[];
+  相同: string[];
+  建议: string;
+}
+
+/** GET /projects/{id}/character-cards 的响应。 */
+export interface CharacterCardListResponse {
+  characters: CharacterCardItem[];
+  voice_collisions: VoiceCollision[];
+}
+
+/** POST /projects/{id}/character-cards/batch 的响应（**没落库**）。 */
+export interface CardsBatchResponse {
+  ok: boolean;
+  角色: Record<string, CharacterCard>;
+  冲突: VoiceCollision[];
+  轮次: number;
+  detail?: string;
+}

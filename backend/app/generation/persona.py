@@ -139,6 +139,17 @@ def character_line(char: Any) -> str:
     extra = render_persona(char.get("persona"))
     if extra:
         head += " ｜ " + extra
+    # 角色卡（2026-10-29）：武器/功法/能力/声纹随角色一起进提示词。
+    card = char.get("card")
+    if isinstance(card, dict) and card:
+        try:
+            from app.generation.character_card import render_card
+
+            card_text = render_card(card)
+        except Exception:  # noqa: BLE001 —— 档案渲染失败不该让整行丢掉
+            card_text = ""
+        if card_text:
+            head += "\n  ↳ " + card_text
     return head
 
 
@@ -258,14 +269,77 @@ def derive_personas(provider: Any, sources: dict[str, list[str]]) -> dict[str, d
         return {}
 
 
-def character_snippets(text: str, name: str, limit: int = 6, window: int = 180) -> list[str]:
-    """从正文里取某角色出现过的片段（名字周围的窗口）。
+def attributed_lines(text: str, name: str, *,
+                     other_names: Iterable[str] | None = None) -> list[str]:
+    """正文里**能确定是这个角色**的行（含台词的整行原文）。
 
-    不用 KG（异步、可能还没抽完）—— 直接从正文找，最可靠也最省事。
+    ## 为什么必须判「独占」（2026-10-29 实测）
+
+    原来取「名字周围 180 字窗口」（`character_snippets` 的旧实现）⇒
+    窗口里**必然混进别人的台词**，模型据此反推的「说话方式」是几个人的混合。
+
+    实测（发布版冒烟库 project=5，肉眼看真实台词）：
+    「沉日者。」「你迟了。」这两句**同时**被算进白烬和沉日者，
+    「我从未参与那一战。」同时被算进顾星河和伊芙琳 ——
+    因为这些行里出现了**两个**角色名（如「白烬抬头。「沉日者。」」）。
+    于是白烬的 persona 把沉日者的台词记成了自己的口头禅。
+
+    ## 判据（保守，宁可少不可错）
+
+    按行切分；只保留**同时满足**：
+
+    1. 这一行出现 `name`；
+    2. 这一行**不出现任何别的角色名**（`other_names` 里除自己以外的）；
+    3. 这一行要么有引号（台词），要么至少有名字（旁白里的动作）。
+
+    第 2 条是核心：一行里两个名字 ⇒ 分不清谁在说 ⇒ **整行不要**。
+    这会让样本变少（实测 project=5 里约四成的行被挡掉），
+    但留下的每一行都确定是这个人 —— 归属错了比样本少坏得多。
     """
     if not text or not name:
         return []
+    others = [str(n) for n in (other_names or []) if n and str(n) != name]
     out: list[str] = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line or name not in line:
+            continue
+        # 一行里出现别的角色名 ⇒ 归属不明 ⇒ 整行不要。
+        if any(o in line for o in others):
+            continue
+        out.append(line)
+    return out
+
+
+def character_snippets(text: str, name: str, limit: int = 6, window: int = 180,
+                       *, other_names: Iterable[str] | None = None) -> list[str]:
+    """从正文里取某角色出现过的片段（**归属明确**的那些行）。
+
+    不用 KG（异步、可能还没抽完）—— 直接从正文找，最可靠也最省事。
+
+    `other_names`：本项目所有角色名。给了就启用「独占」过滤
+    （见 `attributed_lines` 的理由）；不给则退化成旧行为（只按名字找）。
+
+    ⚠️ **调用方应该传 `other_names`** —— 不传就等于没修掉归属污染。
+    """
+    if not text or not name:
+        return []
+    if other_names is not None:
+        lines = attributed_lines(text, name, other_names=other_names)
+        # 每行的上下文窗口按 window 截一下（一行可能很长，别把整页塞进提示词）
+        out: list[str] = []
+        for line in lines:
+            if len(out) >= limit:
+                break
+            if len(line) <= window * 2:
+                out.append(line)
+            else:
+                i = line.find(name)
+                start = max(0, i - window)
+                out.append(line[start:start + window * 2])
+        return out
+    # —— 旧行为（无 other_names 时）：名字周围的窗口 ——
+    out = []
     i = text.find(name)
     while i >= 0 and len(out) < limit:
         out.append(text[max(0, i - window): i + len(name) + window])
@@ -493,6 +567,10 @@ def refresh_personas(db: Any, project: Any, provider: Any, *,
         stamp = f"seg{latest}"
         stale: list[dict] = []
         sources: dict[str, list[str]] = {}
+        # 全部角色名：传给 character_snippets 做「独占」过滤。
+        # 不传就等于没修掉归属污染（实测白烬把沉日者的台词记成自己的口头禅）。
+        all_names = [str(c.get("name")) for c in chars
+                     if isinstance(c, dict) and c.get("name")]
         for c in chars:
             if not isinstance(c, dict) or not c.get("name"):
                 continue
@@ -502,7 +580,8 @@ def refresh_personas(db: Any, project: Any, provider: Any, *,
             updated = str(persona.get("更新于") or "")
             if updated and updated == stamp:
                 continue  # 已按这一段正文反推过（段号指纹相同）
-            snips = character_snippets(text, str(c.get("name")))
+            snips = character_snippets(text, str(c.get("name")),
+                                       other_names=all_names)
             if not snips:
                 continue
             stale.append(c)

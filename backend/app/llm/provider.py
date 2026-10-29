@@ -213,13 +213,18 @@ class OpenAICompatibleChatProvider(LLMProvider):
     def __init__(self, api_key: str, base_url: str, model: str, extra_body: dict | None = None,
                  models: list[str] | None = None,
                  max_tokens: int | None = None, timeout: int = 120,
-                 stream_timeout: int = 180) -> None:
+                 stream_timeout: int = 180,
+                 extra_headers: dict | None = None) -> None:
         if not api_key:
             raise ValueError(f"{self.label} 需要 API key")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.extra_body = extra_body or {}
+        # 额外请求头（默认空 ⇒ 与从前逐字节相同）。
+        # 用途：opencode Go 订阅端点必须带 `x-opencode-session`，
+        # 否则 400 MissingSessionID（2026-10-29 实测）。
+        self.extra_headers = dict(extra_headers or {})
         # None = 不在请求体里加 max_tokens（保留 Writer 原行为，调用方需明确给值才注入）
         self.max_tokens = max_tokens
         # 最近一次调用的 finish_reason（'length' = 被 max_tokens 截断）。
@@ -283,6 +288,8 @@ class OpenAICompatibleChatProvider(LLMProvider):
                 req = urllib.request.Request(f"{self.base_url}/chat/completions", data=body, method="POST")
                 req.add_header("Authorization", f"Bearer {self.api_key}")
                 req.add_header("Content-Type", "application/json")
+                for _hk, _hv in self.extra_headers.items():
+                    req.add_header(_hk, _hv)
                 try:
                     with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
@@ -406,6 +413,8 @@ class OpenAICompatibleChatProvider(LLMProvider):
                     )
                     req.add_header("Authorization", f"Bearer {self.api_key}")
                     req.add_header("Content-Type", "application/json")
+                    for _hk, _hv in self.extra_headers.items():
+                        req.add_header(_hk, _hv)
                     with urllib.request.urlopen(req, timeout=self.stream_timeout) as resp:
                         # 推理块逐 token 到达，不能逐块简单替换——开标签会被
                         # token 边界切断（"<thi" + "nk>"）。过滤器对"可能是开
@@ -703,13 +712,14 @@ class GenericOpenAIChatProvider(OpenAICompatibleChatProvider):
 
     def __init__(self, api_key: str, base_url: str, model: str,
                  models: list[str] | None = None,
-                 thinking_off: bool = False, **kwargs) -> None:
+                 thinking_off: bool = False,
+                 extra_headers: dict | None = None, **kwargs) -> None:
         extra: dict = {}
         if thinking_off:
             # 实测：DeepSeek 认这个字段；不认 reasoning_effort（传了没反应）。
             extra["thinking"] = {"type": "disabled"}
         super().__init__(api_key, base_url, model, extra_body=extra,
-                         models=models, **kwargs)
+                         models=models, extra_headers=extra_headers, **kwargs)
 
 
 class LocalFallbackLLMProvider(LLMProvider):

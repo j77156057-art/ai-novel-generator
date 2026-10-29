@@ -105,6 +105,314 @@ const answers = reactive<Record<string, string>>({});
 const buildingBible = ref(false);
 const bible = ref<PlotBible | null>(null);
 
+// ===== 角色卡：身份/能力（武器·功法·能力）/声纹/关系（2026-10-29） =====
+//
+// 用户的诉求：「新建角色时 AI 自动添加性格、行为、关系、口头禅」+
+// 「不要千篇一律，不能几个人说话方式差不多」+「记录武器功法能力」。
+//
+// 三条规矩（与后端 app/generation/character_card.py 一致）：
+// 1. 你改的归你：保存后标「你写的」，自动流程不会覆盖；
+// 2. AI 只给建议，不替你决定 —— 采纳要你点保存；
+// 3. 声纹是可比的锚点（自称/句长/句末/口头禅），撞了就提示你改。
+const cardsOpen = ref(false);
+const cardsList = ref<any[]>([]);
+const cardCollisions = ref<any[]>([]);
+const cardsBusy = ref(false);
+const cardsMsg = ref<string | null>(null);
+const cardsErr = ref<string | null>(null);
+
+// 单角色编辑
+const cardEditOpen = ref(false);
+const cardEditChar = ref<any>(null);
+const cardForm = reactive<any>({
+  性别: "", 年龄: "", 外貌: "", 身份职业: "", 出身背景: "",
+  武器: "", 功法: "", 能力: "", 能力上限: "",
+  自称: "", 称呼他人: "", 句长: "", 句末: "", 口头禅: "", 禁用词: "", 语气底色: "",
+  关系: "",
+});
+const cardNote = ref("");
+const cardAi = ref<any | null>(null);
+const cardAiMsg = ref<string | null>(null);
+
+// 批量新建
+const batchOpen = ref(false);
+const batchWants = ref("");
+const batchNote = ref("");
+const batchResult = ref<any | null>(null);
+
+function _linesToText(v: any): string {
+  if (Array.isArray(v)) return v.join("\n");
+  return String(v ?? "");
+}
+
+function _textToLines(s: string): string[] {
+  return String(s || "")
+    .split(/\n+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+/** 「名称：说明」逐行 → [{名称,说明}] */
+function _abilityItems(s: string): { 名称: string; 说明: string }[] {
+  return _textToLines(s).map((line) => {
+    const m = line.match(/^(.{1,40}?)[：:]\s*(.*)$/);
+    return m ? { 名称: m[1].trim(), 说明: m[2].trim() } : { 名称: line, 说明: "" };
+  });
+}
+
+function _abilityText(items: any): string {
+  if (!Array.isArray(items)) return "";
+  return items
+    .map((it: any) =>
+      typeof it === "object" && it
+        ? it.说明 ? `${it.名称}：${it.说明}` : String(it.名称 ?? "")
+        : String(it ?? ""),
+    )
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function loadCards() {
+  if (!project.value) return;
+  cardsBusy.value = true;
+  cardsErr.value = null;
+  try {
+    const r = await api.listCharacterCards(project.value.id);
+    cardsList.value = r.characters || [];
+    cardCollisions.value = r.voice_collisions || [];
+  } catch (e: any) {
+    cardsErr.value = String(e?.message || e);
+  } finally {
+    cardsBusy.value = false;
+  }
+}
+
+async function openCardsPanel() {
+  cardsOpen.value = true;
+  cardsMsg.value = null;
+  await loadCards();
+}
+
+function openCardEdit(c: any) {
+  cardEditChar.value = c;
+  const card = c.card || {};
+  const ident = card.身份 || {};
+  const ability = card.能力 || {};
+  const voice = card.声纹 || {};
+  cardForm.性别 = ident.性别 || "";
+  cardForm.年龄 = ident.年龄 || "";
+  cardForm.外貌 = ident.外貌 || "";
+  cardForm.身份职业 = ident.身份职业 || "";
+  cardForm.出身背景 = ident.出身背景 || "";
+  cardForm.武器 = _abilityText(ability.武器);
+  cardForm.功法 = _abilityText(ability.功法);
+  cardForm.能力 = _abilityText(ability.能力);
+  cardForm.能力上限 = _linesToText(ability.能力上限);
+  cardForm.自称 = voice.自称 || "";
+  cardForm.称呼他人 = _linesToText(voice.称呼他人);
+  cardForm.句长 = voice.句长 || "";
+  cardForm.句末 = voice.句末 || "";
+  cardForm.口头禅 = _linesToText(voice.口头禅);
+  cardForm.禁用词 = _linesToText(voice.禁用词);
+  cardForm.语气底色 = voice.语气底色 || "";
+  const rel = card.关系 || {};
+  cardForm.关系 = Object.entries(rel)
+    .map(([k, v]) => `${k}：${v}`)
+    .join("\n");
+  cardNote.value = "";
+  cardAi.value = null;
+  cardAiMsg.value = null;
+  cardsErr.value = null;
+  cardEditOpen.value = true;
+}
+
+function closeCardEdit() {
+  cardEditOpen.value = false;
+  cardEditChar.value = null;
+}
+
+/** 表单 → 卡结构（空项不写，避免把空串塞进库） */
+function cardPayload(): any {
+  const ident: Record<string, string> = {};
+  for (const k of ["性别", "年龄", "外貌", "身份职业", "出身背景"]) {
+    if (cardForm[k]?.trim()) ident[k] = cardForm[k].trim();
+  }
+  const ability: any = {};
+  const w = _abilityItems(cardForm.武器);
+  const g = _abilityItems(cardForm.功法);
+  const n = _abilityItems(cardForm.能力);
+  const cap = _textToLines(cardForm.能力上限);
+  if (w.length) ability.武器 = w;
+  if (g.length) ability.功法 = g;
+  if (n.length) ability.能力 = n;
+  if (cap.length) ability.能力上限 = cap;
+
+  const voice: any = {};
+  if (cardForm.自称?.trim()) voice.自称 = cardForm.自称.trim();
+  if (cardForm.句长?.trim()) voice.句长 = cardForm.句长.trim();
+  if (cardForm.句末?.trim()) voice.句末 = cardForm.句末.trim();
+  if (cardForm.语气底色?.trim()) voice.语气底色 = cardForm.语气底色.trim();
+  const ct = _textToLines(cardForm.称呼他人);
+  const kt = _textToLines(cardForm.口头禅);
+  const ban = _textToLines(cardForm.禁用词);
+  if (ct.length) voice.称呼他人 = ct;
+  if (kt.length) voice.口头禅 = kt;
+  if (ban.length) voice.禁用词 = ban;
+
+  const rel: Record<string, string> = {};
+  for (const line of _textToLines(cardForm.关系)) {
+    const m = line.match(/^(.{1,30}?)[：:]\s*(.+)$/);
+    if (m) rel[m[1].trim()] = m[2].trim();
+  }
+
+  const card: any = {};
+  if (Object.keys(ident).length) card.身份 = ident;
+  if (Object.keys(ability).length) card.能力 = ability;
+  if (Object.keys(voice).length) card.声纹 = voice;
+  if (Object.keys(rel).length) card.关系 = rel;
+  return card;
+}
+
+async function askAiCompleteCard() {
+  if (!project.value || !cardEditChar.value) return;
+  cardsBusy.value = true;
+  cardsErr.value = null;
+  cardAiMsg.value = null;
+  try {
+    const r = await api.generateCharacterCard(project.value.id, {
+      name: cardEditChar.value.name,
+      card: cardPayload(),
+      note: cardNote.value,
+    });
+    if (!r.ok) {
+      cardsErr.value = r.detail || "AI 没给出可用结果";
+      return;
+    }
+    cardAi.value = r.补充 || null;
+    cardAiMsg.value = r.说明 || "AI 已补全，确认后点保存";
+    if (r.voice_collisions?.length) {
+      cardAiMsg.value += `　⚠️ 与 ${r.voice_collisions.length} 个角色的说话方式相近，建议改句长或句末`;
+    }
+  } catch (e: any) {
+    cardsErr.value = String(e?.message || e);
+  } finally {
+    cardsBusy.value = false;
+  }
+}
+
+/** 把 AI 建议填进表单（只填空，不覆盖你已经写的） */
+function applyCardAi() {
+  const c = cardAi.value;
+  if (!c) return;
+  const ident = c.身份 || {};
+  for (const k of ["性别", "年龄", "外貌", "身份职业", "出身背景"]) {
+    if (!cardForm[k]?.trim() && ident[k]) cardForm[k] = ident[k];
+  }
+  const ability = c.能力 || {};
+  for (const [k, key] of [["武器", "武器"], ["功法", "功法"], ["能力", "能力"]] as const) {
+    if (!String(cardForm[key] || "").trim() && ability[k]) {
+      cardForm[key] = _abilityText(ability[k]);
+    }
+  }
+  if (!String(cardForm.能力上限 || "").trim() && ability.能力上限?.length) {
+    cardForm.能力上限 = _linesToText(ability.能力上限);
+  }
+  const voice = c.声纹 || {};
+  for (const k of ["自称", "句长", "句末", "语气底色"]) {
+    if (!cardForm[k]?.trim() && voice[k]) cardForm[k] = voice[k];
+  }
+  for (const k of ["称呼他人", "口头禅", "禁用词"]) {
+    if (!String(cardForm[k] || "").trim() && voice[k]?.length) {
+      cardForm[k] = _linesToText(voice[k]);
+    }
+  }
+  if (!String(cardForm.关系 || "").trim() && c.关系) {
+    cardForm.关系 = Object.entries(c.关系)
+      .map(([k, v]) => `${k}：${v}`)
+      .join("\n");
+  }
+  cardAi.value = null;
+  cardAiMsg.value = "已填入空缺项（你写过的没动）";
+}
+
+async function saveCard() {
+  if (!project.value || !cardEditChar.value) return;
+  cardsBusy.value = true;
+  cardsErr.value = null;
+  try {
+    await api.saveCharacterCard(project.value.id, {
+      name: cardEditChar.value.name,
+      card: cardPayload(),
+    });
+    cardsMsg.value = `「${cardEditChar.value.name}」的卡已保存（标为你写的，不会被自动改）`;
+    closeCardEdit();
+    await loadCards();
+    // 同步剧情圣经（项目里没有 loadBible 这个函数 —— 用既有的一步：
+    // 重新取项目再把 plot_bible 灌进本地 ref，与 savePersona 一致）。
+    const _fresh = await api.getProject(projectId);
+    project.value = _fresh;
+    bible.value = (_fresh.plot_bible as PlotBible) || null;
+  } catch (e: any) {
+    cardsErr.value = String(e?.message || e);
+  } finally {
+    cardsBusy.value = false;
+  }
+}
+
+async function runBatchCards() {
+  if (!project.value) return;
+  const wants = _textToLines(batchWants.value);
+  if (!wants.length) {
+    cardsErr.value = "先写要新建哪些角色（一行一个）";
+    return;
+  }
+  cardsBusy.value = true;
+  cardsErr.value = null;
+  batchResult.value = null;
+  try {
+    const r = await api.generateCharacterCardsBatch(project.value.id, {
+      wants,
+      note: batchNote.value,
+    });
+    if (!r.ok) {
+      cardsErr.value = r.detail || "AI 没给出可用结果（可重试或改要求）";
+      return;
+    }
+    batchResult.value = r;
+    if (r.冲突?.length) {
+      cardsMsg.value = `生成 ${Object.keys(r.角色 || {}).length} 个，仍有 ${r.冲突.length} 处说话方式相近（可单独改）`;
+    } else {
+      cardsMsg.value = `生成 ${Object.keys(r.角色 || {}).length} 个角色，说话方式已互相拉开`;
+    }
+  } catch (e: any) {
+    cardsErr.value = String(e?.message || e);
+  } finally {
+    cardsBusy.value = false;
+  }
+}
+
+/** 采纳批量生成里的一个角色（写进已有角色表） */
+async function adoptBatchCard(name: string) {
+  const card = batchResult.value?.角色?.[name];
+  if (!card || !project.value) return;
+  cardsBusy.value = true;
+  try {
+    await api.saveCharacterCard(project.value.id, { name, card });
+    cardsMsg.value = `已采纳「${name}」`;
+    if (batchResult.value?.角色) delete batchResult.value.角色[name];
+    await loadCards();
+    // 同步剧情圣经（项目里没有 loadBible 这个函数 —— 用既有的一步：
+    // 重新取项目再把 plot_bible 灌进本地 ref，与 savePersona 一致）。
+    const _fresh = await api.getProject(projectId);
+    project.value = _fresh;
+    bible.value = (_fresh.plot_bible as PlotBible) || null;
+  } catch (e: any) {
+    cardsErr.value = String(e?.message || e);
+  } finally {
+    cardsBusy.value = false;
+  }
+}
+
 // ===== 角色个性：人写 + AI 帮着完善（2026-10-28） =====
 //
 // 「让用户自己写角色的性格，自己来决定角色应该有什么样的表现，再由 AI 帮忙完善」。
@@ -2328,6 +2636,217 @@ onUnmounted(stopDistillPolling);
           </div>
         </li>
       </ul>
+    </div>
+    <!-- ---------- 角色卡：武器/功法/能力/声纹/关系（2026-10-29） ---------- -->
+    <div v-if="bible?.characters?.length" class="persona-panel">
+      <div class="card-title" style="font-size: var(--fs-sm)">
+        角色卡<span class="hint">武器、功法、能力、说话方式 —— 写描写与对白时按这个来</span>
+        <button class="link-btn" @click="openCardsPanel">
+          {{ cardsOpen ? "收起" : "查看/编辑" }}
+        </button>
+      </div>
+
+      <template v-if="cardsOpen">
+        <div v-if="cardsBusy && !cardsList.length" class="faint">加载中…</div>
+        <div v-else-if="cardsErr" class="notice err">{{ cardsErr }}</div>
+
+        <div v-if="cardCollisions.length" class="notice warn" style="margin: 6px 0">
+          有几个角色说话方式太像了（{{ cardCollisions.length }} 处）：
+          <span v-for="(c, i) in cardCollisions" :key="i">
+            {{ c.人物.join(" 与 ") }}（{{ c.相同.join("；") }}）
+          </span>
+          <div class="faint" style="font-size: var(--fs-xs)">
+            同场说话读者会分不出谁在说 —— 改其中一个人的句长或句末习惯就行。
+          </div>
+        </div>
+
+        <ul class="persona-list">
+          <li v-for="c in cardsList" :key="c.name" class="persona-item">
+            <div class="row tight" style="gap: 8px">
+              <strong>{{ c.name }}</strong>
+              <span class="faint">{{ c.card?.身份?.身份职业 || c.role }}</span>
+              <button class="link-btn" @click="openCardEdit(c)">编辑卡</button>
+              <span class="faint" style="font-size: var(--fs-xs)">
+                {{ c.card_source === "user" ? "你写的" : c.card_source === "derived" ? "从正文归纳的" : c.card_source === "model" ? "AI 生成的" : "还没建卡" }}
+              </span>
+            </div>
+            <div v-if="c.card && Object.keys(c.card).length" class="persona-detail">
+              <span v-if="c.card.能力?.武器?.length">
+                武器：{{ c.card.能力.武器.map((x: any) => x.名称).join("、") }}
+              </span>
+              <span v-if="c.card.能力?.能力上限?.length">
+                做不到：{{ c.card.能力.能力上限.join("；") }}
+              </span>
+              <span v-if="c.card.声纹?.句长 || c.card.声纹?.句末">
+                说话：{{ c.card.声纹?.自称 ? `自称「${c.card.声纹.自称}」` : "" }}
+                {{ c.card.声纹?.句长 ? `句长${c.card.声纹.句长}` : "" }}
+                {{ c.card.声纹?.句末 || "" }}
+              </span>
+              <span v-if="c.card.声纹?.口头禅?.length">
+                口头禅：{{ c.card.声纹.口头禅.join("、") }}
+              </span>
+            </div>
+            <div v-else class="faint" style="font-size: var(--fs-xs)">
+              还没建卡 —— 建了以后，写打斗与对白时会按他的武器、能力与说话方式来。
+            </div>
+          </li>
+        </ul>
+
+        <div class="row tight" style="gap: 8px; margin-top: 8px">
+          <button class="btn ghost" @click="batchOpen = !batchOpen">
+            {{ batchOpen ? "收起批量新建" : "批量新建角色（AI 一次生成，互相不撞）" }}
+          </button>
+        </div>
+
+        <div v-if="batchOpen" class="field" style="margin-top: 8px">
+          <label>要新建哪些角色（一行一个，可写「名字：一句话设定」）</label>
+          <textarea class="input" rows="4" v-model="batchWants"
+            placeholder="例：顾行舟：新任守夜人，接手父亲的旧灯&#10;祁婆婆：渔帮掌舵人，管着所有出海记录"></textarea>
+          <input class="input" v-model="batchNote" placeholder="额外要求（可选），例：这批人年龄跨度大一些" />
+          <div class="row tight" style="gap: 8px">
+            <button class="btn" :disabled="cardsBusy" @click="runBatchCards">
+              {{ cardsBusy ? "AI 正在生成…" : "生成角色卡" }}
+            </button>
+          </div>
+        </div>
+
+        <div v-if="batchResult?.角色 && Object.keys(batchResult.角色).length"
+             class="notice info" style="margin-top: 8px">
+          <div class="faint" style="font-size: var(--fs-xs); margin-bottom: 6px">
+            生成结果（还没写进去 —— 逐个点「采纳」才会保存）：
+          </div>
+          <div v-for="(card, name) in batchResult.角色" :key="name" class="persona-item">
+            <div class="row tight" style="gap: 8px">
+              <strong>{{ name }}</strong>
+              <span class="faint">{{ card?.身份?.身份职业 || "" }}</span>
+              <button class="link-btn" @click="adoptBatchCard(String(name))">采纳</button>
+            </div>
+            <div class="persona-detail">
+              <span v-if="card?.声纹">
+                说话：{{ card.声纹.自称 ? `自称「${card.声纹.自称}」` : "" }}
+                {{ card.声纹.句长 ? `句长${card.声纹.句长}` : "" }}
+                {{ card.声纹.句末 || "" }}
+              </span>
+              <span v-if="card?.能力?.武器?.length">
+                武器：{{ card.能力.武器.map((x: any) => x.名称).join("、") }}
+              </span>
+              <span v-if="card?.能力?.能力上限?.length">
+                做不到：{{ card.能力.能力上限.join("；") }}
+              </span>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- ===== 角色卡编辑（人写优先，AI 只补空） ===== -->
+    <div v-if="cardEditOpen" class="bible-modal-mask" @click.self="closeCardEdit">
+      <div class="bible-modal persona-modal">
+        <div class="card-title">
+          角色卡{{ cardEditChar?.name ? `「${cardEditChar.name}」` : "" }}
+          <span class="hint">你写的优先；AI 只补空缺，不替你决定</span>
+        </div>
+
+        <div class="field">
+          <label>性别</label>
+          <input class="input" v-model="cardForm.性别" placeholder="例：男" />
+        </div>
+        <div class="field">
+          <label>年龄</label>
+          <input class="input" v-model="cardForm.年龄" placeholder="例：十九" />
+        </div>
+        <div class="field">
+          <label>外貌</label>
+          <input class="input" v-model="cardForm.外貌" placeholder="例：左手虎口有旧疤" />
+        </div>
+        <div class="field">
+          <label>身份职业</label>
+          <input class="input" v-model="cardForm.身份职业" placeholder="例：守城士兵" />
+        </div>
+        <div class="field">
+          <label>出身背景</label>
+          <input class="input" v-model="cardForm.出身背景" placeholder="例：北漠边城，父亲是城头守将" />
+        </div>
+
+        <div class="field">
+          <label>武器（一行一个，可写「名称：说明」）</label>
+          <textarea class="input" rows="2" v-model="cardForm.武器"
+            placeholder="例：断刀：刀身有暗红纹路，不能见水"></textarea>
+        </div>
+        <div class="field">
+          <label>功法 / 技艺（一行一个）</label>
+          <textarea class="input" rows="2" v-model="cardForm.功法"
+            placeholder="例：换气：出手前先沉一口气"></textarea>
+        </div>
+        <div class="field">
+          <label>能力 / 特殊之处（一行一个）</label>
+          <textarea class="input" rows="2" v-model="cardForm.能力"
+            placeholder="例：听声辨位"></textarea>
+        </div>
+        <div class="field">
+          <label>他做不到什么（一行一条 —— 防止角色越写越强）</label>
+          <textarea class="input" rows="2" v-model="cardForm.能力上限"
+            placeholder="例：不会水&#10;记不住经文"></textarea>
+        </div>
+
+        <div class="field">
+          <label>自称</label>
+          <input class="input" v-model="cardForm.自称" placeholder="例：我 / 在下 / 老夫" />
+        </div>
+        <div class="field">
+          <label>怎么称呼别人（一行一条）</label>
+          <textarea class="input" rows="2" v-model="cardForm.称呼他人"
+            placeholder="例：叫长辈用职衔&#10;不叫名字"></textarea>
+        </div>
+        <div class="field">
+          <label>句长档位（极短 / 短 / 中 / 长）</label>
+          <input class="input" v-model="cardForm.句长" placeholder="例：短" />
+        </div>
+        <div class="field">
+          <label>句末习惯</label>
+          <input class="input" v-model="cardForm.句末"
+            placeholder="例：直陈收尾（不用语气词）" />
+        </div>
+        <div class="field">
+          <label>口头禅（一行一条）</label>
+          <textarea class="input" rows="2" v-model="cardForm.口头禅"
+            placeholder="例：活下去"></textarea>
+        </div>
+        <div class="field">
+          <label>他永远不会说的话（一行一条）</label>
+          <textarea class="input" rows="2" v-model="cardForm.禁用词"
+            placeholder="例：感叹句"></textarea>
+        </div>
+        <div class="field">
+          <label>语气底色</label>
+          <input class="input" v-model="cardForm.语气底色" placeholder="例：压着说话" />
+        </div>
+        <div class="field">
+          <label>关系（一行一条，写「对象：称呼；态度」）</label>
+          <textarea class="input" rows="2" v-model="cardForm.关系"
+            placeholder="例：周郎中：称呼周先生；戒备但不敌视"></textarea>
+        </div>
+
+        <div class="field">
+          <label>给 AI 的补充要求（可选）</label>
+          <input class="input" v-model="cardNote"
+            placeholder="例：能力上限多写两条，别把他写得太强" />
+        </div>
+
+        <div v-if="cardAiMsg" class="notice info" style="margin-bottom: 8px">
+          {{ cardAiMsg }}
+          <button v-if="cardAi" class="link-btn" @click="applyCardAi">填入空缺</button>
+        </div>
+
+        <div class="row" style="gap: 8px; margin-top: 4px">
+          <button class="btn" :disabled="cardsBusy" @click="askAiCompleteCard">
+            {{ cardsBusy ? "AI 正在补…" : "AI 帮我补全" }}
+          </button>
+          <button class="btn primary" :disabled="cardsBusy" @click="saveCard">保存</button>
+          <button class="btn ghost" @click="closeCardEdit">取消</button>
+          <span v-if="cardsErr" class="notice err" style="display: inline">{{ cardsErr }}</span>
+        </div>
+      </div>
     </div>
     <div v-else-if="styleRepairMsg" class="notice info distill-inline" style="margin-top: var(--gap)">
       {{ styleRepairMsg }}

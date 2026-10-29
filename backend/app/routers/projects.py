@@ -1254,3 +1254,250 @@ def export_txt(project_id: int, db: Session = Depends(get_db)) -> PlainTextRespo
             "Content-Disposition": f'attachment; filename="{ascii_name}.txt"; filename*=UTF-8\'\'{utf_name}'
         },
     )
+
+# ====================================================================
+# 角色卡：身份 / 能力（武器·功法·能力）/ 声纹 / 关系（2026-10-29）
+# ====================================================================
+#
+# 用户诉求：「没有记录角色使用的武器、功法、什么能力」+「新建角色时 AI 自动
+# 添加性格、行为、关系、口头禅」+「不要千篇一律」。
+#
+# 纪律（与 persona 一致）：
+# 1. **人写的归人**：用户保存的卡标 `来源=user`，任何自动流程不覆盖；
+# 2. **AI 只建议**：生成结果只返回、不落库，采纳由人点；
+# 3. **不编造**：从正文抽卡时武器/功法/能力的名称必须能在正文里查到。
+
+class CardSaveRequest(StrictRequest):
+    """`POST /api/projects/{id}/character-cards` 的请求体。"""
+
+    name: str
+    card: dict
+
+
+class CardGenerateRequest(StrictRequest):
+    """`POST /api/projects/{id}/character-cards/generate`（单角色补全）的请求体。"""
+
+    name: str
+    card: dict = {}
+    note: str = ""
+
+
+class CardsBatchRequest(StrictRequest):
+    """`POST /api/projects/{id}/character-cards/batch`（批量新建）的请求体。"""
+
+    #: 要新建的角色（名字，或「名字：一句话设定」）。
+    wants: list[str]
+    note: str = ""
+
+
+def _bible_of(proj) -> dict:
+    import json as _json
+
+    bible = proj.plot_bible
+    if isinstance(bible, str):
+        try:
+            bible = _json.loads(bible)
+        except Exception:  # noqa: BLE001
+            bible = {}
+    return bible if isinstance(bible, dict) else {}
+
+
+def _story_of(proj) -> dict:
+    return {
+        "title": proj.title or "",
+        "genre": getattr(proj, "genre", "") or "",
+        "style": getattr(proj, "style", "") or "",
+        "premise": getattr(proj, "premise", "") or "",
+    }
+
+
+def _existing_voices(bible: dict) -> dict:
+    """已有角色的声纹签名（批量生成时用来避让）。"""
+    from app.generation.character_card import voice_signature
+
+    out = {}
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        card = c.get("card")
+        if isinstance(card, dict):
+            sig = voice_signature(card)
+            if sig:
+                out[str(c["name"])] = sig
+    return out
+
+
+@router.get("/{project_id}/character-cards")
+def list_character_cards(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """列出本项目所有角色的卡（含 persona，方便界面一次拿全）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    bible = _bible_of(proj)
+    out = []
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        card = c.get("card") if isinstance(c.get("card"), dict) else {}
+        persona = c.get("persona") if isinstance(c.get("persona"), dict) else {}
+        out.append({
+            "name": c.get("name"),
+            "role": c.get("role") or "",
+            "motivation": c.get("motivation") or "",
+            "card": card,
+            "card_source": card.get("来源") or "",
+            "persona": persona,
+            "persona_source": persona.get("来源") or "",
+        })
+    # 声纹撞车（界面提示「这几个人说话太像」，用来引导用户去改）
+    from app.generation.character_card import voice_collisions
+
+    cards = {item["name"]: item["card"] for item in out if item["card"]}
+    return {"characters": out, "voice_collisions": voice_collisions(cards)}
+
+
+@router.post("/{project_id}/character-cards")
+def save_character_card(
+    project_id: int, body: CardSaveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存**用户编辑过**的角色卡（只动 card，不碰 name/role/motivation/persona）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name 不能为空")
+
+    from app.generation.character_card import SOURCE_USER, normalize_card
+
+    card = normalize_card(body.card or {})
+    card["来源"] = SOURCE_USER  # 人写的，任何自动流程不覆盖
+
+    bible = _bible_of(proj)
+    chars = bible.get("characters")
+    if not isinstance(chars, list):
+        chars = []
+    found = False
+    for c in chars:
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            c["card"] = card
+            found = True
+            break
+    if not found:
+        chars.append({"name": name, "role": "", "motivation": "", "card": card})
+    bible["characters"] = chars
+
+    # JSON 列必须显式标脏（2026-10-28 踩过：赋值后 UPDATE 不一定发出）
+    from sqlalchemy.orm.attributes import flag_modified
+
+    proj.plot_bible = bible
+    flag_modified(proj, "plot_bible")
+    db.commit()
+    return {"ok": True, "name": name, "card": card}
+
+
+@router.post("/{project_id}/character-cards/generate")
+def generate_character_card(
+    project_id: int, body: CardGenerateRequest, db: Session = Depends(get_db)
+) -> dict:
+    """给**一个已有角色**补全卡（AI 只建议，不落库）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name 不能为空")
+
+    from app.generation.character_card_gen import complete_card
+
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    bible = _bible_of(proj)
+    char = {"name": name}
+    for c in (bible.get("characters") or []):
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            char = dict(c)
+            break
+    story = _story_of(proj)
+    char.setdefault("_title", story["title"])
+    char.setdefault("_genre", story["genre"])
+    char.setdefault("_premise", story["premise"])
+
+    result = complete_card(provider, char, body.card or char.get("card") or {},
+                           body.note or "")
+    if not result:
+        return {"ok": False, "detail": "AI 没给出可用结果（可重试或改写要求）"}
+    return {
+        "ok": True,
+        "name": name,
+        "补充": result.get("补充") or {},
+        "说明": result.get("说明") or "",
+        "voice_collisions": _collisions_with(result.get("补充") or {}, name, bible),
+    }
+
+
+@router.post("/{project_id}/character-cards/batch")
+def generate_character_cards_batch(
+    project_id: int, body: CardsBatchRequest, db: Session = Depends(get_db)
+) -> dict:
+    """**批量**生成新角色的卡（互相避让；撞了就重写）。
+
+    生成结果**不落库** —— 由用户在界面上逐个采纳。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    wants = [str(w).strip() for w in (body.wants or []) if str(w).strip()]
+    if not wants:
+        raise HTTPException(status_code=400, detail="wants 不能为空")
+
+    from app.generation.character_card_gen import generate_cards
+
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    bible = _bible_of(proj)
+    result = generate_cards(provider, _story_of(proj), wants,
+                            already=_existing_voices(bible), note=body.note or "")
+    return {
+        "ok": bool(result.get("角色")),
+        "角色": result.get("角色") or {},
+        "冲突": result.get("冲突") or [],
+        "轮次": result.get("轮次") or 0,
+    }
+
+
+def _collisions_with(card: dict, name: str, bible: dict) -> list:
+    """新卡与既有角色的声纹撞车（只看有卡的那些）。"""
+    from app.generation.character_card import voice_collisions
+
+    cards = {}
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        if str(c["name"]) == name:
+            continue
+        if isinstance(c.get("card"), dict) and c["card"]:
+            cards[str(c["name"])] = c["card"]
+    if not cards or not card:
+        return []
+    cards[name] = card
+    return [x for x in voice_collisions(cards) if name in x.get("人物", [])]
+
+
+def _provider_or_none():
+    """取当前 LLM provider（取不到就 None —— 端点回 503，不抛栈）。
+
+    入口与 persona 端点一致（`app.llm.provider.get_llm_provider`），
+    不另造一套取法（否则提示词/渠道配置会分叉）。
+    """
+    try:
+        from app.llm.provider import get_llm_provider
+
+        return get_llm_provider()
+    except Exception:  # noqa: BLE001 —— 渠道没配只是这个端点不可用
+        return None
+
