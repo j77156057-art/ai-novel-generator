@@ -1,4 +1,6 @@
-"""语料体检：找出被爬取源注入的重复水印串。
+"""语料体检：语料里的两类污染 —— 注入水印串，和**混进来的别的书**。
+
+## 一、注入水印串（下面「判据（高精度、零语言学假设）」一节讲的就是它）
 
 ## 为什么需要
 
@@ -13,6 +15,11 @@
   且各章水印密度不均 → 语料内部离散度虚高，档案变「松」，判别力下降。
 - **RAG 检索污染**：检索命中的片段里混着无关书名。
 - **图谱抽取污染**：`风沙千里` 会被当成正文内容参与角色/关系抽取。
+
+## 二、混进来的别的书（盗版站把多本书拼成一个 txt）
+
+见本文件末尾「混进了别的书检测」一节：判据是**人物聚集度 + 排他性**，
+不是「像不像本文风」（实测风格离群判据在《大奉打更人》上全是误报）。
 
 ## 判据（高精度、零语言学假设）
 
@@ -99,7 +106,7 @@
 from __future__ import annotations
 
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 
 _CJK = r"[\u4e00-\u9fff]"
 _CJK_RUN = re.compile(_CJK + "+")
@@ -678,4 +685,352 @@ def strip_repeated_ads(
     return cleaned, {
         "removed": removed,
         "ads": sorted(ads, key=lambda a: -a["count"]),
+    }
+
+
+# ────────────────────────────────────────────────────────────
+# 「混进了别的书」检测
+# ────────────────────────────────────────────────────────────
+#
+# 盗版站的「单本下载」经常把**好几本书拼进一个 txt**。实测本机投放的 18 本网文里，
+# `十日终焉.txt`（402 万字）中间插进了另一本书的正文（16 章 / 21.8 万字 / 5.44%），
+# 插进来的章**夹在本书的章之间**（本书的 61 章原封不动留在中间）。
+#
+# 后果不是「读起来别扭」：
+# - **文体档案是混合体**：`fit_profile_v2` 量的是「这份文件的句长/比喻/对白分布」，
+#   而那是好几本书的加权平均 —— 提示词里的「比喻 ≤X/千字」于是既不是这本书的，
+#   也不是那本书的；
+# - **风格样例会取到别的书**：`sample_style_exemplars` 从参考书里取原文段落当
+#   few-shot，取到外书的一段，就把另一个作者的声音喂给了模型；
+# - **检索会召回别的书**：分片里混着另一本书的情节，RAG 命中后进上下文。
+#
+# ## 判据：人物聚集度 + 排他性（不是「像不像本文风」）
+#
+# 第一版判据是**风格离群**（某章与全书中心的余弦相似度低于 `中位数 - k·MAD`）。
+# 它在《十日终焉》上是对的，但在《大奉打更人》上**全是误报**：916 章里标出 97 章 /
+# 60 段，逐段核验后发现排他性 0% —— 那些段里的高频词（`裴满` / `王思` / `许玲`）
+# 在全书别处同样高频，只是那几章文风偏跳脱。
+#
+# **风格离群 ≠ 混书**。真正的判据是：
+#
+# > 混进来的那一本书，有一群**只在这一小片里活动的人** ——
+# > 它的人名在全书别处几乎不出现，且总在相邻的一小段章节里；
+# > 本书的人物则**铺满全书**（主角出现在 1400 章里的 1400 章）。
+#
+# 于是判据分三步：
+#
+# 1. **聚簇词**：某个词出现在 ≥ `min_cast_df` 章里、只占全书的 `local_max_share`
+#    以内、且章号跨度不超过全书章数的 `local_span_ratio`（外书的章被夹在本书的章
+#    中间，跨度比章数大）⇒ 它是「这一小片的人」；
+# 2. **异书章**：一章里出现 ≥ `min_cluster_terms` 个这样的词；
+# 3. **验证**（排他性）：这些词几乎只出现在这一小片里（集中度 ≥ `min_concentration`），
+#    且这一小片自己的高频词有 ≥ `min_exclusive_ratio` 的质量落在这些词上。
+#
+# ## 边界（刻意保守）
+#
+# 沿用本模块「宁可漏报，不可误删」的纪律：
+#
+# - 聚簇词至少出现在 `min_cast_df` 章（一个人名出现一次不算「一本书」）；
+# - 一章里至少 `min_cluster_terms` 个聚簇词（是一群人，不是一个路人）；
+# - 异书段至少 `min_cluster_chapters` 章；
+# - **只报不删**：剔除由调用方显式决定（`strip_foreign_blocks`），
+#   入库链路只把它写进体检报告，由人复核。
+#
+# 阳性对照（《十日终焉》⇒ 必须挑出外书那块）、阴性对照（《大奉打更人》⇒ 必须一条
+# 不报）都在 `tests/test_corpus_foreign_blocks.py` 里。
+#
+# 纯标准库、纯统计，无模型、无随机：同一输入两次结果逐字节一致。
+
+#: 章节标题行：「第 12 章 标题」「第十二回 标题」「第3节 标题」。
+#:
+#: `(?![合])` 是必需的：「第二回合」不是章节标题（实测把「第N回合」当章节切，
+#: 会切出上百个几十字的假章，画像噪声极大）。
+_FOREIGN_CHAPTER_RE = re.compile(
+    r"^[ \t\u3000]*第[ \t]*([0-9０-９一二三四五六七八九十百千零两]+)[ \t]*"
+    r"[章节回](?![合])(?:[ \t]+(\S.*))?$"
+)
+
+#: 无编号的特殊章节（楔子 / 番外 / 完本感言）。
+_FOREIGN_SPECIAL_RE = re.compile(
+    r"^[ \t\u3000]*(楔子|序章|序言|前言|引子|番外|后记|尾声|终章|完本感言|完结感言)"
+    r"(?:[ \t]+(\S.*))?$"
+)
+
+#: 汉字串（用于切 2 字 n-gram）。
+_FOREIGN_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
+
+#: 一章至少这么多字才参与判定（太短的章画像不稳）。
+DEFAULT_FOREIGN_MIN_BLOCK_CHARS = 1200
+#: 每章取多少个高频 2 字串做画像。
+DEFAULT_FOREIGN_TOP_GRAMS = 40
+#: 聚簇词至少出现在这么多章里。
+#:
+#: 取 5：混入进来的书在实测里是 16 章（占 9.6%）的规模；4 章以下会开始
+#: 把「恰好连着几章出现同一个词」的普通巧合当成一族人（合成用例里
+#: 4 章就能骗过 3，5 章则骗不过 —— 代价是漏报极小的混入，可接受）。
+DEFAULT_FOREIGN_MIN_CAST_DF = 5
+#: 一章里至少要出现这么多个聚簇词，才算「这一章属于那一小片」。
+DEFAULT_FOREIGN_MIN_CLUSTER_TERMS = 2
+#: 异书段至少这么多章。
+DEFAULT_FOREIGN_MIN_CLUSTER_CHAPTERS = 2
+#: 聚簇词的章号集中度下限（它出现的章里有多大比例落在这一小片）。
+DEFAULT_FOREIGN_MIN_CONCENTRATION = 0.6
+#: 这一小片自己的高频词里，有多大比例的质量必须落在「只在这一小片出现」的词上。
+DEFAULT_FOREIGN_MIN_EXCLUSIVE_RATIO = 0.4
+#: 报告里最多留多少个独占词。
+DEFAULT_FOREIGN_MAX_TERMS = 12
+#: 「这一小片」占全书章数的上限比例：聚簇词的章号跨度不得超过这个比例。
+DEFAULT_FOREIGN_LOCAL_SPAN_RATIO = 0.15
+#: 聚簇词出现的章数占全书章数的上限：超过就不是「这一小片的人」。
+#:
+#: **实测校准出来的，取 0.25**：放到 0.4/0.5 会让太多词变成「聚簇词」
+#: （比如某个配角在 40% 的章里出现），异书章候选随即膨胀、聚成一坨，
+#: 排他性验证直接不通过 —— 《十日终焉》那份真阳性反而**检不出来了**
+#: （实测 0.25 ⇒ 3 段 / 21.8 万字；0.4 与 0.5 ⇒ 0 段）。
+#: 代价是「混入占比超过 25%」的书检不出来（那种文件本身就不是一本书了）。
+DEFAULT_FOREIGN_LOCAL_MAX_SHARE = 0.25
+#: 聚簇词的章号跨度下限（`max(3×章数, 该值)`）。
+FOREIGN_CLUSTER_SPAN_MIN = 30
+
+
+def _foreign_chapter_spans(text: str) -> list[dict]:
+    """按章节标题把正文切成章，返回每章的字符区间与标题。"""
+    marks: list[tuple[int, str]] = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        s = line.strip()
+        if len(s) <= 60:
+            m = _FOREIGN_CHAPTER_RE.match(s) or _FOREIGN_SPECIAL_RE.match(s)
+            if m:
+                marks.append((pos, s[:40]))
+        pos += len(line)
+
+    out: list[dict] = []
+    for k, (start, title) in enumerate(marks):
+        end = marks[k + 1][0] if k + 1 < len(marks) else len(text)
+        out.append({"index": k, "start": start, "end": end, "title": title})
+    return out
+
+
+def _foreign_top_grams(text: str, k: int) -> list[tuple[str, int]]:
+    """章内高频 2 字串（中文人名/称谓多为 2~3 字，2 字串噪声更小）。"""
+    counter: Counter = Counter()
+    for run in _FOREIGN_CJK_RUN.finditer(text):
+        seq = run.group(0)
+        for i in range(len(seq) - 1):
+            counter[seq[i:i + 2]] += 1
+    return counter.most_common(k)
+
+
+def find_foreign_blocks(
+    text: str,
+    *,
+    min_block_chars: int = DEFAULT_FOREIGN_MIN_BLOCK_CHARS,
+    top_grams: int = DEFAULT_FOREIGN_TOP_GRAMS,
+    min_cast_df: int = DEFAULT_FOREIGN_MIN_CAST_DF,
+    min_cluster_terms: int = DEFAULT_FOREIGN_MIN_CLUSTER_TERMS,
+    min_cluster_chapters: int = DEFAULT_FOREIGN_MIN_CLUSTER_CHAPTERS,
+    min_concentration: float = DEFAULT_FOREIGN_MIN_CONCENTRATION,
+    min_exclusive_ratio: float = DEFAULT_FOREIGN_MIN_EXCLUSIVE_RATIO,
+    max_terms: int = DEFAULT_FOREIGN_MAX_TERMS,
+    local_span_ratio: float = DEFAULT_FOREIGN_LOCAL_SPAN_RATIO,
+    local_max_share: float = DEFAULT_FOREIGN_LOCAL_MAX_SHARE,
+) -> list[dict]:
+    """检出「这本书里混进来的别的书」的块。
+
+    返回按位置排序的块列表；没有命中返回空列表。每块含：
+
+    - `start` / `end`：原文字符区间（可直接切片复核）；
+    - `chars`：块内字数；`ratio`：占全书比例；
+    - `chapters`：块的章序号（0 基）与章标题；
+    - `terms`：**只在这一小片里活动**的词（= 另一本书的人物/设定），给人复核；
+    - `exclusive_ratio`：排他性读数（可复核）；
+    - `sample`：块首的一小段原文。
+
+    一块 = **一段连续的命中章**。外书的章常夹在本书的章中间（实测 16 章外书章夹在
+    77 章区间里，中间 61 章是本书的），所以不能按「首尾跨度」整段给区间 ——
+    那样会把本书的正文一起删掉。
+    """
+    if not text or len(text) < min_block_chars * 4:
+        return []
+
+    chapters = _foreign_chapter_spans(text)
+    kept = [c for c in chapters if (c["end"] - c["start"]) >= min_block_chars]
+    if len(kept) < 8:
+        # 章太少（或这本书没有章节标记）⇒ 判不了，不硬猜。
+        return []
+
+    grams_by_idx: dict[int, list[tuple[str, int]]] = {}
+    for c in kept:
+        body = text[c["start"]:c["end"]]
+        grams_by_idx[c["index"]] = _foreign_top_grams(body, top_grams)
+
+    # —— 词 → 出现在哪些章（章序号升序）——
+    chapters_of: dict[str, list[int]] = defaultdict(list)
+    for idx in sorted(grams_by_idx):
+        for w, _ in grams_by_idx[idx]:
+            chapters_of[w].append(idx)
+
+    # —— 聚簇词：出现章数够多、只占全书一小片、章号挤在一小段 ——
+    clustered: dict[str, list[int]] = {}
+    n_chapters = len(kept)
+    span_cap_base = max(local_span_ratio * n_chapters, FOREIGN_CLUSTER_SPAN_MIN)
+    for w, idxs in chapters_of.items():
+        if len(idxs) < min_cast_df:
+            continue
+        if len(idxs) > local_max_share * n_chapters:
+            # 出现在全书大部分章里的词是本书的通用词，不是「这一小片的人」
+            continue
+        span = idxs[-1] - idxs[0] + 1
+        if span <= max(span_cap_base, 3 * len(idxs)):
+            clustered[w] = idxs
+    if not clustered:
+        return []
+
+    # —— 异书章：含 ≥ min_cluster_terms 个聚簇词 ——
+    clustered_terms_by_chapter: dict[int, list[str]] = defaultdict(list)
+    for w, idxs in clustered.items():
+        for idx in idxs:
+            clustered_terms_by_chapter[idx].append(w)
+
+    foreign_idx = sorted(
+        idx for idx, terms in clustered_terms_by_chapter.items()
+        if len(terms) >= min_cluster_terms
+    )
+    if len(foreign_idx) < min_cluster_chapters:
+        return []
+
+    # —— 把异书章按共享聚簇词聚成块（并查集）——
+    parent = {idx: idx for idx in foreign_idx}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    term_to_chapters: dict[str, list[int]] = defaultdict(list)
+    for idx in foreign_idx:
+        for w in clustered_terms_by_chapter[idx]:
+            term_to_chapters[w].append(idx)
+    for _w, idxs in term_to_chapters.items():
+        base = idxs[0]
+        for other in idxs[1:]:
+            ra, rb = find(base), find(other)
+            if ra != rb:
+                parent[rb] = ra
+
+    clusters: dict[int, list[int]] = {}
+    for idx in foreign_idx:
+        clusters.setdefault(find(idx), []).append(idx)
+
+    # —— 排他性验证 ——
+    blocks: list[dict] = []
+    total_chars = sum(c["end"] - c["start"] for c in kept)
+    for members in clusters.values():
+        if len(members) < min_cluster_chapters:
+            continue
+        member_set = set(members)
+
+        # 这一小片的聚簇词：有多少章落在这一小片里（集中度）
+        block_terms: list[tuple[str, int, float, int]] = []
+        for w, idxs in term_to_chapters.items():
+            inside = sum(1 for i in idxs if i in member_set)
+            if not inside:
+                continue
+            concentration = inside / len(idxs)
+            if concentration < min_concentration:
+                continue
+            count = sum(c for i in members for ww, c in grams_by_idx[i] if ww == w)
+            block_terms.append((w, count, concentration, inside))
+        if not block_terms:
+            continue
+
+        # 这一小片自己的高频词里，有多少质量落在「只在这一小片出现」的词上
+        inside_mass = 0
+        total_mass = 0
+        for idx in members:
+            for w, c in grams_by_idx[idx]:
+                total_mass += c
+                if w in clustered and all(i in member_set for i in chapters_of[w]):
+                    inside_mass += c
+        exclusive_ratio = inside_mass / total_mass if total_mass else 0.0
+        if exclusive_ratio < min_exclusive_ratio:
+            continue
+
+        members_sorted = sorted(members)
+        # —— 关键：外书的章是**夹在**本书的章之间的，不能按「首尾跨度」整段删。
+        # 实测《十日终焉》：命中的 16 章散在 77 章的区间里，中间 61 章是本书的
+        # （陈俊南 / 金元勋 / 山头那一套），整段删会把 16 万字本书正文一起删掉。
+        # 所以按**命中的连续章**切成若干段（run），每段单独给区间。
+        runs: list[list[int]] = []
+        for idx in members_sorted:
+            if runs and idx == runs[-1][-1] + 1:
+                runs[-1].append(idx)
+            else:
+                runs.append([idx])
+
+        block_terms.sort(key=lambda t: (-t[1], t[0]))
+        term_rows = [
+            {"term": w, "count": cnt, "concentration": round(conc, 3), "chapters": inside}
+            for w, cnt, conc, inside in block_terms[:max_terms]
+        ]
+        for gi, run in enumerate(runs):
+            run_set = set(run)
+            run_spans = [c for c in kept if c["index"] in run_set]
+            start = min(s["start"] for s in run_spans)
+            end = max(s["end"] for s in run_spans)
+            chars = end - start
+            blocks.append({
+                "start": start,
+                "end": end,
+                "chars": chars,
+                "ratio": round(chars / total_chars, 6) if total_chars else 0.0,
+                "group": gi,
+                "chapters": run,
+                "chapter_titles": [c["title"] for c in run_spans],
+                "terms": term_rows,
+                "exclusive_ratio": round(exclusive_ratio, 4),
+                "sample": text[start:start + 160].replace("\n", " "),
+            })
+
+    blocks.sort(key=lambda b: (b["start"], b["end"]))
+    return blocks
+
+
+def strip_foreign_blocks(text: str, blocks: list[dict]) -> tuple[str, dict]:
+    """按 `find_foreign_blocks` 的结果剔除异书块，返回 (清洗后文本, 报告)。
+
+    **调用方必须显式决定要不要剔** —— 检测与剔除分开，是为了让「误报」由人拍板，
+    而不是由一条统计判据默默改掉用户的内容。
+    """
+    if not blocks:
+        return text, {"removed": 0, "blocks": []}
+    spans = sorted((int(b["start"]), int(b["end"])) for b in blocks)
+    merged: list[tuple[int, int]] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    parts: list[str] = []
+    last = 0
+    removed = 0
+    for s, e in merged:
+        if s < last:
+            continue
+        parts.append(text[last:s])
+        last = e
+        removed += e - s
+    parts.append(text[last:])
+    cleaned = "".join(parts)
+    return cleaned, {
+        "removed": removed,
+        "blocks": [
+            {
+                "start": s, "end": e, "chars": e - s,
+                "terms": [t["term"] for t in (b.get("terms") or [])][:8],
+            }
+            for (s, e), b in zip(merged, blocks)
+        ],
     }

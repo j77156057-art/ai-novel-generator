@@ -22,6 +22,10 @@ class IngestAttachmentRequest(StrictRequest):
     project_id: int
     attachment_id: str
     instruction: str
+    #: 是否剔除「混进来的别的书」的整章正文（盗版站的 txt 常把多本书拼在一起）。
+    #: 默认 False：检测照做（体检报告会标出），但不删 —— 删的是整章正文，
+    #: 判据万一错了丢的是真内容，所以要人点头。
+    drop_foreign_blocks: bool = False
 
 @router.post("/ingest", response_model=UploadResult)
 def confirm_ingest(body: IngestAttachmentRequest, db: Session = Depends(get_db)):
@@ -41,7 +45,9 @@ def confirm_ingest(body: IngestAttachmentRequest, db: Session = Depends(get_db))
                 "chunks": meta["chunks"], "clean_report": report,
                 "check_status": report.get("agent_check", {}).get("status", "review_required")}
     mp, tp = attachments.paths(body.project_id, body.attachment_id)
-    result = ingest_text(db, tp.read_text(encoding="utf-8"), title=meta["filename"], platform="assistant_attachment")
+    result = ingest_text(db, tp.read_text(encoding="utf-8"), title=meta["filename"],
+                         platform="assistant_attachment",
+                         drop_foreign_blocks=bool(body.drop_foreign_blocks))
     project = attachments.require_project(db, body.project_id)
     project.reference_novel_ids = list(dict.fromkeys([*(project.reference_novel_ids or []), result["novel_id"]]))
     db.commit()

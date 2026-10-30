@@ -46,6 +46,7 @@ def ingest_text(
     source_url: str | None = None,
     chapter_meta: list[dict] | None = None,
     commit_batch: int = 200,
+    drop_foreign_blocks: bool = False,
 ) -> dict:
     """解析 → 切分 → 填 embedding → 写 raw_novels + novel_chunks。
 
@@ -57,9 +58,30 @@ def ingest_text(
     清洗（第 8 步）：在解析之前先剔除水印，保证**入库的分片就是干净的**；
     清洗报告（含检出串、次数、删字数、原文样本）写入 `novel.clean_report`，
     可通过 API 读到。清洗是确定性的，同一输入两次结果逐字节相同。
+
+    `drop_foreign_blocks`：**显式**剔除「混进来的别的书」的整章正文。
+    默认 False —— 检测照做（写进清洗报告），但不删：删的是整章正文，
+    判据万一错了丢的是真内容，所以要人点头。
     """
-    from app.agents.registry import invoke_tool
+    from app.agents.ingest_clean import detect_foreign_blocks_report
+    from app.corpus_health import find_foreign_blocks, strip_foreign_blocks
     from fastapi import HTTPException
+
+    foreign_report: dict = {}
+    if drop_foreign_blocks:
+        # 先在**原始文本**上检测（证据里的章号/样本都指原文），再整段剔除。
+        # 检测只跑一遍：报告与剔除用同一批结果。
+        blocks = find_foreign_blocks(text)
+        foreign_report = detect_foreign_blocks_report(text, blocks=blocks)
+        if blocks:
+            text, rep = strip_foreign_blocks(text, blocks)
+            foreign_report = {
+                **foreign_report,
+                "dropped": True,
+                "removed_chars": int(rep["removed"]),
+            }
+
+    from app.agents.registry import invoke_tool
     prepared = invoke_tool("preview_ingest_clean", db=db, project_id=None, text=text, chapter_meta=chapter_meta)
     checked = invoke_tool("check_ingest_clean", db=db, project_id=None, prepared=prepared)
     if checked["status"] == "blocked":
@@ -69,6 +91,9 @@ def ingest_text(
                      source_text=text, source_chapters=chapter_meta,
                      status="imported_review" if checked["status"] == "review_required" else "imported",
                      clean_report={**prepared["report"], "agent_check": checked})
+    if foreign_report:
+        # 覆盖预览阶段的「只报不删」结论：这次是真删了，要留下删了多少、依据是什么。
+        novel.clean_report = {**novel.clean_report, "foreign_blocks": foreign_report}
     db.add(novel)
     db.flush()
     pieces: list[tuple[int | None, int, str]] = []

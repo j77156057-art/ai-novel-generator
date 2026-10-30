@@ -6,6 +6,7 @@ from difflib import SequenceMatcher
 from fastapi import HTTPException
 from sqlalchemy import select
 from app.corpus_health import scan_watermarks, strip_watermarks, strip_repeated_ads
+from app.corpus_health import find_foreign_blocks, strip_foreign_blocks
 from app.ingestion.clean import build_clean_report, clean_consumption_text, CONSUMPTION_CLEAN_VERSION
 from app.ingestion.parse_txt import parse_txt
 
@@ -45,9 +46,64 @@ def preview_ingest_clean(*, db=None, project_id=None, text: str, chapter_meta=No
                    "input_fingerprint": fingerprint({"text": text, "chapter_meta": chapter_meta}),
                    "cleaned_fingerprint": fingerprint(chapters), "removed_spans": changes,
                    "unresolved": unresolved, "repeated_ads": {"templates": ads["ads"], "detection_block_removed_chars": ads["removed"], "deletion_policy": "identified_header_only_preserve_layout"},
+                   "foreign_blocks": detect_foreign_blocks_report(text),
                    "checks": {"chapter_identity": [(c.get("chapter_no"), c.get("title")) for c in source] == [(c.get("chapter_no"), c.get("title")) for c in chapters],
                               "newlines_preserved": all(a.get("body", "").count("\n") == b["body"].count("\n") for a, b in zip(source, chapters))}})
     return {"chapters": chapters, "report": report}
+
+def detect_foreign_blocks_report(text: str, *, blocks=None, max_blocks: int = 8,
+                                 max_terms: int = 8) -> dict:
+    """检出「这本书里混进来的别的书」，产出**可复核**的体检结论（**只报不删**）。
+
+    ## 为什么单独一套报告
+
+    混进来的书（盗版站把多本书拼成一个 txt）会同时污染三样东西：
+    文体档案（混合统计）、风格样例（取到外书段落）、检索召回（外书情节）。
+    三样都不是「文本脏」能解释的，所以要有**独立的一条结论**，而不是塞进水印那条。
+
+    ## 为什么只报不删
+
+    删的是**整章正文**，比删水印串严重得多：判据万一错了，丢的是真内容。
+    所以这里只给证据（哪几章、独占词是什么、样本长什么样），
+    要剔除由调用方显式决定（投放时 `drop_foreign_blocks=True`）。
+
+    判据与实测见 `app.corpus_health` 的「混进了别的书」一节。
+
+    `blocks` 可传入已检出的结果（避免同一份文本扫两遍 —— 400 万字的书一次要 1.3 秒）。
+    """
+    if blocks is None:
+        blocks = find_foreign_blocks(text)
+    if not blocks:
+        return {
+            "detected": False, "block_count": 0, "chars": 0, "ratio": 0.0, "blocks": [],
+        }
+    chars = sum(int(b["chars"]) for b in blocks)
+    rows = []
+    for b in blocks[:max_blocks]:
+        rows.append({
+            "start": int(b["start"]),
+            "end": int(b["end"]),
+            "chars": int(b["chars"]),
+            "ratio": b["ratio"],
+            "chapter_count": len(b["chapters"]),
+            "chapter_titles": list(b["chapter_titles"])[:4],
+            "terms": [t["term"] for t in (b["terms"] or [])][:max_terms],
+            "exclusive_ratio": b["exclusive_ratio"],
+            "sample": (b["sample"] or "")[:120],
+        })
+    return {
+        "detected": True,
+        "block_count": len(blocks),
+        "chars": chars,
+        "ratio": round(chars / max(len(text), 1), 6),
+        "blocks": rows,
+        "action": (
+            "这份语料里混进了别的书（盗版站的 txt 常把多本书拼在一起）。"
+            "剔除请在投放时开启「剔除混书块」；不剔除的话，"
+            "文体档案与风格样例会是混合的。"
+        ),
+    }
+
 
 def review_samples(samples):
     from app.llm.provider import LocalFallbackLLMProvider

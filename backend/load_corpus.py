@@ -95,7 +95,8 @@ def dedupe_novels(db: Session) -> None:
     db.commit()
 
 
-def import_txts(db: Session, paths: list[str]) -> list[int]:
+def import_txts(db: Session, paths: list[str],
+                drop_foreign_blocks: bool = False) -> list[int]:
     """复用 M1 ingest 通路（解析 → 分章 → 切分 → 入库），保持与上传一致。"""
     from app.ingestion.store import ingest_text
 
@@ -104,11 +105,25 @@ def import_txts(db: Session, paths: list[str]) -> list[int]:
         title = os.path.basename(p)
         # 编码探测：GBK / GB18030 的国内网文 txt 不再被硬编码 utf-8 挡住。
         text, detected = read_text_file(p)
-        res = ingest_text(db, text, title=title, platform="upload")
+        res = ingest_text(db, text, title=title, platform="upload",
+                          drop_foreign_blocks=drop_foreign_blocks)
         ids.append(res["novel_id"])
         report = res.get("clean_report") or {}
         print(f"  已灌入 {title}: novel_id={res['novel_id']} "
               f"{res['chapters']} 章 / {res['chunks']} 分片 / 编码={detected}")
+        foreign = report.get("foreign_blocks") or {}
+        if foreign.get("detected"):
+            terms = "、".join(
+                str(t) for b in (foreign.get("blocks") or [])[:1]
+                for t in (b.get("terms") or [])[:6]
+            )
+            if foreign.get("dropped"):
+                print(f"    混书块：剔除 {foreign['block_count']} 段 / "
+                      f"{foreign.get('removed_chars', 0):,} 字（独占词：{terms}）")
+            else:
+                print(f"    混书块：检出 {foreign['block_count']} 段 / "
+                      f"{foreign['chars']:,} 字（{foreign.get('ratio', 0) * 100:.2f}%），"
+                      f"独占词：{terms} —— 加 --drop-foreign-blocks 可剔除")
         if report.get("cleaned"):
             marks = "，".join(
                 f"{m['text']}×{m['count']}" for m in report.get("marks", [])
@@ -151,6 +166,8 @@ def main() -> int:
                     help="定向导入：只导指定 txt（可多次传），不再扫描 data/seed")
     ap.add_argument("--no-graph", action="store_true",
                     help="跳过大图谱重建（定向补录语料时通常不需要重建全量图）")
+    ap.add_argument("--drop-foreign-blocks", action="store_true",
+                    help="剔除「混进来的别的书」的整章正文（盗版站的 txt 常把多本书拼在一起）")
     args = ap.parse_args()
 
     engine = _engine()
@@ -176,7 +193,7 @@ def main() -> int:
             if not txts:
                 print(f"  {SEED_DIR} 下没有 .txt —— 请把小说 txt 放进来")
             else:
-                import_txts(db, txts)
+                import_txts(db, txts, drop_foreign_blocks=args.drop_foreign_blocks)
 
         if args.drop_demo:
             print("\n=== 清理 demo 语料 ===")
