@@ -474,6 +474,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 | `tests/` | **1,858** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：9 个纯逻辑文件（43 项，`node --test`）+ 3 个组件级文件（27 项，vitest + jsdom） |
 | `docs/` | 73 份设计文档与指南：架构怎么定的、判据为什么这么定 |
+| `skills/` | 可复用的**方法单元**（agent skill）：盲评包脱敏与防泄露（SKILL.md + 事故复盘 + 泄露扫描脚本） |
 | `ENGINEERING.md` | 工程纪律：每一条规矩背后都是一次真实踩坑 |
 | `data/seed/` | 语料**投放区**（空目录 + 投放说明） |
 
