@@ -1,6 +1,6 @@
 ---
 name: blind-packet-deanonymization
-description: 出盲评包（人写 vs AI 产出两两对比的评测包）时，把人类侧文本的专名脱敏成等长占位符，并让包真的「盲」——六道闸门、判定三态、题面级复查、交付前独立扫描。Use when building, modifying, or shipping a blind evaluation packet, when masking proper nouns for A/B comparison, when a packet leaks the source book, or when touching backend/acceptance_lib.py、backend/app/style/entity_judge.py、backend/verify_acceptance_real.py 的脱敏链路。
+description: 出盲评包（人写 vs AI 产出两两对比的评测包）时，把人类侧文本的专名脱敏成等长占位符，并让包真的「盲」——七道闸门、判定三态、题面级复查、逐题题材指纹、交付前独立扫描。Use when building, modifying, or shipping a blind evaluation packet, when masking proper nouns for A/B comparison, when a packet leaks the source book, when the two sides of an item are different genres, or when touching backend/acceptance_lib.py、backend/app/style/entity_judge.py、backend/verify_acceptance_real.py 的脱敏链路。
 ---
 
 # 盲评包脱敏与防泄露
@@ -18,7 +18,7 @@ description: 出盲评包（人写 vs AI 产出两两对比的评测包）时，
 所以闸门是 **fail closed**：任一条不成立 ⇒ 包标成「不是盲评包」，
 `verify_blind_eval.py` **拒绝出统计结论**（退出码 2），题面根本不发出去。
 
-## 六道闸门
+## 七道闸门
 
 | 闸门 | 为什么必须有 | 怎么查 |
 |---|---|---|
@@ -28,6 +28,10 @@ description: 出盲评包（人写 vs AI 产出两两对比的评测包）时，
 | ④ 题材/年代一致 | 一古一今，评者不看内容就能分出 | 年代标记词**份额 + 命中数**，**整包级别**算 |
 | ⑤ 脱敏痕迹密度对称 | 两侧井号密度差一大截 ⇒ 数井号就认出来了 | 占位符密度（井号/百字）两侧对比 |
 | ⑥ 题面级专名复查 | 逐词判定**会漏**，漏了就是真名留在题面里 | 脱敏后把**成段题面**再读一遍，把还是专名的词挑出来补遮 |
+| ⑦ 逐题题材指纹一致 | ④ 只分了「古风/现代」两桶；**同代不同题材**照样泄露（实测：人类侧满篇「厉鬼/复苏/规则」，我们侧都市市井，评者读一两题就能分辨） | **模型读正文判题材**（闭集 9 类）：每题两侧判得一样才留这题，否则换窗口；**脱敏后再判一次** |
+
+⚠️ ④ 和 ⑦ 不是一回事：**年代一致 ≠ 题材一致**。实测那次泄露里
+年代闸门全绿，题材闸门才抓到。
 
 ## 脱敏链路（两侧必须是同一条）
 
@@ -76,7 +80,39 @@ description: 出盲评包（人写 vs AI 产出两两对比的评测包）时，
 - 补不干净 ⇒ 整包作废、题面不发；
 - 补遮占正文 > `RESIDUAL_MAX_RATIO`（5%）⇒ 多半是模型把普通词当专名 ⇒ 整包作废。
 
-## 交付前自检（三条**独立**口径）
+## 第七道闸门：题材指纹（第二次作废盲评包的原因）
+
+> 实测（2026-10-31）：18 题包出完，评者只读了一两题就说
+> 「一个厉鬼的，另外一个不知道什么题材，根据题材大概都知道哪个是人写的」。
+
+### 题材要**每一题两侧都一致**，而且题与题之间要乱着来
+
+- 题材在包内必须是**共有属性**，不能是**单侧信号**；
+- ⇒ 出包走**多题材臂**：每个臂 = 一个题材（我们侧该题材的产出 + 人类侧该题材的语料），
+  **每一题的两侧都取自同一个臂**，不同题来自不同臂，题序打散；
+- 我们侧要凑齐多个题材 ⇒ 要有**多个题材臂**（各自投一本参考书炼文风档案、
+  各自一套剧情圣经、同一套引擎与同一个渠道模型）。
+
+### 判题材：**模型读正文**，不是词表
+
+- **词表不可信**（实测 18 本语料）：「剑/刀/江湖/系统/掌柜/伙计/巷子」这类词
+  **在过半的书里都出现** ⇒ 旧词表把 **9/18 本**判错（现代都市小说被判成古风武侠）。
+  词表只当**粗筛**（省模型调用），判据是 `acceptance_lib.judge_genres`：
+  **闭集** 9 个子题材 + 「其他」、只判世界观与场景、结果按文本 sha256 缓存。
+- 三条口径**别改回去**：
+  1. **两侧都没露题材指纹 ⇒ 距离 0**（不是 1.0）—— 原来算 1.0，害得一道题都出不来；
+  2. **一侧「其他」、另一侧题材明确 ⇒ 算不一致**（保守换窗口）；
+     只有**两侧都「其他」**才算一致（都没线索 ⇒ 没有泄露）；
+  3. **判不出来（空）⇒ 算不一致**（fail closed），不能默认放过。
+
+### 出包流程（`build_multi_arm_packet`）
+
+1. 人类侧窗口先用**词表粗筛**（取最像的几个）；
+2. **模型判题材**：两侧判得一样才留下这一题，否则**换窗口**；
+3. **脱敏之后再判一次** —— 判的是**评者真正看到的那段文字**；
+4. 题序打散。
+
+## 交付前自检（四条**独立**口径）
 
 ```bash
 python skills/blind-packet-deanonymization/scripts/leak_scan.py \
@@ -86,7 +122,9 @@ python skills/blind-packet-deanonymization/scripts/leak_scan.py \
 1. **判定名残留**：判成专名的词逐个回查题面 ⇒ 必须 **0 处**（退出码 1 = 包不能发）；
 2. **排他 + 人名形状**（完全不用 LLM）：本书高频、别的书里几乎没有、且过 `_valid_name`
    ⇒ 回查题面。**命中不等于泄露**（普通词也会命中），要逐个看上下文；
-3. **题面级复查**（新 provider、无缓存）：把整份题面再读一遍。
+3. **题面级复查**（新 provider、无缓存）：把整份题面再读一遍；
+4. **逐题题材指纹核对**（完全不用 LLM）：出包时题材是**模型**判的，
+   这一遍用**词表**判 —— 两把尺互相独立。命中要人眼过一遍。
 
 ## 出包之后：判定脚本
 
@@ -105,22 +143,27 @@ python skills/blind-packet-deanonymization/scripts/leak_scan.py \
 - **挡得住名字，挡不住「这段我读过」** —— 脱敏只处理专名；
   书里的标志性短语（成语化的设定、专有的门派/体系称呼）还会留在题面里。
   这一条要写进交付说明，不粉饰。
+- **挡得住题材，挡不住「风格差」** —— ⑦ 只保证两侧**同一类故事**；
+  如果我们这侧的文风明显更「工整」，评者仍然能靠文风分辨（那正是这个包要测的东西）。
 - **跨代语料换题材也救不了** —— ④ 是硬闸门，跨代一律作废。
 - **人类侧的名天然比 AI 产出密** —— 出版小说的人物名密度本来就高，
   ⑤ 是用来暴露这个不对称，不是用来掩盖它；密度差太多就换语料，别调阈值。
 - **闸门量的是统计特征，泄密是逐词事实** —— 前五道闸门全绿也可能漏名字
   （实测就是）。所以 ⑥ 必须**换一条链路**复查，不能复用同一份判定。
+- **题材判据本身是模型** —— 换模型/换档位可能判得不同 ⇒ 判据与模型版本要一起记；
+  ⑦ 只能保证「题材不是单侧信号」，保证不了「这题一定分不出」。
 
 ## 相关文件
 
 | 文件 | 作用 |
 |---|---|
-| `backend/acceptance_lib.py` | 召回 / 判定 / 占位符替换 / 密度 / 年代 / 题面级复查 |
+| `backend/acceptance_lib.py` | 召回 / 判定 / 占位符替换 / 密度 / 年代 / 题材指纹与题材判定 / 题面级复查 |
 | `backend/app/style/entity_judge.py` | 逐词判定、批次重试、判定缓存版本 |
-| `backend/verify_acceptance_real.py` | 出包流程（六道闸门）、`--snips` 取样 |
+| `backend/verify_acceptance_real.py` | 出包流程（七道闸门）、多题材臂出包、`--snips` 取样 |
 | `backend/verify_blind_eval.py` | 记录表解析 + 二项检验（`blind=false` ⇒ 拒绝出结论） |
-| `tests/test_blind_packet_guard.py` | 闸门守卫测试 |
+| `tests/test_blind_packet_guard.py` | 闸门守卫测试（脱敏 / 判定三态 / 题面复查） |
+| `tests/test_blind_genre_guard.py` | 题材闸门守卫测试（指纹 / 判定 / 多臂出包） |
 | `docs/acceptance-metrics.md` §5 | 盲评流程与判据 |
-| `ENGINEERING.md` | 事故复盘与取舍（搜「盲评包漏遮真名」） |
+| `ENGINEERING.md` | 事故复盘与取舍（搜「盲评包漏遮真名」「题材指纹」） |
 
 事故复盘（根因、实测数字、教训）见 [reference.md](reference.md)。

@@ -76,9 +76,14 @@ from acceptance_lib import (  # noqa: E402
     baseline_corpus_spec,
     blind_verdict,
     corpus_texts,
+    density_leak,
+    era_mismatch,
     grams,
+    genre_distance,
+    genre_mismatch,
     human_baseline,
     jaccard,
+    judge_genres,
     mask_density,
     mask_names,
     mask_side,
@@ -112,6 +117,13 @@ RESIDUAL_ROUNDS = 3
 #: 超过它 ⇒ 模型多半把普通词当成了专名（这时候再补遮只会把题面涂花）。
 #: 这种包宁可作废，也不能交出去一个被涂花的题面。
 RESIDUAL_MAX_RATIO = 0.05
+
+#: 每题挑人类侧窗口时试几个（先按题材指纹粗筛，再交给模型判题材）。
+#:
+#: ⚠️ 别调大：这些窗口**每一个都要过一遍模型判题材**（4 段一批），
+#: 24 个候选 × 6 道题 × 3 个臂 = 400+ 段 ⇒ 光判题材就要两小时。
+#: 实测 6 个够用（词表粗筛先排掉了一大半明显不像的）。
+WINDOW_TRIES = 6
 
 PASS = 0
 FAIL = 0
@@ -520,6 +532,411 @@ def sample_positions(n_segments: int, k: int = 6) -> list[int]:
         if p not in out:
             out.append(p)
     return out
+
+
+def build_multi_arm_packet(arms: list[dict], out_dir: Path, provider=None,
+                            n_snips: int = 18, chars: int = 400,
+                            judge_provider=None) -> dict:
+    """多题材臂的盲评包：**每题两侧同题材，题与题之间题材乱着来**。
+
+    ## 为什么要有它
+
+    单题材臂的包会被**题材指纹**泄露（实测 2026-10-31）：人类侧那本满篇
+    「厉鬼 / 复苏 / 规则」，我们侧是都市市井悬疑 ⇒ 评者读一两题就能分出
+    哪边是出版物，**年代闸门全绿也没抓到**（年代只分了「古风 / 现代」两桶）。
+
+    ⇒ 做法：**每一题的两侧都取自同一个题材臂**（同题材、同年代），
+      而**不同题来自不同题材臂** —— 题材在题与题之间乱着来，
+      评者没法用「哪边像人写的」定位，只能逐题读文风。
+
+    ## 题材怎么判（权威口径是模型，不是词表）
+
+    词表口径实测太弱（18 本语料里「剑/刀/江湖/系统/掌柜」这类词在过半的书里
+    都出现 ⇒ 现代都市小说被误判成古风武侠，9/18 判错）。
+    所以这里的流程是：
+
+      1. 词表**粗筛**：从人类侧书里挑出与我们的段最像的几个窗口；
+      2. **模型判题材**（`acceptance_lib.judge_genres`）：读正文，闭集分类；
+      3. 逐题硬闸：两侧题材判得一样才留下这一题，否则换窗口；
+      4. **脱敏之后再判一次** —— 判的是评者真正看到的那段文字。
+
+    ## arms 的结构
+
+    ```python
+    {"name": "古风",
+     "rows":   [{"seg": 1, "text": "..."}],       # 我们侧该题材的产出
+     "corpus": [("书名", "整本正文")],               # 人类侧该题材的语料
+     "era": "古风"}
+    ```
+    """
+    if not arms:
+        return {}
+    rng = random.Random()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    genre_provider = judge_provider or provider
+
+    # —— 1. 每臂分多少题（多的往前排，余数分给前面的臂）——
+    base, extra = divmod(n_snips, len(arms))
+    quota = [base + (1 if i < extra else 0) for i in range(len(arms))]
+
+    # —— 2. 每臂出候选对：我们的段 × 人类侧窗口（词表粗筛）——
+    candidates: list[dict] = []
+    for arm, k in zip(arms, quota):
+        rows = [r for r in (arm.get("rows") or []) if r.get("text")]
+        corpus = [(n, normalize_for_blind(t)) for n, t in (arm.get("corpus") or [])]
+        if not rows or not corpus or k <= 0:
+            continue
+        pos = sample_positions(len(rows), k)
+        for p in pos:
+            seg_text = normalize_for_blind(rows[p - 1]["text"])
+            # ⚠️ **两侧长度必须一样**：我们侧也取 `chars` 字的窗口
+            # （整段 2000+ 字 vs 人类侧 400 字 = 一眼就能看出来的非对称特征）。
+            # 段本身比窗口还短的（生成被截断的段）⇒ 跳过，不拿它凑数。
+            if len(seg_text) < chars:
+                continue
+            st = rng.randrange(0, len(seg_text) - chars)
+            ours_text = seg_text[st:st + chars]
+            # 人类侧候选窗口：词表粗筛，取与我们的段最像的 WINDOW_TRIES 个
+            scored: list[tuple[float, str, int, str]] = []
+            for name, src in corpus:
+                for off in _candidate_offsets(src, chars):
+                    w = src[off:off + chars]
+                    scored.append((genre_distance(ours_text, w), name, off, w))
+            scored.sort(key=lambda x: x[0])
+            for d, name, off, w in scored[:WINDOW_TRIES]:
+                bad_era, _ = era_mismatch(ours_text, w)
+                candidates.append({
+                    "arm": arm.get("name", ""),
+                    "era": arm.get("era", ""),
+                    "seg": rows[p - 1].get("seg"),
+                    "ours": ours_text,
+                    "human": w,
+                    "book": name,
+                    "offset": off,
+                    "genre_distance": d,
+                    "era_ok": not bad_era,
+                })
+
+    if not candidates:
+        return {}
+
+    # —— 3. 模型判题材（粗筛出来的候选，逐个判）——
+    labels: dict[str, str] = {}
+    label_fail = False
+    to_judge: list[tuple[str, str]] = []
+    if genre_provider is None:
+        label_fail = True
+    else:
+        seen: set[str] = set()
+        for c in candidates:
+            for role, text in (("ours", c["ours"]), ("human", c["human"])):
+                key = f"{role}:{c['arm']}:{c['seg']}:{c['book']}:{c['offset']}"
+                c.setdefault("keys", {})[role] = key
+                if key not in seen:
+                    seen.add(key)
+                    to_judge.append((key, text))
+        try:
+            labels = judge_genres(to_judge, genre_provider,
+                                  cache_path=out_dir / "blind_genres.json",
+                                  log=lambda m: print(f"     [题材判定] {m}"))
+        except Exception as exc:  # noqa: BLE001
+            label_fail = True
+            print(f"  ⛔ 题材判定失败：{exc}")
+        missing = [k for k, _ in to_judge if k not in labels]
+        if missing:
+            # **没判出来的不能当「一致」**（fail closed，同脱敏链路的口径）
+            label_fail = True
+            print(f"  ⛔ 有 {len(missing)}/{len(to_judge)} 段题材没判出来")
+
+    # —— 4. 逐题硬闸：两侧题材判得一样才留这一题 ——
+    chosen: list[dict] = []
+    used_human: set[tuple[str, int]] = set()
+    if not label_fail:
+        for arm, k in zip(arms, quota):
+            got = 0
+            for c in sorted([c for c in candidates if c["arm"] == arm.get("name", "")],
+                            key=lambda c: (c["genre_distance"], c["offset"])):
+                if got >= k:
+                    break
+                la = labels.get(c["keys"]["ours"], "")
+                lb = labels.get(c["keys"]["human"], "")
+                bad, ev = genre_mismatch(c["ours"], c["human"], labels=(la, lb))
+                c["genre_evidence"] = ev
+                c["genre_ok"] = not bad
+                if bad or not c["era_ok"]:
+                    continue
+                if (c["book"], c["offset"]) in used_human:
+                    continue
+                used_human.add((c["book"], c["offset"]))
+                chosen.append(c)
+                got += 1
+            print(f"  臂「{arm.get('name', '')}」出题 {got}/{k}")
+
+    if not chosen:
+        if label_fail:
+            print("  ⛔ 题材没判出来 ⇒ **不出题面**")
+            return {"n": 0, "blind": False, "emitted": False,
+                    "reasons": ["题材判定没跑成，不能确认两侧同题材"], "positions": []}
+        print("  ⛔ 没有一道题两侧题材对得上 ⇒ **不出题面**")
+        return {"n": 0, "blind": False, "emitted": False,
+                "reasons": ["没有一道题的两侧题材判为一致"], "positions": []}
+
+    # —— 5. 脱敏：两侧同一个函数；我们侧按臂分批，人类侧按书分批 ——
+    ours_by_arm: dict[str, list[str]] = {}
+    for c in chosen:
+        ours_by_arm.setdefault(c["arm"], []).append(c["ours"])
+    ours_full_by_arm: dict[str, str] = {}
+    for arm in arms:
+        ours_full_by_arm[arm.get("name", "")] = "\n".join(
+            normalize_for_blind(r["text"]) for r in (arm.get("rows") or [])
+            if r.get("text"))
+    human_by_book: dict[str, list[str]] = {}
+    for c in chosen:
+        human_by_book.setdefault(c["book"], []).append(c["human"])
+    human_full_by_book: dict[str, str] = {}
+    for arm in arms:
+        for n, t in (arm.get("corpus") or []):
+            human_full_by_book[n] = normalize_for_blind(t)
+
+    mask_fail: list[str] = []
+    ours_masked: dict[str, list[str]] = {}
+    human_masked: dict[str, list[str]] = {}
+    if provider is None:
+        mask_fail.append("没有 provider（判定专名要用模型）")
+    else:
+        for arm_name, texts in ours_by_arm.items():
+            try:
+                out, hit = mask_side(texts, ours_full_by_arm.get(arm_name, ""), provider,
+                                     cache_path=out_dir / f"blind_names_ours_{_slug(arm_name)}.json",
+                                     log=lambda m, a=arm_name: print(f"     [我们侧 {a}] {m}"))
+                ours_masked[arm_name] = out
+            except Exception as exc:  # noqa: BLE001
+                mask_fail.append(f"我们侧 {arm_name} 脱敏失败（{exc}）")
+        for book, texts in human_by_book.items():
+            try:
+                out, hit = mask_side(texts, human_full_by_book.get(book, ""), provider,
+                                     cache_path=out_dir / f"blind_names_human_{_slug(book)}.json",
+                                     log=lambda m, b=book: print(f"     [人类侧 {b}] {m}"))
+                human_masked[book] = out
+            except Exception as exc:  # noqa: BLE001
+                mask_fail.append(f"人类侧 {book} 脱敏失败（{exc}）")
+
+    # 逐题把脱敏后的文本挂回（两侧各自是同一批片段，顺序一致）
+    # ⚠️ 计数要**按臂/按书**分别记 —— 用一个全局下标的话，
+    # 只要 `chosen` 里两个臂交错了，取到的就是别的臂的脱敏结果。
+    oi_by_arm: dict[str, int] = {}
+    hi_by_book: dict[str, int] = {}
+    for c in chosen:
+        arm_texts = ours_masked.get(c["arm"])
+        book_texts = human_masked.get(c["book"])
+        oi = oi_by_arm.get(c["arm"], 0)
+        hi = hi_by_book.get(c["book"], 0)
+        c["ours_m"] = arm_texts[oi] if arm_texts and oi < len(arm_texts) else c["ours"]
+        c["human_m"] = book_texts[hi] if book_texts and hi < len(book_texts) else c["human"]
+        oi_by_arm[c["arm"]] = oi + 1
+        hi_by_book[c["book"]] = hi + 1
+
+    # —— 6. **脱敏后再判一次题材**：判的是评者真正看到的那段文字 ——
+    reasons: list[str] = []
+    evidence: dict = {}
+    bad_pairs: list[dict] = []
+    if genre_provider is not None and not mask_fail:
+        m_items = []
+        for c in chosen:
+            m_items.append((f"m:ours:{c['arm']}:{c['seg']}", c["ours_m"]))
+            m_items.append((f"m:human:{c['book']}:{c['offset']}", c["human_m"]))
+        try:
+            mlabels = judge_genres(m_items, genre_provider,
+                                   cache_path=out_dir / "blind_genres.json",
+                                   log=lambda m: print(f"     [题面题材判定] {m}"))
+        except Exception as exc:  # noqa: BLE001
+            mask_fail.append(f"题面级题材判定失败：{exc}")
+            mlabels = {}
+        for c in chosen:
+            la = mlabels.get(f"m:ours:{c['arm']}:{c['seg']}", "")
+            lb = mlabels.get(f"m:human:{c['book']}:{c['offset']}", "")
+            bad, ev = genre_mismatch(c["ours_m"], c["human_m"], labels=(la, lb))
+            c["genre_ok"] = not bad
+            c["genre_evidence"] = ev
+            c["era_ok_after"] = not era_mismatch(c["ours_m"], c["human_m"])[0]
+            # 长度对称：两侧字数差太多 ⇒ 评者不看内容也知道哪边是「摘出来的」
+            lo, lh = len(c["ours_m"]), len(c["human_m"])
+            ratio = min(lo, lh) / max(lo, lh, 1)
+            c["len_ratio"] = round(ratio, 3)
+            c["len_ok"] = ratio >= 0.85
+            if bad or not c["era_ok_after"] or not c["len_ok"]:
+                bad_pairs.append(c)
+        evidence["genre_labels"] = {
+            "ours": {f"{c['arm']}:{c['seg']}":
+                     mlabels.get(f"m:ours:{c['arm']}:{c['seg']}", "") for c in chosen},
+            "human": {f"{c['book']}@{c['offset']}":
+                      mlabels.get(f"m:human:{c['book']}:{c['offset']}", "") for c in chosen},
+        }
+    else:
+        for c in chosen:
+            c["genre_ok"] = True
+            c["era_ok_after"] = True
+            lo, lh = len(c["ours_m"]), len(c["human_m"])
+            c["len_ratio"] = round(min(lo, lh) / max(lo, lh, 1), 3)
+            c["len_ok"] = c["len_ratio"] >= 0.85
+
+    # 题材/年代对不上的题**直接剔掉**（不拿不合格的题充数）
+    if bad_pairs:
+        bad_ids = {id(c) for c in bad_pairs}
+        kept = [c for c in chosen if id(c) not in bad_ids]
+        print(f"  ⛔ {len(bad_pairs)} 道题脱敏后两侧题材/年代对不上 ⇒ 剔掉")
+        chosen = kept
+        if not chosen:
+            reasons.append("脱敏后没有一道题的两侧题材仍然一致")
+
+    ours_all = [c["ours_m"] for c in chosen]
+    human_all = [c["human_m"] for c in chosen]
+    dens_ours = mask_density("\n".join(ours_all))
+    dens_human = mask_density("\n".join(human_all))
+    evidence["mask_density"] = {"ours": dens_ours, "human": dens_human}
+    if density_leak(dens_ours, dens_human):
+        reasons.append(
+            f"脱敏痕迹密度差得出来（我们 {dens_ours:.2f} vs 人类 {dens_human:.2f} "
+            "个井号/百字）：数一数就能认出出版物那一侧")
+    per_arm = {}
+    for c in chosen:
+        per_arm.setdefault(c["arm"], {"n": 0, "genre_bad": 0, "era_bad": 0})
+        per_arm[c["arm"]]["n"] += 1
+        if not c["genre_ok"]:
+            per_arm[c["arm"]]["genre_bad"] += 1
+        if not c["era_ok_after"]:
+            per_arm[c["arm"]]["era_bad"] += 1
+    evidence["per_arm"] = per_arm
+    print(f"  各臂题数与题材一致性：{per_arm}")
+
+    # —— 7. 题面级专名复查（第六道闸门，同单臂包）——
+    residual_left: list[str] = []
+    residual_found: list[str] = []
+    if provider is not None and not mask_fail:
+        judge = judge_provider or provider
+        body = "\n".join(ours_all) + "\n" + "\n".join(human_all)
+        for rnd in range(RESIDUAL_ROUNDS):
+            try:
+                left = residual_proper_nouns(
+                    body, judge, cache_path=out_dir / "blind_residual.json",
+                    log=lambda m: print(f"     [题面复查] {m}"))
+            except Exception as exc:  # noqa: BLE001
+                mask_fail.append(f"题面级专名复查失败：{exc}")
+                break
+            if not left:
+                break
+            residual_found += left
+            if rnd == RESIDUAL_ROUNDS - 1:
+                residual_left = left
+                break
+            for c in chosen:
+                c["ours_m"] = mask_names(c["ours_m"], left)[0]
+                c["human_m"] = mask_names(c["human_m"], left)[0]
+            body = "\n".join(c["ours_m"] for c in chosen) + "\n" + \
+                "\n".join(c["human_m"] for c in chosen)
+            print(f"     → 补遮 {len(left)} 个残留专名后重查")
+
+    blind = not reasons and not mask_fail and not residual_left
+    if mask_fail:
+        reasons.append("脱敏没跑成，题面里留着没脱敏的原文：" + "；".join(mask_fail))
+    if residual_left:
+        reasons.append("题面里还残留专名（复查没清干净）：" + "、".join(residual_left[:10]))
+
+    # —— 8. 组装题面：题序打散（题材在题与题之间乱着来）——
+    order = list(range(len(chosen)))
+    rng.shuffle(order)
+    items, key = [], []
+    for i, c in enumerate(chosen):
+        flip = rng.random() < 0.5
+        slot_a = "human" if flip else "ours"
+        slot_b = "ours" if flip else "human"
+        items.append({"id": f"s{i + 1:02d}", "A": slot_a, "B": slot_b})
+        key.append({
+            "sample_id": f"s{i + 1:02d}",
+            "slot_A": slot_a, "slot_B": slot_b,
+            "arm": c["arm"], "our_segment_no": c["seg"],
+            "human_source": c["book"],
+            "genre_distance": c["genre_distance"],
+            "genre_ok": c["genre_ok"], "era_ok": c["era_ok_after"],
+            "len_ratio": c.get("len_ratio"),
+            "genre_evidence": c.get("genre_evidence", {}),
+        })
+
+    lines = ["# 盲评题面（**只有 A/B，没有标签**）", ""]
+    if not blind:
+        lines += [
+            "> ⚠️ **本包不是盲评包**：两侧文本不满足盲评条件（见下）。",
+            "> 评者不看内容就能分出哪边是哪边 ⇒ **不能用它做统计判定**。", ">",
+        ]
+        for reason in reasons:
+            lines.append(f"> - {reason}")
+        lines.append("")
+    else:
+        lines += [
+            f"每题两段各约 {chars} 字，一段来自本项目的产出，一段来自人类作品。",
+            "**两侧的专名都已替换成等长占位符（＃＃）** —— 处理痕迹两边一样。",
+            "题目之间的题材**不一样**，但**每一题的两段是同一个题材**。",
+            "请只凭文本判断，不要猜来源。**二选一**，不许「差不多」。", "",
+        ]
+    for n, idx in enumerate(order, 1):
+        a_text = chosen[idx]["ours_m"] if items[idx]["A"] == "ours" else chosen[idx]["human_m"]
+        b_text = chosen[idx]["ours_m"] if items[idx]["B"] == "ours" else chosen[idx]["human_m"]
+        lines += [f"## 第 {n} 题（{items[idx]['id']}）", "", "**A**", "",
+                  "> " + a_text.replace("\n", "\n> "), "",
+                  "**B**", "", "> " + b_text.replace("\n", "\n> "), ""]
+
+    (out_dir / "blind_key.json").write_text(json.dumps({
+        "note": "密封文件：谁是我们生成的、人类语料是谁、两侧是否同题材。不要和题面一起给评者。",
+        "blind": blind,
+        "blind_reasons": reasons,
+        "evidence": evidence,
+        "residual_names": {"repaired": sorted(set(residual_found)), "left": residual_left},
+        "items": key,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if mask_fail or residual_left or not chosen:
+        why = ("脱敏没跑成" if mask_fail else
+               "题面里还残留专名" if residual_left else "没有合格题目")
+        print(f"  ⛔ {why} ⇒ **不出题面**")
+        return {"n": len(chosen), "blind": False, "reasons": reasons, "emitted": False,
+                "positions": [c["seg"] for c in chosen],
+                "mask_density": {"ours": dens_ours, "human": dens_human},
+                "per_arm": per_arm}
+
+    (out_dir / "blind_samples.md").write_text("\n".join(lines), encoding="utf-8")
+    sheet = ["# 盲评记录表", "",
+             "| sample | 更像人写 | 主线更清 | 有 AI 腔 | 猜 AI | 备注 |",
+             "|---|---|---|---|---|---|"]
+    for it in items:
+        sheet.append(f"| {it['id']} | A / B | A / B | A / B | A / B | |")
+    sheet += ["", "## 合计", "", "- 「更像人写」选我们那段的次数 k = ____",
+              "- 评者人数 = ____（题面每份独立作答，互不通气）",
+              f"- 判定 n = 评者人数 × {len(items)}"]
+    (out_dir / "blind_sheet.md").write_text("\n".join(sheet), encoding="utf-8")
+    return {"n": len(items), "blind": True, "reasons": reasons, "emitted": True,
+            "positions": [c["seg"] for c in chosen],
+            "mask_density": {"ours": dens_ours, "human": dens_human},
+            "per_arm": per_arm}
+
+
+def _slug(name: str) -> str:
+    """给书名/臂名做文件名安全的短标签（ASCII 优先，中文保留但去掉路径字符）。"""
+    out = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in (name or ""))
+    return (out or "x")[:40]
+
+
+def _candidate_offsets(text: str, chars: int, step: int = 2000, limit: int = 300) -> list[int]:
+    """在长文本里取候选窗口起点（稀疏采样，够用又快）。"""
+    n = len(text or "")
+    if n <= chars:
+        return [0]
+    offs = list(range(0, n - chars + 1, step))
+    if len(offs) > limit:
+        offs = offs[:limit]
+    if offs[-1] != n - chars:
+        offs.append(n - chars)
+    return offs
 
 
 def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir: Path,

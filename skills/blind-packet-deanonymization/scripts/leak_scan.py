@@ -5,7 +5,7 @@ r"""盲评包泄露扫描（**不依赖出包流程自己的判定**）。
 
 包里要有 `blind_samples.md`（题面）与 `blind_names_*.json`（判定缓存）。
 
-跑三条口径：
+跑四条口径：
 
 1. **判定名残留** —— 把判定缓存里「判成专名」的词逐个回查题面。
    出现次数必须为 **0**（这查的是「遮了没有」）。
@@ -16,6 +16,9 @@ r"""盲评包泄露扫描（**不依赖出包流程自己的判定**）。
    ⚠️ 命中**不等于**泄露：普通词也会命中，必须逐个看上下文。
 3. **题面级复查**（可选，需要模型）—— 把整份题面交给模型「只报还是专名的词」。
    这一遍与出包时用的判定链路不同（输入/提示词/缓存都不同），能抓住独立漏网的。
+4. **逐题题材指纹核对**（**完全不用 LLM**）—— 出包时题材是**模型**判的，
+   这一遍用**词表**判，两把尺互相独立。命中 ⇒ 两侧题材词汇分布不同，
+   **要人眼过一遍**（词表已知会误判）。
 
 退出码：1 = 判定名还有残留（**这个包不能发出去**）；0 = 通过。
 """
@@ -106,6 +109,71 @@ def check_text_level(packet: Path, provider=None, backend: str = "") -> list[str
     return left
 
 
+def parse_items(samples: str) -> list[tuple[str, str, str]]:
+    """把题面拆成 ``[(题号, A 文本, B 文本)]``。"""
+    items: list[tuple[str, str, str]] = []
+    cur_id, side, buf = "", "", []
+    for line in samples.splitlines():
+        if line.startswith("## 第"):
+            if cur_id and side:
+                items.append((cur_id, "A", "\n".join(buf)))
+            cur_id, side, buf = "", "", []
+            head = line.strip()
+            if "(" in head and head.endswith(")"):
+                cur_id = head[head.rfind("(") + 1:-1]
+            continue
+        if line.strip() in ("**A**", "**B**"):
+            if cur_id and side:
+                items.append((cur_id, side, "\n".join(buf)))
+                buf = []
+            side = line.strip().strip("*")
+            continue
+        if side and line.startswith("> "):
+            buf.append(line[2:])
+    if cur_id and side:
+        items.append((cur_id, side, "\n".join(buf)))
+    # 题面里 A、B 是交替出现的：重组成 (题号, A, B)
+    paired: list[tuple[str, str, str]] = []
+    pending: dict[str, dict[str, str]] = {}
+    for sid, s, text in items:
+        pending.setdefault(sid, {})[s] = text
+    for sid, d in pending.items():
+        if "A" in d and "B" in d:
+            paired.append((sid, d["A"], d["B"]))
+    return paired
+
+
+def check_genre_mismatch(packet: Path, backend: str = "") -> list[str]:
+    """口径 4：**逐题题材指纹**独立核对（**完全不用 LLM**）。
+
+    出包时用的是**模型**判题材；这一遍是**词表**口径 —— 两把尺互相独立，
+    词表弱（已知会误判），所以这里的命中**要人眼过一遍**：
+    命中说明两侧的题材词汇分布不同，是**需要看一眼**的地方，
+    不是「一定泄露」。
+    """
+    _backend_on_path(backend)
+    from acceptance_lib import genre_dominant, genre_profile  # noqa: E402
+
+    samples = (packet / "blind_samples.md").read_text(encoding="utf-8")
+    pairs = parse_items(samples)
+    if not pairs:
+        print("[4] 跳过（题面里没解析出题目）")
+        return []
+    bad: list[str] = []
+    for sid, a, b in pairs:
+        da = genre_dominant(genre_profile(a))
+        db = genre_dominant(genre_profile(b))
+        if da and db and da != db:
+            print(f"[4] {sid}：A 主导={da}　B 主导={db} ⇒ 两侧题材不同（要看一眼）")
+            bad.append(sid)
+        elif da or db:
+            print(f"[4] {sid}：只有一侧露题材指纹（A={da or '无'}　B={db or '无'}）"
+                  "⇒ 一侧看不出题材（要看一眼）")
+            bad.append(sid)
+    print(f"[4] 逐题题材核对：{len(pairs)} 题，{len(bad)} 题需要人眼过一遍")
+    return bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--packet", required=True, help="盲评包目录（含 blind_samples.md）")
@@ -125,12 +193,14 @@ def main() -> int:
                           args.backend)
     if args.judge_provider:
         check_text_level(packet, args.judge_provider, args.backend)
+    check_genre_mismatch(packet, args.backend)
 
     print("=" * 60)
     if leaked:
         print(f"⛔ 判定过的专名仍留在题面里 {len(leaked)} 处 ⇒ 这个包不能发出去")
         return 1
-    print("✅ 判定名残留 0 处（口径 2 的命中要人眼过一遍：它们可能是普通词）")
+    print("✅ 判定名残留 0 处（口径 2 / 口径 4 的命中要人眼过一遍："
+          "它们可能是普通词、也可能是题材差异）")
     return 0
 
 

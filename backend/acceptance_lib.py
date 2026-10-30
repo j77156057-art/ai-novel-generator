@@ -677,6 +677,331 @@ def normalize_for_blind(text: str) -> str:
     return "\n".join(out)
 
 
+#: 题材指纹词表（**子题材**，不是年代）—— **粗筛口径**，不是判据。
+#:
+#: ## 为什么要有这道闸门
+#:
+#: 年代闸门只分了「古风 / 现代」两桶，而实测的泄露是**同代不同题材**：
+#: 人类侧那本用「厉鬼 / 复苏 / 规则」这套灵异术语，我们侧是都市市井悬疑 ——
+#: 评者读一两题就知道哪边是出版物，**年代闸门全绿也没抓到**。
+#:
+#: ## 词表只当粗筛：实测证明「按词判题材」很弱
+#:
+#: 2026-10-31 实测（18 本本地语料，逐词统计）：
+#: **「剑」「刀」「江湖」「师父」「将军」「系统」「掌柜」「伙计」「巷子」这类词，
+#: 在过半的书里都出现过** —— 它们是网文的通用词，不是题材专有词。
+#: 用它们当标记 ⇒ 现代都市小说被误判成古风武侠（实测 18 本里有 9 本被标错）。
+#:
+#: 所以：
+#: ① 词表里**只留区分度高的词**（在多数书里根本不出现或明显集中在某一题材）；
+#: ② **权威口径是 LLM 判题材**（`judge_genres`）—— 它读正文、看世界观，
+#:    不靠几个词；③ 词表只用来**粗筛候选窗口**，省掉大量 LLM 调用。
+#:
+#: 选词标准：一个词要么在**某个题材里集中出现**，要么是**该题材的硬名词**
+#: （「供销社」「镖局」「人皮纸」这种别处根本不用的词）。
+GENRE_MARKERS = {
+    "灵异克苏鲁": (
+        "驭鬼者", "鬼域", "邪祟", "凶宅", "灵异事件", "诡异事件", "收容所",
+        "怨灵", "凶灵", "尸鬼", "鬼眼",
+    ),
+    "规则怪谈": (
+        "终焉", "主办方", "人皮纸", "生肖", "副本",
+    ),
+    "都市异能": (
+        "面板", "异兽", "商城", "签到", "异能者", "异能", "超能力", "宿主",
+    ),
+    "都市市井": (
+        "冰柜", "后厨", "饭馆", "面馆", "粉笔", "手电", "城管", "筒子楼",
+        "招待所", "灶眼", "巷口", "街口",
+    ),
+    "年代八五": (
+        "供销社", "工分", "粮票", "布票", "个体户", "国营", "车间", "厂子",
+        "媒人", "介绍对象", "洋房", "收音机", "公社", "万元", "下乡", "返城",
+        "搪瓷缸", "拖拉机",
+    ),
+    "古风武侠": (
+        "内力", "真气", "镖局", "朝廷", "世子", "郡主", "教主", "帮主",
+        "师妹", "剑客", "轻功", "剑法", "刀法",
+    ),
+    "言情豪门": (
+        "白月光", "闪婚", "前妻", "千亿", "总裁",
+    ),
+}
+
+
+def genre_profile(text: str) -> dict[str, float]:
+    """题材指纹：每个子题材的标记词密度（每百字命中数）。
+
+    用来查「两侧是不是在讲同一类故事」——
+    一侧满篇「厉鬼/复苏/规则」、另一侧是市井巷子 ⇒ 评者不看文风就能分出哪边是出版物。
+    """
+    t = _clean(text)
+    n = max(len(t), 1)
+    return {g: 100.0 * sum(t.count(w) for w in words) / n for g, words in GENRE_MARKERS.items()}
+
+
+def genre_dominant(profile: dict[str, float], *, min_hits: float = 0.05) -> str:
+    """主导子题材（密度最高且过阈值的那个）；都不够格 ⇒ 空串。
+
+    为什么要最小密度：单个词命中一次就算「主导」的话，噪声会赢。
+    """
+    best, best_v = "", -1.0
+    for g, v in sorted(profile.items(), key=lambda x: -x[1]):
+        if v > best_v:
+            best, best_v = g, v
+    return best if best_v >= min_hits else ""
+
+
+def genre_distance(a: str, b: str) -> float:
+    """两段文本的题材指纹距离（0 = 完全一样，1 = 毫无共同点）。
+
+    口径（2026-10-31 修过一次）：
+    - 两侧主导题材**都明确且相同** ⇒ 0.0
+    - 两侧主导题材**都明确但不同** ⇒ 1.0
+    - 只有一侧有主导 ⇒ 0.5（半信半疑：一边露了题材指纹，另一边没露）
+    - **两侧都没有主导 ⇒ 0.0**
+
+    ⚠️ 最后一条是修掉的 bug：原来这一档算成 **1.0**（"毫无共同点"），
+    与事实相反 —— 两侧都没露题材指纹，说明**没有题材线索可用**，不是题材不同。
+    口径错了的后果很实：都市臂的人类侧整本没有题材标记，于是每一题
+    都被算成"最大不同"，一道题都出不来。
+    """
+    pa, pb = genre_profile(a), genre_profile(b)
+    da, db = genre_dominant(pa), genre_dominant(pb)
+    if da and db:
+        return 0.0 if da == db else 1.0
+    if da or db:
+        return 0.5          # 一边有明确题材、另一边没有 ⇒ 半信半疑
+    # 两边都没有明确主导 ⇒ **没有题材线索可用**（不是「题材不同」）
+    return 0.0
+
+
+#: 两侧题材指纹距离超过这个值 ⇒ 判「不是同一个题材」。
+#:
+#: 口径：距离 0 = 主导题材一致（或两侧都没露）；0.5 = 一边有题材一边没有；
+#: 1 = 主导题材明确不同。
+GENRE_MAX_DISTANCE = 0.5
+
+
+# --------------------------------------------------------------------------- #
+# 题材判定（权威口径）：让模型读正文判题材
+# --------------------------------------------------------------------------- #
+
+#: 题材分类的**闭集**（子题材级）。判定模型只能原样选一个。
+#:
+#: ⚠️ 为什么是闭集：开放式提问会让模型自由发挥，同一段文字两次判出两个类，
+#: 那这道闸门就成了随机数。闭集 + 「看不出来就选其他」才有可复现性。
+GENRE_CLASSES = (
+    "现代都市（市井生活流）",
+    "现代都市异能（系统流/超能力）",
+    "年代穿越（1980前后/改革开放）",
+    "古风武侠（江湖门派/内力招式）",
+    "东方玄幻（修真/仙侠/御剑）",
+    "灵异克苏鲁（厉鬼复苏/收容/邪祟）",
+    "规则怪谈（终焉之地/违规/通关）",
+    "言情豪门（总裁/婚约/替身）",
+    "其他（以上都不是，或看不出来）",
+)
+
+#: 「看不出来」的那一类。两边都落在它上面 ⇒ **不算题材不一致**
+#:（都没露题材指纹 ⇒ 没有题材线索可用）。
+GENRE_UNKNOWN = GENRE_CLASSES[-1]
+
+#: 题材判定提示词 —— **通用模板，不含任何具体书名/人物/地名**。
+_GENRE_JUDGE_SYSTEM = """你是中文网络小说的题材分类员。给你几段正文片段，逐段判断它属于哪一类故事。
+
+可选类别（只能原样选一个）：
+- 现代都市（市井生活流）：市井、底层生活、小店/街坊、现实向的犯罪或悬疑
+- 现代都市异能（系统流/超能力）：系统、面板、觉醒、强化、超凡、异兽
+- 年代穿越（1980前后/改革开放）：供销社、工厂、粮票、返城、下乡、万元
+- 古风武侠（江湖门派/内力招式）：门派、镖局、内力、真气、朝廷、世子
+- 东方玄幻（修真/仙侠/御剑）：宗门、筑基、渡劫、灵根、妖兽、御剑
+- 灵异克苏鲁（厉鬼复苏/收容/邪祟）：厉鬼、复苏、收容所、凶宅、诡秘
+- 规则怪谈（终焉之地/违规/通关）：规则、违规、通关、主办方、副本
+- 言情豪门（总裁/婚约/替身）：总裁、闪婚、替身、白月光、千亿
+- 其他（以上都不是，或看不出来）
+
+判据：
+1. 只看片段里的**世界观与场景**（年代、地点、力量体系、日常物件），**不看文笔好坏**。
+2. 看不出来就选「其他」，**不要猜**。
+3. 片段可能从段落中间开始，缺上下文 —— 按能判断到的写。
+
+只输出 JSON 数组，每个片段一次，id 与输入一致：
+[{"id": 1, "genre": "现代都市（市井生活流）"}]"""
+#: 一次判多少个片段。片段约 400 字，4 个一批输入约 1600 字、输出很短。
+GENRE_JUDGE_BATCH = 4
+
+#: 题材判定缓存的版本号（判定逻辑升级 ⇒ 旧缓存整份作废）。
+GENRE_CACHE_VERSION = 1
+
+
+def _genre_cache_key(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _load_genre_cache(cache_path: Path | None) -> dict[str, str]:
+    if not cache_path or not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(data, dict) or data.get("__v__") != GENRE_CACHE_VERSION:
+        return {}
+    got = data.get("genres")
+    return dict(got) if isinstance(got, dict) else {}
+
+
+def _save_genre_cache(cache_path: Path | None, genres: dict[str, str]) -> None:
+    if not cache_path:
+        return
+    try:
+        cache_path.write_text(
+            json.dumps({"__v__": GENRE_CACHE_VERSION, "genres": genres},
+                       ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001 - 缓存失败不影响主流程
+        pass
+
+
+def _genre_judge_batch(provider, items: list[tuple[int, str]]) -> dict[int, str]:
+    """判一批片段的题材。返回 ``{片段序号: 题材}``（判不出来的直接不出现）。
+
+    ⚠️ **输入用 JSON 传，不要用「空行分段」**：正文里本来就有换行，
+    用空行做分隔符会把片段切碎、编号冲掉 —— 实测因此让 5/90 段
+    「没判出来」，整包被误判为作废（fail closed 把它暴露出来了，但这是一次误伤）。
+    """
+    payload = [{"id": sid, "text": text} for sid, text in items]
+    user = ("以下是待分类的正文片段（JSON 数组，id 字段是编号）：\n"
+            + json.dumps(payload, ensure_ascii=False)
+            + "\n\n按 id 逐个给出 genre。")
+    raw = ""
+    for _ in range(2):
+        try:
+            raw = provider.chat(_GENRE_JUDGE_SYSTEM, user)
+            break
+        except Exception:  # noqa: BLE001 - 单批失败不影响其余批次
+            continue
+    m = re.search(r"\[.*\]", raw or "", re.S)
+    if not m:
+        return {}
+    try:
+        arr = json.loads(m.group(0))
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[int, str] = {}
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        try:
+            sid = int(it.get("id"))
+        except (TypeError, ValueError):
+            continue
+        g = str(it.get("genre") or "").strip()
+        if not g:
+            continue
+        # 类别必须是闭集里的：**原样**匹配，或模型只写了类别的短名（「现代都市」）。
+        # ⚠️ 短名有**歧义**（「现代都市」既是「市井生活流」的前缀，也是「都市异能」的前缀）
+        # ⇒ 歧义时**不认**（当作没判出来），宁可 fail closed 也不要错分。
+        exact = [c for c in GENRE_CLASSES if g == c]
+        if exact:
+            out[sid] = exact[0]
+            continue
+        pref = [c for c in GENRE_CLASSES if g.startswith(c.split("（")[0])]
+        if pref and len({len(c.split("（")[0]) for c in pref}) == 1:
+            out[sid] = pref[0]
+    return out
+
+
+def judge_genres(items: list[tuple[str, str]], provider, *,
+                  cache_path: Path | None = None,
+                  batch_size: int = GENRE_JUDGE_BATCH,
+                  log=None) -> dict[str, str]:
+    """给若干片段判题材。``items`` 是 ``[(键, 文本), ...]``。
+
+    返回 ``{键: 题材}``；**判不出来的键不会出现在返回值里**（调用方要按
+    「没判出来」保守处理 —— 题材闸门里等于这题作废）。
+
+    ## 为什么要有这个函数
+
+    词表口径实测太弱：2026-10-31 在 18 本本地语料上统计，「剑」「刀」「江湖」
+    「系统」「掌柜」「伙计」这类词**在过半的书里都出现** ⇒ 按词判题材会把
+    现代都市小说误判成古风武侠（9/18 判错）。模型读正文判题材才是权威口径。
+
+    缓存按**文本 sha256**，与书无关：同一段文本换批次也复用。
+    """
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    cache = _load_genre_cache(cache_path)
+    if cache:
+        _log(f"复用题材判定缓存 {len(cache)} 条")
+
+    out: dict[str, str] = {}
+    pending: list[tuple[str, str]] = []
+    for key, text in items:
+        ck = _genre_cache_key(text)
+        if ck in cache:
+            out[key] = cache[ck]
+        else:
+            pending.append((key, text))
+    _log(f"待判题材 {len(pending)} 个（已缓存 {len(items) - len(pending)} 个）")
+
+    nb = (len(pending) + batch_size - 1) // batch_size
+    for i in range(0, len(pending), batch_size):
+        batch = pending[i:i + batch_size]
+        # 片段序号用「批内序号」，回包时映射回 key
+        numbered = [(n + 1, t) for n, (_k, t) in enumerate(batch)]
+        got = _genre_judge_batch(provider, numbered)
+        for n, (key, text) in enumerate(batch, 1):
+            g = got.get(n)
+            if not g:
+                continue
+            out[key] = g
+            cache[_genre_cache_key(text)] = g
+        _log(f"批 {i // batch_size + 1}/{nb} 判出 {len(got)}/{len(batch)} 个")
+        _save_genre_cache(cache_path, cache)
+
+    return out
+
+
+def genre_mismatch(a: str, b: str, labels: tuple[str, str] | None = None) -> tuple[bool, dict]:
+    """两侧是不是**明显不是同一题材**。返回 ``(是否不一致, 证据)``。
+
+    ``labels`` 传 LLM 判出来的题材（权威口径）时以它为准。三种情况：
+
+    - 两边**都判得出来且一样** ⇒ 一致（两边都是「其他」也算：都没露题材指纹）
+    - 两边**都判得出来但不一样** ⇒ 不一致
+    - **一边看不出来、另一边题材明确** ⇒ **不能算一致**（保守起见当不一致）：
+      一侧满篇题材术语、另一侧看不出题材，评者照样能靠题材分辨出来。
+
+    ⚠️ 还要分清两种「没有标签」：
+      - ``""`` = **没判出来**（批次失败/截断）⇒ fail closed，当不一致；
+      - ``GENRE_UNKNOWN`` = 判出来了但看不出题材 ⇒ 可以和另一侧的「其他」配对。
+    """
+    if labels is not None:
+        la, lb = labels
+        ev = {"judged": {"A": la, "B": lb}, "source": "llm"}
+        if not la or not lb:
+            # 没判出来 ⇒ **不能算一致**（fail closed）
+            return True, {**ev, "reason": "有一侧题材没判出来"}
+        if la == lb:
+            return False, {**ev, "reason": "两侧题材判得一样"}
+        if GENRE_UNKNOWN in (la, lb):
+            # 一侧看不出来、另一侧题材明确 ⇒ **无法确认同题材**，保守当不一致
+            return True, {**ev, "reason": "一侧看不出题材、另一侧题材明确，无法确认同题材"}
+        return True, {**ev, "reason": "两侧题材判得不一样"}
+    d = genre_distance(a, b)
+    pa, pb = genre_profile(a), genre_profile(b)
+    return d > GENRE_MAX_DISTANCE, {
+        "distance": round(d, 3),
+        "dominant": {"A": genre_dominant(pa), "B": genre_dominant(pb)},
+        "profile": {"A": {k: round(v, 3) for k, v in pa.items() if v > 0},
+                    "B": {k: round(v, 3) for k, v in pb.items() if v > 0}},
+        "source": "wordlist",
+    }
+
+
 def era_counts(text: str) -> dict[str, int]:
     """年代标记的**命中数**（不是密度）。"""
     t = _clean(text)

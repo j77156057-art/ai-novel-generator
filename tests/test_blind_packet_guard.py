@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -54,21 +55,38 @@ from acceptance_lib import (  # noqa: E402
 class _StubJudge:
     """按词判定专名的假 provider（只用于测流程，不测判定质量）。
 
-    它要应付**两种**提示词：
+    它要应付**三种**提示词：
 
     - 逐词判定（system 里含「标注员」）：回「每个词一个 JSON 对象」
     - 题面级复查（system 里含「校对」）：回「残留专名的 JSON 数组」
+    - 题材判定（system 里含「题材分类员」）：回「每个片段一个题材」
     """
 
     def __init__(self, names: set[str], residual: list[str] | None = None,
-                 fail_words: set[str] | None = None):
+                 fail_words: set[str] | None = None,
+                 genre_rules: dict[str, str] | None = None):
         self.names = names
         self.residual = list(residual or [])
         self.fail_words = set(fail_words or set())
+        #: 题材判定规则：{正文里的关键词: 题材名}；命中第一个就返回它
+        self.genre_rules = genre_rules or {}
         self.calls = 0
+
+    def _genre(self, text: str) -> str:
+        for kw, g in self.genre_rules.items():
+            if kw in text:
+                return g
+        return "其他（以上都不是，或看不出来）"
 
     def chat(self, system: str, user: str) -> str:
         self.calls += 1
+        if "题材分类员" in system:      # 题材判定（输入是 JSON 数组）
+            arr = []
+            m = re.search(r"\[.*\]", user, re.S)
+            for it in json.loads(m.group(0)) if m else []:
+                arr.append({"id": it.get("id"),
+                            "genre": self._genre(it.get("text") or "")})
+            return json.dumps(arr, ensure_ascii=False)
         if "校对" in system:          # 题面级复查
             # 每轮只报一个（队列）—— 模拟「复查每轮都揪出新名字」
             if self.residual:
