@@ -33,6 +33,9 @@ dist/
 coverage.xml
 htmlcov/
 
+# 验收跑 / 冒烟跑的输出目录（脚本默认写这里；产物含正文片段，不进版本库）
+out/
+
 # 个人状态目录
 .workbuddy/
 

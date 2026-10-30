@@ -167,7 +167,7 @@ def read_minimax_key() -> str:
     key = os.environ.get("MINIMAX_API_KEY", "").strip()
     if key:
         return key
-    db = os.environ.get("SMOKE_DB", r"D:\Temp\smoke_run.db")
+    db = os.environ.get("SMOKE_DB", "out/smoke_run.db")
     if not os.path.exists(db):
         return ""
     try:
@@ -673,7 +673,10 @@ def main() -> int:
     ap.add_argument("--model", default="")
     ap.add_argument("--max-tokens", type=int, default=8000)
     ap.add_argument("--timeout", type=int, default=300)
-    ap.add_argument("--out", default=r"D:\Temp\acc_real")
+    # 输出目录用**相对路径**：写死成某台机器的绝对路径，换台机器 clone 就会
+    # 生成一个名字里带盘符的目录（POSIX 上那根本不是目录，是一个普通文件名）。
+    # 用正斜杠：Windows 的 Python 也认这个分隔符。
+    ap.add_argument("--out", default="out/acceptance")
     ap.add_argument("--corpus", default="", help="基线语料（.db / .txt / 目录）")
     ap.add_argument("--human-corpus", default="",
                     help="盲评的**人类侧**语料（.db / .txt / 目录；"

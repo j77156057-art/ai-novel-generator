@@ -29,8 +29,8 @@
    不能当结论。脚本会把这一点明确打出来，不让人误读成「通过」。
 
 用法：
-    python verify_blind_eval.py --sheet D:\\Temp\\acc_real\\blind_sheet.csv \\
-                                --key  D:\\Temp\\acc_real\\blind_key.json
+    python verify_blind_eval.py --sheet out/acceptance/blind_sheet.csv \\
+                                --key  out/acceptance/blind_key.json
 """
 
 from __future__ import annotations

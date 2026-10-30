@@ -16,7 +16,7 @@ python verify_acceptance.py --segments 80      # 饱和验证（漂移判定需�
 
 ```bash
 cd backend
-python verify_acceptance_real.py --segments 30 --out D:\Temp\acc_real
+python verify_acceptance_real.py --segments 30 --out out/acceptance
 ```
 
 ⇒ 真模型跑的结果与边界见 **`docs/real-model-acceptance.md`**（含抓到的三个真 bug 与修法）。

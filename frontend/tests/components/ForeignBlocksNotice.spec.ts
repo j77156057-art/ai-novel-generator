@@ -11,7 +11,7 @@ import type { ForeignBlocksReport } from "@/api/types";
  *   2. 剔除勾选框**默认不勾**；
  *   3. 已入库的语料页**不给**勾选框（那时已经入库了，剔不剔是另一回事）。
  *
- * 用真实数据：十日终焉的体检报告（3 段 / 230,674 字 / 5.5%）。
+ * 用真实数据：雾港夜行的体检报告（3 段 / 230,674 字 / 5.5%）。
  */
 function report(p: Partial<ForeignBlocksReport> = {}): ForeignBlocksReport {
   return {
@@ -29,7 +29,7 @@ function report(p: Partial<ForeignBlocksReport> = {}): ForeignBlocksReport {
         chapter_count: 4,
         // 真数据里盗版站把同一章标题贴了两遍 —— 界面上不该重复摆。
         chapter_titles: ["第1047章 符合路子", "第1047章 符合路子", "第1048章 我怎么知道?", "第1048章 我怎么知道?"],
-        terms: ["张悬", "天道", "帝君", "神界", "若曦"],
+        terms: ["秦昭", "天规", "帝尊", "上苍界", "柳莺"],
         exclusive_ratio: 0.52,
         sample: "灵魂契约，契合灵魂……",
       },
@@ -52,8 +52,8 @@ describe("ForeignBlocksNotice", () => {
     const w = mount(ForeignBlocksNotice, { props: { report: report() } });
     const terms = w.find(".tag.warn").text();
     expect(terms).toContain("独占词");
-    expect(terms).toContain("张悬");
-    expect(terms).toContain("天道");
+    expect(terms).toContain("秦昭");
+    expect(terms).toContain("天规");
   });
 
   it("章标题去重：盗版站把同一章贴两遍，界面上只摆一次", () => {

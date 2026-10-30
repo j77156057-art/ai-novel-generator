@@ -54,7 +54,7 @@ def is_author_talk(rule_text: str) -> bool:
     """这条声音词典规则讲的是「作者对读者说话」吗？
 
     命中的都是**强**信号 —— 实测在《北荒刀歌》285 条里 0 条命中（零误伤），
-    在《诡秘之主》52 条里剔掉 7 条（全是噪声：能力/危险/相应/白银/成员/利用/曾经）。
+    在《长夜司》52 条里剔掉 7 条（全是噪声：能力/危险/相应/白银/成员/利用/曾经）。
     """
     return any(marker in (rule_text or "") for marker in AUTHOR_TALK_MARKERS)
 
