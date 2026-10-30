@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -342,18 +344,48 @@ def detect_proper_nouns(text: str, provider, *, candidates: dict[str, int] | Non
     `candidates` 可传入**已过滤的候选集**（例如只保留出现在盲评样本里的词），
     省掉对用不上的词的 LLM 判定开销。
     """
+    names, _unjudged = detect_proper_nouns_detailed(
+        text, provider, candidates=candidates, cache_path=cache_path, log=log)
+    return names
+
+
+def detect_proper_nouns_detailed(text: str, provider, *, candidates: dict[str, int] | None = None,
+                                  cache_path=None, log=None,
+                                  batch_size: int | None = None) -> tuple[list[str], list[str]]:
+    """同 `detect_proper_nouns`，但**多返回一份「没判出来」的词**。
+
+    返回 ``(专名列表, 没判出来的词列表)``。
+
+    ## 为什么必须把这两者分开
+
+    「判出来不是专名」和「没判出来」是**相反**的两种状态：
+
+    - 判出来不是专名 ⇒ 不遮（遮了会毁掉正常词汇）
+    - 没判出来 ⇒ **可能是个真名**，当普通词处理 = 把名字留在题面里 = 盲评作废
+
+    实测（2026-10-30）：判定批次撞上 max_tokens 被截断时整批回包解析失败，
+    旧实现把这一批**全部**记成「不是专名」并写进缓存 ⇒ 18 题盲评包的人类侧
+    1896 个候选里 1880 个是 null，真名「张山」「李香玲」原样出现在题面里。
+    """
     from app.style.entities import drop_fragments
-    from app.style.entity_judge import judge_proper_nouns
+    from app.style.entity_judge import UNJUDGED, judge_proper_nouns
 
     cand = candidates if candidates is not None else proper_noun_candidates(text)
-    verdicts = judge_proper_nouns(list(cand.keys()), provider, cache_path=cache_path, log=log)
+    kwargs = {"cache_path": cache_path, "log": log}
+    if batch_size:
+        kwargs["batch_size"] = batch_size
+    verdicts = judge_proper_nouns(list(cand.keys()), provider, **kwargs)
 
     layer_of = {
         "character": "characters", "place": "places",
         "faction": "factions", "item": "items",
     }
     table: dict[str, list[str]] = {k: [] for k in layer_of.values()}
+    unjudged: list[str] = []
     for word, verdict in verdicts.items():
+        if verdict == UNJUDGED:
+            unjudged.append(word)
+            continue
         layer = layer_of.get(verdict or "")
         if layer:
             table[layer].append(word)
@@ -362,7 +394,7 @@ def detect_proper_nouns(text: str, provider, *, candidates: dict[str, int] | Non
     # 否则替换后正文里会剩下半个名字。
     kept, _dropped = drop_fragments(table, text)
     names = {n for layer in kept.values() for n in layer}
-    return sorted(names, key=lambda s: (-len(s), s))
+    return sorted(names, key=lambda s: (-len(s), s)), sorted(unjudged)
 
 
 def mask_names(text: str, names: list[str]) -> tuple[str, list[str]]:
@@ -421,6 +453,23 @@ def mask_density(text: str) -> float:
     return 100.0 * text.count(_MASK_CHAR) / n
 
 
+class MaskingIncomplete(Exception):
+    """脱敏没做完（有一批词**没判出来**）—— 这个包不能当盲评包发出去。
+
+    为什么要专门抛这个而不是默默放过：没判出来的词**可能是真名**，
+    当普通词留着 = 名字直接暴露出处。盲评包宁可作废也不能带名字出去。
+    """
+
+
+#: 盲评脱敏的判定批次大小。**比通用的 100 小**。
+#:
+#: 为什么：逐词判定的回包是「每个词一个 JSON 对象」，批次越大回包越长，
+#: 越容易被 max_tokens 拦腰截断；而**截断会让整批判定直接消失**
+#: （实测 2026-10-30：18 题盲评包的人类侧 1896 个候选里 1880 个被记成
+#: 「不是专名」，真名原样留在题面里）。批次小 ⇒ 回包短 ⇒ 几乎不会截断。
+JUDGE_BATCH_SIZE = 30
+
+
 def mask_side(snippets: list[str], source_text: str, provider, *,
               cache_path=None, log=None) -> tuple[list[str], list[str]]:
     """把一侧的专名遮掉 —— 返回 ``(脱敏后的片段, 实际遮掉的词)``。
@@ -433,10 +482,24 @@ def mask_side(snippets: list[str], source_text: str, provider, *,
 
     `source_text` 是该侧全文，用于整本级高频召回与残片独立出现率计算；
     `snippets` 是真正要放进题面的片段。
+
+    ## 为什么「没判出来」要抛异常而不是默默放过
+
+    判定分三种状态：判出是专名 / 判出不是专名 / **没判出来**。
+    前两种都有明确的处置方式；第三种（批次失败、输出被截断）意味着
+    「这个词有没有可能是真名，我不知道」—— 留着它 = 把名字留在题面里。
+
+    所以这里 **fail closed**：抛 `MaskingIncomplete`，由出包流程把整个包
+    判成不是盲评包（题面根本不发出去）。
     """
     cand = recall_proper_nouns(snippets, source_text)
-    names = detect_proper_nouns(source_text, provider, candidates=cand,
-                                cache_path=cache_path, log=log)
+    names, unjudged = detect_proper_nouns_detailed(
+        source_text, provider, candidates=cand, cache_path=cache_path, log=log,
+        batch_size=JUDGE_BATCH_SIZE)
+    if unjudged:
+        raise MaskingIncomplete(
+            f"有 {len(unjudged)} 个候选词没判出来（判定批次失败或被截断），"
+            f"它们可能是真名：{unjudged[:8]}{' …' if len(unjudged) > 8 else ''}")
     out: list[str] = []
     used: set[str] = set()
     for s in snippets:
@@ -444,6 +507,79 @@ def mask_side(snippets: list[str], source_text: str, provider, *,
         out.append(masked)
         used |= set(hit)
     return out, sorted(used)
+
+
+#: 题面级专名复查的提示词 —— **读成段正文、只报专名**。
+#:
+#: 为什么要有这一遍（第六道闸门）：逐词判定会漏。漏了就等于把真名留在
+#: 题面里，盲评当场作废。而这一遍是**读正文**——模型自己看上下文挑名字，
+#: 比「看着一个孤零零的词猜它是不是人名」可靠得多；输出又只是「名字列表」，
+#: 不会像逐词判定那样动辄几百个 JSON 对象 ⇒ 不容易被 max_tokens 截断。
+_RESIDUAL_SYSTEM = """你是中文小说正文的校对。下面这段正文里可能还残留着专有名词（人名、地名、势力名、物件名）。
+
+请把**确实是专名**的词，按它在原文里的字面形式列出来。
+不要列普通词：职业、泛称、动作、状态、形容词、虚词、章节标题都不要列。
+已经变成全角井号（＃）的位置不用管。
+
+只输出 JSON 数组（没有就输出 []），例如：["张三","青丘城"]"""
+
+
+def residual_proper_nouns(text: str, provider, *, cache_path=None,
+                           log=None) -> list[str]:
+    """题面级复查：这段正文里**还剩哪些专名**。
+
+    返回词列表（只保留**确实出现在正文里**的词 —— 模型偶尔会凭空补词）。
+
+    ## 这是**独立于逐词判定**的一遍
+
+    - 逐词判定：把候选词一个一个丢给模型判「是不是专名」—— 会漏
+    - 这一遍：把**成段正文**丢给模型，让它自己挑出还是专名的词
+
+    两遍的输入、提示词、缓存都不同 ⇒ 一遍漏了另一遍大概率能抓住。
+    """
+    if not text or not text.strip():
+        return []
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    cache: dict = {}
+    if cache_path and cache_path.exists():
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cache = loaded
+        except Exception:  # noqa: BLE001
+            cache = {}
+    if key in cache:
+        names = [str(x) for x in cache[key] if isinstance(x, str)]
+        if log:
+            log(f"复用题面复查缓存 {len(names)} 个")
+        return names
+
+    raw = ""
+    try:
+        raw = provider.chat(_RESIDUAL_SYSTEM, text)
+    except Exception as exc:  # noqa: BLE001 - 复查失败要报出来，不能当「查过了」
+        raise MaskingIncomplete(f"题面级专名复查失败：{exc}") from exc
+    names: list[str] = []
+    m = re.search(r"\[.*\]", raw or "", re.S)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            names = [str(x).strip() for x in arr
+                     if isinstance(x, str) and x.strip()]
+        except Exception:  # noqa: BLE001
+            names = []
+    # 模型偶尔会凭空补词 —— 只认正文里真有的
+    names = sorted({n for n in names if n in text})
+    if cache_path:
+        try:
+            cache[key] = names
+            cache_path.write_text(json.dumps(cache, ensure_ascii=False),
+                                  encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+    if log:
+        log(f"题面复查：残留专名 {len(names)} 个 {names[:8]}")
+    return names
 
 
 #: 脱敏痕迹密度比超过这个倍数 ⇒ 判「痕迹泄露」。

@@ -52,16 +52,34 @@ from acceptance_lib import (  # noqa: E402
 # --------------------------------------------------------------------------- #
 
 class _StubJudge:
-    """按词判定专名的假 provider（只用于测流程，不测判定质量）。"""
+    """按词判定专名的假 provider（只用于测流程，不测判定质量）。
 
-    def __init__(self, names: set[str]):
+    它要应付**两种**提示词：
+
+    - 逐词判定（system 里含「标注员」）：回「每个词一个 JSON 对象」
+    - 题面级复查（system 里含「校对」）：回「残留专名的 JSON 数组」
+    """
+
+    def __init__(self, names: set[str], residual: list[str] | None = None,
+                 fail_words: set[str] | None = None):
         self.names = names
+        self.residual = list(residual or [])
+        self.fail_words = set(fail_words or set())
         self.calls = 0
 
     def chat(self, system: str, user: str) -> str:
         self.calls += 1
-        words = [w for w in user.split("：", 1)[-1].split("、") if w]
-        arr = [{"w": w, "t": "character" if w in self.names else None} for w in words]
+        if "校对" in system:          # 题面级复查
+            # 每轮只报一个（队列）—— 模拟「复查每轮都揪出新名字」
+            if self.residual:
+                return json.dumps([self.residual.pop(0)], ensure_ascii=False)
+            return json.dumps([], ensure_ascii=False)
+        words = [w.strip() for w in user.split("：", 1)[-1].split("、") if w.strip()]
+        arr = []
+        for w in words:
+            if w in self.fail_words:  # 模拟「这批判不出来」
+                continue
+            arr.append({"w": w, "t": "character" if w in self.names else None})
         return json.dumps(arr, ensure_ascii=False)
 
 
@@ -334,3 +352,141 @@ def test_跨代语料出的包被标成不是盲评且判定脚本拒绝出结�
         capture_output=True, text=True, encoding="utf-8")
     assert proc.returncode == 2, f"应当拒绝出结论，实际退出码 {proc.returncode}\n{proc.stdout}"
     assert "不出统计结论" in proc.stdout
+
+
+# --------------------------------------------------------------------------- #
+# 6. 题数可调：n = 评者人数 × 题数，所以「多请人」和「多出题」是两条等效的路
+# --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# 7. 第六道闸门：判定失败不许当成「不是专名」；题面里不许残留专名
+# --------------------------------------------------------------------------- #
+
+def test_判定批次失败不许被记成不是专名(tmp_path):
+    """回归：批次失败（回包被截断/解析不了）时，旧实现把整批记成 null，
+    而 null 的含义是「不是专名」⇒ 真名留在题面里（实测 2026-10-30）。"""
+    from app.style.entity_judge import UNJUDGED, judge_proper_nouns
+
+    class _Failing:
+        def chat(self, system, user):
+            return "截断了，没有 JSON"     # 解析不了 ⇒ 整批没判出来
+
+    cache = tmp_path / "names.json"
+    got = judge_proper_nouns(["赵长安"], _Failing(), cache_path=cache)
+    assert got["赵长安"] == UNJUDGED, got
+    # **没判出来的词不许进缓存**（下次还会重判）；更不许被写成 null
+    raw = cache.read_text(encoding="utf-8")
+    assert "赵长安" not in raw, raw
+
+
+def test_旧格式判定缓存要作废(tmp_path):
+    """旧缓存把「批次失败」记成了 null —— 继续用它 = 继续用一份漏过名的判定。"""
+    from app.style.entity_judge import judge_proper_nouns
+
+    cache = tmp_path / "legacy.json"
+    cache.write_text(json.dumps({"赵长安": None}, ensure_ascii=False), encoding="utf-8")
+
+    class _Ok:
+        def chat(self, system, user):
+            words = [w.strip() for w in user.split("：", 1)[-1].split("、") if w.strip()]
+            return json.dumps([{"w": w, "t": "character"} for w in words], ensure_ascii=False)
+
+    got = judge_proper_nouns(["赵长安"], _Ok(), cache_path=cache)
+    assert got["赵长安"] == "character", got
+
+
+def test_没判出来的词会让整包作废(tmp_path):
+    """判定不出来的词可能是真名 ⇒ 宁可整包不发，也不能带名字出去。"""
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import build_blind_packet
+
+    corpus = [("现代都市", "他把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。" * 40)]
+    p = _StubJudge({"林夜", "苏晚", "陆见微"}, fail_words={"陆见微"})
+    info = build_blind_packet(_rows(), corpus, tmp_path, provider=p)
+    assert info["emitted"] is False, info
+    assert info["blind"] is False
+    assert not (tmp_path / "blind_samples.md").exists(), "题面不该发出去"
+
+
+def test_题面里残留的专名会被补遮(tmp_path):
+    """第六道闸门：逐词判定漏掉的，题面复查要能抓住并补遮。"""
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import build_blind_packet
+
+    corpus = [("现代都市", "他把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。" * 40)]
+    # 逐词判定只认出「林夜」；题面复查额外认出「苏晚」（它漏了）
+    p = _StubJudge({"林夜"}, residual=["苏晚"])
+    out_dir = tmp_path
+    info = build_blind_packet(_rows(), corpus, out_dir, provider=p)
+    assert info["emitted"] is True, info
+    key = json.loads((out_dir / "blind_key.json").read_text(encoding="utf-8"))
+    assert "苏晚" in key["residual_names"]["repaired"], key["residual_names"]
+    sheet = (out_dir / "blind_samples.md").read_text(encoding="utf-8")
+    assert "苏晚" not in sheet, "残留的专名必须被补遮掉"
+
+
+def test_残留专名补不干净就不发题面(tmp_path):
+    """每一轮复查都报新名字 ⇒ 补不干净 ⇒ 整包作废（fail closed）。"""
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import build_blind_packet
+
+    line = ("赵长安、钱小七站在路灯下，雨还在下，他把手机揣回兜里，出了便利店。")
+    corpus = [("现代都市", line * 40)]
+    p = _StubJudge({"林夜"}, residual=["苏晚", "赵长安", "钱小七"])
+    out_dir = tmp_path
+    info = build_blind_packet(_rows(), corpus, out_dir, provider=p)
+    assert info["emitted"] is False, info
+    assert info["blind"] is False
+    assert not (out_dir / "blind_samples.md").exists(), "补不干净就不该发题面"
+    assert any("残留" in r for r in info["reasons"]), info["reasons"]
+
+
+def test_默认取样位置保持首2中2尾2():
+    """默认 6 题的取样口径**不能被改掉** —— 漂移与退化都发生在长跑的首尾。"""
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import sample_positions
+
+    assert sample_positions(30) == [1, 3, 15, 16, 29, 30]
+
+
+def test_题数加到18时取样要铺满整条长跑():
+    """题多了必须**分散取**：否则十几道题落在同一段区间，
+    评者其实在评同一批文本，样本量是假的。"""
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import sample_positions
+
+    pos = sample_positions(30, 18)
+    assert len(pos) == 18, pos
+    assert pos[0] == 1 and pos[-1] == 30, pos          # 首尾必留
+    assert len(set(pos)) == 18, pos                    # 不许重复
+    # 铺开：后半程也要有题（不是全挤在前半）
+    assert sum(1 for p in pos if p > 15) >= 8, pos
+    # 相邻取样点不能太密（否则等于同一段取好几次）
+    assert max(b - a for a, b in zip(pos, pos[1:])) <= 3, pos
+
+
+def test_出18题的包_记录表与题数一致(tmp_path):
+    """记录表上的「判定 n = 评者人数 × ?」必须跟实际题数走，
+    写死 6 的话，评者按表算出来的 n 就是错的。"""
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import build_blind_packet
+
+    corpus = [("现代都市", "他把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。" * 40)]
+    out_dir = tmp_path
+    info = build_blind_packet(_rows(30), corpus, out_dir,
+                              provider=_StubJudge(set()), n_snips=18)
+    assert info["emitted"] is True
+    assert info["n"] == 18
+
+    key = json.loads((out_dir / "blind_key.json").read_text(encoding="utf-8"))
+    assert len(key["items"]) == 18, len(key["items"])
+
+    sheet = (out_dir / "blind_sheet.md").read_text(encoding="utf-8")
+    assert "判定 n = 评者人数 × 18" in sheet, sheet
+    assert "× 6" not in sheet, sheet
+    assert sheet.count("| A / B | A / B | A / B | A / B | |") == 18, sheet
+
+    # 题面里的题数也要对得上
+    samples = (out_dir / "blind_samples.md").read_text(encoding="utf-8")
+    assert samples.count("**A**") == 18, samples.count("**A**")
+

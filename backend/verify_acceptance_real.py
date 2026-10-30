@@ -80,10 +80,12 @@ from acceptance_lib import (  # noqa: E402
     human_baseline,
     jaccard,
     mask_density,
+    mask_names,
     mask_side,
     metaphor_per100,
     normalize_for_blind,
     pctl,
+    residual_proper_nouns,
     sent_cv,
     thresholds,
 )
@@ -98,6 +100,18 @@ from app.llm.provider import GenericOpenAIChatProvider, MiniMaxChatProvider  # n
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+#: 题面级专名复查最多补遮几轮。
+#:
+#: 每一轮都是「读题面 → 列出残留专名 → 补遮 → 再读」。
+#: 3 轮还清不干净 ⇒ 说明漏的不是个别词，而是判定链路整体失灵 ⇒ 整包作废。
+RESIDUAL_ROUNDS = 3
+
+#: 补遮掉的专名字数占正文的比例上限。
+#:
+#: 超过它 ⇒ 模型多半把普通词当成了专名（这时候再补遮只会把题面涂花）。
+#: 这种包宁可作废，也不能交出去一个被涂花的题面。
+RESIDUAL_MAX_RATIO = 0.05
 
 PASS = 0
 FAIL = 0
@@ -184,7 +198,8 @@ def read_minimax_key() -> str:
     return ""
 
 
-def build_provider(channel: str, model: str, max_tokens: int, timeout: int, session: str):
+def build_provider(channel: str, model: str, max_tokens: int, timeout: int, session: str,
+                   *, thinking_off: bool = False, install_singleton: bool = True):
     """按渠道名装配 provider，并装成 Writer 单例。
 
     ⚠️ 装成单例是刻意的：生成链路里有一批**内部**的 LLM 调用
@@ -192,6 +207,16 @@ def build_provider(channel: str, model: str, max_tokens: int, timeout: int, sess
     `get_llm_provider()`。只把 provider 传进 `generate_next_segment` 的话，
     那些调用会落到 LocalFallback —— 于是「真模型跑」里混着模板正文，
     结论就不成立了。
+
+    ## `thinking_off`：判定专名那条链路要关思考
+
+    逐词判定要回「每个词一个 JSON 对象」，**输出越长越容易被 max_tokens
+    拦腰截断**；开了思考时推理块还要吃掉同一份预算 ⇒ 截断概率更高。
+    而截断的后果不是「这段判定差一点」，而是**整批判定消失**
+    （JSON 解析失败 ⇒ 旧实现把整批判成「不是专名」⇒ 真名留在题面里）。
+    所以判定用的 provider 单独装一个、关掉思考。
+
+    `install_singleton=False` ⇒ 不覆盖 Writer 单例（判定 provider 用）。
     """
     if channel == "opencode-go":
         key = read_oc_key()
@@ -210,6 +235,7 @@ def build_provider(channel: str, model: str, max_tokens: int, timeout: int, sess
             },
             max_tokens=max_tokens,
             timeout=timeout,
+            thinking_off=thinking_off,
         )
     elif channel == "minimax":
         key = read_minimax_key()
@@ -221,7 +247,8 @@ def build_provider(channel: str, model: str, max_tokens: int, timeout: int, sess
         )
     else:
         raise SystemExit(f"未知渠道：{channel}")
-    provider_mod._PROVIDER = prov
+    if install_singleton:
+        provider_mod._PROVIDER = prov
     return prov
 
 
@@ -468,10 +495,25 @@ def judge(rows: list[dict], thr: dict | None, segments: int, proj_id: int) -> di
 # 盲评包
 # --------------------------------------------------------------------------- #
 
-def sample_positions(n_segments: int) -> list[int]:
-    """跨位置取样：首 2、中 2、尾 2（漂移与文风退化都发生在长跑里）。"""
-    want = [1, 3, max(1, n_segments // 2), max(2, n_segments // 2 + 1),
-            max(1, n_segments - 1), n_segments]
+def sample_positions(n_segments: int, k: int = 6) -> list[int]:
+    """跨位置取样。
+
+    **默认 6 个位置**：首 2、中 2、尾 2（漂移与文风退化都发生在长跑里）。
+
+    **k > 6 时在整条长跑上均匀铺开** —— 题数多了就必须分散取：
+    否则十几道题都落在同一段区间里，评者其实在评同一批文本，
+    样本量是假的（判断之间高度相关，符号检验会低估不确定性）。
+
+    跨位置取样是**刻意的**：只取段首会漏掉长跑后的退化，
+    只取尾部会漏掉开头的跑偏。
+    """
+    if k <= 6:
+        want = [1, 3, max(1, n_segments // 2), max(2, n_segments // 2 + 1),
+                max(1, n_segments - 1), n_segments]
+    else:
+        # 首尾必留（漂移的两个端点），中间按 k 等分铺开
+        step = (n_segments - 1) / (k - 1) if k > 1 and n_segments > 1 else 1
+        want = [1 + int(round(i * step)) for i in range(k)]
     out: list[int] = []
     for p in want:
         p = max(1, min(n_segments, p))
@@ -481,10 +523,11 @@ def sample_positions(n_segments: int) -> list[int]:
 
 
 def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir: Path,
-                       provider=None, n_snips: int = 6, chars: int = 400) -> dict:
+                       provider=None, n_snips: int = 6, chars: int = 400,
+                       judge_provider=None) -> dict:
     """生成盲评包。
 
-    ⚠️ **这版有四条硬约束**（2026-10-30，主人一句话点破了第一版）：
+    ⚠️ **这版有六条硬约束**（2026-10-30，主人一句话点破了第一版）：
     「光是看到主角叫啥我就知道是不是人写的了」。
 
     1. **两侧同等脱敏**：第一版的人类样本取自一部知名小说，人物名一出来
@@ -498,6 +541,10 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
        把密封文件里的 `blind` 置 false ⇒ **判定脚本拒绝给统计结论**。
     4. **脱敏痕迹密度对称**：两侧占位符密度差太远 ⇒ 数井号就能认出
        出版物那一侧，同样判为不是盲评。
+    5. **脱敏没跑成就不发题面**：留没脱敏的原文 = 直接交出出处。
+    6. **题面级专名复查**（2026-10-30 补）：逐词判定会漏（一次批次失败
+       = 一百个真名被记成普通词），所以脱敏之后**再读一遍题面**，
+       把还是专名的词挑出来补遮；补不干净 ⇒ 整个包作废。
 
     另外：**人类语料身份记在密封文件里**（不进题面），事后能追溯样本来源。
     """
@@ -509,7 +556,7 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
     #    不归一的话，题面里会出现「第74章 报复」这种拼进正文的章节头。
     ok_rows = [{"seg": r["seg"], "text": normalize_for_blind(r["text"])} for r in ok_rows]
     corpus = [(name, normalize_for_blind(t)) for name, t in corpus]
-    positions = sample_positions(len(ok_rows))
+    positions = sample_positions(len(ok_rows), n_snips)
     picked = [r for r in ok_rows if r["seg"] in positions][:n_snips]
     if len(picked) < n_snips:
         return {}
@@ -570,6 +617,53 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
     if human_masked:
         print(f"  人类侧遮掉 {len(human_masked)} 个专名：{human_masked[:12]}")
 
+    # —— 第六道闸门：题面级专名复查（逐词判定会漏，这一遍**读正文**）——
+    #
+    # 为什么必须有：逐词判定漏一个 = 真名原样留在题面里 = 盲评当场作废。
+    # 实测（2026-10-30）：一次批次撞上 max_tokens 被截断 ⇒ 整批 100 个候选
+    # 被记成「不是专名」⇒ 人类侧 1896 个候选里 1880 个是 null，
+    # 真名「张山」「李香玲」原样出现在第 1 题里。
+    #
+    # 这一遍把**成段正文**交给模型，让它自己挑出还是专名的词 ——
+    # 输入、提示词、缓存都与逐词判定不同 ⇒ 一遍漏了另一遍能抓住。
+    # 挑到了就补遮（等长占位符，长度守恒），再查一遍；
+    # 补不干净 ⇒ 整个包作废，题面不发出去。
+    residual_found: list[str] = []
+    residual_left: list[str] = []
+    if provider is not None and not mask_fail:
+        judge = judge_provider or provider
+        body = "\n".join(ours_anon) + "\n" + "\n".join(human_anon)
+        for rnd in range(RESIDUAL_ROUNDS):
+            try:
+                left = residual_proper_nouns(
+                    body, judge, cache_path=out_dir / "blind_residual.json",
+                    log=lambda m: print(f"     [题面复查] {m}"))
+            except Exception as exc:  # noqa: BLE001 - 复查失败 ⇒ 不发题面，不能崩整轮验收
+                mask_fail.append(f"题面级专名复查失败：{exc}")
+                break
+            if not left:
+                break
+            residual_found += left
+            if rnd == RESIDUAL_ROUNDS - 1:
+                residual_left = left
+                break
+            # 补遮：两侧都补（同一个词两侧都出现就都遮，保持痕迹对称）
+            ours_anon = [mask_names(t, left)[0] for t in ours_anon]
+            human_anon = [mask_names(t, left)[0] for t in human_anon]
+            body = "\n".join(ours_anon) + "\n" + "\n".join(human_anon)
+            print(f"     → 补遮 {len(left)} 个残留专名后重查")
+        if residual_found:
+            total = max(len(body), 1)
+            ratio = sum(len(n) for n in set(residual_found)) / total
+            print(f"  题面复查：补遮 {len(set(residual_found))} 个残留专名"
+                  f"（占正文 {ratio:.1%}）")
+            # 补遮比例过高 ⇒ 模型多半把普通词当成了专名 ⇒ 别把包糟蹋了
+            if ratio > RESIDUAL_MAX_RATIO:
+                residual_left = residual_left or sorted(set(residual_found))
+                mask_fail.append(
+                    f"题面复查补遮比例过高（{ratio:.1%} > {RESIDUAL_MAX_RATIO:.0%}）："
+                    "模型多半在把普通词当专名，这个包不可信")
+
     # —— 自检：题材/年代 + 脱敏痕迹密度（**整包级别**）——
     dens_ours = mask_density("\n".join(ours_anon))
     dens_human = mask_density("\n".join(human_anon))
@@ -583,6 +677,11 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
     if mask_fail:
         verdict["reasons"] = list(verdict["reasons"]) + [
             "脱敏没跑成，题面里留着没脱敏的原文：" + "；".join(mask_fail)]
+        verdict["blind"] = False
+        blind = False
+    if residual_left:
+        verdict["reasons"] = list(verdict["reasons"]) + [
+            "题面里还残留专名（复查没清干净）：" + "、".join(residual_left[:10])]
         verdict["blind"] = False
         blind = False
     if not blind:
@@ -637,13 +736,18 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
                     "blind_reasons": verdict["reasons"],
                     "evidence": verdict["evidence"],
                     "masked_names": {"ours": ours_masked, "human": human_masked},
+                    "residual_names": {
+                        "repaired": sorted(set(residual_found)),
+                        "left": residual_left,
+                    },
                     "human_corpus": [name for name, _t in corpus],
                     "items": key}, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 脱敏没跑成 ⇒ 题面里留着**没脱敏的原文**（专名直接暴露出处）
-    # ⇒ **不发题面**，只留密封文件作追溯用。
-    if mask_fail:
-        print("  ⛔ 脱敏没跑成 ⇒ **不出题面**（blind_samples.md / blind_sheet.md 不生成）")
+    # 脱敏没跑成 / 题面里还残留专名 ⇒ 题面里留着**没脱敏的原文**
+    # （专名直接暴露出处）⇒ **不发题面**，只留密封文件作追溯用。
+    if mask_fail or residual_left:
+        why = "脱敏没跑成" if mask_fail else "题面里还残留专名"
+        print(f"  ⛔ {why} ⇒ **不出题面**（blind_samples.md / blind_sheet.md 不生成）")
         return {"positions": [r["seg"] for r in picked], "n": n_snips, "blind": False,
                 "reasons": verdict["reasons"], "emitted": False,
                 "mask_density": {"ours": dens_ours, "human": dens_human}}
@@ -657,7 +761,7 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
         sheet.append(f"| {it['id']} | A / B | A / B | A / B | A / B | |")
     sheet += ["", "## 合计", "", "- 「更像人写」选我们那段的次数 k = ____",
               "- 评者人数 = ____（题面每份独立作答，互不通气）",
-              "- 判定 n = 评者人数 × 6"]
+              f"- 判定 n = 评者人数 × {len(items)}"]
     (out_dir / "blind_sheet.md").write_text("\n".join(sheet), encoding="utf-8")
     return {"positions": [r["seg"] for r in picked], "n": n_snips, "blind": blind,
             "reasons": verdict["reasons"], "emitted": True,
@@ -682,6 +786,9 @@ def main() -> int:
                     help="盲评的**人类侧**语料（.db / .txt / 目录；"
                          "给目录 = 多本混采；缺省用基线语料）")
     ap.add_argument("--baseline-max-chars", type=int, default=1_200_000)
+    ap.add_argument("--snips", type=int, default=6,
+                    help="盲评包题数（默认 6）。题数 × 评者人数 = 判定数 n；"
+                         "n < 18 时检验没有统计力量，所以要么多请人、要么把题数加到 18。")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no-blind", action="store_true")
     args = ap.parse_args()
@@ -705,6 +812,13 @@ def main() -> int:
     provider = build_provider(args.channel, model, args.max_tokens, args.timeout,
                                session=f"acc{time.strftime('%m%d%H%M')}")
     print(f"  provider：{type(provider).__name__}（已装成 Writer 单例，内部调用同源）")
+    # 判定专名**单独一个 provider**：关思考、不装成单例。
+    # 理由：逐词判定的回包是「每个词一个 JSON 对象」，输出越长越容易被
+    # max_tokens 拦腰截断，而截断 = 整批判定消失 = 真名留在题面里。
+    judge_provider = build_provider(args.channel, model, args.max_tokens, args.timeout,
+                                     session=f"judge{time.strftime('%m%d%H%M')}",
+                                     thinking_off=True, install_singleton=False)
+    print("  判定 provider：独立实例（关思考）—— 判定回包短，不易被截断")
 
     section("A. 人类散文基线（阈值的来源）")
     base, thr = load_baseline(args.baseline_max_chars)
@@ -754,7 +868,8 @@ def main() -> int:
         if corpus:
             print(f"  人类侧语料：{human_spec}")
             print(f"  混采书目：{'、'.join(n for n, _t in corpus)}")
-        info = build_blind_packet(rows, corpus, out_dir, provider=provider)
+        info = build_blind_packet(rows, corpus, out_dir, provider=provider,
+                                   n_snips=args.snips, judge_provider=judge_provider)
         if info:
             print(f"  取样段：{info['positions']}")
             print(f"  脱敏痕迹密度（井号/百字）：我们 {info['mask_density']['ours']:.2f} / "
