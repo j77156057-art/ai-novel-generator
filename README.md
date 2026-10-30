@@ -128,8 +128,11 @@
   其余 17 本**零误报**;剔除后外书人名 1,136 → 0 次,本书人名 14,242 → 14,242 次
   (一字不少)。**外书的章是夹在本书的章之间的**,所以按「命中的连续章」切段删,
   不按首尾跨度整段删(否则会连带删掉 16.8 万字本书正文)。
-- **接在哪儿** —— 投放时的体检报告(`clean_report.foreign_blocks`)与审核面板
-  (`foreign_book_blocks` 规则)都看得见;剔除是投放时的一个显式开关。
+- **接在哪儿** —— 投放时的**待确认卡**上直接写出「混进了几段别的书、独占词是哪些、
+  占了多大比例」,并给一个**默认不勾**的「剔除这几段」勾选框;
+  入库后语料页的「入库体检」块给出同样结论并说明是否已剔除;
+  审核面板(`foreign_book_blocks` 规则)也看得见。剔除是投放时的一个显式开关,
+  默认关闭 —— 检测照做,删不删由人点。
 
 ### 📇 角色档案:让「这个角色是谁」真的进到提示词里
 
@@ -402,7 +405,7 @@ npm test               # = node --test tests/*.test.ts && vitest run
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/                  # 1,849 项用例（+ 8 项需外部语料/验收库才跳）
+python -m pytest tests/                  # 1,850 项用例（+ 8 项需外部语料/验收库才跳）
 ```
 
 > 结尾会有一行 `1832 passed, 8 skipped in ...` —— **别再给这条命令加 `-q`**：
@@ -468,7 +471,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **1,849** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `tests/` | **1,850** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：9 个纯逻辑文件（43 项，`node --test`）+ 3 个组件级文件（27 项，vitest + jsdom） |
 | `docs/` | 73 份设计文档与指南：架构怎么定的、判据为什么这么定 |
 | `ENGINEERING.md` | 工程纪律：每一条规矩背后都是一次真实踩坑 |
@@ -541,7 +544,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   跑的就是 README「跑测试」那一节写的命令 —— 不给 CI 另写一套更严格的检查。
   **在 Linux 上绿,不只是本机绿** —— 流水线能在 Linux 上抓出本机看不见的缺陷
   (测试子进程删掉父进程的 SQLite 文件:Windows 删不掉打开中的文件,本机因此全绿)。
-- **规模** —— 后端 **1,849** 项测试(`pytest tests`),前端 9 个纯逻辑测试文件(43 项)
+- **规模** —— 后端 **1,850** 项测试(`pytest tests`),前端 10 个纯逻辑测试文件(50 项)
   + 3 个组件级测试文件(27 项,vitest + jsdom),**当前全绿**。
 - **文档里的数字被机器守着** —— `tests/test_readme_test_count.py`:
   README 写的用例数必须等于 `pytest` **实际收集到的**条数,且 README 里几处写法
@@ -613,6 +616,8 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   (超过就不是「一本书里混了几章」,而是「这本书本身就是拼的」);
   混入少于 5 章的也放过去。取这组阈值是因为放宽会让候选膨胀、
   排他性验证不通过,**真阳性反而检不出来**(实测 25% ⇒ 3 段;40% ⇒ 0 段)。
+  同一组阈值也意味着:**检不检出取决于混入的局部密度** ——
+  把那 16 章单独截出来(20 万字、人物名出现在 16 章里)反而不报。
 - **默认不带浏览器 UA** —— provider 的请求头只带 Authorization 与 Content-Type。
   指向走 Cloudflare 的 OpenAI 兼容端点(例如某些订阅通道)会被拦成 **403**,
   错误是「Forbidden」而不是原因。自定义请求头还没做,这是已知边界。

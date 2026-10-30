@@ -1,5 +1,68 @@
 // 与后端 Pydantic schemas 对齐的 TS 类型（手动镜像，改后端时同步此处）。
 
+/**
+ * 语料体检报告（`RawNovel.clean_report`）。
+ *
+ * 全部字段都是**可选**的：不同入库路径写入的字段不一样，
+ * 所以界面读的时候一律用 `?.` 兜底，不假设它一定存在。
+ */
+export interface CorpusCleanReport {
+  /** 洗掉的注入水印串（每条含文本与出现次数）。 */
+  marks?: Array<{ text: string; count: number }>;
+  /** 剔除总字数。 */
+  removed_chars?: number;
+  /** 清洗前后字数。 */
+  chars_in?: number;
+  chars_out?: number;
+  /** 清洗是否改动了内容。 */
+  cleaned?: boolean;
+  /** 「混进来的别的书」的体检结论（盗版站的 txt 常把多本书拼在一起）。 */
+  foreign_blocks?: ForeignBlocksReport;
+  /** 其它体检维度（原文缺失等），按后端实际写入的键展示。 */
+  [key: string]: unknown;
+}
+
+/**
+ * 「混进了别的书」的检出结论。
+ *
+ * 命中的是**人物聚集度 + 排他性**（出现集中、且别处见不到的人物名），
+ * 不是风格离群 —— 风格离群会把作者自己的章节也判成外来。
+ */
+export interface ForeignBlocksReport {
+  /** 是否检出。 */
+  detected: boolean;
+  /** 检出块数。 */
+  block_count: number;
+  /** 涉及字数。 */
+  chars: number;
+  /** 占比（0~1）。 */
+  ratio: number;
+  /** 是否已剔除（入库时显式开启过剔除才会为 true）。 */
+  dropped?: boolean;
+  /** 实际剔除字数。 */
+  removed_chars?: number;
+  /** 逐块明细。 */
+  blocks?: Array<{
+    /** 该块的起止字符位置。 */
+    start: number;
+    end: number;
+    /** 该块字数。 */
+    chars: number;
+    /** 该块占全书比例（0~1）。 */
+    ratio: number;
+    /** 该块含几章。 */
+    chapter_count: number;
+    /** 该块的章标题。 */
+    chapter_titles?: string[];
+    /** 该块独占的人物名（判定依据）。 */
+    terms?: string[];
+    /** 独占词集中度（0~1）。 */
+    exclusive_ratio?: number;
+    /** 正文样本（用于人工确认这是不是另一本书）。 */
+    sample?: string;
+  }>;
+}
+
 export interface NovelOut {
   id: number;
   title: string | null;
@@ -12,6 +75,11 @@ export interface NovelOut {
    * 界面上的「故事进行到第几章」输入框靠它定上界 —— 没有它只能等后端 400。
    */
   max_chapter_no?: number;
+  /**
+   * 入库时的语料清洗报告（含「混进了别的书」的检出结论）。
+   * 用户要能看到「洗掉了什么」「里面混了什么」。
+   */
+  clean_report?: CorpusCleanReport | null;
 }
 
 /**

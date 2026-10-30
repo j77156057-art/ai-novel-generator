@@ -2,8 +2,9 @@
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "@/api/client";
-import type { ChunkOut, NovelOut, SearchHit } from "@/api/types";
+import type { ChunkOut, CorpusCleanReport, ForeignBlocksReport, NovelOut, SearchHit } from "@/api/types";
 import { useAsync } from "@/composables/useAsync";
+import ForeignBlocksNotice from "@/components/ForeignBlocksNotice.vue";
 
 const router = useRouter();
 const { data: novels, loading: novelsLoading, error: novelsError, run: reloadNovels } =
@@ -18,6 +19,19 @@ const hits = ref<SearchHit[] | null>(null);
 const searching = ref(false);
 
 onMounted(() => reloadNovels());
+
+/** 这本语料入库时的体检报告。 */
+function reportOf(n: NovelOut | null): CorpusCleanReport | null {
+  return n?.clean_report ?? null;
+}
+
+/** 「混进了别的书」的检出结论；没检出 → null（整块不渲染，不留空态）。 */
+function foreignOf(n: NovelOut | null): ForeignBlocksReport | null {
+  const report = reportOf(n);
+  const foreign = report?.foreign_blocks;
+  if (!foreign || !foreign.detected) return null;
+  return foreign;
+}
 
 /** 去助理页：文本提交已经统一到那里（agent 会带它走清洗 → 抽检 → 蒸馏 → 审查）。 */
 function goAssistant(): void {
@@ -94,6 +108,14 @@ async function runSearch() {
         </div>
       </div>
     </div>
+  </section>
+
+  <section v-if="foreignOf(selected)" class="card">
+    <div class="card-title">入库体检 <span class="hint">《{{ selected?.title }}》</span></div>
+    <div class="notice warn" style="margin-top: 8px">
+      {{ foreignOf(selected)!.dropped ? "入库时已剔除这些内容。" : "这些内容仍在库里。" }}
+    </div>
+    <ForeignBlocksNotice :report="foreignOf(selected)!" />
   </section>
 
   <template v-if="selected">

@@ -95,7 +95,19 @@ def propose_ingest(*, db, project_id, attachment_id, instruction):
     if not explicit_ingest(instruction):
         return None
     from app.agents.pending_actions import build_pending_action
+    # 体检结论随卡片一起下发：用户点确认前就该看到「这份 txt 里混进了别的书」。
+    # 检测在这里跑（只读、确定性），不改动任何数据 —— 剔不剔由人在卡上选。
+    prepared = prepare_attachment(db=db, project_id=project_id, attachment_id=attachment_id)
+    report = prepared.get("report") or {}
+    foreign = report.get("foreign_blocks") or {}
+    detail = {
+        "attachment_id": attachment_id, "filename": meta["filename"], "destructive": False,
+        "description": "确认后清洗、助手抽样检查并入库；不确定内容保留待复查。",
+        "foreign_blocks": foreign,
+    }
+    # `drop_foreign_blocks` 放进 body，**默认 False**：检测照做，删不删由人点。
+    # 删的是整章正文，判据万一错了丢的是真内容 —— 所以不给「默认剔」这个默认值。
     return build_pending_action(kind="ingest_attachment", title="清洗并投放附件：" + meta["filename"],
-        detail={"attachment_id": attachment_id, "filename": meta["filename"], "destructive": False,
-                "description": "确认后清洗、助手抽样检查并入库；不确定内容保留待复查。"},
-        body={"project_id": project_id, "attachment_id": attachment_id, "instruction": instruction})
+        detail=detail,
+        body={"project_id": project_id, "attachment_id": attachment_id, "instruction": instruction,
+              "drop_foreign_blocks": False})

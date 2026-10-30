@@ -268,3 +268,38 @@ def test_corpus_audit_surfaces_foreign_blocks(db_session):
     issue = next(i for i in report.issues if i.rule == "foreign_book_blocks")
     assert issue.severity == "warn"
     assert issue.evidence, "混书结论没有证据"
+
+
+def test_pending_ingest_card_carries_foreign_report(db_session):
+    """投放卡：结论要**跟着卡一起下发**，且剔除默认关闭。
+
+    为什么这是两件事：
+    - 结论不在卡上 ⇒ 用户点确认之前看不到「里面混了什么」，等于盲投；
+    - 剔除默认打开 ⇒ 一条统计判据就能替用户删掉整章正文。
+    所以卡上必须**带结论**（detail.foreign_blocks）且
+    **带一个默认 false 的剔除位**（body.drop_foreign_blocks）。
+    """
+    from app.agents import attachments
+    from app.models import Project
+
+    project_id = 1
+    project = db_session.get(Project, project_id)
+    if project is None:
+        project = Project(id=project_id, title="测试项目", target_length=3000,
+                          generation_length=1200, genre="都市异能")
+        db_session.add(project)
+        db_session.commit()
+    meta = attachments.stage(
+        db=db_session, project_id=project_id, filename="混了书的语料.txt",
+        data=_mixed_book_text().encode("utf-8"),
+    )
+    card = attachments.propose_ingest(
+        db=db_session, project_id=project_id, attachment_id=meta["attachment_id"],
+        instruction="请把这份语料投放入库",
+    )
+    assert card is not None, "投放指令没有产出待确认卡"
+    foreign = (card["detail"] or {}).get("foreign_blocks") or {}
+    assert foreign.get("detected"), "投放卡没带混书结论"
+    assert foreign.get("block_count", 0) >= 1
+    assert card["body"].get("drop_foreign_blocks") is False, "剔除默认必须是关的（只报不删）"
+    assert card["endpoint"] == "/api/assistant/attachments/ingest"

@@ -33,15 +33,18 @@ import { useRoute, useRouter } from "vue-router";
 import { ApiError, api } from "@/api/client";
 import { createAttachmentDraft, pasteAttachmentFiles } from "@/utils/assistantAttachments";
 import AssistantIssueList from "@/components/AssistantIssueList.vue";
+import ForeignBlocksNotice from "@/components/ForeignBlocksNotice.vue";
 import WorkflowStrip from "@/components/WorkflowStrip.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
 import { bodyRepairVerificationText, pendingActionKindLabel, pendingActionRiskMeta, reactNotice, sourceLabel } from "@/utils/assistantDisplay";
+import { distinctChapterTitles } from "@/utils/corpusReport";
 import type {
   AssistantChoiceOption,
   AssistantEvidence,
   AssistantIssue,
   AssistantPendingAction,
   AssistantReactBlock,
+  ForeignBlocksReport,
   ProjectOut,
 } from "@/api/types";
 
@@ -91,6 +94,13 @@ interface ActionCard {
   draft: string;
   /** 草稿对应请求体里的哪个字段（服务端下发；空 = 这张卡没有草稿）。 */
   draftField: string;
+  /**
+   * 「剔除混进来的别的书」的勾选状态（投放语料时才有）。
+   *
+   * 默认**不勾**：检测照做（结论展示在卡上），删不删由人点。
+   * 删的是整章正文，判据万一错了丢的是真内容。
+   */
+  dropForeignBlocks: boolean;
 }
 
 interface Turn {
@@ -361,6 +371,7 @@ async function send(): Promise<void> {
       result: null,
       draft: draftOf(action),
       draftField: draftFieldOf(action),
+      dropForeignBlocks: false,
     }));
     turn.loading = false;
   } catch (err) {
@@ -464,9 +475,15 @@ async function confirmCard(card: ActionCard): Promise<void> {
   card.result = null;
   // 有草稿的卡：回传**用户改过的那一版**（协议字段仍由服务端下发，
   // 前端只覆盖用户输入的那一个字段）。
-  const body = card.draftField
+  let body = card.draftField
     ? { ...(card.action.body ?? {}), [card.draftField]: card.draft }
     : card.action.body;
+  // 「剔除混进来的别的书」是**用户在卡上勾的**，所以这一位由前端覆盖。
+  // 它不是「前端拼字段」—— 字段名与取值域都由服务端在 body 里给好了，
+  // 这里只把用户的勾选状态写进去（不勾时保持服务端给的 false）。
+  if (foreignBlocksOf(card) && card.dropForeignBlocks) {
+    body = { ...(body ?? {}), drop_foreign_blocks: true };
+  }
   try {
     const res = await api.assistantRunPendingAction(
       card.action.endpoint,
@@ -539,6 +556,26 @@ function draftOf(action: AssistantPendingAction): string {
 
 function riskMetaOf(card: ActionCard): { label: string; tag: string; hint: string } {
   return pendingActionRiskMeta(card.action);
+}
+
+// ==================================================================
+// 「混进了别的书」的体检结论（投放语料时）
+//
+// 盗版站的「单本下载」常把多本书拼成一份 txt。这类 txt 进了库，
+// 文体档案是混合体的统计、风格样例可能取到外书的段落 ——
+// 所以投放前要能看见「里面混了什么」，并由人决定剔不剔。
+//
+// 判定口径（服务端给，前端不自己判）：
+//   人物聚集度 + 排他性 —— 集中出现、且别处见不到的人物名。
+// ==================================================================
+
+/** 这张卡带的混书检出结论；没检出（或不是投放卡）→ null。 */
+function foreignBlocksOf(card: ActionCard): ForeignBlocksReport | null {
+  const detail = card.action.detail as Record<string, unknown> | undefined;
+  const raw = detail?.foreign_blocks;
+  if (!raw || typeof raw !== "object") return null;
+  const report = raw as ForeignBlocksReport;
+  return report.detected ? report : null;
 }
 
 /**
@@ -950,6 +987,16 @@ onMounted(async () => {
                     spellcheck="false"
                   />
                 </div>
+
+                <!-- 混书体检：投放前告诉用户这份 txt 里混进了别的书，并让人决定剔不剔。
+                     勾选框**只在检出时出现**，默认不勾 —— 检测照做，删不删由人点。 -->
+                <ForeignBlocksNotice
+                  v-if="foreignBlocksOf(card)"
+                  :report="foreignBlocksOf(card)!"
+                  selectable
+                  :model-value="card.dropForeignBlocks"
+                  @update:model-value="card.dropForeignBlocks = $event"
+                />
 
                 <div v-if="card.rows.length" class="meta-grid">
                   <div v-for="row in card.rows" :key="row.key">
