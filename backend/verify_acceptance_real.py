@@ -82,6 +82,7 @@ from acceptance_lib import (  # noqa: E402
     mask_density,
     mask_side,
     metaphor_per100,
+    normalize_for_blind,
     pctl,
     sent_cv,
     thresholds,
@@ -503,6 +504,11 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
     ok_rows = [r for r in rows if not r.get("error") and r.get("text")]
     if not ok_rows:
         return {}
+    # —— 版式归一（**两侧同一个函数**）：盗版站文本带段首缩进和章节标记，
+    #    我们这侧没有 ⇒ 缩进/章节号本身就是「非对称特征」。
+    #    不归一的话，题面里会出现「第74章 报复」这种拼进正文的章节头。
+    ok_rows = [{"seg": r["seg"], "text": normalize_for_blind(r["text"])} for r in ok_rows]
+    corpus = [(name, normalize_for_blind(t)) for name, t in corpus]
     positions = sample_positions(len(ok_rows))
     picked = [r for r in ok_rows if r["seg"] in positions][:n_snips]
     if len(picked) < n_snips:
@@ -517,17 +523,23 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
             ours.append(t)
             continue
         st = rng.randrange(0, len(t) - chars)
-        ours.append(t[st:st + chars].replace("\n", ""))
+        ours.append(t[st:st + chars])
 
-    pool = [text for _name, text in corpus if len(text) >= chars * 3]
+    pool = [(name, text) for name, text in corpus if len(text) >= chars * 3]
     human: list[str] = []
+    human_src: list[str] = []
     if pool:
-        for _ in range(n_snips):
-            src = rng.choice(pool)
-            start = rng.randrange(0, max(1, len(src) - chars))
-            human.append(src[start:start + chars].replace("\n", ""))
+        # **轮转取书**（不是随机抽）：多本混采时保证每本出的题数一样 ——
+        # 随机抽可能 5 题来自同一本，评者认出一本就等于认出大半。
+        start = rng.randrange(len(pool))
+        for i in range(n_snips):
+            name, src = pool[(start + i) % len(pool)]
+            off = rng.randrange(0, max(1, len(src) - chars))
+            human.append(src[off:off + chars])
+            human_src.append(name)
     else:
         human = ["（没有语料可取人类片段）"] * n_snips
+        human_src = ["（无）"] * n_snips
 
     # —— 两侧同等脱敏（同一套流程：召回 → LLM 判定 → 残片剔除 → 等长占位符）——
     ours_anon, ours_masked = ours, []
@@ -589,7 +601,8 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
         slot_b = "ours" if flip else "human"
         items.append({"id": f"s{i + 1:02d}", "A": slot_a, "B": slot_b})
         key.append({"sample_id": f"s{i + 1:02d}", "slot_A": slot_a, "slot_B": slot_b,
-                    "our_segment_no": picked[i]["seg"]})
+                    "our_segment_no": picked[i]["seg"],
+                    "human_source": human_src[i]})
     order = list(range(n_snips))
     rng.shuffle(order)
 
@@ -662,6 +675,9 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--out", default=r"D:\Temp\acc_real")
     ap.add_argument("--corpus", default="", help="基线语料（.db / .txt / 目录）")
+    ap.add_argument("--human-corpus", default="",
+                    help="盲评的**人类侧**语料（.db / .txt / 目录；"
+                         "给目录 = 多本混采；缺省用基线语料）")
     ap.add_argument("--baseline-max-chars", type=int, default=1_200_000)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no-blind", action="store_true")
@@ -722,11 +738,19 @@ def main() -> int:
 
     if not args.no_blind:
         section("C. 盲评包")
+        # 人类侧语料**可以跟基线语料不是同一批**：
+        # 基线要「一份能代表当代网文的语料」，盲评人类侧要「同题材 + 混采几本」，
+        # 两者诉求不同 ⇒ 分开指定（--human-corpus / BLIND_HUMAN_CORPUS）。
+        human_spec = args.human_corpus or os.environ.get("BLIND_HUMAN_CORPUS", "") \
+            or baseline_corpus_spec()
         try:
-            corpus = corpus_texts(baseline_corpus_spec(), max_chars=600_000) if os.path.exists(
-                baseline_corpus_spec()) else []
+            corpus = corpus_texts(human_spec, max_chars=600_000) if os.path.exists(
+                human_spec) else []
         except Exception:  # noqa: BLE001
             corpus = []
+        if corpus:
+            print(f"  人类侧语料：{human_spec}")
+            print(f"  混采书目：{'、'.join(n for n, _t in corpus)}")
         info = build_blind_packet(rows, corpus, out_dir, provider=provider)
         if info:
             print(f"  取样段：{info['positions']}")

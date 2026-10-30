@@ -41,6 +41,7 @@ from acceptance_lib import (  # noqa: E402
     mask_density,
     mask_names,
     mask_side,
+    normalize_for_blind,
     recall_proper_nouns,
     shape_candidates,
 )
@@ -234,6 +235,25 @@ def test_占位符密度能算出来():
     assert mask_density("没有任何专名的一段话。") == 0
 
 
+def test_版式归一去掉缩进与章节标记():
+    """盗版站文本带段首缩进和章节标题行 —— 那都是**非对称特征**。"""
+    raw = ("    第74章 报复\n"
+           "    他把烟一丢，站了起来。\n"
+           "\n"
+           "    “事情搞定了？”\n")
+    out = normalize_for_blind(raw)
+    assert "第74章" not in out
+    assert "报复" not in out
+    assert not out.startswith(" ")
+    assert "    " not in out
+    assert "他把烟一丢" in out
+
+
+def test_版式归一不会误删正文里的章节字样():
+    out = normalize_for_blind("他说第74章那段写得不错，后来就没再提。")
+    assert "第74章" in out, "正文里提到章号不该被当章节标记删掉"
+
+
 # --------------------------------------------------------------------------- #
 # 5. 端到端闸门：不是盲评包 ⇒ 判定脚本拒绝出统计结论（退出码 2）
 # --------------------------------------------------------------------------- #
@@ -243,6 +263,26 @@ def _rows(n: int = 12) -> list[dict]:
             "他把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。"
             "监控和卷宗都调出来，地铁末班车上他还在刷视频。")
     return [{"seg": i + 1, "text": body * 3, "error": None} for i in range(n)]
+
+
+def test_混采时轮转取书而不是随机抽(tmp_path):
+    """多本混采要**轮转**：随机抽可能 5 题来自同一本，
+    评者认出一本就等于认出大半。"""
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import build_blind_packet
+
+    corpus = [
+        ("甲书", "他把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。" * 40),
+        ("乙书", "她把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。" * 40),
+    ]
+    out_dir = tmp_path
+    info = build_blind_packet(_rows(), corpus, out_dir, provider=_StubJudge(set()))
+    assert info["emitted"] is True
+    key = json.loads((out_dir / "blind_key.json").read_text(encoding="utf-8"))
+    srcs = [it["human_source"] for it in key["items"]]
+    assert set(srcs) == {"甲书", "乙书"}, srcs
+    # 6 题 / 2 本 ⇒ 各 3 题
+    assert srcs.count("甲书") == srcs.count("乙书") == 3, srcs
 
 
 def test_脱敏没跑成就不发题面(tmp_path):
