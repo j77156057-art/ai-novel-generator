@@ -145,6 +145,30 @@ class LLMProvider:
         """
         yield self.chat(system, user, constraints=constraints)
 
+    def variant(self, *, thinking_off: bool = False, max_tokens: int | None = None):
+        """返回一个**变体** provider：只改「思考开关」与「输出预算」。
+
+        ## 为什么需要它
+
+        机械改写（形态校正 / 归属校正）**不需要思考**，但思考会吃同一份
+        token 预算 —— 实测 2026-10-31：归属校正的分块改写全部**返回空输出**
+        （推理块吃光 `max_tokens=8000` ⇒ 正文一个字都没吐），
+        同一段文本只要关掉思考就能正常回包。
+
+        ## 为什么不直接改原 provider
+
+        provider 是**单例**：Writer 路径要用「会思考」的默认档，
+        改请求体就等于把整条生成链的档位改了。
+        ⇒ 变体是**浅拷贝**：只换 `extra_body` 与 `max_tokens`，
+        其余（api_key / base_url / headers / 限流状态）共享。
+
+        ## 默认实现
+
+        基类**原样返回自己**（不认这些参数就当没要求变体），
+        真正支持的子类覆盖它。
+        """
+        return self
+
     def set_stop_sequences(self, sequences: list[str] | None) -> None:
         """v2.6：设置下一次 chat/stream_chat 的 stop token 列表。
 
@@ -254,6 +278,27 @@ class OpenAICompatibleChatProvider(LLMProvider):
         参数传值（每次调用独立），不用这个 setter。
         """
         self._stop_sequences = list(sequences) if sequences else None
+
+    def variant(self, *, thinking_off: bool = False, max_tokens: int | None = None):
+        """变体：浅拷贝，只换 `extra_body` 与 `max_tokens`。
+
+        ⚠️ **只换请求体，不换身份** —— api_key / base_url / headers /
+        限流与重试状态都共享（浅拷贝 ⇒ 同一个对象上的引用不变）。
+
+        关思考的发法：请求体加 `thinking: {"type": "disabled"}`
+        （DeepSeek 吃这个字段；不认的厂商会静默忽略 ⇒ 最坏是没关上，
+        不会报错）。
+        """
+        import copy as _copy
+
+        new = _copy.copy(self)
+        extra = dict(self.extra_body or {})
+        if thinking_off:
+            extra["thinking"] = {"type": "disabled"}
+        new.extra_body = extra
+        if max_tokens is not None:
+            new.max_tokens = max_tokens
+        return new
 
     def _model_chain(self) -> list[str]:
         return self._models

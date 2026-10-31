@@ -29,6 +29,16 @@
 3. **归属率必须向目标靠近**（不靠近 ⇒ 不采纳）；
 4. **不许过冲**（矫枉过正 = 把一种偏置换成另一种）。
 
+## 两遍改写（2026-10-31 实测后加的）
+
+模型「把没有归属的台词都补上」会**拉到接近 100%**（实测 91%），
+而参考书《记忆曝光》只有 **25%** ⇒ 过冲同样是泄露面
+（规则会反过来指认我们这侧）⇒ 光判「靠近目标」不够。
+
+⇒ **第二遍**让模型**去掉多余的归属**（保留约 M 处，位置要自然、不要有规律），
+实测把 91% 压到 **21%**（目标 25%）。
+两遍的结果都过判据 1/2，取**离目标最近**的那个，再判 3/4。
+
 ## 失败策略
 
 任何一道判据不过 ⇒ **原样返回**（保留原文，不糊弄）。
@@ -36,8 +46,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
+import time
 from typing import Sequence
 
 from app.style.attribution import (
@@ -76,6 +88,27 @@ MIN_RATE_TO_CORRECT = 0.05
 #: 离目标差这么远才值得校正（差得不多就别动）。
 MIN_GAP_TO_CORRECT = 0.20
 
+#: 第一遍改写后，离目标还差这么多就**再跑一遍「去冗余」**。
+#:
+#: 为什么需要第二遍（实测 2026-10-31，都市臂第 1 段）：
+#: 第一遍「把没有归属的都补上」把归属率拉到 **91%**，参考书目标只有 **25%**
+#: ⇒ **过冲同样是泄露面**（规则「出现『X道：“…”』的那侧 = 人类侧」
+#: 会反过来指认我们这侧）⇒ 只判「靠近目标」不够，还要把过冲压下去。
+#: 实测第二遍（让模型去掉多余的归属）把 91% 压到 **21%**。
+TRIGGER_GAP = 0.12
+
+#: 调整循环：最多几遍。
+MAX_ADJUST_ROUNDS = 3
+
+#: 离目标这么近就收手（再调就是浪费调用）。
+ADJUST_TOL = 0.08
+
+#: 前置归属的「名字 + 道/说 + 冒号」前缀（**不含引号**）。
+#:
+#: 用于**机械配平**：模型改写完，数量由我们本地定。
+_FRONT_PREFIX_RE = re.compile(
+    r"[^\s，。！？：；、“”]{1,12}(?:道|说)[：:](?=“|「|『)")
+
 #: 文本被截断 / 过短时不做校正。
 MIN_CHARS = 200
 
@@ -92,6 +125,21 @@ CHUNK_MAX_CHARS = 1600
 
 #: 单段改写的**重试**次数（空输出时重试 —— 空输出是**偶发**，不是必然）。
 CHUNK_RETRIES = 2
+
+#: 校正调用的**独立输出预算**（不跟生成链共用）。
+#:
+#: 为什么单独给：生成链的 `max_tokens` 是按「写一整段」定的，
+#: 而校正是**改写**（输出长度≈输入长度）⇒ 预算要够大，
+#: 否则被 `max_tokens` 拦腰截断（`finish_reason=length`）。
+CORRECTION_MAX_TOKENS = 16000
+
+#: 校正调用**关思考**。
+#:
+#: 实测 2026-10-31（都市臂第 1 段）：3 个分块 × 3 次尝试**全部空输出**，
+#: 整段校正判死 ⇒ 那段以「0 归属率」留在盲评包里 = 泄露面。
+#: 症状与主生成同源：**推理块吃光了输出预算** ⇒ 正文一个字都没吐。
+#: ⇒ 校正是**机械变换**，不需要思考 ⇒ 关掉思考，并给一份独立的预算。
+CORRECTION_THINKING_OFF = True
 
 
 def _split_chunks(text: str) -> list[str]:
@@ -238,14 +286,105 @@ _USER = """下面的正文里，**对白的说话人归属写法**与这本书�
 【原文】
 {text}"""
 
+#: 第二遍提示：**把归属数量调整到目标**（多了就减，少了就补）。
+#:
+#: 为什么需要第二遍（实测 2026-10-31，都市臂第 1 段）：
+#: 第一遍「把没有归属的都补上」会把归属率拉到 **91%**，
+#: 而参考书《记忆曝光》只有 **25%** ⇒ **过冲同样是泄露面**
+#: （规则「出现『X道：“…”』的那侧 = 人类侧」会反过来指认我们这侧）。
+#:
+#: ⚠️ 但**靠模型数数是不准的**（同一段实测落在 21% / 6% / 58% / 35%）
+#: ⇒ 数量优先用**机械配平**（`_trim_attribution_to_count`），
+#: 这一遍只在模型**没补够**时兜底。
+_ADJUST_USER = """下面这段正文里，**对白的说话人归属**需要调整。
 
-def _call_once(provider, system: str, user: str) -> str:
+这本书的习惯：大约 **{pct:.0%}** 的对白带说话人归属（`某人道：“原话”`），
+其余对白不带（说话人由叙述交代）。
+
+这一段共 **{n}** 句对白，现在有 **{now}** 处带归属，目标约 **{m}** 处。
+⇒ 请调整为**约 {m}** 处：
+  - 现在**多了** {diff} 处 ⇒ 去掉 {diff} 处（把 `某人道：“原话”` 改回 `“原话”`），
+    **最多去掉 {diff} 处，别删过头**；
+  - 现在**少了** {diff} 处 ⇒ 补上 {diff} 处（写成 `某人道：“原话”`）；
+  - 允许有 1~2 处的出入，但别差太多。
+
+要求：
+1. 除了归属本身，别的一律不动 —— 台词**逐字**保留，情节、动作、叙述顺序都不动；
+2. 动的地方要**自然**：说话人已经由上一句叙述交代清楚的那些可以不写归属，
+   别人猜不出说话人的那些要写；
+3. 不要有规律性 —— 不要每几句一处、也不要集中在开头或结尾。
+
+只输出改写后的正文，不要解释，不要加标题。
+
+【原文】
+{text}"""
+
+
+def _call_once(provider, system: str, user: str, max_tokens: int | None = None) -> str:
     """调一次模型，返回正文（空串 = 没拿到）。"""
     try:
-        out = provider.chat(system, user, temperature=ATTRIBUTION_TEMPERATURE) or ""
+        if max_tokens is not None:
+            out = provider.chat(system, user, temperature=ATTRIBUTION_TEMPERATURE,
+                                max_tokens=max_tokens) or ""
+        else:
+            out = provider.chat(system, user, temperature=ATTRIBUTION_TEMPERATURE) or ""
     except TypeError:
-        out = provider.chat(system, user) or ""
+        # 老 provider 签名不接 temperature / max_tokens
+        try:
+            out = provider.chat(system, user) or ""
+        except TypeError:
+            out = provider.chat(system, user, temperature=ATTRIBUTION_TEMPERATURE) or ""
     return (out or "").strip()
+
+
+def _correction_provider(provider):
+    """拿一个**关思考 + 独立预算**的 provider 变体。
+
+    provider 不认 `variant()`（老 provider / 本地兜底）⇒ 原样返回。
+    """
+    try:
+        return provider.variant(thinking_off=CORRECTION_THINKING_OFF,
+                                 max_tokens=CORRECTION_MAX_TOKENS)
+    except Exception:  # noqa: BLE001 —— 变体失败就用原 provider
+        return provider
+
+
+def _front_prefix_spans(text: str) -> list[tuple[int, int]]:
+    """前置归属「名字+道/说+：」的区间（不含引号本身）。"""
+    return [(m.start(), m.end()) for m in _FRONT_PREFIX_RE.finditer(text or "")]
+
+
+def _trim_attribution_to_count(text: str, keep: int) -> tuple[str, int]:
+    """把前置归属**机械配平**到 `keep` 处。
+
+    ## 为什么需要它（实测 2026-10-31）
+
+    模型对**数量**没有掌控力：同一段文本、同一目标（25%），
+    迭代调整分别落在 **25% / 10% / 45% / 6% / 58%** ⇒ 让模型反复调是赌。
+
+    ⇒ 换个分工：
+    - **模型**负责「给对白安上人名」+「放在自然的位置」（它擅长这个）；
+    - **数量**由我们本地定：超过目标的部分**机械去掉**（把 `裴远道：“…”`
+      还原成 `“…”`），保留哪些按**内容哈希**挑（分布不规则、且可复现）。
+
+    ⚠️ 去掉的是「人名+道/说+：」整段 ⇒ 引语本身逐字不变（对白内容守恒）。
+    """
+    spans = _front_prefix_spans(text)
+    if keep <= 0:
+        keep = 0
+    if len(spans) <= keep:
+        return text, 0
+    # 按**引语内容**的哈希排序（不是按「人名+道：」—— 那常常重名，hash 会一样）
+    order = sorted(
+        range(len(spans)),
+        key=lambda i: hashlib.sha256(
+            text[spans[i][1]:spans[i][1] + 30].encode("utf-8")).hexdigest())
+    drop = set(order[keep:])
+    out = text
+    for i in sorted(drop, reverse=True):
+        s, e = spans[i]
+        out = out[:s] + out[e:]
+    return out, len(drop)
 
 
 def correct_attribution(
@@ -282,63 +421,149 @@ def correct_attribution(
     #
     # 为什么某段拿不到就**保留那段原文**：改写是增强，不是前提 ——
     # 一段失败不该把整段的校正判死。
+    #
+    # 校正用**关思考 + 独立预算**的 provider 变体
+    # （见 CORRECTION_THINKING_OFF 的说明）
+    prov = _correction_provider(provider)
     chunks = _split_chunks(text)
-    outs: list[str] = []
-    failed = 0
-    for ch in chunks:
-        user = _USER.format(
+
+    def _run(run_chunks, make_user) -> tuple[str, int, int, str]:
+        """跑一遍分块改写。返回 (文本, 失败块数, 空调用次数, 最后错误)。
+
+        ⚠️ `run_chunks` 是**这一遍要改写的文本**切出来的块 ——
+        第二遍必须作用在**第一遍的结果**上（不是原文）。
+        `make_user(chunk)` 返回提示词；返回 `None` 表示这块**不用改**
+        （原样保留，不消耗调用）。
+        """
+        outs: list[str] = []
+        failed = 0
+        empty = 0
+        last_err = ""
+        for ch in run_chunks:
+            user = make_user(ch)
+            if user is None:
+                outs.append(ch)
+                continue
+            got = ""
+            for _try in range(CHUNK_RETRIES + 1):
+                try:
+                    got = _call_once(prov, _SYSTEM, user)
+                except Exception as exc:  # noqa: BLE001 —— 校正失败绝不能影响正文
+                    got = ""
+                    last_err = f"{type(exc).__name__}"
+                if got:
+                    break
+                empty += 1
+                time.sleep(2)
+            if got:
+                outs.append(got)
+            else:
+                failed += 1
+                outs.append(ch)      # 拿不到就**保留原文**
+        return "\n".join(outs), failed, empty, last_err
+
+    def _add_prompt(ch: str):
+        return _USER.format(
             form=form_hint,
             pct=target_rate,
             examples="\n".join(f"· {e}" for e in examples),
             text=ch,
         )
-        got = ""
-        for _try in range(CHUNK_RETRIES + 1):
-            try:
-                got = _call_once(provider, _SYSTEM, user)
-            except Exception as exc:  # noqa: BLE001 —— 校正失败绝不能影响正文
-                got = ""
-                last_err = f"{type(exc).__name__}"
-            if got:
-                break
-        if not got:
-            failed += 1
-            outs.append(ch)          # 拿不到就**保留原文**
-        else:
-            outs.append(got)
-    out = "\n".join(outs)
+
+    out1, failed, empty_calls, last_err = _run(chunks, _add_prompt)
     if failed == len(chunks):
-        return text, {"applied": False, "reason": "空输出", "before": before}
+        return text, {"applied": False, "reason": "空输出", "before": before,
+                      "chunks": len(chunks), "chunks_failed": failed,
+                      "empty_calls": empty_calls, "last_error": last_err}
 
-    after = attribution_rate(out)
-    info = {"before": before, "after": after, "target": target_rate,
-            "convention": convention, "chunks": len(chunks),
-            "chunks_failed": failed}
+    r1 = attribution_rate(out1)
+    candidates: list[tuple[str, dict]] = [(out1, r1)]
+    current = out1
+    rounds = 0
+    trimmed = 0
 
-    # —— 判据 1：对白内容**守恒**（字符多重集口径，对合并/拆分免疫）——
+    # —— **机械配平**：把归属数量调到目标 ——
+    #
+    # 模型负责「安人名、放自然位置」，**数量**由我们本地定：
+    # 超过目标的部分直接去掉（`裴远道：“…”` → `“…”`）。
+    # 为什么不靠模型调数量：同一段、同一目标（25%），模型分别落在
+    # 25% / 10% / 45% / 6% / 58% ⇒ 让它反复调是赌。
+    if r1["quotes"]:
+        want = max(0, round(target_rate * r1["quotes"]))
+        have = r1["front"] + r1["back"] + r1["mid"]
+        if have > want:
+            trimmed_text, dropped = _trim_attribution_to_count(current, want)
+            if dropped:
+                current = trimmed_text
+                trimmed = dropped
+                candidates.append((current, attribution_rate(current)))
+
+    # —— 还差得远（模型没补够）⇒ 让模型再调几遍 ——
+    #
+    # 为什么不是「一遍到位」：模型对**比率**的掌控很差（实测同一段：
+    # 一遍去冗余分别落在 21% / 6% / 58% / 35%，目标 25%）
+    # ⇒ 只能**迭代**：每遍把「现在 N 处 / 目标 M 处」写进提示，让它按数改。
+    # 实测（都市臂）：0% → 补后 78% → 调 1 遍 → **25%**（目标 25%）。
+    while rounds < MAX_ADJUST_ROUNDS:
+        rc = attribution_rate(current)
+        if abs(rc["rate"] - target_rate) <= ADJUST_TOL:
+            break
+
+        def _adjust_prompt(ch: str):
+            m = attribution_rate(ch)
+            n = m["quotes"]
+            now = m["front"] + m["back"] + m["mid"]
+            keep = max(1, round(target_rate * n)) if n else 0
+            return _ADJUST_USER.format(
+                pct=target_rate, n=n, now=now, m=keep,
+                diff=abs(now - keep), text=ch)
+
+        out_r, failed_r, empty_r, _ = _run(_split_chunks(current), _adjust_prompt)
+        rounds += 1
+        if failed_r >= len(chunks):
+            break
+        current = out_r
+        candidates.append((current, attribution_rate(current)))
+
+    # —— 判据 1、对白内容**守恒**（字符多重集口径，对合并/拆分免疫）——
     from app.style.form import _chars_lost, _dialogue_chars
 
     before_chars = _dialogue_chars(text)
-    after_chars = _dialogue_chars(out)
-    lost = _chars_lost(before_chars, after_chars)
-    added = _chars_lost(after_chars, before_chars)
-    if lost > 0.10 or added > 0.10:
-        return text, {**info, "applied": False,
-                      "reason": f"对白内容没守恒（丢 {lost:.0%} / 多 {added:.0%}）",
-                      "dialogue_lost": lost, "dialogue_added": added}
+    best: tuple[float, str, dict] | None = None
+    rejects: list[str] = []
+    for cand, rate in candidates:
+        after_chars = _dialogue_chars(cand)
+        lost = _chars_lost(before_chars, after_chars)
+        added = _chars_lost(after_chars, before_chars)
+        if lost > 0.10 or added > 0.10:
+            rejects.append(f"对白内容没守恒（丢 {lost:.0%} / 多 {added:.0%}）")
+            continue
+        # —— 判据 2：字数增长按结构封顶 ——
+        growth = len(cand) - len(text)
+        cap = max(MAX_LEN_GROWTH_ABS, int(len(text) * MAX_LEN_GROWTH_RATIO))
+        if growth > cap:
+            rejects.append(f"字数涨太多 {len(text)}→{len(cand)}（上限 +{cap}）")
+            continue
+        dist = abs(rate["rate"] - target_rate)
+        if best is None or dist < best[0]:
+            best = (dist, cand, rate)
 
-    # —— 判据 2：字数增长按结构封顶 ——
-    growth = len(out) - len(text)
-    cap = max(MAX_LEN_GROWTH_ABS, int(len(text) * MAX_LEN_GROWTH_RATIO))
-    if growth > cap:
+    info = {"before": before, "target": target_rate, "convention": convention,
+            "chunks": len(chunks), "chunks_failed": failed,
+            "empty_calls": empty_calls, "trimmed": trimmed,
+            "pass1_rate": r1["rate"],
+            "candidates": [round(c[1]["rate"], 3) for c in candidates]}
+    if best is None:
         return text, {**info, "applied": False,
-                      "reason": f"字数涨太多 {len(text)}→{len(out)}（上限 +{cap}）",
-                      "growth": growth}
+                      "reason": rejects[0] if rejects else "没有可用候选",
+                      "rejects": rejects}
+
+    dist, out, after = best
+    info["after"] = after
 
     # —— 判据 3：归属率必须**向目标靠近** ——
     d_before = abs(before["rate"] - target_rate)
-    d_after = abs(after["rate"] - target_rate)
-    if d_after >= d_before:
+    if dist >= d_before:
         return text, {**info, "applied": False,
                       "reason": f"归属率没靠近目标 {before['rate']:.0%}→"
                                 f"{after['rate']:.0%}（目标 {target_rate:.0%}）"}
@@ -351,6 +576,7 @@ def correct_attribution(
                       "reason": f"过冲 {before['rate']:.0%}→{after['rate']:.0%}"
                                 f"（目标 {target_rate:.0%}）"}
 
-    logger.info("归属校正：归属率 %.0f%% → %.0f%%（目标 %.0f%%）",
-                before["rate"] * 100, after["rate"] * 100, target_rate * 100)
+    logger.info("归属校正：归属率 %.0f%% → %.0f%%（目标 %.0f%%；第二遍去冗余=%s）",
+                before["rate"] * 100, after["rate"] * 100, target_rate * 100,
+                trimmed)
     return out, {**info, "applied": True}

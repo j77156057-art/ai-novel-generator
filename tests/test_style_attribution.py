@@ -328,11 +328,15 @@ def test_归属校正拒绝不靠近目标的改写():
     assert "没靠近" in info.get("reason", ""), info
 
 
-def test_归属校正过冲要拒绝():
-    """矫枉过正（把一种偏置换成另一种）⇒ 拒绝。"""
+def test_归属校正过冲会被配平到目标():
+    """矫枉过正 ⇒ 不是原样保留，而是**配平到目标**。
+
+    2026-10-31 改：过冲不再是「拒绝」，而是先机械配平再判。
+    （拒绝会让整段留在「0 归属 / 90% 归属」这种极端状态 —— 那正是泄露面。）
+    """
     from app.style.attribution_fix import correct_attribution
 
-    # 7 句对白里给 5 句加归属 ⇒ 归属率 71%；目标 40% ⇒ 更近了，但冲过去 31 点 ⇒ 拒
+    # 7 句对白里给 5 句加归属 ⇒ 归属率 71%；目标 40%
     partial = ("秦昭道：“别动。”\n裴远道：“放手。”\n秦昭道：“你到底想怎样。”\n"
                + _NARR + "\n"
                "裴远道：“让开。”\n“我不让。”\n" + _NARR + "\n"
@@ -343,8 +347,8 @@ def test_归属校正过冲要拒绝():
         _BODY, prov, target_rate=0.4, convention="front_dao",
         examples=["秦昭道：“放肆。”"],
     )
-    assert not info.get("applied"), info
-    assert "过冲" in info.get("reason", ""), info
+    assert info.get("applied"), info
+    assert abs(info["after"]["rate"] - 0.4) <= 0.15, info
 
 
 def test_切片不会把对白切断():
@@ -394,3 +398,141 @@ def test_某一段拿不到就保留那段原文():
     assert info.get("applied") is True, info
     # 失败的那一段保持原样
     assert "（这段会失败）" in out, out[:200]
+
+
+# --------------------------------------------------------------------------- #
+# 两遍改写（2026-10-31 实测后加的）
+# --------------------------------------------------------------------------- #
+
+#: 「只给部分对白加归属」的正文：7 句对白里 2 句带归属 ⇒ 29%。
+_PARTIAL = ("秦昭道：“别动。”\n“放手。”\n“你到底想怎样。”\n" + _NARR + "\n"
+            "“让开。”\n“我不让。”\n" + _NARR + "\n"
+            "“你听见没有？”\n秦昭道：“听见了。”\n" + _NARR + "\n"
+            "他等了片刻，才又开口。\n")
+
+
+class _TwoPassProvider:
+    """按提示词内容分两路返回：加归属 / 去冗余。
+
+    记录每次拿到的提示词 —— 用来断言「第二遍作用在**第一遍的结果**上」。
+    """
+
+    def __init__(self, added, trimmed):
+        self.added = added
+        self.trimmed = trimmed
+        self.prompts: list[str] = []
+
+    def chat(self, system, user, temperature=None):
+        self.prompts.append(user)
+        if "去掉多余" in user:
+            return self.trimmed
+        return self.added
+
+
+def test_过冲会被机械配平到目标():
+    """模型改写过冲 ⇒ 数量由本地**机械配平**（模型数不准，见 `_trim_attribution_to_count`）。"""
+    from app.style.attribution_fix import correct_attribution
+
+    prov = _TwoPassProvider(_FIXED, _FIXED)   # 第一遍 100%
+    out, info = correct_attribution(
+        _BODY, prov, target_rate=0.3, convention="front_dao",
+        examples=["秦昭道：“放肆。”"],
+    )
+    assert info.get("applied"), info
+    assert abs(info["after"]["rate"] - 0.3) <= 0.15, info
+    assert info.get("trimmed"), f"应该发生过机械配平：{info}"
+
+
+def test_机械配平后引语逐字不变():
+    """配平只去「人名+道：」前缀 ⇒ 台词内容守恒。"""
+    from app.style.attribution_fix import _trim_attribution_to_count
+
+    out, dropped = _trim_attribution_to_count(_FIXED, 2)
+    assert dropped == 5, dropped
+    assert out.count("“") == _FIXED.count("“")
+    for line in _FIXED.split("\n"):
+        if "“" in line:
+            core = line.split("“", 1)[1]
+            assert core in out, f"引语内容被改了：{line}"
+
+
+def test_模型没补够时会再调几遍():
+    """模型一次没补够 ⇒ 迭代调整（每遍按「现在 N 处 / 目标 M 处」下指令）。"""
+    from app.style.attribution_fix import correct_attribution
+
+    prov = _TwoPassProvider(_PARTIAL, _PARTIAL)   # 第一遍只补到 29%
+    out, info = correct_attribution(
+        _BODY, prov, target_rate=0.8, convention="front_dao",
+        examples=["秦昭道：“放肆。”"],
+    )
+    assert len(prov.prompts) >= 2, f"应该调不止一遍：{len(prov.prompts)}"
+    assert info.get("applied"), info
+
+
+def test_第二遍作用在第一遍的结果上():
+    """回归：调整遍的输入必须是**第一遍的输出**，不能是原文。"""
+    from app.style.attribution_fix import correct_attribution
+
+    prov = _TwoPassProvider(_PARTIAL, _PARTIAL)   # 29% ⇒ 离目标 80% 还远 ⇒ 会调
+    correct_attribution(
+        _BODY, prov, target_rate=0.8, convention="front_dao",
+        examples=["秦昭道：“放肆。”"],
+    )
+    assert len(prov.prompts) >= 2, prov.prompts
+    second = prov.prompts[1]
+    body = second.split("【原文】")[-1]
+    assert "秦昭道" in body, "调整遍拿到的应是第一遍改写后的文本"
+
+
+def test_校正走关思考的provider变体():
+    """校正必须用**关思考 + 独立预算**的变体（空输出的根因）。"""
+    from app.style.attribution_fix import correct_attribution
+
+    class _VariantProvider:
+        def __init__(self):
+            self.variant_kwargs = None
+
+        def variant(self, **kwargs):
+            self.variant_kwargs = kwargs
+            return self
+
+        def chat(self, system, user, temperature=None, max_tokens=None):
+            return _FIXED
+
+    prov = _VariantProvider()
+    correct_attribution(
+        _BODY, prov, target_rate=0.8, convention="front_dao",
+        examples=["秦昭道：“放肆。”"],
+    )
+    assert prov.variant_kwargs is not None, "没走 variant()"
+    assert prov.variant_kwargs.get("thinking_off") is True, prov.variant_kwargs
+    assert prov.variant_kwargs.get("max_tokens"), prov.variant_kwargs
+
+
+def test_provider没有variant也能跑():
+    """老 provider / 本地兜底没有 variant() ⇒ 不能炸。"""
+    from app.style.attribution_fix import correct_attribution
+
+    prov = _FakeProvider(_FIXED)
+    out, info = correct_attribution(
+        _BODY, prov, target_rate=0.8, convention="front_dao",
+        examples=["秦昭道：“放肆。”"],
+    )
+    assert info.get("applied"), info
+
+
+def test_两遍都空输出就保留原文():
+    """空输出 ⇒ 原样返回，绝不把正文改坏。"""
+    from app.style.attribution_fix import correct_attribution
+
+    class _EmptyProvider:
+        def chat(self, system, user, temperature=None, max_tokens=None):
+            return ""
+
+    out, info = correct_attribution(
+        _BODY, _EmptyProvider(), target_rate=0.8, convention="front_dao",
+        examples=["秦昭道：“放肆。”"],
+    )
+    assert info.get("applied") is False, info
+    assert info.get("reason") == "空输出", info
+    assert out == _BODY
