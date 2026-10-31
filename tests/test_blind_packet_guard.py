@@ -584,7 +584,7 @@ def test_记录表只留两列_另外两列在二选一下是废话(tmp_path):
     build_blind_packet(_rows(12), corpus, out_dir, provider=_StubJudge(set()))
     sheet = (out_dir / "blind_sheet.md").read_text(encoding="utf-8")
     header = [ln for ln in sheet.splitlines() if ln.startswith("| sample")][0]
-    assert "更好看" in header and "主线更清" in header, header
+    assert "更像这本书写出来的" in header and "主线更清" in header, header
     assert "有 AI 腔" not in sheet, sheet
     assert "猜 AI" not in sheet, sheet
     # 备注列留着 —— 评者认出出处时写在那一列，判定脚本会单独拎出来
@@ -606,7 +606,7 @@ def test_判定脚本按表头取列而不是按位置(tmp_path):
     rows = parse_sheet(p)
     assert len(rows) == 1, rows
     # 规范列名是「更好看」；旧列名「更像人写」映射到同一列
-    assert rows[0]["更好看"] == "A", rows
+    assert rows[0]["更像这本书写出来的"] == "A", rows
     assert rows[0]["主线更清"] == "B", rows
     assert rows[0]["备注"] == "认出出处", rows
 

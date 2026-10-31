@@ -138,18 +138,19 @@ def test_E1包也能读_引擎侧算我们那一侧(tmp_path):
     assert our_slot_of({"slot_A": "generic", "slot_B": "engine"}) == "B"
 
 
-def test_记录表第1列改叫更好看_旧列名照样能读(tmp_path):
-    """新包用「更好看」，旧包用「更像人写」⇒ 两者都归一到同一列。"""
-    from verify_blind_eval import COL_BETTER, parse_sheet
+def test_记录表第1列问风格保真度_旧列名照样能读(tmp_path):
+    """规范列名是「更像这本书写出来的」；旧列名都映射到同一列。
 
-    new = _sheet(tmp_path, "| s01 | A | B | |\n")
-    old = _sheet(tmp_path, "| s01 | A | B | |\n")
-    new.write_text(
-        "| sample | 更好看 | 主线更清 | 备注 |\n|---|---|---|---|\n| s01 | A | B | |\n",
-        encoding="utf-8")
-    old.write_text(
-        "| sample | 更像人写 | 主线更清 | 备注 |\n|---|---|---|---|\n| s01 | A | B | |\n",
-        encoding="utf-8")
-    assert COL_BETTER == "更好看"
-    assert parse_sheet(new)[0][COL_BETTER] == "A"
-    assert parse_sheet(old)[0][COL_BETTER] == "A"
+    口径变更（三次）：「更像人写」→「更好看」→「更像这本书写出来的」。
+    根因是**产出是原作的派生物** ⇒ 引擎该被验收的是**风格保真度**，
+    既不是绝对好看，也不是已经不可分辨的「像不像 AI」。
+    """
+    from verify_blind_eval import COL_FIDELITY, parse_sheet
+
+    assert COL_FIDELITY == "更像这本书写出来的"
+    for header in ("更像这本书写出来的", "更像这本书", "更好看", "更像人写"):
+        p = _sheet(tmp_path, "| s01 | A | B | |\n")
+        p.write_text(
+            f"| sample | {header} | 主线更清 | 备注 |\n"
+            "|---|---|---|---|\n| s01 | A | B | |\n", encoding="utf-8")
+        assert parse_sheet(p)[0][COL_FIDELITY] == "A", header
