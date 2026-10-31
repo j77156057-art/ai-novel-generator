@@ -103,11 +103,23 @@ MAX_ADJUST_ROUNDS = 3
 #: 离目标这么近就收手（再调就是浪费调用）。
 ADJUST_TOL = 0.08
 
-#: 前置归属的「名字 + 道/说 + 冒号」前缀（**不含引号**）。
+#: 前置归属的「（名字）+ 道/说 + 冒号」前缀（**不含引号**）。
 #:
 #: 用于**机械配平**：模型改写完，数量由我们本地定。
+#:
+#: ⚠️ 名字部分**可以为空** —— 最常见的写法是「叙述，**道：**“…”」
+#: （说话人在前面的叙述里，归属只剩一个动词 + 冒号）。
+#: 第一版正则要求名字至少 1 个字 ⇒ 这类**一个都匹配不到** ⇒ 配平削不动。
 _FRONT_PREFIX_RE = re.compile(
-    r"[^\s，。！？：；、“”]{1,12}(?:道|说)[：:](?=“|「|『)")
+    r"([^\s，。！？：；、“”]{0,12})(道|说)[：:](?=“|「|『)")
+
+#: 名字部分超过这个长度 ⇒ 当**叙述**处理（只删动词，别把叙述也删了）。
+#: 「林可低声道：」是 4 个字（名字 + 语气）⇒ 整段删；
+#: 「隔了两三口气的工夫才道：」是 12 个字（叙述）⇒ 只删「道：」。
+_NAMELIKE_MAX = 6
+
+#: 叙述型前缀末尾的**语气/连接词**（只删动词时顺带去掉一个，免得留下「才：“…”」）。
+_TRAILING_PARTICLES = "才又便就"
 
 #: 文本被截断 / 过短时不做校正。
 MIN_CHARS = 200
@@ -350,8 +362,30 @@ def _correction_provider(provider):
 
 
 def _front_prefix_spans(text: str) -> list[tuple[int, int]]:
-    """前置归属「名字+道/说+：」的区间（不含引号本身）。"""
-    return [(m.start(), m.end()) for m in _FRONT_PREFIX_RE.finditer(text or "")]
+    """前置归属「（名字）+ 道/说 + 冒号」的**可删区间**（不含引号本身）。
+
+    删多删少有讲究：
+    - 「，**道：**“…”」⇒ 说话人在前面的叙述里 ⇒ 只删「道：」⇒ 剩下「，“…”」；
+    - 「**林可低声道：**“…”」⇒ 名字 + 语气 ⇒ 整段删 ⇒ 剩下「“…”」；
+    - 「隔了两三口气的工夫才**道：**“…”」⇒ 那是**叙述** ⇒ 只删「道：」
+      （顺带去掉末尾的语气词「才」，免得留下「才：“…”」）。
+    """
+    spans: list[tuple[int, int]] = []
+    for m in _FRONT_PREFIX_RE.finditer(text or ""):
+        name = m.group(1) or ""
+        verb_start = m.start(2)
+        if not name:
+            spans.append((verb_start, m.end()))
+            continue
+        if len(name) <= _NAMELIKE_MAX:
+            spans.append((m.start(), m.end()))
+            continue
+        # 叙述型：只删动词 + 冒号（末尾的语气词也去掉）
+        start = verb_start
+        if name[-1] in _TRAILING_PARTICLES:
+            start -= 1
+        spans.append((start, m.end()))
+    return spans
 
 
 def _trim_attribution_to_count(text: str, keep: int) -> tuple[str, int]:

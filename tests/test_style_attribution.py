@@ -456,6 +456,27 @@ def test_机械配平后引语逐字不变():
             assert core in out, f"引语内容被改了：{line}"
 
 
+def test_配平能削掉裸动词形式的归属():
+    """「叙述，**道：**“…”」这种（说话人在前面的叙述里）也要能削掉。
+
+    第一版正则要求「名字」至少一个字 ⇒ 这类一个都匹配不到 ⇒ 配平削不动。
+    """
+    from app.style.attribution_fix import _trim_attribution_to_count
+
+    text = ("他没抬头，把包夹紧，道：“我知道。”\n"
+            "林可低声道：“走。”\n"
+            "隔了两三口气的工夫才道：“本子呢。”\n")
+    out, dropped = _trim_attribution_to_count(text, 0)
+    assert dropped == 3, dropped
+    assert "道：" not in out and "说：" not in out, out
+    # 叙述没被删掉（只删了动词 + 冒号）
+    assert "隔了两三口气的工夫" in out, out
+    assert "把包夹紧" in out, out
+    # 引语逐字不变
+    for q in ("我知道。", "走。", "本子呢。"):
+        assert q in out, out
+
+
 def test_模型没补够时会再调几遍():
     """模型一次没补够 ⇒ 迭代调整（每遍按「现在 N 处 / 目标 M 处」下指令）。"""
     from app.style.attribution_fix import correct_attribution
