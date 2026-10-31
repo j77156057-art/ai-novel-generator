@@ -104,10 +104,12 @@ def parse_sheet(path: Path) -> list[dict]:
         if not line.startswith("|"):
             continue
         cells = [_norm_header(c) for c in line.strip("|").split("|")]
+        if cells and cells[0].startswith("-"):
+            continue                      # 分隔行
         if not header and cells and cells[0] == "sample":
             header = cells
             continue
-        if not cells or not re.match(r"^s\d+$", cells[0]):
+        if not cells or not cells[0]:
             continue
         if not header:
             header = ["sample", COL_HUMAN, COL_MAIN, COL_AI, COL_GUESS, "备注"]
@@ -118,8 +120,67 @@ def parse_sheet(path: Path) -> list[dict]:
                 continue
             rec[_ALIASES.get(name, name)] = cell
         rec.setdefault("sample", cells[0])
+        if not re.match(r"^s\d+$", cells[0]):
+            # ⚠️ 题号写坏了（少打一个 s / 写成 09 / 写成 s2）——
+            # **不要直接丢行**（那一行的作答是有价值的）：
+            # 先留着，由 main() 按**表里的顺序**补回题号。
+            rec["_bad_id"] = True
         rows.append(rec)
     return rows
+
+
+def repair_sample_ids(rows: list[dict], key_items: dict) -> list[str]:
+    """题号写坏的行：**按表里的顺序**补回题号。
+
+    ## 为什么不能直接丢行
+
+    2026-10-31 第二次真跑实测：评者把 `s02` 写成 `s`、`s09` 写成 `09`
+    ⇒ 两题被丢掉，n 从 17 掉到 15 ⇒ 检验**力量更弱**、结论更不准。
+    那一行的作答是有价值的（评者确实做了判断）⇒ 该补回，不该丢。
+
+    ## 为什么可以按位置补
+
+    作答表是**逐题按顺序**填的（题面从上到下）⇒ 行序就是题序。
+
+    ## 边界
+
+    **只在「行数 == 题数」时补** —— 否则行与题的对应关系不可靠，
+    宁可不补、让这几行作废（返回的说明里会写清楚）。
+
+    返回：给人看的说明列表（空 ⇒ 什么都没补）。
+    """
+    bad = [i for i, r in enumerate(rows) if r.get("_bad_id")]
+    if not bad:
+        return []
+    if len(rows) != len(key_items):
+        return [f"有 {len(bad)} 行的题号写坏了，但表里的行数（{len(rows)}）"
+                f"与题数（{len(key_items)}）对不上 ⇒ 不按位置补，这几行作废"]
+    taken = {r["sample"] for r in rows if not r.get("_bad_id")}
+    order = list(key_items.keys())
+    fixed: list[str] = []
+    for i in bad:
+        cand = order[i]
+        if cand in taken:
+            continue
+        rows[i]["sample"] = cand
+        rows[i].pop("_bad_id", None)
+        taken.add(cand)
+        fixed.append(f"第 {i + 1} 行 → {cand}")
+    if not fixed:
+        return []
+    return [f"有 {len(bad)} 行的题号写坏了，已按**表里的顺序**补回："
+            + "；".join(fixed)]
+
+
+def our_slot_of(item: dict) -> str:
+    """我们那一段在 **A 侧还是 B 侧**。
+
+    ⚠️ 这里返回的是「**我们那段的位置**」，不是「评者选了哪一侧」。
+    2026-10-31 踩坑：把这两件事写反 ⇒ 输出里「我们的段在 A 侧」和
+    ✓ 标记一起反了 ⇒ 读脚本的人会被直接误导（「✓ 越多的题越像人写」
+    恰好是错的）。
+    """
+    return "A" if item.get("slot_A") == "ours" else "B"
 
 
 def binom_tail_le(k: int, n: int) -> float:
@@ -151,6 +212,14 @@ def main() -> int:
     rows = parse_sheet(sheet_path)
     key_obj = json.loads(key_path.read_text(encoding="utf-8"))
     key_items = {it["sample_id"]: it for it in key_obj["items"]}
+
+    # —— 题号写坏了的行：**按表里的顺序**补回 ——
+    #
+    # 为什么不能直接丢：2026-10-31 实测，评者把 `s02` 写成 `s`、`s09` 写成 `09`
+    # ⇒ 两题被丢掉，n 从 17 掉到 15 ⇒ 检验**力量更弱**、结论更不准。
+    # 表是**逐题按顺序**填的 ⇒ 行序就是题序 ⇒ 可以按位置补。
+    for note in repair_sample_ids(rows, key_items):
+        print(("ℹ️ " if note.startswith("有 ") else "⚠️ ") + note)
 
     print("=" * 78)
     print("盲评判定")
@@ -205,8 +274,14 @@ def main() -> int:
         ours = (slot == "ours")
         if ours:
             k += 1
-        detail.append((r["sample"], "A" if ours else "B", r.get(COL_HUMAN, "").upper(),
-                       item["our_segment_no"]))
+        # ⚠️ 这里记的是「**我们那段在哪一侧**」（不是「评者选了哪一侧」）。
+        #    2026-10-31 实测踩坑：原来写的是 `"A" if ours else "B"` ⇒
+        #    评者选了**我们**那段时反而显示「我们的段在 A 侧」，
+        #    连 ✓ 标记都反了 ⇒ 读脚本输出的人会被直接误导
+        #    （「✓ 越多的题越像人写」恰好是错的）。
+        our_slot = our_slot_of(item)
+        detail.append((r["sample"], our_slot, r.get(COL_HUMAN, "").upper(),
+                       item["our_segment_no"], ours))
 
         # —— 第二列：主线更清（**独立维度**：叙事清晰度，不是「像不像人写的」）——
         ans_main = (r.get(COL_MAIN) or "").upper()
@@ -226,9 +301,10 @@ def main() -> int:
                 cross["neither"] += 1
 
     print()
-    for s, ours_slot, ans, seg in detail:
-        mark = "✓" if ours_slot == ans else " "
-        print(f"  {s}  我们的段在 {ours_slot} 侧，评者选 {ans}  {mark}"
+    for s, our_slot, ans, seg, ours in detail:
+        # ✓ = 评者选了**我们**那段（与 k 的口径一致）
+        mark = "✓" if ours else " "
+        print(f"  {s}  我们的段在 {our_slot} 侧，评者选 {ans}  {mark}"
               + (f"（第 {seg} 段）" if seg else ""))
 
     p = binom_tail_le(k, n)

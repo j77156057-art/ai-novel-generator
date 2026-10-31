@@ -61,3 +61,67 @@ def test_评者不足时脚本必须说清楚没力量():
     """n=6 时 k=4 的 p=0.344 ——「随机猜」根本甩不掉 ⇒ 只能当观察。"""
     assert binom_tail_le(4, 6) > 0.05
     assert binom_tail_le(2, 6) > 0.05
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-31 第二次真跑暴露的两个缺陷（补测，防止再写反）
+# --------------------------------------------------------------------------- #
+#
+# ① 题号写坏的行被**直接丢掉**
+#    实测：评者把 `s02` 写成 `s`、`s09` 写成 `09`
+#    ⇒ 两题被丢，n 从 17 掉到 15 ⇒ 检验力量更弱、结论更不准。
+#
+# ② ✓ 标记与「我们的段在哪一侧」**都是反的**
+#    ⇒ 读脚本输出的人会被直接误导（「✓ 越多的题越像人写」恰好是错的）。
+
+
+def _sheet(tmp_path, body: str):
+    p = tmp_path / "sheet.md"
+    p.write_text(
+        "| sample | 更像人写 | 主线更清 | 备注 |\n"
+        "|---|---|---|---|\n" + body,
+        encoding="utf-8")
+    return p
+
+
+def test_题号写坏的行不能丢(tmp_path):
+    """`s` / `09` 这种题号**要留下**（那一行的作答有价值）。"""
+    from verify_blind_eval import parse_sheet
+
+    p = _sheet(tmp_path, "| s01 | A | A | |\n| s | B | A | |\n| 09 | B | B | |\n")
+    rows = parse_sheet(p)
+    assert len(rows) == 3, rows
+    assert [r.get("_bad_id") for r in rows] == [None, True, True]
+
+
+def test_题号按表内顺序补回(tmp_path):
+    """行序 = 题序 ⇒ 第 2 行补 s02、第 3 行补 s03。"""
+    from verify_blind_eval import parse_sheet, repair_sample_ids
+
+    p = _sheet(tmp_path, "| s01 | A | A | |\n| s | B | A | |\n| 09 | B | B | |\n")
+    rows = parse_sheet(p)
+    key_items = {"s01": {}, "s02": {}, "s03": {}}
+    notes = repair_sample_ids(rows, key_items)
+    assert notes, notes
+    assert [r["sample"] for r in rows] == ["s01", "s02", "s03"]
+    assert not any(r.get("_bad_id") for r in rows)
+
+
+def test_行数对不上就不补(tmp_path):
+    """行数 ≠ 题数 ⇒ 位置对应不可靠 ⇒ 不补，宁可作废。"""
+    from verify_blind_eval import parse_sheet, repair_sample_ids
+
+    p = _sheet(tmp_path, "| s01 | A | A | |\n| s | B | A | |\n")
+    rows = parse_sheet(p)
+    key_items = {"s01": {}, "s02": {}, "s03": {}}
+    notes = repair_sample_ids(rows, key_items)
+    assert notes and "作废" in notes[0], notes
+    assert rows[1]["sample"] == "s"          # 没被改
+
+
+def test_我们的段在哪一侧不能写反():
+    """`our_slot_of` 返回「我们那段的位置」，不是「评者选了哪一侧」。"""
+    from verify_blind_eval import our_slot_of
+
+    assert our_slot_of({"slot_A": "ours", "slot_B": "human"}) == "A"
+    assert our_slot_of({"slot_A": "human", "slot_B": "ours"}) == "B"
