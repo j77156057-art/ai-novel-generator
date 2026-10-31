@@ -658,6 +658,97 @@ def _maybe_correct_form(
         return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
 
 
+def _maybe_correct_attribution(
+    db,
+    project: Project,
+    text: str,
+    provider,
+    *,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """归属校正：把「说话人归属」的写法掰到**参考书自己的写法**。
+
+    ## 为什么要有（实测）
+
+    参考书《魔道祖师》**76.6%** 的对白带说话人归属（`X道：“…”`），
+    我们的产出只有 **3.2%**（提示词加了一句口径后 14.2%）⇒ 差 5 倍。
+    而盲评实测：「出现『X道：“…”』的那侧 = 人类侧」这条规则**精确率 100%**
+    ⇒ 这是泄露面，不修就出不了能用的盲评包。
+
+    ## 闸门（为什么要多花一次模型调用）
+
+    只在**离目标够远**时才校正：差得不多就别动（改写本身有风险）。
+    目标与样例都来自**参考书自己** ⇒ 换一本书自动跟着换。
+
+    ## 失败策略
+
+    `style/attribution_fix.correct_attribution` 内部有四道判据
+    （对白内容守恒 / 字数 / 归属率是否靠近 / 不许过冲），
+    任何一道不过就返回原文。这里再兜一层异常。
+    """
+    if not text or not text.strip():
+        return text, {"applied": False, "reason": "空文本"}
+    try:
+        from app.config import settings as _st
+        if not bool(getattr(_st, "style_attribution_correction", True)):
+            return text, {"applied": False, "reason": "归属校正开关关闭"}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.style.attribution_fix import (
+            attribution_rate,
+            attribution_target,
+            correct_attribution,
+        )
+        from app.style.stylometry import paragraphs as _paras
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("归属校正模块不可用: %s", exc)
+        return text, {"applied": False, "reason": "模块不可用"}
+
+    before = attribution_rate(text)
+    if before["quotes"] < 3:
+        return text, {"applied": False, "reason": "对白太少", "before": before}
+
+    # —— 目标与样例：从参考书的段落里量 ——
+    try:
+        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+        target = None
+        if ids:
+            from app.models import NovelChunk
+            rows = db.query(NovelChunk).filter(
+                NovelChunk.novel_id.in_(ids)).limit(1200).all()
+            pool: list[str] = []
+            for r in rows:
+                pool.extend(_paras(r.text or ""))
+            target = attribution_target(pool)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("归属目标取不到: %s", exc)
+        target = None
+    if not target:
+        return text, {"applied": False, "reason": "量不出归属目标", "before": before}
+
+    # —— 闸门：离目标够远才值得花一次调用 ——
+    from app.style.attribution_fix import MIN_GAP_TO_CORRECT, MIN_RATE_TO_CORRECT
+    gap = abs(before["rate"] - target["rate"])
+    if gap < MIN_GAP_TO_CORRECT:
+        return text, {"applied": False, "reason": f"离目标够近（差 {gap:.0%}）",
+                      "before": before, "target": target}
+    if target["rate"] < MIN_RATE_TO_CORRECT:
+        return text, {"applied": False, "reason": "参考书自己就几乎没有归属",
+                      "before": before, "target": target}
+
+    try:
+        return correct_attribution(
+            text, provider,
+            target_rate=target["rate"],
+            convention=target["convention"],
+            examples=target["examples"],
+        )
+    except Exception as exc:  # noqa: BLE001 —— 校正失败绝不能影响正文
+        logging.getLogger(__name__).warning("归属校正异常，保留原文: %s", exc)
+        return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+
 def _candidate_pool_size() -> int:
     """候选池大小（1 = 关闭）。
 
@@ -961,6 +1052,20 @@ def _run_text_chain(
         db, project, text, provider,
         profile=_style_profile(db, project), novel_ids=novel_ids,
     )
+    # 归属校正：把「说话人归属」的写法掰到参考书自己的写法。
+    #
+    # 为什么要**独立一次改写**（而不是加进提示词）：`style/form.py` 的实测结论 ——
+    # 提示层挪不动对白形态（四轮实验全部无效），事后改写能改。
+    # 实测（2026-10-31）：参考书《魔道祖师》**76.6%** 的对白带说话人归属，
+    # 我们只有 **3.2%**（加了一句提示口径后 14.2%）⇒ 差 5 倍，
+    # 而「出现『X道：“…”』的那侧 = 人类侧」这条规则的精确率是 **100%**。
+    #
+    # 放在形态校正**之后**、beat 插入**之前**：形态校正会重排段落，
+    # beat 会新增叙述 —— 归属校正要改的是**最终**的对白形态，
+    # 但要在 beat 之前做完，免得刚补好的归属又被 beat 拆散。
+    text, attr_info = _maybe_correct_attribution(
+        db, project, text, provider, novel_ids=novel_ids,
+    )
     # beat 插入：在连续对白段的开头补一句动作/神态叙述。
     # 放在形态校正**之后** —— 形态校正只重排已有的叙述，碰到「前面也是台词」
     # 就并无可并；这一步是**新增**叙述，填的正是那个缺口。
@@ -968,7 +1073,7 @@ def _run_text_chain(
         db, project, text, provider, novel_ids=novel_ids,
     )
     if (rewrite_info.get("applied") or form_info.get("applied")
-            or beat_info.get("applied")):
+            or attr_info.get("applied") or beat_info.get("applied")):
         summary = provider.summarize(text)
 
     # 照搬门禁：正文 vs 参考语料。放在**所有**正文改写之后、落库之前 ——
@@ -988,6 +1093,7 @@ def _run_text_chain(
         "ai_rewrite_info": ai_rewrite_info,
         "dedup_stats": dedup_stats,
         "form_info": form_info,
+        "attr_info": attr_info,
         "beat_info": beat_info,
         "verbatim_info": verbatim_info,
     }
@@ -2890,6 +2996,7 @@ def generate_next_segment(
     scene_audit = chain["scene_audit"]
     rewrite_info = chain["rewrite_info"]
     form_info = chain["form_info"]
+    attr_info = chain.get("attr_info") or {}
     beat_info = chain["beat_info"]
     verbatim_info = chain["verbatim_info"]
 
@@ -2996,6 +3103,7 @@ def generate_next_segment(
         "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
         "form_info": form_info,
+        "attr_info": chain.get("attr_info") or {},
         "candidate_pool": pool_info,
         "beat_info": beat_info,
         "verbatim_info": verbatim_info,
@@ -3145,6 +3253,7 @@ def generate_next_segment_stream(
     scene_audit = chain["scene_audit"]
     rewrite_info = chain["rewrite_info"]
     form_info = chain["form_info"]
+    attr_info = chain.get("attr_info") or {}
     beat_info = chain["beat_info"]
     verbatim_info = chain["verbatim_info"]
 

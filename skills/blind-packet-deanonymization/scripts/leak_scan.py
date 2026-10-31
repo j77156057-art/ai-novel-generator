@@ -267,6 +267,68 @@ def check_flavor_asymmetry(packet: Path, backend: str = "") -> list[str]:
     return bad
 
 
+def check_style_discriminability(packet: Path, backend: str = "") -> list[str]:
+    """口径 6：**逐题的写法不对称**（完全不用 LLM）。
+
+    前五条口径查的都是**内容**（专名 / 题材 / 痕迹）。
+    这一条查的是**写法** —— 实测（2026-10-31 盲评第一次真跑），
+    八道闸门全绿、`blind=true`，但规则「出现『X道：“…”』的那侧 = 人类侧」
+    在 10 对可判题里**判对 10**（精确率 100%）⇒ 评者能靠写法定位。
+
+    ## 为什么这里**只能提示、不能硬拦**
+
+    判别力（哪条规则能定位哪边是「我们」）**需要密封文件** ——
+    题面里 A/B 是**逐题随机**的，没有 `blind_key.json` 就不知道哪边是谁。
+    ⇒ 本脚本没有密封文件，**只能测「逐题两侧的写法不对���」**，
+    那是**必要条件**，不是充分条件。
+
+    ⚠️ 而逐题不对称**单靠本脚本也判不了「泄露」**：
+    题面里 A/B 逐题随机 ⇒ 「道」字落在 A 侧还是 B 侧也是随机的
+    ⇒ 从外面看是均衡的 ⇒ **看不出方向**。
+    ⇒ 所以这一条只能当「**要看一眼**」（与口径 4 / 5 同级），
+    **硬判定在出包器里**（`backend/verify_acceptance_real.py` 有密封文件，
+    能算精确率）。
+
+    ## 逐题不对称**为什么仍然值得看
+
+    评者不需要知道哪边是「我们」—— 他只要学会「**挑带『X道：“…”』的那一侧**」。
+    人类侧 11/18 题有、我们侧 1/18 题有 ⇒ 他这么挑就能拿 10/18。
+    ⇒ 逐题不对称的题数，就是他能这么挑对的次数。
+    """
+    _backend_on_path(backend)
+    from acceptance_lib import attribution_discriminability  # noqa: E402
+    from app.style.attribution import attribution_profile  # noqa: E402
+
+    samples = (packet / "blind_samples.md").read_text(encoding="utf-8")
+    pairs = parse_items(samples)
+    if not pairs:
+        print("[6] 跳过（题面里没解析出题目）")
+        return []
+
+    # —— 逐题：两侧的「道」字派归属是否一边有、一边没有 ——
+    one_sided = 0
+    for sid, a, b in pairs:
+        pa = attribution_profile(a)
+        pb = attribution_profile(b)
+        if (pa["front_dao"] > 0) != (pb["front_dao"] > 0):
+            one_sided += 1
+    print(f"[6] 逐题「道」字派归属一边有一边无：{one_sided}/{len(pairs)} 题"
+          "（评者只要学会「挑有『X道：“…”』的那一侧」就能用）")
+
+    res = attribution_discriminability([a for _s, a, _b in pairs],
+                                       [b for _s, _a, b in pairs])
+    for r in res.get("rules", []):
+        print(f"[6]    {r['rule']}：可判 {r['decidable']}　判对 {r['correct']}"
+              f"　精确率 {r['precision']:.0%}"
+              "（⚠️ 没有密封文件 ⇒ A/B 逐题随机 ⇒ 这个精确率**没有意义**）")
+    bad = [sid for sid, a, b in pairs
+           if (attribution_profile(a)["front_dao"] > 0)
+           != (attribution_profile(b)["front_dao"] > 0)]
+    print(f"[6] 写法不对称：{len(pairs)} 题，{len(bad)} 题需要人眼过一遍"
+          "（**硬判定要密封文件**，出包器里才有）")
+    return bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--packet", required=True, help="盲评包目录（含 blind_samples.md）")
@@ -288,11 +350,17 @@ def main() -> int:
         check_text_level(packet, args.judge_provider, args.backend)
     check_genre_mismatch(packet, args.backend)
     check_flavor_asymmetry(packet, args.backend)
+    style_bad = check_style_discriminability(packet, args.backend)
 
     print("=" * 60)
     if leaked:
         print(f"⛔ 判定过的专名仍留在题面里 {len(leaked)} 处 ⇒ 这个包不能发出去")
         return 1
+    if style_bad:
+        # ⚠️ 写法这一条**只能提示**：没有密封文件就不知道哪边是「我们」，
+        # 判别力测不了 ⇒ 硬判定在出包器里（它有密封文件）。
+        print(f"⚠️ 写法上逐题不对称 {len(style_bad)} 题 ⇒ 要人眼过一遍"
+              "（**硬判定要有密封文件**，出包器里才有）")
     print("✅ 判定名残留 0 处（口径 2 / 口径 4 的命中要人眼过一遍："
           "它们可能是普通词、也可能是题材差异）")
     return 0

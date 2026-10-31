@@ -22,6 +22,8 @@
 import logging
 from typing import Any, Sequence
 
+from app.style.attribution import attribution_directive
+
 
 def _override_block(text: str, label: str, *, leading_newline: bool = False) -> str:
     """把一段运行时覆写渲染成提示词里的追加块。
@@ -859,18 +861,39 @@ def build_user_prompt(
         # 含引号行中位只有 **12 字** —— 一行一句「“别动。”」「“客人？”」。
         # 那句口径正是这么写出来的，所以要改成「对白也不单独成行」。
         exemplar_lines = []
+        exemplar_texts = []
         for i, ex in enumerate(style_exemplars, 1):
             title = ex.get("novel_title") or f"语料{ex.get('novel_id')}"
             safe_text = clean_consumption_text(ex.get("text", ""))[0]
+            exemplar_texts.append(safe_text)
             exemplar_lines.append(f"—— 样板 {i}（来自《{title}》）——\n{safe_text}")
+        # —— 对话归属位置的口径（2026-10-31 新加）——
+        #
+        # 为什么要有这一句：盲评第一次真跑判 FAIL，逐对排查发现
+        # **只用一条写法规则就能定位哪边是人类侧**（精确率 100%）：
+        # 参考书写「X道：“…”」（引语在说话人后面），我们写「“…。”某某说」
+        # 或「某某说：“…”」（说字派）。八道闸门查的是内容，这一维是写法。
+        #
+        # 为什么**光给样例不够**：实测那 3 条样例里已经有 29 次「X道：“…”」，
+        # 模型照样只写出 0.06 次/百字（差 16 倍）⇒ 形态要**样例 + 显式口径**一起给。
+        #
+        # 为什么口径是**量出来的**而不是写死的：不同参考书差别极大
+        # （《魔道祖师》0.99 次/百字、《校花的透视高手》0.00），
+        # 写死「一律用『道』」会在别的书上教错 ⇒ 按这本书自己的样例量。
+        attr_directive = attribution_directive(exemplar_texts)
+        style_rules = [
+            "请用同样的句法写本次要写的这一段：叙述句要写到该写长的时候再断，"
+            "一句里带上动作、环境、神态，不要写成每句十来个字的短句流水账；"
+            "对白也不要单独成行——说话人的动作、神态、语气要和台词写进同一段，照样板里的样子。",
+        ]
+        if attr_directive:
+            style_rules.append(attr_directive)
+        style_rules.append("样板只用来学写法，**不要复用其中的情节与人物**。")
         blocks += [
             "",
             "【句法样板（照着写）】",
             "下面是参考书原文的几个片段。它们示范了这个作者的**句子长度、断句位置、标点习惯**。",
-            "请用同样的句法写本次要写的这一段：叙述句要写到该写长的时候再断，"
-            "一句里带上动作、环境、神态，不要写成每句十来个字的短句流水账；"
-            "对白也不要单独成行——说话人的动作、神态、语气要和台词写进同一段，照样板里的样子。",
-            "样板只用来学写法，**不要复用其中的情节与人物**。",
+            *style_rules,
             "\n\n".join(exemplar_lines),
         ]
     return "\n".join(blocks)

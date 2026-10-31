@@ -103,6 +103,7 @@ from acceptance_lib import (  # noqa: E402
     residual_proper_nouns_per_item,
     sent_cv,
     shape_candidates,
+    attribution_discriminability,
     thresholds,
 )
 
@@ -1038,6 +1039,11 @@ def build_multi_arm_packet(arms: list[dict], out_dir: Path, provider=None,
                             print(f"      [配对·拒] {p['arm']} 段{i} 窗口{off}: "
                                   f"子题材指纹不对称 {asym}")
                         continue
+                    # —— 第九道闸门：句法惯例对称性（**写法**）——
+                    # ⚠️ 这一道**不逐题剔除**，只在**整包**上判（见整包自证处）。
+                    # 实测（真包验算）：逐题剔除的**净效果是负的** ——
+                    # 剔掉的 10 题里把我们判赢的 2 题也剔了，而我们判输的 8 题
+                    # 一个没抓到 ⇒ 这次失败是**系统性**的，逐题治不了。
                     hd = mask_density(htext)
                     lo_d, hi_d = min(odens, hd), max(odens, hd)
                     if lo_d <= 0:
@@ -1106,6 +1112,25 @@ def build_multi_arm_packet(arms: list[dict], out_dir: Path, provider=None,
         reasons.append(
             f"有 {len(asym_items)}/{len(chosen)} 题的两侧子题材指纹不对称"
             f"（例：{asym_items[0]['asym']}）⇒ 评者能靠题材定位")
+
+    # —— 第九道闸门：**整包**写法判别力检验 ——
+    # 问的是「**只用写法，能不能定位哪边是人类侧**」。
+    # 能 ⇒ 这个包在写法上不盲 ⇒ 评者能靠写法定位 ⇒ **不该发出去**。
+    #
+    # ⚠️ 为什么是整包、不是逐题剔除：实测（真包验算）逐题剔除**净效果为负**
+    # （把我们判赢的 2 题剔了、我们判输的 8 题一个没抓到）⇒ 这次失败是
+    # **系统性**的（我们侧从不按参考书的惯例写对话归属），逐题治不了。
+    #
+    # 实测（2026-10-31 第一次真跑）：规则「『X道：“…”』出现的那侧 = 人类侧」
+    # 在 10 对可判题里**判对 10**（精确率 100%）⇒ 这个包在写法上根本不盲。
+    attr = attribution_discriminability(ours_all, human_all)
+    evidence["style_discriminability"] = attr
+    if attr.get("leaky"):
+        reasons.append(
+            f"**只用写法就能定位哪边是人类侧**（规则「{attr['rule']}」"
+            f"在 {attr['best'].get('decidable')} 对可判题里判对 "
+            f"{attr['best'].get('correct')}，精确率 "
+            f"{attr['best'].get('precision', 0):.0%}）⇒ 这个包在写法上不盲")
 
     # —— 6. 题面级专名复查（第六道闸门，同单臂包）——
     #
@@ -1479,6 +1504,23 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
             "题面里还残留专名（复查没清干净）：" + "、".join(residual_left[:10])]
         verdict["blind"] = False
         blind = False
+
+    # —— 第九道闸门：**整包**写法判别力检验（单臂包也要查）——
+    #
+    # 为什么单臂包也要查：写法泄露与题材/专名**无关**。
+    # 多臂包那次实测：题材、年代、专名、脱敏痕迹**全部对称**，
+    # 但「只用写法就能定位哪边是人类侧」的规则精确率 **100%**。
+    attr = attribution_discriminability(ours_anon, human_anon)
+    verdict.setdefault("evidence", {})["style_discriminability"] = attr
+    if attr.get("leaky"):
+        verdict["reasons"] = list(verdict["reasons"]) + [
+            f"**只用写法就能定位哪边是人类侧**（规则「{attr['rule']}」"
+            f"在 {attr['best'].get('decidable')} 对可判题里判对 "
+            f"{attr['best'].get('correct')}，精确率 "
+            f"{attr['best'].get('precision', 0):.0%}）⇒ 这个包在写法上不盲"]
+        verdict["blind"] = False
+        blind = False
+
     if not blind:
         print("  ⚠️ 自检：这个包**不是盲评包**")
         for reason in verdict["reasons"]:

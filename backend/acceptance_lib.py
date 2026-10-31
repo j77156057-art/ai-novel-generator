@@ -1166,6 +1166,140 @@ def flavor_asymmetry(a: str, b: str) -> list[dict]:
     return bad
 
 
+
+# --------------------------------------------------------------------------- #
+# 第九道闸门：句法惯例对称性（**写法**，不是内容）
+# --------------------------------------------------------------------------- #
+
+#: **尺只有一份** —— `app/style/attribution.py`。
+#:
+#: 为什么按文件路径加载、而不是 `from app.style.attribution import ...`：
+#: 那样会触发 `app/style/__init__.py` ⇒ 拖进 sqlalchemy ⇒
+#: 盲评 skill 脚本 `skills/blind-packet-deanonymization/scripts/leak_scan.py`
+#: 就没法在**只装了标准库**的环境里独立跑了。
+#:
+#: ⚠️ 第一版尺**坏过**：动词集合漏了单独的「说」，我们侧写的「才说：“…”」
+#: 全部漏检 ⇒ 得出「我们侧从不写前置归属」的**错误结论**。
+#: ⇒ 尺必须先用**阳性对照**自证（对照用例在 `app/style/attribution.py` 顶部
+#: 与 `tests/test_style_attribution.py`）。
+def _load_attribution_module():
+    """按文件路径加载唯一的归属尺（绕开 app 包的 __init__ 副作用）。"""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "app" / "style" / "attribution.py"
+    spec = importlib.util.spec_from_file_location("_style_attribution", path)
+    if spec is None or spec.loader is None:  # pragma: no cover —— 路径被改坏
+        raise ImportError(f"找不到归属尺：{path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ATTR = _load_attribution_module()
+
+#: 对外暴露唯一的尺。
+attribution_profile = _ATTR.attribution_profile
+attribution_convention = _ATTR.attribution_convention
+
+#: 第九道闸门：**整包**判别力检验的门槛。
+#:
+#: 为什么只看整包、不逐题剔除：这次失败是**系统性**的
+#: （我们侧从不按参考书的惯例写归属，不是个别题漏了）
+#: ⇒ 逐题过滤治不了系统性偏差 —— 实测在真包上逐题剔除**净效果是负的**：
+#: 剔掉的 10 题里有 2 题恰恰是我们判赢的，而我们输的 8 题一个没抓到。
+#:
+#: 真正该问的是：**只用「写法」，能不能定位哪边是人类侧？**
+#: 能 ⇒ 这个包在写法上不盲 ⇒ 不该发出去。
+#:
+#: 门槛（先写死）：
+ATTR_MIN_DECIDABLE = 6      # 至少多少对可判，才敢下结论（样本太小别乱判）
+ATTR_MIN_PRECISION = 0.90   # 精确率门槛
+
+#: 候选规则（**事先登记**，不是事后挑一条最好看的）。
+#:
+#: 每条规则的 `pick` 返回「被判为人类侧」的那一侧；返回 None = 这对不可判。
+#: 规则的方向不重要（闸门只判「能不能被分开」），但要记下来给人看。
+#:
+#: ⚠️ 三条规则覆盖**四个形态**（前置·道系 / 前置·说系 / 后置 / 插话式）。
+def _rule_front_dao(ours: dict, human: dict):
+    if human["front_dao"] > 0 and ours["front_dao"] == 0:
+        return "human"
+    if ours["front_dao"] > 0 and human["front_dao"] == 0:
+        return "ours"
+    return None
+
+
+def _rule_front_shuo(ours: dict, human: dict):
+    if ours["front_shuo"] > 0 and human["front_shuo"] == 0:
+        return "ours"
+    if human["front_shuo"] > 0 and ours["front_shuo"] == 0:
+        return "human"
+    return None
+
+
+def _rule_back(ours: dict, human: dict):
+    """引语**后面**接说话人（真后置或插话式）的那侧 = 我们侧。"""
+    ob, hb = ours["back"] + ours["mid"], human["back"] + human["mid"]
+    if ob > 0 and hb == 0:
+        return "ours"
+    if hb > 0 and ob == 0:
+        return "human"
+    return None
+
+
+#: 事先登记的候选规则表（名字 → 判别函数）。
+ATTR_RULES = (
+    ("「X道：“…”」出现的那侧 = 人类侧", _rule_front_dao),
+    ("「X说：“…”」出现的那侧 = 我们侧", _rule_front_shuo),
+    ("引语后接说话人（后置/插话）的那侧 = 我们侧", _rule_back),
+)
+
+
+def attribution_discriminability(ours_texts: list[str], human_texts: list[str]) -> dict:
+    """整包判别力检验：**只用写法**，能不能定位哪边是人类侧？
+
+    返回：
+        leaky        是不是「写法上不盲」（有规则精确率过线且样本够）
+        rule         命中的规则名（没命中则空串）
+        best         精确率最高的那条规则的明细
+        rules        全部候选规则的明细（给人看）
+
+    ## 为什么是「整包」而不是「逐题剔除」
+
+    逐题剔除实测**净效果为负**（真包上：剔掉我们判赢的 2 题，
+    我们判输的 8 题一个没抓到）⇒ 这次失败是系统性的，逐题治不了。
+    而整包检验直接回答「这个包在写法上盲不盲」—— 这才是闸门该管的事。
+
+    ⚠️ 闸门只看**写法**能不能分开两侧，不判断哪边是「人写的」——
+    那是评测的事，不是闸门的事。
+    """
+    pairs = list(zip(ours_texts or [], human_texts or []))
+    detail: list[dict] = []
+    best = None
+    for name, fn in ATTR_RULES:
+        dec = cor = 0
+        for o, h in pairs:
+            pick = fn(attribution_profile(o), attribution_profile(h))
+            if pick is None:
+                continue
+            dec += 1
+            if pick == "human":
+                cor += 1
+        precision = (cor / dec) if dec else 0.0
+        row = {"rule": name, "decidable": dec, "correct": cor,
+               "precision": round(precision, 3)}
+        detail.append(row)
+        if dec >= ATTR_MIN_DECIDABLE and (best is None or precision > best["precision"]):
+            best = row
+    leaky = bool(best and best["precision"] >= ATTR_MIN_PRECISION)
+    return {
+        "leaky": leaky,
+        "rule": best["rule"] if (best and leaky) else "",
+        "best": best or {},
+        "rules": detail,
+        "n_pairs": len(pairs),
+    }
+
 # --------------------------------------------------------------------------- #
 # 题材判定（权威口径）：让模型读正文判题材
 # --------------------------------------------------------------------------- #
