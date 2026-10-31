@@ -405,7 +405,7 @@ npm test               # = node --test tests/*.test.ts && vitest run
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/                  # 1,903 项用例（+ 8 项需外部语料/验收库才跳）
+python -m pytest tests/                  # 1,904 项用例（+ 8 项需外部语料/验收库才跳）
 ```
 
 > 结尾会有一行 `1895 passed, 8 skipped in ...` —— **别再给这条命令加 `-q`**：
@@ -471,7 +471,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **1,903** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `tests/` | **1,904** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：9 个纯逻辑文件（43 项，`node --test`）+ 3 个组件级文件（27 项，vitest + jsdom） |
 | `docs/` | 73 份设计文档与指南：架构怎么定的、判据为什么这么定 |
 | `skills/` | 可复用的**方法单元**（agent skill）：盲评包脱敏与防泄露（SKILL.md + 事故复盘 + 泄露扫描脚本） |
@@ -547,7 +547,7 @@ curl -X POST "http://localhost:8000/api/projects/{pid}/distill" \
   跑的就是 README「跑测试」那一节写的命令 —— 不给 CI 另写一套更严格的检查。
   **在 Linux 上绿,不只是本机绿** —— 流水线能在 Linux 上抓出本机看不见的缺陷
   (测试子进程删掉父进程的 SQLite 文件:Windows 删不掉打开中的文件,本机因此全绿)。
-- **规模** —— 后端 **1,903** 项测试(`pytest tests`),前端 10 个纯逻辑测试文件(50 项)
+- **规模** —— 后端 **1,904** 项测试(`pytest tests`),前端 10 个纯逻辑测试文件(50 项)
   + 3 个组件级测试文件(27 项,vitest + jsdom),**当前全绿**。
 - **文档里的数字被机器守着** —— `tests/test_readme_test_count.py`:
   README 写的用例数必须等于 `pytest` **实际收集到的**条数,且 README 里几处写法

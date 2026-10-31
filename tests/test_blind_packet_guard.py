@@ -499,8 +499,7 @@ def test_题数加到18时取样要铺满整条长跑():
 
 
 def test_出18题的包_记录表与题数一致(tmp_path):
-    """记录表上的「判定 n = 评者人数 × ?」必须跟实际题数走，
-    写死 6 的话，评者按表算出来的 n 就是错的。"""
+    """记录表上写的题数必须跟实际题数走，写死 6 的话评者会按错数字数。"""
     sys.path.insert(0, str(BACKEND))
     from verify_acceptance_real import build_blind_packet
 
@@ -515,13 +514,55 @@ def test_出18题的包_记录表与题数一致(tmp_path):
     assert len(key["items"]) == 18, len(key["items"])
 
     sheet = (out_dir / "blind_sheet.md").read_text(encoding="utf-8")
-    assert "判定 n = 评者人数 × 18" in sheet, sheet
+    assert "一共 **18 题**" in sheet, sheet
     assert "× 6" not in sheet, sheet
     assert sheet.count("| A / B | A / B | |") == 18, sheet
 
     # 题面里的题数也要对得上
     samples = (out_dir / "blind_samples.md").read_text(encoding="utf-8")
     assert samples.count("**A**") == 18, samples.count("**A**")
+
+
+def test_记录表不给评者留填不了的合计栏(tmp_path):
+    """⚠️ 记录表上**不能**有「选我们那段次数 k」这种栏。
+
+    三个理由（2026-10-31 改表时想到的）：
+
+    1. **评者填不了** —— A/B 与「哪边是我们的」是**逐题随机**的（映射在密封文件里），
+       评者没有也不该有办法从汇总数反推 k ⇒ 这一栏只会让人瞎填一个数。
+    2. **k 不用人填** —— `verify_blind_eval.py` 直接从密封文件算 k 与 n。
+    3. **它引入了「汇总方视角」的措辞** —— 「选**我们**那段」暗示了
+       「有人=我们的产出、有人=不是」。
+       ⚠️ 这条**不是新增的实质泄露**：题面开头已经说了
+       「一段来自本项目的产出，一段来自人类作品」
+       ⇒ 评者本来就知道有一侧是我们产的；这里只是多余的框架提示。
+       真问题在前两条，这条是顺手一起清掉。
+
+    ⇒ 表上只留评者填得到的东西：题号 + 两列判断 + 备注。
+    """
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import build_blind_packet
+
+    corpus = [("现代都市", "他把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。" * 40)]
+    out_dir = tmp_path
+    build_blind_packet(_rows(12), corpus, out_dir, provider=_StubJudge(set()))
+    sheet = (out_dir / "blind_sheet.md").read_text(encoding="utf-8")
+    assert "合计" not in sheet, sheet
+    assert "k = ____" not in sheet, sheet
+    assert "评者人数" not in sheet, sheet
+    # 整张表上不该出现「我们」——那是汇总方的视角，评者没有这个视角
+    # （题面里说了「一段来自本项目的产出」，所以这不是防泄露，是防多余框架）
+    assert "我们" not in sheet, sheet
+    # 题数要写在表头（评者要知道一共多少题），但不能算 n
+    assert "判定 n" not in sheet, sheet
+    assert "一共 **" in sheet, sheet
+    # 写出来的题数要和表里的行数一致
+    import re as _re
+    m = _re.search(r"一共 \*\*(\d+) 题\*\*", sheet)
+    assert m, sheet
+    n_rows = len([ln for ln in sheet.splitlines()
+                  if ln.startswith("| s") and "A / B" in ln])
+    assert int(m.group(1)) == n_rows, (m.group(1), n_rows)
 
 
 def test_记录表只留两列_另外两列在二选一下是废话(tmp_path):
