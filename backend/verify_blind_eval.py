@@ -1,4 +1,4 @@
-"""盲评判据：把「更像人写」的作答变成**可算的判定**，不靠感觉。
+"""盲评判据：把「更好看」的作答变成**可算的判定**，不靠感觉。
 
 ==============================================================================
 用在哪：docs/acceptance-metrics.md §5「人工盲评流程」。
@@ -8,7 +8,7 @@
 
 - 每份题面 **N 道题**（跨位置取样；默认 N=6，可用 `--snips` 加到 18）。
 - 评者**只看 A/B**，不知道谁是谁；映射在密封文件里。
-- 记「我们那段被判为**更像人写**」的次数 k，判定数 n = 评者人数 × N。
+- 记「我们那段被判为**更好看**」的次数 k，判定数 n = 评者人数 × N。
 - 二项检验（H₀：评者只是随机猜，p = 0.5），看**下尾**：
 
       P(X ≤ k) < 0.05  ⇒ 我们的段显著更少被选中 ⇒ **可被识别为 AI** ⇒ FAIL
@@ -33,8 +33,8 @@
 
 ## 记录表只有两列，另一列用来出**交叉表**
 
-- 第 1 列「更像人写」—— 判定用（上面的二项检验）；
-- 第 2 列「主线更清」—— **独立维度**（叙事清晰度 ≠ 像不像人写的）；
+- 第 1 列「更好看」（旧包叫「更像人写」）—— 判定用（上面的二项检验）；
+- 第 2 列「主线更清」—— **独立维度**（叙事清晰度 ≠ 好不好看）；
   脚本拿它出交叉表：两列**指向不同侧**的那些题 = 诊断信息
   （我们的产出是「主线清楚但不像人写」⇒ 语言层问题；
   「像人写但主线乱」⇒ 结构层问题）。
@@ -57,22 +57,30 @@ import math
 import re
 from pathlib import Path
 
-# 题面里「更像人写」是第 1 列判断
-COL_HUMAN = "更像人写"
+#: 第 1 列判断（**主判据**）。
+#:
+#: 2026-11-01 起规范名是「**更好看**」：盲评 v2 把主判据从「像不像人写」换成
+#: 「哪段更想读下去」—— 用户（评者）判断「现在已经不太分得出 AI 了」
+#: ⇒ 「像不像 AI」已不可稳定分辨，当验收门会随模型进步越来越失效。
+#: 旧包（「更像人写」列）仍然能读：`_ALIASES` 把它映射到同一列。
+COL_BETTER = "更好看"
+#: 旧列名（保留给旧包）
+COL_HUMAN = COL_BETTER
 COL_MAIN = "主线更清"
 COL_AI = "有AI腔"
 COL_GUESS = "猜AI"
 
 #: 旧表头 → 规范名（表头里可能有空格）。
 #:
-#: ⚠️ **只有两列是有效的**：「更像人写」「主线更清」。
+#: ⚠️ **只有两列是有效的**：「更好看」（旧名「更像人写」）与「主线更清」。
 #: 「有 AI 腔」「猜 AI」两列在**强制二选一**下与第一列**互补**（必然取反）⇒
 #: 信息量为零 ⇒ 2026-10-31 删掉（主人当场指出：「猜了哪个更像人写，
 #: 另外那个不就是 AI 了么」⇒ 同一个意思问了两遍）。
 #:
 #: 旧表仍然能读：多出来的列按表头位置取，不影响判定。
 _ALIASES = {
-    "更像人写": COL_HUMAN,
+    "更好看": COL_BETTER,
+    "更像人写": COL_BETTER,
     "主线更清": COL_MAIN,
     "有AI腔": COL_AI,
     "猜AI": COL_GUESS,
@@ -172,6 +180,15 @@ def repair_sample_ids(rows: list[dict], key_items: dict) -> list[str]:
             + "；".join(fixed)]
 
 
+#: 「我们那一侧」在密封文件里的标签。
+#:
+#: - 历史包（人类侧 vs 我们侧）：`"ours"`
+#: - 盲评 v2 的 E1 包（引擎侧 vs 同模型裸写侧）：`"engine"`
+#:
+#: 两个都算「我们那一侧」⇒ 判定脚本不用改逻辑就能读新包。
+OUR_LABELS = ("ours", "engine")
+
+
 def our_slot_of(item: dict) -> str:
     """我们那一段在 **A 侧还是 B 侧**。
 
@@ -180,7 +197,7 @@ def our_slot_of(item: dict) -> str:
     ✓ 标记一起反了 ⇒ 读脚本的人会被直接误导（「✓ 越多的题越像人写」
     恰好是错的）。
     """
-    return "A" if item.get("slot_A") == "ours" else "B"
+    return "A" if item.get("slot_A") in OUR_LABELS else "B"
 
 
 def binom_tail_le(k: int, n: int) -> float:
@@ -271,7 +288,7 @@ def main() -> int:
             print(f"  {r['sample']}：密封文件里没有这一题 —— 跳过")
             continue
         slot = item["slot_A"] if (r[COL_HUMAN] or "").upper() == "A" else item["slot_B"]
-        ours = (slot == "ours")
+        ours = (slot in OUR_LABELS)
         if ours:
             k += 1
         # ⚠️ 这里记的是「**我们那段在哪一侧**」（不是「评者选了哪一侧」）。
@@ -310,7 +327,7 @@ def main() -> int:
     p = binom_tail_le(k, n)
     p_up = binom_tail_ge(k, n)
     print()
-    print(f"  n = {n}　k = {k}（我们那段被判「更像人写」的次数）")
+    print(f"  n = {n}　k = {k}（我们那段被判「更好看」的次数）")
     print(f"  P(X ≤ k | p=0.5) = {p:.4f}　← 判定用的那一侧（下尾）")
     print(f"  P(X ≥ k | p=0.5) = {p_up:.4f}　← 反向证据：比随机猜更常被选中")
 
@@ -320,8 +337,8 @@ def main() -> int:
         print(f"  【第二列】n = {n_main}　k = {k_main}"
               f"（我们那段被判「主线更清」的次数）　P(X ≤ k) = {p_main:.4f}")
         print("  两列交叉（对我们那段）：")
-        print(f"    更像人写 + 主线更清 都是我们 = {cross['both']}")
-        print(f"    只有更像人写是我们           = {cross['human_only']}")
+        print(f"    更好看 + 主线更清 都是我们 = {cross['both']}")
+        print(f"    只有更好看是我们             = {cross['human_only']}")
         print(f"    只有主线更清是我们           = {cross['ours_only']}")
         print(f"    两个都不是我们               = {cross['neither']}")
         split = cross["human_only"] + cross["ours_only"]

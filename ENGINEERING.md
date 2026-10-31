@@ -6940,3 +6940,50 @@ vs 回声年代的 57）⇒ 密度天花板降下来了。
   现在 `repair_sample_ids()` **按表内顺序补回**（只在行数 == 题数时补，
   否则宁可作废并写明原因）。
 
+## 盲评 v2：把「像不像 AI」换成「引擎值不值」
+
+（2026-11-01，设计见 `docs/blind-eval-v2-design.md`）
+
+### 转向的触发点
+
+用户（也是评者）在看完诊断后说了一句：**「其实目前已经不太分得出 AI 了」**
+⇒ 「像不像 AI」已不可稳定分辨 ⇒ 它当验收门的效力随模型进步只会越来越低。
+再叠加上尺本身的毛病：旧盲评的人类侧是**出版过的商业网文**（上尾分布），
+我们侧是模型初稿 ⇒ 那个 FAIL 量的是「出版级成品 vs 模型初稿」，
+**不是**「AI vs 普通人类写作」。
+
+⇒ v2 的三个对照：
+
+| 编号 | A 侧 | B 侧 | 作用 |
+|---|---|---|---|
+| **E1** | 引擎全链路 | **同一模型裸写**（只关文体机制） | 主验收门：引擎值不值 |
+| **E2** | 引擎全链路 | 引擎关掉全部后处理层 | 校正层有没有用 |
+| **E3** | 引擎全链路 | 出版网文 | 只作绝对参照，**不判定** |
+
+### 落地时改了三处
+
+1. **`config.py` 补登记两个真字段**：`style_attribution_correction` /
+   `style_ellipsis_correction`。
+   ⚠️ 这两项此前**只靠 `getattr(settings, "...", True)` 的默认值生效** ——
+   config 里根本没有字段 ⇒ **关不掉** ⇒ E1/E2 无法实现。
+   默认值仍是 True ⇒ 现有产出一个字都不变。
+2. **记录表第 1 列改名**：「更像人写」→「**更好看**」
+   （`build_blind_sheet` 出表 + `verify_blind_eval.py` 的规范列名
+   `COL_BETTER = "更好看"`）。
+   旧列名通过 `_ALIASES` 映射到同一列 ⇒ **旧包照样能读**。
+3. **密封文件的「我们那一侧」支持两种标签**：`"ours"`（旧包）与 `"engine"`（E1 包），
+   判定脚本用 `OUR_LABELS = ("ours", "engine")` 判定 ⇒ **判定逻辑不用分叉**。
+
+### E1 的裸写臂怎么关文体机制
+
+`engine._style_profile` / `_style_narrative` → None；
+`sample_style_exemplars` → []；
+`settings.style_form_correction` / `style_attribution_correction` /
+`style_ellipsis_correction` / `style_rewrite` / `style_rewrite_gate` → False。
+
+⚠️ 保留：角色约束、伏笔、KG 切片、RAG 检索上下文、照搬门禁、续写纪律
+⇒ **两侧唯一的差别就是文体机制**。
+
+实测「机制真的关掉了」（都市臂）：前置归属占比 引擎 91.4% vs 裸写 42.9%；
+省略号 50 个 vs 6 个。
+

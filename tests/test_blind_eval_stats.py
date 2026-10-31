@@ -125,3 +125,31 @@ def test_我们的段在哪一侧不能写反():
 
     assert our_slot_of({"slot_A": "ours", "slot_B": "human"}) == "A"
     assert our_slot_of({"slot_A": "human", "slot_B": "ours"}) == "B"
+
+
+def test_E1包也能读_引擎侧算我们那一侧(tmp_path):
+    """盲评 v2 的 E1 包：两侧都是模型产出，标签是 engine / generic。
+
+    ⇒ 判定脚本不能只认 `"ours"` —— 否则 E1 包算出来的 k 全是 0。
+    """
+    from verify_blind_eval import our_slot_of
+
+    assert our_slot_of({"slot_A": "engine", "slot_B": "generic"}) == "A"
+    assert our_slot_of({"slot_A": "generic", "slot_B": "engine"}) == "B"
+
+
+def test_记录表第1列改叫更好看_旧列名照样能读(tmp_path):
+    """新包用「更好看」，旧包用「更像人写」⇒ 两者都归一到同一列。"""
+    from verify_blind_eval import COL_BETTER, parse_sheet
+
+    new = _sheet(tmp_path, "| s01 | A | B | |\n")
+    old = _sheet(tmp_path, "| s01 | A | B | |\n")
+    new.write_text(
+        "| sample | 更好看 | 主线更清 | 备注 |\n|---|---|---|---|\n| s01 | A | B | |\n",
+        encoding="utf-8")
+    old.write_text(
+        "| sample | 更像人写 | 主线更清 | 备注 |\n|---|---|---|---|\n| s01 | A | B | |\n",
+        encoding="utf-8")
+    assert COL_BETTER == "更好看"
+    assert parse_sheet(new)[0][COL_BETTER] == "A"
+    assert parse_sheet(old)[0][COL_BETTER] == "A"

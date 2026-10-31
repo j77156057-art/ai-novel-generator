@@ -200,6 +200,18 @@ class Settings(BaseSettings):
     # （见 app/style/form.py 与 form_merge.py）。默认开 —— 它有闸门（只有偏离
     # 参考书自己分布带的段落才动），且不做就永远带着模型的对白先验。
     style_form_correction: bool = True
+    # 归属校正总开关：把「说话人归属」的写法掰到**参考书自己的写法**
+    # （见 app/style/attribution_fix.py）。默认开 —— 与形态校正同理：
+    # 不做就永远带着模型自己的归属先验（实测 3.2% vs 参考书 25%~77%）。
+    #
+    # ⚠️ 2026-11-01 补登记：这一项与省略号校正此前**只靠 `getattr(..., True)`
+    #    的默认值生效**（config 里没有字段）⇒ 无法关闭。
+    #    盲评 v2 的 E1/E2 对照（引擎全链路 vs 关掉文体机制）必须能把它们关掉，
+    #    所以补成**真字段**（默认值 True = 原行为，不改任何现有产出）。
+    style_attribution_correction: bool = True
+    # 省略号校正总开关：把省略号的**用法**（有没有、落在对白哪个位置）掰到参考书
+    # （见 app/style/ellipsis_fix.py）。同样在 2026-11-01 补登记为真字段。
+    style_ellipsis_correction: bool = True
     # 形态校正的**做法**：
     #   "merge"（默认）= 机械校正：把「纯台词段」并进**旁边**那段纯叙述 ——
     #     按**最大匹配**选配对（含向后并），只改段落边界，
