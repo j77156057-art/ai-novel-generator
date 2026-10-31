@@ -266,6 +266,12 @@ def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -
 # 段内自我重复的告警阈值：删掉超过这个比例说明模型已经陷入复读循环
 _REPETITION_WARN_RATIO = 0.15
 
+#: 省略号密度离参考书目标差这么远才值得校正（差得不多就别碰）。
+#:
+#: 口径与归属校正的 `MIN_GAP_TO_CORRECT`（0.20）一致，但这里放宽一点：
+#: 省略号是**纯机械**的改动（不调模型、只在对白结尾加「……」）⇒ 代价低。
+MIN_GAP_TO_ELLIPSIS = 0.05
+
 
 def _dedup_before_commit(text: str) -> tuple[str, dict]:
     """落库前清掉段内几乎逐字重复的段落，返回 (清理后文本, 统计)。
@@ -749,6 +755,85 @@ def _maybe_correct_attribution(
         return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
 
 
+def _maybe_correct_ellipsis(
+    db,
+    project: Project,
+    text: str,
+    provider,
+    *,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """省略号习惯校正：对白里「用省略号」的密度对齐**参考书自己**。
+
+    ## 为什么要有（实测）
+
+    2026-10-31 的盲评包里，「**有省略号的那侧 = 人类侧**」可判 7 对、
+    判对 7 对、**精确率 100%** ⇒ 一条真泄露线。
+    我们 0.068 个/百字 vs 参考书 0.684 个/百字（差 10 倍）。
+
+    ## 闸门
+
+    - 只在**离目标够远**时才动（差得不多就别碰）；
+    - 目标与惯例都来自**参考书自己** ⇒ 换一本书自动跟着换。
+
+    ## 失败策略
+
+    `style/ellipsis_fix.apply_ellipsis_habit` 内部量完直接改（纯机械，
+    不调模型）⇒ 失败极少；这里再兜一层异常。
+    """
+    if not text or not text.strip():
+        return text, {"applied": False, "reason": "空文本"}
+    try:
+        from app.config import settings as _st
+        if not bool(getattr(_st, "style_ellipsis_correction", True)):
+            return text, {"applied": False, "reason": "省略号校正开关关闭"}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.style.ellipsis_fix import (
+            apply_ellipsis_habit,
+            ellipsis_rate,
+            ellipsis_target,
+        )
+        from app.style.stylometry import paragraphs as _paras
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("省略号校正模块不可用: %s", exc)
+        return text, {"applied": False, "reason": "模块不可用"}
+
+    before = ellipsis_rate(text)
+    if before["quotes"] < 5:
+        return text, {"applied": False, "reason": "对白太少", "before": before}
+
+    # —— 目标：从参考书的段落里量 ——
+    try:
+        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+        target = None
+        if ids:
+            from app.models import NovelChunk
+            rows = db.query(NovelChunk).filter(
+                NovelChunk.novel_id.in_(ids)).limit(1200).all()
+            pool: list[str] = []
+            for r in rows:
+                pool.extend(_paras(r.text or ""))
+            target = ellipsis_target(pool)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("省略号目标取不到: %s", exc)
+        target = None
+    if not target:
+        return text, {"applied": False, "reason": "量不出省略号目标", "before": before}
+
+    gap = abs(before["rate"] - target["rate"])
+    if gap < MIN_GAP_TO_ELLIPSIS:
+        return text, {"applied": False, "reason": f"离目标够近（差 {gap:.0%}）",
+                      "before": before, "target": target}
+
+    try:
+        return apply_ellipsis_habit(text, target["rate"])
+    except Exception as exc:  # noqa: BLE001 —— 校正失败绝不能影响正文
+        logging.getLogger(__name__).warning("省略号校正异常，保留原文: %s", exc)
+        return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+
 def _candidate_pool_size() -> int:
     """候选池大小（1 = 关闭）。
 
@@ -1066,6 +1151,15 @@ def _run_text_chain(
     text, attr_info = _maybe_correct_attribution(
         db, project, text, provider, novel_ids=novel_ids,
     )
+    # 省略号习惯校正：把对白里「用省略号」的密度掰到参考书自己的。
+    #
+    # 为什么要单独一层（实测 2026-10-31）：盲评里「**有省略号的那侧 = 人类侧**」
+    # 这条规则可判 7 对、判对 7 对、精确率 **100%** ⇒ 一条真泄露线。
+    # 我们 0.068 个/百字 vs 参考书 0.684 个/百字（差 10 倍）。
+    # ⇒ 与归属校正**同一类问题**（写法指纹没对齐），走同一条路：**按参考书实测的比例补**。
+    text, ell_info = _maybe_correct_ellipsis(
+        db, project, text, provider, novel_ids=novel_ids,
+    )
     # beat 插入：在连续对白段的开头补一句动作/神态叙述。
     # 放在形态校正**之后** —— 形态校正只重排已有的叙述，碰到「前面也是台词」
     # 就并无可并；这一步是**新增**叙述，填的正是那个缺口。
@@ -1073,7 +1167,8 @@ def _run_text_chain(
         db, project, text, provider, novel_ids=novel_ids,
     )
     if (rewrite_info.get("applied") or form_info.get("applied")
-            or attr_info.get("applied") or beat_info.get("applied")):
+            or attr_info.get("applied") or ell_info.get("applied")
+            or beat_info.get("applied")):
         summary = provider.summarize(text)
 
     # 照搬门禁：正文 vs 参考语料。放在**所有**正文改写之后、落库之前 ——
@@ -1094,6 +1189,7 @@ def _run_text_chain(
         "dedup_stats": dedup_stats,
         "form_info": form_info,
         "attr_info": attr_info,
+        "ell_info": ell_info,
         "beat_info": beat_info,
         "verbatim_info": verbatim_info,
     }
