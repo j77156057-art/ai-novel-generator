@@ -36,16 +36,16 @@ POSITIVE_FRONT = [
     "一名少年问道：“公子，何事？”",
     "李牧终于 Associates说道：“一只猫叼走了记忆晶体？”".replace(" Associates", ""),
     "颜柔说道：“先生，那接下来该怎么办？我们失去了联系。”",
-    "苏问渠没接，盯着那饼看了两息，才说：“内务房不管饭。”",
-    "姜昀想了想，说：“这牌子被人刮过。”",
+    "裴远没接，盯着那饼看了两息，才说：“内务房不管饭。”",
+    "秦昭想了想，说：“这牌子被人刮过。”",
 ]
 
 #: **阴性对照**：不该命中前置归属。
 NEGATIVE_FRONT = [
-    "“木头。”苏问渠低声说。",
+    "“木头。”裴远低声说。",
     "“你手里拿的什么。”",
     "“先吃。”",
-    "姜昀压低声音。",
+    "秦昭压低声音。",
     "他点了点头，转身走进雨里，脚步声很快没了。",
 ]
 
@@ -66,7 +66,7 @@ def test_尺不误伤裸台词和后置归属():
 
 def test_尺认得出后置归属():
     """后置：「引语 + 说话人 + 动词」是另一条惯例，也要认。"""
-    p = attribution_profile("“木头。”苏问渠低声说。")
+    p = attribution_profile("“木头。”裴远低声说。")
     assert p["back"] == 1, p
     assert p["front"] == 0, p
 
@@ -97,21 +97,21 @@ def test_插话式单独算不混进后置():
 
 def test_尺分得清道字派和说字派():
     """「道」与「说」是两个派别 —— 盲评里正是靠这个定位的。"""
-    dao = attribution_profile("魏宗主道：“放肆。”")
-    shuo = attribution_profile("姜昀说：“别动。”")
+    dao = attribution_profile("秦昭道：“放肆。”")
+    shuo = attribution_profile("秦昭说：“别动。”")
     assert dao["front_dao"] == 1 and dao["front_shuo"] == 0, dao
     assert shuo["front_shuo"] == 1 and shuo["front_dao"] == 0, shuo
 
 
 def test_坏过的尺不能复发():
     """回归：第一版尺漏了单独的「说」⇒ 这里钉死。"""
-    p = attribution_profile("姜昀想了想，说：“这牌子被人刮过。”")
+    p = attribution_profile("秦昭想了想，说：“这牌子被人刮过。”")
     assert p["front"] == 1, "「说」字派又漏了 —— 尺退回第一版了"
     assert p["front_shuo"] == 1, p
 
 
 def test_门槛卡边的那本书也要触发():
-    """回归：门槛把《记忆曝光》挡在外面 ⇒ 都市臂没拿到口径。
+    """回归：门槛把《回声年代》挡在外面 ⇒ 都市臂没拿到口径。
 
     实测：那本书**样例**里的前置密度只有 0.080/百字（命中 3 次），
     第一版门槛定 0.10 ⇒ 判定「没有明显惯例」⇒ **不给口径**
@@ -121,7 +121,7 @@ def test_门槛卡边的那本书也要触发():
     """
     # 3 次「道」字派前置归属，散在约 3700 字里 ⇒ 密度 ≈ 0.081/百字
     filler = "他站在廊下，看着天色一点点暗下去，远处传来更鼓的声响。" * 60
-    samples = [filler + "魏宗主道：“放肆。”", filler + "他道：“你且慢。”",
+    samples = [filler + "秦昭道：“放肆。”", filler + "他道：“你且慢。”",
                filler + "一名少年问道：“公子，何事？”"]
     d = attribution_directive(samples)
     assert d, "卡边的那本书被门槛挡掉了 ⇒ 口径没下达"
@@ -131,14 +131,14 @@ def test_门槛卡边的那本书也要触发():
 def test_一次两次命中不算惯例():
     """光有 1~2 次命中 ⇒ 不给口径（宁可少说，也不要教错）。"""
     filler = "他站在廊下，看着天色一点点暗下去。" * 200
-    samples = [filler + "魏宗主道：“放肆。”"]
+    samples = [filler + "秦昭道：“放肆。”"]
     assert attribution_directive(samples) == ""
 
 
 def test_能判出这本书用道字派前置():
     text = "\n".join([
-        "魏宗主道：“放肆。”",
-        "蓝忘机道：“兄长。”",
+        "秦昭道：“放肆。”",
+        "裴远道：“兄长。”",
         "一名少年问道：“公子，何事？”",
     ])
     conv = attribution_convention(text)
@@ -158,8 +158,8 @@ def test_没有明显惯例就不乱判():
 def test_口径从样例里量出来且带正确实例():
     """口径必须**自带一个正确实例** —— 形态要靠实例教，不能只给数字。"""
     samples = [
-        "魏宗主道：“放肆。”\n众人皆惊，一时无人敢应。\n他负手而立，衣袍无风自动。",
-        "蓝忘机道：“兄长。”\n那声音清冷，听不出喜怒。\n云梦江氏的人互看一眼，谁也没有先动。",
+        "秦昭道：“放肆。”\n众人皆惊，一时无人敢应。\n他负手而立，衣袍无风自动。",
+        "裴远道：“兄长。”\n那声音清冷，听不出喜怒。\n云梦江氏的人互看一眼，谁也没有先动。",
         "一名少年问道：“公子，何事？”\n少年立在阶下，不敢抬头。\n风从廊下穿过，卷起几片落叶。",
     ]
     d = attribution_directive(samples)
@@ -185,8 +185,8 @@ def test_提示词里带上了归属口径():
     from app.generation.prompts import build_user_prompt
 
     exs = [{"novel_id": 1, "novel_title": "样例书", "text": (
-        "魏宗主道：“放肆。”\n众人皆惊，一时无人敢应。\n他负手而立，衣袍无风自动。\n"
-        "蓝忘机道：“兄长。”\n那声音清冷，听不出喜怒。\n云梦江氏的人互看一眼，谁也没有先动。\n"
+        "秦昭道：“放肆。”\n众人皆惊，一时无人敢应。\n他负手而立，衣袍无风自动。\n"
+        "裴远道：“兄长。”\n那声音清冷，听不出喜怒。\n云梦江氏的人互看一眼，谁也没有先动。\n"
         "一名少年问道：“公子，何事？”\n少年立在阶下，不敢抬头。\n风从廊下穿过，卷起几片落叶。\n"
     )}]
     prompt = build_user_prompt([], [], None, 1200, style_exemplars=exs)
@@ -205,7 +205,7 @@ def test_没有样例时提示词不变():
 def test_整包判别力检验抓得出不盲的包():
     """第九道闸门：只用写法就能定位 ⇒ 这个包在写法上不盲。"""
     ours = ["他开口：“别动。”\n他皱眉：“我不走。”\n他说：“放手。”"] * 6
-    human = ["魏宗主道：“放肆。”\n蓝忘机道：“兄长。”\n一名少年问道：“公子，何事？”"] * 6
+    human = ["秦昭道：“放肆。”\n裴远道：“兄长。”\n一名少年问道：“公子，何事？”"] * 6
     res = attribution_discriminability(ours, human)
     assert res["leaky"] is True, res
     assert res["rule"], res
@@ -213,7 +213,7 @@ def test_整包判别力检验抓得出不盲的包():
 
 def test_整包判别力检验对对称的包不报警():
     """两侧写法一样 ⇒ 不该拦。"""
-    same = "魏宗主道：“放肆。”\n蓝忘机道：“兄长。”\n少年问道：“何事？”"
+    same = "秦昭道：“放肆。”\n裴远道：“兄长。”\n少年问道：“何事？”"
     res = attribution_discriminability([same] * 8, [same] * 8)
     assert res["leaky"] is False, res
 
@@ -221,7 +221,7 @@ def test_整包判别力检验对对称的包不报警():
 def test_判别力检验样本不够时不下结论():
     """可判对数太少 ⇒ 不下结论（宁可放过，不可乱拦）。"""
     ours = ["他开口：“别动。”"]
-    human = ["魏宗主道：“放肆。”"]
+    human = ["秦昭道：“放肆。”"]
     res = attribution_discriminability(ours, human)
     assert res["leaky"] is False, res
 
@@ -234,7 +234,7 @@ def test_归属率的分母是对白句数不是百字():
     """分母错了 ⇒ 诊断和目标都会错。"""
     from app.style.attribution_fix import attribution_rate
 
-    text = "姜昀道：“你怎么在这儿？”\n“我在这儿。”苏问渠道。\n他没有回答。"
+    text = "秦昭道：“你怎么在这儿？”\n“我在这儿。”裴远道。\n他没有回答。"
     r = attribution_rate(text)
     assert r["quotes"] == 2, r
     assert r["hits"] >= 2, r
@@ -244,8 +244,8 @@ def test_归属率的分母是对白句数不是百字():
 def test_能从参考书段落里量出归属目标():
     from app.style.attribution_fix import attribution_target
 
-    one = "魏宗主道：“放肆。”\n众人皆惊，一时无人敢应。\n他负手而立，衣袍无风自动。"
-    two = "蓝忘机道：“兄长。”\n那声音清冷，听不出喜怒。\n云梦江氏的人互看一眼。"
+    one = "秦昭道：“放肆。”\n众人皆惊，一时无人敢应。\n他负手而立，衣袍无风自动。"
+    two = "裴远道：“兄长。”\n那声音清冷，听不出喜怒。\n云梦江氏的人互看一眼。"
     three = "一名少年问道：“公子，何事？”\n少年立在阶下，不敢抬头。\n风卷起几片落叶。"
     t = attribution_target([one, two, three] * 8)
     assert t, "量不出目标"
@@ -282,10 +282,10 @@ _BODY = ("“别动。”\n“放手。”\n“你到底想怎样。”\n" + _NA
          "他等了片刻，才又开口。\n")
 
 #: 同一段台词，**只**多加了说话人归属（对白内容逐字相同）
-_FIXED = ("姜昀道：“别动。”\n苏问渠道：“放手。”\n姜昀道：“你到底想怎样。”\n"
+_FIXED = ("秦昭道：“别动。”\n裴远道：“放手。”\n秦昭道：“你到底想怎样。”\n"
           + _NARR + "\n"
-          "苏问渠道：“让开。”\n姜昀道：“我不让。”\n" + _NARR + "\n"
-          "姜昀道：“你听见没有？”\n苏问渠道：“听见了。”\n" + _NARR + "\n"
+          "裴远道：“让开。”\n秦昭道：“我不让。”\n" + _NARR + "\n"
+          "秦昭道：“你听见没有？”\n裴远道：“听见了。”\n" + _NARR + "\n"
           "他等了片刻，才又开口。\n")
 
 
@@ -295,7 +295,7 @@ def test_归属校正确实能把归属率往上拉():
     prov = _FakeProvider(_FIXED)
     text, info = correct_attribution(
         _BODY, prov, target_rate=0.8, convention="front_dao",
-        examples=["魏宗主道：“放肆。”"],
+        examples=["秦昭道：“放肆。”"],
     )
     assert info.get("applied"), info
     assert info["after"]["rate"] > info["before"]["rate"], info
@@ -309,7 +309,7 @@ def test_归属校正拒绝改动对白内容():
     prov = _FakeProvider(tampered)
     text, info = correct_attribution(
         _BODY, prov, target_rate=0.8, convention="front_dao",
-        examples=["魏宗主道：“放肆。”"],
+        examples=["秦昭道：“放肆。”"],
     )
     assert not info.get("applied"), info
     assert "守恒" in info.get("reason", ""), info
@@ -322,7 +322,7 @@ def test_归属校正拒绝不靠近目标的改写():
     prov = _FakeProvider(_BODY)  # 原样返回 ⇒ 归属率没动
     text, info = correct_attribution(
         _BODY, prov, target_rate=0.8, convention="front_dao",
-        examples=["魏宗主道：“放肆。”"],
+        examples=["秦昭道：“放肆。”"],
     )
     assert not info.get("applied"), info
     assert "没靠近" in info.get("reason", ""), info
@@ -333,15 +333,15 @@ def test_归属校正过冲要拒绝():
     from app.style.attribution_fix import correct_attribution
 
     # 7 句对白里给 5 句加归属 ⇒ 归属率 71%；目标 40% ⇒ 更近了，但冲过去 31 点 ⇒ 拒
-    partial = ("姜昀道：“别动。”\n苏问渠道：“放手。”\n姜昀道：“你到底想怎样。”\n"
+    partial = ("秦昭道：“别动。”\n裴远道：“放手。”\n秦昭道：“你到底想怎样。”\n"
                + _NARR + "\n"
-               "苏问渠道：“让开。”\n“我不让。”\n" + _NARR + "\n"
-               "姜昀道：“你听见没有？”\n“听见了。”\n" + _NARR + "\n"
+               "裴远道：“让开。”\n“我不让。”\n" + _NARR + "\n"
+               "秦昭道：“你听见没有？”\n“听见了。”\n" + _NARR + "\n"
                "他等了片刻，才又开口。\n")
     prov = _FakeProvider(partial)
     text, info = correct_attribution(
         _BODY, prov, target_rate=0.4, convention="front_dao",
-        examples=["魏宗主道：“放肆。”"],
+        examples=["秦昭道：“放肆。”"],
     )
     assert not info.get("applied"), info
     assert "过冲" in info.get("reason", ""), info
@@ -372,7 +372,7 @@ class _ChunkProvider:
         body = user.split("【原文】")[-1].strip()
         if self.bad_marker and self.bad_marker in body:
             return ""
-        return body.replace("“", "姜昀道：“")
+        return body.replace("“", "秦昭道：“")
 
 
 def test_某一段拿不到就保留那段原文():
@@ -387,7 +387,7 @@ def test_某一段拿不到就保留那段原文():
     prov = _ChunkProvider(bad_marker="会失败")
     out, info = correct_attribution(
         text, prov, target_rate=0.8, convention="front_dao",
-        examples=["魏宗主道：“放肆。”"],
+        examples=["秦昭道：“放肆。”"],
     )
     assert info.get("chunks", 0) > 1, info
     assert info.get("chunks_failed", 0) == 1, info
