@@ -179,7 +179,7 @@ except Exception as exc:  # noqa: BLE001 —— 簿记失败绝不打断 SSE（�
 | T6 | 失败不阻断 | 注入 merge 异常 → `done` 事件仍发出、带 `rebuilt:False`；正文已落库 |
 | T7（可选） | 并发 | replay 与 merge 交错不产生幽灵 / 丢失（线程测试） |
 
-测试环境提示：pytest 只在 `backend/venv`；`pytest.ini` 的 `testpaths=../tests`（根 `tests/`）；**全量回归必须加 `--basetemp=D:/Temp/xxx`**，否则沙箱 tmp 回收会造 EXIT=1 假失败。
+测试环境提示：pytest 只在 `backend/venv`；`pytest.ini` 的 `testpaths=../tests`（根 `tests/`）；**全量回归必须加 `--basetemp=<临时目录>`**，否则沙箱 tmp 回收会造 EXIT=1 假失败。
 
 ---
 

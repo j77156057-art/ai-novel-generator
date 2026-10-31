@@ -16,7 +16,7 @@
 - `worktrees/codex-bc-dfg`（其他 agent 持有，**勿碰**）
 
 ```bash
-cd "C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator"
+cd "<本机工作区路径>
 git worktree list
 git log --oneline -10 master
 ```
@@ -27,10 +27,10 @@ git log --oneline -10 master
 
 ## 1. 环境（沿用 stage3/4/5）
 
-- 项目路径：`C:\Users\h'h'h\WorkBuddy\2026-10-12-11-59-30\ai-novel-generator`
+- 项目路径：`<本机工作区路径>`
 - 你的 worktree：`worktrees/master`（HEAD = `d06b97a`）
 - 用户名含单引号 → bash 路径会炸，命令写成 .py 脚本放 scratch 目录执行
-- 后端 venv：`C:\Users\h'h'h\AppData\Local\Programs\Python\Python313\python.exe`（有 sqlalchemy 2.0.35）
+- 后端 venv：`<本机 python>`（有 sqlalchemy 2.0.35）
 - 跑测试前必须 `env -u PYTHONPATH -u VIRTUAL_ENV`
 - git commit 用 `git commit -F msg文件`（**不要**在 commit message 里用反引号）
 - 不要碰 `worktrees/fix-extractor-3char-and-noise` / `timeline-pacing` / `codex-bc-dfg`
@@ -114,8 +114,8 @@ percentile 100% 常态化不等于告警无用。**以下场景** percentile > 9
 ## 4. 测试约定与当前绿数
 
 - 独立脚本：`cd backend && env -u PYTHONPATH -u VIRTUAL_ENV "<venv python>" tests/test_xxx.py`
-- 集中跑：`cd scratch && "C:/Users/h'h'h/AppData/Local/Programs/Python/Python313/python.exe" run_tests.py tests/test_xxx.py [更多 tests]`
-- 冒烟脚本位置：`C:\Users\h'h'h\AppData\Local\hermes\cache\scratch\smoke_v2XX.py`（v21 起，20 个版本）
+- 集中跑：`cd scratch && "<本机 python> run_tests.py tests/test_xxx.py [更多 tests]`
+- 冒烟脚本位置：`<本机临时目录>smoke_v2XX.py`（v21 起，20 个版本）
 
 **当前绿数（stage6 末）**：
 - 18 套件 548 断言全绿
@@ -250,13 +250,13 @@ providers.yaml writer.max_tokens 4096 → 8192（v2.20 验证段 1 wc 2491→577
 
 ```bash
 # 1. 状态确认
-cd "C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator"
+cd "<本机工作区路径>
 git worktree list
 git log --oneline -10 master
 
 # 2. 跑 18 套件确认环境通（548 断言全绿基线）
-cd "C:/Users/h'h'h/AppData/Local/hermes/cache/scratch"
-"C:/Users/h'h'h/AppData/Local/Programs/Python/Python313/python.exe" run_tests.py \
+cd "<本机临时目录>"
+"<本机 python> run_tests.py \
   tests/test_v30_judge.py tests/test_era_dimension.py tests/test_kg_cascade_protocol.py \
   tests/test_batch_worker_observability.py tests/test_kg_v3_frontend_api.py \
   tests/test_v30_integration.py tests/test_v30_retrieval.py tests/test_v30_extractor.py \

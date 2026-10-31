@@ -24,6 +24,7 @@
    那种改动在这里会被当场抓住，而不是默默污染数据。
 """
 from __future__ import annotations
+import tempfile
 
 import os
 import subprocess
@@ -37,7 +38,7 @@ _REPO = _BACKEND.parent
 _PY = _BACKEND / "venv" / "Scripts" / "python.exe"
 _TIMEOUT = 180
 #: 临时库目录。**每个脚本一个独立文件**——否则某个脚本 drop_all/create_all 会串味到下一个。
-_TMP_DIR = Path("D:/Temp/legacy_gate")
+_TMP_DIR = Path(tempfile.gettempdir()) / "legacy_gate"
 
 #: 脚本可能打开的真实库（相对 backend/）。跑前跑后必须原样。
 _REAL_DBS = ("novel_demo.db", "novel_dev.db")

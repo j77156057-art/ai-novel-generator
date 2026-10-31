@@ -9,8 +9,9 @@ E. build_graph 返回 0 characters → 记 0 + warning
 
 用 fake db/build_graph，不碰真 SQLite。
 """
+import os
 import sys
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.style.narrative as N
 

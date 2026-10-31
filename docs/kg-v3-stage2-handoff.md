@@ -37,10 +37,10 @@
 
 ## 1. 环境（重要，别踩坑）
 
-- 项目路径：`C:\Users\h'h'h\WorkBuddy\2026-10-12-11-59-30\ai-novel-generator`
+- 项目路径：`<本机工作区路径>`
 - 你的 worktree：`worktrees/master`（HEAD = `e31a2a9`）
 - 用户名含单引号 → bash 路径会炸，命令写成 .py 脚本放 scratch 目录执行，不要 python -c
-- 后端 venv：`C:\Users\h'h'h\AppData\Local\Programs\Python\Python313\python.exe`（有 sqlalchemy 2.0.35）
+- 后端 venv：`<本机 python>`（有 sqlalchemy 2.0.35）
 - 跑测试前必须 `env.pop("PYTHONPATH") + env.pop("VIRTUAL_ENV")`（在 .py 脚本里），否则 venv 被 Hermes 环境覆盖
 - git commit 用 `git commit -F msg文件`（**不要**在 commit message 里用反引号）
 - 不要碰 `worktrees/timeline-pacing` 和 `worktrees/style-distill`（其他 agent 的）
@@ -114,7 +114,7 @@ a6ea0b6 前端集成：KG 工作台 5 tabs
 
 - 独立脚本：`cd backend && env -u PYTHONPATH -u VIRTUAL_ENV "<venv python>" tests/test_xxx.py`
 - 断言打印 PASS/FAIL + 总数，退出码 0/1；新功能必须配测试
-- 冒烟脚本位置：`C:\Users\h'h'h\AppData\Local\hermes\cache\scratch\run_tests.py`
+- 冒烟脚本位置：`<本机临时目录>run_tests.py`
   （python 脚本包 venv，`python run_tests.py tests/test_x.py` 可批量）
 - 种子脚本：`seed_kg_smoke.py`（KG 五表数据）、`seed_worker.py`（AgentRun 3 行）在 scratch
 - **核心 5 套件当前全绿**：cascade_protocol 49 / batch_worker_observability 36 /

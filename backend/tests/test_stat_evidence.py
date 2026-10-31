@@ -20,17 +20,35 @@ LLM 引用这些数字完全符合要求。
 
 第 2 步是关键：让「他等了三分钟才走」这种含数字的真叙事被正确拒绝。
 """
+import os
+import pathlib
+import os
 import pathlib
 import sys
 
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.style.narrative import (  # noqa: E402
     _is_statistical_evidence,
     _validate_evidence,
 )
 
-CORPUS = pathlib.Path(r"C:\Users\h'h'h\Downloads\雪中悍刀行.txt")
+#: 语料目录：环境变量 NOVEL_DIR → 仓库的 data/seed → 本机 Downloads。
+#: 语料不随仓库分发，找不到就由调用方跳过（不写死任何绝对路径）。
+_CORPUS_DIRS = [pathlib.Path(d) for d in
+                (os.environ.get("NOVEL_DIR"), "data/seed", str(pathlib.Path.home() / "Downloads"))
+                if d]
+
+
+def _corpus(name: str) -> pathlib.Path:
+    """在语料目录里找一份语料：NOVEL_DIR → data/seed → 本机 Downloads。"""
+    for d in _CORPUS_DIRS:
+        p = d / name
+        if p.exists():
+            return p
+    return _CORPUS_DIRS[0] / name
+
+CORPUS = _corpus("雪中悍刀行.txt")
 _TEXT = None
 
 

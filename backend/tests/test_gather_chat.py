@@ -5,10 +5,11 @@ A. 空列表返回 []
 B. 5 个 0.3s 串行 = 1.5s, _gather_chat 应 < 0.5s（5x 提速）
 C. 失败/异常透传为 Exception 实例
 """
+import os
 import asyncio
 import time
 import sys
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.llm.provider import LLMProvider
 from app.style.narrative import _gather_chat, _DEFAULT_MAX_CONCURRENT

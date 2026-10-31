@@ -22,7 +22,7 @@ RAG（混合检索）每次生成都会把检索到的语料原文塞进提示�
 
 ```bash
 cd backend
-"C:/Users/h'h'h/.workbuddy/binaries/python/envs/default/Scripts/python.exe" load_corpus.py
+python load_corpus.py
 ```
 
 脚本会：上传全部 txt → 重建知识图谱 → 打印每本的分片数与总字数。
@@ -33,7 +33,7 @@ cd backend
 demo 文本本身带 AI 腔，留着会污染检索。入库确认没问题后：
 
 ```bash
-"C:/Users/h'h'h/.workbuddy/binaries/python/envs/default/Scripts/python.exe" load_corpus.py --drop-demo
+python load_corpus.py --drop-demo
 ```
 
 ## 注意

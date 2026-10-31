@@ -9,10 +9,13 @@
 
 零误伤是底线——任何误伤合法内容都是 fail。
 """
+import os
+import pathlib
+import os
 import pathlib
 import sys
 
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.corpus_health import (  # noqa: E402
     strip_repeated_ads,
@@ -20,10 +23,25 @@ from app.corpus_health import (  # noqa: E402
     _REPEATED_ADS_WHITELIST,
 )
 
+#: 语料目录：环境变量 NOVEL_DIR → 仓库的 data/seed → 本机 Downloads。
+#: 语料不随仓库分发，找不到就由调用方跳过（不写死任何绝对路径）。
+_CORPUS_DIRS = [pathlib.Path(d) for d in
+                (os.environ.get("NOVEL_DIR"), "data/seed", str(pathlib.Path.home() / "Downloads"))
+                if d]
+
+
+def _corpus(name: str) -> pathlib.Path:
+    """在语料目录里找一份语料：NOVEL_DIR → data/seed → 本机 Downloads。"""
+    for d in _CORPUS_DIRS:
+        p = d / name
+        if p.exists():
+            return p
+    return _CORPUS_DIRS[0] / name
+
 
 def test_a_snow_real_data():
     """A: 雪中悍刀行 511 万字真链路——识别 2 个广告模板，零误伤。"""
-    p = pathlib.Path(r"C:\Users\h'h'h\Downloads\雪中悍刀行.txt")
+    p = _corpus("雪中悍刀行.txt")
     if not p.exists():
         print("  (跳过：语料不存在)")
         return
@@ -45,7 +63,7 @@ def test_a_snow_real_data():
 
 def test_b_doupo_real_data():
     """B: 斗破苍穹 603 万字真链路——识别 1 个广告模板，零误伤武功效果。"""
-    p = pathlib.Path(r"C:\Users\h'h'h\Downloads\斗破苍穹.txt")
+    p = _corpus("斗破苍穹.txt")
     if not p.exists():
         print("  (跳过：语料不存在)")
         return
@@ -66,7 +84,7 @@ def test_b_doupo_real_data():
 
 def test_c_dafeng_real_data():
     """C: 大奉打更人 510 万字真链路——零误伤省略号/ps说明。"""
-    p = pathlib.Path(r"C:\Users\h'h'h\Downloads\大奉打更人.txt")
+    p = _corpus("大奉打更人.txt")
     if not p.exists():
         print("  (跳过：语料不存在)")
         return

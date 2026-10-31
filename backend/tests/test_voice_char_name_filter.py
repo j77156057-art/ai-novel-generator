@@ -8,11 +8,12 @@
 2. 称谓/地名/泛称（江湖/公子/师父/皇帝/家伙/许多/高手…）
 3. 同一份声音内容被复制给多个人名（LLM 长 JSON 输出的复制粘贴错误）
 """
+import os
 import json
 import pathlib
 import sys
 
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.style.narrative import (  # noqa: E402
     _VOICE_STOP_WORDS,

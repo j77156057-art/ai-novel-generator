@@ -10,8 +10,9 @@
     python _calibrate_breadth.py
 """
 from __future__ import annotations
-
 import os
+import pathlib
+
 import re
 import sys
 from collections import Counter
@@ -20,15 +21,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.ingestion.encoding import read_text_file  # noqa: E402
 
+#: 语料目录：环境变量 NOVEL_DIR → 仓库的 data/seed → 本机 Downloads。
+#: 语料不随仓库分发，找不到就由调用方跳过（不写死任何绝对路径）。
+_CORPUS_DIRS = [pathlib.Path(d) for d in
+                (os.environ.get("NOVEL_DIR"), "data/seed", str(pathlib.Path.home() / "Downloads"))
+                if d]
+
+
+def _corpus(name: str) -> pathlib.Path:
+    """在语料目录里找一份语料：NOVEL_DIR → data/seed → 本机 Downloads。"""
+    for d in _CORPUS_DIRS:
+        p = d / name
+        if p.exists():
+            return p
+    return _CORPUS_DIRS[0] / name
+
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 _LENGTHS = (3, 4, 5, 6)
 _MIN_COUNT = 60
 _MIN_RATIO = 0.9
 
 FILES = [
-    "C:/Users/h'h'h/Downloads/斗破苍穹.txt",
-    "C:/Users/h'h'h/Downloads/大奉打更人.txt",
-    "C:/Users/h'h'h/Downloads/豪门宠婚，爵少你别闹.txt",
+    str(_corpus("斗破苍穹.txt")),
+    str(_corpus("大奉打更人.txt")),
+    str(_corpus("豪门宠婚，爵少你别闹.txt")),
 ]
 
 

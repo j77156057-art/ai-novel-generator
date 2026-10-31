@@ -15,6 +15,7 @@
 跑法：python tests/stress/test_v30_stress.py （在 backend/ 下）
 """
 from __future__ import annotations
+import tempfile
 
 import os
 import sys
@@ -60,7 +61,7 @@ def check_true(label: str, cond) -> None:
     check(label, bool(cond), True)
 
 
-DB_PATH = r"C:\Users\h'h'h\AppData\Local\hermes\cache\scratch\step6_stress.db"
+DB_PATH = str(Path(tempfile.gettempdir()) / "step6_stress.db")
 engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine, future=True)

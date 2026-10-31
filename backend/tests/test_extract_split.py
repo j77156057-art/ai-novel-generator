@@ -22,9 +22,10 @@
 两个函数保留在代码里（测试仍覆盖），但主循环不再调用——若后续有
 需要单独分析骨架/质感的场景可复用。相应断言标注「保留未接入」。
 """
+import os
 import sys
 
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.style.narrative import (  # noqa: E402
     _build_extract_prompt,

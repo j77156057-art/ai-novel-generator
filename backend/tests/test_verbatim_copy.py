@@ -27,9 +27,10 @@
 
 改成 `re.findall(r"[^。！？…\n]+[。！？…]?", ...)` 保留终止符。
 """
+import os
 import sys
 
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.style.narrative import _is_verbatim_copy  # noqa: E402
 

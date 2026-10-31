@@ -3,12 +3,13 @@
 不碰真实开发库：DATABASE_URL 必须由外部指向临时库（脚本会自检并拒绝非临时库）。
 
 用法（在 backend/ 目录下）：
-    DATABASE_URL="sqlite:///D:/Temp/demo_ingest.db" python _demo_ingest_temp.py "C:/Users/h'h'h/Downloads/豪门宠婚，爵少你别闹.txt"
+    DATABASE_URL="sqlite:///./demo_ingest.db" python _demo_ingest_temp.py str(_corpus("豪门宠婚，爵少你别闹.txt"))
 """
 from __future__ import annotations
+import os
+import pathlib
 
 import json
-import os
 import sys
 
 # —— 必须在 import app.db 之前锁定库（否则 engine 会绑到默认的 novel_dev.db）——
@@ -16,7 +17,7 @@ _url = os.environ.get("DATABASE_URL", "")
 if "novel_dev.db" in _url or "novel_demo.db" in _url or not _url:
     raise SystemExit(
         f"拒绝运行：DATABASE_URL={_url!r} 未指向临时库。"
-        "请显式设置到临时目录（如 D:/Temp/demo_ingest.db）。"
+        "请显式设置到临时目录（如 ./demo_ingest.db）。"
     )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +27,21 @@ from app.ingestion.encoding import read_text_file  # noqa: E402
 from app.ingestion.store import ingest_text  # noqa: E402
 from app.models import NovelChunk, RawNovel  # noqa: E402
 from app.schemas import NovelOut  # noqa: E402
+
+#: 语料目录：环境变量 NOVEL_DIR → 仓库的 data/seed → 本机 Downloads。
+#: 语料不随仓库分发，找不到就由调用方跳过（不写死任何绝对路径）。
+_CORPUS_DIRS = [pathlib.Path(d) for d in
+                (os.environ.get("NOVEL_DIR"), "data/seed", str(pathlib.Path.home() / "Downloads"))
+                if d]
+
+
+def _corpus(name: str) -> pathlib.Path:
+    """在语料目录里找一份语料：NOVEL_DIR → data/seed → 本机 Downloads。"""
+    for d in _CORPUS_DIRS:
+        p = d / name
+        if p.exists():
+            return p
+    return _CORPUS_DIRS[0] / name
 
 
 def main() -> int:

@@ -8,10 +8,10 @@
 ## 【接手任务】ai-novel-generator —— KG v3.0 后续工作
 
 ## 环境（重要，别踩坑）
-- 项目路径：`C:\Users\h'h'h\WorkBuddy\2026-10-12-11-59-30\ai-novel-generator`
+- 项目路径：`<本机工作区路径>`
 - 你的 worktree：`worktrees/master`（HEAD = `6e6f406`）
 - 用户名含单引号 → bash 路径会炸，命令写成 .py 脚本放 scratch 目录执行，不要 python -c
-- 后端 venv：`C:\Users\h'h'h\AppData\Local\Programs\Python\Python313\python.exe`（有 sqlalchemy 2.0.35）
+- 后端 venv：`<本机 python>`（有 sqlalchemy 2.0.35）
 - 跑测试前必须 `env.pop("PYTHONPATH") + env.pop("VIRTUAL_ENV")`（在 .py 脚本里），否则 venv 被 Hermes 环境覆盖
 - git commit 用 `git commit -F msg文件`（**不要**在 commit message 里用反引号）
 - 不要碰 `worktrees/timeline-pacing` 和 `worktrees/style-distill`（其他 agent 的）

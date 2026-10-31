@@ -5,10 +5,10 @@
 
 ## 一、环境（关键，别踩坑）
 
-- worktree：C:\Users\h'h'h\WorkBuddy\2026-10-12-11-59-30\ai-novel-generator\worktrees\timeline-pacing
+- worktree：<本机工作区路径>
 - 分支：feat/timeline-pacing，基于 master 5bb5701 切出（隔离了主线其他 agent 的未提交改动）
-- 用户名含单引号 h'h'h：bash 里 cd 必须双引号包整个路径，如 cd "C:/Users/h'h'h/..."。不带引号会被解析坏。
-- Python：C:/Users/h'h'h/AppData/Local/Programs/Python/Python313/python.exe（有 sqlalchemy 2.0.35）
+- 用户名含单引号时：bash 里 cd 必须双引号包整个路径，如 cd "<路径>"。不带引号会被解析坏。
+- Python：<本机 python> sqlalchemy 2.0.35）
 - 测试风格：独立脚本，不是 pytest——python tests/test_xxx.py，脚本自己 sys.exit
 - LLM：智谱 glm-4-flash。起服务环境变量：
   LLM_PROVIDER=zhipu

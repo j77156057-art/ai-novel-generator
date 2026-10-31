@@ -20,6 +20,8 @@
   - **只标红**：审计前后正文逐字节不变
 """
 from __future__ import annotations
+import os
+import tempfile
 
 import copy
 import json

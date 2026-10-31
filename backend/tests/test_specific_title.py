@@ -29,9 +29,10 @@ v2.237 的 `_VOICE_STOP_WORDS` 把「和尚」「儒生」这类泛称收进去�
 
 「和尚」「道士」本身是泛称（指任意僧人/道人），只有加前缀才具体化。
 """
+import os
 import sys
 
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.style.narrative import (  # noqa: E402
     _is_specific_title,

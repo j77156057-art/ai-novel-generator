@@ -27,3 +27,6 @@ backend/live_result.txt
 # data/seed/ 下 UTF-8 解码后文件名笔误的旧版种子（保留本地不再入库）
 data/seed/【示例·网文】组建-王德财.txt
 data/seed/【示例·网文】黑市病案-无证证词.txt
+
+# 根目录散落的语料/草稿（真实作品原文、下载的 txt）——绝不进版本库
+/*.txt

@@ -5,10 +5,11 @@ A. async_chat 返回字符串（与 chat() 一致）
 B. asyncio.gather 多个 async_chat 真正并发（3 个 fake 调 0.3s, 整并发耗时 < 0.5s）
 C. async_chat 把 exceptions 透传（chat 抛错时 gather return_exceptions=True 能接住）
 """
+import os
 import asyncio
 import time
 import sys
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.llm.provider import LLMProvider
 

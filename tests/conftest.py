@@ -106,7 +106,7 @@ def _force_isolated_database() -> str:
         )
 
     # (b) 允许的临时目标选择：
-    #     - 显式传入的库若落在已存在的目录里 → 沿用（尊重「用 D:/Temp 下的临时库」）；
+    #     - 显式传入的库若落在已存在的目录里 → 沿用（尊重「用临时目录下的临时库」）；
     #     - 否则退到 AI_NOVEL_TEST_DB_DIR，再退到系统临时目录。
     if incoming_path and os.path.isdir(os.path.dirname(incoming_path)):
         target = incoming_path

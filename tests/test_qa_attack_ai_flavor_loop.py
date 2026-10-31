@@ -8,7 +8,7 @@
 本文件**只新增测试断言，不修改任何业务代码**。运行方式：
 
   backend/venv/Scripts/python.exe -m pytest tests/test_qa_attack_ai_flavor_loop.py -v \
-      --basetemp=D:/Temp/gate_qa
+      --basetemp=<临时目录>
 
 攻击面（实现者声称已覆盖之外的角度）：
   A. 闭环污染：跨项目泄漏 / global 行误读 / Writer 直连路径 / 人工提案覆写被踩

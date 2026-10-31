@@ -17,7 +17,7 @@ import os from "node:os";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const MANAGED = "C:/Users/h'h'h/.workbuddy/binaries/node/workspace/node_modules/playwright-core";
+const MANAGED = process.env.PLAYWRIGHT_CORE || "playwright-core";
 
 function loadChromium() {
   for (const spec of [process.env.E2E_PW || "playwright-core", MANAGED]) {
@@ -37,7 +37,7 @@ const PID = process.env.E2E_PID || "1";
 const URL_PROJECT = `${BASE}/projects/${PID}`;
 const EXE =
   process.env.E2E_CHROME ||
-  "C:/Users/h'h'h/AppData/Local/ms-playwright/chromium-1248/chrome-win64/chrome.exe";
+  process.env.CHROMIUM_PATH || "";
 const SHOT = process.env.E2E_SHOT || path.join(os.tmpdir(), `qa6_assistant_${PID}.png`);
 
 let pass = 0;

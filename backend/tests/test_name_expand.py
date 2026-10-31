@@ -7,6 +7,9 @@ C. 扩展率字段正确返回（0~1）
 D. 样本太少时不扩展（< 20 次）
 E. 优先采纳更长的扩展（1-2 字里取更完整的）
 """
+import os
+import pathlib
+import os
 import pathlib
 import sys
 
@@ -15,9 +18,24 @@ sys.path.insert(0, str(BACKEND))
 
 from app.style.narrative import _expand_names_from_corpus, _extend_name_candidates
 
+#: 语料目录：环境变量 NOVEL_DIR → 仓库的 data/seed → 本机 Downloads。
+#: 语料不随仓库分发，找不到就由调用方跳过（不写死任何绝对路径）。
+_CORPUS_DIRS = [pathlib.Path(d) for d in
+                (os.environ.get("NOVEL_DIR"), "data/seed", str(pathlib.Path.home() / "Downloads"))
+                if d]
+
+
+def _corpus(name: str) -> pathlib.Path:
+    """在语料目录里找一份语料：NOVEL_DIR → data/seed → 本机 Downloads。"""
+    for d in _CORPUS_DIRS:
+        p = d / name
+        if p.exists():
+            return p
+    return _CORPUS_DIRS[0] / name
+
 # 用仓库/下载目录的真实语料；缺失时退化到内置片段
 CORPUS_CANDIDATES = [
-    pathlib.Path(r"C:\Users\h'h'h\Downloads\雪中悍刀行.txt"),
+    _corpus("雪中悍刀行.txt"),
 ]
 
 

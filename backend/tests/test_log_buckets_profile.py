@@ -11,8 +11,13 @@ E. 退化路径：短语料切不出长 bucket（4 断言）
 
 设计文档：docs/style_log_buckets_design.md
 """
+import pathlib
 import os
 import sys
+
+#: 语料目录：默认仓库的 data/seed，也可用环境变量 NOVEL_DIR 指向别处；
+#: 语料不在就跳过对应用例（语料不随仓库分发）。
+_CORPUS_DIR = pathlib.Path(os.environ.get("NOVEL_DIR", "data/seed"))
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -33,7 +38,7 @@ def check(name, cond, *, detail=""):
 def _make_reference():
     """从大奉 5 章（~50K 字）合成 5 个 fake 章节，~50KB 总长，保证三档都够切。"""
     from pathlib import Path
-    dafeng5 = Path(r"C:/Users/h'h'h/AppData/Local/hermes/cache/scratch/dafeng_前15章.txt")
+    dafeng5 = Path(_CORPUS_DIR) / "dafeng_前15章.txt"
     if not dafeng5.exists():
         return None
     return dafeng5.read_text(encoding="utf-8")

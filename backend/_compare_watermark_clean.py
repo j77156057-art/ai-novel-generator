@@ -3,12 +3,13 @@
 只读 Downloads 里原文，不改动。输出 JSON 到 stdout（供人抄进 docs/corpus/ 对比报告）。
 
 用法（在 backend/ 目录下）：
-    python _compare_watermark_clean.py "C:/Users/h'h'h/Downloads/斗破苍穹.txt"
+    python _compare_watermark_clean.py str(_corpus("斗破苍穹.txt"))
 """
 from __future__ import annotations
+import os
+import pathlib
 
 import json
-import os
 import re
 import sys
 
@@ -16,6 +17,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.corpus_health import scan_watermarks, strip_watermarks  # noqa: E402
 from app.ingestion.encoding import read_text_file  # noqa: E402
+
+#: 语料目录：环境变量 NOVEL_DIR → 仓库的 data/seed → 本机 Downloads。
+#: 语料不随仓库分发，找不到就由调用方跳过（不写死任何绝对路径）。
+_CORPUS_DIRS = [pathlib.Path(d) for d in
+                (os.environ.get("NOVEL_DIR"), "data/seed", str(pathlib.Path.home() / "Downloads"))
+                if d]
+
+
+def _corpus(name: str) -> pathlib.Path:
+    """在语料目录里找一份语料：NOVEL_DIR → data/seed → 本机 Downloads。"""
+    for d in _CORPUS_DIRS:
+        p = d / name
+        if p.exists():
+            return p
+    return _CORPUS_DIRS[0] / name
 
 #: 残留检查用的特征串（水印 / 盗版站标记 / 乱码）。
 RESIDUAL_TOKENS = ("武动乾坤", "最新章节", "请记住", "www.", "。武动乾坤")

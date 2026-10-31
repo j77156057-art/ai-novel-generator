@@ -7,9 +7,10 @@ C. 数值语义正确：全短句文本的短句占比=1.0，全对白段落=对
 D. _format_features_rule 产出非空且含关键数字
 E. prompt 前缀已注入（user 含「本块客观统计」，system 不再要求文笔量化审计）
 """
+import os
 import sys
 
-sys.path.insert(0, r"C:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/worktrees/master/backend")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.style.narrative import (
     build_deterministic_features,

@@ -12,7 +12,7 @@
 不碰真实开发库：DATABASE_URL 必须由外部指向临时库（脚本自检并拒绝非临时库）。
 
 用法（在 backend/ 目录下）：
-    DATABASE_URL="sqlite:///D:/Temp/demo_step10.db" python _demo_step10_clean.py
+    DATABASE_URL="sqlite:///./demo_step10.db" python _demo_step10_clean.py
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ _url = os.environ.get("DATABASE_URL", "")
 if "novel_dev.db" in _url or "novel_demo.db" in _url or not _url:
     raise SystemExit(
         f"拒绝运行：DATABASE_URL={_url!r} 未指向临时库。"
-        "请显式设置到临时目录（如 D:/Temp/demo_step10.db）。"
+        "请显式设置到临时目录（如 ./demo_step10.db）。"
     )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
