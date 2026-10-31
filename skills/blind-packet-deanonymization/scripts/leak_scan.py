@@ -47,20 +47,70 @@ def _backend_on_path(backend: str = "") -> Path:
                      "或把脚本放在仓库的 skills/<name>/scripts/ 下）")
 
 
+def _slug(name: str) -> str:
+    """与 `verify_acceptance_real._slug` 同款（缓存文件名要对得上）。"""
+    out = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in (name or ""))
+    return (out or "x")[:40]
+
+
+def _verdicts(cache_path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    verdicts = data.get("verdicts", data) if isinstance(data, dict) else {}
+    return {w: v for w, v in verdicts.items() if v} if isinstance(verdicts, dict) else {}
+
+
 def check_judged_residue(packet: Path, samples: str) -> list[str]:
-    """口径 1：判定成专名的词，必须一个都不在题面里。"""
+    """口径 1：判定成专名的词，必须一个都不在题面里。
+
+    ## 为什么必须**按书核对**（2026-10-31 修）
+
+    原来是把**每个缓存文件**里的专名拿到**整份题面**里搜 ——
+    跨书误报很严重：同一个词在 A 书里是专名（「云深」在《回声年代》里判成
+    character）、在 B 书里不是（《道途魔典》里判成不是专名），
+    只要它出现在题面的**任何一侧**就被报成残留。
+
+    ⇒ 现在按题逐题核对：**这一题的人类侧片段**只用**它那本书**的缓存查，
+    **我们侧片段**只用该臂的缓存查 ⇒ 不再有跨书误报。
+    """
+    key_path = packet / "blind_key.json"
+    if not key_path.exists():
+        print("[1] 跳过（包里没有 blind_key.json，没法按书核对）")
+        return []
+    try:
+        key = json.loads(key_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        print("[1] 跳过（blind_key.json 读不出来）")
+        return []
+    meta = {it.get("sample_id"): it for it in key.get("items", [])}
+    pairs = parse_items(samples)
+    if not meta or not pairs:
+        print("[1] 跳过（题面或密封文件里没解析出题目）")
+        return []
+
     leaked: list[str] = []
-    for cache_path in sorted(packet.glob("blind_names_*.json")):
-        try:
-            data = json.loads(cache_path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
+    for sid, a_text, b_text in pairs:
+        it = meta.get(sid)
+        if not it:
             continue
-        verdicts = data.get("verdicts", data) if isinstance(data, dict) else {}
-        names = [w for w, v in verdicts.items() if v]
-        hits = [w for w in names if w in samples]
-        print(f"[1] {cache_path.name}：判成专名 {len(names)} 个，"
-              f"仍出现在题面里的 {len(hits)} {hits[:10]}")
-        leaked += hits
+        human_side = a_text if it.get("slot_A") == "human" else b_text
+        our_side = b_text if it.get("slot_A") == "human" else a_text
+        for cache_path in (
+            packet / f"blind_names_human_{_slug(it.get('human_source', ''))}.json",
+            packet / f"blind_names_ours_{_slug(it.get('arm', ''))}.json",
+        ):
+            if not cache_path.exists():
+                continue
+            names = _verdicts(cache_path)
+            scope = human_side if cache_path.name.startswith("blind_names_human") else our_side
+            hits = [w for w in names if w in scope]
+            if hits:
+                print(f"[1] {sid}　{cache_path.name}：仍出现在这一题里 {len(hits)} {hits[:10]}")
+                leaked += hits
+    if not leaked:
+        print("[1] 按书核对：判定成专名的词，没有一个还留在题面里")
     return leaked
 
 
@@ -116,11 +166,20 @@ def parse_items(samples: str) -> list[tuple[str, str, str]]:
     for line in samples.splitlines():
         if line.startswith("## 第"):
             if cur_id and side:
-                items.append((cur_id, "A", "\n".join(buf)))
+                # ⚠️ 这里必须用 **side**，不能写死 "A" ——
+                # 换题时 buf 里装的是**上一题的 B 段**（遇到 "**B**" 时 buf 被清空过），
+                # 写死 "A" 会把 B 段记成 A 段 ⇒ 重组时缺 "B" ⇒ **一题都解析不出来**
+                # （实测：这个 bug 让口径 4 一直在「跳过」）。
+                items.append((cur_id, side, "\n".join(buf)))
             cur_id, side, buf = "", "", []
             head = line.strip()
-            if "(" in head and head.endswith(")"):
-                cur_id = head[head.rfind("(") + 1:-1]
+            # ⚠️ 题面里的题号用的是**全角括号**「（s01）」——
+            # 只认 ASCII 括号会永远提取不到题号 ⇒ 一题都解析不出来
+            # （实测：这个 bug 让口径 1 与口径 4 一直在「跳过」）。
+            if ("(" in head and head.endswith(")")) or \
+                    ("（" in head and head.endswith("）")):
+                idx = max(head.rfind("("), head.rfind("（"))
+                cur_id = head[idx + 1:-1]
             continue
         if line.strip() in ("**A**", "**B**"):
             if cur_id and side:
@@ -166,11 +225,45 @@ def check_genre_mismatch(packet: Path, backend: str = "") -> list[str]:
         if da and db and da != db:
             print(f"[4] {sid}：A 主导={da}　B 主导={db} ⇒ 两侧题材不同（要看一眼）")
             bad.append(sid)
+        elif da and db:
+            # 两侧都有主导题材**且相同** ⇒ 词表口径下也是同一题材 ⇒ 不用看
+            continue
         elif da or db:
             print(f"[4] {sid}：只有一侧露题材指纹（A={da or '无'}　B={db or '无'}）"
                   "⇒ 一侧看不出题材（要看一眼）")
             bad.append(sid)
     print(f"[4] 逐题题材核对：{len(pairs)} 题，{len(bad)} 题需要人眼过一遍")
+    return bad
+
+
+def check_flavor_asymmetry(packet: Path, backend: str = "") -> list[str]:
+    """口径 5：**世界观级子题材指纹对称**（完全不用 LLM）。
+
+    口径 4 用的是粗题材词表（分不清军旅/宅斗/系统流这些**闭集外**的子题材），
+    这一遍用 `acceptance_lib.flavor_asymmetry` 单独查一遍：
+    某一类子题材指纹**只在一侧**出现 ⇒ 评者能靠题材定位 ⇒ 要看一眼。
+
+    ⚠️ 词表口径会有误判（这套词表本来就是**粗筛**）⇒ 命中是「要看一眼」，
+    不是「一定泄露」；但**出包时这一条是硬门槛**（不对称就换窗口）。
+    """
+    _backend_on_path(backend)
+    from acceptance_lib import flavor_asymmetry  # noqa: E402
+
+    samples = (packet / "blind_samples.md").read_text(encoding="utf-8")
+    pairs = parse_items(samples)
+    if not pairs:
+        print("[5] 跳过（题面里没解析出题目）")
+        return []
+    bad: list[str] = []
+    for sid, a, b in pairs:
+        asym = flavor_asymmetry(a, b)
+        if asym:
+            detail = "、".join(
+                f"{x['class']}（只在{x['only_in']}侧，{x['hits_a']} vs {x['hits_b']}）"
+                for x in asym)
+            print(f"[5] {sid}：子题材指纹不对称 {detail} ⇒ 要看一眼")
+            bad.append(sid)
+    print(f"[5] 子题材指纹对称：{len(pairs)} 题，{len(bad)} 题需要人眼过一遍")
     return bad
 
 
@@ -194,6 +287,7 @@ def main() -> int:
     if args.judge_provider:
         check_text_level(packet, args.judge_provider, args.backend)
     check_genre_mismatch(packet, args.backend)
+    check_flavor_asymmetry(packet, args.backend)
 
     print("=" * 60)
     if leaked:

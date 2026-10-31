@@ -88,9 +88,12 @@ class _StubJudge:
                             "genre": self._genre(it.get("text") or "")})
             return json.dumps(arr, ensure_ascii=False)
         if "校对" in system:          # 题面级复查
-            # 每轮只报一个（队列）—— 模拟「复查每轮都揪出新名字」
-            if self.residual:
-                return json.dumps([self.residual.pop(0)], ensure_ascii=False)
+            # 报告**当前文本里还在的**第一个候选名 —— 模拟「每轮都揪出新名字」。
+            # （不能无条件报队首：名字被遮掉后就不在文本里了，报了也会被
+            #   「只认正文里真有的」那一关滤掉 ⇒ 模拟不出「补不干净」。）
+            for n in self.residual:
+                if n in user:
+                    return json.dumps([n], ensure_ascii=False)
             return json.dumps([], ensure_ascii=False)
         words = [w.strip() for w in user.split("：", 1)[-1].split("、") if w.strip()]
         arr = []
@@ -444,13 +447,25 @@ def test_题面里残留的专名会被补遮(tmp_path):
 
 
 def test_残留专名补不干净就不发题面(tmp_path):
-    """每一轮复查都报新名字 ⇒ 补不干净 ⇒ 整包作废（fail closed）。"""
+    """每一轮复查都报新名字 ⇒ 补不干净 ⇒ 整包作废（fail closed）。
+
+    ⚠️ **逐题复查**（2026-10-31 改）后，一次出包会调「题面级复查」**每题一次**。
+    stub 每次都报「当前文本里还在的」第一个候选名 ⇒ 补了一轮又冒出一个，
+    轮数用完仍有残留 ⇒ 最后一轮仍有残留 ⇒ 整包作废、题面不发出去。
+
+    （轮数是 `RESIDUAL_ROUNDS`，本测试不写死它 ——
+      文本里的名字够多（18 个）⇒ 任何轮数都补不干净 ⇒ 语义与轮数无关。）
+    """
     sys.path.insert(0, str(BACKEND))
     from verify_acceptance_real import build_blind_packet
 
-    line = ("赵长安、钱小七站在路灯下，雨还在下，他把手机揣回兜里，出了便利店。")
+    # 正文里放够多的名字：每个被补遮掉，下一轮就冒出下一个
+    many = ["赵长安", "钱小七", "孙明月", "李听澜", "周砚秋", "吴子期",
+            "郑云舟", "王怀瑾", "冯清和", "陈砚之", "褚明玉", "卫南风",
+            "蒋寒星", "沈青崖", "韩暮辞", "杨九思", "朱见山", "秦未央"]
+    line = "、".join(many) + "站在路灯下，雨还在下，他把手机揣回兜里，出了便利店。"
     corpus = [("现代都市", line * 40)]
-    p = _StubJudge({"林夜"}, residual=["苏晚", "赵长安", "钱小七"])
+    p = _StubJudge({"林夜"}, residual=list(many))
     out_dir = tmp_path
     info = build_blind_packet(_rows(), corpus, out_dir, provider=p)
     assert info["emitted"] is False, info
@@ -507,4 +522,101 @@ def test_出18题的包_记录表与题数一致(tmp_path):
     # 题面里的题数也要对得上
     samples = (out_dir / "blind_samples.md").read_text(encoding="utf-8")
     assert samples.count("**A**") == 18, samples.count("**A**")
+
+
+# --------------------------------------------------------------------------- #
+# 题面级复查的**假阳性**（2026-10-31 实测：18 题包卡在假阳性上，题面发不出去）
+# --------------------------------------------------------------------------- #
+
+class _ResidualStub:
+    """只会回答「题面里还剩哪些专名」的假 provider。"""
+
+    def __init__(self, reported):
+        self.reported = list(reported)
+        self.calls = 0
+
+    def chat(self, system, user):  # noqa: ARG002
+        self.calls += 1
+        return json.dumps(self.reported, ensure_ascii=False)
+
+
+def test_占位符不被当成残留专名():
+    """模型把已经遮好的「＃＃＃」报回来 —— 那不是专名，遮它只会越遮越长。"""
+    sys.path.insert(0, str(BACKEND))
+    from acceptance_lib import residual_proper_nouns
+
+    text = "他＃＃＃站在门口，雨还在下。"
+    p = _ResidualStub(["＃＃＃", "＃＃"])
+    out = residual_proper_nouns(text, p)
+    assert out == [], out
+
+
+def test_带杂质字符的名字照样遮掉():
+    """「灶|房」：竖线是抓取残留。
+
+    ⚠️ 这种**不能丢** —— 丢掉就等于让竖线原样留在题面上，
+    评者一看就知道这文本被处理过（还会以为是机器那边被处理了 ⇒ 反而偏向另一侧）。
+    遮掉反而干净：等长占位符会把竖线一起吃掉。
+    """
+    sys.path.insert(0, str(BACKEND))
+    from acceptance_lib import residual_proper_nouns
+
+    text = "灶|房里没有人，门是虚掩着。"
+    p = _ResidualStub(["灶|房"])
+    assert residual_proper_nouns(text, p) == ["灶|房"]
+
+
+def test_杂质字符加超长串被丢掉():
+    """模型偶尔会把一整句话抄回来（长度 > 6 且带杂质字符）—— 那不是名字。
+
+    ⚠️ 这条也是回归护栏：过滤器的长度判断一旦写错（比如少了常量定义），
+    这里就会抛 NameError，整包以「复查失败」作废 —— 一次改动毁掉一整轮出包。
+    """
+    sys.path.insert(0, str(BACKEND))
+    from acceptance_lib import residual_proper_nouns
+
+    text = "他说了一句很长的话，长到不像一个名字，里面还有竖线|。"
+    p = _ResidualStub(["很长很长很长的一句话|"])
+    assert residual_proper_nouns(text, p) == []
+
+
+def test_两字切串残渣被丢掉():
+    """《道途魔典》「他带柳入林而入」里的「带柳」是跨词残渣，不是人名。"""
+    sys.path.insert(0, str(BACKEND))
+    from acceptance_lib import residual_proper_nouns
+
+    text = "他带柳入林而入，只见有个少年站在那里。"
+    p = _ResidualStub(["带柳"])
+    assert residual_proper_nouns(text, p) == []
+
+
+def test_三字真地名不被当成残渣丢掉():
+    """⚠️ 反向护栏：「藏经阁」的「藏」也在动词表里 —— 若按动词首字一刀切，
+    真地名会被当成残渣丢掉 ⇒ **漏遮** ⇒ 真名暴露出处。"""
+    sys.path.insert(0, str(BACKEND))
+    from acceptance_lib import residual_proper_nouns
+
+    text = "他推开藏经阁的门，里面全是灰。"
+    p = _ResidualStub(["藏经阁"])
+    assert residual_proper_nouns(text, p) == ["藏经阁"]
+
+
+def test_安全闸门不缓存否定结论(tmp_path):
+    """⚠️ 安全闸门**不能缓存否定结论**。
+
+    踩过的坑（2026-10-31）：模型是非确定性的 —— 同一段文字问两次，
+    答案可能不同（实测 s06 的「麻子」第一次没报、第二次报了）。
+    一旦「这段是干净的」被缓存下来，之后每次重建都白捡这个**假阴性**：
+    题面上留着真名，却以为已经查过了。
+    """
+    sys.path.insert(0, str(BACKEND))
+    from acceptance_lib import residual_proper_nouns
+
+    text = "他带柳入林而入，只见有个少年站在那里。"
+    cache_path = tmp_path / "resid.json"
+    p = _ResidualStub([])
+    residual_proper_nouns(text, p, cache_path=cache_path)
+    residual_proper_nouns(text, p, cache_path=cache_path)
+    assert p.calls == 2, "同一段文字问两次 ⇒ 必须真的问两次，不能吃缓存"
+    assert not cache_path.exists(), "安全闸门不该写判定缓存"
 
