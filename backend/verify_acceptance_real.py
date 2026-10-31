@@ -1231,19 +1231,44 @@ def build_multi_arm_packet(arms: list[dict], out_dir: Path, provider=None,
                 "per_arm": per_arm}
 
     (out_dir / "blind_samples.md").write_text("\n".join(lines), encoding="utf-8")
-    sheet = ["# 盲评记录表", "",
-             "| sample | 更像人写 | 主线更清 | 有 AI 腔 | 猜 AI | 备注 |",
-             "|---|---|---|---|---|---|"]
-    for it in items:
-        sheet.append(f"| {it['id']} | A / B | A / B | A / B | A / B | |")
-    sheet += ["", "## 合计", "", "- 「更像人写」选我们那段的次数 k = ____",
-              "- 评者人数 = ____（题面每份独立作答，互不通气）",
-              f"- 判定 n = 评者人数 × {len(items)}"]
-    (out_dir / "blind_sheet.md").write_text("\n".join(sheet), encoding="utf-8")
+    (out_dir / "blind_sheet.md").write_text(build_blind_sheet(items), encoding="utf-8")
     return {"n": len(items), "blind": True, "reasons": reasons, "emitted": True,
             "positions": [c["seg"] for c in chosen],
             "mask_density": {"ours": dens_ours, "human": dens_human},
             "per_arm": per_arm}
+
+
+def build_blind_sheet(items: list[dict]) -> str:
+    """生成盲评**记录表**（给评者填的那张）。
+
+    ## 为什么只有**两列**（2026-10-31 改）
+
+    原来的表有四列：「更像人写」「主线更清」「有 AI 腔」「猜 AI」。
+    主人当场点破：「猜了哪个更像人写，另外那个不就是 AI 了么」
+    ⇒ **强制二选一下，「猜 AI」与「更像人写」必然取反，「有 AI 腔」同理**
+    ⇒ 这两列的**信息量是零**，还让评者多填 36 次。
+
+    ⇒ 现在只留两列：
+    - 「更像人写」—— **判定用**（二项检验的主指标）；
+    - 「主线更清」—— **独立维度**（叙事清晰度 ≠ 像不像人写的），
+      判定脚本拿它出**交叉表**：两列指向不同侧的那些题 =
+      「我们的产出是主线清楚但不像人写（语言层问题），
+      还是像人写但主线乱（结构层问题）」。
+
+    「备注」列留着：评者如果认出某一侧出自哪本书，写在这一列，
+    判定脚本会把它单独拎出来（那一题不计入统计）。
+    """
+    lines = ["# 盲评记录表", "",
+             "两列都填 `A` 或 `B`；**备注**列可留空 —— 但如果你觉得某一侧出自某本具体的书，",
+             "请写在这一列（那一题会被单独剔除，不计入判定）。", "",
+             "| sample | 更像人写 | 主线更清 | 备注 |",
+             "|---|---|---|---|"]
+    for it in items:
+        lines.append(f"| {it['id']} | A / B | A / B | |")
+    lines += ["", "## 合计", "", "- 「更像人写」选我们那段的次数 k = ____",
+              "- 评者人数 = ____（题面每份独立作答，互不通气）",
+              f"- 判定 n = 评者人数 × {len(items)}"]
+    return "\n".join(lines)
 
 
 def _slug(name: str) -> str:
@@ -1507,16 +1532,7 @@ def build_blind_packet(rows: list[dict], corpus: list[tuple[str, str]], out_dir:
                 "mask_density": {"ours": dens_ours, "human": dens_human}}
 
     (out_dir / "blind_samples.md").write_text("\n".join(lines), encoding="utf-8")
-
-    sheet = ["# 盲评记录表", "",
-             "| sample | 更像人写 | 主线更清 | 有 AI 腔 | 猜 AI | 备注 |",
-             "|---|---|---|---|---|---|"]
-    for it in items:
-        sheet.append(f"| {it['id']} | A / B | A / B | A / B | A / B | |")
-    sheet += ["", "## 合计", "", "- 「更像人写」选我们那段的次数 k = ____",
-              "- 评者人数 = ____（题面每份独立作答，互不通气）",
-              f"- 判定 n = 评者人数 × {len(items)}"]
-    (out_dir / "blind_sheet.md").write_text("\n".join(sheet), encoding="utf-8")
+    (out_dir / "blind_sheet.md").write_text(build_blind_sheet(items), encoding="utf-8")
     return {"positions": [r["seg"] for r in picked], "n": n_snips, "blind": blind,
             "reasons": verdict["reasons"], "emitted": True,
             "mask_density": {"ours": dens_ours, "human": dens_human}}

@@ -31,6 +31,18 @@
    （1 人 × 18 题）。后者省事，但同一个人的 18 次判断不是独立的
    （口味是相关的）⇒ 符号检验会把 p 值算得偏乐观，结论只能说「倾向」。
 
+## 记录表只有两列，另一列用来出**交叉表**
+
+- 第 1 列「更像人写」—— 判定用（上面的二项检验）；
+- 第 2 列「主线更清」—— **独立维度**（叙事清晰度 ≠ 像不像人写的）；
+  脚本拿它出交叉表：两列**指向不同侧**的那些题 = 诊断信息
+  （我们的产出是「主线清楚但不像人写」⇒ 语言层问题；
+  「像人写但主线乱」⇒ 结构层问题）。
+
+⚠️ 旧的四列表（「有 AI 腔」「猜 AI」）在**强制二选一**下与第 1 列**互补**
+⇒ 信息量为零 ⇒ 2026-10-31 删掉（判定脚本本来也只用第 1 列）。
+旧表仍能读；**按表头名取列，不按位置**。
+
 用法：
     python verify_blind_eval.py --sheet out/acceptance/blind_sheet.csv \\
                                 --key  out/acceptance/blind_key.json
@@ -51,9 +63,33 @@ COL_MAIN = "主线更清"
 COL_AI = "有AI腔"
 COL_GUESS = "猜AI"
 
+#: 旧表头 → 规范名（表头里可能有空格）。
+#:
+#: ⚠️ **只有两列是有效的**：「更像人写」「主线更清」。
+#: 「有 AI 腔」「猜 AI」两列在**强制二选一**下与第一列**互补**（必然取反）⇒
+#: 信息量为零 ⇒ 2026-10-31 删掉（主人当场指出：「猜了哪个更像人写，
+#: 另外那个不就是 AI 了么」⇒ 同一个意思问了两遍）。
+#:
+#: 旧表仍然能读：多出来的列按表头位置取，不影响判定。
+_ALIASES = {
+    "更像人写": COL_HUMAN,
+    "主线更清": COL_MAIN,
+    "有AI腔": COL_AI,
+    "猜AI": COL_GUESS,
+}
+
+
+def _norm_header(cell: str) -> str:
+    """表头归一：去掉空格与强调符号。"""
+    return re.sub(r"[\s*]", "", cell or "")
+
 
 def parse_sheet(path: Path) -> list[dict]:
-    """读作答表。支持 CSV 与 Markdown 表格两种填法。"""
+    """读作答表。支持 CSV 与 Markdown 表格两种填法。
+
+    ⚠️ **按表头取列**，不按位置 —— 位置一改就全错位（2026-10-31 删列时踩过）。
+    表头认不出来时退回位置约定（sample / 更像人写 / 主线更清 / …）。
+    """
     text = path.read_text(encoding="utf-8")
     rows: list[dict] = []
     if path.suffix.lower() == ".csv":
@@ -61,18 +97,28 @@ def parse_sheet(path: Path) -> list[dict]:
             if (r.get("sample") or "").strip():
                 rows.append({k: (v or "").strip() for k, v in r.items()})
         return rows
-    # markdown 表：| s01 | A | B | A | A | 备注 |
+    # markdown 表：先读表头拿列名，再按列名取
+    header: list[str] = []
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("|"):
             continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
+        cells = [_norm_header(c) for c in line.strip("|").split("|")]
+        if not header and cells and cells[0] == "sample":
+            header = cells
+            continue
         if not cells or not re.match(r"^s\d+$", cells[0]):
             continue
-        if len(cells) < 4:
-            continue
-        rows.append({"sample": cells[0], COL_HUMAN: cells[1], COL_MAIN: cells[2],
-                     COL_AI: cells[3], COL_GUESS: cells[4] if len(cells) > 4 else ""})
+        if not header:
+            header = ["sample", COL_HUMAN, COL_MAIN, COL_AI, COL_GUESS, "备注"]
+        rec: dict[str, str] = {}
+        for i, cell in enumerate(cells):
+            name = header[i] if i < len(header) else ""
+            if not name:
+                continue
+            rec[_ALIASES.get(name, name)] = cell
+        rec.setdefault("sample", cells[0])
+        rows.append(rec)
     return rows
 
 
@@ -136,9 +182,20 @@ def main() -> int:
     if missing:
         print(f"⚠️ 还没作答的题：{missing}（按已作答的算，结果偏乐观）")
 
+    # ⚠️ **备注列写了的题单独拎出来** —— 评者如果认出某一侧出自哪本书，
+    #    那一题的判断就不是「盲」的了 ⇒ 人工剔除，不计入统计。
+    flagged = [r["sample"] for r in answered
+               if (r.get("备注") or r.get("remark") or r.get("note") or "").strip()]
+    if flagged:
+        print(f"⚠️ 这些题**评者写了备注**（可能认出了出处）⇒ 请人工确认是否剔除：{flagged}")
+
     n = len(answered)
     k = 0
     detail = []
+    #: 第二列「主线更清」的交叉分析：对我们那一段，四种组合各几题
+    cross = {"both": 0, "human_only": 0, "ours_only": 0, "neither": 0}
+    k_main = 0
+    n_main = 0
     for r in answered:
         item = key_items.get(r["sample"])
         if not item:
@@ -150,6 +207,23 @@ def main() -> int:
             k += 1
         detail.append((r["sample"], "A" if ours else "B", r.get(COL_HUMAN, "").upper(),
                        item["our_segment_no"]))
+
+        # —— 第二列：主线更清（**独立维度**：叙事清晰度，不是「像不像人写的」）——
+        ans_main = (r.get(COL_MAIN) or "").upper()
+        if ans_main in ("A", "B"):
+            n_main += 1
+            slot_main = item["slot_A"] if ans_main == "A" else item["slot_B"]
+            ours_main = (slot_main == "ours")
+            if ours_main:
+                k_main += 1
+            if ours and ours_main:
+                cross["both"] += 1
+            elif ours:
+                cross["human_only"] += 1
+            elif ours_main:
+                cross["ours_only"] += 1
+            else:
+                cross["neither"] += 1
 
     print()
     for s, ours_slot, ans, seg in detail:
@@ -163,6 +237,26 @@ def main() -> int:
     print(f"  n = {n}　k = {k}（我们那段被判「更像人写」的次数）")
     print(f"  P(X ≤ k | p=0.5) = {p:.4f}　← 判定用的那一侧（下尾）")
     print(f"  P(X ≥ k | p=0.5) = {p_up:.4f}　← 反向证据：比随机猜更常被选中")
+
+    if n_main:
+        p_main = binom_tail_le(k_main, n_main)
+        print()
+        print(f"  【第二列】n = {n_main}　k = {k_main}"
+              f"（我们那段被判「主线更清」的次数）　P(X ≤ k) = {p_main:.4f}")
+        print("  两列交叉（对我们那段）：")
+        print(f"    更像人写 + 主线更清 都是我们 = {cross['both']}")
+        print(f"    只有更像人写是我们           = {cross['human_only']}")
+        print(f"    只有主线更清是我们           = {cross['ours_only']}")
+        print(f"    两个都不是我们               = {cross['neither']}")
+        split = cross["human_only"] + cross["ours_only"]
+        print(f"    ⇒ 两列**指向不同侧**的题 = {split}/{n_main}"
+              "（评者认为「主线更清楚的那段」和「更像人写的那段」不是同一段）")
+        if split:
+            print("      这一格是**诊断信息**：我们的产出若是「主线清楚但不像人写」，")
+            print("      问题在语言层（腔、句式）；若是「像人写但主线乱」，问题在结构层。")
+    else:
+        print("  （第二列「主线更清」没有作答 —— 交叉分析跳过；判定不受影响。）")
+
     if n < 18:
         print(f"  ⚠️ n = {n} < 18：这个检验**没有足够力量**"
               f"（多请人，或把题数加到 18，凑够 n=18）。")

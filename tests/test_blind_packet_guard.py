@@ -517,11 +517,98 @@ def test_出18题的包_记录表与题数一致(tmp_path):
     sheet = (out_dir / "blind_sheet.md").read_text(encoding="utf-8")
     assert "判定 n = 评者人数 × 18" in sheet, sheet
     assert "× 6" not in sheet, sheet
-    assert sheet.count("| A / B | A / B | A / B | A / B | |") == 18, sheet
+    assert sheet.count("| A / B | A / B | |") == 18, sheet
 
     # 题面里的题数也要对得上
     samples = (out_dir / "blind_samples.md").read_text(encoding="utf-8")
     assert samples.count("**A**") == 18, samples.count("**A**")
+
+
+def test_记录表只留两列_另外两列在二选一下是废话(tmp_path):
+    """⚠️ 「有 AI 腔」「猜 AI」这两列**信息量为零**。
+
+    记录表要求**每列二选一** ⇒ 「猜 AI」与「更像人写」**必然取反**，
+    「有 AI 腔」同理 ⇒ 问了三遍同一件事，还让评者多填 36 次。
+
+    主人当场点破：「猜了哪个更像人写，另外那个不就是 AI 了么」。
+
+    ⇒ 记录表只留两列：「更像人写」（判定用）+「主线更清」（**独立维度**：
+      叙事清晰度，不是「像不像人写的」）。
+    """
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import build_blind_packet
+
+    corpus = [("现代都市", "他把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。" * 40)]
+    out_dir = tmp_path
+    build_blind_packet(_rows(12), corpus, out_dir, provider=_StubJudge(set()))
+    sheet = (out_dir / "blind_sheet.md").read_text(encoding="utf-8")
+    header = [ln for ln in sheet.splitlines() if ln.startswith("| sample")][0]
+    assert "更像人写" in header and "主线更清" in header, header
+    assert "有 AI 腔" not in sheet, sheet
+    assert "猜 AI" not in sheet, sheet
+    # 备注列留着 —— 评者认出出处时写在那一列，判定脚本会单独拎出来
+    assert "备注" in header, header
+
+
+def test_判定脚本按表头取列而不是按位置(tmp_path):
+    """⚠️ 列一改，按位置取列就全错位（2026-10-31 删列时踩过）。
+
+    ⇒ 解析必须**按表头名**；表头顺序换了也要对。
+    """
+    sys.path.insert(0, str(BACKEND))
+    from verify_blind_eval import parse_sheet
+
+    p = tmp_path / "sheet.md"
+    p.write_text("| sample | 主线更清 | 更像人写 | 备注 |\n"
+                 "|---|---|---|---|\n"
+                 "| s01 | B | A | 认出出处 |\n", encoding="utf-8")
+    rows = parse_sheet(p)
+    assert len(rows) == 1, rows
+    assert rows[0]["更像人写"] == "A", rows
+    assert rows[0]["主线更清"] == "B", rows
+    assert rows[0]["备注"] == "认出出处", rows
+
+
+def test_判定脚本用第二列做交叉分析(tmp_path):
+    """第二列不能是**摆设** —— 判定脚本要拿它出交叉表。
+
+    「主线更清」与「更像人写」**指向不同侧**的那些题 = 诊断信息：
+    我们的产出是「主线清楚但不像人写」（语言层的问题），
+    还是「像人写但主线乱」（结构层的问题）。
+    """
+    sys.path.insert(0, str(BACKEND))
+    from verify_acceptance_real import build_blind_packet
+
+    corpus = [("现代都市", "他把手机揣回兜里，出了便利店，雨还在下，路灯把积水照成一片。" * 40)]
+    out_dir = tmp_path
+    build_blind_packet(_rows(12), corpus, out_dir, provider=_StubJudge(set()))
+    key = json.loads((out_dir / "blind_key.json").read_text(encoding="utf-8"))
+    ids = [it["sample_id"] for it in key["items"]]
+
+    # 人写列全选人类侧那一列；主线更清列全选我们那一列 ⇒ 全部「分裂」
+    # （密封文件里 slot_A/slot_B 记的是「这一侧是 ours 还是 human」）
+    def _letter(it, want):
+        """want='ours'/'human' ⇒ 该侧在题面里的字母（A/B）。"""
+        if it["slot_A"] == want:
+            return "A"
+        return "B"
+
+    human_side = {it["sample_id"]: _letter(it, "human") for it in key["items"]}
+    ours_side = {it["sample_id"]: _letter(it, "ours") for it in key["items"]}
+    lines = ["| sample | 更像人写 | 主线更清 | 备注 |", "|---|---|---|---|"]
+    for sid in ids:
+        lines.append(f"| {sid} | {human_side[sid]} | {ours_side[sid]} | |")
+    rec = out_dir / "blind_sheet.md"
+    rec.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(BACKEND / "verify_blind_eval.py"),
+         "--sheet", str(rec), "--key", str(out_dir / "blind_key.json")],
+        capture_output=True, text=True, encoding="utf-8")
+    # 人写列全选人类侧 ⇒ k=0 ⇒ 判定为「可被识别为 AI」⇒ 退出码 1（这是**正确**行为）
+    assert proc.returncode == 1, f"退出码 {proc.returncode}\n{proc.stdout}"
+    assert "两列交叉" in proc.stdout, proc.stdout
+    assert f"指向不同侧**的题 = {len(ids)}/{len(ids)}" in proc.stdout, proc.stdout
 
 
 # --------------------------------------------------------------------------- #
