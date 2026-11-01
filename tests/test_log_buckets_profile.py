@@ -184,12 +184,27 @@ def test_d_style_distance_uses_bucket():
     if len(ref) < 6000:
         return
     profile = fit_profile_v2([ref], unit_chars=3000)
-    # 用 6000 字（v2.10 智谱段 1 长度）测 distance，应走 long bucket
-    text_6000 = ref * 1  # 截到 6000 字
-    text_6000 = text_6000[:6000]
+    # 用 6000 **汉字**（v2.10 智谱段 1 长度）测 distance，应走 long bucket。
+    # ⚠️ 2026-11-01：`unit_chars` 的单位改成**汉字**了（档案与测量同一把尺），
+    # 选桶也按汉字数算 ⇒ 这里必须按汉字截取，截 6000 个字符只有 ~3700 汉字
+    # （1.23x ⇒ medium bucket），原断言就不成立了。
+    from app.style.stylometry import _CJK_CHAR
+
+    def _take_cjk(s: str, n: int) -> str:
+        out: list[str] = []
+        count = 0
+        for ch in s:
+            out.append(ch)
+            if _CJK_CHAR.match(ch):
+                count += 1
+                if count >= n:
+                    break
+        return "".join(out)
+
+    text_6000 = _take_cjk(ref, 6000)
     dist = style_distance(text_6000, profile)
     check("D1: distance 返回 bucket 字段", "bucket" in dist)
-    check("D2: 6000 字选 long bucket (2.0x)", dist.get("bucket") == "long")
+    check("D2: 6000 汉字选 long bucket (2.0x)", dist.get("bucket") == "long")
     # v2.231 契约变更：留出单元 < _MIN_HOLDOUT_FOR_PERCENTILE 时 percentile 报 None
     # （分位被粗化到无意义——9 个样本每档 11.1%，超过最大值即 100%）。
     # 因此这里接受两种合法结果：

@@ -69,7 +69,7 @@ def test_profile_baseline_matches_runtime_measurement():
     这是「档案与测量不是同一把尺」的自检：口径漂了（比如分句器把闭合引号
     甩成独立句），拟合值与实测值会差出三成。
     """
-    from app.style.stylometry import cut_units, features
+    from app.style.stylometry import cjk_len, cut_units, features
 
     # 对白密集的语料（闭合引号问题最容易暴露的那种）
     body = (
@@ -82,7 +82,11 @@ def test_profile_baseline_matches_runtime_measurement():
     text = body * 40
     units = cut_units(text, 3000, max_units=20)
     assert units, "切不出单元"
-    fitted = features(units[0])["句长均值"]
+    # unit_chars 设成该单元的**汉字数** ⇒ 长度归一化系数 = 1 ⇒ 比裸值
+    # （2026-11-01：unit_chars 的单位改成汉字了，系数也随之以汉字数计算；
+    #  拿默认 3000 去量一个 2360 汉字的单元，系数是 0.93 ——
+    #  那是**长度归一化**，不是口径漂移。）
+    fitted = features(units[0], unit_chars=cjk_len(units[0]))["句长均值"]
 
     # 同一段文字的实测句长均值（同一把尺）
     lens = [len(s) for p in text.split("\n") if p.strip() for s in sentences(p)]

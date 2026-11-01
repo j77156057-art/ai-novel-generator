@@ -61,7 +61,12 @@ PROFILE_VERSION = 2
 #: v3（2026-10-25）：加了对白形态两个特征（对白段中位字数 / 纯台词段占比）。
 #: 特征集一变，老档案里**没有**这两项，`z_scores` 会把缺失项算成 z=0 ——
 #: 也就是「这两项从不偏离」。那是假的，必须让老档案整体失效重拟。
-MEASUREMENT_VERSION = 3
+#:
+#: v4（2026-11-01）：**换了分母**（密度类从「全字符数」改成「纯汉字数」）
+#: **并新增 12 项**（标点用法 / 分段用法）。
+#: 换分母比加特征更狠：老档案里每一个密度项的数值都变了
+#: （实测「句号密度」23/千全字符 → 36/千汉字），留用就是拿旧尺量新东西。
+MEASUREMENT_VERSION = 4
 
 #: percentile 计算要求的最小留出单元数。
 #:
@@ -87,8 +92,19 @@ _ELLIPSIS_RUN = re.compile(r"[…]{2,}|\.{3,}")
 #: 口径与 `app/ingestion/chunk.py` 的 `_SENT_END_RE` 对齐：同一个语料，
 #: 切块与测量必须用同一套句子边界，否则两边说的不是同一件事。
 _SENT_END_RE = re.compile(r"[。！？!?…]+[」』”’）)\]】》〕]*")
+#: 「纯汉字」的**唯一口径**：U+4E00–U+9FFF（CJK 统一表意文字基本区）。
+#:
+#: 为什么单列出来：仓库里原本有**三套**汉字计数（本文件的 `_CJK_RUN` 含扩展区 A、
+#: `engine._cjk_count` 只到 U+9FFF、`candidate._cjk_len` 同后者）——
+#: 一旦「纯汉字」成了密度类特征的**分母**，三处必须同一口径，
+#: 否则长度守恒、候选打分、档案密度各用各的数。
+#:
+#: 2026-11-01 起：密度类特征的分母从「全字符数」改成「纯汉字数」，
+#: 理由与代价见 `docs/stylometry-counting-layers.md`。
+_CJK_CHAR = re.compile(r"[\u4e00-\u9fff]")
+
 #: 连续汉字串。用一次 findall 而不是逐字符 match —— 百万字语料上后者慢两个数量级。
-_CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 
 #: 引号内的对白（中文网文以 “” 为主，兼容「」『』）
 _QUOTE_PAIRS = (("“", "”"), ("「", "」"), ("『", "』"))
@@ -109,7 +125,12 @@ _PUNCT = {
     "pause": "、",
     "colon": "：",
     "semicolon": "；",
+    "dash": "—",
 }
+
+#: 「标点」**计数**用的全部标点字符（只用于算「标点占比」这个排版量；
+#: 密度类特征的分母是**纯汉字**，不含这些）。
+_PUNCT_ALL = "，。！？…、；：—·「」『』“”‘’（）《》〈〉【】〔〕"
 
 #: 中文作者归属研究里最经典的指纹 = 高频虚词频率。这里只取最稳的几个，
 #: 不铺开成十几个（会稀释其余特征）。「的」与「了」是最强的两个。
@@ -117,6 +138,7 @@ _FUNC_WORDS = "的了着过是在不就都也又很这那"
 
 #: 特征顺序即 `FEATURES`；保持固定顺序，档案与 z 向量才对得上。
 FEATURES: tuple[str, ...] = (
+    # —— 原有 21 项（2026-11-01 之前）——
     "句长均值",
     "句长CV",
     "句长p90",
@@ -138,6 +160,21 @@ FEATURES: tuple[str, ...] = (
     "四字格密度",
     "短串占比",
     "虚词密度",
+    # —— 新增：标点用法 / 分段用法（2026-11-01）——
+    # 「作者的写法」这一层之前一个都没测：顿号分号冒号连密度都没进档案，
+    # 而密度特征的分母里又混着它们的总量。详见 docs/stylometry-counting-layers.md。
+    "顿号密度",
+    "分号密度",
+    "冒号密度",
+    "破折号密度",
+    "逗号句内位置",
+    "引号内句号占比",
+    "段均汉字数",
+    "叙述段连长度",
+    "对白段连长度",
+    "段首对白率",
+    "空白占比",
+    "段间空行密度",
 )
 
 #: 特征的通俗解释（面板/报告里用，避免读者对着「CV」发愣）
@@ -149,30 +186,48 @@ FEATURE_NOTES: dict[str, str] = {
     "长句占比": "≥40 字的句子比例（绵长句偏好）",
     "段长CV": "段落长短参差程度（越小越像 AI 写等长段）",
     "段均句数": "一个自然段平均几句话",
-    "对白字占比": "引号内的字数占正文比例",
+    "对白字占比": "引号内的汉字占正文汉字的比例",
     "对白段占比": "含对白的段落比例",
     # ⚠️ 这条说明与实现的**口径不完全一致**，见下方注释。
     "纯台词段占比": "含对白的段落里「引号外几乎没有文字」的占比（越低=叙述越密）",
-    "逗号密度": "每千字逗号数",
-    "句号密度": "每千字句号数",
-    "感叹号密度": "每千字感叹号数",
-    "问号密度": "每千字问号数",
-    "省略号密度": "每千字省略号数",
-    "比喻密度": "每千字「像/如同/仿佛…」（AI 腔偏高）",
-    "情绪直陈密度": "每千字贴标签式情绪词（AI 腔偏高）",
+    "逗号密度": "每千汉字逗号数",
+    "句号密度": "每千汉字句号数",
+    "感叹号密度": "每千汉字感叹号数",
+    "问号密度": "每千汉字问号数",
+    "省略号密度": "每千汉字省略号数",
+    "比喻密度": "每千汉字「像/如同/仿佛…」（AI 腔偏高）",
+    "情绪直陈密度": "每千汉字贴标签式情绪词（AI 腔偏高）",
     "段尾升华率": "以总结/拔高收尾的段落比例（AI 腔偏高）",
-    "四字格密度": "每千字被标点界定的四字串（成语代理指标）",
+    "四字格密度": "每千汉字被标点界定的四字串（成语代理指标）",
     "短串占比": "被标点界定的 ≤3 字短串比例（用词粒度代理指标）",
-    "虚词密度": "每千字高频虚词（的/了/着/过/是/在…）——中文作者归属的经典指纹",
+    "虚词密度": "每千汉字高频虚词（的/了/着/过/是/在…）——中文作者归属的经典指纹",
+    # —— 标点用法 / 分段用法（2026-11-01 新增）——
+    "顿号密度": "每千汉字的顿号数（并列语气）",
+    "分号密度": "每千汉字的分号数（长句分层）",
+    "冒号密度": "每千汉字的冒号数（引出台词/列举）",
+    "破折号密度": "每千汉字的破折号数（——，按出现次数算）",
+    "逗号句内位置": "逗号平均落在句子的第几成（0=句首，1=句尾）",
+    "引号内句号占比": "对白句里句末标点收在引号**内**的比例",
+    "段均汉字数": "一个自然段平均多少汉字",
+    "叙述段连长度": "连续几段都是叙述（没有对白）的平均段数",
+    "对白段连长度": "连续几段都是对白段的平均段数",
+    "段首对白率": "开头 12 字内就出现对白引号的段落占比",
+    "空白占比": "空白（换行/空格）占全部字符的比例 —— 排版量",
+    "段间空行密度": "每段之间平均隔几个空行 —— 排版量",
 }
 
 #: 代理指标——不是直接测量，只是结构性近似，判读时必须知道这一点
 PROXY_FEATURES = frozenset({"四字格密度", "短串占比"})
 
 #: 方案 C「features 长度归一化」——非密度类特征分组。
-#: 这 11 个特征是「按字/句/段/run 统计」的值，在 1000 字 vs 6000 字段上
+#:
+#: 这些是「按字/句/段/run 统计」的值，在 1000 字 vs 6000 字段上
 #: 统计波动大（CV/占比类尤其敏感），导致 z-score 系统性偏大。
 #: 方案 C 对它们乘 exp(-|log(len/unit_chars)| * 0.3) 双向收敛，让跨长度可比。
+#:
+#: 2026-11-01：新增的「标点用法 / 分段用法」特征里，**比例与位置类**
+#: （逗号句内位置、引号内句号占比、段首对白率、空白占比、段间空行密度）
+#: 归到这一组；**计数/密度类**（顿号/分号/冒号/破折号密度）留在密度组。
 NON_DENSITY_FEATURES = frozenset({
     "句长均值", "句长CV", "句长p90",
     "短句占比", "长句占比",
@@ -180,6 +235,9 @@ NON_DENSITY_FEATURES = frozenset({
     "对白字占比", "对白段占比",
     "纯台词段占比",
     "短串占比", "段尾升华率",
+    "逗号句内位置", "引号内句号占比",
+    "段均汉字数", "叙述段连长度", "对白段连长度",
+    "段首对白率", "空白占比", "段间空行密度",
 })
 
 #: 密度类特征（per1k 已归一化）——不变
@@ -276,6 +334,38 @@ def dialogue_char_count(text: str) -> int:
             if b < 0:
                 break
             n += b - a - 1
+            i = b + 1
+    return n
+
+
+def dialogue_cjk_count(text: str) -> int:
+    """引号内的**汉字**数（对白篇幅，与「正文汉字数」同一单位）。
+
+    ## 为什么分子也要换成汉字
+
+    2026-11-01 把 `对白字占比` 的分母从「全字符数」换成「纯汉字数」，
+    但分子 `dialogue_char_count` 还按**字符**算 —— 于是分子分母**不同单位**了：
+
+    `“你来了。”他说。` ⇒ 分子 4 个字符（引号内含句号）、分母 5 个汉字
+    ⇒ 读成 **0.8**，而真实的「对白占比」是 3/5 = **0.6**。
+
+    比值可以 > 1，档案基线直接失真（且这种错**不会**被「偏置归零检验」抓到 ——
+    那一检验只看密度类）。
+
+    ⇒ 凡是「分子 ÷ 分母」的比值，两边必须同一单位。
+    这里两边都用**汉字**（「字数」在中文里本来就指汉字）。
+    """
+    n = 0
+    for open_q, close_q in _QUOTE_PAIRS:
+        i = 0
+        while True:
+            a = text.find(open_q, i)
+            if a < 0:
+                break
+            b = text.find(close_q, a + 1)
+            if b < 0:
+                break
+            n += len(_CJK_CHAR.findall(text[a + 1:b]))
             i = b + 1
     return n
 
@@ -532,12 +622,97 @@ def _cv(values: Sequence[float]) -> float:
 # 特征向量
 # --------------------------------------------------------------------------- #
 
+def cjk_len(text: str) -> int:
+    """纯汉字数（标点、空格、换行不算）—— **全仓库唯一口径**。
+
+    引擎的段长闸门（`engine._cjk_count`）与候选打分（`candidate._cjk_len`）
+    都改成调这里，避免三处各数各的。口径见 `_CJK_CHAR`。
+    """
+    return len(_CJK_CHAR.findall(text or ""))
+
+
+def raw_counts(text: str) -> dict:
+    """纯量层：这段文本**有多少** —— 汉字、标点、空白、句、段。
+
+    ## 为什么要单独一层（2026-11-01）
+
+    密度类特征的分母必须**只**取纯量。若分母是「全字符数」，
+    它同时含**标点**与**空白（换行）** —— 而这两样恰恰是**被测的写法**
+    （这位作者用多少标点、多久换一次段、段间留多少空行）。
+
+    实测（七本样本）：空白占比 9.5%~24.2%，
+    同一个「每千汉字 36 个句号」的写法，密度读数能差 **26%**。
+    同书自比是自洽的（分母对双方一致），**跨书比较**被污染。
+
+    ⇒ 这一层只回答「有多少」，不做任何风格判断；
+    「怎么用」是 `features()` 的事。完整设计见
+    `docs/stylometry-counting-layers.md`。
+
+    口径与 `engine._cjk_count` / `candidate._cjk_len` 统一（见 `_CJK_CHAR`）。
+    """
+    text = text or ""
+    n_chars = len(text)
+    n_cjk = len(_CJK_CHAR.findall(text))
+    n_ws = sum(1 for ch in text if ch.isspace())
+    n_punct = sum(text.count(c) for c in _PUNCT_ALL)
+    paras = paragraphs(text)
+    n_sent = sum(len(sentences(p)) for p in paras)
+    return {
+        "字符数": n_chars,
+        "汉字数": n_cjk,
+        "标点数": n_punct,
+        "空白数": n_ws,
+        "段数": len(paras),
+        "句数": n_sent,
+    }
+
+
+def measure_summary(text: str) -> dict:
+    """纯量层读数（展示用）：汉字 / 标点 / 空白 / 字符，外加两个占比。
+
+    ## 为什么需要这一层单独对外
+
+    界面原来只显示「X 字」，用的是 JS 的 `text.length` —— **把标点和换行也数进去了**。
+    于是同一段正文，说「1200 字」时读者脑子里想的是「1200 个汉字」，
+    实际可能是 1050 汉字 + 130 标点 + 20 换行。**这个差就是 15%**，
+    而 15% 恰好能把一段「达标」的文字显示成「差 150 字」。
+
+    更要紧的是：标点占比与空白占比**就是作者的写法**（用多少标点、多久换段），
+    它们在 `features()` 里已经单列成特征，界面上却一点都看不见 ——
+    特征在后台跑，用户在界面上找不到对应的东西。
+
+    ⇒ 这一层只回答「有多少」，不做任何风格判断。
+
+    占比的分母用**字符数**（与 `features()` 里「空白占比」一致），不是汉字数 ——
+    占比问的是「这段文本里有多少是标点」，用字符数当分母才说得通。
+    """
+    counts = raw_counts(text or "")
+    n_chars = counts["字符数"]
+    return {
+        "chars": n_chars,
+        "cjk": counts["汉字数"],
+        "punct": counts["标点数"],
+        "blank": counts["空白数"],
+        "paras": counts["段数"],
+        "sents": counts["句数"],
+        "punct_pct": round(counts["标点数"] / n_chars * 100, 2) if n_chars else 0.0,
+        "blank_pct": round(counts["空白数"] / n_chars * 100, 2) if n_chars else 0.0,
+    }
+
+
 def features(text: str, *, unit_chars: int = 3000) -> dict[str, float]:
     """一段文本的文体特征向量。全部是可机检的计数与比值。
 
-    方案 C「长度归一化」(v2.15+)：对 11 个非密度类特征（按字/句/段/run 统计）
+    ## 分母口径（2026-11-01 改）
+
+    密度类特征的分母从「**全字符数**」改成「**纯汉字数**」。
+    理由：全字符数里含标点与空白，而那两样是**作者的写法** ——
+    混进分母会让**跨书比较**带系统性偏置（实测 26%）。
+    同书自比不受影响（分母对双方一致）。见 `docs/stylometry-counting-layers.md`。
+
+    方案 C「长度归一化」(v2.15+)：对非密度类特征（按字/句/段/run 统计）
     乘 exp(-|log(len/unit_chars)| * 0.3) 双向收敛，让跨长度可比——治本
-    percentile 100% 触发。12 个密度类特征（per1k 已归一）不变。
+    percentile 100% 触发。密度类特征（per1k 已归一）不变。
 
     unit_chars 默认 3000（与 generation_length 对齐）。unit_chars <= 0
     时 scale=1.0（不缩放），保证旧调用兼容。
@@ -548,7 +723,12 @@ def features(text: str, *, unit_chars: int = 3000) -> dict[str, float]:
     if n == 0 or not paras:
         return {k: 0.0 for k in FEATURES}
 
-    per1k = 1000.0 / n
+    # —— 纯量层：密度类特征的分母只用「纯汉字数」——
+    n_cjk = len(_CJK_CHAR.findall(text))
+    if n_cjk == 0:
+        # 没有汉字（纯标点/空白）：密度没有意义，用全字符兜底，避免除零。
+        n_cjk = n
+    per1k = 1000.0 / n_cjk
 
     sents: list[str] = []
     for p in paras:
@@ -558,7 +738,7 @@ def features(text: str, *, unit_chars: int = 3000) -> dict[str, float]:
     para_lens = [len(p) for p in paras]
     sents_per_para = [len(sentences(p)) for p in paras]
 
-    dlg_chars = dialogue_char_count(text)
+    dlg_chars = dialogue_cjk_count(text)
     dlg_paras = sum(1 for p in paras if any(q in p for q, _ in _QUOTE_PAIRS))
     bare_seg_ratio = dialogue_segment_form(paras)[1]
 
@@ -582,7 +762,7 @@ def features(text: str, *, unit_chars: int = 3000) -> dict[str, float]:
         "长句占比": long_sent / len(sent_lens),
         "段长CV": _cv(para_lens),
         "段均句数": statistics.fmean(sents_per_para),
-        "对白字占比": dlg_chars / n,
+        "对白字占比": dlg_chars / n_cjk,
         "对白段占比": dlg_paras / len(paras),
         "纯台词段占比": bare_seg_ratio,
         "逗号密度": text.count(_PUNCT["comma"]) * per1k,
@@ -597,12 +777,115 @@ def features(text: str, *, unit_chars: int = 3000) -> dict[str, float]:
         "短串占比": sum(1 for r in runs if r <= 3) / n_runs,
         "虚词密度": sum(text.count(w) for w in _FUNC_WORDS) * per1k,
     }
-    # 方案 C：11 个非密度特征按 log 长度缩放
-    scale = _length_scale_factor(n, unit_chars)
+    # —— 新增：标点用法 / 分段用法（2026-11-01）——
+    #
+    # 这些是**作者的写法**：用哪些标点、标点放在哪、什么时候换段。
+    # 之前一个都没测（顿号/分号/冒号连密度都没进档案），
+    # 而「密度」的分母里又混着它们的总量。
+    vec.update(_punctuation_and_paragraph_features(text, paras, sents, n, n_cjk))
+    # 方案 C：非密度特征按 log 长度缩放
+    # ⚠️ 缩放的输入用**纯汉字数**（不是全字符数）：否则同一段文本只改排版
+    # （空行多少）就会让缩放后的读数漂 1% —— 「偏置归零检验」就过不了。
+    # 与 `cut_units` / `band_check` 同一把尺：unit_chars 的单位是**汉字**。
+    scale = _length_scale_factor(n_cjk, unit_chars)
     for k in NON_DENSITY_FEATURES:
         if k in vec:
             vec[k] = vec[k] * scale
     return {k: float(vec[k]) for k in FEATURES}
+
+
+#: 段首多长之内出现对白引号算「以对白开头的段」（经验值：一句引导语的长度）。
+_LEAD_DIALOGUE_HEAD = 12
+
+#: 引号收尾的两种写法（句末标点在内 / 在外）。
+_QUOTE_END_INNER = re.compile(r"[。！？…][”’」』）】》\"]\s*$")
+_QUOTE_END_OUTER = re.compile(r"[”’」』）】》\"][。！？…]\s*$")
+
+
+def _punctuation_and_paragraph_features(
+    text: str,
+    paras: list[str],
+    sents: list[str],
+    n_chars: int,
+    n_cjk: int,
+) -> dict[str, float]:
+    """标点用法 + 分段用法这一组特征（2026-11-01 新增）。
+
+    ## 为什么单独写一个函数
+
+    这组特征量的是**「怎么用」**：逗号放在句子的哪个位置、句号收在引号里还是外、
+    顿号分号冒号用不用、多久换一次段、段与段之间留多少空行。
+    它们与「有多少」严格分开 —— 分母一律取纯量。
+
+    ⚠️ 这里的比例都是**段级/句级**的（分母是段数或句数），
+    密度类的分母是**纯汉字数**（`features()` 里算好传进来）。
+    """
+    per1k = 1000.0 / n_cjk if n_cjk else 0.0
+
+    # —— 标点种类（之前完全没测的三个 + 破折号）——
+    out: dict[str, float] = {
+        "顿号密度": text.count(_PUNCT["pause"]) * per1k,
+        "分号密度": text.count(_PUNCT["semicolon"]) * per1k,
+        "冒号密度": text.count(_PUNCT["colon"]) * per1k,
+        # 中文破折号是「——」（两个字），按**出现次数**算，不按字符算
+        "破折号密度": text.count("——") * per1k,
+    }
+
+    # —— 逗号在句内的相对位置（0=句首，1=句尾）——
+    pos: list[float] = []
+    inner = outer = 0
+    for s in sents:
+        scjk = len(_CJK_CHAR.findall(s))
+        if scjk > 0:
+            for m in re.finditer(_PUNCT["comma"], s):
+                before = len(_CJK_CHAR.findall(s[:m.start()]))
+                pos.append(before / scjk)
+        if any(q in s for q, _ in _QUOTE_PAIRS):
+            if _QUOTE_END_INNER.search(s):
+                inner += 1
+            elif _QUOTE_END_OUTER.search(s):
+                outer += 1
+    out["逗号句内位置"] = statistics.fmean(pos) if pos else 0.0
+    out["引号内句号占比"] = inner / (inner + outer) if (inner + outer) else 0.0
+
+    # —— 分段用法 ——
+    para_cjk = [len(_CJK_CHAR.findall(p)) for p in paras]
+    out["段均汉字数"] = statistics.fmean(para_cjk) if para_cjk else 0.0
+
+    is_dlg = [any(q in p for q, _ in _QUOTE_PAIRS) for p in paras]
+    out["叙述段连长度"] = _mean_run_length([not d for d in is_dlg])
+    out["对白段连长度"] = _mean_run_length(is_dlg)
+    out["段首对白率"] = (
+        sum(1 for p in paras if any(q in p[:_LEAD_DIALOGUE_HEAD] for q, _ in _QUOTE_PAIRS))
+        / len(paras)
+        if paras else 0.0
+    )
+
+    # —— 排版量：把「空白（换行/空格）」从密度分母里拿出来，单列成特征 ——
+    n_ws = sum(1 for ch in text if ch.isspace())
+    out["空白占比"] = n_ws / n_chars if n_chars else 0.0
+    empty_lines = sum(1 for line in text.split("\n") if not line.strip())
+    out["段间空行密度"] = empty_lines / len(paras) if paras else 0.0
+    return out
+
+
+def _mean_run_length(flags: list[bool]) -> float:
+    """布尔序列里「连续为 True 的段」的**平均长度**（没有则为 0）。
+
+    例：叙述段连长度 = 连续几段都是叙述段的平均段数 ——
+    它量的是「作者多久才切回一次对白」，是换段节奏的一部分。
+    """
+    runs: list[int] = []
+    cur = 0
+    for f in flags:
+        if f:
+            cur += 1
+        elif cur:
+            runs.append(cur)
+            cur = 0
+    if cur:
+        runs.append(cur)
+    return statistics.fmean(runs) if runs else 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -613,6 +896,18 @@ def cut_units(text: str, unit_chars: int, *, max_units: int | None = None) -> li
     """把长文切成 `unit_chars` 上下的单元，**尽量落在段落边界**。
 
     落在段落边界是必须的：硬切会把一句话拦腰截断，句长与段长统计随即失真。
+
+    ## `unit_chars` 的单位是**汉字**（2026-11-01 改）
+
+    原来按「全字符数」切，于是「一个单元」的长度取决于那本书的标点与空行占比 ——
+    而那正是**被测的写法**。后果有两处：
+    ① 档案里 `unit_chars=3000` 实际只有 2200 个汉字；
+    ② 长度归一化的 scale 用全字符算 ⇒ 同一段文本**只改排版**，
+    归一化后的读数也会漂（实测 1%）⇒ 「偏置归零检验」过不了。
+
+    ⇒ 现在按**汉字数**切与算：unit_chars=3000 就是 3000 个汉字，
+    与 `features()` 的 scale、`band_check()` 的除法、引擎的段长闸门（`_cjk_count`）
+    **同一把尺**。
     """
     paras = paragraphs(text)
     units: list[str] = []
@@ -620,20 +915,25 @@ def cut_units(text: str, unit_chars: int, *, max_units: int | None = None) -> li
     size = 0
     truncated = False
     for p in paras:
-        if size and size + len(p) + 1 > unit_chars:
+        p_cjk = len(_CJK_CHAR.findall(p))
+        if size and size + p_cjk > unit_chars:
             units.append("\n".join(buf))
             buf, size = [], 0
             if max_units and len(units) >= max_units:
                 truncated = True
                 break
         buf.append(p)
-        size += len(p) + 1
+        size += p_cjk
     if buf and not truncated:
         units.append("\n".join(buf))
     # 过短的尾巴（< 半个单元）会让 CV、对白占比这类统计严重偏斜，单独剔掉。
     # 这一步必须走完——提前 return 会让截断路径漏掉过滤，静默混进脏样本。
     floor = max(1, unit_chars // 2)
-    return [u for u in units if len(u) >= floor]
+    out: list[str] = []
+    for u in units:
+        if len(_CJK_CHAR.findall(u)) >= floor:
+            out.append(u)
+    return out
 
 
 def _quantile(sorted_vals: list[float], q: float) -> float:
@@ -832,7 +1132,7 @@ def band_check(text: str, profile: dict, names: Sequence[str]) -> dict[str, dict
         or 0
     )
     if profile.get("version") == 2 and profile.get("buckets"):
-        bucket_name = pick_bucket(len(text), base_unit)
+        bucket_name = pick_bucket(cjk_len(text), base_unit)
         bucket = profile["buckets"].get(bucket_name) or profile["buckets"].get("medium")
         if not bucket:
             return out
@@ -841,7 +1141,9 @@ def band_check(text: str, profile: dict, names: Sequence[str]) -> dict[str, dict
         bucket = profile
     unit = int(bucket.get("unit_chars") or base_unit or 3000)
     vec = features(text, unit_chars=unit)
-    scale = _length_scale_factor(len(text), unit)
+    # 长度因子也用**纯汉字数**（与 `features()` 内部一致）——
+    # 否则「同一段文本只改排版」会让归一化后的读数漂。
+    scale = _length_scale_factor(cjk_len(text), unit)
     feat = bucket.get("feat") or profile.get("feat") or {}
     for name in names:
         band = feat.get(name) or {}
@@ -880,7 +1182,7 @@ def style_distance(text: str, profile: dict) -> dict:
     )
     # 方案 B 路径：v2 profile 有 buckets 字段 → 选 bucket
     if profile.get("version") == 2 and profile.get("buckets"):
-        bucket_name = pick_bucket(len(text or ""), base_unit)
+        bucket_name = pick_bucket(cjk_len(text or ""), base_unit)
         bucket = profile["buckets"].get(bucket_name) or profile["buckets"].get("medium")
         if bucket is None:
             # 极端：v2 但 buckets 都空 —— 退回 medium bucket 结构
@@ -917,12 +1219,14 @@ def style_distance(text: str, profile: dict) -> dict:
         )
 
     unit_chars = int(bucket.get("unit_chars") or 0)
+    n_cjk = cjk_len(text or "")
     return {
         "chars": len(text or ""),
+        "cjk": n_cjk,
         "unit_chars": unit_chars,
         "bucket": bucket_name,  # v2 才有意义（"short"/"medium"/"long"）
         # 粒度不对齐时距离会系统性偏大或偏小，必须如实标注而不是静默给个数字
-        "scale_ratio": round(len(text or "") / base_unit, 2) if base_unit else None,
+        "scale_ratio": round(n_cjk / base_unit, 2) if base_unit else None,
         "mean_abs_z": round(total, 3),
         "max_abs_z": round(max(abs_z.values()), 3) if abs_z else 0.0,
         "percentile": None if percentile is None else round(percentile, 1),
@@ -1058,7 +1362,39 @@ def describe(profile: dict, *, max_features: int | None = None) -> str:
         if v:
             _punct.append(f"{label} {v}")
     if _punct:
-        lines.append("【标点】每千字：" + " · ".join(_punct))
+        # ⚠️ 分母是**汉字**不是全字符（2026-11-01）——文案也要跟着改，
+        # 否则模型按「每千字」理解，实际目标比它以为的高 ~25%。
+        lines.append("【标点】每千汉字：" + " · ".join(_punct))
+    # —— 标点用法 / 分段用法（2026-11-01 新增）——
+    _usage = []
+    for label, key in (("顿号", "顿号密度"), ("分号", "分号密度"),
+                       ("冒号", "冒号密度"), ("破折号", "破折号密度")):
+        v = mean_only(key, digits=1)
+        if v:
+            _usage.append(f"{label} {v}/千汉字")
+    _cpos = mean_only("逗号句内位置", 100.0, "%")
+    if _cpos:
+        _usage.append(f"逗号平均落在句子的 {_cpos} 处")
+    _qinner = mean_only("引号内句号占比", 100.0, "%")
+    if _qinner:
+        _usage.append(f"对白句号收在引号内 {_qinner}")
+    if _usage:
+        lines.append("【标点用法】" + " · ".join(_usage))
+    _seg_bits = []
+    _pcjk = mean_only("段均汉字数", digits=0)
+    if _pcjk:
+        _seg_bits.append(f"每段约 {_pcjk} 汉字")
+    _narr = mean_only("叙述段连长度", digits=1)
+    if _narr:
+        _seg_bits.append(f"连续叙述 {_narr} 段")
+    _dlgrun = mean_only("对白段连长度", digits=1)
+    if _dlgrun:
+        _seg_bits.append(f"连续对白 {_dlgrun} 段")
+    _lead = mean_only("段首对白率", 100.0, "%")
+    if _lead:
+        _seg_bits.append(f"段首即对白 {_lead}")
+    if _seg_bits:
+        lines.append("【分段】" + " · ".join(_seg_bits))
     lines.append(
         f"【上限（超出即偏 AI 腔）】比喻 ≤{_n(st('比喻密度')['p90'])}/千字"
         f" · 情绪直陈 ≤{_n(st('情绪直陈密度')['p90'])}/千字"

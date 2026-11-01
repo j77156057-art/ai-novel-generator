@@ -86,6 +86,7 @@ import type {
   SearchHit,
   UploadResult,
 } from "./types";
+import type { RawMeasure } from "../utils/measure.ts";
 
 const BASE = "/api";
 
@@ -625,6 +626,8 @@ export const api = {
         below_target?: boolean;
         below_floor?: boolean;
       };
+      /** 纯量层读数：汉字 / 标点 / 空白 + 占比（后端 `measure_summary`）。 */
+      measure?: RawMeasure;
     }) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
@@ -673,6 +676,8 @@ export const api = {
                         below_target?: boolean;
                         below_floor?: boolean;
                       };
+                      /** 纯量层读数：汉字 / 标点 / 空白 + 占比。 */
+                      measure?: RawMeasure;
                     }
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
@@ -699,6 +704,19 @@ export const api = {
       chars: number;
       summary: string;
       id: number;
+      /** 实际汉字数（与 length_report.cjk 相同） */
+      cjk?: number;
+      /** 段长闸门的报告：目标 / 下限 / 实测 / 是否达标 */
+      length_report?: {
+        target_cjk?: number;
+        floor_cjk?: number;
+        cjk?: number;
+        attempts?: number;
+        below_target?: boolean;
+        below_floor?: boolean;
+      };
+      /** 纯量层读数：汉字 / 标点 / 空白 + 占比（后端 `measure_summary`）。 */
+      measure?: RawMeasure;
     }) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
@@ -748,6 +766,8 @@ export const api = {
                         below_target?: boolean;
                         below_floor?: boolean;
                       };
+                      /** 纯量层读数：汉字 / 标点 / 空白 + 占比。 */
+                      measure?: RawMeasure;
                     }
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);

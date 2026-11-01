@@ -1,5 +1,9 @@
 // 与后端 Pydantic schemas 对齐的 TS 类型（手动镜像，改后端时同步此处）。
 
+import type { Measure, RawMeasure } from "../utils/measure.ts";
+
+export type { Measure, RawMeasure };
+
 /**
  * 语料体检报告（`RawNovel.clean_report`）。
  *
@@ -403,6 +407,15 @@ export interface GenerationOut {
   chapter_range: string | null;
   text: string | null;
   summary: unknown;
+  /**
+   * 纯量层读数（后端 `stylometry.measure_summary`）。
+   *
+   * 「汉字」是段长闸门量的那个数；「标点占比 / 空白占比」是**写法**，
+   * 跟字数是两码事，所以并排给出而不是混进一个「字数」里。
+   *
+   * 后端是 snake_case（Python 的规矩），前端用 `toMeasure()` 转成 camelCase。
+   */
+  measure?: RawMeasure;
 }
 
 export interface PremiseProposal {
@@ -613,7 +626,7 @@ export interface GeneratePlan {
    * 本次下发的文风档案摘要（来自参考语料实测）。
    *
    * 刻意不是完整档案：预检要回答的是「下发的是哪份档案、它可不可信」，
-   * 而不是复现统计（完整档案有 20 个特征的分布，约 7KB）。
+   * 而不是复现统计（完整档案有 33 个特征的分布，约 10KB）。
    */
   style_profile: {
     available: boolean;

@@ -59,14 +59,18 @@ def test_stats_uses_the_archive_ruler():
 
     这条是「不许修过头」能不能用的前提：拿档案的带卡自己量的数，
     两把尺必须在同一口径上。
+
+    ⚠️ `unit_chars` 设成这段文本的**汉字数** ⇒ 长度归一化系数 = 1
+    ⇒ 比的是裸值（归一化是「把不同长度的文本拉到同一基准」，
+    它随长度变，不随尺子变 —— 混进来比就说明没比在同一件事上）。
     """
-    from app.style.stylometry import features
+    from app.style.stylometry import cjk_len, features
 
     text = ("“走。”他说。\n\n雨停了。\n\n"
             "屋里只剩下灯芯爆响的声音，谁也没有再开口说话，"
             "窗外的巷子空荡荡的，只有脚步声一下一下地远去。")
     mine = _stats(text)[0]
-    theirs = float(features(text, unit_chars=len(text))["句长均值"])
+    theirs = float(features(text, unit_chars=cjk_len(text))["句长均值"])
     assert abs(mine - theirs) < 1e-6, (mine, theirs)
 
 

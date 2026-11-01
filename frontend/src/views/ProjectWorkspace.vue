@@ -2,6 +2,8 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "@/api/client";
+import { formatMeasure, measureText, toMeasure } from "@/utils/measure";
+import type { Measure } from "@/utils/measure";
 import type {
   AlertsResponse,
   DistillJob,
@@ -1130,8 +1132,16 @@ const generationLength = ref(3000);
 const streaming = ref(false);
 const streamedText = ref("");
 const liveBox = ref<HTMLElement | null>(null);
-const generations = ref<{ id: number; segment_no: number; text: string | null }[]>([]);
+const generations = ref<{ id: number; segment_no: number; text: string | null; measure?: Measure }[]>([]);
 const lastText = ref<string | null>(null);
+
+/**
+ * 本次生成的纯量读数（汉字 / 标点 / 空白 + 占比）。
+ *
+ * 后端 done 事件给的 `measure` 是**权威值**（与段长闸门同一个口径）；
+ * 拿不到时前端本地算一遍（`utils/measure.ts` 的口径与后端逐字一致）。
+ */
+const lastMeasure = ref<Measure | null>(null);
 
 // 阅读区展开/收起（默认给足高度，长文可一键全展开，不再被小框憋住）
 const expandLive = ref(false);
@@ -1156,7 +1166,7 @@ const pagedGens = computed(() => {
 });
 
 // 单段重生成（#24）
-const regenState = ref<Record<number, { text: string; loading: boolean }>>({});
+const regenState = ref<Record<number, { text: string; loading: boolean; measure?: Measure }>>({});
 
 // 标记完成（#25 保存）
 const completed = computed(() => project.value?.status === "completed");
@@ -1218,6 +1228,8 @@ async function loadGenerations() {
       id: g.id,
       segment_no: g.segment_no,
       text: g.text,
+      // 后端给的纯量读数（汉字 / 标点 / 空白 + 占比）；没有就本地算一遍。
+      measure: toMeasure(g.measure) ?? measureText(g.text || ""),
     }));
     if (page.value > totalPages.value) page.value = totalPages.value;
   } catch {
@@ -1864,6 +1876,7 @@ async function runGenerate() {
   streaming.value = true;
   streamedText.value = "";
   lastText.value = "";
+  lastMeasure.value = null;
   batchCount.value = 0;
   try {
     for (let i = 0; i < chaptersPerGen.value; i++) {
@@ -1874,8 +1887,10 @@ async function runGenerate() {
           streamedText.value += text;
           followLiveBox(); // 仅在读者本就在底部时跟随，绝不强制下拉页面
         },
-        async () => {
+        async (meta) => {
           lastText.value = streamedText.value;
+          // 纯量读数优先用后端给的（与段长闸门同口径），没有才本地算。
+          lastMeasure.value = toMeasure(meta.measure) ?? measureText(streamedText.value);
           batchCount.value = i + 1;
           await loadGenerations();
           refreshPriorIfOpen(); // 每段生成完前情都变了，面板开着就同步刷新
@@ -1889,6 +1904,17 @@ async function runGenerate() {
   }
 }
 
+/** 流式过程中的读数（边写边算，给「正在生成…」那行用）。 */
+const liveMeasure = computed(() => measureText(streamedText.value));
+/**
+ * 展示用读数：生成中用本地实时值，生成完用后端给的权威值。
+ * 两个来源口径一致（`utils/measure.ts` ↔ `stylometry.measure_summary`），
+ * 所以从「正在生成」切到「已完成」时数字不会跳。
+ */
+const shownMeasure = computed(() =>
+  streaming.value ? liveMeasure.value : (lastMeasure.value ?? measureText(lastText.value || "")),
+);
+
 async function runRegenerate(g: { id: number; segment_no: number }) {
   regenState.value[g.id] = { text: "", loading: true };
   try {
@@ -1899,7 +1925,9 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
       (text) => {
         regenState.value[g.id].text += text;
       },
-      async () => {
+      async (meta) => {
+        const st = regenState.value[g.id];
+        if (st) st.measure = toMeasure(meta.measure) ?? measureText(st.text);
         await loadGenerations();
         refreshPriorIfOpen(); // 重生成会重算受影响的卷摘要与主线，前情报告同步刷新
       },
@@ -3811,9 +3839,9 @@ onUnmounted(stopDistillPolling);
       <div class="card-title" style="font-size: var(--fs-md)">
         本次生成内容
         <span v-if="streaming" class="hint">
-          正在生成… 已 {{ streamedText.length }} 字（第 {{ batchCount }}/{{ chaptersPerGen }} 段）
+          正在生成… {{ formatMeasure(shownMeasure) }}（第 {{ batchCount }}/{{ chaptersPerGen }} 段）
         </span>
-        <span v-else class="hint">{{ (lastText || "").length }} 字</span>
+        <span v-else class="hint">{{ formatMeasure(shownMeasure) }}</span>
         <button class="btn sm" style="margin-left: 10px" @click="expandLive = !expandLive">
           {{ expandLive ? "收起" : "展开全文" }}
         </button>
@@ -3896,6 +3924,9 @@ onUnmounted(stopDistillPolling);
           <div class="row tight" style="width: 100%">
             <span class="tag accent mono" style="flex: none">第 {{ g.segment_no }} 段</span>
             <span class="faint mono" style="font-size: var(--fs-xs)">#{{ g.id }}</span>
+            <!-- 纯量读数：汉字是「多长」，标点/空白占比是「怎么写」——
+                 后两者是作者的写法，混进「字数」里就看不出问题出在哪。 -->
+            <span class="faint mono" style="font-size: var(--fs-xs)">{{ formatMeasure(g.measure) }}</span>
             <span style="flex: 1"></span>
             <button
               class="btn sm"
@@ -3913,6 +3944,11 @@ onUnmounted(stopDistillPolling);
             class="prose live-box"
             style="width: 100%"
           >{{ regenState[g.id]?.text }}</div>
+          <div
+            v-else-if="regenState[g.id]?.measure"
+            class="faint mono"
+            style="font-size: var(--fs-xs)"
+          >重生成后：{{ formatMeasure(regenState[g.id]?.measure) }}</div>
           <div
             v-else
             class="prose seg-text"

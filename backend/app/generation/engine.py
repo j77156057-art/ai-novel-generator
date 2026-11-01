@@ -2674,8 +2674,42 @@ def _persist_timeline_state(db, project: Project, st: TimelineState) -> None:
 
 
 def _cjk_count(text: str) -> int:
-    """汉字数（标点、空格、换行不算）。段长要求的计量单位。"""
-    return sum(1 for ch in (text or '') if '一' <= ch <= '鿿')
+    """汉字数（标点、空格、换行不算）。段长要求的计量单位。
+
+    口径统一到 `stylometry.cjk_len`（2026-11-01）：仓库里原本有三套汉字计数
+    （本处、`candidate._cjk_len`、`stylometry._CJK_RUN` 含扩展区 A），
+    而「纯汉字」已经是密度类特征的**分母**、也是档案 `unit_chars` 的单位 ——
+    三处必须同一口径，否则长度守恒、候选打分、档案密度各用各的数。
+    """
+    from app.style.stylometry import cjk_len
+
+    return cjk_len(text)
+
+
+def _measure_payload(text: str) -> dict:
+    """纯量层读数：汉字 / 标点 / 空白 / 字符，外加标点占比、空白占比。
+
+    ## 为什么要有这一坨
+
+    界面原来只显示「X 字」，用的是 JS 的 `text.length` —— **把标点和换行也算进去了**。
+    于是同一段正文，说「1200 字」时，读者脑子里想的是「1200 个汉字」，
+    实际却可能是 1050 汉字 + 130 标点 + 20 换行。**这个差就是 15%**，
+    而 15% 恰好能把一段「达标」的文字显示成「差 150 字」。
+
+    更要紧的是：标点占比与空白占比**就是作者的写法**（用多少标点、多久换段），
+    这两样在 `docs/stylometry-counting-layers.md` 里已经单列成特征，
+    界面却一点都看不见 —— 特征在后台跑，用户在界面上找不到对应的东西。
+
+    ⇒ 段长闸门给的是**汉字数**（唯一口径 `stylometry.cjk_len`），
+    这里把它和「标点 / 空白各占多少」**并排**给出来：
+    用户既能看懂「这段有多长」，也能看到「长是因为写字多，还是因为标点多」。
+
+    占比的分母用**字符数**（与 `stylometry.features()` 里「空白占比」一致），
+    不是汉字数 —— 占比是「这段文本里有多少是标点」，用字符数当分母才说得通。
+    """
+    from app.style.stylometry import measure_summary
+
+    return measure_summary(text or "")
 
 
 def _enforce_length(provider, system: str, user: str, text: str, *, target_chars: int,
@@ -3494,6 +3528,8 @@ def generate_next_segment_stream(
         # 流式路径接上闸门后，界面**能知道**这段到底多长、够不够下限。
         "cjk": length_report.get("cjk"),
         "length_report": length_report,
+        # 纯量层读数：汉字 / 标点 / 空白 + 占比（界面并排显示，见 _measure_payload）
+        "measure": _measure_payload(text),
         "summary": summary,
         "summary_tree": tree_stats,
         "id": gen.id,
@@ -3677,6 +3713,8 @@ def regenerate_segment_stream(
         "chars": len(text),
         "cjk": length_report.get("cjk"),
         "length_report": length_report,
+        # 纯量层读数（与生成路径同款）：汉字 / 标点 / 空白 + 占比
+        "measure": _measure_payload(text),
         "summary": summary,
         "summary_tree": tree_stats,
         "id": target.id,

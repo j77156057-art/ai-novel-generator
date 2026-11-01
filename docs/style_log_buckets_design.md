@@ -2,6 +2,12 @@
 
 > 设计时间：2026-10-17 16:50
 > 背景：8 轮真链路冒烟 + 1 轮 probe + 1 轮并行 v2.12 实测一致确认 `style_distance` 粒度不对齐（详见 `docs/percentile_root_cause_analysis.md`）
+>
+> ⚠️ **2026-11-01 补充（计量分层后）**：`unit_chars` 的单位已从「全字符数」改为
+> **汉字数**（`cut_units` 按汉字切、`pick_bucket` 按汉字选桶、`band_check` 的长度因子
+> 也按汉字除），密度类特征的分母同时改成**纯汉字**。
+> 本文是当初的设计记录，里面的数字**未按新尺重算**；
+> 影响面与基线作废清单见 `docs/stylometry-counting-layers.md`。
 
 ---
 

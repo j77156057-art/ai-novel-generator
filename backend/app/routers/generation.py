@@ -199,6 +199,8 @@ def _resolve_profile(proj: Project, profile: str | None) -> str:
 
 
 def _to_generation_out(gen: Generation) -> dict:
+    from app.style.stylometry import measure_summary
+
     return {
         "id": gen.id,
         "project_id": gen.project_id,
@@ -206,6 +208,10 @@ def _to_generation_out(gen: Generation) -> dict:
         "chapter_range": gen.chapter_range,
         "text": gen.text,
         "summary": gen.summary,
+        # 纯量层读数：汉字 / 标点 / 空白 + 占比。
+        # 界面逐段显示「这段有多长」时，用的是**汉字数**而不是字符数 ——
+        # 段长闸门量的也是汉字数，两边必须是同一个数。
+        "measure": measure_summary(gen.text or ""),
     }
 
 

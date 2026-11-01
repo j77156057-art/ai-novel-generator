@@ -36,7 +36,7 @@ def test_a_features_signature():
     try:
         vec = features(text, unit_chars=1500)
         check("A1: features 接受 unit_chars 关键字", isinstance(vec, dict))
-        check("A2: features 返 20 特征", len(vec) == 21, detail=f"got {len(vec)}")
+        check("A2: features 返 33 特征", len(vec) == 33, detail=f"got {len(vec)}")
     except TypeError as e:
         check("A1: features 接受 unit_chars 关键字", False, detail=f"TypeError: {e}")
         return
@@ -44,7 +44,7 @@ def test_a_features_signature():
     try:
         vec_old = features(text)
         check("A3: 旧调用 features(text) 不报错", isinstance(vec_old, dict))
-        check("A4: 旧调用与新调用返同 20 特征", set(vec_old.keys()) == set(vec.keys()))
+        check("A4: 旧调用与新调用返同 33 特征", set(vec_old.keys()) == set(vec.keys()))
     except TypeError as e:
         check("A3: 旧调用兼容", False, detail=f"TypeError: {e}")
 
@@ -153,10 +153,10 @@ def test_e_degradation():
     try:
         vec = features(text, unit_chars=0)
         check("E1: features(text, unit_chars=0) 不崩", isinstance(vec, dict))
-        check("E2: 返 20 特征", len(vec) == 21)
+        check("E2: 返 33 特征", len(vec) == 33)
     except TypeError:
         check("E1: features unit_chars=0", False, detail="(keyword not supported yet)")
-        check("E2: 返 20 特征", False, detail="(skipped)")
+        check("E2: 返 33 特征", False, detail="(skipped)")
     except Exception as e:
         check("E1: features unit_chars=0", False, detail=f"ERR {e}")
     # unit_chars=None

@@ -1,5 +1,9 @@
 docs: 真链路 percentile 100% 触发架构级根因调查（unit_chars 粒度不对齐）
 
+> ⚠️ **2026-11-01 补充**：计量分层后 `unit_chars` 的单位改为**汉字数**
+> （`cut_units` / `pick_bucket` / 长度归一化因子都按汉字），密度类分母改成**纯汉字**。
+> 本文记录的是当时的根因调查，数字未按新尺重算；见 `docs/stylometry-counting-layers.md`。
+
 **8 轮真链路冒烟 + 1 轮 probe 一致结论**：
 - v2.7-v2.10 智谱 250414 percentile 100/100
 - d56f988 v2.12 nemotron-3-super 真链路 percentile 100/100

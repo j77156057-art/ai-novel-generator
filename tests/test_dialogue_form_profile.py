@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 from app.style.stylometry import (  # noqa: E402
     FEATURES,
     MEASUREMENT_VERSION,
+    cjk_len,
     describe,
     dialogue_segment_form,
     features,
@@ -73,12 +74,15 @@ def test_feature_vector_has_bare_ratio():
 
     文本要凑到 3000 字上下 —— 非密度特征会按长度归一化（方案 C），
     短文本上算出来的值是缩放过的，不能直接跟裸比例比。
+
+    ⚠️ 2026-11-01：归一化的输入从「全字符数」改成「**汉字数**」
+    （`unit_chars` 的单位现在是汉字），所以这里必须把 `unit_chars`
+    设成这段文本的**汉字数** ⇒ 缩放系数 = 1 ⇒ 比的就是裸比例。
     """
     assert "纯台词段占比" in FEATURES
     unit = "\n".join([BARE, WITH_ACTION, NARRATIVE])
     text = "\n".join([unit] * 40)  # ≈ 3000 字
-    vec = features(text)
-    # 归一化系数按长度算（方案 C），所以是「接近」而不是精确等于
+    vec = features(text, unit_chars=cjk_len(text))
     assert abs(vec["纯台词段占比"] - 1 / 3) < 0.03, vec["纯台词段占比"]
 
 

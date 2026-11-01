@@ -116,7 +116,14 @@ class Candidate:
 
 
 def _cjk_len(text: str) -> int:
-    return sum(1 for ch in (text or "") if "一" <= ch <= "鿿")
+    """纯汉字数 —— 口径统一到 `stylometry.cjk_len`（2026-11-01）。
+
+    理由：档案的 `unit_chars` 与密度类特征的分母都以**汉字**为单位，
+    候选打分的长度守恒必须跟它同一把尺。
+    """
+    from app.style.stylometry import cjk_len
+
+    return cjk_len(text)
 
 
 def _form_measure(text: str, profile: dict | None) -> tuple[float | None, dict | None]:
