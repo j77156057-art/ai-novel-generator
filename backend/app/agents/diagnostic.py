@@ -114,7 +114,12 @@ def read_capability(db, project_id: int, capability_id: str, scope: dict) -> dic
                 raise PermissionError('binding_requires_full_reference_scope')
             content = corpus_content_hash(ids, db)
             cfg = resolve_tier(project.narrative_tier)
-            want = narrative_fingerprint(ids, cfg, corpus_hash=content)
+            # 范围与生成链路同口径：项目上存的蒸馏范围（见 resolve_project_scope）。
+            # 少了这一项，诊断会把「全量蒸出来的档案」判成失效 —— 而生成链路
+            # 恰恰是认这个范围的，两边口径必须一致。
+            from app.style.scope import resolve_project_scope
+            want = narrative_fingerprint(ids, cfg, corpus_hash=content,
+                                         scope=resolve_project_scope(project))
             cached = project.style_narrative or {}
             shared = find_style_distill(db, ids, cfg.key, want['tier_signature'], content) if ids else None
             match = bool(ids and cached.get('fingerprint') == want and cached.get('narrative_version') == NARRATIVE_VERSION)

@@ -79,6 +79,12 @@ class Project(Base):
     # 「用哪一档算」的意图。产出里已经记了 tier，但那是结果不是偏好——用户改档
     # 之后要靠本字段才知道下次该按哪档重算。
     narrative_tier = Column(String(16), nullable=True)
+    # 本项目蒸馏的**范围偏好**（JSON，见 app.style.scope.DistillScope）。
+    # 与 `narrative_tier` 同理：那是「用哪一档算」的意图，这是「读哪几章」的意图。
+    # 空 = 没设 = 沿用档位自带的采样策略。
+    # 为什么必须是项目级：生成链路核对指纹时带着范围，
+    # 两边口径不一致 ⇒ 每次生成都重蒸一遍（而且重蒸的是默认范围那份）。
+    narrative_scope = Column(JSON, nullable=True)
     # 本项目**应用**的「人物塑造模板」产物 id（`character_templates.id`，
     # 形如 full:9a3f1166f4e6:1f2a3b4c —— id 自带档位，一眼看出是哪一档）。
     # 空 = 还没提炼过；**档位与项目当前档位不一致时不注入**
@@ -742,9 +748,20 @@ class DistillRun(Base):
     # 这一行记的是「这次实际按哪档算的」，历史任务不该随偏好变化而变化。
     tier = Column(String(16), nullable=True)
     # 这次跑的是**哪种产物**："narrative"（叙事档案，整本蒸馏）/
-    # "character_template"（人物塑造模板，独立产物 —— 抽它不必重蒸整本）。
+    # "character_template"（人物塑造模板，独立产物 —— 抽它不必重蒸整本）/
+    # "book_digest"（全书压缩摘要，P2）。
     # 两者共用同一张任务表，进度条与轮询逻辑完全一样。
     kind = Column(String(24), nullable=False, default="narrative")
+    # 本次蒸馏的**范围**（JSON，见 app.style.scope.DistillScope）。
+    # 为什么落库：范围决定了「这一轮读的是哪几章」，是任务的输入之一；
+    # 任务行是历史记录，不该随项目偏好变化而变化 —— 与 tier 同理。
+    # 同时它是**并发防重**的键的一部分：同档位但范围不同的两次蒸馏，
+    # 产出完全不同，不能复用同一条在跑的任务。
+    scope_json = Column(JSON, nullable=True)
+    # 本次任务针对的**语料**（book_digest 这类「按书」的产物用）。
+    # 叙事蒸馏是按项目的（一次蒸多本参考语料），而全书摘要是对**一本书**做的 ——
+    # 产物本身按书存，任务行记下是哪本书，便于从任务跳回产物。
+    novel_id = Column(Integer, ForeignKey("raw_novels.id"), nullable=True, index=True)
     # pending | running | success | failed
     status = Column(String(16), nullable=False, default="pending")
     # 人话阶段名（如「语料 2/3：提炼第 5/12 块」），直接显示给用户

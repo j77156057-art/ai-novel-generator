@@ -134,12 +134,24 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("projects", "character_template_id", "VARCHAR(96)"),
         # —— 蒸馏任务的产物种类（叙事档案 / 人物塑造模板）——
         ("distill_runs", "kind", "VARCHAR(24) NOT NULL DEFAULT 'narrative'"),
+        # —— 蒸馏任务的范围（JSON，见 app.style.scope.DistillScope）——
+        # 漏这一项的后果：老库的 distill_runs 行补不出这一列，
+        # 任何 SELECT distill_runs.* 都会 no such column。
+        # nullable：既有任务行是「没设范围」跑的，补 NULL 不破坏它们。
+        ("distill_runs", "scope_json", "JSON"),
+        # —— 蒸馏任务针对的语料（book_digest 这类「按书」的产物）——
+        # nullable：叙事蒸馏是按项目的，没有单本书。
+        ("distill_runs", "novel_id", "INTEGER"),
         # —— 蒸馏库条目的可读档位键（与人物塑造模板的 id 同一套格式）——
         ("style_distills", "product_key", "VARCHAR(96)"),
         # —— 文风蒸馏三档：项目级「用哪一档算」的偏好（full/balanced/fast）——
         # nullable：既有项目的 style_narrative 是按默认完整档算的，补 NULL 不破坏它们。
         # 漏这一项的后果与 style_narrative 相同：老库 SELECT projects.* 直接炸。
         ("projects", "narrative_tier", "VARCHAR(16)"),
+        # —— 蒸馏范围偏好（JSON，见 app.style.scope.DistillScope）——
+        # nullable：既有项目是「没设范围」蒸的，补 NULL 不破坏它们。
+        # 漏这一项的后果同 narrative_tier：老库 SELECT projects.* 直接炸。
+        ("projects", "narrative_scope", "JSON"),
         # —— 两段式文风改写开关（0 关 / 1 开）——
         # 漏这一项的后果同 style_narrative：create_all 只给新库建列，
         # 老库 SELECT projects.* 会 no such column。

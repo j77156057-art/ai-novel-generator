@@ -26,6 +26,31 @@ from app.style.jobs import (
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
+class DistillScopeSpec(StrictRequest):
+    """`POST /api/projects/{id}/distill` 的**范围**（可选）。
+
+    不传 = 沿用档位自带的采样策略（与加这条轴之前逐字节一致）。
+
+    字段：
+
+    - `mode`：`tier`（默认，沿用档位）/ `percentage` / `fixed_chapters` /
+      `range` / `all`；
+    - `ratio`：`mode=percentage` 时的采样比例（0 < ratio ≤ 1）；
+    - `chapters`：`mode=fixed_chapters` 时的章数（均匀摊在全书，含早期章节）；
+    - `from_chapter` / `to_chapter`：`mode=range` 时的章节区间（含两端）；
+    - `respect_cutoff`：是否尊重项目的「故事进行到第几章」边界（默认 True）。
+
+    非法组合在这里就 422/400 —— 不让它变成一个跑了两小时才失败的后台任务。
+    """
+
+    mode: str = "tier"
+    ratio: float | None = None
+    chapters: int | None = None
+    from_chapter: int | None = None
+    to_chapter: int | None = None
+    respect_cutoff: bool = True
+
+
 class DistillStartRequest(StrictRequest):
     """`POST /api/projects/{id}/distill` 的请求体。
 
@@ -38,6 +63,8 @@ class DistillStartRequest(StrictRequest):
     tier: str | None = None
     #: True = 同档位也强制重算（忽略指纹缓存）。
     force: bool = False
+    #: 蒸馏范围（可选）。见 `DistillScopeSpec`。
+    scope: DistillScopeSpec | None = None
 
 
 class StyleDistillApplyRequest(StrictRequest):
@@ -157,8 +184,12 @@ def start_distill(
     前端拿 job_id 轮询 `GET .../distill/jobs/{job_id}` 看进度。这样即便用户
     关掉页面、刷新、切到别的步骤，蒸馏也不中断、进度也不丢。
 
-    并发防重：项目上已有 pending/running 的**同档位**任务且不 force 时，
-    直接复用那条（返回它的 job_id，`reused: True`），不重复烧一遍 LLM。
+    并发防重：项目上已有 pending/running 的任务且不 force 时，
+    **同档位同范围**直接复用那条（返回它的 job_id，`reused: True`），
+    不重复烧一遍 LLM。
+
+    范围不同 ⇒ 产出完全不同 ⇒ **不能复用**：这时返回 409 并说清
+    「已有一条范围不同的蒸馏在跑」，而不是偷偷把旧范围的结果给用户。
 
     缓存命中预测：不 force 时若本次会直接复用「项目已存档案」或「蒸馏库」，
     返回 `from_cache: True` 与 `cache_source`（"project" / "library"）。
@@ -169,6 +200,7 @@ def start_distill(
         raise HTTPException(status_code=404, detail="project 不存在")
 
     from app.style.narrative import resolve_tier
+    from app.style.scope import DistillScope, parse_scope
 
     # 档位优先级：本次显式传的 > 项目已存的偏好 > 默认完整档。
     # 非法档位在这里就 400 —— 不让它变成一个跑 40 分钟才失败的后台任务。
@@ -177,9 +209,25 @@ def start_distill(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # 范围同理：非法范围当场 400（跑两小时才失败是最贵的错法）。
+    try:
+        scope = parse_scope(
+            body.scope.model_dump(exclude_none=True) if body.scope else None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # 选档是项目级偏好：存下来，之后不带 tier 的调用（含生成链路）也按它来。
     if proj.narrative_tier != cfg.key:
         proj.narrative_tier = cfg.key
+        db.commit()
+
+    # 范围同样是项目级偏好：生成链路核对档案指纹时带着范围，
+    # 两边口径必须一致 —— 否则「全量蒸出来的档案」会被当成失效，
+    # 每次生成都重蒸一遍默认范围的（用户点的全量被静默丢掉）。
+    scope_public = scope.to_public_dict()
+    if (getattr(proj, "narrative_scope", None) or None) != scope_public:
+        proj.narrative_scope = scope_public
         db.commit()
 
     # —— 缓存命中预测（不调模型，秒级返回）——
@@ -198,13 +246,14 @@ def start_distill(
             )
 
             content_hash = corpus_content_hash(ids, db)
-            want = narrative_fingerprint(ids, cfg, corpus_hash=content_hash)
+            want = narrative_fingerprint(
+                ids, cfg, corpus_hash=content_hash, scope=scope
+            )
             cached = proj.style_narrative or {}
             if isinstance(cached, dict) and cached.get("fingerprint") == want:
                 from_cache = True
                 cache_source = "project"
             else:
-                content_hash = corpus_content_hash(ids, db)
                 existing = find_style_distill(
                     db, ids, cfg.key, want["tier_signature"], content_hash
                 )
@@ -216,16 +265,34 @@ def start_distill(
         # 同档位才复用：换档位的指纹不同，必须重算，复用会静默拿旧档结果。
         active = find_active_run(db, project_id)
         if active is not None and active.tier == cfg.key:
-            return {
-                "job_id": active.id,
-                "status": active.status,
-                "tier": active.tier,
-                "reused": True,
-                "from_cache": False,
-                "cache_source": None,
-            }
+            active_scope = (
+                parse_scope(active.scope_json)
+                if getattr(active, "scope_json", None)
+                else DistillScope()
+            )
+            if active_scope.signature() == scope.signature():
+                return {
+                    "job_id": active.id,
+                    "status": active.status,
+                    "tier": active.tier,
+                    "scope": scope.to_public_dict(),
+                    "reused": True,
+                    "from_cache": False,
+                    "cache_source": None,
+                }
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"已有一条范围不同的蒸馏在跑（job_id={active.id}，"
+                    f"范围={active_scope.to_public_dict()}）。"
+                    "范围不同产出的档案完全不同，不能拿旧范围的结果顶替 —— "
+                    "等它结束或先取消那条。"
+                ),
+            )
 
-    run = create_distill_run(db, project_id, cfg.key)
+    run = create_distill_run(
+        db, project_id, cfg.key, scope=scope_public
+    )
     background_tasks.add_task(
         run_distill_job, run.id, project_id, cfg.key, body.force
     )
@@ -233,10 +300,50 @@ def start_distill(
         "job_id": run.id,
         "status": run.status,
         "tier": run.tier,
+        "scope": scope.to_public_dict(),
         "reused": False,
         "from_cache": from_cache,
         "cache_source": cache_source,
     }
+
+
+@router.post("/{project_id}/distill/estimate")
+def estimate_distill(
+    project_id: int,
+    body: DistillStartRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """估算一次蒸馏的规模（读多少章 / 切多少块 / 调多少次模型）。
+
+    为什么要有这个端点：全量蒸馏是**小时级**（833 章 30% 采样实测 42 分钟）。
+    用户点「全量」之前就该知道这一轮要读多少章、调多少次模型，
+    而不是点完之后在不知道代价的情况下等。
+
+    估出来的数字与真实蒸馏**同一把尺**（同一个采样器、同一个分块器、
+    同一个渠道块大小），所以它不是「大概」，是「就是这么算的」。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+
+    from app.style.narrative import estimate_distill_cost, resolve_tier
+    from app.style.scope import parse_scope
+
+    try:
+        cfg = resolve_tier(body.tier or getattr(proj, "narrative_tier", None))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        scope = parse_scope(
+            body.scope.model_dump(exclude_none=True) if body.scope else None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    ids = [int(i) for i in (proj.reference_novel_ids or [])]
+    if not ids:
+        raise HTTPException(status_code=400, detail="项目未选参考语料，无法估算")
+    return estimate_distill_cost(db, proj, ids, tier=cfg, scope=scope)
 
 
 @router.get("/{project_id}/distill/jobs")
@@ -533,12 +640,14 @@ def apply_style_distill(
         raise HTTPException(status_code=404, detail="蒸馏库条目不存在或已归档")
 
     from app.style.narrative import narrative_fingerprint, resolve_tier
+    from app.style.scope import resolve_project_scope
 
     cfg = resolve_tier(entry.tier)
     ids = [int(i) for i in (proj.reference_novel_ids or [])]
-    # 指纹按「本项目当前语料 + 该条目档位」算，确保应用后对本项目保持 sticky，
-    # 不会在下次生成时被 project_narrative 判失效而重算。
-    fp = narrative_fingerprint(ids, cfg) if ids else {
+    # 指纹按「本项目当前语料 + 该条目档位 + 本项目当前范围」算，
+    # 确保应用后对本项目保持 sticky，不会被下次生成判失效而重算。
+    scope = resolve_project_scope(proj)
+    fp = narrative_fingerprint(ids, cfg, scope=scope) if ids else {
         "source_ids": [], "narrative_version": entry.narrative_version,
         "tier": cfg.key, "tier_signature": entry.tier_signature,
     }

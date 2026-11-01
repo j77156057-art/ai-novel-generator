@@ -434,11 +434,16 @@ def test_api_shape_matches_frontend_distill_job_contract(db_session):
     shape = distill_run_to_dict(run)
 
     expected_keys = {
-        "id", "project_id", "tier", "status", "stage", "progress_current",
-        "progress_total", "n_chapters", "rule_count", "rejected", "error",
-        "created_at", "started_at", "finished_at",
+        "id", "project_id", "tier", "kind", "scope", "status", "stage",
+        "progress_current", "progress_total", "n_chapters", "rule_count",
+        "rejected", "error", "created_at", "started_at", "finished_at",
     }
     assert set(shape) == expected_keys
+    # `kind` = 这次跑的是哪种产物；`scope` = 这一轮蒸的是哪几章（P1 范围轴）。
+    # 两个字段都要在：**产物种类不同、范围不同 ⇒ 产出不同**，
+    # 界面上要能一眼看出「这条进度跑的是什么」。
+    assert shape["kind"] == "narrative"
+    assert shape["scope"] is None, "没设范围时必须是 null（= 沿用档位自带策略）"
     assert shape["progress_total"] == 0, "pending 行总数只能是 0（= 未探明）"
     assert shape["progress_current"] == 0
     assert shape["finished_at"] is None

@@ -42,6 +42,17 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.style.scope import (
+    MODE_ALL,
+    MODE_FIXED,
+    MODE_PERCENTAGE,
+    MODE_RANGE,
+    MODE_TIER,
+    DistillScope,
+    parse_scope,
+    resolve_project_scope,
+)
+
 if TYPE_CHECKING:  # pragma: no cover —— 只给类型检查器看，运行时不导入
     from app.models import StyleDistill
 
@@ -59,7 +70,25 @@ ProgressCallback = Callable[[str, int, int], None]
 #:
 #: 与 `style/pipeline.py` 的 `PIPELINE_SCHEMA` 同理：指纹只有 `source_ids + narrative_version`，
 #: 管不到「档案长什么样」。加字段时老档案不会自动失效，前端拿到的摘要会永远少一块。
-NARRATIVE_VERSION = 9
+#:
+#: v10（2026-11-02，P1 范围轴）：规则条目新增 `weight`（成熟度权重），
+#: 档案新增 `scope` / `weighting`。老档案没有这两个字段 ⇒ 必须失效重算，
+#: 否则「按章加权」的档案与「没加权」的档案会被当成同一份缓存互相顶掉。
+NARRATIVE_VERSION = 10
+
+#: 成熟度权重口径的版本号。改了权重算法（分档、阈值）就 +1，
+#: 它进档案的 `weighting.version`，便于事后分辨「这份档案是哪套口径算的」。
+WEIGHTING_VERSION = 1
+
+#: 早期章节（全书前一半）的成熟度权重。
+#:
+#: 为什么是 0.5 而不是 0：早期章节**不是错的**，只是**不代表成熟期**。
+#: 权重 0 ⇒ 早期章节会被完全排除出提示词，等于在背后偷偷丢数据；
+#: 权重 0.5 ⇒ 它排在成熟期之后、但在同层里仍然均匀摊开，
+#: 成熟期不够填满某一维时它能补位。
+MATURITY_WEIGHT_EARLY = 0.5
+#: 成熟期章节（全书后一半）的成熟度权重。
+MATURITY_WEIGHT_MATURE = 1.0
 
 #: 采样比例：从全文章节中采样的百分比。
 #: 603 章 × 30% = 181 章。原为 15%，2026-10-19 提高到 30%——
@@ -520,13 +549,26 @@ def list_tiers() -> list[dict[str, Any]]:
     return [TIER_REGISTRY[k].to_public_dict() for k in order if k in TIER_REGISTRY]
 
 
-def _tier_signature(tier: NarrativeTier) -> str:
+def _tier_signature(tier: NarrativeTier, scope: DistillScope | None = None) -> str:
     """档位配置的稳定短哈希。
 
     进指纹用：改了某档的维度白名单 / 采样章数 / 清洗强度，旧缓存必须失效
     （配置变了却复用旧结果 = 又一次静默返回旧结果）。
+
+    ## 范围（scope）为什么也进这里
+
+    范围变了 ⇒ 蒸出来的档案内容变了 ⇒ 旧档案必须失效。
+    这是「档位不进指纹」那个坑的同构问题：项目已踩过两次
+    「换了输入却拿到旧结果而且不报错」。最坏的一种是
+    「用户点了全量，实际拿到的是 30% 采样蒸出来的那份」。
+
+    **默认范围不进哈希**：不传 scope（或传默认 scope）时哈希与加范围轴之前
+    逐字节相同 ⇒ 已有项目的缓存与蒸馏库行继续命中，不会因为加了条轴就全量重算。
     """
-    blob = json.dumps(tier.fingerprint_payload(), sort_keys=True, ensure_ascii=False)
+    payload = tier.fingerprint_payload()
+    if scope is not None and not scope.is_default:
+        payload = {**payload, "scope": scope.fingerprint_payload()}
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
 
@@ -1841,6 +1883,140 @@ def sample_chapters_for_tier(
     if tier.sampling_mode == "percentage":
         return _sample_chapters_v6(chapters, ratio=tier.sample_ratio or SAMPLE_RATIO)
     return _sample_chapters_fixed(chapters, tier.fixed_chapters or 30)
+
+
+def _sample_chapters_spread(
+    chapters: list[tuple[int, str]], n_chapters: int
+) -> list[tuple[int, str]]:
+    """固定章数、**均匀摊在全书**（含早期章节）。
+
+    ## 与 `_sample_chapters_fixed` 的区别（这是刻意的）
+
+    `_sample_chapters_fixed` 取**后 2/3** —— 那是档位自带的采样策略，
+    理由写在它自己的注释里：早期章节文风会漂。
+
+    但范围轴上的「固定 N 章」是**用户显式点的**：用户说「蒸 50 章」，
+    期待的是「全书里均匀取 50 章」，而不是「在后 2/3 里取 50 章」——
+    后者会静默改变用户要的章数比例。
+
+    早期文风漂移由**按章加权**处理（规则带成熟度权重，注入时成熟期优先），
+    而不是靠偷偷丢章 —— 偷偷丢章会让「全量」这个选项名不副实。
+    """
+    if not chapters:
+        return []
+    target = max(1, int(n_chapters))
+    if len(chapters) <= target:
+        return list(chapters)
+    step = len(chapters) / target
+    picks = sorted({min(int(i * step), len(chapters) - 1) for i in range(target)})
+    return [chapters[i] for i in picks]
+
+
+def sample_chapters_for_scope(
+    chapters: list[tuple[int, str]],
+    tier: NarrativeTier,
+    scope: DistillScope | None = None,
+) -> list[tuple[int, str]]:
+    """按**范围**采样章节——范围轴在采样上的唯一入口。
+
+    Args:
+        chapters: 全书 `[(chapter_no, text), ...]`（已按章号排序）。
+        tier: 档位（`mode="tier"` 时用它的采样策略）。
+        scope: 范围；None 或默认范围 ⇒ 与加范围轴之前逐字节一致。
+
+    Returns:
+        采样后的章节列表（按章号排序）。
+    """
+    scope = scope or DistillScope()
+    if scope.mode == MODE_TIER:
+        return sample_chapters_for_tier(chapters, tier)
+    if scope.mode == MODE_ALL:
+        return list(chapters)
+    if scope.mode == MODE_RANGE:
+        lo = int(scope.from_chapter or 1)
+        hi = int(scope.to_chapter or lo)
+        return [(n, t) for n, t in chapters if lo <= n <= hi]
+    if scope.mode == MODE_FIXED:
+        return _sample_chapters_spread(chapters, int(scope.chapters or 30))
+    if scope.mode == MODE_PERCENTAGE:
+        return _sample_chapters_v6(chapters, ratio=float(scope.ratio or SAMPLE_RATIO))
+    # parse_scope 已经把 mode 限死在合法集合里；到这里说明有漏网之鱼。
+    raise ValueError(f"未知的蒸馏范围模式：{scope.mode!r}")
+
+
+def maturity_weight(chapter_no: int | None, total_chapters: int) -> float:
+    """某一章的**成熟度权重**（早期 0.5 / 成熟期 1.0）。
+
+    ## 分界为什么是「全书的一半」
+
+    与 `_mature_chapters` 的口径一致（成熟期 = 章号较大的一半），
+    区别只在于：那个口径是**按规则出现的章节**排序取后一半，
+    这个口径是按**全书位置**取后一半。
+
+    按全书位置才说得通：「早期文风漂移」是**这本书**的属性，
+    与这次采样到了哪些章无关 —— 否则同一章在「全量」里算早期、
+    在「只蒸后 2/3」里又算成熟，权重会自相矛盾。
+
+    ## 章号未知（≤ 0）怎么办
+
+    角色声音维度的部分规则没有真实章号（`chapter_no=0`）。
+    不知道来源位置时**不惩罚**：给它成熟期权重，
+    否则「不知道来自哪一章」会被当成「来自第 1 章」。
+    """
+    if chapter_no is None or chapter_no <= 0:
+        return MATURITY_WEIGHT_MATURE
+    if total_chapters <= 1:
+        return MATURITY_WEIGHT_MATURE
+    pos = (float(chapter_no) - 1.0) / float(total_chapters - 1)
+    pos = min(max(pos, 0.0), 1.0)
+    return MATURITY_WEIGHT_MATURE if pos >= 0.5 else MATURITY_WEIGHT_EARLY
+
+
+def _distill_cutoffs(project, novel_ids: list[int]) -> dict[int, int]:
+    """项目上给参考语料设的「故事进行到第几章」边界（`{novel_id: 章号}`）。
+
+    **复用 `generation/visibility.py` 的 `VisibilityPolicy`**，不自己再解析一遍：
+    那份解析规则（`novel_id`/`chapter` 必须是 int、chapter ≥ 1、必须是被选中的语料）
+    是全项目统一的边界口径。蒸馏自己写一份解析，早晚会和检索链那套对不上，
+    而对不上的后果正是设计稿 §4.4 要消灭的：
+    「检索得到的片段」和「蒸出来的规则」来自不同范围。
+
+    `unbounded_paths={"original"}` 表示「没设边界的书整本可见」——
+    蒸馏是学写法，不是剧透（理由见 `extract_narrative_profile` 里的注释）。
+    """
+    from app.generation.visibility import VisibilityPolicy
+
+    policy = VisibilityPolicy(
+        project, list(novel_ids), unbounded_paths=frozenset({"original"})
+    )
+    return dict(policy.cutoffs)
+
+
+def _attach_maturity_weights(
+    rules: dict[str, list], novel_totals: dict[int, int]
+) -> dict[str, int]:
+    """给每条规则打上成熟度权重，返回 `{权重: 条数}` 统计。
+
+    权重口径见 `maturity_weight`。分母是**本次实际读到**的章数
+    （`novel_totals`），不是全书章数 —— 被 cutoff 截断时，读到的是前缀，
+    那个前缀的后一半才是「读到范围内的成熟期」。
+
+    放在**汇总之后**统一打，而不是在每个 append 点打：规则有十几处 append，
+    逐处打权重早晚会漏一处，而漏掉的那一处就是「权重缺失 ⇒ 被当成成熟期」
+    的静默偏差。
+    """
+    counts: dict[str, int] = {}
+    for items in rules.values():
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            nid = item.get("novel_id")
+            total = novel_totals.get(nid, 0) if isinstance(nid, int) else 0
+            weight = maturity_weight(item.get("chapter_no"), total)
+            item["weight"] = weight
+            key = f"{weight:g}"
+            counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 #: 占位符：LLM 直接照抄 prompt 示例（「角色A」「具体角色名」）
@@ -3789,12 +3965,14 @@ def extract_narrative_profile(
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
     tier: str | NarrativeTier | None = None,
     progress: ProgressCallback | None = None,
+    scope: DistillScope | None = None,
 ) -> dict:
     """从参考语料提炼叙事档案。
 
     Args:
         tier: 档位 key（"full"/"balanced"/"fast"）或 NarrativeTier 对象。
             None →默认完整档（与引入档位之前行为逐字节一致）。
+        scope: 蒸馏范围（`mode="tier"` 时行为与加范围轴之前逐字节一致）。
         progress: 可选的进度回调 `progress(stage, current, total)`，用于后台
             蒸馏任务的进度条。**None 时行为与加进度之前完全一致**——采样、
             维度、provider 选择、返回结构一项都不变。
@@ -3828,6 +4006,15 @@ def extract_narrative_profile(
     # 本档要提炼的维度（白名单子集）。全维度档下它就等于 NARRATIVE_DIMENSIONS。
     tier_dims = [d for d in NARRATIVE_DIMENSIONS if d in cfg.dimensions]
     has_dim = set(tier_dims)
+
+    # —— 范围轴（P1）：范围 + 可见边界 ——
+    # 范围决定「读哪几章」；边界决定「最多读到哪一章」。
+    # 两者是不同层的东西：范围是这次蒸馏的显式选择，边界是项目上早就设好的
+    # 「故事进行到第几章」——两者叠加，取更严的那个。
+    scope = scope or DistillScope()
+    cutoffs = _distill_cutoffs(project, novel_ids) if scope.respect_cutoff else {}
+    #: 每本书**本次实际读到**的章数（权重的分母，见 `maturity_weight`）。
+    novel_totals: dict[int, int] = {}
 
     all_rules: dict[str, list[dict]] = {
         dim: [] for dim in tier_dims + ["文风漂移分析"]
@@ -3872,11 +4059,27 @@ def extract_narrative_profile(
         if not chapters:
             continue
 
+        # 可见边界（cutoff）：项目上给这本书设了「故事进行到第几章」，
+        # 就只蒸边界之前 —— 与检索链同一边界，否则「检索到的片段」和
+        # 「蒸出来的规则」可能来自不同范围（设计稿 §4.4）。
+        #
+        # 没设边界的书**整本照蒸**（不是 fail-closed）：蒸馏是学写法，
+        # 参考书整本都是合法风格材料，与 `generation/profiles.py` 的
+        # `STYLE_REFERENCE_PATHS = {"original"}` 同一口径。角色聊天那条
+        # 「没边界就整本挡掉」的规则是**剧透**问题，搬过来会让没设边界的老项目
+        # 一蒸馏就变成空档案。
+        cutoff = cutoffs.get(nid)
+        if cutoff is not None:
+            chapters = [(n, t) for n, t in chapters if n <= cutoff]
+            if not chapters:
+                continue
+        novel_totals[nid] = len(chapters)
+
         canonical: list[tuple[str, int]] = []
         alias: dict[str, str] = {}
-        # 按档位配置采样：完整档走百分比 + 对话密集优先 + 场景均衡；
-        # 平衡/快速档走固定章数均匀采样。
-        sampled = sample_chapters_for_tier(chapters, cfg)
+        # 按**范围**采样：默认沿用档位策略（mode="tier"），
+        # 用户显式指定范围时按范围来（整本 / 区间 / 固定章数 / 百分比）。
+        sampled = sample_chapters_for_scope(chapters, cfg, scope)
         total_chapters += len(sampled)
 
         # 分块：按**字数**装箱，不按章数。
@@ -4447,6 +4650,12 @@ def extract_narrative_profile(
     if progress is not None:
         progress("⑥ 汇总提炼出的规则", PH_SUMMARY - 1, _DISTILL_TOTAL_PHASES)
 
+    # —— 成熟度权重（按章加权，P1）——
+    # 早期章节**照样蒸馏、照样入库**，只是权重低；注入提示词时成熟期优先。
+    # 这样「全量」名副其实（档案里确实有早期规则），又不让生涩的早期写法
+    # 主导提示词。
+    weight_counts = _attach_maturity_weights(all_rules, novel_totals)
+
     return {
         "version": NARRATIVE_VERSION,
         "source_ids": sorted(int(i) for i in novel_ids),
@@ -4468,6 +4677,19 @@ def extract_narrative_profile(
         # 不做自动删除——审计本身会误判（北荒刀歌「阿拙」是丫鬟名却被标为普通名词）。
         "voice_name_audit": voice_audit or {"suspicious": [], "checked": 0,
                                             "skipped": False},
+        # —— 范围轴（P1）：这一轮蒸的是哪几章 ——
+        # 落进档案是为了**事后可查**：「这份档案是全量蒸的还是采样蒸的」
+        # 不能只靠记忆，界面与报告都要能一眼看到。
+        "scope": scope.to_public_dict(),
+        # 实际生效的可见边界（{novel_id: 章号}）；为空表示没设边界、整本照蒸。
+        "cutoffs_applied": {str(k): v for k, v in sorted(cutoffs.items())},
+        # 成熟度权重的口径与分布（早期条数 / 成熟期条数）。
+        "weighting": {
+            "version": WEIGHTING_VERSION,
+            "early": MATURITY_WEIGHT_EARLY,
+            "mature": MATURITY_WEIGHT_MATURE,
+            "counts": weight_counts,
+        },
     }
 
 
@@ -4621,8 +4843,9 @@ def narrative_fingerprint(
     source_ids: list[int], tier: str | NarrativeTier | None = None,
     *, corpus_hash: str | None = None,
     block_chars: int | None = None,
+    scope: DistillScope | None = None,
 ) -> dict:
-    """叙事档案的失效判据：语料集合 + 提炼版本号 + **档位** + **块大小**。
+    """叙事档案的失效判据：语料集合 + 提炼版本号 + **档位** + **块大小** + **范围**。
 
     ## 为什么档位必须在指纹里（本项目已踩过两次的同类坑）
 
@@ -4648,13 +4871,14 @@ def narrative_fingerprint(
         tier: 档位 key 或配置对象；None → 默认完整档。
         corpus_hash: 语料正文哈希；给了就进指纹（语料改了要失效）。
         block_chars: 本次蒸馏的块大小；给了就进指纹（换渠道要失效）。
+        scope: 本次蒸馏的范围；给了就进指纹（换范围要失效）。
     """
     cfg = tier if isinstance(tier, NarrativeTier) else resolve_tier(tier)
     return {
         "source_ids": sorted(int(i) for i in source_ids),
         "narrative_version": NARRATIVE_VERSION,
         "tier": cfg.key,
-        "tier_signature": _tier_signature(cfg),
+        "tier_signature": _tier_signature(cfg, scope),
         **({"corpus_hash": corpus_hash} if corpus_hash is not None else {}),
         **({"block_chars": int(block_chars)} if block_chars else {}),
     }
@@ -4729,6 +4953,7 @@ def _persist_style_distill(
     cfg: "NarrativeTier",
     content_hash: str,
     profile: dict,
+    tier_signature: str | None = None,
 ) -> None:
     """把一次蒸馏产物写进「蒸馏库」。
 
@@ -4748,11 +4973,15 @@ def _persist_style_distill(
     from app.models import StyleDistill
 
     sid_hash = _source_ids_hash(source_ids)
+    # 档位签名必须与「找缓存时用的那一个」**逐字节一致**：
+    # 调用方（project_narrative）把含范围的签名传进来，
+    # 传不到时退回档位自身的签名（默认范围 ⇒ 两者相同）。
+    sig = tier_signature or _tier_signature(cfg)
     existing = db.scalar(
         select(StyleDistill).where(
             StyleDistill.source_ids_hash == sid_hash,
             StyleDistill.tier == cfg.key,
-            StyleDistill.tier_signature == _tier_signature(cfg),
+            StyleDistill.tier_signature == sig,
             StyleDistill.content_hash == content_hash,
             StyleDistill.narrative_version == NARRATIVE_VERSION,
             StyleDistill.status == "active",
@@ -4761,7 +4990,7 @@ def _persist_style_distill(
     rules = profile.get("rules") or {}
     rule_count = sum(len(v) for v in rules.values() if isinstance(v, list))
     # 可读的档位键（与人物塑造模板的 id 同一套格式）：哪一档、哪次配置、哪一版语料。
-    product_key = f"{cfg.key}:{_tier_signature(cfg)}:{(content_hash or '')[:8]}"
+    product_key = f"{cfg.key}:{sig}:{(content_hash or '')[:8]}"
     if existing is not None:
         existing.style_narrative = profile
         existing.n_chapters = profile.get("n_chapters")
@@ -4776,7 +5005,7 @@ def _persist_style_distill(
         source_ids=sorted(int(i) for i in source_ids),
         source_ids_hash=sid_hash,
         tier=cfg.key,
-        tier_signature=_tier_signature(cfg),
+        tier_signature=sig,
         content_hash=content_hash,
         narrative_version=int(profile.get("narrative_version", NARRATIVE_VERSION)),
         status="active",
@@ -4800,6 +5029,7 @@ def project_narrative(
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
     tier: str | NarrativeTier | None = None,
     progress: ProgressCallback | None = None,
+    scope: DistillScope | None = None,
 ) -> dict | None:
     """取项目当前该用的叙事档案；没有参考语料则返回 None。
 
@@ -4812,6 +5042,7 @@ def project_narrative(
     Args:
         progress: 可选的进度回调，原样透传给 `extract_narrative_profile`
             （后台蒸馏任务的进度条用）。None 时行为与加进度之前完全一致。
+        scope: 蒸馏范围（`mode="tier"` 时与加范围轴之前逐字节一致）。
 
     Raises:
         ValueError: tier / project.narrative_tier 是未知档位 key。
@@ -4824,10 +5055,15 @@ def project_narrative(
     if cfg_tier is None:
         cfg_tier = getattr(project, "narrative_tier", None)
     cfg = cfg_tier if isinstance(cfg_tier, NarrativeTier) else resolve_tier(cfg_tier)
+    # 范围：显式传入 > 项目上存的偏好 > 默认范围。
+    # 生成链路（project_narrative_safe）不传 ⇒ 按项目偏好核对指纹，
+    # 不会把用户蒸出来的「全量」当成失效而重蒸一遍（见 resolve_project_scope）。
+    scope = resolve_project_scope(project, scope)
 
     content_hash = corpus_content_hash(ids, db)
     want = narrative_fingerprint(ids, cfg, corpus_hash=content_hash,
-                                 block_chars=_block_chars_for_fingerprint())
+                                 block_chars=_block_chars_for_fingerprint(),
+                                 scope=scope)
     cached = project.style_narrative or {}
     profile = None
 
@@ -4866,7 +5102,8 @@ def project_narrative(
         if profile is None:
             # 没命中任何缓存/库（或 force 强制重算）→ 真实提取。
             profile = extract_narrative_profile(
-                db, project, ids, max_chapters=max_chapters, tier=cfg, progress=progress
+                db, project, ids, max_chapters=max_chapters, tier=cfg, progress=progress,
+                scope=scope,
             )
             profile["fingerprint"] = want
             project.style_narrative = profile
@@ -4876,7 +5113,8 @@ def project_narrative(
     # 只要本次产出了可用档案，全局库里就有它，标着档位，任何项目可直接复用。
     if content_hash is None:
         content_hash = corpus_content_hash(ids, db)
-    _persist_style_distill(db, project, ids, cfg, content_hash, profile)
+    _persist_style_distill(db, project, ids, cfg, content_hash, profile,
+                            tier_signature=want["tier_signature"])
     db.commit()
     return profile
 
@@ -4889,6 +5127,7 @@ def project_narrative_safe(
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
     tier: str | NarrativeTier | None = None,
     progress: ProgressCallback | None = None,
+    scope: DistillScope | None = None,
 ) -> dict | None:
     """生成链路上的安全包装。与 `style_profile_safe` 同理：失败只能降级为「不注入」，
     绝不能让整次生成失败。
@@ -4898,7 +5137,7 @@ def project_narrative_safe(
     """
     try:
         return project_narrative(db, project, force=force, max_chapters=max_chapters,
-                                 tier=tier, progress=progress)
+                                 tier=tier, progress=progress, scope=scope)
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
             "叙事档案不可用，本次生成跳过叙事档案块：%s: %s", type(exc).__name__, exc
@@ -4908,6 +5147,89 @@ def project_narrative_safe(
         except Exception:  # noqa: BLE001
             pass
         return None
+
+
+def estimate_distill_cost(
+    db: Session,
+    project,
+    novel_ids: list[int],
+    *,
+    tier: str | NarrativeTier | None = None,
+    scope: DistillScope | None = None,
+) -> dict:
+    """估算一次蒸馏的**规模**：读多少章 / 多少字 / 切多少块 / 调多少次模型。
+
+    ## 为什么要在提交前给预估
+
+    833 章语料跑完整档实测 42 分钟（30% 采样）⇒「全量」是**小时级**。
+    用户点一下「全量」然后在不知道要等多久、要花多少钱的情况下等两小时，
+    是最坏的体验。预估让界面能说清「这一轮会读 N 章、切 M 块、调 K 次模型」。
+
+    ## 口径必须是「同一把尺」
+
+    - 采样用**同一个** `sample_chapters_for_scope` ⇒ 估出来的章数就是真会读的章数；
+    - 分块用**同一个** `_chapters_per_block` + **同一个**块大小来源
+      （`_block_chars_for_fingerprint`，与实际蒸馏走同一张渠道能力表）⇒ 块数是真的；
+    - LLM 调用数 = 块数（每块一次提炼）+ 角色声音调用
+      （完整档约 11 次/本：8 个主要角色逐个 + 3 批配角；快速档 1 次/本）。
+
+    估不准的地方只有角色数量（取决于图谱里有多少角色），所以那一项单独列，
+    不混进块数里假装很准。
+    """
+    cfg = tier if isinstance(tier, NarrativeTier) else resolve_tier(tier)
+    scope = scope or DistillScope()
+    cutoffs = _distill_cutoffs(project, novel_ids) if scope.respect_cutoff else {}
+    block_chars = _block_chars_for_fingerprint()
+
+    books: list[dict] = []
+    total_chapters = 0
+    total_chars = 0
+    total_blocks = 0
+    voice_calls = 0
+    for nid in novel_ids:
+        chapters = _load_novel_chapters(db, nid)
+        if not chapters:
+            continue
+        cutoff = cutoffs.get(nid)
+        if cutoff is not None:
+            chapters = [(n, t) for n, t in chapters if n <= cutoff]
+            if not chapters:
+                continue
+        sampled = sample_chapters_for_scope(chapters, cfg, scope)
+        if not sampled:
+            continue
+        chars = sum(len(t) for _, t in sampled if t)
+        block_size = max(
+            MIN_CHAPTERS_PER_CHUNK, _chapters_per_block(sampled, block_chars)
+        )
+        blocks = max(1, -(-len(sampled) // block_size))
+        calls = 1 if cfg.voice_mode == "single_batch" else VOICE_MAIN_CHARACTERS + 3
+        books.append({
+            "novel_id": int(nid),
+            "chapters": len(sampled),
+            "chars": chars,
+            "blocks": blocks,
+            "voice_calls": calls,
+        })
+        total_chapters += len(sampled)
+        total_chars += chars
+        total_blocks += blocks
+        voice_calls += calls
+
+    return {
+        "tier": cfg.key,
+        "scope": scope.to_public_dict(),
+        "block_chars": block_chars,
+        "books": books,
+        "chapters": total_chapters,
+        "chars": total_chars,
+        "blocks": total_blocks,
+        "llm_calls": total_blocks + voice_calls,
+        "voice_calls": voice_calls,
+        # 实测参考（不是本函数算出来的）：完整档 833 章 / 30% 采样 ⇒ 42 分钟。
+        # 界面据此给「大概多久」的量级，不给具体分钟数（语料不同差别很大）。
+        "reference": "833 章语料、30% 采样、完整档实测 42 分钟",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -5085,6 +5407,33 @@ def _mature_chapters(chapters: list) -> list:
     return chapters[half:] or chapters
 
 
+def _rule_weight(item) -> float | None:
+    """规则条目的成熟度权重；**老档案没有这个键** ⇒ None（走旧取法）。"""
+    if isinstance(item, dict):
+        w = item.get("weight")
+        if isinstance(w, (int, float)) and not isinstance(w, bool):
+            return float(w)
+    return None
+
+
+def _spread_pick(pool: list, need: int) -> list:
+    """从 `pool` 里**均匀**取 `need` 个（保持原顺序）。
+
+    「摊开」而不是「挤在一起」：各维度取的章号错开，提示词不会变成
+    「同一个场景的说明书」。取 1 个时取**中点**而不是边界 ——
+    最后一章可能是尾声，文风另有偏差。
+    """
+    if need <= 0 or not pool:
+        return []
+    if len(pool) <= need:
+        return list(pool)
+    if need == 1:
+        return [pool[len(pool) // 2]]
+    step = (len(pool) - 1) / (need - 1)
+    indexes = sorted({round(i * step) for i in range(need)})
+    return [pool[i] for i in indexes]
+
+
 def _select_dim_rules(items: list, limit: int) -> list:
     """挑出注入提示词的手法规则：**成熟期优先**、跨章摊开。
 
@@ -5112,13 +5461,58 @@ def _select_dim_rules(items: list, limit: int) -> list:
     不因为「没有章号」就只剩一条。
 
     代价：**零模型调用**。规则早就在档案里，只是换了个挑法。
+
+    ## 带权重的新档案（按章加权，P1）
+
+    新档案的每条规则带 `weight`（早期 0.5 / 成熟期 1.0）。取法变成
+    **按权重分层、层内摊开**：成熟期先取，成熟期不够填满这一维时，
+    再从早期层里**均匀**补 —— 而不是像旧路径那样按追加顺序补
+    （那会优先补到**最早**的几章，也就是最生涩的那部分）。
+
+    老档案（没有 `weight` 键）**逐字节走旧路径**：权重是新档案才有的信息，
+    拿它去改老档案的取法等于凭空改变历史产物的行为。
     """
     if limit <= 0 or not items:
         return []
     groups, chapters = _group_by_chapter(items)
     known = [c for c in chapters if c != -1]
+
+    # 带权重的新档案：按权重分层挑选。
+    chapter_weight: dict[int, float] = {}
+    for ch, group in groups.items():
+        for item in group:
+            w = _rule_weight(item)
+            if w is not None:
+                chapter_weight[ch] = w
+                break
+    if chapter_weight:
+        classes: dict[float, list] = {}
+        for ch in known:
+            w = chapter_weight.get(ch)
+            if w is None:
+                continue
+            classes.setdefault(w, []).append(ch)
+        picked_chapters: list = []
+        for w in sorted(classes, reverse=True):
+            if len(picked_chapters) >= limit:
+                break
+            picked_chapters.extend(
+                _spread_pick(classes[w], limit - len(picked_chapters))
+            )
+        picked = [groups[ch][0] for ch in picked_chapters]
+        if len(picked) < limit:
+            # 兜底：没有权重的章（老数据混进新档案的情况）+ 剩余条目。
+            chosen = {id(x) for x in picked}
+            for item in items:
+                if len(picked) >= limit:
+                    break
+                if id(item) not in chosen:
+                    picked.append(item)
+                    chosen.add(id(item))
+        return picked
+
     mature = _mature_chapters(known) if known else []
-    picked_chapters: list = []
+    picked_chapters = []
     if mature:
         if limit == 1:
             # 只取一条时，「摊开」无从谈起 —— 取成熟期的中点，
@@ -5165,7 +5559,10 @@ def _select_beat_steps(items: list, limit: int) -> list:
     mature = _mature_chapters(chapters)
     picked: list = []
     seen_labels: set[str] = set()
-    for ch in mature:  # 升序：弧的先后不能乱
+
+    def _take(ch: int) -> bool:
+        """从这一章里取还没见过的步骤标签。返回 True 表示已取满。"""
+        nonlocal picked
         for item in groups[ch]:
             raw = item.get("rule", "") if isinstance(item, dict) else str(item)
             label = raw.split("：", 1)[0].strip()
@@ -5174,6 +5571,22 @@ def _select_beat_steps(items: list, limit: int) -> list:
             seen_labels.add(label)
             picked.append(item)
             if len(picked) >= limit:
+                return True
+        return False
+
+    for ch in mature:  # 升序：弧的先后不能乱
+        if _take(ch):
+            return picked
+
+    # 成熟期凑不满一整条弧时（按章加权的新档案）：用早期章节补，
+    # 仍然按章号升序 —— 弧的先后不能乱。
+    # 老档案（没有 weight 键）**不**走这条补位路径，行为与加权重之前逐字节一致。
+    if len(picked) < limit and any(_rule_weight(it) is not None for it in items):
+        mature_set = set(mature)
+        for ch in chapters:
+            if ch in mature_set:
+                continue
+            if _take(ch):
                 return picked
     return picked
 

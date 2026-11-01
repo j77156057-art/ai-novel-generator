@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "@/api/client";
 import { formatMeasure, measureText, toMeasure } from "@/utils/measure";
 import type { Measure } from "@/utils/measure";
 import type {
   AlertsResponse,
+  DistillCostEstimate,
   DistillJob,
+  DistillScope,
   GeneratePlan,
   Graph,
   LlmConfig,
@@ -1392,6 +1394,94 @@ const effectiveTier = computed(
 );
 
 // ====================================================================
+// 蒸馏范围（P1）：这一轮蒸哪几章
+// ====================================================================
+//
+// 档位决定「提炼得多细」，范围决定「读哪几章」，两者正交。
+// 范围是**项目级偏好**：蒸馏时记到项目上，生成链路核对指纹时用同一份，
+// 否则「全量蒸出来的档案」会被当成失效，每次生成都重蒸一遍默认范围的。
+//
+// 范围选项的文案写在这里（前端不查后端的选项清单）—— 但**规模预估**
+// 必须走后端：预估要用真实的采样与分块逻辑算，前端自己估等于给用户一个假数。
+
+const SCOPE_OPTIONS: {
+  mode: DistillScope["mode"];
+  label: string;
+  desc: string;
+}[] = [
+  { mode: "tier", label: "沿用档位", desc: "按所选档位自带的采样策略" },
+  { mode: "all", label: "全量", desc: "整本都蒸；早期章节按权重降权" },
+  { mode: "range", label: "章节区间", desc: "只蒸指定区间（含两端）" },
+  { mode: "fixed_chapters", label: "固定章数", desc: "全书均匀取 N 章" },
+  { mode: "percentage", label: "按百分比", desc: "按语料量百分比采样" },
+];
+
+const scopeMode = ref<DistillScope["mode"]>("tier");
+const scopeChapters = ref(30);
+const scopeFrom = ref<number | null>(null);
+const scopeTo = ref<number | null>(null);
+const scopeRatio = ref(0.3);
+const scopeRespectCutoff = ref(true);
+const scopeEstimate = ref<DistillCostEstimate | null>(null);
+const scopeEstimateErr = ref<string | null>(null);
+
+/** 本次要提交的范围；null = 沿用档位（与后端默认逐字节一致）。 */
+const effectiveScope = computed<DistillScope | null>(() => {
+  const base = {
+    mode: scopeMode.value,
+    ratio: null,
+    chapters: null,
+    from_chapter: null,
+    to_chapter: null,
+    respect_cutoff: scopeRespectCutoff.value,
+  } as DistillScope;
+  if (scopeMode.value === "tier" || scopeMode.value === "all") return scopeMode.value === "all" ? base : null;
+  if (scopeMode.value === "fixed_chapters") {
+    return { ...base, chapters: Math.max(1, Math.floor(scopeChapters.value) || 1) };
+  }
+  if (scopeMode.value === "percentage") {
+    return { ...base, ratio: Math.min(1, Math.max(0.01, scopeRatio.value || 0.3)) };
+  }
+  // range：起止都缺省时用「从第 1 章到最大章」，不猜具体数字 ——
+  // 猜错的话用户点了却蒸了别的范围，而界面上看不出来。
+  const from = scopeFrom.value ?? 1;
+  const to = scopeTo.value ?? from;
+  return { ...base, from_chapter: Math.max(1, from), to_chapter: Math.max(from, to) };
+});
+
+/** 规模预估（后端算，前端只显示）。 */
+let scopeEstimateTimer: ReturnType<typeof setTimeout> | null = null;
+async function refreshScopeEstimate() {
+  if (!selectedRefs.value.length) {
+    scopeEstimate.value = null;
+    scopeEstimateErr.value = null;
+    return;
+  }
+  try {
+    scopeEstimate.value = await api.estimateDistill(
+      projectId,
+      effectiveTier.value || null,
+      effectiveScope.value,
+    );
+    scopeEstimateErr.value = null;
+  } catch (err) {
+    scopeEstimate.value = null;
+    scopeEstimateErr.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+watch(
+  [effectiveTier, effectiveScope, () => selectedRefs.value.join(",")],
+  () => {
+    if (scopeEstimateTimer !== null) clearTimeout(scopeEstimateTimer);
+    scopeEstimateTimer = setTimeout(() => {
+      scopeEstimateTimer = null;
+      void refreshScopeEstimate();
+    }, 400);
+  },
+);
+
+// ====================================================================
 // 文风蒸馏后台任务（可观测进度）
 // ====================================================================
 //
@@ -1759,7 +1849,12 @@ async function submitDistill(force = false): Promise<boolean> {
     distillJob.value = null;
     return false;
   }
-  const r = await api.startDistill(projectId, effectiveTier.value || null, force);
+  const r = await api.startDistill(
+    projectId,
+    effectiveTier.value || null,
+    force,
+    effectiveScope.value,
+  );
   // 一旦真正发起了任务，立刻清掉强制开关：后台运行已在跑，复选框的使命结束。
   // 否则运行期间再点一次「保存并开始蒸馏」会带着 force=true 又起一条强制任务，
   // 等于把同一份语料烧两遍 LLM。下一轮若还想强制重算，用户重新勾即可。
@@ -2320,6 +2415,13 @@ onMounted(async () => {
 
 // 轮询定时器必须在组件销毁时清掉，否则会对着已卸载的组件继续写 ref。
 onUnmounted(stopDistillPolling);
+// 规模预估的防抖定时器同理：组件没了就别再发请求、也别再写 ref。
+onUnmounted(() => {
+  if (scopeEstimateTimer !== null) {
+    clearTimeout(scopeEstimateTimer);
+    scopeEstimateTimer = null;
+  }
+});
 </script>
 
 <template>
@@ -2622,6 +2724,63 @@ onUnmounted(stopDistillPolling);
       </div>
       <p v-if="forceRedistill" class="notice warn distill-inline">
         已开启强制重算：本次会真正重新调用模型蒸馏，耗时与费用按所选档位正常发生。
+      </p>
+    </div>
+
+    <!-- ============ 蒸馏范围（这一轮蒸哪几章） ============ -->
+    <div class="library-block">
+      <div class="card-title" style="font-size: var(--fs-md)">
+        蒸馏范围<span class="hint">默认沿用档位 · 全量最准也最贵</span>
+      </div>
+      <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
+        档位决定<strong>提炼得多细</strong>，范围决定<strong>读哪几章</strong>。
+        换范围会换掉缓存键，不会拿旧范围的档案顶替；下面的规模预估由服务端按同一套采样与分块逻辑算出。
+      </p>
+
+      <div class="scope-list">
+        <button
+          v-for="o in SCOPE_OPTIONS"
+          :key="o.mode"
+          class="scope-opt"
+          :class="{ on: scopeMode === o.mode }"
+          :aria-pressed="scopeMode === o.mode"
+          type="button"
+          @click="scopeMode = o.mode"
+        >
+          <span class="tier-name">{{ o.label }}</span>
+          <span class="tier-desc">{{ o.desc }}</span>
+        </button>
+      </div>
+
+      <div v-if="scopeMode === 'fixed_chapters'" class="row scope-params">
+        <label class="checkbox" for="scope-chapters">章数</label>
+        <input id="scope-chapters" type="number" min="1" v-model.number="scopeChapters" />
+      </div>
+
+      <div v-if="scopeMode === 'range'" class="row scope-params">
+        <label class="checkbox" for="scope-from">起始章</label>
+        <input id="scope-from" type="number" min="1" v-model.number="scopeFrom" />
+        <label class="checkbox" for="scope-to">结束章</label>
+        <input id="scope-to" type="number" min="1" v-model.number="scopeTo" />
+      </div>
+
+      <div v-if="scopeMode === 'percentage'" class="row scope-params">
+        <label class="checkbox" for="scope-ratio">采样比例</label>
+        <input id="scope-ratio" type="number" min="0.01" max="1" step="0.05" v-model.number="scopeRatio" />
+      </div>
+
+      <label class="checkbox" style="margin-top: var(--gap)">
+        <input type="checkbox" v-model="scopeRespectCutoff" />
+        尊重「故事进行到第几章」边界（不越过边界读原文）
+      </label>
+
+      <p class="faint scope-estimate" style="font-size: var(--fs-sm)">
+        <template v-if="scopeEstimate">
+          本轮将读 {{ scopeEstimate.chapters }} 章 · 约 {{ scopeEstimate.blocks }} 块 · 约
+          {{ scopeEstimate.llm_calls }} 次模型调用（实测参考：{{ scopeEstimate.reference }}）
+        </template>
+        <template v-else-if="scopeEstimateErr">规模预估不可用：{{ scopeEstimateErr }}</template>
+        <template v-else>选定语料与范围后显示本轮规模预估</template>
       </p>
     </div>
 
@@ -4486,6 +4645,47 @@ onUnmounted(stopDistillPolling);
 .cut-input {
   width: 110px;
 }
+/* ---------- 蒸馏范围选择 ---------- */
+/* 范围是「一行一个选项 + 一行说明」的清单：五个选项各有各的参数，
+   挤成 pill 会让参数无处安放。 */
+.scope-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.scope-opt {
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 12px;
+  border-radius: var(--radius-md);
+  border: var(--border-w) solid var(--border-strong);
+  background: var(--bg);
+  color: var(--fg);
+}
+.scope-opt:hover {
+  border-color: var(--accent);
+}
+.scope-opt.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.scope-params {
+  margin-top: var(--gap);
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.scope-params input[type="number"] {
+  width: 110px;
+}
+.scope-estimate {
+  margin-top: var(--gap);
+}
+
 /* ---------- 蒸馏档位选择 ---------- */
 /* 卡片式而非 chip 式：三档要并排比较的是「什么时候用」和「要等多久」，
    一行 pill 装不下这些说明文字。 */

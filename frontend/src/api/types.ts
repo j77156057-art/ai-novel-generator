@@ -1392,11 +1392,65 @@ export type DistillStatus = "pending" | "running" | "success" | "failed";
  * 刷新、切步骤都不该丢进度。所以进度落在 DB（`distill_runs` 表），前端轮询，
  * 而不是挂在某条 HTTP 连接的 SSE 上——那条连接一断就什么都没了。
  */
+/**
+ * 蒸馏**范围**：这一轮蒸的是哪几章（`app.style.scope.DistillScope`）。
+ *
+ * 与档位正交：档位管「提炼得多细」，范围管「读哪几章」。
+ *
+ * - `tier`：沿用档位自带的采样策略（默认，也是「什么都没指定」的样子）
+ * - `percentage`：按语料量百分比采样，带 `ratio`
+ * - `fixed_chapters`：固定章数、均匀摊在全书，带 `chapters`
+ * - `range`：章节区间，带 `from_chapter` / `to_chapter`（含两端）
+ * - `all`：全部章节
+ *
+ * `respect_cutoff` = 是否尊重项目的「故事进行到第几章」边界（默认 true）。
+ */
+export interface DistillScope {
+  mode: "tier" | "percentage" | "fixed_chapters" | "range" | "all";
+  ratio: number | null;
+  chapters: number | null;
+  from_chapter: number | null;
+  to_chapter: number | null;
+  respect_cutoff: boolean;
+}
+
+/**
+ * 蒸馏范围的**预估**（POST /api/projects/{id}/distill/estimate 的响应）。
+ *
+ * 这些数字与真实蒸馏同一把尺（同一个采样器、同一个分块器、同一张渠道能力表），
+ * 所以不是「大概」，而是「就是这么算的」。
+ */
+export interface DistillCostEstimate {
+  tier: string;
+  scope: DistillScope;
+  /** 每个蒸馏块的目标字数（跟渠道走）。 */
+  block_chars: number;
+  books: {
+    novel_id: number;
+    chapters: number;
+    chars: number;
+    blocks: number;
+    voice_calls: number;
+  }[];
+  chapters: number;
+  chars: number;
+  blocks: number;
+  /** 本次预计的模型调用总数（块数 + 角色声音调用）。 */
+  llm_calls: number;
+  voice_calls: number;
+  /** 实测参考（不是估算出来的）：完整档 833 章 / 30% 采样 = 42 分钟。 */
+  reference: string;
+}
+
 export interface DistillJob {
   id: number;
   project_id: number;
   /** 本次实际使用的档位 key（full/balanced/fast）。 */
   tier: string | null;
+  /** 本次跑的是哪种产物：narrative / character_template / book_digest。 */
+  kind?: string | null;
+  /** 本次的蒸馏范围（null = 没设范围 = 沿用档位自带策略）。 */
+  scope?: DistillScope | null;
   status: DistillStatus;
   /** 人话阶段名，如「语料 2/3：提炼第 5/12 块」，直接显示给用户。 */
   stage: string | null;
@@ -1420,6 +1474,8 @@ export interface DistillStartResponse {
   job_id: number;
   status: DistillStatus;
   tier: string | null;
+  /** 本次实际生效的范围（与请求一致，归一化后的形状）。 */
+  scope?: DistillScope | null;
   /**
    * true = 复用了该项目正在跑的同档位任务，没有新起一条。
    *

@@ -33,7 +33,9 @@ import type {
   ChunkOut,
   DistillJob,
   DistillJobListResponse,
+  DistillScope,
   DistillStartResponse,
+  DistillCostEstimate,
   ExpertQuestions,
   GenerateLoopResult,
   GeneratePlan,
@@ -297,10 +299,39 @@ export const api = {
    * 不用 `buildNarrative` 之类的同步端点：完整档在 833 章语料上实测 42 分钟，
    * 同步请求必然超时；而且同步端点一断线就没进度了，谈不上「离开页面继续跑」。
    */
-  startDistill: (projectId: number, tier?: string | null, force = false) =>
+  startDistill: (
+    projectId: number,
+    tier?: string | null,
+    force = false,
+    scope?: DistillScope | null,
+  ) =>
     request<DistillStartResponse>(
       `/projects/${projectId}/distill`,
-      jsonInit("POST", { tier: tier ?? null, force }),
+      jsonInit("POST", {
+        tier: tier ?? null,
+        force,
+        ...(scope ? { scope } : {}),
+      }),
+    ),
+
+  /**
+   * 估算一次蒸馏的规模（读多少章 / 切多少块 / 调多少次模型）。
+   *
+   * 全量蒸馏是小时级的，用户点下去之前就该知道代价。
+   * 数字由后端按**同一套**采样与分块逻辑算出，与真实蒸馏一致。
+   */
+  estimateDistill: (
+    projectId: number,
+    tier?: string | null,
+    scope?: DistillScope | null,
+  ) =>
+    request<DistillCostEstimate>(
+      `/projects/${projectId}/distill/estimate`,
+      jsonInit("POST", {
+        tier: tier ?? null,
+        force: false,
+        ...(scope ? { scope } : {}),
+      }),
     ),
 
   /**

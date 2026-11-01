@@ -86,6 +86,8 @@ def distill_run_to_dict(run: DistillRun) -> dict[str, Any]:
         "id": run.id,
         "project_id": run.project_id,
         "tier": run.tier,
+        "kind": run.kind,
+        "scope": run.scope_json,
         "status": run.status,
         "stage": run.stage,
         "progress_current": int(run.progress_current or 0),
@@ -101,19 +103,30 @@ def distill_run_to_dict(run: DistillRun) -> dict[str, Any]:
 
 
 def create_distill_run(db: Session, project_id: int, tier: str,
-                       kind: str = "narrative") -> DistillRun:
+                       kind: str = "narrative",
+                       scope: dict | None = None,
+                       novel_id: int | None = None) -> DistillRun:
     """登记一条蒸馏任务（pending），返回已 flush 的行（拿到 id）。
 
     只登记、不开工：开工由调用方把 `run_distill_job` 丢进 BackgroundTasks，
     这样 `POST /distill` 才能在毫秒级返回 job_id。
 
-    `kind` 区分产物种类（narrative / character_template）—— 两者共用同一张
-    任务表，进度与轮询逻辑完全一样。
+    `kind` 区分产物种类（narrative / character_template / book_digest）——
+    两者共用同一张任务表，进度与轮询逻辑完全一样。
+
+    `scope` 是本次蒸馏的**范围**（`app.style.scope.DistillScope` 的公开形状）。
+    落库的原因：任务行是历史记录，「这一轮读的是哪几章」不该随项目偏好变化；
+    而且并发防重要靠它区分「同档位不同范围」的两次蒸馏。
+
+    `novel_id` 是「按书」的产物（全书摘要）针对的那本书；
+    叙事蒸馏一次蒸多本参考语料，没有单本书 ⇒ 留空。
     """
     run = DistillRun(
         project_id=project_id,
         tier=tier,
         kind=kind,
+        scope_json=scope,
+        novel_id=novel_id,
         status=STATUS_PENDING,
         stage="已排队，等待后台开始",
         progress_current=0,
@@ -283,6 +296,14 @@ def run_distill_job(
         if not (project.reference_novel_ids or []):
             raise ValueError("项目未选参考语料，无法蒸馏（请先选语料或走自由生成）")
 
+        # 范围从**任务行**里读，而不是从入参传：
+        # 任务行才是这一次蒸馏的真实输入（进程重启后也还在）。
+        scope = None
+        if getattr(run, "scope_json", None):
+            from app.style.scope import parse_scope
+
+            scope = parse_scope(run.scope_json)
+
         progress = _make_progress_writer(job_id, db)
         if (run.kind or "narrative") == "character_template":
             # 人物塑造模板：独立产物（每块一次调用，约 1/8 的量）——
@@ -298,7 +319,7 @@ def run_distill_job(
             run.rejected = getattr(row, "rejected", None)
         else:
             profile = project_narrative(
-                db, project, force=force, tier=tier, progress=progress
+                db, project, force=force, tier=tier, progress=progress, scope=scope
             )
             if not isinstance(profile, dict):
                 raise ValueError("蒸馏未产出档案（可能是档位不合法或语料为空）")
@@ -333,3 +354,5 @@ def run_distill_job(
             logger.exception("蒸馏任务收尾时间戳写入失败 job_id=%s", job_id)
         finally:
             db.close()
+
+
