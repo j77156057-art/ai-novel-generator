@@ -376,16 +376,34 @@ POST /api/projects/{id}/style-spec/export          → 从档案重导（口径�
 POST /api/projects/{id}/style-spec/check           → 传入一段文本，逐项判定（前端调试用）
 
 # ② 蒸馏范围（扩展现有端点）
-POST /api/projects/{id}/distill   body: {tier, force, scope:{mode, chapters, from, to}}
+POST /api/projects/{id}/distill   body: {tier, force, scope:{mode, ratio, chapters, from_chapter, to_chapter, respect_cutoff}}
+POST /api/projects/{id}/distill/estimate   body: 同上 → 本轮规模预估（章/块/调用数）
 
-# ③ 全书压缩
-POST /api/books/{novel_id}/digest   body: {mode: auto|retrieval|whole, target_ratio}
-GET  /api/books/{novel_id}/digest
-GET  /api/books/{novel_id}/digest/verify            → 压缩比 / 主线覆盖 / 角色覆盖
+# ③ 全书压缩（BookDigest）
+POST /api/projects/{id}/digests   body: {novel_id, mode, target_ratio, force}   → 后台任务，立即返回 job_id
+GET  /api/books/{novel_id}/digest          → 最新摘要（含渲染文本）
+GET  /api/books/{novel_id}/digest/verify   → 压缩比 / 主线覆盖 / 角色覆盖 / 证据缺失率
 ```
 
 全部走**后台任务 + 进度轮询**（照 `distill_runs` 的形状：`pending → running → success/failed`，
 `finally` 里必写 `finished_at`）。
+
+### 6.1 摘要端点为什么是「项目级提交 + 书级查询」（2026-11-02 实施时改的）
+
+设计稿原写 `POST /api/books/{novel_id}/digest`。实施时改成
+**项目级提交 + 书级查询**，效果一样（提交时仍要指定哪本书），但：
+
+- **产物按书存**（`book_digests`）：一本书的摘要与哪个项目无关，跨项目复用；
+- **提交挂在项目下**：后台任务表（`distill_runs`）的项目列必填，进度天然属于「某项目的操作」。
+
+⇒ 文档与实现以本节为准。
+
+### 6.2 范围参数名（`from` / `to` 改了）
+
+设计稿原写 `"from": 1, "to": 200`。实现用 **`from_chapter` / `to_chapter`** ——
+`from` 是 Python 关键字，用它做字段名会让「解析请求体」的那一层没法用普通属性访问，
+而字段名一旦别扭，后面所有调用点都要绕。
+
 
 ---
 
@@ -598,3 +616,70 @@ P0 的代码已进仓库。落地的文件：
    单看渠道能读多少会得出错误结论（实测就错了一轮）。
 3. **验收要比「下游实际用到的」，不是「中间产出的总量」** ——
    总量是候选池，下游只吃一小部分。
+
+---
+
+## 13. P1 / P2 实施记录（2026-11-02，已落地）
+
+### 13.1 拍板（主人 2026-11-02 选）
+
+| # | 事项 | 结论 |
+|---|---|---|
+| 1 | 全量档的早期文风漂移 | **按章加权**（早期权重 0.5 / 成熟期 1.0，注入时成熟期优先；不额外跑一遍蒸馏） |
+| 2 | BookDigest 本轮范围 | **产物 + 验收 + 消费接入**（生成上下文 / 检索 / 角色对话三条链路全接） |
+
+### 13.2 P1 落地的文件
+
+| 文件 | 作用 |
+|---|---|
+| `backend/app/style/scope.py`（新） | `DistillScope` + `parse_scope`（非法参数当场报错）+ `resolve_project_scope` |
+| `backend/app/style/narrative.py` | `sample_chapters_for_scope`（四种范围）、`maturity_weight`、`_attach_maturity_weights`、带权重的 `_select_dim_rules` / `_select_beat_steps`、`estimate_distill_cost`、`narrative_fingerprint(scope=…)`、`_tier_signature(tier, scope)` |
+| `backend/app/models.py` + `backend/app/db.py` | `projects.narrative_scope`（JSON）、`distill_runs.scope_json`（JSON）+ 迁移 |
+| `backend/app/style/jobs.py` | 任务行记范围；范围从**任务行**读（进程重启也还在） |
+| `backend/app/routers/projects.py` | `DistillScopeSpec`、scope 进 `POST /distill`、新增 `POST /distill/estimate`、范围不同的并发 ⇒ 409 |
+| `backend/app/agents/diagnostic.py` | 诊断算指纹时用**同一份**范围口径 |
+| `frontend/src/api/types.ts` / `client.ts` / `views/ProjectWorkspace.vue` | 范围选择 UI + 规模预估显示 + 提交时带 scope |
+| `tests/test_distill_scope.py`（新，42 项） | 解析 / 指纹 / 采样 / 边界 / 加权 / 预估 / API |
+
+### 13.3 P1 的三条实现结论（详见 ENGINEERING.md）
+
+1. **范围必须落成项目级偏好** —— 否则生成链路按默认范围核对指纹，
+   全量蒸出来的档案永远失效 ⇒ 每次生成都重蒸一遍默认范围的；
+2. **默认范围不进指纹哈希** —— 否则加一条轴就让所有既有缓存与蒸馏库行集体失效；
+3. **cutoff 的口径与剧透口径刻意不同** —— 蒸馏是学写法（没边界就整本照蒸），
+   角色聊天是防剧透（没边界就整本挡掉）。解析复用 `VisibilityPolicy`，不另写一份。
+
+### 13.4 P2 落地的文件
+
+| 文件 | 作用 |
+|---|---|
+| `backend/app/style/digest.py`（新） | 档位选择、提示词、解析、**证据强制**、三项验收、渲染、落库 |
+| `backend/app/generation/digest_context.py`（新） | 消费侧：摘要块 / 角色摘要块 / 摘要检索（含 cutoff 与路径纪律） |
+| `backend/app/models.py` + `backend/app/db.py` | `book_digests` 表（时间线 / 角色 / 反应 + 验收结论） |
+| `backend/app/style/jobs.py` | `run_book_digest_job`（后台任务，同款失败纪律） |
+| `backend/app/routers/digest.py`（新） | 提交 / 查询 / 验收三个端点 |
+| `backend/app/generation/engine.py` + `prompts.py` | 续写路径注入摘要块；摘要条目进剧情检索上下文 |
+| `backend/app/roleplay/chat.py` | 角色对话注入「生平 + 情境反应」 |
+| `backend/verify_book_digest.py`（新，20 项） | 可证伪验证：证据强制 / 三项验收 / **阳性对照** / 档位选择 |
+| `tests/test_book_digest.py`（新，28 项） | 单元 + 端点 + 消费边界 |
+
+### 13.5 P2 的验收口径（实测中被验证脚本推翻过三次）
+
+1. **压缩比**：`chars_out ≤ max(chars_in / 目标比, MIN_DIGEST_CHARS=200)`
+   —— 小书压到 100 字不是压缩，是删内容；
+2. **主线覆盖**：候选事件与摘要共享 **≥ 2 个有区分度的 2-gram**（不是逐字比对，
+   改写必漏判；也不是语义判定，闸门里不该有模型）；
+3. **角色覆盖**：高频角色名出现在**渲染文本**里的比例（扫渲染文本才数得到
+   「只出现在关系里的人」）；
+4. **证据缺失率** ≤ 20%（成片缺失 ⇒ 模型在编 ⇒ 整次判失败）。
+
+⇒ 验证脚本 `backend/verify_book_digest.py` 现在 **20/20 通过**，
+且带**阳性对照**（故意做坏的摘要必须被判 FAIL）。
+
+### 13.6 本轮没做的（明说，不留「看起来做了」的错觉）
+
+- **摘要的前端面板**没做（后端端点齐了）；
+- **切块档与整本档都没真跑过真书**（要订阅额度，且要先确认渠道的**输出预算**
+  够不够 —— 摘要的输出体量由结构化条目数决定，与上下文上限是两回事）；
+- **检索接入只做了「摘要条目进剧情检索上下文」**，
+  没有把时间线/反应做成独立的可检索索引表。
