@@ -139,6 +139,23 @@ def create_distill_run(db: Session, project_id: int, tier: str,
     return run
 
 
+def find_active_book_run(db: Session, novel_id: int) -> DistillRun | None:
+    """取这本书最近一条**未终态**的全书摘要任务（没有则 None）。
+
+    与 `find_active_run` 分开：叙事蒸馏按项目防重，
+    全书摘要按**书**防重（同一本书在两个项目里各跑一次是纯浪费）。
+    """
+    return db.scalar(
+        select(DistillRun)
+        .where(
+            DistillRun.novel_id == int(novel_id),
+            DistillRun.kind == "book_digest",
+            DistillRun.status.in_(ACTIVE_STATUSES),
+        )
+        .order_by(DistillRun.id.desc())
+    )
+
+
 def find_active_run(db: Session, project_id: int,
                     kind: str = "narrative") -> DistillRun | None:
     """取该项目最近一条**未终态**任务（pending/running），没有则 None。
@@ -356,3 +373,110 @@ def run_distill_job(
             db.close()
 
 
+def run_book_digest_job(
+    job_id: int,
+    project_id: int,
+    novel_id: int,
+    mode: str = "auto",
+    target_ratio: float = 10.0,
+    force: bool = False,
+) -> None:
+    """后台执行一次**全书摘要**（BookDigest）。
+
+    与 `run_distill_job` 同款纪律：
+
+    1. 自己开 session（不复用请求 session）；
+    2. 任何异常都落 `failed` + `error`，绝不停在 `running`；
+    3. 进度只报进度，不碰摘要逻辑。
+
+    Args:
+        job_id: `DistillRun.id`（已登记为 pending）。
+        project_id: 触发这次摘要的项目（只用于归属与存在性校验）。
+        novel_id: 要做摘要的语料。
+        mode: 抽取档位（`auto` / `whole` / `retrieval`）。
+        target_ratio: 压缩比目标（输出 ≤ 输入 / 该值）。
+        force: True 时即便已有摘要也重算（并覆盖旧行）。
+    """
+    from app.style.digest import (
+        build_book_digest,
+        digest_content_hash,
+        latest_digest,
+        save_digest,
+    )
+    from app.style.narrative import resolve_distill_provider
+
+    db = SessionLocal()
+    try:
+        run = db.get(DistillRun, job_id)
+        if run is None:
+            logger.error("全书摘要任务行不存在 job_id=%s", job_id)
+            return
+
+        run.status = STATUS_RUNNING
+        run.started_at = _utcnow()
+        run.stage = "已受理，正在读取全书"
+        run.progress_current = 0
+        run.progress_total = 0
+        run.error = None
+        db.commit()
+
+        if db.get(Project, project_id) is None:
+            raise ValueError(f"project {project_id} 不存在")
+
+        provider = resolve_distill_provider()
+        progress = _make_progress_writer(job_id, db)
+        digest = build_book_digest(
+            db, novel_id, provider=provider, mode=mode, progress=progress,
+            target_ratio=target_ratio,
+        )
+
+        content_hash = digest_content_hash(db, novel_id)
+        if not force:
+            existing = latest_digest(db, novel_id)
+            if existing is not None and existing.content_hash == content_hash:
+                # 同一本书同一版正文已经摘要过 ⇒ 直接复用，不重算（幂等）。
+                run.status = STATUS_SUCCESS
+                run.stage = "命中已有摘要，未重新抽取"
+                run.n_chapters = (digest.get("source") or {}).get("n_chapters")
+                run.rule_count = _digest_entry_count(digest)
+                run.rejected = (digest.get("stats") or {}).get("dropped")
+                run.progress_total = max(int(run.progress_total or 0), 1)
+                run.progress_current = run.progress_total
+                db.commit()
+                return
+        row = save_digest(db, digest, content_hash)
+
+        run.status = STATUS_SUCCESS
+        run.stage = "全书摘要已就绪"
+        run.n_chapters = (digest.get("source") or {}).get("n_chapters")
+        run.rule_count = _digest_entry_count(digest)
+        run.rejected = (digest.get("stats") or {}).get("dropped")
+        run.progress_total = max(int(run.progress_total or 0), 1)
+        run.progress_current = run.progress_total
+        run.error = None
+        db.commit()
+        logger.info("全书摘要完成 novel_id=%s digest_id=%s", novel_id, row.id)
+    except Exception as exc:  # noqa: BLE001 —— 后台任务不得往外抛
+        logger.exception(
+            "全书摘要任务失败 job_id=%s novel_id=%s", job_id, novel_id
+        )
+        _mark_failed(db, job_id, exc)
+    finally:
+        try:
+            run = db.get(DistillRun, job_id)
+            if run is not None and run.finished_at is None:
+                run.finished_at = _utcnow()
+                db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("全书摘要任务收尾时间戳写入失败 job_id=%s", job_id)
+        finally:
+            db.close()
+
+
+def _digest_entry_count(digest: dict) -> int:
+    """摘要的条目总数（时间线 + 角色 + 反应）。"""
+    return (
+        len(digest.get("timeline") or [])
+        + len(digest.get("characters") or [])
+        + len(digest.get("reactions") or [])
+    )

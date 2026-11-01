@@ -949,6 +949,64 @@ class StyleDistill(Base):
     product_key = Column(String(96), nullable=True, index=True)
 
 
+class BookDigest(Base):
+    """一本书的**结构化摘要**（全书压缩产物，P2）。
+
+    ## 它是什么
+
+    三块结构化内容：
+
+    - `timeline`：时间线（按**因果顺序**，不是叙述顺序）；
+    - `characters`：角色生平（身份 / 关系 / 关键经历 / 说话特征）；
+    - `reactions`：情境 → 反应（他面对什么事会说什么、会怎么做）。
+
+    与叙事档案（`StyleDistill`）是**两种不同的东西**，不能混：
+
+    - 叙事档案 = 「**怎么写**」（手法规则，注入生成提示词）；
+    - 全书摘要 = 「**写了什么**」（这本书的内容，替代整本进上下文）。
+
+    ⇒ 分表存，不塞进 `style_narrative`。
+
+    ## 复用键
+
+    `(novel_id, content_hash, digest_version)`：同一本书、同一版正文、同一版结构
+    ⇒ 至多一行 active。语料重新导入/清洗后正文变了（`content_hash` 变）⇒ 旧摘要失效，
+    不会被当成「这本书的摘要」继续用。
+
+    ## 产物里的每一条都必须有证据
+
+    入库前已经过 `app.style.digest.enforce_evidence`：
+    **没证据（章号 + 原文逐字片段）的条目直接丢弃**。
+    这一层不再复查 —— 复查是入库前的职责，表里存的就是「站得住的条目」。
+    """
+
+    __tablename__ = "book_digests"
+
+    id = Column(Integer, primary_key=True)
+    # 这本书（raw_novels.id）。摘要按**书**存，跨项目复用。
+    novel_id = Column(Integer, ForeignKey("raw_novels.id"), nullable=False, index=True)
+    # 产物结构版本（见 app.style.digest.DIGEST_VERSION）。结构变了旧产物失效。
+    digest_version = Column(Integer, nullable=False, default=1)
+    # 抽取档位：whole（整本一次投喂）/ retrieval（切块抽 + 合并）。
+    mode = Column(String(16), nullable=False, default="auto")
+    # 为什么选这一档（人话）。界面上要能看到「为什么是切块抽」。
+    mode_reason = Column(Text, nullable=True)
+    # 语料正文 sha256：正文变了摘要必须重算（与 style_distills 同口径）。
+    content_hash = Column(String(64), nullable=False, index=True)
+    # 三块产物（timeline / characters / reactions）。
+    payload = Column(JSON, nullable=True)
+    # 渲染后的文本（进上下文的就是它；JSON 是存储形态，文本是消费形态）。
+    text = Column(Text, nullable=True)
+    # 摘要字段：输入/输出字数、压缩比、证据留存与丢弃条数。
+    stats_json = Column(JSON, nullable=True)
+    # 三项验收的结论（压缩比 / 主线覆盖 / 角色覆盖 / 证据缺失率）。
+    verify_json = Column(JSON, nullable=True)
+    # active | archived
+    status = Column(String(16), nullable=False, default="active", index=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
 class CharacterTemplate(Base):
     """**人物塑造模板库**：按档位分开存放的「怎么塑造一个人物」方法论。
 

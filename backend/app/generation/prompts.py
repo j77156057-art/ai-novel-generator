@@ -434,6 +434,7 @@ def build_system_prompt(
     entity_table: dict | None = None,
     override_style: str = "",
     override_constraint: str = "",
+    book_digest: str = "",
 ) -> str:
     """静态系统提示——整轮生成保持不变，置于最前，保证提示词缓存命中率。
 
@@ -447,6 +448,10 @@ def build_system_prompt(
 
     `override_style` / `override_constraint` 是**运行时覆写**（`prompt_overrides` 表）：
     渲染成独立的一段，插在【风格】之后 / 【续写纪律】之后；默认空串 ⇒ 输出不变。
+
+    `book_digest` 是**参考书的结构化摘要**（全书压缩产物）：续写路径下用它
+    替代「整本原文进上下文」，原创路径恒为空串（见 `generation/digest_context.py`
+    的三条纪律）。默认空串 ⇒ 输出逐字节不变。
     """
     # —— 合并而非遮蔽 ——
     # 旧实现「有 plot_bible 就只取 bible」会让生成后抽取的事实（KG reminders）被静默丢弃：
@@ -498,6 +503,10 @@ def build_system_prompt(
         f"{_narrative_block(style_narrative, include_voice=_profile_rules.get('include_voice', True), dims=_profile_rules.get('narrative_dims'), voice_character=_voice_character_for(profile, character_names), entity_table=entity_table)}"
         f"{_character_template_block(style_narrative, enabled=bool(_profile_rules.get('include_character_template')))}"
         f"{_character_profile_block(style_narrative, profile=profile, character_names=character_names)}"
+        # —— 参考书背景摘要（全书压缩产物，P2）——
+        # 续写路径下它替代「整本原文进上下文」；原创路径恒为空
+        # （摘要是**剧情**，塞进原创提示词会让模型照着参考书的剧情写）。
+        f"{book_digest}"
         f"{_scale_block}"
         "【文风要求：真人小说感，忌 AI 腔】"
         "- 禁止金句化台词：人物不许说出格言式总结或口号（如「不被遗忘本身就是最贵的代价」）；"

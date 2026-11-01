@@ -95,6 +95,7 @@ SYSTEM_TEMPLATE = """你现在扮演《{book_title}》里的{character}。
 
 {profile_block}
 {voice_block}
+{digest_block}
 【你说话的方式】
 {voice}
 【你知道的和你只是听到的】
@@ -129,8 +130,14 @@ def build_system(
     book_title: str = "",
     style_narrative: dict | None = None,
     timeline_block: str = "",
+    digest_block: str = "",
 ) -> str:
-    """角色扮演的 system 提示（稳定部分 ⇒ 进 system，不击穿缓存）。"""
+    """角色扮演的 system 提示（稳定部分 ⇒ 进 system，不击穿缓存）。
+
+    `digest_block` 是**全书摘要**里这个角色的生平与「情境 → 反应」（P2）。
+    它补的是检索补不了的那一块：检索能找到他**说过**的话，
+    找不到他**面对某件事会怎么反应**。
+    """
     profile = _character_profile_block(style_narrative, character)
     voice = _voice_block(style_narrative, character)
     title = book_title or getattr(project, "title", "") or "参考书"
@@ -139,6 +146,7 @@ def build_system(
         character=character,
         profile_block=("【你是谁】\n" + profile) if profile else "",
         voice_block=("\n" + timeline_block) if timeline_block else "",
+        digest_block=("\n" + digest_block) if digest_block else "",
         voice=voice or "（没有这个角色的说话方式参考 —— 用你自己的日常口吻说话。）",
     )
 
@@ -258,6 +266,20 @@ def run_chat(
     except Exception:  # noqa: BLE001 —— 取不到时间线不该阻断对话
         timeline_block = ""
 
+    # —— 全书摘要里的「他是谁 / 他面对这种事会怎么反应」（P2）——
+    #
+    # 检索只能找到他**说过**的话；「他会怎么反应」只有摘要里有。
+    # 边界口径与上面完全一致（同一份 cutoff）：越界即剧透。
+    digest_block = ""
+    try:
+        from app.generation.digest_context import digest_character_block
+
+        digest_block = digest_character_block(
+            db, project, novel_ids, name, cutoffs=cutoffs
+        )
+    except Exception:  # noqa: BLE001 —— 摘要是增强，取不到不该阻断对话
+        digest_block = ""
+
     style_narrative = getattr(project, "style_narrative", None) or {}
     # 角色档案的证据回填：老档案没有 claim 账本 ⇒ 整个档案渲染成空串 ⇒
     # 模型拿不到「他经历过什么」。回填走字段级事实核验（零模型调用）。
@@ -271,6 +293,7 @@ def run_chat(
     system = build_system(
         project, name, style_narrative=style_narrative,
         timeline_block=timeline_block,
+        digest_block=digest_block,
     )
     user = build_user(question, evidence_block)
 

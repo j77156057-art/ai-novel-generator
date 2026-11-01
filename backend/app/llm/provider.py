@@ -121,6 +121,20 @@ class LLMProvider:
     #: 实测数据见各渠道类的注释。
     distill_block_chars: int = 0
 
+    #: 该渠道**单次请求**能吃下的输入字数上限（整本摘要用）。0 = 未声明。
+    #:
+    #: 与 `distill_block_chars` 是两回事：
+    #:
+    #: - `distill_block_chars` = 「**实测能安全吃下且产出不劣化**」的块大小
+    #:   （蒸馏用。块大了候选池会变小，见该属性的注释）；
+    #: - `max_context_chars` = 「**能收下**」的硬上限
+    #:   （整本摘要用。整本投喂要的就是把书一次丢进去，代价是产出条目数有上限）。
+    #:
+    #: 为什么没声明就当吃不下：假设错了的后果是「请求发出去了、回来被截断、
+    #: 我们以为压缩成功了」—— 这是本仓库反复踩的那类静默失效。
+    #: 没有实测值就不声明，让调用方退回「切块抽 + 合并」这条保守路径。
+    max_context_chars: int = 0
+
     def chat(self, system: str, user: str, constraints: dict | None = None,
              temperature: float | None = None) -> str:
         """chat 调用。temperature=None = 用渠道默认（创作 0.7）。
@@ -878,6 +892,18 @@ class OpenCodeGoChatProvider(GenericOpenAIChatProvider):
     #:
     #: 详见 ENGINEERING.md 与 docs/context-budget-design.md §3.5~§3.6。
     distill_block_chars = 50_000
+
+    #: 单次请求能吃下的输入字数上限（整本摘要用）。
+    #:
+    #: 取 **150 万字**：服务端硬上限是 1048576 tokens、中文约 0.52 token/字
+    #: ⇒ 理论约 200 万字（实测 200 万字能读到末尾）。
+    #: 这里取 150 万是**留余量** —— 整本投喂时输入里还有系统提示与结构说明，
+    #: 而且余量留给「万一中文比例更高」的情况。
+    #:
+    #: ⚠️ 这个值**只声明「能收下」**，不代表「该用满」：
+    #: 蒸馏的块大小另算（`distill_block_chars`，理由见上面），
+    #: 因为块大了**候选池**会变小 —— 那是产出质量问题，与上下文上限无关。
+    max_context_chars = 1_500_000
 
     def __init__(self, api_key: str, base_url: str, model: str,
                  models: list[str] | None = None,

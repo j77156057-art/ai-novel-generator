@@ -33,6 +33,7 @@ from app.routers import assistant_generation as assistant_generation_router  # n
 from app.routers import assistant_clean as assistant_clean_router  # noqa: E402
 from app.routers import kg_v3 as kg_v3_router  # noqa: E402
 from app.routers import roleplay as roleplay_router  # noqa: E402
+from app.routers import digest as digest_router  # noqa: E402
 
 
 @asynccontextmanager
@@ -104,6 +105,8 @@ app.add_middleware(
 )
 app.include_router(novels.router)
 app.include_router(projects.router)
+# 全书摘要（BookDigest）：提交在项目下（复用任务表），产物按书存（跨项目复用）。
+app.include_router(digest_router.router)
 app.include_router(generation.router)
 app.include_router(kg_v3_router.router)
 app.include_router(roleplay_router.router)

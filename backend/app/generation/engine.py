@@ -2044,6 +2044,27 @@ def build_context(
         # 会把角色原话当成剧情参考塞进正文。
         if _rag_mode != "character":
             rag_context = [h["text"] for h in rag_items if h.get("text")]
+            # —— 摘要条目也进剧情上下文（**只限续写路径**）——
+            #
+            # 摘要比原文片段便宜得多（一条 30 字 vs 一段几千字），而且已经带章号，
+            # 正是「这本书前面发生了什么」的浓缩版。
+            # 只限续写：原创路径注入参考书的**剧情**会让模型照着它写；
+            # 角色聊天那条路径已经有专门的角色摘要块，不必再灌一遍。
+            if _rag_mode == "continuation":
+                try:
+                    from app.generation.digest_context import retrieve_digest_entries
+
+                    for nid in novel_ids:
+                        _dhits = retrieve_digest_entries(
+                            db, nid, _query, k=3,
+                            cutoff=visibility.cutoffs.get(nid),
+                        )
+                        for _h in _dhits:
+                            rag_context.append(
+                                f"（摘要·第{_h['chapter_no']}章）{_h['text']}"
+                            )
+                except Exception as exc:  # noqa: BLE001 —— 摘要是增强，不阻断生成
+                    logging.getLogger(__name__).warning("摘要检索失败（忽略）: %s", exc)
 
     # RAG 结果可能含反向禁忌词（原文确实用了这些词，但反向禁忌禁止生成时使用）。
     # 不删除 RAG 结果（它们是相关剧情素材），但在注入 prompt 时标注清楚。
@@ -2158,6 +2179,19 @@ def build_context(
     _ctx["style_narrative"] = narrative
     _ctx["visibility_diagnostics"] = visibility.diagnostics
     _ctx["profile_warnings"] = _warnings + visibility.diagnostics["warnings"]
+    # —— 参考书背景摘要（全书压缩产物，P2）——
+    # 续写路径下它替代「整本原文进上下文」；原创路径恒为空
+    # （摘要是**剧情**，塞进原创提示词会让模型照着参考书的剧情写 ——
+    #  与叙事规则里的证据引文泄漏是同一类事故）。
+    try:
+        from app.generation.digest_context import digest_block
+
+        _ctx["book_digest"] = digest_block(
+            db, project, novel_ids, profile=profile
+        )
+    except Exception as exc:  # noqa: BLE001 —— 摘要是增强，绝不能挡住生成
+        logging.getLogger(__name__).warning("摘要块构建失败（忽略）: %s", exc)
+        _ctx["book_digest"] = ""
     return _ctx
 
 
@@ -3271,6 +3305,7 @@ def generate_next_segment(
         entity_table=ctx.get("entity_table"),
         override_style=_ov.get("style_suffix", ""),
         override_constraint=_ov.get("constraint_note", ""),
+        book_digest=ctx.get("book_digest", ""),
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -3520,6 +3555,7 @@ def generate_next_segment_stream(
         entity_table=ctx.get("entity_table"),
         override_style=_ov.get("style_suffix", ""),
         override_constraint=_ov.get("constraint_note", ""),
+        book_digest=ctx.get("book_digest", ""),
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -3734,6 +3770,7 @@ def _build_generation_prompts(
         character_names=_l2_character_names(project, {**ctx, "prior_summaries": l1_chain(tree), "prior_blocks": blocks}, profile or "continuation"),
         override_style=_ov.get("style_suffix", ""),
         override_constraint=_ov.get("constraint_note", ""),
+        book_digest=ctx.get("book_digest", ""),
     )
     user = build_user_prompt(
         l1_chain(tree),
