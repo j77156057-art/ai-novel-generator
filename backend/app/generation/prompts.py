@@ -52,9 +52,19 @@ def _style_block(style_dims: dict | None) -> str:
 def _profile_block(style_profile: dict | None) -> str:
     """把参考语料的实测档案渲染成静态提示块。
 
-    **必须是静态的**：`describe()` 是纯确定性函数（同一档案两次调用逐字节相同，
-    `verify_stylometry` D 段有闸门），档案本身又按指纹缓存，所以这段文本整轮生成
-    保持不变，放在 system 里不会击穿提示词缓存。
+    **必须是静态的**：档案按指纹缓存、规格书由档案导出，两者在整轮生成里恒定
+    ⇒ 这段文本整轮生成保持不变，放在 system 里不会击穿提示词缓存。
+
+    ## 用规格书（`render_spec`）而不是 `describe()`（2026-11-01）
+
+    `describe()` 给的是**均值**（「对白占正文 18%」「每段约 15 汉字」），
+    而均值当目标是**错的指令** —— 模型会照着均值写，产出机械产物。
+    规格书给的是**闭集区间**（p10~p90）+ 中心值：
+    落在区间内即合格，中心值只是方向。
+
+    **同源纪律**：提示词里说的区间 = 验收用的区间。
+    两者都从**同一份 spec** 出（`render_spec(spec)` 与 `spec_check(text, spec)`）
+    ⇒ 不可能两套口径。老档案没有 `spec` 字段 ⇒ 退回 `describe()`（保底可用）。
 
     与【风格】的分工：【风格】是用户选的平台调性（番茄/晋江…），是**倾向**；
     这里是**参考语料实测出来的数字**，是可验收的。两者冲突时以数字为准 ——
@@ -62,9 +72,18 @@ def _profile_block(style_profile: dict | None) -> str:
     """
     if not style_profile:
         return ""
-    from app.style.stylometry import describe
+    from app.style.spec import render_spec
 
-    body = describe(style_profile)
+    spec = style_profile.get("spec") or {}
+    body = render_spec(spec)
+    if not body:
+        # 老档案（没有 spec 字段）⇒ 退回旧的 describe() 渲染，
+        # 宁可给均值口径，也别把整块文风基线丢掉。
+        from app.style.stylometry import describe
+
+        body = describe(style_profile)
+    if not body:
+        return ""
     health = style_profile.get("corpus_health") or {}
     cleaned = style_profile.get("clean")
     flagged = [
@@ -82,12 +101,12 @@ def _profile_block(style_profile: dict | None) -> str:
     else:
         note = ""
     return (
-        "\n【文风档案：从参考语料实测，按下列数字贴近】"
-        "以下是统计出来的客观区间，不是修辞建议；生成时优先满足这些数字特征：\n"
+        "\n【文风规格：从参考语料实测，按下列区间贴近】"
+        "以下是统计出来的客观区间，不是修辞建议；"
+        "**落在区间内即合格**，不必照抄中心值（中心只是方向）：\n"
         f"{body}\n"
         + (f"{note}\n" if note else "")
     )
-
 
 def _merge_named(bible_items: list, kg_items: list) -> list:
     """按 name 合并角色：bible（用户构思）优先，KG 里 bible 没有的补在后面。"""

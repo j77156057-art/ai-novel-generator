@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 import statistics
+from typing import Sequence
 
 #: 改写提示词。刻意不写「少用句号」——实测会被理解成「不用标点」，
 #: 输出 1000 字零标点（句长指标直接爆到 1036）。必须写「把句号改成逗号」。
@@ -50,11 +51,40 @@ _REWRITE_USER = """把下面这段小说改写成长句节奏。
 5. 情节、人物、细节、对白内容一律不变，只调整断句；
 6. **不要扩写**：改写后的字数要和原文差不多（上下浮动 10% 以内），
    不要增加新的对白、动作或情节 —— 你的活儿只是「重新断句」，不是「续写」。
-
+{spec_hint}
 只输出改写后的正文，不要解释，不要加标题。
 
 【原文】
 {text}"""
+
+
+def _spec_hint_lines(deviations: Sequence[str] | None) -> str:
+    """把规格书的偏差句拼成改写提示里的一段（可选）。
+
+    ## 为什么要给模型看「哪里偏了」
+
+    原来只有「目标句长带」一句话，模型只知道**该到哪**，不知道**现在差多少**
+    ⇒ 它只能凭感觉拉句子长度（实测：普遍冲到带上限以上）。
+    给出偏差量（实测 6.2，目标 0.7~4.5）后，模型知道该**收**还是该**放**。
+
+    ## 为什么只给区间型出带项
+
+    上限型（比喻/情绪直陈/段尾拔高）超出只告警、不回灌 ——
+    改写只动断句，让它去「少用比喻」是越权（它改不了，只会乱删）。
+
+    ## 没有偏差句时
+
+    返回空串 ⇒ 提示词与改造前**逐字节相同**（不凭空加一句「请注意质量」）。
+    """
+    lines = [d for d in (deviations or []) if d]
+    if not lines:
+        return ""
+    body = "\n".join(f"   - {d}" for d in lines)
+    return (
+        "\n\n**另外，这一段与参考书的实测写法有以下差距（请一并靠拢）**：\n"
+        f"{body}\n"
+        "   （只调整断句与节奏去靠拢这些数字；情节与内容仍然一律不变。）"
+    )
 
 
 #: 目标句长的**兜底**说法（没有参考书档案时用）。
@@ -253,6 +283,7 @@ def rewrite_style(
     *,
     target_sentence_range: tuple[float, float] | None = None,
     target_sentence_len: float | None = None,
+    deviations: Sequence[str] | None = None,
 ) -> tuple[str, dict]:
     """把 text 改写成参考语料的断句节奏，返回 (结果文本, 诊断)。
 
@@ -270,6 +301,12 @@ def rewrite_style(
        写死的数字与参考书实测的 22~27 字差一倍，模型必然把句子拉过头；
     2. **判据多一条**：改完的句长**离这条带不能更远**
        （不许修过头：实测一句冲到 41.2 字，而档案 p90 才 26.7）。
+
+    ## `deviations`：规格书的偏差句（可选，2026-11-01）
+
+    来自 `app.style.spec.spec_deviation_lines`（**只含区间型出带项**），
+    拼进提示词让模型知道**现在差多少**，而不只是**该到哪**。
+    不给 ⇒ 提示词与从前逐字节相同。
 
     ## 判据（全过才采纳）
 
@@ -292,6 +329,7 @@ def rewrite_style(
     user_prompt = _REWRITE_USER.format(
         text=text,
         sentence_target=_sentence_target_line(target_sentence_range),
+        spec_hint=_spec_hint_lines(deviations),
     )
     # 先用「关思考 + 独立预算」的变体；万一这个变体不被接受（例如强制
     # adaptive thinking 的模型会 400），退回原 provider 再试一次。

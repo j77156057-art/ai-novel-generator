@@ -316,6 +316,84 @@ def _dedup_before_commit(text: str) -> tuple[str, dict]:
 REWRITE_GATE_FEATURES = ("句长均值", "句号密度")
 
 
+# --------------------------------------------------------------------------- #
+# 仲裁点（2026-11-01）
+# --------------------------------------------------------------------------- #
+#
+# 改造前，这段文字会被三道闸门各判一次：
+#   - 段长闸门 `_enforce_length`：整段总汉字数 vs 目标 × 80%
+#   - 形态闸门 `_rewrite_gate` / `candidate`：参考书分布带（`band_check`）
+#   - 风格告警 `_style_warning`：percentile / 绝对 z
+# 三者互不相识 ⇒ 同一段文字可能同时得到「严重偏离，要改写」与「正常」两个结论。
+#
+# ⇒ 现在段级文风判定只有一个出口：`_style_gate`。
+# 它用**规格书**（`app.style.spec`）当尺 —— 与注入提示词的是**同一份** spec，
+# 于是「提示词里说的区间 = 验收用的区间」这条纪律在代码层真正成立。
+
+def _style_gate(text: str, profile: dict | None) -> dict:
+    """段级文风判定的**唯一出口**（仲裁点）。
+
+    ## 返回什么
+
+    ::
+
+        {
+          "available": bool,       # 有没有规格书可判
+          "items": {key: {...}},   # 逐项落位（value/lo/hi/in_band/deviation）
+          "in_band": [key, ...],   # 在带内的项
+          "out_of_band": [key, ...],  # **区间型**出带 ⇒ 可回灌
+          "warn_only": [key, ...],    # **上限型**出带 ⇒ 只告警
+          "deviations": [str, ...],   # 可回灌的偏差句（给改写流程）
+        }
+
+    ## 三条判定规则（2026-11-01 拍板）
+
+    1. **区间型出带 ⇒ 回灌**：附上偏差量，让执行方自己改。
+    2. **上限型出带 ⇒ 只告警**：比喻/情绪直陈/段尾拔高这类「越少越好」，
+       超出不该回灌（回灌等于让模型去凑指标），也不阻断。
+    3. **没进提示词的项 ⇒ 只记录不判定**：模型看不见它，回灌没有意义。
+
+    ## 为什么不用 `band_check` 单独判
+
+    `band_check` 是「拿档案的带当尺」，`spec_check` 是「拿规格书当尺」，
+    而规格书**由档案导出** ⇒ 同一把尺的两个视图。
+    用规格书当尺的好处是：段级判定与提示词里给模型的区间**逐字同源**，
+    模型收到的指令与验收它的判据不可能对不上。
+
+    ## 降级
+
+    没有档案 / 档案里没有规格书（老档案）⇒ `available=False`，什么都不判。
+    档案是增强，不是生成的前提 —— 判不出来就放行，绝不阻断。
+    """
+    if not profile or not text or not text.strip():
+        return {"available": False, "items": {}, "in_band": [],
+                "out_of_band": [], "warn_only": [], "deviations": []}
+    try:
+        from app.style.spec import spec_check, spec_deviation_lines
+
+        spec = profile.get("spec") or {}
+        if not spec or not spec.get("items"):
+            return {"available": False, "items": {}, "in_band": [],
+                    "out_of_band": [], "warn_only": [], "deviations": []}
+        check = spec_check(text, spec)
+    except Exception:  # noqa: BLE001 —— 判不出来就不判，绝不能阻断生成
+        return {"available": False, "items": {}, "in_band": [],
+                "out_of_band": [], "warn_only": [], "deviations": []}
+
+    items = check.get("items") or {}
+    in_band = [k for k, v in items.items() if v.get("checked") and v.get("in_band")]
+    return {
+        "available": True,
+        "items": items,
+        "in_band": in_band,
+        "out_of_band": list(check.get("out_of_band") or []),
+        "warn_only": list(check.get("warn_only") or []),
+        # 回灌句只给**区间型**出带项（上限型只告警，见规则 2）
+        "deviations": spec_deviation_lines(check),
+        "recorded": list(check.get("recorded") or []),
+    }
+
+
 def _strip_ws(text: str) -> str:
     """去掉所有空白 —— 用来验证「只改了段落边界（和那一处标点形态）、内容一个字节没动」。"""
     return re.sub(r"\s+", "", text or "")
@@ -340,6 +418,19 @@ def _rewrite_gate(text: str, profile: dict | None) -> tuple[bool, list[dict]]:
     - 「句号密度 > p90」= 比 **90% 的人类样本**还碎。
 
     分位数来自参考书自己的分布：语料换了尺子也跟着换，不用维护第二套常量。
+
+    ## 与仲裁点 `_style_gate` 的关系（2026-11-01）
+
+    两者的**尺是同一把**：这里的 `band_check` 取的 p10/p90，
+    正是规格书里那两项的 `lo`/`hi`（规格书由档案导出 ⇒ 同源）。
+
+    但**分工不同**，不能合并：
+    - `_style_gate` 判的是「这一段整体像不像（逐项 in/out）」⇒ **报告用**；
+    - `_rewrite_gate` 判的是「值不值得多花一次模型调用改写」⇒ **成本闸门**，
+      只看改写**修得动**的那两项（`REWRITE_GATE_FEATURES`），且要「严重偏离」。
+
+    合并的后果很具体：规格书有 34 项，逐项出带在跨书对照里能出 13 项 ——
+    若「有出带就改写」，每一段都会白花一次模型调用，而改写只修得动断句。
 
     ## 返回
 
@@ -1180,6 +1271,12 @@ def _run_text_chain(
     if verbatim_info.get("rewritten"):
         summary = provider.summarize(text)
 
+    # —— 仲裁点：段级文风判定的**唯一出口**（2026-11-01）——
+    # 放在**所有改写之后**：落库的是最终文本，判定必须量最终文本。
+    # 逐项 in/out + 偏差一起落库（`summary.pipeline.style_gate`）⇒ 事后可查，
+    # 不用重跑、不用翻日志就知道「这段为什么被判成出带」。
+    style_gate = _style_gate(text, _style_profile(db, project))
+
     return text, summary, {
         "scene_audit": scene_audit,
         # `rewrite_info` = 文风改写那道的诊断（与从前一致：AI 味重写的诊断
@@ -1192,6 +1289,7 @@ def _run_text_chain(
         "ell_info": ell_info,
         "beat_info": beat_info,
         "verbatim_info": verbatim_info,
+        "style_gate": style_gate,
     }
 
 
@@ -1535,13 +1633,19 @@ def _maybe_rewrite_style(
     try:
         from app.generation.rewrite import rewrite_style
         targets = _rewrite_targets(text, profile)
+        # 规格书偏差（2026-11-01）：让改写知道**现在差多少**，不只是**该到哪**。
+        # 尺是同一把 —— 与注入提示词的那份 spec 同源。
+        deviations = _style_gate(text, profile).get("deviations") or []
         new_text, info = rewrite_style(
             text, _rewrite_provider(provider),
             target_sentence_range=targets.get("sentence_range"),
+            deviations=deviations,
         )
         info["gate"] = gate_info
         info["targets"] = ({"sentence_range": list(targets["sentence_range"])}
                            if targets.get("sentence_range") else None)
+        if deviations:
+            info["deviations"] = deviations
         if info.get("applied"):
             b, a = info.get("before"), info.get("after")
             logging.getLogger(__name__).info(
@@ -1687,6 +1791,11 @@ def _pipeline_record(chain: dict) -> dict:
     **一律落库**。只要查库，不需要日志、不需要重跑。
 
     只存诊断，不存正文（正文在 `generations.text` 里）。
+
+    ## `style_gate`：仲裁点的逐项判定（2026-11-01）
+
+    规格书有 34 项，逐项 in/out 是**唯一**能回答「这段哪里不像参考书」的东西
+    （百分位只给一个总分，说不出是哪一项）。所以它落库，且落的是**明细**。
     """
     def _pick(name: str) -> dict:
         info = chain.get(name) or {}
@@ -1696,6 +1805,34 @@ def _pipeline_record(chain: dict) -> dict:
                 "reasons", "target", "targets", "gates")
         return {k: info[k] for k in keep if k in info}
 
+    def _pick_gate() -> dict:
+        gate = chain.get("style_gate") or {}
+        if not isinstance(gate, dict) or not gate.get("available"):
+            return {}
+        # 逐项明细：每项的实测值 / 区间 / 是否在带内 / 偏差
+        items = gate.get("items") or {}
+        rows = {
+            k: {
+                "value": v.get("value"),
+                "lo": v.get("lo"),
+                "hi": v.get("hi"),
+                "target": v.get("target"),
+                "kind": v.get("kind"),
+                "unit": v.get("unit"),
+                "in_band": v.get("in_band"),
+                "deviation": v.get("deviation"),
+            }
+            for k, v in items.items()
+            if v.get("checked")
+        }
+        return {
+            "in_band": list(gate.get("in_band") or []),
+            "out_of_band": list(gate.get("out_of_band") or []),
+            "warn_only": list(gate.get("warn_only") or []),
+            "deviations": list(gate.get("deviations") or []),
+            "items": rows,
+        }
+
     return {
         "rewrite": _pick("rewrite_info"),
         "ai_rewrite": _pick("ai_rewrite_info"),
@@ -1704,6 +1841,7 @@ def _pipeline_record(chain: dict) -> dict:
         "ellipsis": _pick("ell_info"),
         "beat": _pick("beat_info"),
         "verbatim": _pick("verbatim_info"),
+        "style_gate": _pick_gate(),
     }
 
 
@@ -3321,6 +3459,7 @@ def generate_next_segment(
         "constraints": ctx["constraints"],
         "rag_context": ctx["rag_context"],
         "style_warning": style_warning,
+        "style_gate": chain.get("style_gate") or {},
         "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
         "form_info": form_info,
@@ -3534,6 +3673,7 @@ def generate_next_segment_stream(
         "summary_tree": tree_stats,
         "id": gen.id,
         "style_warning": style_warning,
+        "style_gate": chain.get("style_gate") or {},
         "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
         "form_info": form_info,

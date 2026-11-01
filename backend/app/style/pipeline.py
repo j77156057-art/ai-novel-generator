@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.corpus_health import find_repeated_watermarks, strip_watermarks
+from app.style.spec import SPEC_VERSION, build_spec
 from app.style.stylometry import (
     MEASUREMENT_VERSION,
     PROFILE_VERSION,
@@ -28,9 +29,24 @@ from app.style.stylometry import (
 MAX_MARK_ROWS = 5
 MAX_SAMPLES_PER_MARK = 2
 
-#: 单本档案 JSON 的字节上限。档案要存进 JSON 列、还要在预检响应里下发摘要，
-#: 膨胀到几十 KB 会让两边都难受。实测一本 38 万字语料约 6.8KB，余量充足。
-PROFILE_MAX_JSON_BYTES = 32_768
+#: 单本档案 JSON 的字节上限。
+#:
+#: **2026-11-01 放开**：原先是 32,768（32KB），理由写着「档案要存进 JSON 列、
+#: 还要在预检响应里下发摘要，膨胀到几十 KB 会让两边都难受」。
+#: 这条理由**早已不成立**：
+#: - 预检响应**刻意不回传整份档案**（`routers/generation._style_profile_digest`
+#:   只挑固定字段），档案再大也不影响预检响应；
+#: - JSON 列（SQLite TEXT / PostgreSQL JSONB）本身没有 32KB 限制。
+#:
+#: 而这个上限的**实际代价**很实在：规格书（34 项，10.5KB）塞不进档案，
+#: 于是要么把规格书踢出档案（它本该是可复用的产物），
+#: 要么让多本参考书的大档案「静默超限」（实测《十日终焉》去规格书也有 36KB）。
+#:
+#: ⇒ 按「模型有一百万上下文」的尺度重设：档案是**内部产物**，
+#: 它只进 JSON 列与内存，不进提示词（提示词里进的是渲染后的规格书，1.4KB）。
+#: 上限只保留给「病态输入」兜底，取 4MB —— 远超任何真实档案
+#: （实测四本合集 55KB），但不会误伤。
+PROFILE_MAX_JSON_BYTES = 4 * 1024 * 1024
 
 #: 档案的**形状**修订号（本模块产出的 JSON 结构，不是 `stylometry.PROFILE_VERSION`
 #: 那个统计口径版本）。**任何会改变档案字段的改动都必须把它 +1。**
@@ -105,6 +121,7 @@ def build_reference_profile(
     unit_chars: int = 3000,
     label: str = "",
     clean: bool = True,
+    chapter_lengths: list[int] | None = None,
 ) -> dict:
     """在若干本参考语料上炼一份档案（含语料体检记录）。
 
@@ -113,6 +130,15 @@ def build_reference_profile(
     `clean=False` 时**仍然体检**，只是不删。这条不能省：如果跳过检测，档案里就
     没有任何污染记录，提示块也就没法如实说「这些数字是脏的」—— 那等于用
     一个看起来很干净的结果去骗人。检测与清洗必须是两件独立的事。
+
+    ## 章长统计 + 文风规格书（2026-11-01）
+
+    `chapter_lengths` 传进来后，这份档案会带上 `chapter_stats`（每章多少汉字的
+    分布）与 `spec`（文风规格书）。两者都是**纯统计**，零 LLM。
+
+    为什么章长要**在拟合时**统计，而不是另跑一次：档案是**按指纹缓存**的，
+    另跑一次就意味着每次生成都可能拿到不同的章长分布 ⇒ 提示词每次都变
+    ⇒ 击穿提示词缓存。放进档案里，它就跟着指纹一起恒定。
     """
     cleaned: list[str] = []
     health: dict[str, dict] = {}
@@ -134,6 +160,15 @@ def build_reference_profile(
     profile["clean"] = bool(clean)
     profile["corpus_health"] = health
     profile["source_chars"] = sum(len(c) for c in cleaned)
+
+    # 章长分布 + 文风规格书（纯统计，随档案一起恒定）
+    if chapter_lengths:
+        from app.style.chapter_stats import chapter_length_stats
+
+        profile["chapter_stats"] = chapter_length_stats(
+            chapter_lengths, label=label or "参考语料"
+        )
+    profile["spec"] = build_spec(profile)
     return profile
 
 
@@ -146,6 +181,11 @@ def profile_fingerprint(source_ids: list[int], unit_chars: int) -> dict:
     `measurement` 同理：**测量口径**（句子边界规则）变了也要重算 ——
     否则老档案是「用旧尺子量的」，运行时却用新尺子量生成段，两边不可比
     （实测：老档案基线 56.0，新口径实测 39.2，差 40%，判定全部失真）。
+
+    `spec` 是**规格书版本**（2026-11-01 加）：规格书由档案导出，
+    规格书的项目集或判定规则变了 ⇒ 档案里的 `spec` 字段是旧的 ⇒ 必须重算。
+    否则「提示词里说的区间」与「验收用的区间」会变成两套口径 ——
+    那正是这个设计要消灭的东西。
     """
     return {
         "source_ids": sorted(int(i) for i in source_ids),
@@ -153,6 +193,7 @@ def profile_fingerprint(source_ids: list[int], unit_chars: int) -> dict:
         "version": PROFILE_VERSION,
         "schema": PIPELINE_SCHEMA,
         "measurement": MEASUREMENT_VERSION,
+        "spec": SPEC_VERSION,
     }
 
 
@@ -194,8 +235,18 @@ def project_profile(
         name, text = _load_novel_text(db, nid)
         texts[name] = text
 
+    # 章长统计：走 `novel_chunks`（入库时已按章切好）⇒ 与生成链路读到的是同一份语料。
+    # 取不到就退化成「没有章长项」（规格书里少一项，不影响其余项）。
+    try:
+        from app.style.chapter_stats import load_chapter_lengths
+
+        chapter_lengths = load_chapter_lengths(db, ids)
+    except Exception:  # noqa: BLE001 —— 章长取不到不该让整份档案失败
+        chapter_lengths = []
+
     profile = build_reference_profile(
-        texts, unit_chars=unit_chars, label=f"project:{project.id}"
+        texts, unit_chars=unit_chars, label=f"project:{project.id}",
+        chapter_lengths=chapter_lengths,
     )
     profile["fingerprint"] = want
     project.style_profile = profile
