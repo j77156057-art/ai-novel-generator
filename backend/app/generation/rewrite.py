@@ -25,6 +25,10 @@
     19s
 
 `M3.1-Flash` 质量相当（59-69）但关不掉思考，61-88s，不作默认。
+
+⚠️ 上面这组数字是**旧尺**（自己切句）量的。2026-11-01 起 `_stats` 改成
+**档案那把尺**（`stylometry` 的句长均值 / 句号密度）—— 见 `_stats` 的说明。
+新旧尺在参考书上差 25%~40%，历史数字不再与现在可比。
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ _REWRITE_USER = """把下面这段小说改写成长句节奏。
 1. 把原本的句号改成逗号，用逗号串联连续的动作、观察与心理；
 2. 必须保留标点，不要把整段连成一串，段落间仍要用句号收束；
 3. **对白必须保留引号**，不要把对话并进叙述句里；
-4. 平均每句 45 到 70 个字；
+4. {sentence_target}；
 5. 情节、人物、细节、对白内容一律不变，只调整断句；
 6. **不要扩写**：改写后的字数要和原文差不多（上下浮动 10% 以内），
    不要增加新的对白、动作或情节 —— 你的活儿只是「重新断句」，不是「续写」。
@@ -53,15 +57,77 @@ _REWRITE_USER = """把下面这段小说改写成长句节奏。
 {text}"""
 
 
+#: 目标句长的**兜底**说法（没有参考书档案时用）。
+#:
+#: ⚠️ 这个数字以前是**写死在提示词里**的（45~70 字），而参考书自己的句长带
+#: 实测只有 22~27 字 ⇒ 模型必然把句子拉过头：
+#: 实测一句从 25.6 字冲到 **41.2** 字（档案 p90 才 26.7）。
+#: 又因为**句号密度 ≈ 1000 / 句长**（实测 39.1 vs 38.3、24.3 vs 24.5），
+#: 句长冲过头 ⇒ 句号密度跟着一起出带 ⇒ 「产出不像参考书」的头号短板。
+#: ⇒ 目标必须来自档案；写死的数字只能当兜底。
+DEFAULT_SENTENCE_TARGET = "平均每句 45 到 70 个字"
+
+
+def _sentence_target_line(target_range: tuple[float, float] | None) -> str:
+    """目标句长那句话 —— 有档案就用档案的带，没有才用兜底。
+
+    ## 为什么写成「硬上限 + 宁可少合并」（实测 2026-11-01）
+
+    原来这句是「平均每句 X 到 Y 个字」—— 模型把 Y 当成**目标值**，
+    实测改写出来的句长普遍比档案带高 10%~40%（一次冲到 29.9，带上限 26.6）。
+
+    探针对照（同一份真实草稿 × 3 种写法）：
+    | 写法 | 落在带内 | 冲过头的那些 |
+    |---|---|---|
+    | 只给区间 | 2/3 | 29.9 |
+    | **加硬上限 + 宁可少合并** | 2/3 | **27.1** |
+    | 再加参考书真实句子做样例 | 2/3 | 27.5 |
+    ⇒ 「任何一句都不要超过 Y 个字」能把冲过头的幅度压掉约 3 字；
+    样例句没有带来额外收益（本轮不进，见 §10.4「本版不做什么」）。
+    """
+    if not target_range:
+        return f"{DEFAULT_SENTENCE_TARGET}（没有参考目标，按这个来）"
+    lo, hi = target_range
+    mid = (lo + hi) / 2
+    return (f"每句的长度控制在 **{lo:.0f} 到 {hi:.0f} 个字**之间"
+            f"（平均约 {mid:.0f} 个字）；"
+            f"**任何一句都不要超过 {hi:.0f} 个字**；"
+            f"宁可少合并一点，也不要把句子拉得太长"
+            f"（这是参考书自己的节奏）")
+
+
 def _stats(text: str) -> tuple[float, float, int]:
-    """(平均句长, 句号密度/千字, 对白引号数)"""
-    ss = [s for s in re.split(r"[。！？…]", text) if len(s.strip()) > 3]
-    periods = text.count("。") + text.count("！") + text.count("？")
-    fresh = re.findall(r"[“「]", text)
+    """(平均句长, 句号密度/千字, 对白引号数) —— **与档案同一把尺**。
+
+    ## 为什么必须换成档案那把尺（2026-11-01 实测）
+
+    这里原先自己切句：按 `[。！？…]` 切、**丢掉 ≤3 字的碎片**、**不算终结符**。
+    实测这把尺在**参考书**上比档案的 `stylometry` 句长均值高 **25%~40%**
+    （参考书三段 3000 字窗口：改写尺 27.3 / 29.3 / 30.0，
+    档案尺 19.0 / 23.3 / 20.8），而在生成文本上只差 2%~5%。
+
+    ⇒ 拿档案的句长带去卡改写尺量的数，是**苹果比橘子**：
+    一段「改得跟参考书一模一样」的文本，在改写尺上读 27~30（比档案带 18~27 高），
+    于是判据「不许修过头」会**系统性误杀**改得最好的那类结果。
+
+    实测（2026-11-01，A/B 六段真实产出）：换成同一把尺后，
+    「修过头」这道判据的判决与**最终 21 项带内率**完全对得上 ——
+    拒绝的 A1/A2/B2 是 6/21、13/21、12/21，采纳的 B1/A3 是 17/21、14/21；
+    换成旧尺时 B1（最好的那段，17/21）会被误拒。
+
+    所以这里直接复用 `app.style.stylometry` 的切句与计数
+    （终结符算进句长、闭合引号跟句、句号密度只数「。」）——
+    与 `band_check`、档案分布、闸门判定**同一把尺**。
+    """
+    from app.style.stylometry import paragraphs as _paras
+    from app.style.stylometry import sentences as _sents
+
+    lens = [len(s) for p in _paras(text) for s in _sents(p)]
+    n = max(len(text), 1)
     return (
-        statistics.mean(len(s) for s in ss) if ss and periods else 0.0,
-        periods / max(len(text), 1) * 1000,
-        len(fresh),
+        statistics.fmean(lens) if lens else 0.0,
+        text.count("。") / n * 1000,
+        len(re.findall(r"[“「]", text)),
     )
 
 
@@ -96,6 +162,26 @@ MAX_LEN_GROWTH_RATIO = 0.15
 #: 那说明它把叙述与台词拆开了 —— 即使句长变好了，这个代价也不该默默接受。
 MAX_BARE_RATIO_INCREASE = 0.05
 
+#: 句长「实质改善」的判定：**+≥ 2 字** 或 **+≥ 10%**（取其一即可）。
+#:
+#: 为什么不再是原来的硬阈值「≥ 1.2×」：实测两段**真实改善**
+#: （旧尺 +19.1% / +19.8%，档案尺 +21.6% / +18.8%）
+#: 因为差半个百分点的相对阈值被**静默丢掉** ⇒ 白花一次模型调用，
+#: 而且丢掉的那两段其实把句号密度拉近了 15%。
+MIN_SENTENCE_LEN_GAIN_ABS = 2.0
+MIN_SENTENCE_LEN_GAIN_RATIO = 0.10
+
+
+def _distance_to_band(value: float, lo: float | None, hi: float | None) -> float:
+    """值离目标带的距离（带内 = 0）。没有带 ⇒ 视为 0（不拦）。"""
+    if lo is None or hi is None:
+        return 0.0
+    if value < lo:
+        return lo - value
+    if value > hi:
+        return value - hi
+    return 0.0
+
 #: 改写用的**温度**。
 #:
 #: 断句是「变换」不是「创作」，高温会让同一份输入的输出漂移
@@ -109,6 +195,42 @@ MAX_BARE_RATIO_INCREASE = 0.05
 #:
 #: ⇒ 低温的价值是「**防漂**」，不是「防膨胀」；仍然值得给。
 REWRITE_TEMPERATURE = 0.2
+
+
+#: 改写调用**关思考**。
+#:
+#: 实测 2026-11-01（跨书对照 18 段 + 单独探针）：闸门触发了 **17/18 段**，
+#: 而改写每次都**返回空输出**（`applied=False, reason=空输出`）⇒
+#: 「改了等于没改」，产出侧完全看不出来。
+#: 根因与归属校正同源：**推理块吃光了输出预算**（max_tokens=8000），
+#: 正文一个字都没吐。
+#:
+#: ⇒ 改写是**机械变换**（只动断句），不需要思考 ⇒ 关掉思考，
+#: 并给一份**独立预算**（下面那个）。仓库里已有同一套路：
+#: `app/style/attribution_fix.py` 的 `CORRECTION_THINKING_OFF`。
+REWRITE_THINKING_OFF = True
+
+#: 改写调用的**独立输出预算**（不跟生成链共用）。
+#:
+#: 为什么单独给：生成链的 `max_tokens` 是按「写一整段正文」定的，
+#: 而改写是**改写**（输出长度 ≈ 输入长度）⇒ 预算要够大，
+#: 否则被 `max_tokens` 拦腰截断（`finish_reason=length`）。
+#:
+#: 实测（A/B，2026-11-01）：开思考 + 8000 ⇒ 空输出；开思考 + 16000 ⇒ 2/3 采纳；
+#: 关思考 + 8000 ⇒ 2/3 采纳且快 2.5 倍。⇒ 关思考 + 16000 是两头都占的组合。
+REWRITE_MAX_TOKENS = 16000
+
+
+def _call_provider(provider):
+    """改写调用用哪个 provider：**关思考 + 独立预算**的变体。
+
+    provider 不认 `variant()`（老 provider / 本地兜底 / 测试假 provider）⇒ 原样返回。
+    """
+    try:
+        return provider.variant(thinking_off=REWRITE_THINKING_OFF,
+                                max_tokens=REWRITE_MAX_TOKENS)
+    except Exception:  # noqa: BLE001 —— 变体失败就用原 provider
+        return provider
 
 
 def _bare_ratio(text: str) -> float:
@@ -129,6 +251,7 @@ def rewrite_style(
     text: str,
     provider,
     *,
+    target_sentence_range: tuple[float, float] | None = None,
     target_sentence_len: float | None = None,
 ) -> tuple[str, dict]:
     """把 text 改写成参考语料的断句节奏，返回 (结果文本, 诊断)。
@@ -138,28 +261,55 @@ def rewrite_style(
         reason       未采纳的原因
         before/after 改写前后的 (句长, 句号/千字, 引号数)
         chars        (原字数, 新字数)
+        target       目标句长带（来自参考书档案的 p10~p90）
 
-    ## 五道判据（全过才采纳）
+    ## `target_sentence_range`：目标句长带（p10, p90），来自参考书档案
+
+    给了它，两件事同时变：
+    1. **提示词里的目标句长**从写死的「45~70 字」换成这条带 ——
+       写死的数字与参考书实测的 22~27 字差一倍，模型必然把句子拉过头；
+    2. **判据多一条**：改完的句长**离这条带不能更远**
+       （不许修过头：实测一句冲到 41.2 字，而档案 p90 才 26.7）。
+
+    ## 判据（全过才采纳）
 
     1. 字数不能缩水过多（< 60%）；
     2. **字数不能膨胀过多**（> 125%）—— 模型把「每句 45~70 字」当成「多写点」
        时会凭空扩写（实测 3011 字 → 5979 字，引号 60 → 161）；
     3. 对白引号不能明显丢失（< 80%）；
-    4. 句长必须真的变长（> 1.2×），否则这一步没意义；
-    5. **对白形态不能被改坏**（纯台词段占比不能上升 > 5 个百分点）——
+    4. 句长必须有**实质改善**（+≥ 2 字或 +≥ 10%）；
+    5. **不许修过头**：句长离目标带不能比改写前更远（给了目标带才判）；
+    6. **对白形态不能被改坏**（纯台词段占比不能上升 > 5 个百分点）——
        改写只做断白，不该让「一行一句台词」变多（实测一次把 52% 改到 84%）。
     """
     if not text or not text.strip():
         return text, {"applied": False, "reason": "空文本"}
 
+    if target_sentence_range is None and target_sentence_len:
+        target_sentence_range = (target_sentence_len * 0.75, target_sentence_len * 1.25)
+
     before = _stats(text)
-    try:
-        out = provider.chat(
-            _REWRITE_SYSTEM, _REWRITE_USER.format(text=text),
-            temperature=REWRITE_TEMPERATURE,
-        ) or ""
-    except Exception as exc:  # noqa: BLE001 - 改写失败绝不能阻断生成
-        return text, {"applied": False, "reason": f"调用失败: {type(exc).__name__}", "before": before}
+    user_prompt = _REWRITE_USER.format(
+        text=text,
+        sentence_target=_sentence_target_line(target_sentence_range),
+    )
+    # 先用「关思考 + 独立预算」的变体；万一这个变体不被接受（例如强制
+    # adaptive thinking 的模型会 400），退回原 provider 再试一次。
+    out = ""
+    last_exc: Exception | None = None
+    for prov in (_call_provider(provider), provider):
+        try:
+            out = prov.chat(
+                _REWRITE_SYSTEM, user_prompt,
+                temperature=REWRITE_TEMPERATURE,
+            ) or ""
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001 - 改写失败绝不能阻断生成
+            last_exc = exc
+            out = ""
+    if last_exc is not None:
+        return text, {"applied": False, "reason": f"调用失败: {type(last_exc).__name__}", "before": before}
 
     out = out.strip()
     if not out:
@@ -192,15 +342,39 @@ def rewrite_style(
             "before": before, "after": after,
         }
 
-    # 判据 4：句长必须真的变长了，否则这一步没有意义
-    if after[0] <= before[0] * 1.2:
+    # 判据 4：句长必须有**实质改善**（不再用「≥ 1.2×」那个硬阈值）
+    # 句长用**档案那把尺**（见 `_stats`），所以这里的 % 与档案带同口径。
+    gain_abs = after[0] - before[0]
+    gain_ratio = (gain_abs / before[0]) if before[0] else 0.0
+    if not (gain_abs >= MIN_SENTENCE_LEN_GAIN_ABS
+            or gain_ratio >= MIN_SENTENCE_LEN_GAIN_RATIO):
         return text, {
             "applied": False,
             "reason": f"句长未改善 {before[0]:.1f}→{after[0]:.1f}",
             "before": before, "after": after,
         }
 
-    # 判据 5：对白形态不能被改坏（改写只做断句，不该让「一行一句台词」变多）
+    # 判据 5：**不许修过头** —— 句长离目标带不能比改写前更远。
+    # 实测（A 臂第 1 段）：句长被拉到档案带的两倍（档案尺 39.5 vs 带上限 26.7），
+    # ⇒ 越过带子的另一端；又因为句号密度 ≈ 1000/句长，句号密度跟着一起出带。
+    # 那一段的**最终 21 项带内率只有 6/21**（六段里最差）——
+    # 所以这道判据不是洁癖，是实打实挡住一次质量崩塌。
+    if target_sentence_range:
+        lo, hi = target_sentence_range
+        d_before = _distance_to_band(before[0], lo, hi)
+        d_after = _distance_to_band(after[0], lo, hi)
+        # 注意是「更远」而不是「不更近」：`d_after > d_before` 才算修过头。
+        # 用 `>=` 会把「本来就在带内、改完还在带内」也拒掉（0 > 0 不成立，
+        # 0 >= 0 成立）—— 那是误杀。
+        if d_after > d_before:
+            return text, {
+                "applied": False,
+                "reason": (f"句长修过头 {before[0]:.1f}→{after[0]:.1f}"
+                           f"（目标带 {lo:.1f}~{hi:.1f}，离带更远了）"),
+                "before": before, "after": after,
+            }
+
+    # 判据 6：对白形态不能被改坏（改写只做断句，不该让「一行一句台词」变多）
     try:
         bare_before = _bare_ratio(text)
         bare_after = _bare_ratio(out)
@@ -219,5 +393,5 @@ def rewrite_style(
         "before": before,
         "after": after,
         "chars": (len(text), len(out)),
-        "target": target_sentence_len,
+        "target": list(target_sentence_range) if target_sentence_range else None,
     }

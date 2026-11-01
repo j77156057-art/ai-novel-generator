@@ -146,7 +146,7 @@ cd frontend && npm install && npm run dev    # http://localhost:5173 ，/api 代
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/                 # 1,956 项用例（+ 8 项需外部语料/验收库才跳）
+python -m pytest tests/                 # 1,966 项用例（+ 8 项需外部语料/验收库才跳）
 ```
 
 > 结尾会有一行 `1948 passed, 8 skipped in ...` —— **别再给这条命令加 `-q`**：
@@ -242,7 +242,7 @@ flowchart TD
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **1,956** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `tests/` | **1,966** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：10 个纯逻辑文件（50 项，`node --test`）+ 4 个组件级文件（33 项，vitest + jsdom） |
 | `docs/` | 74 份设计文档与指南：架构怎么定的、判据为什么这么定 |
 | `docs/images/` | README 用的界面截图 |

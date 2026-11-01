@@ -1453,6 +1453,43 @@ def _maybe_insert_beats(
         return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
 
 
+def _rewrite_targets(text: str, profile: dict | None) -> dict:
+    """改写要用的目标：**参考书自己的句长带**（p10~p90）。
+
+    ## 为什么目标必须来自档案，不能写死
+
+    改写提示词里原先写死「平均每句 45 到 70 个字」，而参考书实测的句长带
+    只有 22~27 字 ⇒ 模型必然把句子拉过头（实测一句冲到 41.2 字）。
+    又因为**句号密度 ≈ 1000 / 句长**（实测 39.1 vs 38.3、24.3 vs 24.5），
+    句长冲过头 ⇒ 句号密度跟着一起出带 ——
+    那正是「产出不像参考书」的头号短板（句号密度 94% 出带）。
+
+    口径与 `band_check` 一致：按文本长度选桶，再取该桶的分布带。
+    """
+    if not profile:
+        return {}
+    try:
+        from app.style.stylometry import pick_bucket
+
+        base_unit = int((profile.get("_meta") or {}).get("base_unit_chars")
+                        or profile.get("unit_chars") or 0)
+        if profile.get("version") == 2 and profile.get("buckets"):
+            bucket_name = pick_bucket(len(text), base_unit)
+            bucket = (profile["buckets"].get(bucket_name)
+                      or profile["buckets"].get("medium") or {})
+        else:
+            bucket = profile
+        feat = bucket.get("feat") or profile.get("feat") or {}
+        band = (feat.get("句长均值") or {})
+        lo, hi = band.get("p10"), band.get("p90")
+        if lo is None or hi is None:
+            return {}
+        return {"sentence_range": (float(lo), float(hi)), "bucket": bucket_name
+                if profile.get("version") == 2 else "v1"}
+    except Exception:  # noqa: BLE001 —— 取不到目标就按「没有目标」走，绝不能阻断生成
+        return {}
+
+
 def _maybe_rewrite_style(
     project: Project,
     text: str,
@@ -1487,13 +1524,24 @@ def _maybe_rewrite_style(
     decision = _rewrite_decision(project, override)
     if decision == "never":
         return text, {"applied": False, "reason": "开关关闭"}
+    gate_info: dict = {"decision": decision}
     if decision == "gate":
         severe, reasons = _rewrite_gate(text, profile)
+        gate_info["severe"] = bool(severe)
+        gate_info["reasons"] = reasons
         if not severe:
-            return text, {"applied": False, "reason": "偏离未达闸门", "gates": reasons}
+            return text, {"applied": False, "reason": "偏离未达闸门",
+                          "gates": reasons, "gate": gate_info}
     try:
         from app.generation.rewrite import rewrite_style
-        new_text, info = rewrite_style(text, _rewrite_provider(provider))
+        targets = _rewrite_targets(text, profile)
+        new_text, info = rewrite_style(
+            text, _rewrite_provider(provider),
+            target_sentence_range=targets.get("sentence_range"),
+        )
+        info["gate"] = gate_info
+        info["targets"] = ({"sentence_range": list(targets["sentence_range"])}
+                           if targets.get("sentence_range") else None)
         if info.get("applied"):
             b, a = info.get("before"), info.get("after")
             logging.getLogger(__name__).info(
@@ -1625,20 +1673,62 @@ def _verbatim_system_prompt(threshold: int = 25) -> str:
     )
 
 
-def _commit_segment(db, project: Project, text: str, summary: str) -> tuple[Generation, int]:
+def _pipeline_record(chain: dict) -> dict:
+    """生成链路的**可查留痕**：每一道正文工序做了什么、为什么没做。
+
+    ## 为什么要有它
+
+    2026-11-01 的排查：「闸门触发了却没改」这件事**从产出侧完全看不出来** ——
+    产出与没走这道工序时一模一样，只有返回体里一行 `info.reason`，
+    而那行不落库 ⇒ 事后查不出来。最后是靠「把最终文本重喂给闸门判定」
+    才定位到改写静默返回空输出。
+
+    ⇒ 所以：闸门判了什么、改写采没采纳、采纳前后的 (句长, 句号密度, 引号数)
+    **一律落库**。只要查库，不需要日志、不需要重跑。
+
+    只存诊断，不存正文（正文在 `generations.text` 里）。
+    """
+    def _pick(name: str) -> dict:
+        info = chain.get(name) or {}
+        if not isinstance(info, dict):
+            return {}
+        keep = ("applied", "reason", "before", "after", "chars", "gate",
+                "reasons", "target", "targets", "gates")
+        return {k: info[k] for k in keep if k in info}
+
+    return {
+        "rewrite": _pick("rewrite_info"),
+        "ai_rewrite": _pick("ai_rewrite_info"),
+        "form": _pick("form_info"),
+        "attr": _pick("attr_info"),
+        "ellipsis": _pick("ell_info"),
+        "beat": _pick("beat_info"),
+        "verbatim": _pick("verbatim_info"),
+    }
+
+
+def _commit_segment(db, project: Project, text: str, summary: str,
+                    pipeline: dict | None = None) -> tuple[Generation, int]:
     """落库一段：写 Generation + 追加 L1 到摘要树 + 同步扁平归档。
 
     `project.summary` **继续维护**，但它已从「注入源」退为「L1 无损归档」：
     前端/旧接口仍读它，而注入提示词的是 compose_prior 拼的有界前情块。
     两份都写不构成双写风险——它们由同一次 record_l1 派生，且树才是权威。
+
+    `pipeline` 是本次生成的工序留痕（闸门判定 + 改写结果等），
+    写进 `summary` 这个 JSON 列 —— 查库就能知道「这段为什么长这样」，
+    不必依赖日志。
     """
     segment_no = _next_segment_no(db, project.id)
+    summary_json: dict = {"text": summary}
+    if pipeline:
+        summary_json["pipeline"] = pipeline
     gen = Generation(
         project_id=project.id,
         segment_no=segment_no,
         chapter_range=f"段{segment_no}",
         text=text,
-        summary={"text": summary},
+        summary=summary_json,
     )
     db.add(gen)
 
@@ -3107,7 +3197,8 @@ def generate_next_segment(
             'written_segments': written,
         })
 
-    gen, segment_no = _commit_segment(db, project, text, summary)
+    gen, segment_no = _commit_segment(db, project, text, summary,
+                                 pipeline=_pipeline_record(chain))
     # 正文变了 → 上一版的整段验收**不再覆盖这一版**：义务换绑（不删除），
     # 派生状态作废（引擎只做增量合并，不是解锁要求的全量重建）。
     _rebind_acceptance_after_generation(db, project)
@@ -3360,7 +3451,8 @@ def generate_next_segment_stream(
                           "可以再点一次生成，或换个模型试试。"}
         return
 
-    gen, segment_no = _commit_segment(db, project, text, summary)
+    gen, segment_no = _commit_segment(db, project, text, summary,
+                                 pipeline=_pipeline_record(chain))
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
     node_judge = _judge_and_advance(db, project, provider, text, written)
 
