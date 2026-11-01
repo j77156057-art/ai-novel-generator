@@ -51,6 +51,7 @@ from app.style.narrative import (  # noqa: E402
     NarrativeTier,
     _build_character_name_index,
     _FAST_TIER_DROP_DIMENSIONS,
+    _block_chars_for_fingerprint,
     extract_narrative_profile,
     list_tiers,
     narrative_fingerprint,
@@ -325,10 +326,17 @@ def test_project_narrative_same_tier_hits_cache():
     try:
         nid = _make_corpus(db, 30)
         proj = _make_project(db, nid, tier=TIER_FAST)
+        # 指纹带块大小（2026-11-01 起）：块大小跟渠道走 ⇒ 它是产出的一部分，
+        # 必须进指纹，否则换渠道会静默复用旧渠道的规则。
+        # 这里用**与生产同一来源**的块大小，否则两边算出来对不上 ⇒ 缓存不命中。
         cached = {
             "tier": TIER_FAST,
             "rules": {},
-            "fingerprint": narrative_fingerprint([nid], TIER_FAST, corpus_hash=corpus_content_hash([nid], db)),
+            "fingerprint": narrative_fingerprint(
+                [nid], TIER_FAST,
+                corpus_hash=corpus_content_hash([nid], db),
+                block_chars=_block_chars_for_fingerprint(),
+            ),
             "narrative_version": NARRATIVE_VERSION,
         }
         proj.style_narrative = cached

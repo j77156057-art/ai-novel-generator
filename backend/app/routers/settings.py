@@ -158,6 +158,20 @@ def thinking_control_for(provider: str, model: str = "") -> dict:
                     "note": "老 M3 只能关思考（它不认 effort，默认就关着）"}
         return {"mode": "none", "field": None, "levels": (), "note": ""}
 
+    if provider == "opencode-go":
+        # opencode Go 订阅通道，默认模型 deepseek-v4.1-flash。
+        #
+        # 2026-11-01 实测：这个模型是**思考型**的，思考 token 与正文**共用**
+        # 同一份 max_tokens 预算 ⇒ max_tokens=64 时正文**一个字都没有**
+        # （finish_reason=length，只有思维链）。
+        #
+        # ⇒ 渠道层默认关思考（provider.OpenCodeGoChatProvider 的 thinking_off 默认 True），
+        # 界面这里给「开/关」两档，让用户能按需要打开。
+        return {"mode": "disable", "field": "thinking",
+                "levels": ("default", "off"),
+                "note": "默认关（渠道层已关）：思考 token 与正文共用预算，"
+                        "max_tokens 太小会让正文一个字都没有（实测 finish_reason=length）"}
+
     if provider == "openai":
         # 通用兼容渠道：只有实测过的 DeepSeek 系给出开关
         if any(model.startswith(m) for m in ("deepseek-chat", "deepseek-reasoner",
@@ -267,6 +281,17 @@ PROVIDER_META: dict[str, dict] = {
         "free_note": "确定性模板生成，离线可跑，非模型质量",
         "default_models": ["local-template"],
     },
+    "opencode-go": {
+        "label": "opencode Go（订阅 · 1M 上下文）",
+        "key_hint": "opencode 账号的 API key（形如 oc-...）",
+        "free_note": (
+            "**订阅**通道，与按量的 zen/v1 不是一回事（按量会 429/402）。"
+            "上下文实测 1M token（约 200 万汉字）——本仓库唯一能把整本书一次投喂的渠道。"
+            "端点固定 zen/go/v1，系统会自动带上必需的 session 头与浏览器 UA。"
+        ),
+        # 与 `config.opencode_go_models` 的 CSV 与 `_default_model_for("opencode-go")` 三处一致。
+        "default_models": ["deepseek-v4.1-flash"],
+    },
 }
 
 # 渠道 → settings 里的 key 字段名 / model 字段名 / models(链) 字段名
@@ -277,6 +302,7 @@ _KEY_FIELD = {
     "minimax": "minimax_api_key",
     "dashscope": "dashscope_api_key",
     "openai": "openai_api_key",
+    "opencode-go": "opencode_go_api_key",
 }
 _MODEL_FIELD = {
     "openrouter": "openrouter_model",
@@ -285,6 +311,7 @@ _MODEL_FIELD = {
     "minimax": "minimax_model",
     "dashscope": "llm_model",
     "openai": "openai_model",
+    "opencode-go": "opencode_go_model",
 }
 _MODELS_FIELD = {
     "openrouter": "openrouter_models",
@@ -293,6 +320,7 @@ _MODELS_FIELD = {
     "minimax": "minimax_models",
     "dashscope": "dashscope_models",
     "openai": "openai_models",
+    "opencode-go": "opencode_go_models",
 }
 
 #: 需要用户填自定义 base_url 的渠道（没有厂商默认地址可回落 / 端点即配置）。

@@ -48,6 +48,8 @@ _LEGACY_CHANNEL_FIELDS: dict[str, tuple[str, str]] = {
     "dashscope": ("dashscope_api_key", "dashscope_base_url"),
     # 通用 OpenAI 兼容接口：没有厂商默认值，端点必须来自本表（用户可覆盖）。
     "openai": ("openai_api_key", "openai_base_url"),
+    # opencode Go **订阅**通道（1M 上下文，见 provider.OpenCodeGoChatProvider）。
+    "opencode-go": ("opencode_go_api_key", "opencode_go_base_url"),
 }
 
 #: 走「渠道 legacy 字段回退」的角色（Writer 有自己的 legacy 路径，不走这张表）。
@@ -303,6 +305,20 @@ class Settings(BaseSettings):
     openai_models: str = "gpt-4o-mini,gpt-4o"
 
     # ------------------------------------------------------------------
+    # opencode Go **订阅**通道（与上面的「按量」zen/v1 不是一回事）。
+    #
+    # 端点固定为 zen/go/v1 —— zen/v1 是按量付费的，会 429/402（额度不足）。
+    # 订阅端点要带 `x-opencode-session` + 浏览器 UA 才通（见 provider 层）。
+    #
+    # 上下文能力：**1M token**（实测硬上限 1048576，约 200 万汉字），
+    # 是本仓库目前唯一能把「整本书」一次投喂进去的渠道。
+    # ------------------------------------------------------------------
+    opencode_go_api_key: str = ""
+    opencode_go_base_url: str = "https://opencode.ai/zen/go/v1"
+    opencode_go_model: str = "deepseek-v4.1-flash"
+    opencode_go_models: str = "deepseek-v4.1-flash"
+
+    # ------------------------------------------------------------------
     # ADR-2026-10-12 第 2 步：Writer / Assistant 双轨隔离（第 8 步再加 Distiller 第三轨）。
     #
     # 6 字段各自独立（provider / api_key / base_url / model / max_tokens / timeout），
@@ -362,6 +378,16 @@ class Settings(BaseSettings):
     #   minimax 实测 15（0.86 req/s，114K TPM）
     # 只有确认自己渠道额度更高时才需要设这个值。
     distill_max_concurrent: int = 0
+    # 蒸馏块大小覆盖（单位：字）。0 = 按渠道自动（provider.distill_block_chars）。
+    #
+    # 渠道实测值见 provider.py 的 distill_block_chars 注释：
+    #   智谱 GLM-4-Flash  20,000（撞 28K TPM 的限流，不是上下文）
+    #   opencode Go deepseek-v4.1-flash  200,000（1M token 上下文，见实测表）
+    #
+    # ⚠️ 手动调大**不会**让模型「看得更仔细」：块越大单块要压缩的输入越多，
+    # 而输出预算（max_tokens 8192）不变 ⇒ 规则条数会掉。
+    # 这个口子是给「我知道自己在做什么」的人留的。
+    distill_block_chars: int = 0
 
     def _legacy_channel_field(self, provider: str, field: str) -> str:
         """按渠道名取 legacy 字段值（Assistant / Distiller 的 api_key / base_url 回退用）。
@@ -406,6 +432,11 @@ class Settings(BaseSettings):
     def openai_model_list(self) -> list[str]:
         """通用 OpenAI 兼容渠道的候选链。"""
         return self._dedup_models(self.openai_models)
+
+    @property
+    def opencode_go_model_list(self) -> list[str]:
+        """opencode Go 订阅通道的候选链。"""
+        return self._dedup_models(self.opencode_go_models)
 
     @staticmethod
     def _dedup_models(csv: str) -> list[str]:

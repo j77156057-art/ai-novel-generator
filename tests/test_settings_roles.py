@@ -788,9 +788,21 @@ def test_model_lists_are_consistent_across_three_sources(db_session):
         )
         # 2) 运行时切换链 CSV = 下拉清单（有 CSV 的渠道）
         if provider in models_field:
-            csv_list = getattr(settings, f"{provider}_model_list")
+            # ⚠️ **不能**用 f"{provider}_model_list" 拼属性名 —— 那是巧合不是契约：
+            # 渠道名带连字符时（`opencode-go`）拼出来是 `opencode-go_model_list`
+            # ⇒ 不是合法属性名 ⇒ AttributeError。
+            # 正确做法：经 `_MODELS_FIELD` 映射拿到 CSV 字段名，
+            # 再由「CSV 字段名 → <字段名>_model_list」找属性。
+            csv_field = models_field[provider]
+            csv_list = getattr(settings, f"{csv_field}_model_list", None)
+            if csv_list is None:
+                # 没有同名属性时退到 CSV 原文（仍然要校验一致性）
+                csv_list = [
+                    m.strip() for m in str(getattr(settings, csv_field, "")).split(",")
+                    if m.strip()
+                ]
             assert csv_list == defaults, (
-                f"{provider}: config 的 {models_field[provider]} 与 PROVIDER_META 不一致"
+                f"{provider}: config 的 {csv_field} 与 PROVIDER_META 不一致"
                 f"（{csv_list} != {defaults}）"
             )
 

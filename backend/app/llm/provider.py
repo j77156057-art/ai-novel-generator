@@ -108,6 +108,19 @@ class LLMProvider:
     #: 定低了白白浪费一晚上。
     max_concurrent_hint: int = 0
 
+    #: 该渠道**单次请求**能安全吃下的输入字数（蒸馏块按它装箱）。0 = 未声明。
+    #:
+    #: 为什么是「实测」而不是「厂商标称的 context window」：标称的是**能收**的上限，
+    #: 不是**能用**的上限。三个后果，逐条都实测踩过：
+    #:   ① 超了可能被**静默截断**（模型只看到前半段，产出半截结果却不报错）；
+    #:   ② 超了可能被 429（撞的是 TPM，不是 context window）；
+    #:   ③ 就算能收下，**块越大单块输出越少**（要压缩的输入涨了，输出预算没涨）
+    #:   ⇒ 规则条数会掉，这是「放大块」的真实代价，不是 context window 能解决的问题。
+    #:
+    #: 所以这个值是「**实测能安全吃下且产出不劣化**」的上限，不是模型能收的最大值。
+    #: 实测数据见各渠道类的注释。
+    distill_block_chars: int = 0
+
     def chat(self, system: str, user: str, constraints: dict | None = None,
              temperature: float | None = None) -> str:
         """chat 调用。temperature=None = 用渠道默认（创作 0.7）。
@@ -600,6 +613,15 @@ class ZhipuChatProvider(OpenAICompatibleChatProvider):
     # 短 prompt 能跑到，长 prompt 到不了。
     max_concurrent_hint = 2
 
+    # 蒸馏块大小：2 万字。
+    #
+    # ⚠️ **这里不是 context window 的限制** —— GLM-4-Flash 的上下文是 128K token，
+    # 2 万字远没到。真正的限制是上面那条 **28K TPM**：块一大，单次请求的 token
+    # 就超过一分钟配额 ⇒ 429。放大块只会把 429 变多，不会更快。
+    #
+    # ⇒ 换到 1M 上下文的渠道后，这个值要跟着换（见 `OpenCodeGoChatProvider`）。
+    distill_block_chars = 20_000
+
 
 class SiliconFlowChatProvider(OpenAICompatibleChatProvider):
     """硅基流动 SiliconFlow（api.siliconflow.cn）：国产开源模型最全，国内低延迟。
@@ -765,6 +787,128 @@ class GenericOpenAIChatProvider(OpenAICompatibleChatProvider):
             extra["thinking"] = {"type": "disabled"}
         super().__init__(api_key, base_url, model, extra_body=extra,
                          models=models, extra_headers=extra_headers, **kwargs)
+
+
+#: 走 Cloudflare 的 OpenAI 兼容端点必需的浏览器 UA。
+#:
+#: ⚠️ **这不是 opencode 特有** —— 凡是走 Cloudflare 的 OpenAI 兼容端点，
+#: 裸 urllib 的 UA（`Python-urllib/3.x`）都会被拦成 **403 `error code: 1010`**
+#: （2026-11-01 实测 opencode.ai/zen/go/v1 复现）。
+#:
+#: 之前只有 `verify_acceptance_real.py` 手工带了这个头 ⇒ **通过界面配置
+#: 这个端点必然 403**。本常量把它提到 provider 层，让正常配置路径也能通。
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
+
+class OpenCodeGoChatProvider(GenericOpenAIChatProvider):
+    """opencode **Go 订阅**通道（`https://opencode.ai/zen/go/v1`）。
+
+    ## 它与「按量付费」端点的区别
+
+    | 端点 | 结果 |
+    |---|---|
+    | `https://opencode.ai/zen/v1`（按量） | 429 `FreeUsageLimitError` / 402 `Insufficient account funds` |
+    | **`https://opencode.ai/zen/go/v1`（订阅）** | **200 ✅** |
+
+    ## 两个必需的头（少了就是 400/403，不是 200）
+
+    1. **`x-opencode-session`** —— 少了 ⇒ 400 `MissingSessionID`（2026-10-29 实测）。
+    2. **浏览器 UA** —— 少了 ⇒ 403 / Cloudflare `error code: 1010`（2026-11-01 实测）。
+
+    这两个头之前只写在验收脚本里（`verify_acceptance_real.py`），
+    ⇒ **通过界面把蒸馏接到这个渠道会直接失败**。本类把它们收到 provider 层。
+
+    ## 上下文能力：1M token（实测，不是标称）
+
+    2026-11-01 实测（服务端自己报的数）：
+
+    | 输入字数 | 结果 | 耗时 |
+    |---|---|---|
+    | 200,000 | ✅ 读到末尾 | 6.2s |
+    | 500,000 | ✅ | 9.8s |
+    | 1,000,000 | ✅ | 52.2s |
+    | **2,000,000** | **✅** | **85.2s** |
+    | 2,500,000 | ❌ `context_length_exceeded`（1299741 tokens） | — |
+    | 3,250,000 | ❌ 1688708 tokens | — |
+
+    ⇒ 硬上限 **1048576 tokens**（服务端原文：`maximum context length is 1048576
+    tokens`），中文约 0.52 token/字 ⇒ 约 **200 万字**。
+    「读到末尾」用**文末插针**验的（问模型末尾那个标记是什么）——
+    只问首字的话，端点静默截断也照样「通过」。
+
+    ## 但蒸馏块给 20 万字，不是 200 万（且这个值后来被实测收窄了）
+
+    `distill_block_chars` **不是**「模型能收的最大值」，而是
+    「**实测下不牺牲候选池多样性的块大小**」。
+
+    ⚠️ **实测纠正过一次错误判断**（2026-11-01）：
+    我原先以为「块放大 ⇒ 规则条数掉」是**输出预算**（max_tokens 8192）不够导致的。
+
+    **那个判断是错的** —— 实测每块产出**恒定约 40 条**
+    （块 2 万 / 5 万 / 10 万 / 20 万都一样），因为提示词里**写死了条数**
+    （「每题给 1 条，总数 4-8 条」× 约 10 维）。
+    ⇒ 总规则数的下降**全部来自块数变少**，不是每块产得少。
+
+    ⇒ 真正的代价是**候选池变小**（每维候选从约 111 条降到约 12 条），
+    而下游每维只取 5 条（`RULES_PER_DIM`）⇒ 12 选 5 的多样性只剩 1/4。
+
+    ⇒ 取值由实测定，见 ENGINEERING.md 与 docs/context-budget-design.md §3.5~§3.6。
+    """
+
+    label = "opencode Go"
+
+    #: 蒸馏块大小（字）。
+    #:
+    #: 取值 = 5 万，**不是** 20 万、也不是 200 万。定案判据：
+    #:
+    #: | 块大小 | 块数 | 每维候选 min | 注入字数 | 墙钟 |
+    #: |---|---|---|---|---|
+    #: | 2 万（基线） | 28 | 86 | 2297 | 1170s |
+    #: | **5 万（取值）** | 11 | **32** | **1754** | **391s** |
+    #: | 20 万 | 3 | **8**（❌ 8 选 5，多样性几乎归零） | 1643 | 120s |
+    #:
+    #: 判据：**每维候选 ≥ 30**（下游每维取 5 条）∧ **注入长度同量级**
+    #: ∧ **墙钟更快**；两条都满足时取更小的块（候选池越大越好）。
+    #:
+    #: ⇒ 20 万虽然墙钟快 5 倍，但每维只剩约 12 条候选 ⇒ **多样性不够**，
+    #: 而多样性正是「从全书挑出代表性写法」的来源 ⇒ 不取。
+    #:
+    #: 详见 ENGINEERING.md 与 docs/context-budget-design.md §3.5~§3.6。
+    distill_block_chars = 50_000
+
+    def __init__(self, api_key: str, base_url: str, model: str,
+                 models: list[str] | None = None,
+                 thinking_off: bool | None = None,
+                 session: str | None = None,
+                 extra_headers: dict | None = None, **kwargs) -> None:
+        """`thinking_off`：`None`（未指定）⇒ **关**（本渠道默认）；True/False = 显式指定。
+
+        ## 为什么默认关
+
+        deepseek-v4.1-flash 是**思考型**模型：思考 token 与正文**共用**同一份
+        max_tokens 预算。实测（2026-11-01）max_tokens=64 ⇒ 正文**一个字都没有**
+        （`finish_reason=length`），只有思维链。
+
+        ⇒ 蒸馏与写手要的都是正文，思维链没有价值却吃掉全部预算 ⇒ 默认关。
+
+        关法是 `thinking={"type":"disabled"}`（DeepSeek 认这个字段，实测
+        reasoning 归零、延迟 27.8s→8.2s；它不认 `reasoning_effort`）。
+        用户可在界面上显式选「开」。
+        """
+        headers = {
+            "User-Agent": _BROWSER_UA,
+            # session id 的语义：同一批请求归到一次「会话」下。
+            # 不给 ⇒ 用时间戳生成（同一进程内多个实例会撞，但无副作用）。
+            "x-opencode-session": session or f"ocgo-{int(time.time())}",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        super().__init__(api_key, base_url, model, models=models,
+                         thinking_off=True if thinking_off is None else thinking_off,
+                         extra_headers=headers, **kwargs)
 
 
 class LocalFallbackLLMProvider(LLMProvider):
@@ -973,11 +1117,22 @@ def _thinking_kwargs(provider: str, model: str, thinking: str) -> dict:
         # 能关的：老 M3（类里本来默认就关）与通用兼容渠道（DeepSeek）
         if prov == "minimax" or prov == "openai":
             return {"thinking_off": True}
+    if value == "default":
+        # 「开思考」= 显式不关。
+        #
+        # 为什么需要这一档（2026-11-01）：opencode-go 渠道**层默认关**思考
+        # （deepseek-v4.1-flash 的思考 token 与正文共用预算 ⇒ 关掉才有正文），
+        # 但用户可能想开（比如某些任务要推理）。
+        #
+        # 只对 opencode-go 显式处理，其它渠道的 "default" 保持原样（不传任何参数
+        # ⇒ 渠道自己的默认行为不变）—— 避免改动其它渠道的既有行为。
+        if prov == "opencode-go":
+            return {"thinking_off": False}
     return {}
 
 
 def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
-                   thinking_off: bool = False,
+                   thinking_off: bool | None = None,
                    max_tokens: int | None = None, timeout: int = 120,
                    stream_timeout: int = 180) -> LLMProvider:
     """按渠道名直接构造 provider 实例（测试端点用，不走缓存/单例）。
@@ -986,6 +1141,21 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
     - Assistant 工厂会显式传 timeout=60 / stream_timeout=60；
     - 其它调用方（settings.py 的连通性测试）不传 → 默认 None / 120 / 180 =
       与 b58c763 行为一致（stream_timeout=180 是关键，不能与 chat 共用 120）。
+
+    ## `thinking_off` 为什么是三态（2026-11-01）
+
+    `None` = **未指定** ⇒ 用**渠道自己的默认**；
+    `True` / `False` = 显式要求关 / 开。
+
+    之前它是 `bool = False`，含义被混淆成「默认关」——于是 `None` 这个状态
+    根本表达不出来，「渠道默认关思考」与「调用方要求开思考」分不开。
+
+    真实案例：opencode-go 渠道默认**关**思考（deepseek-v4.1-flash 的思考 token
+    与正文共用 max_tokens 预算 ⇒ 不关就没有正文），但用户可以在界面选「开」。
+    ⇒ 需要三态才能同时表达这两件事。
+
+    兼容性：原 `False` 语义（「不关」）保持不变 ——
+    `None` 在通用 openai 渠道下等价于旧的 `False`（该渠道默认本来就不关）。
     """
     if provider == "openrouter":
         url = base_url or settings.openrouter_base_url
@@ -1012,6 +1182,20 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
         return DashScopeChatProvider(api_key, url, model,
                                       max_tokens=max_tokens, timeout=timeout,
                                       stream_timeout=stream_timeout)
+    if provider == "opencode-go":
+        # opencode Go **订阅**通道。与「按量」的 zen/v1 不是一回事：
+        # 按量端点会 429/402（额度不足），订阅端点要带 session 头才通。
+        # 这个分支存在的理由：那两个必需的头（x-opencode-session + 浏览器 UA）
+        # 以前只写在验收脚本里 ⇒ 通过界面配这个端点必然 403。
+        url = base_url or settings.opencode_go_base_url
+        return OpenCodeGoChatProvider(api_key, url, model, models=[model],
+                                      # `None`（未指定）⇒ 该渠道的默认 = **关思考**
+                                      # （deepseek-v4.1-flash 的思考 token 与正文共用
+                                      #  max_tokens 预算 ⇒ 不关就没有正文）。
+                                      # 显式 True/False 则是用户在界面上的选择。
+                                      thinking_off=thinking_off,
+                                      max_tokens=max_tokens, timeout=timeout,
+                                      stream_timeout=stream_timeout)
     if provider == "openai":
         # 通用 OpenAI 兼容渠道：任何实现了 /chat/completions + Bearer 鉴权的端点
         # （官方 / one-api / vLLM / LM Studio / 中转站…）。端点优先取调用方给的
@@ -1021,7 +1205,9 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
         # 「配了但一直在用离线模板」，是极难排查的静默失效。
         url = base_url or settings.openai_base_url
         return GenericOpenAIChatProvider(api_key, url, model, models=[model],
-                                         thinking_off=thinking_off,
+                                         # `None`（未指定）⇒ 该渠道的默认 = **不关**
+                                         # （保持 2026-11-01 之前的行为逐字节不变）。
+                                         thinking_off=bool(thinking_off),
                                          max_tokens=max_tokens, timeout=timeout,
                                          stream_timeout=stream_timeout)
     return LocalFallbackLLMProvider()
@@ -1046,6 +1232,7 @@ def _default_model_for(provider: str) -> str:
         "minimax": "MiniMax-M3.1-Flash-Preview",
         "dashscope": "qwen-plus",
         "openai": "gpt-4o-mini",
+        "opencode-go": "deepseek-v4.1-flash",
     }.get(provider, "")
 
 
@@ -1091,6 +1278,40 @@ def build_role_provider(role: str, stream_timeout: int = 60) -> LLMProvider:
     kwargs.update(_thinking_kwargs(provider, model,
                                    str(cfg.get("thinking") or "")))
     return build_provider(provider, api_key, model, base_url, **kwargs)
+
+
+def block_chars_for_channel(channel: str | None = None) -> int:
+    """查某个渠道的蒸馏块大小能力（字）。**不构造 provider**。
+
+    用途：指纹计算（`narrative._block_chars_for_fingerprint`）需要在**没有
+    provider 实例**的情况下知道块大小 —— 造实例要 key、要连网络，
+    而算指纹不该有这些副作用。
+
+    `channel=None` ⇒ 取**蒸馏角色**当前配置的渠道。
+
+    ## 与实例上的值同源
+
+    这里的每个数字都直接取自对应 provider 类的 `distill_block_chars`
+    （同一张能力表），所以「查表」与「造实例」必然一致。
+
+    ⚠️ 改了某个类的 `distill_block_chars`，这张表要同步改 —— 两边不一致的话
+    指纹会算出与实际蒸馏不同的块大小 ⇒ 缓存永远不命中（或命中错误的旧结果）。
+    下面的 `tests/test_distill_block_size.py` 有一致性断言守着这条。
+    """
+    if not channel:
+        try:
+            channel = str(settings.get_provider_config("distiller").get("provider") or "").strip()
+        except Exception:  # noqa: BLE001 —— 配置读不到不该让调用方炸
+            channel = ""
+    key = (channel or "").strip().lower()
+    table = {
+        "zhipu": ZhipuChatProvider,
+        "opencode-go": OpenCodeGoChatProvider,
+    }
+    cls = table.get(key)
+    if cls is None:
+        return 0
+    return int(getattr(cls, "distill_block_chars", 0) or 0)
 
 
 def build_assistant_provider() -> LLMProvider:

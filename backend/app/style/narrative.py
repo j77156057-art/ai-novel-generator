@@ -77,7 +77,7 @@ MIN_SAMPLE_CHARS = 300_000
 #: 每块最少章节数（太少提炼不出模式）
 MIN_CHAPTERS_PER_CHUNK = 5
 
-#: 每个蒸馏块的目标字数。
+#: 每个蒸馏块的目标字数（**保守兜底值**）。
 #:
 #: 为什么按字数而不是章数：不同书章长差 3-5 倍（有的 1500 字/章，
 #: 有的 8000 字/章）。固定章数会让某些书的块是别的书的 5 倍大，
@@ -85,6 +85,10 @@ MIN_CHAPTERS_PER_CHUNK = 5
 #:
 #: 2 万字：实测该长度下模型能稳定输出 7 维规则且不截断；
 #: 再往上（4 万字）rejected 明显上升。
+#:
+#: ⚠️ **这是兜底，不是上限**（2026-11-01 改）：渠道实测能吃更多时用渠道的值
+#: （见 `_resolve_block_chars`）。历史依据是智谱 GLM-4-Flash（28K TPM ⇒ 撞的是
+#: 限流不是上下文），换一个 1M 上下文的渠道后这个数字就成了无谓的保守。
 TARGET_BLOCK_CHARS = 20_000
 
 
@@ -3469,6 +3473,99 @@ def _resolve_concurrency(provider, requested: int | None = None) -> int:
     return hint if hint > 0 else _DEFAULT_MAX_CONCURRENT
 
 
+def _resolve_block_chars(provider, requested: int | None = None) -> int:
+    """决定本次蒸馏每个块的目标字数。优先级：显式参数 > 渠道实测值 > 保守兜底。
+
+    渠道值取 `provider.distill_block_chars`（0 = 该渠道没实测过）。
+
+    ## 为什么块大小要「跟着渠道走」
+
+    旧的 2 万字是**为智谱 GLM-4-Flash 定的**：那个渠道撞的是 28K TPM 的限流，
+    块一大就 429。换一个 1M 上下文的渠道后，同样的 2 万字就是**白扔 90% 的
+    上下文预算**——书的每个字都要多跑一次请求，墙钟时间被放大几十倍。
+
+    实测（2026-11-01，opencode Go / deepseek-v4.1-flash）：
+      输入   20,000 字 → 4.0s  ✅
+      输入  200,000 字 → 5.4s  ✅
+      输入  500,000 字 → 9.8s  ✅
+      输入  1000,000 字 → 52.2s ✅（且读到了文本末尾的「针」）
+      输入  2000,000 字 → 85.2s ✅（同样读到末尾）
+      输入  2500,000 字 → 400 `context_length_exceeded`（1299741 tokens > 1048576）
+    ⇒ 服务端硬上限 1048576 tokens，中文约 0.52 token/字 ⇒ 约 200 万字。
+
+    ## 但「能吃下」不等于「该用满」
+
+    块越大 ⇒ **块数变少** ⇒ 每维的**候选池**变小
+    （实测：2 万/块 ⇒ 每维候选约 111 条；20 万/块 ⇒ 约 12 条）
+    ⇒ 而下游每维只取 5 条（`RULES_PER_DIM`）⇒ **选样的多样性下降**。
+
+    ⚠️ **实测纠正过一个错误判断**（2026-11-01）：
+    我原先以为「规则条数掉到 1/8.4」是**输出预算**（max_tokens）不够导致的，
+    ⇒ 由此得出「要放大块就得同步放大 max_tokens」。
+
+    **那个判断是错的**：实测每块产出**恒定约 40 条**（块 2 万 / 5 万 / 10 万 /
+    20 万都一样）—— 条数由**提示词里写死的「每题 1 条，总数 4-8 条」**决定，
+    不是由预算决定 ⇒ 总规则数的下降**全部来自块数变少**。
+
+    ⇒ 所以本函数的取值语义是「**实测下不牺牲候选池多样性的块大小**」，
+    不是「模型能收的最大值」——两者差着一个数量级。
+
+    另外允许 `settings.distill_block_chars` 强行覆盖（0 = 不覆盖），
+    给用户留一个「我知道自己在做什么」的口子（与 `distill_max_concurrent` 同形状）。
+
+    ## 指纹用同一个值
+
+    `narrative_fingerprint` 也要带块大小（换渠道 ⇒ 产出不同 ⇒ 旧缓存必须失效），
+    但指纹是在**还没构造 provider** 时算的 ⇒ 用 `_block_chars_for_fingerprint`：
+    它只读「配置覆盖 + 渠道名 ⇒ 能力值」这两个**不依赖实例**的来源，
+    与 `_resolve_block_chars` 走同一张能力表 ⇒ 两者必然一致。
+    """
+    if requested and requested > 0:
+        return requested
+    forced = _configured_block_chars()
+    if forced > 0:
+        return forced
+    hint = int(getattr(provider, "distill_block_chars", 0) or 0)
+    return hint if hint > 0 else TARGET_BLOCK_CHARS
+
+
+def _configured_block_chars() -> int:
+    """用户显式配置的块大小覆盖（0 = 不覆盖）。配置不可读时返回 0。"""
+    try:
+        from app.config import settings as _st
+        return int(getattr(_st, "distill_block_chars", 0) or 0)
+    except Exception:  # noqa: BLE001 —— 配置不可读不该让蒸馏失败
+        return 0
+
+
+def _block_chars_for_fingerprint() -> int:
+    """算指纹用的块大小——**不构造 provider**，但与 `_resolve_block_chars` 同源。
+
+    ## 为什么不能直接用 `_resolve_block_chars(None)`
+
+    那样会永远拿到兜底值（2 万字），而实际蒸馏用的是渠道的值（20 万字）
+    ⇒ 指纹永远对不上 ⇒ **缓存永远不命中**（每次都重跑），
+    而且用户换渠道后拿到的是**旧渠道**的规则。
+
+    ## 怎么做到同源
+
+    块大小只有两个来源：① `settings.distill_block_chars`（显式覆盖）；
+    ② 渠道类的 `distill_block_chars`（实测能力）。
+
+    ② 按**渠道名**查（能力表在 provider 模块里），与实例上的值来自**同一张表**
+    ⇒ 一致。这里刻意用「查表」而不是「造实例」——
+    造实例要 key、要连网络，而指纹计算不该有这些副作用。
+    """
+    forced = _configured_block_chars()
+    if forced > 0:
+        return forced
+    try:
+        from app.llm.provider import block_chars_for_channel
+    except Exception:  # noqa: BLE001 —— provider 读不到不该让蒸馏失败
+        return TARGET_BLOCK_CHARS
+    return block_chars_for_channel()
+
+
 async def _gather_chat_async(
     provider, prompts: list[tuple[str, str, dict | None]],
     max_concurrent: int | None = None,
@@ -3788,11 +3885,15 @@ def extract_narrative_profile(
         # （约 1000 字），20 个 = 2 万字/块。改成真章节后 20 章 = 11 万字/块，
         # prompt 会超长模型上下文。
         #
-        # 现在按字数装箱：目标每块 TARGET_BLOCK_CHARS 字，最少 MIN_CHAPTERS_PER_CHUNK 章。
+        # 现在按字数装箱：目标每块 `block_chars` 字，最少 MIN_CHAPTERS_PER_CHUNK 章。
         # 这样对不同章长的书都成立（有的书一章 5000 字，有的 1500 字）。
+        #
+        # `block_chars` 由**渠道能力**决定（`_resolve_block_chars`），
+        # 不是写死的 2 万字——见该函数的实测数据。
+        block_chars = _resolve_block_chars(provider)
         block_size = max(
             MIN_CHAPTERS_PER_CHUNK,
-            _chapters_per_block(sampled, TARGET_BLOCK_CHARS),
+            _chapters_per_block(sampled, block_chars),
         )
         chunk_size = block_size
         chunk_starts = list(range(0, len(sampled), chunk_size))
@@ -4434,9 +4535,11 @@ def extract_character_template(
         if not chapters:
             continue
         sampled = sample_chapters_for_tier(chapters, cfg)
+        # 块大小跟渠道走（与叙事档案同一把尺），见 `_resolve_block_chars`。
+        block_chars = _resolve_block_chars(provider)
         block_size = max(
             MIN_CHAPTERS_PER_CHUNK,
-            _chapters_per_block(sampled, TARGET_BLOCK_CHARS),
+            _chapters_per_block(sampled, block_chars),
         )
         chunk_starts = list(range(0, len(sampled), block_size))
         n_chunks = len(chunk_starts)
@@ -4517,8 +4620,9 @@ def extract_character_template(
 def narrative_fingerprint(
     source_ids: list[int], tier: str | NarrativeTier | None = None,
     *, corpus_hash: str | None = None,
+    block_chars: int | None = None,
 ) -> dict:
-    """叙事档案的失效判据：语料集合 + 提炼版本号 + **档位**。
+    """叙事档案的失效判据：语料集合 + 提炼版本号 + **档位** + **块大小**。
 
     ## 为什么档位必须在指纹里（本项目已踩过两次的同类坑）
 
@@ -4529,9 +4633,21 @@ def narrative_fingerprint(
     所以指纹里除了档位 key，还带档位**配置的哈希**（`_tier_signature`）：
     改了某档的维度白名单 / 采样章数 / 清洗强度，旧缓存同样会失效。
 
+    ## 为什么块大小也要在指纹里（2026-11-01）
+
+    块大小从「写死 2 万字」改成「跟着渠道走」之后，它就成了**产出的一部分**：
+    同一个语料、同一档位，换个渠道（2 万字 vs 20 万字/块）出来的规则**不一样**。
+
+    ⇒ 不把它放进指纹 ⇒ 用户从智谱换到 opencode-go，界面照样「命中缓存」，
+    拿到的是**旧渠道的规则**，而且没有任何报错。
+
+    这跟上面「档位不进指纹」是**同一个坑的第三次出现**，所以一并堵上。
+
     Args:
         source_ids: 参考语料 novel_id 列表。
         tier: 档位 key 或配置对象；None → 默认完整档。
+        corpus_hash: 语料正文哈希；给了就进指纹（语料改了要失效）。
+        block_chars: 本次蒸馏的块大小；给了就进指纹（换渠道要失效）。
     """
     cfg = tier if isinstance(tier, NarrativeTier) else resolve_tier(tier)
     return {
@@ -4540,6 +4656,7 @@ def narrative_fingerprint(
         "tier": cfg.key,
         "tier_signature": _tier_signature(cfg),
         **({"corpus_hash": corpus_hash} if corpus_hash is not None else {}),
+        **({"block_chars": int(block_chars)} if block_chars else {}),
     }
 
 
@@ -4709,7 +4826,8 @@ def project_narrative(
     cfg = cfg_tier if isinstance(cfg_tier, NarrativeTier) else resolve_tier(cfg_tier)
 
     content_hash = corpus_content_hash(ids, db)
-    want = narrative_fingerprint(ids, cfg, corpus_hash=content_hash)
+    want = narrative_fingerprint(ids, cfg, corpus_hash=content_hash,
+                                 block_chars=_block_chars_for_fingerprint())
     cached = project.style_narrative or {}
     profile = None
 
