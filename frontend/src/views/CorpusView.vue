@@ -11,21 +11,28 @@ const uploadState = ref<{ loading: boolean; result: UploadResult | null; error: 
   result: null,
   error: null,
 });
+const fileInput = ref<HTMLInputElement | null>(null);
 
 const selected = ref<NovelOut | null>(null);
 const chunks = ref<ChunkOut[]>([]);
 const chunksLoading = ref(false);
+const chunksError = ref<string | null>(null);
 
 const q = ref("");
 const hits = ref<SearchHit[] | null>(null);
 const searching = ref(false);
+const searchError = ref<string | null>(null);
 
 onMounted(() => reloadNovels());
+
+function chooseFile() {
+  if (!uploadState.value.loading) fileInput.value?.click();
+}
 
 async function onFile(e: Event) {
   const input = e.target as HTMLInputElement;
   const file = input.files?.[0];
-  if (!file) return;
+  if (!file || uploadState.value.loading) return;
   uploadState.value = { loading: true, result: null, error: null };
   try {
     const r = await api.uploadNovel(file);
@@ -38,28 +45,43 @@ async function onFile(e: Event) {
   }
 }
 
-async function openChunks(n: NovelOut) {
-  selected.value = n;
-  hits.value = null;
-  q.value = "";
+async function loadChunks(n: NovelOut) {
   chunksLoading.value = true;
+  chunksError.value = null;
   try {
     chunks.value = await api.listChunks(n.id);
   } catch (err) {
     chunks.value = [];
-    alert(err instanceof Error ? err.message : String(err));
+    chunksError.value = err instanceof Error ? err.message : String(err);
   } finally {
     chunksLoading.value = false;
   }
 }
 
+async function openChunks(n: NovelOut) {
+  selected.value = n;
+  hits.value = null;
+  searchError.value = null;
+  q.value = "";
+  chunks.value = [];
+  await loadChunks(n);
+}
+
+async function retryChunks() {
+  if (selected.value) await loadChunks(selected.value);
+}
+
 async function runSearch() {
-  if (!selected.value || !q.value.trim()) return;
+  const novel = selected.value;
+  const query = q.value.trim();
+  if (!novel || !query || searching.value) return;
   searching.value = true;
+  searchError.value = null;
+  hits.value = null;
   try {
-    hits.value = await api.searchNovel(selected.value.id, q.value.trim());
+    hits.value = await api.searchNovel(novel.id, query);
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    searchError.value = err instanceof Error ? err.message : String(err);
   } finally {
     searching.value = false;
   }
@@ -75,87 +97,298 @@ async function runSearch() {
 
   <section class="card">
     <div class="card-title">上传语料 <span class="hint">.txt · UTF-8</span></div>
-    <div class="row">
-      <label class="btn primary" style="cursor: pointer">
-        选择 .txt 上传
-        <input type="file" accept=".txt,text/plain" hidden @change="onFile" />
-      </label>
-      <span v-if="uploadState.loading" class="muted"><span class="spinner" /> 解析中…</span>
+    <div class="row upload-row">
+      <input
+        ref="fileInput"
+        type="file"
+        accept=".txt,text/plain"
+        hidden
+        :disabled="uploadState.loading"
+        @change="onFile"
+      />
+      <button
+        type="button"
+        class="btn primary"
+        :disabled="uploadState.loading"
+        @click="chooseFile"
+      >
+        {{ uploadState.loading ? "正在上传…" : "选择 .txt 上传" }}
+      </button>
+      <span v-if="uploadState.loading" class="muted" role="status">
+        <span class="spinner" /> 正在上传并解析…
+      </span>
     </div>
-    <div v-if="uploadState.result" class="notice ok" style="margin-top: 16px">
+    <div v-if="uploadState.result" class="notice ok upload-notice" role="status">
       已入库：{{ uploadState.result.title }} · {{ uploadState.result.chapters }} 章 / {{ uploadState.result.chunks }} 分片（novel_id={{ uploadState.result.novel_id }}）
     </div>
-    <div v-if="uploadState.error" class="notice err" style="margin-top: 16px">{{ uploadState.error }}</div>
+    <div v-if="uploadState.error" class="notice err upload-notice" role="alert">
+      {{ uploadState.error }}
+    </div>
   </section>
 
   <section class="card">
     <div class="card-title">已入库语料 <span class="hint">{{ novels?.length ?? 0 }} 本</span></div>
-    <div v-if="novelsLoading" class="empty"><span class="spinner" /> 加载中…</div>
-    <div v-else-if="novelsError" class="notice err">{{ novelsError }}</div>
+    <div
+      v-if="novelsLoading"
+      class="skeleton-stack novel-skeleton"
+      role="status"
+      aria-label="正在加载语料列表"
+      aria-busy="true"
+    >
+      <div class="skeleton-line" aria-hidden="true"></div>
+      <div class="skeleton-line" aria-hidden="true"></div>
+      <div class="skeleton-line" aria-hidden="true"></div>
+    </div>
+    <div v-else-if="novelsError" class="notice err error-with-action" role="alert">
+      <span class="error-message">{{ novelsError }}</span>
+      <button type="button" class="btn" @click="reloadNovels">重新加载</button>
+    </div>
     <div v-else-if="!novels?.length" class="empty">还没有语料，先上传一本。</div>
     <div v-else class="list">
-      <div
+      <button
         v-for="n in novels"
         :key="n.id"
-        class="list-item clickable"
+        type="button"
+        class="list-item clickable novel-item"
         :class="{ active: selected?.id === n.id }"
         @click="openChunks(n)"
       >
-        <div>
-          <strong>{{ n.title || "（无题）" }}</strong>
-          <span class="faint mono" style="margin-left: 10px">#{{ n.id }}</span>
+        <div class="novel-copy">
+          <strong class="novel-title" :title="n.title || '（无题）'">{{ n.title || "（无题）" }}</strong>
+          <span class="novel-id faint mono">#{{ n.id }}</span>
         </div>
-        <div class="row tight">
+        <div class="row tight novel-meta">
           <span class="tag">{{ n.platform || "—" }}</span>
-          <span class="faint" style="font-size: var(--fs-xs)">查看分片 →</span>
+          <span class="faint novel-action">查看分片</span>
         </div>
-      </div>
+      </button>
     </div>
   </section>
 
   <template v-if="selected">
     <section class="card">
       <div class="card-title">
-        分片 · 《{{ selected.title }}》
-        <span class="hint">{{ chunksLoading ? "加载中" : chunks.length + " 片" }}</span>
+        <span class="selection-title">分片 · 《{{ selected.title || "（无题）" }}》</span>
+        <span class="hint">
+          {{ chunksLoading ? "加载中" : chunksError ? "加载失败" : chunks.length + " 片" }}
+        </span>
       </div>
-      <div class="row" style="margin-bottom: 16px">
-        <div class="field" style="flex: 1">
-          <label>混合检索（M2）</label>
-          <input class="input" v-model="q" placeholder="输入关键词或语义，如：林夜 那道光" @keyup.enter="runSearch" />
+      <div class="row search-row">
+        <div class="field search-field">
+          <label for="corpus-search">混合检索（M2）</label>
+          <input
+            id="corpus-search"
+            v-model="q"
+            class="input"
+            placeholder="输入关键词或语义描述"
+            @keyup.enter="runSearch"
+          />
         </div>
-        <button class="btn primary" :disabled="searching || !q.trim()" @click="runSearch">
+        <button type="button" class="btn primary" :disabled="searching || !q.trim()" @click="runSearch">
           {{ searching ? "检索中…" : "检索" }}
         </button>
       </div>
 
-      <div v-if="hits" style="margin-bottom: 16px">
-        <div class="card-title" style="font-size: var(--fs-md)">检索命中 <span class="hint">RRF 融合 Top {{ hits.length }}</span></div>
-        <div class="list">
-          <div v-for="h in hits" :key="h.chunk_id" class="list-item" style="align-items: flex-start">
-            <div style="flex: 1">
-              <div class="row tight" style="margin-bottom: 6px">
+      <div v-if="searching" class="empty search-state" role="status" aria-live="polite">
+        <span class="spinner" /> 正在检索…
+      </div>
+      <div v-else-if="searchError" class="notice err error-with-action search-state" role="alert">
+        <span class="error-message">{{ searchError }}</span>
+        <button type="button" class="btn" @click="runSearch">重试检索</button>
+      </div>
+      <div v-else-if="hits" class="search-results">
+        <div class="card-title section-heading">
+          检索命中 <span class="hint">RRF 融合 · {{ hits.length }} 条</span>
+        </div>
+        <div v-if="!hits.length" class="empty">未检索到相关片段，请调整关键词后重试。</div>
+        <div v-else class="list">
+          <div v-for="h in hits" :key="h.chunk_id" class="list-item hit-item">
+            <div class="hit-content">
+              <div class="row tight hit-meta">
                 <span class="tag info">第 {{ h.chapter_no ?? "?" }} 章</span>
                 <span class="tag">idx {{ h.idx }}</span>
                 <span class="tag accent mono">score {{ h.score.toFixed(4) }}</span>
-                <span class="faint mono" style="font-size: var(--fs-xs)">bm25 {{ h.bm25.toFixed(3) }} · vec {{ h.vector.toFixed(3) }}</span>
+                <span class="faint mono hit-score">bm25 {{ h.bm25.toFixed(3) }} · vec {{ h.vector.toFixed(3) }}</span>
               </div>
-              <div class="prose" style="font-size: var(--fs-sm); max-height: 120px; overflow: auto">{{ h.text }}</div>
+              <div class="prose hit-text">{{ h.text }}</div>
             </div>
           </div>
         </div>
       </div>
 
-      <div v-if="chunksLoading" class="empty"><span class="spinner" /> 载入分片…</div>
+      <div
+        v-if="chunksLoading"
+        class="skeleton-stack chunk-skeleton"
+        role="status"
+        aria-label="正在加载分片"
+        aria-busy="true"
+      >
+        <div class="skeleton-line" aria-hidden="true"></div>
+        <div class="skeleton-line" aria-hidden="true"></div>
+        <div class="skeleton-line" aria-hidden="true"></div>
+      </div>
+      <div v-else-if="chunksError" class="notice err error-with-action" role="alert">
+        <span class="error-message">{{ chunksError }}</span>
+        <button type="button" class="btn" @click="retryChunks">重新加载分片</button>
+      </div>
+      <div v-else-if="!chunks.length" class="empty">该语料暂无分片。</div>
       <div v-else class="list">
-        <div v-for="c in chunks" :key="c.id" class="list-item" style="align-items: flex-start">
-          <div class="row tight" style="width: 120px; flex: none">
+        <div v-for="c in chunks" :key="c.id" class="list-item chunk-item">
+          <div class="row tight chunk-meta">
             <span class="tag">第 {{ c.chapter_no ?? "?" }} 章</span>
-            <span class="faint mono" style="font-size: var(--fs-xs)">#{{ c.idx }}</span>
+            <span class="faint mono chunk-index">#{{ c.idx }}</span>
           </div>
-          <div class="prose" style="font-size: var(--fs-sm); flex: 1; max-height: 90px; overflow: auto">{{ c.text }}</div>
+          <div class="prose chunk-text">{{ c.text }}</div>
         </div>
       </div>
     </section>
   </template>
 </template>
+
+<style scoped>
+.upload-row {
+  align-items: center;
+}
+.upload-notice {
+  margin-top: 16px;
+}
+.notice {
+  overflow-wrap: anywhere;
+}
+.error-with-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--gap-md);
+}
+.error-message {
+  flex: 1 1 240px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.novel-skeleton .skeleton-line {
+  width: 100%;
+  height: 44px;
+}
+.novel-item {
+  appearance: none;
+  width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.novel-item:last-child {
+  border-bottom: 0;
+}
+.novel-item:hover {
+  background: var(--bg-sunken);
+}
+.novel-item.active {
+  background: var(--accent-soft);
+}
+.novel-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.novel-copy {
+  flex: 1;
+  min-width: 0;
+}
+.novel-title {
+  overflow-wrap: anywhere;
+}
+.novel-id {
+  margin-left: 10px;
+  white-space: nowrap;
+}
+.novel-meta {
+  flex: none;
+  max-width: 100%;
+}
+.novel-meta .tag {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.novel-action {
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.selection-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.card-title .hint {
+  flex: none;
+}
+.search-row {
+  margin-bottom: 16px;
+}
+.search-field {
+  flex: 1;
+  min-width: min(260px, 100%);
+}
+.search-state,
+.search-results {
+  margin-bottom: 16px;
+}
+.section-heading {
+  font-size: var(--fs-md);
+}
+.hit-item {
+  align-items: flex-start;
+}
+.hit-content {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+}
+.hit-meta {
+  align-items: center;
+  min-width: 0;
+  margin-bottom: 6px;
+}
+.hit-score {
+  min-width: 0;
+  font-size: var(--fs-xs);
+  overflow-wrap: anywhere;
+}
+.hit-text,
+.chunk-text {
+  min-width: 0;
+  max-width: 100%;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-size: var(--fs-sm);
+}
+.hit-text {
+  max-height: 120px;
+}
+.chunk-skeleton .skeleton-line {
+  width: 100%;
+  height: 64px;
+}
+.chunk-item {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.chunk-meta {
+  flex: 0 0 120px;
+  align-items: center;
+  max-width: 100%;
+}
+.chunk-index {
+  font-size: var(--fs-xs);
+}
+.chunk-text {
+  flex: 1 1 280px;
+  max-height: 90px;
+}
+</style>

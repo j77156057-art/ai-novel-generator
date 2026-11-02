@@ -15,11 +15,13 @@ const router = useRouter();
 const loading = ref(true);
 const error = ref<string | null>(null);
 
-onMounted(async () => {
+async function resolveAssistant() {
+  loading.value = true;
+  error.value = null;
   try {
     const projects = await api.listProjects();
     if (!projects.length) {
-      router.replace("/projects");
+      await router.replace("/projects");
       return;
     }
     // 返回按 id 倒序（最近创建在前）。最近建的往往是还没挂语料的空壳项目，
@@ -29,33 +31,64 @@ onMounted(async () => {
       (p) => (p.reference_novel_ids?.length ?? 0) > 0,
     );
     const target = withCorpus[0] ?? projects[0];
-    router.replace(`/projects/${target.id}/assistant`);
+    await router.replace(`/projects/${target.id}/assistant`);
   } catch {
     loading.value = false;
-    error.value = "加载项目失败，无法进入助手。请确认后端已启动后重试。";
+    error.value = "项目加载或页面跳转失败，暂时无法进入助手。请确认后端已启动后重试。";
   }
-});
+}
+
+onMounted(resolveAssistant);
 </script>
 
 <template>
   <div class="assistant-resolver">
-    <div v-if="loading" class="hint">正在进入助手工作台…</div>
-    <div v-else-if="error" class="hint error">{{ error }}</div>
+    <div
+      v-if="loading"
+      class="state-panel resolver-panel"
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+    >
+      <div class="skeleton-stack" aria-hidden="true">
+        <div class="skeleton-line resolver-skeleton-title"></div>
+        <div class="skeleton-line"></div>
+      </div>
+      <h1 class="state-title">正在进入助手工作台</h1>
+      <p class="state-description">正在加载项目并选择合适的对话上下文。</p>
+    </div>
+    <div v-else-if="error" class="state-panel resolver-panel" role="alert">
+      <h1 class="state-title">暂时无法进入助手</h1>
+      <p class="state-description">{{ error }}</p>
+      <div class="state-actions">
+        <button type="button" class="btn primary" @click="resolveAssistant">重试</button>
+      </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .assistant-resolver {
   height: 100%;
+  min-height: 240px;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 24px;
 }
-.hint {
-  color: var(--fg-muted);
-  font-size: var(--fs-sm);
+.resolver-panel {
+  width: min(440px, 100%);
+  text-align: center;
 }
-.hint.error {
-  color: var(--danger, #d9534f);
+.resolver-panel .skeleton-stack {
+  margin-bottom: var(--gap-lg);
+}
+.resolver-panel .state-actions {
+  justify-content: center;
+}
+.resolver-skeleton-title {
+  width: 60%;
+  margin-right: auto;
+  margin-left: auto;
 }
 </style>

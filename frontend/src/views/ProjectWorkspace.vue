@@ -24,8 +24,22 @@ const router = useRouter();
 const projectId = Number(route.params.id);
 
 const project = ref<ProjectOut | null>(null);
+const projectLoading = ref(true);
 const loadError = ref<string | null>(null);
+const actionNotice = ref<{ kind: "ok" | "err"; text: string } | null>(null);
 const novels = ref<NovelOut[]>([]);
+const novelsError = ref<string | null>(null);
+
+function errorText(err: unknown) {
+  if (err instanceof TypeError && /fetch/i.test(err.message)) {
+    return "无法连接服务，请检查网络连接或后端启动状态。";
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+function showActionError(action: string, err: unknown) {
+  actionNotice.value = { kind: "err", text: `${action}：${errorText(err)}` };
+}
 
 // 当前生效的 LLM 渠道（工作台徽标，点击去模型设置）
 const llmConfig = ref<LlmConfig | null>(null);
@@ -165,6 +179,7 @@ function startEditTitle() {
   editingTitle.value = true;
 }
 async function saveTitle() {
+  actionNotice.value = null;
   if (!project.value) return;
   const t = titleDraft.value.trim();
   editingTitle.value = false;
@@ -172,7 +187,7 @@ async function saveTitle() {
   try {
     project.value = await api.patchProject(projectId, { title: t });
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    showActionError("标题保存失败", err);
   }
 }
 
@@ -182,7 +197,19 @@ const streaming = ref(false);
 const streamedText = ref("");
 const liveBox = ref<HTMLElement | null>(null);
 const generations = ref<{ id: number; segment_no: number; text: string | null }[]>([]);
+const generationsLoading = ref(false);
+const generationsError = ref<string | null>(null);
 const lastText = ref<string | null>(null);
+const latestGeneration = computed(() => generations.value[generations.value.length - 1] ?? null);
+const previewText = computed(() => {
+  if (streaming.value) return streamedText.value;
+  return lastText.value || latestGeneration.value?.text || "";
+});
+const previewTitle = computed(() => {
+  if (streaming.value) return "正在生成的正文";
+  if (lastText.value) return "本次生成内容";
+  return latestGeneration.value ? `第 ${latestGeneration.value.segment_no} 段` : "等待第一段正文";
+});
 
 // 阅读区展开/收起（默认给足高度，长文可一键全展开，不再被小框憋住）
 const expandLive = ref(false);
@@ -212,12 +239,13 @@ const regenState = ref<Record<number, { text: string; loading: boolean }>>({});
 // 标记完成（#25 保存）
 const completed = computed(() => project.value?.status === "completed");
 async function toggleComplete() {
+  actionNotice.value = null;
   if (!project.value) return;
   const next = completed.value ? "generating" : "completed";
   try {
     project.value = await api.patchProject(projectId, { status: next });
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    showActionError("项目状态保存失败", err);
   }
 }
 
@@ -250,19 +278,23 @@ async function loadProject() {
     generationLength.value = project.value.generation_length || 3000;
     bible.value = (project.value.plot_bible as PlotBible) || null;
   } catch (err) {
-    loadError.value = err instanceof Error ? err.message : String(err);
+    loadError.value = errorText(err);
   }
 }
 
 async function loadNovels() {
+  novelsError.value = null;
   try {
     novels.value = await api.listNovels();
-  } catch {
+  } catch (err) {
     novels.value = [];
+    novelsError.value = errorText(err);
   }
 }
 
 async function loadGenerations() {
+  generationsLoading.value = true;
+  generationsError.value = null;
   try {
     const gens = await api.listGenerations(projectId);
     generations.value = gens.map((g) => ({
@@ -271,8 +303,10 @@ async function loadGenerations() {
       text: g.text,
     }));
     if (page.value > totalPages.value) page.value = totalPages.value;
-  } catch {
-    generations.value = [];
+  } catch (err) {
+    generationsError.value = errorText(err);
+  } finally {
+    generationsLoading.value = false;
   }
 }
 
@@ -775,6 +809,7 @@ async function savePremise() {
 
 // —— 步骤 5：构思 ——
 async function runAsk() {
+  actionNotice.value = null;
   asking.value = true;
   questions.value = [];
   questionNote.value = null;
@@ -784,12 +819,13 @@ async function runAsk() {
     questions.value = r.questions || [];
     questionNote.value = r.note || null;
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    showActionError("专家问题生成失败", err);
   } finally {
     asking.value = false;
   }
 }
 async function buildBible() {
+  actionNotice.value = null;
   buildingBible.value = true;
   try {
     if (project.value?.mode) await patch({ mode: project.value.mode });
@@ -799,7 +835,7 @@ async function buildBible() {
     await patch({ plot_bible: b, status: "planned" });
     goStep(6);
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    showActionError("剧情构思失败", err);
   } finally {
     buildingBible.value = false;
   }
@@ -815,6 +851,7 @@ function followLiveBox() {
 }
 
 async function runGenerate() {
+  actionNotice.value = null;
   streaming.value = true;
   streamedText.value = "";
   lastText.value = "";
@@ -845,13 +882,14 @@ async function runGenerate() {
       );
     }
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    showActionError("正文生成失败", err);
   } finally {
     streaming.value = false;
   }
 }
 
 async function runRegenerate(g: { id: number; segment_no: number }) {
+  actionNotice.value = null;
   regenState.value[g.id] = { text: "", loading: true };
   genKgMsg.value = null; // 同上：本轮重生成的簿记结果覆盖上一轮提示
   genKgLevel.value = "";
@@ -874,17 +912,19 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
       },
     );
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    showActionError("段落重新生成失败", err);
   } finally {
     if (regenState.value[g.id]) regenState.value[g.id].loading = false;
   }
 }
 
 async function runExport() {
+  actionNotice.value = null;
   try {
     await api.exportTxt(projectId, project.value?.title || "novel");
+    actionNotice.value = { kind: "ok", text: "正文导出已开始，请在浏览器下载记录中查看。" };
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    showActionError("正文导出失败", err);
   }
 }
 
@@ -1459,57 +1499,60 @@ async function loadGraph() {
   }
 }
 
-onMounted(async () => {
-  await Promise.all([loadProject(), loadNovels(), loadTiers()]);
-  kgSourceOptions.value = buildSourceOptions();
-  await loadGenerations();
-  restoreStep(); // 续接上次进度，不再每次回到步骤①
-  // 前情预检：**进工作台就拉一次**，让折叠头直接带信号。
-  // 只在已有段落时才拉——空项目没有前情可看，白跑一次 RAG。
-  // 必须提前拉的原因：面板的价值在于「有洞/退化时你还没点开就看得见」；
-  // 若要等用户点开才发现，就等于把最该暴露的失败藏在了交互后面。
-  // 代价可控：generate-plan 只组装上下文，不调用 LLM。
-  if (generations.value.length) void loadPlan();
-  // 哨兵告警：进工作台就拉，理由同上 —— 硬冲突要「还没读到那一段就看得见」
-  void loadAlerts();
-  // 蒸馏进度恢复：离开页面再回来不能丢进度（后台任务在服务端照跑）。
-  void resumeDistillJob();
-  // 蒸馏库列表：进工作台就拉，应用面板才有东西可选。
-  void loadStyleDistills();
-  // 模型徽标：失败静默（不影响主流程）
+async function initialize() {
+  projectLoading.value = true;
+  loadError.value = null;
   try {
-    llmConfig.value = await api.getLlmConfig();
-  } catch {
-    /* 忽略：徽标缺失不阻塞工作台 */
+    await Promise.all([loadProject(), loadNovels(), loadTiers()]);
+    if (!project.value) return;
+    kgSourceOptions.value = buildSourceOptions();
+    await loadGenerations();
+    restoreStep();
+    if (generations.value.length) void loadPlan();
+    void loadAlerts();
+    void resumeDistillJob();
+    void loadStyleDistills();
+    void api.getLlmConfig()
+      .then((config) => { llmConfig.value = config; })
+      .catch(() => { /* 模型徽标缺失不阻塞工作台。 */ });
+  } finally {
+    projectLoading.value = false;
   }
-});
+}
+
+onMounted(initialize);
 
 // 轮询定时器必须在组件销毁时清掉，否则会对着已卸载的组件继续写 ref。
 onUnmounted(stopDistillPolling);
 </script>
 
 <template>
-  <header class="page-head">
-    <div class="eyebrow">02 · Workspace</div>
+  <header class="page-head workspace-head">
+    <div class="eyebrow">Project workspace</div>
     <div class="title-block">
       <template v-if="editingTitle">
         <input
           class="input title-input"
           v-model="titleDraft"
+          maxlength="120"
+          aria-label="项目名称"
           @keyup.enter="saveTitle"
           @blur="saveTitle"
         />
       </template>
       <template v-else>
         <h1 class="title-click" @click="startEditTitle">
-          {{ project?.title ?? "项目 #" + projectId }}
+          {{ project?.title ?? (projectLoading ? "正在加载项目" : "项目 #" + projectId) }}
         </h1>
-        <button class="link-btn" @click="startEditTitle">重命名</button>
+        <button v-if="project" class="link-btn" @click="startEditTitle">重命名</button>
       </template>
-      <span v-if="completed" class="tag ok">已完成</span>
-      <span v-else class="tag">创作中</span>
-      <span
+      <template v-if="project">
+        <span v-if="completed" class="tag ok">已完成</span>
+        <span v-else class="tag">创作中</span>
+      </template>
+      <button
         v-if="llmConfig"
+        type="button"
         class="tag model-badge"
         :class="llmConfig.effective.is_fallback ? 'warn' : 'info'"
         title="当前生效的生成模型，点击去设置"
@@ -1517,25 +1560,35 @@ onUnmounted(stopDistillPolling);
       >
         {{ llmConfig.effective.is_fallback ? "本地兜底" : llmConfig.effective.label }} ·
         <span class="mono">{{ llmConfig.effective.model }}</span>
-      </span>
+      </button>
     </div>
-    <p>
-      向导式创作：选参考语料（可跳过→自由生成）→ 类型 → 风格 → 内容 → 构思 → 生成。
-      知识图谱只在生成后出现，且按「参考语料 / 生成后」各自成图，绝不混在一起。
-    </p>
-    <div class="row" style="margin-top: 10px">
+    <p>按步骤完善参考语料、类型、风格与剧情设定，再生成正文并检查知识图谱。</p>
+    <div v-if="project" class="row workspace-actions">
       <button class="btn" :class="completed ? '' : 'primary'" @click="toggleComplete">
         {{ completed ? "重新开启创作" : "保存并标记完成" }}
       </button>
-      <!-- 助手已独立成页（/projects/:id/assistant）：这里只留入口，七步向导一行不动 -->
-      <button class="btn" @click="router.push(`/projects/${projectId}/assistant`)">
-        打开助手工作台 →
-      </button>
+      <button class="btn" @click="router.push(`/projects/${projectId}/assistant`)">打开助手工作台</button>
     </div>
   </header>
 
-  <div v-if="loadError" class="notice err">{{ loadError }}</div>
+  <div v-if="actionNotice" class="notice action-notice" :class="actionNotice.kind" :role="actionNotice.kind === 'err' ? 'alert' : 'status'">
+    <span>{{ actionNotice.text }}</span>
+    <button class="link-btn" @click="actionNotice = null">关闭</button>
+  </div>
 
+  <div v-if="projectLoading" class="card workspace-loading" aria-label="正在加载项目" aria-busy="true">
+    <span class="skeleton-line loading-title" />
+    <div class="skeleton-stack"><span v-for="i in 5" :key="i" class="skeleton-line" /></div>
+  </div>
+  <div v-else-if="loadError" class="state-panel" role="alert">
+    <strong class="state-title">项目加载失败</strong>
+    <span class="state-description">{{ loadError }}</span>
+    <div class="state-actions">
+      <button class="btn primary" @click="initialize">重新加载</button>
+      <button class="btn" @click="router.push('/projects')">返回项目列表</button>
+    </div>
+  </div>
+  <template v-else>
   <!-- 步骤指示器 -->
   <div class="stepper">
     <button
@@ -1579,8 +1632,12 @@ onUnmounted(stopDistillPolling);
       选中哪些，生成时<strong>只</strong>抽取这些语料的风格；不选则完全自由生成，不会混入任何语料。
       每本语料后续会建成<strong>各自独立</strong>的图谱。
     </p>
-    <div v-if="!novels.length" class="empty">语料库为空，可跳过本步。</div>
-    <div class="chips">
+    <div v-if="novelsError" class="notice err inline-retry" role="alert">
+      <span>语料列表加载失败：{{ novelsError }}</span>
+      <button class="link-btn" @click="loadNovels">重试</button>
+    </div>
+    <div v-else-if="!novels.length" class="empty">语料库为空，可跳过本步。</div>
+    <div v-if="novels.length" class="chips">
       <button
         v-for="n in novels"
         :key="n.id"
@@ -2012,46 +2069,82 @@ onUnmounted(stopDistillPolling);
   </section>
 
   <!-- ============ 步骤 6：生成控制台 ============ -->
-  <section v-else-if="step === 6" class="card">
-    <div class="card-title">⑥ 生成控制台</div>
-    <div class="row" style="align-items: flex-start">
-      <div class="field" style="width: 200px">
-        <label>单次生成字数（长文单段，避免多段压缩）</label>
-        <input class="input" type="number" min="500" step="500" v-model.number="generationLength" />
-      </div>
-      <div class="field" style="width: 160px">
-        <label>一次生成段数</label>
-        <select class="input" v-model.number="chaptersPerGen">
-          <option :value="1">1 段</option>
-          <option :value="2">2 段</option>
-          <option :value="3">3 段</option>
-          <option :value="5">5 段</option>
-        </select>
-      </div>
-      <div class="field" style="flex: 1; min-width: 220px">
-        <label>本段参考语料</label>
-        <div class="ref-summary">
-          <span v-if="!selectedRefs.length" class="tag">自由生成（无参考）</span>
-          <span v-for="nid in selectedRefs" :key="nid" class="tag accent">
-            {{ novels.find((x) => x.id === nid)?.title || nid }}
-          </span>
+  <section v-else-if="step === 6" class="generation-console">
+    <div class="generation-heading">
+      <div><span class="section-kicker">Production & proof</span><h2>生成与校样</h2></div>
+      <span class="edition-mark">已归档 {{ generations.length }} 段</span>
+    </div>
+    <div class="production-grid">
+      <div class="production-controls">
+        <span class="control-kicker">印刷控制</span>
+        <div class="generation-fields">
+          <div class="field">
+            <label for="generation-length">单段字数</label>
+            <input id="generation-length" class="input" type="number" min="500" step="500" v-model.number="generationLength" />
+          </div>
+          <div class="field">
+            <label for="chapters-per-gen">生成段数</label>
+            <select id="chapters-per-gen" class="input" v-model.number="chaptersPerGen">
+              <option :value="1">1 段</option>
+              <option :value="2">2 段</option>
+              <option :value="3">3 段</option>
+              <option :value="5">5 段</option>
+            </select>
+          </div>
         </div>
+        <div class="field reference-field">
+          <label>本段参考语料</label>
+          <div class="ref-summary">
+            <span v-if="!selectedRefs.length" class="tag">自由生成（无参考）</span>
+            <span v-for="nid in selectedRefs" :key="nid" class="tag accent">
+              {{ novels.find((x) => x.id === nid)?.title || nid }}
+            </span>
+          </div>
+        </div>
+        <div class="generation-actions">
+          <button class="btn primary" :disabled="streaming" @click="runGenerate">
+            {{ streaming ? "正在续写" : `生成 ${chaptersPerGen} 段` }}
+          </button>
+          <button class="btn" :disabled="!generations.length" @click="runExport">导出 txt</button>
+        </div>
+        <button class="btn ghost back-step" @click="goStep(5)">返回剧情构思</button>
+        <div v-if="genKgMsg" :class="['notice', genKgLevel || 'info']" class="generation-notice">{{ genKgMsg }}</div>
       </div>
-    </div>
-    <div class="row" style="margin-top: var(--gap)">
-      <button class="btn ghost" @click="goStep(5)">← 上一步</button>
-      <button class="btn primary" :disabled="streaming" @click="runGenerate">
-        {{ streaming ? "续写中…" : `生成 ${chaptersPerGen} 段` }}
-      </button>
-      <button class="btn" :disabled="!generations.length" @click="runExport">导出 txt</button>
-    </div>
 
-    <!-- 生成 / 重生成的 KG 簿记结果：就地在动作发生的那一步暴露，不留到第 7 步 -->
-    <div
-      v-if="genKgMsg"
-      :class="['notice', genKgLevel || 'info']"
-      style="margin-top: var(--gap)"
-    >{{ genKgMsg }}</div>
+      <section class="manuscript-stage" :class="{ streaming }" aria-labelledby="proof-title">
+        <header class="proof-head">
+          <div>
+            <span class="proof-kicker">正文校样</span>
+            <h3 id="proof-title">{{ previewTitle }}</h3>
+          </div>
+          <div class="proof-tools">
+            <span class="proof-count">{{ previewText.length }} 字</span>
+            <button v-if="previewText" class="btn sm" @click="expandLive = !expandLive">
+              {{ expandLive ? "收起校样" : "展开全文" }}
+            </button>
+          </div>
+        </header>
+        <div v-if="streaming" class="proof-status" role="status">
+          <span class="proof-status-dot" aria-hidden="true" />
+          正在接收第 {{ Math.min(batchCount + 1, chaptersPerGen) }} / {{ chaptersPerGen }} 段，已写入 {{ streamedText.length }} 字
+        </div>
+        <div
+          v-if="previewText"
+          ref="liveBox"
+          class="prose live-box proof-text"
+          :class="{ expanded: expandLive }"
+        >{{ previewText }}</div>
+        <div v-else class="proof-empty">
+          <strong>尚无正文校样</strong>
+          <p>生成第一段后，正文会在这里按阅读版式呈现。</p>
+          <button class="btn sm" :disabled="streaming" @click="runGenerate">生成第一段</button>
+        </div>
+        <footer v-if="previewText" class="proof-foot">
+          <span>当前项目正文</span>
+          <span>{{ expandLive ? "完整校样" : "滚动阅读" }}</span>
+        </footer>
+      </section>
+    </div>
 
     <!-- 生成 / 重生成的质量回执：后端早就下发了，这里才第一次露面。
          三种信号各占一条、各自分级，不合并——「已替你改过」和「该你决定了」
@@ -2314,24 +2407,6 @@ onUnmounted(stopDistillPolling);
       </div>
     </div>
 
-    <div v-if="streaming || lastText" class="card" style="margin-top: var(--gap); box-shadow: none">
-      <div class="card-title" style="font-size: var(--fs-md)">
-        本次生成内容
-        <span v-if="streaming" class="hint">
-          正在生成… 已 {{ streamedText.length }} 字（第 {{ batchCount }}/{{ chaptersPerGen }} 段）
-        </span>
-        <span v-else class="hint">{{ (lastText || "").length }} 字</span>
-        <button class="btn sm" style="margin-left: 10px" @click="expandLive = !expandLive">
-          {{ expandLive ? "收起" : "展开全文" }}
-        </button>
-      </div>
-      <div
-        ref="liveBox"
-        class="prose live-box"
-        :class="{ expanded: expandLive }"
-      >{{ streaming ? streamedText : lastText }}</div>
-    </div>
-
     <!-- 规则哨兵告警：只标红，不改正文。
          放在段落列表上方，是因为它是「读到那一段之前就该知道」的信号：
          死人又说话了、境界倒回去了 —— 这类硬伤埋在正文里读者才不管你写得多好。
@@ -2375,7 +2450,7 @@ onUnmounted(stopDistillPolling);
     </div>
 
     <!-- 已生成段落：分页 + 单段重生成 -->
-    <div class="card" style="margin-top: var(--gap); box-shadow: none">
+    <div class="card generation-history" style="margin-top: var(--gap); box-shadow: none">
       <div class="card-title" style="font-size: var(--fs-md)">
         已生成段落 <span class="hint">{{ generations.length }} 段</span>
       </div>
@@ -2392,12 +2467,17 @@ onUnmounted(stopDistillPolling);
         <button class="btn sm" :disabled="page >= totalPages" @click="page++">下一页 →</button>
       </div>
 
-      <div v-if="!generations.length" class="empty">还没有生成记录，点「生成一段」开始。</div>
-      <div class="list">
+      <div v-if="generationsLoading && !generations.length" class="empty"><span class="spinner" /> 正在读取生成记录</div>
+      <div v-else-if="generationsError" class="notice err inline-retry" role="alert">
+        <span>生成记录读取失败：{{ generationsError }}</span>
+        <button class="link-btn" @click="loadGenerations">重试</button>
+      </div>
+      <div v-else-if="!generations.length" class="empty">还没有生成记录，点击上方生成按钮开始。</div>
+      <div v-if="generations.length" class="list">
         <div
           v-for="g in pagedGens"
           :key="g.id"
-          class="list-item"
+          class="list-item segment-entry"
           style="align-items: flex-start; flex-direction: column; gap: 8px"
         >
           <div class="row tight" style="width: 100%">
@@ -2485,6 +2565,7 @@ onUnmounted(stopDistillPolling);
       <button class="btn ghost" @click="goStep(6)">← 返回生成</button>
     </div>
   </section>
+  </template>
 </template>
 
 <style scoped>
@@ -2495,6 +2576,7 @@ onUnmounted(stopDistillPolling);
   flex-wrap: wrap;
 }
 .model-badge {
+  font: inherit;
   cursor: pointer;
   transition: border-color 0.15s ease;
 }
@@ -2502,18 +2584,27 @@ onUnmounted(stopDistillPolling);
   border-color: var(--accent);
 }
 .title-input {
-  font-size: var(--fs-2xl);
-  font-weight: 800;
-  padding: 4px 10px;
-  min-width: 320px;
+  width: min(100%, 560px);
+  min-width: min(320px, 100%);
+  font-size: var(--fs-xl);
+  font-weight: 650;
+  padding: 5px 10px;
 }
 .title-click {
+  min-width: 0;
   cursor: pointer;
+  overflow-wrap: anywhere;
 }
-.title-click:hover {
-  color: var(--accent-ink);
-  text-decoration: underline dotted;
-}
+.title-click:hover { color: var(--accent-ink); }
+.workspace-head { padding-bottom: 22px; border-bottom: 1px solid var(--border-strong); }
+.workspace-head .title-click { font-size: 38px; }
+.workspace-actions { align-items: center; margin-top: 14px; }
+.action-notice { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.action-notice .link-btn { flex: none; color: inherit; }
+.inline-retry { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.inline-retry .link-btn { flex: none; color: inherit; }
+.workspace-loading { min-height: 300px; }
+.workspace-loading .loading-title { width: 34%; height: 22px; margin-bottom: 28px; }
 /* .link-btn 统一走全局 style/base.css（本文件原先那份副本已删除）。
    「重命名」按钮挂在 .title-block（align-items:center）里，不需要 align-self 修正。 */
 /* 强制重蒸馏勾选项：与 .row 同高、可点击、文字不换行 */
@@ -2536,51 +2627,51 @@ onUnmounted(stopDistillPolling);
 }
 .stepper {
   display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-bottom: var(--gap-lg);
+  gap: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  margin-bottom: 28px;
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
 }
 .step {
+  min-width: 108px;
+  flex: 1;
+  justify-content: center;
   font: inherit;
   font-size: var(--fs-xs);
   font-weight: 600;
-  padding: 7px 12px;
-  border-radius: var(--radius-full);
-  border: var(--border-w) solid var(--border);
-  background: var(--bg-elev);
+  padding: 12px 8px 11px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
   color: var(--fg-muted);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  white-space: nowrap;
+  transition: color 160ms var(--ease-out-quart), border-color 160ms var(--ease-out-quart);
 }
-.step:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
+.step:hover:not(:disabled) { color: var(--accent-ink); }
+.step:disabled { opacity: 0.42; cursor: not-allowed; }
 .step .num {
   display: inline-flex;
-  width: 18px;
-  height: 18px;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-full);
-  background: var(--bg-sunken);
-  font-family: var(--font-mono);
+  font-family: Georgia, serif;
+  font-size: 18px;
+  font-weight: 400;
+  line-height: 1;
+  flex: none;
 }
 .step.active {
-  background: var(--accent);
-  color: var(--accent-fg);
-  border-color: var(--accent);
-}
-.step.active .num {
-  background: rgba(255, 255, 255, 0.25);
-  color: var(--accent-fg);
-}
-.step.done .num {
-  background: var(--accent-soft);
   color: var(--accent-ink);
+  border-bottom-color: var(--accent);
+  margin-bottom: -1px;
 }
+.step.active .num { color: var(--accent); }
+.step.done .num { color: var(--fg); }
 /* ---------- 蒸馏进度（跨步骤常驻） ---------- */
 /* 步骤①上的小徽标：蒸馏在后台跑时，用户跳到别的步骤也能一眼看到
    「还在跑」。**文字在前**（"蒸馏中"），圆点只是冗余强化 —— 灰度/色弱下
@@ -2599,9 +2690,9 @@ onUnmounted(stopDistillPolling);
   padding: 0 7px;
 }
 .step.active .step-distill {
-  color: var(--accent-fg);
-  background: rgba(255, 255, 255, 0.25);
-  border-color: rgba(255, 255, 255, 0.4);
+  color: var(--accent-ink);
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
 }
 .step-dot {
   width: 6px;
@@ -2870,6 +2961,41 @@ onUnmounted(stopDistillPolling);
   gap: 6px;
   padding-top: var(--gap-sm);
 }
+/* ---------- 生成与正文校样 ---------- */
+.generation-console { min-width: 0; }
+.generation-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; padding: 16px 0 18px; border-top: 2px solid var(--fg); }
+.section-kicker, .control-kicker, .proof-kicker { color: var(--accent-ink); font-size: 10px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
+.generation-heading h2 { margin-top: 4px; font-family: var(--font-display); font-size: 28px; font-weight: 600; }
+.edition-mark { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; }
+.production-grid { display: grid; grid-template-columns: 282px minmax(0, 1fr); gap: 24px; align-items: start; }
+.production-controls { min-width: 0; padding: 20px; border: 1px solid var(--border); border-top: 2px solid var(--accent); background: var(--bg-elev); }
+.generation-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 18px; }
+.reference-field { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.generation-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; margin-top: 22px; }
+.back-step { margin-top: 8px; padding-left: 0; }
+.generation-notice { margin-top: 16px; }
+.manuscript-stage { position: relative; min-width: 0; min-height: 520px; display: flex; flex-direction: column; border: 1px solid var(--border-strong); border-top: 3px solid var(--accent); background: var(--bg-elev); transition: border-color 220ms var(--ease-out-quart); }
+.manuscript-stage::before { content: ""; position: absolute; top: 104px; bottom: 48px; left: 22px; width: 1px; background: var(--accent-line); }
+.manuscript-stage.streaming { border-color: var(--accent-line); }
+.proof-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 20px 24px 16px; border-bottom: 1px solid var(--border); }
+.proof-head h3 { margin-top: 4px; font-family: var(--font-display); font-size: 25px; font-weight: 600; }
+.proof-tools { display: flex; align-items: center; gap: 12px; }
+.proof-count { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
+.proof-status { display: flex; align-items: center; gap: 8px; padding: 9px 24px; border-bottom: 1px solid var(--accent-line); background: var(--accent-soft); color: var(--accent-ink); font-size: var(--fs-xs); }
+.proof-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: proof-pulse 1.4s ease-in-out infinite; }
+.manuscript-stage .proof-text { flex: 1; width: 100%; max-width: 76ch; max-height: min(62vh, 680px); padding: 26px 32px 32px 46px; background: transparent; border-radius: 0; font-size: 17px; line-height: 2.1; letter-spacing: .015em; }
+.proof-empty { flex: 1; min-height: 330px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 32px; text-align: center; }
+.proof-empty strong { font-family: var(--font-display); font-size: 24px; }
+.proof-empty p { margin: 0 0 8px; color: var(--fg-muted); font-size: var(--fs-sm); }
+.proof-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: auto; padding: 10px 24px; border-top: 1px solid var(--border); color: var(--fg-faint); font-size: 10px; letter-spacing: .08em; }
+.generation-history { border-top: 2px solid var(--fg); }
+.generation-history .segment-entry { padding: 20px 0; }
+.generation-history .seg-text { padding: 18px 0; border-top: 1px solid var(--border); border-radius: 0; background: transparent; }
+@keyframes proof-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+@media (max-width: 1050px) { .production-grid { grid-template-columns: 248px minmax(0, 1fr); gap: 18px; } }
+@media (max-width: 900px) { .production-grid { grid-template-columns: 1fr; } .production-controls { max-width: none; } }
+@media (prefers-reduced-motion: reduce) { .proof-status-dot { animation: none; } }
+
 .live-box {
   /* 阅读区默认给足高度（随视口自适应），长文不再被 360px 小框憋住 */
   max-height: min(62vh, 820px);
@@ -3095,6 +3221,7 @@ onUnmounted(stopDistillPolling);
   padding: 8px 10px 8px 0;
   border-bottom: var(--border-w) solid var(--border);
   vertical-align: top;
+  overflow-wrap: anywhere;
 }
 .prior-table tr:last-child td {
   border-bottom: none;
@@ -3207,12 +3334,16 @@ onUnmounted(stopDistillPolling);
 }
 
 @media (max-width: 720px) {
-  .grid-2 {
-    grid-template-columns: 1fr;
-  }
+  .grid-2 { grid-template-columns: 1fr; }
+  .step { flex: 0 0 108px; }
+  .title-input { min-width: 0; }
+  .action-notice { align-items: flex-start; }
+  .generation-heading { align-items: flex-start; flex-direction: column; }
+  .proof-head { flex-direction: column; }
+  .proof-tools { width: 100%; justify-content: space-between; }
+  .manuscript-stage::before { display: none; }
+  .manuscript-stage .proof-text { padding: 22px; }
   .prior-table td:last-child,
-  .prior-table th:last-child {
-    display: none;
-  }
+  .prior-table th:last-child { display: none; }
 }
 </style>

@@ -735,7 +735,10 @@ onMounted(async () => {
 
 <style scoped>
 .assistant {
-  margin-top: var(--gap);
+  margin-top: 4px;
+  padding: 24px;
+  border-color: var(--border);
+  box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
   gap: var(--gap);
@@ -747,9 +750,10 @@ onMounted(async () => {
   flex-wrap: wrap;
 }
 .asst-head h1 {
-  font-family: var(--font-serif);
-  font-size: var(--fs-2xl);
-  margin-top: 4px;
+  font-family: var(--font-sans);
+  font-size: 27px;
+  letter-spacing: -.04em;
+  margin-top: 6px;
 }
 .back-link {
   font-size: var(--fs-sm);
@@ -783,9 +787,10 @@ onMounted(async () => {
   flex-direction: column;
   gap: var(--gap-sm);
   padding: var(--gap);
-  border: 1px dashed var(--border-strong);
+  border: 1px solid var(--accent-line);
   border-radius: var(--radius-md);
   color: var(--fg-muted);
+  background: var(--accent-soft);
 }
 .stream-hint p {
   margin: 0;
@@ -807,13 +812,14 @@ onMounted(async () => {
   align-self: flex-end;
   max-width: 85%;
   background: var(--accent);
+  box-shadow: 0 4px 10px rgba(65,106,117,.17);
   color: var(--accent-fg);
   white-space: pre-wrap;
 }
 .bubble.assistant {
   align-self: stretch;
   border: var(--border-w) solid var(--border);
-  background: var(--bg-sunken);
+  background: var(--bg-elev);
 }
 .loading-line {
   color: var(--fg-faint);
@@ -930,9 +936,11 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: var(--gap-sm);
-  padding-top: var(--gap);
+  padding-top: 18px;
   border-top: 1px solid var(--border-strong);
 }
+.composer .input { background: var(--bg-elev); border-color: var(--border-strong); min-height: 84px; }
+.composer .input::placeholder { color: var(--fg-faint); }
 @media (max-width: 720px) {
   .meta-grid {
     grid-template-columns: 1fr;

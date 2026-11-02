@@ -18,6 +18,7 @@ const finished = computed(() =>
 
 async function refresh() {
   loading.value = true;
+  error.value = null;
   try {
     projects.value = await api.listProjects();
   } catch (err) {
@@ -46,71 +47,95 @@ function goCreate() {
     </p>
   </header>
 
-  <div v-if="error" class="notice err">{{ error }}</div>
-
-  <!-- 新建入口 -->
-  <button class="create-card" @click="goCreate">
-    <span class="plus">＋</span>
-    <span>新建一部小说</span>
+  <button type="button" class="create-card" @click="goCreate">
+    新建一部小说
   </button>
 
-  <!-- 正在创作 -->
-  <section class="card">
-    <div class="card-title">
-      正在创作 <span class="hint">{{ inProgress.length }} 部</span>
+  <div
+    v-if="loading"
+    class="card state-panel loading-panel"
+    role="status"
+    aria-live="polite"
+    aria-busy="true"
+  >
+    <div class="skeleton-stack" aria-hidden="true">
+      <div class="skeleton-line skeleton-heading"></div>
+      <div class="skeleton-line"></div>
+      <div class="skeleton-line skeleton-short"></div>
     </div>
-    <div v-if="loading" class="empty"><span class="spinner" /> 加载中…</div>
-    <div v-else-if="!inProgress.length" class="empty">还没有进行中的小说。</div>
-    <div v-else class="list">
-      <div
-        v-for="p in inProgress"
-        :key="p.id"
-        class="list-item"
-        style="cursor: pointer"
-        @click="openProject(p.id)"
-      >
-        <div class="row tight" style="flex: 1; flex-wrap: wrap">
-          <strong>{{ p.title }}</strong>
-          <span class="faint mono" style="font-size: var(--fs-xs)">#{{ p.id }}</span>
-          <span class="tag" :class="p.mode === 'expert' ? 'info' : ''">{{ p.mode }}</span>
-          <span v-if="p.genre" class="tag">{{ p.genre }}</span>
-          <span v-if="p.style" class="tag accent">{{ p.style }}</span>
-          <span class="tag warn">创作中</span>
-          <span class="faint" style="font-size: var(--fs-xs)">已生成 {{ p.segment_count }} 段</span>
-        </div>
-        <span class="faint" style="font-size: var(--fs-xs)">继续 →</span>
-      </div>
-    </div>
-  </section>
+    <p class="state-description">正在加载小说列表…</p>
+  </div>
 
-  <!-- 已创建完 -->
-  <section class="card">
-    <div class="card-title">
-      已创建完 <span class="hint">{{ finished.length }} 部</span>
+  <div v-else-if="error" class="card state-panel" role="alert">
+    <h2 class="state-title">小说列表加载失败</h2>
+    <p class="state-description">{{ error }}</p>
+    <div class="state-actions">
+      <button type="button" class="btn primary" @click="refresh">重新加载</button>
     </div>
-    <div v-if="!finished.length" class="empty">
-      还没有标记完成的小说。在工作台点「保存并标记完成」即可归档到这里。
-    </div>
-    <div v-else class="list">
-      <div
-        v-for="p in finished"
-        :key="p.id"
-        class="list-item"
-        style="cursor: pointer"
-        @click="openProject(p.id)"
-      >
-        <div class="row tight" style="flex: 1; flex-wrap: wrap">
-          <strong>{{ p.title }}</strong>
-          <span class="faint mono" style="font-size: var(--fs-xs)">#{{ p.id }}</span>
-          <span v-if="p.genre" class="tag">{{ p.genre }}</span>
-          <span v-if="p.style" class="tag accent">{{ p.style }}</span>
-          <span class="tag ok">已完成</span>
-          <span class="faint" style="font-size: var(--fs-xs)">共 {{ p.segment_count }} 段</span>
-        </div>
-        <span class="faint" style="font-size: var(--fs-xs)">查看 →</span>
+  </div>
+
+  <template v-else>
+    <section class="card">
+      <div class="card-title">
+        正在创作 <span class="hint">{{ inProgress.length }} 部</span>
       </div>
-    </div>
-  </section>
+      <div v-if="!inProgress.length" class="empty">还没有进行中的小说。</div>
+      <div v-else class="list project-list">
+        <button
+          v-for="p in inProgress"
+          :key="p.id"
+          type="button"
+          class="list-item project-item"
+          @click="openProject(p.id)"
+        >
+          <div class="project-copy">
+            <div class="project-title-line">
+              <strong class="project-title" :title="p.title">{{ p.title }}</strong>
+              <span class="project-id faint mono">#{{ p.id }}</span>
+            </div>
+            <div class="project-meta">
+              <span class="tag" :class="p.mode === 'expert' ? 'info' : ''">{{ p.mode }}</span>
+              <span v-if="p.genre" class="tag">{{ p.genre }}</span>
+              <span v-if="p.style" class="tag accent">{{ p.style }}</span>
+              <span class="tag warn">创作中</span>
+              <span class="project-count faint">已生成 {{ p.segment_count }} 段</span>
+            </div>
+          </div>
+        </button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">
+        已完成 <span class="hint">{{ finished.length }} 部</span>
+      </div>
+      <div v-if="!finished.length" class="empty">
+        还没有标记完成的小说。在工作台点「保存并标记完成」即可归档到这里。
+      </div>
+      <div v-else class="list project-list">
+        <button
+          v-for="p in finished"
+          :key="p.id"
+          type="button"
+          class="list-item project-item"
+          @click="openProject(p.id)"
+        >
+          <div class="project-copy">
+            <div class="project-title-line">
+              <strong class="project-title" :title="p.title">{{ p.title }}</strong>
+              <span class="project-id faint mono">#{{ p.id }}</span>
+            </div>
+            <div class="project-meta">
+              <span v-if="p.genre" class="tag">{{ p.genre }}</span>
+              <span v-if="p.style" class="tag accent">{{ p.style }}</span>
+              <span class="tag ok">已完成</span>
+              <span class="project-count faint">共 {{ p.segment_count }} 段</span>
+            </div>
+          </div>
+        </button>
+      </div>
+    </section>
+  </template>
 </template>
 
 <style scoped>
@@ -119,14 +144,14 @@ function goCreate() {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: var(--gap-md);
-  padding: 18px 20px;
+  justify-content: center;
+  padding: 15px 18px;
   margin-bottom: var(--gap-lg);
-  border: 2px dashed var(--border-strong);
+  border: 1px dashed var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--bg-elev);
   color: var(--accent-ink);
-  font-weight: 700;
+  font-weight: 600;
   font-size: var(--fs-md);
   cursor: pointer;
 }
@@ -134,17 +159,26 @@ function goCreate() {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
-.create-card .plus {
-  display: inline-flex;
-  width: 28px;
-  height: 28px;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-full);
-  background: var(--accent);
-  color: var(--accent-fg);
-  font-size: 20px;
-  line-height: 1;
+.create-card:focus-visible,
+.project-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.loading-panel {
+  text-align: center;
+}
+.loading-panel .skeleton-stack {
+  max-width: 560px;
+  margin: 0 auto var(--gap-md);
+}
+.skeleton-heading {
+  width: 42%;
+}
+.skeleton-short {
+  width: 68%;
+}
+.project-list {
+  gap: var(--gap-sm);
 }
 .list-item {
   display: flex;
@@ -156,12 +190,50 @@ function goCreate() {
   border-radius: var(--radius-md);
   background: var(--bg);
 }
-.list-item:hover {
+.project-item {
+  width: 100%;
+  min-width: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.project-item:hover {
   border-color: var(--accent);
 }
-.row.tight {
+.project-copy {
+  flex: 1;
+  min-width: 0;
+}
+.project-title-line {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--gap-sm);
+  min-width: 0;
+}
+.project-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.project-id {
+  flex: none;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+.project-meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--gap-sm);
+  min-width: 0;
+  margin-top: 7px;
+}
+.project-meta .tag {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.project-count {
+  font-size: var(--fs-xs);
 }
 </style>
