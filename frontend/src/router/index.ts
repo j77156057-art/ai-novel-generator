@@ -1,9 +1,16 @@
 import { createRouter, createWebHistory } from "vue-router";
+import { isLoggedIn } from "@/utils/auth";
 
 const routes = [
   // 打开应用直接进入助手对话：/assistant 会自动挑一个项目落到它的助手页，
   // 不再先弹项目列表（产品决策：助手是对话框，打开即聊）。
   { path: "/", redirect: "/assistant" },
+  {
+    path: "/login",
+    name: "login",
+    component: () => import("@/views/LoginView.vue"),
+    meta: { title: "登录", idx: "00" },
+  },
   {
     path: "/corpus",
     name: "corpus",
@@ -64,4 +71,18 @@ const routes = [
 export const router = createRouter({
   history: createWebHistory(),
   routes,
+});
+
+router.beforeEach((to) => {
+  if (to.path === "/api" || to.path.startsWith("/api/")) return true;
+
+  if (to.path === "/login") {
+    return isLoggedIn.value ? "/assistant" : true;
+  }
+
+  if (!isLoggedIn.value) {
+    return { path: "/login", query: { redirect: to.fullPath } };
+  }
+
+  return true;
 });

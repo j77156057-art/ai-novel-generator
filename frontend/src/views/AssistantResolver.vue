@@ -39,8 +39,8 @@ onMounted(async () => {
 
 <template>
   <div class="assistant-resolver">
-    <div v-if="loading" class="hint">正在进入助手工作台…</div>
-    <div v-else-if="error" class="hint error">{{ error }}</div>
+    <div v-if="loading" class="resolver-state"><span class="spinner" /><strong>正在准备工作区</strong><p>选择最近使用的项目与语料上下文…</p></div>
+    <div v-else-if="error" class="resolver-state error" role="alert"><strong>暂时无法进入助手</strong><p>{{ error }}</p><button class="btn" type="button" @click="router.push('/projects')">查看创作项目</button></div>
   </div>
 </template>
 
@@ -51,11 +51,10 @@ onMounted(async () => {
   align-items: center;
   justify-content: center;
 }
-.hint {
-  color: var(--fg-muted);
-  font-size: var(--fs-sm);
-}
-.hint.error {
-  color: var(--fg-danger, #d9534f);
-}
+.resolver-state { min-width: min(100%, 360px); padding: 30px; text-align: center; color: var(--fg-muted); background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; }
+.resolver-state .spinner { margin-bottom: 14px; }
+.resolver-state strong { display: block; color: var(--fg); font-family: var(--font-serif); font-size: var(--fs-lg); }
+.resolver-state p { margin: 8px 0 0; font-size: var(--fs-sm); }
+.resolver-state.error { border-color: var(--danger); }
+.resolver-state.error .btn { margin-top: 18px; }
 </style>

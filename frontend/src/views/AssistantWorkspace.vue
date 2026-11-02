@@ -756,7 +756,7 @@ onMounted(async () => {
 
 <template>
   <header class="page-head">
-    <div class="eyebrow">02 · Assistant</div>
+    <div class="eyebrow">05 · WRITING ASSISTANT</div>
     <div class="asst-head">
       <h1>助手工作台</h1>
       <div class="row tight">
@@ -845,12 +845,7 @@ onMounted(async () => {
       </span>
     </div>
 
-    <p>
-      这里只有问答。诊断、日志分析、语料 / 图谱 / 生成物审核都由助手<strong>自己判断</strong>
-      什么时候需要，调用的结果会直接出现在下面的回答里。
-      <strong>助手不会未经确认就改动你的正文</strong>：需要写操作时，它会在回答里给一张
-      待确认卡片，你点「确认」才会执行，点「取消」什么都不发生。
-    </p>
+    <p>在一个对话里查正文、语料与图谱。诊断和审核结果随回答展示；所有写操作都必须经你确认。</p>
   </header>
 
   <section class="card assistant">
@@ -1141,6 +1136,9 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: var(--gap);
+  padding: 0;
+  overflow: hidden;
+  background: var(--bg-elev);
 }
 .asst-head {
   display: flex;
@@ -1210,20 +1208,24 @@ onMounted(async () => {
 .stream {
   display: flex;
   flex-direction: column;
-  gap: var(--gap);
-  min-height: 16em;
+  gap: 18px;
+  min-height: 320px;
   max-height: 62vh;
   overflow-y: auto;
-  padding-right: 4px;
+  padding: 22px 24px;
+  scroll-behavior: smooth;
 }
 .stream-hint {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: var(--gap);
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-md);
+  margin: auto 0;
+  padding: 34px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 7px;
   color: var(--fg-muted);
+  background: var(--bg);
 }
 .stream-hint p {
   margin: 0;
@@ -1243,15 +1245,18 @@ onMounted(async () => {
 /* 用户靠右 + 主色底；助手靠左 + 中性底。位置本身也是一种双编码。 */
 .bubble.user {
   align-self: flex-end;
-  max-width: 85%;
-  background: var(--accent);
-  color: var(--accent-fg);
+  max-width: 78%;
+  background: #2b2c27;
+  color: #fffaf1;
   white-space: pre-wrap;
+  border-radius: 10px 10px 2px 10px;
 }
 .bubble.assistant {
   align-self: stretch;
+  padding: 18px;
   border: var(--border-w) solid var(--border);
-  background: var(--bg-sunken);
+  background: var(--bg);
+  border-radius: 2px 10px 10px 10px;
 }
 .loading-line {
   color: var(--fg-faint);
@@ -1406,17 +1411,21 @@ onMounted(async () => {
 .composer {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding-top: var(--gap);
+  gap: 10px;
+  padding: 18px 24px 20px;
+  background: var(--bg-elev);
   border-top: 1px solid var(--border-strong);
 }
+.composer textarea { width: 100%; background: var(--bg); }
+.composer .btn.primary { min-width: 88px; }
 @media (max-width: 720px) {
   .meta-grid {
     grid-template-columns: 1fr;
   }
-  .stream {
-    max-height: 70vh;
-  }
+  .stream { max-height: 70vh; padding: 16px; }
+  .composer { padding: 14px 16px 16px; }
+  .bubble.user { max-width: 92%; }
+  .stream-hint { padding: 22px 18px; }
 }
 /* 本轮降级标记：结论与解释分两行 —— 结论用粗体，解释是它的展开说明。 */
 .react-notice-detail {

@@ -14,6 +14,7 @@ import type {
   LlmConfig,
   NarrativeTier,
   NovelOut,
+  OutlineCandidate,
   PlotBible,
   ProjectOut,
   StoryBackground,
@@ -22,6 +23,16 @@ import type {
 } from "@/api/types";
 import DistillProgress from "@/components/DistillProgress.vue";
 import RoleplayPanel from "@/components/RoleplayPanel.vue";
+import {
+  downloadTextFile,
+  formatCharacterCardsMarkdown,
+  formatOutlineMarkdown,
+  formatRemindersMarkdown,
+  projectExportFilename,
+  projectExportTypeLabel,
+  sanitizeFilename,
+  type ProjectExportType,
+} from "@/utils/projectExports";
 import {
   boundaryFromProject,
   boundaryLabel,
@@ -109,6 +120,107 @@ const questionNote = ref<string | null>(null);
 const answers = reactive<Record<string, string>>({});
 const buildingBible = ref(false);
 const bible = ref<PlotBible | null>(null);
+
+// 因果大纲：后端已提供生成、澄清与应用，这里补齐作者确认链路。
+const outlineGoals = ref("");
+const outlineNodeCount = ref(3);
+const outlineCandidate = ref<OutlineCandidate | null>(null);
+const outlineBusy = ref<"generate" | "clarify" | "apply" | null>(null);
+const outlineErr = ref<string | null>(null);
+const outlineNotice = ref<string | null>(null);
+const outlineAnswers = reactive<Record<string, string>>({});
+const OUTLINE_FIELD_LABELS: Record<string, string> = {
+  title: "标题", premise: "事件前提", motivation: "行动动机", action: "行动",
+  result: "结果", cost: "代价", time: "时间", location: "地点", participants: "参与者",
+  state_before: "开始前状态", state_after: "结束后状态",
+};
+function outlineFieldLabel(field: string): string {
+  return OUTLINE_FIELD_LABELS[field] || field;
+}
+
+function outlineFailure(candidate: OutlineCandidate): string {
+  const code = typeof candidate.error?.code === "string" ? candidate.error.code : "unknown";
+  const labels: Record<string, string> = {
+    missing_premise_or_bible: "请先填写大概内容并合成剧情圣经。",
+    writer_unavailable: "当前生成模型不可用，请先在模型设置中配置可用渠道。",
+    possible_copy: "规划可能照搬参考情节，已阻止保存。请调整创作目标后重试。",
+    invalid_model_structure: "模型没有返回完整的因果节点，请重试。",
+    model_request_failed: "模型请求失败，请稍后重试或检查模型配置。",
+  };
+  return labels[code] || `大纲生成未完成（${code}）。`;
+}
+
+async function runGenerateOutline() {
+  const goals = outlineGoals.value.split(/\n+/).map((x) => x.trim()).filter(Boolean);
+  if (!goals.length) {
+    outlineErr.value = "请至少填写一条创作目标。";
+    return;
+  }
+  outlineBusy.value = "generate";
+  outlineErr.value = null;
+  outlineNotice.value = null;
+  try {
+    const result = await api.generateOutline(projectId, {
+      confirm_bible: true,
+      goals,
+      node_count: outlineNodeCount.value,
+      preview: true,
+    });
+    if (result.degraded || !result.nodes?.length) {
+      outlineCandidate.value = null;
+      outlineErr.value = outlineFailure(result);
+      return;
+    }
+    outlineCandidate.value = result;
+    Object.keys(outlineAnswers).forEach((key) => delete outlineAnswers[key]);
+    outlineNotice.value = result.structurally_complete
+      ? "大纲草案已生成，请逐节复核后保存。"
+      : "草案还有待定信息，补全后再保存。";
+  } catch (err) {
+    outlineErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    outlineBusy.value = null;
+  }
+}
+
+async function runClarifyOutline() {
+  if (!outlineCandidate.value) return;
+  const answers = Object.fromEntries(
+    Object.entries(outlineAnswers).filter(([, value]) => value.trim()).map(([key, value]) => [key, value.trim()]),
+  );
+  if (!Object.keys(answers).length) {
+    outlineErr.value = "请填写至少一项待澄清信息。";
+    return;
+  }
+  outlineBusy.value = "clarify";
+  outlineErr.value = null;
+  try {
+    outlineCandidate.value = await api.clarifyOutline(projectId, outlineCandidate.value, answers);
+    Object.keys(outlineAnswers).forEach((key) => delete outlineAnswers[key]);
+    outlineNotice.value = outlineCandidate.value.structurally_complete
+      ? "信息已补全，可以保存大纲。"
+      : "仍有待定信息，请继续补全。";
+  } catch (err) {
+    outlineErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    outlineBusy.value = null;
+  }
+}
+
+async function runApplyOutline() {
+  if (!outlineCandidate.value?.structurally_complete) return;
+  outlineBusy.value = "apply";
+  outlineErr.value = null;
+  try {
+    await api.applyOutline(projectId, outlineCandidate.value);
+    project.value = await api.getProject(projectId);
+    outlineNotice.value = "大纲已保存，后续生成将按这份剧情规划推进。";
+  } catch (err) {
+    outlineErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    outlineBusy.value = null;
+  }
+}
 
 // ===== 世界背景与硬规则（2026-10-30） =====
 //
@@ -1950,7 +2062,8 @@ async function buildBible() {
     const b = await api.buildBible(projectId, ans);
     bible.value = b;
     await patch({ plot_bible: b, status: "planned" });
-    goStep(6);
+    outlineCandidate.value = null;
+    outlineNotice.value = "剧情圣经已保存。可继续生成因果大纲，或直接进入生成控制台。";
   } catch (err) {
     alert(err instanceof Error ? err.message : String(err));
   } finally {
@@ -2034,11 +2147,89 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
   }
 }
 
-async function runExport() {
+type ExportSelection = "text" | ProjectExportType;
+const exportOpen = ref(false);
+const exportBusy = ref(false);
+const exportErr = ref<string | null>(null);
+const exportNotice = ref<string | null>(null);
+const exportSelection = reactive<Record<ExportSelection, boolean>>({
+  text: true,
+  outline: true,
+  characters: true,
+  reminders: true,
+});
+const hasExportSelection = computed(() => Object.values(exportSelection).some(Boolean));
+const exportOptions: { key: ProjectExportType; description: string }[] = [
+  { key: "outline", description: "已保存的剧情大纲，Markdown 有序列表" },
+  { key: "characters", description: "角色动机、身份、能力、声纹与关系" },
+  { key: "reminders", description: "未解伏笔与人物约束，附章节信息" },
+];
+
+function runExport() {
+  exportSelection.text = generations.value.length > 0;
+  exportErr.value = null;
+  exportNotice.value = null;
+  exportOpen.value = true;
+}
+
+async function runSelectedExport() {
+  if (!project.value || !hasExportSelection.value) return;
+  exportBusy.value = true;
+  exportErr.value = null;
+  exportNotice.value = null;
   try {
-    await api.exportTxt(projectId, project.value?.title || "novel");
+    const current = await api.getProject(projectId);
+    project.value = current;
+    const title = sanitizeFilename(current.title) || "未命名作品";
+    let count = 0;
+    if (exportSelection.text) {
+      await api.exportTxt(projectId, `${title}-正文.txt`);
+      count += 1;
+    }
+    if (exportSelection.outline) {
+      downloadTextFile(projectExportFilename(current, "outline"), formatOutlineMarkdown(current.outline));
+      count += 1;
+    }
+    if (exportSelection.characters) {
+      const result = await api.listCharacterCards(projectId);
+      downloadTextFile(
+        projectExportFilename(current, "characters"),
+        formatCharacterCardsMarkdown(result.characters || []),
+      );
+      count += 1;
+    }
+    if (exportSelection.reminders) {
+      const result = await api.getReminders(projectId);
+      downloadTextFile(projectExportFilename(current, "reminders"), formatRemindersMarkdown(result));
+      count += 1;
+    }
+    exportNotice.value = `已生成 ${count} 份文件，浏览器将按下载权限逐份保存。`;
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    exportErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    exportBusy.value = false;
+  }
+}
+
+const extensionCount = ref(1);
+const extensionBusy = ref(false);
+const extensionErr = ref<string | null>(null);
+const extensionNotice = ref<string | null>(null);
+
+async function runExtendPlan() {
+  extensionBusy.value = true;
+  extensionErr.value = null;
+  extensionNotice.value = null;
+  try {
+    const result = await api.extendPlan(projectId, extensionCount.value);
+    extensionNotice.value = result.nodes.length
+      ? `${result.message} 新增：${result.nodes.map((node) => node.title).join("、")}。`
+      : result.message;
+    project.value = await api.getProject(projectId);
+  } catch (err) {
+    extensionErr.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    extensionBusy.value = false;
   }
 }
 
@@ -2472,6 +2663,7 @@ onUnmounted(() => {
       <button class="btn" @click="router.push(`/projects/${projectId}/assistant`)">
         打开助手工作台 →
       </button>
+      <button class="btn" :disabled="!project" @click="runExport">导出作品</button>
     </div>
   </header>
 
@@ -3165,6 +3357,75 @@ onUnmounted(() => {
       <div v-if="bible.note" class="notice warn" style="margin-top: 12px">{{ bible.note }}</div>
     </div>
 
+    <section v-if="bible" class="outline-builder" aria-labelledby="outline-builder-title">
+      <div class="outline-heading">
+        <div><span class="outline-kicker">CAUSAL OUTLINE</span><h2 id="outline-builder-title">因果大纲</h2></div>
+        <span v-if="project?.plot_timeline" class="tag ok">已有剧情规划</span>
+      </div>
+      <p class="outline-intro">把剧情圣经拆成可复核的场景节点。模型先给草案，待定信息由作者补全，确认保存后才进入生成契约。</p>
+
+      <div v-if="project?.outline && !outlineCandidate" class="saved-outline">
+        <strong>当前已保存大纲</strong>
+        <ol v-if="Array.isArray(project.outline)"><li v-for="(item, i) in project.outline" :key="i">{{ item }}</li></ol>
+        <div v-else class="prose">{{ project.outline }}</div>
+      </div>
+
+      <div class="outline-controls">
+        <div class="field goals-field">
+          <label for="outline-goals">创作目标（每行一条）</label>
+          <textarea id="outline-goals" class="input" v-model="outlineGoals" rows="3" placeholder="例如：主角主动追查失踪事件&#10;在第三节点揭示盟友隐瞒的关键事实" />
+        </div>
+        <div class="field node-field">
+          <label for="outline-count">场景节点</label>
+          <select id="outline-count" class="input" v-model.number="outlineNodeCount">
+            <option :value="3">3 节</option><option :value="5">5 节</option><option :value="8">8 节</option><option :value="12">12 节</option>
+          </select>
+        </div>
+        <button class="btn primary" type="button" :disabled="!!outlineBusy || !!generations.length" @click="runGenerateOutline">
+          {{ outlineBusy === "generate" ? "生成中…" : "生成大纲草案" }}
+        </button>
+      </div>
+      <p v-if="generations.length" class="faint outline-lock">已有正文，不能覆盖剧情规划；可在生成控制台按需扩展后续规划。</p>
+      <div v-if="outlineErr" class="notice err" role="alert">{{ outlineErr }}</div>
+      <div v-if="outlineNotice" class="notice ok" role="status">{{ outlineNotice }}</div>
+
+      <div v-if="outlineCandidate?.nodes?.length" class="outline-draft">
+        <div class="draft-list">
+          <details v-for="(node, i) in outlineCandidate.nodes" :key="i" class="draft-node" :open="i === 0">
+            <summary><span>{{ String(i + 1).padStart(2, "0") }}</span><strong>{{ node.title }}</strong><small>{{ node.time }} · {{ node.location }}</small></summary>
+            <dl>
+              <div><dt>前提</dt><dd>{{ node.premise }}</dd></div><div><dt>动机</dt><dd>{{ node.motivation }}</dd></div>
+              <div><dt>行动</dt><dd>{{ node.action }}</dd></div><div><dt>结果</dt><dd>{{ node.result }}</dd></div>
+              <div><dt>代价</dt><dd>{{ node.cost }}</dd></div><div><dt>参与者</dt><dd>{{ node.participants.join("、") }}</dd></div>
+              <div><dt>状态变化</dt><dd>{{ node.state_before }} → {{ node.state_after }}</dd></div>
+            </dl>
+          </details>
+        </div>
+
+        <div v-if="outlineCandidate.unknown_fields?.length" class="clarify-box">
+          <strong>待作者确认</strong>
+          <p>这些信息不能由模型代为决定。填写后点击“补全草案”，可分批提交。</p>
+          <div v-for="item in outlineCandidate.unknown_fields" :key="`${item.node_id}.${item.field}`" class="field clarify-field">
+            <label :for="`clarify-${item.node_id}-${item.field}`">{{ item.node_id }} · {{ outlineFieldLabel(item.field) }}</label>
+            <input :id="`clarify-${item.node_id}-${item.field}`" class="input" v-model="outlineAnswers[`${item.node_id}.${item.field}`]" />
+          </div>
+          <button class="btn" type="button" :disabled="!!outlineBusy" @click="runClarifyOutline">
+            {{ outlineBusy === "clarify" ? "提交中…" : "补全草案" }}
+          </button>
+        </div>
+
+        <div class="draft-actions">
+          <span v-if="outlineCandidate.structurally_complete" class="tag ok">结构完整，待保存</span>
+          <span v-else class="tag warn">仍有 {{ outlineCandidate.unknown_fields?.length || 0 }} 项待确认</span>
+          <button class="btn primary" type="button" :disabled="!!outlineBusy || !outlineCandidate.structurally_complete || !!generations.length" @click="runApplyOutline">
+            {{ outlineBusy === "apply" ? "保存中…" : "确认并保存大纲" }}
+          </button>
+          <button class="btn ghost" type="button" @click="goStep(6)">前往生成控制台 →</button>
+        </div>
+      </div>
+      <div v-else class="outline-skip"><button class="link-btn" type="button" @click="goStep(6)">暂不做大纲，直接进入生成控制台 →</button></div>
+    </section>
+
     <!-- ===== plot_bible 编辑模态（kg-cascade-protocol）===== -->
     <div v-if="bibleEditOpen" class="bible-modal-mask" @click.self="bibleEditOpen = false">
       <div class="bible-modal">
@@ -3309,8 +3570,21 @@ onUnmounted(() => {
       <button class="btn primary" :disabled="streaming" @click="runGenerate">
         {{ streaming ? "续写中…" : `生成 ${chaptersPerGen} 段` }}
       </button>
-      <button class="btn" :disabled="!generations.length" @click="runExport">导出 txt</button>
+      <button class="btn" :disabled="!project" @click="runExport">导出作品</button>
     </div>
+
+    <details v-if="project?.plot_timeline" class="plan-extension">
+      <summary>后续规划与扩展 <span>用于现有剧情点已写完、仍需继续创作时</span></summary>
+      <div class="extension-body">
+        <p>只在已保存的故事权威范围内追加剧情点与生成契约。没有可扩展空间时，后端会明确拒绝，不会擅自续编。</p>
+        <div class="row tight">
+          <div class="field"><label for="extension-count">追加剧情点</label><select id="extension-count" class="input" v-model.number="extensionCount"><option :value="1">1 个</option><option :value="2">2 个</option><option :value="3">3 个</option></select></div>
+          <button class="btn" type="button" :disabled="extensionBusy" @click="runExtendPlan">{{ extensionBusy ? "扩展中…" : "扩展后续规划" }}</button>
+        </div>
+        <div v-if="extensionErr" class="notice err" role="alert">{{ extensionErr }}</div>
+        <div v-if="extensionNotice" class="notice ok" role="status">{{ extensionNotice }}</div>
+      </div>
+    </details>
 
     <!-- ---------- 文风档案的禁用词冲突：生成会被挡住，得在这儿就看见 ---------- -->
     <div v-if="styleConflicts.length" class="notice err distill-inline" style="margin-top: var(--gap)">
@@ -4293,9 +4567,40 @@ onUnmounted(() => {
     </div>
 
   </template>
+
+  <div v-if="exportOpen" class="export-mask" @click.self="!exportBusy && (exportOpen = false)">
+    <section class="export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-title">
+      <div class="export-head">
+        <div><span class="export-kicker">DELIVERABLES</span><h2 id="export-title">导出《{{ project?.title }}》</h2></div>
+        <button class="btn ghost" type="button" :disabled="exportBusy" aria-label="关闭导出" @click="exportOpen = false">关闭</button>
+      </div>
+      <p class="export-intro">选择本次需要的文件。正文为 TXT，其余为 Markdown；每份文件自动带作品名与类型。</p>
+      <div class="export-options">
+        <label class="export-option" :class="{ disabled: !generations.length }">
+          <input v-model="exportSelection.text" type="checkbox" :disabled="!generations.length || exportBusy" />
+          <span><strong>正文</strong><small>{{ generations.length ? `${generations.length} 段生成正文 · TXT` : "暂无生成正文" }}</small></span>
+          <em>.txt</em>
+        </label>
+        <label v-for="option in exportOptions" :key="option.key" class="export-option">
+          <input v-model="exportSelection[option.key]" type="checkbox" :disabled="exportBusy" />
+          <span><strong>{{ projectExportTypeLabel(option.key) }}</strong><small>{{ option.description }}</small></span>
+          <em>.md</em>
+        </label>
+      </div>
+      <div v-if="exportErr" class="notice err" role="alert">{{ exportErr }}</div>
+      <div v-if="exportNotice" class="notice ok" role="status">{{ exportNotice }}</div>
+      <div class="export-actions">
+        <span>{{ Object.values(exportSelection).filter(Boolean).length }} 份文件</span>
+        <button class="btn primary" type="button" :disabled="exportBusy || !hasExportSelection" @click="runSelectedExport">
+          {{ exportBusy ? "正在生成文件…" : "生成并下载" }}
+        </button>
+      </div>
+    </section>
+  </div>
 </template>
 
 <style scoped>
+.page-head { padding-top: 6px; }
 .page-head .title-block {
   display: flex;
   align-items: center;
@@ -4354,52 +4659,47 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 .stepper {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
   margin-bottom: var(--gap-lg);
+  padding: 5px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
 }
 .step {
+  min-width: 0;
+  min-height: 54px;
   font: inherit;
-  font-size: var(--fs-xs);
+  font-size: 11px;
   font-weight: 600;
-  padding: 7px 12px;
-  border-radius: var(--radius-full);
-  border: var(--border-w) solid var(--border);
-  background: var(--bg-elev);
+  padding: 8px 7px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--fg-muted);
   cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 5px;
+  text-align: left;
 }
-.step:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
+.step:hover:not(:disabled) { background: var(--bg); }
+.step:disabled { opacity: 0.42; cursor: not-allowed; }
 .step .num {
   display: inline-flex;
-  width: 18px;
-  height: 18px;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-full);
-  background: var(--bg-sunken);
-  font-family: var(--font-mono);
+  color: var(--fg-faint);
+  font: 9px/1 var(--font-mono);
 }
-.step.active {
-  background: var(--accent);
-  color: var(--accent-fg);
-  border-color: var(--accent);
-}
-.step.active .num {
-  background: rgba(255, 255, 255, 0.25);
-  color: var(--accent-fg);
-}
-.step.done .num {
-  background: var(--accent-soft);
-  color: var(--accent-ink);
-}
+.step.active { background: #2b2c27; color: #fffaf1; border-color: #2b2c27; }
+.step.active .num { color: #d8836f; background: transparent; }
+.step.done { color: var(--fg); }
+.step.done .num { color: var(--accent-ink); background: transparent; }
 /* ---------- 蒸馏进度（跨步骤常驻） ---------- */
 /* 步骤①上的小徽标：蒸馏在后台跑时，用户跳到别的步骤也能一眼看到
    「还在跑」。**文字在前**（"蒸馏中"），圆点只是冗余强化 —— 灰度/色弱下
@@ -4608,8 +4908,9 @@ onUnmounted(() => {
   border-color: var(--accent);
 }
 .board.on {
-  border-color: var(--accent);
-  background: var(--accent-soft);
+  border-color: #2b2c27;
+  background: #2b2c27;
+  color: #fffaf1;
 }
 .board-name {
   font-size: var(--fs-sm);
@@ -4620,9 +4921,8 @@ onUnmounted(() => {
   line-height: 1.5;
   color: var(--fg-muted);
 }
-.board.on .board-name {
-  color: var(--accent-ink);
-}
+.board.on .board-name { color: #fffaf1; }
+.board.on .board-desc { color: #b9b9ae; }
 .cut-list {
   margin-top: var(--gap);
   display: flex;
@@ -5216,13 +5516,72 @@ onUnmounted(() => {
   border-radius: 6px;
 }
 
+/* 大纲、规划扩展与导出：与主工作台共用暖纸/墨色体系。 */
+.outline-builder { margin-top: 26px; padding-top: 24px; border-top: 1px solid var(--border-strong); }
+.outline-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.outline-kicker, .export-kicker { color: var(--accent-ink); font: 10px/1.4 var(--font-mono); letter-spacing: .12em; }
+.outline-heading h2 { margin-top: 4px; font: 21px/1.3 var(--font-serif); }
+.outline-intro { max-width: 70ch; margin: 8px 0 18px; color: var(--fg-muted); font-size: var(--fs-sm); }
+.outline-controls { display: flex; align-items: flex-end; gap: 12px; }
+.goals-field { flex: 1; }
+.node-field { width: 110px; flex: none; }
+.outline-lock { margin: 8px 0 0; font-size: var(--fs-xs); }
+.outline-builder .notice { margin-top: 12px; }
+.saved-outline { margin-bottom: 18px; padding: 14px 16px; background: var(--bg); border-left: 3px solid var(--ok); }
+.saved-outline ol { margin: 8px 0 0; padding-left: 22px; }
+.saved-outline li { margin-top: 4px; }
+.outline-draft { margin-top: 18px; }
+.draft-list { display: flex; flex-direction: column; gap: 8px; }
+.draft-node { background: var(--bg); border: 1px solid var(--border); border-radius: 7px; }
+.draft-node summary { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 13px 14px; cursor: pointer; }
+.draft-node summary > span { color: var(--accent-ink); font: 10px/1 var(--font-mono); }
+.draft-node summary small { color: var(--fg-faint); font-weight: 400; }
+.draft-node dl { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 20px; margin: 0; padding: 0 18px 16px 54px; }
+.draft-node dl div { min-width: 0; }
+.draft-node dt { color: var(--fg-faint); font-size: 10px; }
+.draft-node dd { margin: 3px 0 0; color: var(--fg-muted); font-size: var(--fs-sm); line-height: 1.7; }
+.clarify-box { margin-top: 14px; padding: 16px; background: var(--warn-soft); border-radius: 7px; }
+.clarify-box > p { margin: 5px 0 14px; color: var(--fg-muted); font-size: var(--fs-xs); }
+.clarify-field { margin-bottom: 10px; }
+.draft-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+.outline-skip { margin-top: 14px; }
+.plan-extension { margin-top: 18px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.plan-extension summary { padding: 13px 2px; cursor: pointer; font-size: var(--fs-sm); font-weight: 600; }
+.plan-extension summary span { margin-left: 10px; color: var(--fg-faint); font-size: var(--fs-xs); font-weight: 400; }
+.extension-body { padding: 0 2px 16px; }
+.extension-body > p { max-width: 76ch; margin: 0 0 12px; color: var(--fg-muted); font-size: var(--fs-xs); }
+.extension-body .notice { margin-top: 10px; }
+.export-mask { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 24px; background: rgba(28, 28, 24, .56); }
+.export-dialog { width: min(100%, 600px); max-height: calc(100vh - 48px); overflow-y: auto; padding: 26px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 70px rgba(20, 20, 17, .22); }
+.export-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.export-head h2 { margin-top: 5px; font: 23px/1.4 var(--font-serif); }
+.export-intro { margin: 10px 0 18px; color: var(--fg-muted); font-size: var(--fs-sm); }
+.export-options { display: flex; flex-direction: column; gap: 8px; }
+.export-option { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 13px 14px; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; }
+.export-option:has(input:checked) { border-color: var(--accent-line); background: var(--accent-soft); }
+.export-option.disabled { opacity: .55; cursor: not-allowed; }
+.export-option input { width: 16px; height: 16px; accent-color: var(--accent); }
+.export-option span { display: flex; flex-direction: column; gap: 3px; }
+.export-option small { color: var(--fg-muted); font-size: 11px; }
+.export-option em { color: var(--fg-faint); font: 10px/1 var(--font-mono); font-style: normal; }
+.export-dialog .notice { margin-top: 12px; }
+.export-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+.export-actions > span { color: var(--fg-faint); font-size: var(--fs-xs); }
+
+@media (max-width: 980px) {
+  .stepper { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .outline-controls { align-items: stretch; flex-wrap: wrap; }
+  .goals-field { flex-basis: 100%; }
+}
 @media (max-width: 720px) {
-  .grid-2 {
-    grid-template-columns: 1fr;
-  }
-  .prior-table td:last-child,
-  .prior-table th:last-child {
-    display: none;
-  }
+  .grid-2 { grid-template-columns: 1fr; }
+  .prior-table td:last-child, .prior-table th:last-child { display: none; }
+  .stepper { display: flex; overflow-x: auto; }
+  .step { min-width: 104px; }
+  .draft-node summary { grid-template-columns: 26px minmax(0, 1fr); }
+  .draft-node summary small { grid-column: 2; }
+  .draft-node dl { grid-template-columns: 1fr; padding-left: 18px; }
+  .export-mask { padding: 12px; }
+  .export-dialog { padding: 20px 16px; }
 }
 </style>

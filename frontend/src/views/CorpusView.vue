@@ -23,10 +23,12 @@ const { data: novels, loading: novelsLoading, error: novelsError, run: reloadNov
 const selected = ref<NovelOut | null>(null);
 const chunks = ref<ChunkOut[]>([]);
 const chunksLoading = ref(false);
+const chunksError = ref<string | null>(null);
 
 const q = ref("");
 const hits = ref<SearchHit[] | null>(null);
 const searching = ref(false);
+const searchError = ref<string | null>(null);
 
 onMounted(() => reloadNovels());
 
@@ -222,6 +224,8 @@ async function openChunks(n: NovelOut) {
   hits.value = null;
   q.value = "";
   chunksLoading.value = true;
+  chunksError.value = null;
+  searchError.value = null;
   digestJob.value = null;
   digestNotice.value = null;
   void loadDigest(n.id);
@@ -229,7 +233,7 @@ async function openChunks(n: NovelOut) {
     chunks.value = await api.listChunks(n.id);
   } catch (err) {
     chunks.value = [];
-    alert(err instanceof Error ? err.message : String(err));
+    chunksError.value = err instanceof Error ? err.message : String(err);
   } finally {
     chunksLoading.value = false;
   }
@@ -238,10 +242,12 @@ async function openChunks(n: NovelOut) {
 async function runSearch() {
   if (!selected.value || !q.value.trim()) return;
   searching.value = true;
+  searchError.value = null;
   try {
     hits.value = await api.searchNovel(selected.value.id, q.value.trim());
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err));
+    hits.value = null;
+    searchError.value = err instanceof Error ? err.message : String(err);
   } finally {
     searching.value = false;
   }
@@ -260,48 +266,55 @@ onMounted(async () => {
 </script>
 
 <template>
-  <header class="page-head">
-    <div class="eyebrow">01 · Corpus</div>
-    <h1>语料库</h1>
-    <p>上传 UTF-8 小说 .txt → 自动分章切分入库。选中一本可查看分片，并用 M2 混合检索（BM25 × 向量）召回相关片段。</p>
+  <header class="page-head corpus-head">
+    <div>
+      <div class="eyebrow">01 · REFERENCE LIBRARY</div>
+      <h1>语料库</h1>
+      <p>让参考书止于参考：入库先体检，检索可追溯，全书摘要保留原文证据。</p>
+    </div>
+    <button class="btn primary" type="button" @click="goAssistant">通过助手投放语料 <span aria-hidden="true">→</span></button>
   </header>
 
-  <section class="card">
-    <div class="card-title">投放语料 <span class="hint">.txt · UTF-8</span></div>
-    <div class="notice info" style="margin-top: 4px">
-      文本提交已统一到助理 agent。直接上传会绕过整条流程（清洗、抽检、蒸馏、审查）——
-      实测那类语料里有大量空/超短分片、切分停在半句话中间，文风也就不可信了。
-      请到助理页上传附件，agent 会带它走：清洗 → 抽检 → 蒸馏 → 审查。
-    </div>
-    <div class="row" style="margin-top: 12px">
-      <button class="btn primary" @click="goAssistant">去助理页投放</button>
-    </div>
-  </section>
-
-  <section class="card">
-    <div class="card-title">已入库语料 <span class="hint">{{ novels?.length ?? 0 }} 本</span></div>
-    <div v-if="novelsLoading" class="empty"><span class="spinner" /> 加载中…</div>
-    <div v-else-if="novelsError" class="notice err">{{ novelsError }}</div>
-    <div v-else-if="!novels?.length" class="empty">还没有语料，先上传一本。</div>
-    <div v-else class="list">
-      <div
-        v-for="n in novels"
-        :key="n.id"
-        class="list-item clickable"
-        :class="{ active: selected?.id === n.id }"
-        @click="openChunks(n)"
-      >
-        <div>
-          <strong>{{ n.title || "（无题）" }}</strong>
-          <span class="faint mono" style="margin-left: 10px">#{{ n.id }}</span>
-        </div>
-        <div class="row tight">
-          <span class="tag">{{ n.platform || "—" }}</span>
-          <span class="faint" style="font-size: var(--fs-xs)">查看分片 →</span>
-        </div>
+  <div class="corpus-overview">
+    <section class="library-browser" aria-labelledby="corpus-list-title">
+      <div class="browser-head">
+        <div><span class="browser-kicker">已入库</span><h2 id="corpus-list-title">参考书架</h2></div>
+        <span class="book-count">{{ novels?.length ?? 0 }} 本</span>
       </div>
-    </div>
-  </section>
+      <div v-if="novelsLoading" class="empty"><span class="spinner" /> 正在读取语料…</div>
+      <div v-else-if="novelsError" class="notice err" role="alert">
+        {{ novelsError }}<button class="link-btn" type="button" @click="reloadNovels">重试</button>
+      </div>
+      <div v-else-if="!novels?.length" class="corpus-empty">
+        <span aria-hidden="true">00</span><strong>书架还是空的</strong><p>从助手附件开始，完成清洗、抽检、蒸馏与审查后再入库。</p>
+      </div>
+      <div v-else class="book-list">
+        <button
+          v-for="n in novels"
+          :key="n.id"
+          class="book-row"
+          :class="{ active: selected?.id === n.id }"
+          type="button"
+          @click="openChunks(n)"
+        >
+          <span class="book-spine" aria-hidden="true"></span>
+          <span class="book-copy"><strong>{{ n.title || "（无题）" }}</strong><small>{{ n.platform || "未标记平台" }} · #{{ n.id }}</small></span>
+          <span class="book-enter" aria-hidden="true">↗</span>
+        </button>
+      </div>
+    </section>
+
+    <aside class="ingest-guide">
+      <span class="guide-index">INGEST / 01</span>
+      <h2>不是上传，<br />是建立可靠参考。</h2>
+      <p>文本统一经助手附件进入完整工序，避免空分片、断句与混书内容直接污染参考库。</p>
+      <ol>
+        <li><span>01</span>清洗文本</li><li><span>02</span>抽检与体检</li>
+        <li><span>03</span>提炼风格</li><li><span>04</span>审查后入库</li>
+      </ol>
+      <small>支持 .txt / .md · 由助手附件链路暂存与交付</small>
+    </aside>
+  </div>
 
   <section v-if="foreignOf(selected)" class="card">
     <div class="card-title">入库体检 <span class="hint">《{{ selected?.title }}》</span></div>
@@ -509,6 +522,7 @@ onMounted(async () => {
         </button>
       </div>
 
+      <div v-if="searchError" class="notice err" role="alert" style="margin-bottom: 16px">{{ searchError }}</div>
       <div v-if="hits" style="margin-bottom: 16px">
         <div class="card-title" style="font-size: var(--fs-md)">检索命中 <span class="hint">RRF 融合 Top {{ hits.length }}</span></div>
         <div class="list">
@@ -527,6 +541,10 @@ onMounted(async () => {
       </div>
 
       <div v-if="chunksLoading" class="empty"><span class="spinner" /> 载入分片…</div>
+      <div v-else-if="chunksError" class="notice err" role="alert">
+        {{ chunksError }}<button class="link-btn" type="button" @click="selected && openChunks(selected)">重试</button>
+      </div>
+      <div v-else-if="!chunks.length" class="empty">这本书暂时没有可显示的分片。</div>
       <div v-else class="list">
         <div v-for="c in chunks" :key="c.id" class="list-item" style="align-items: flex-start">
           <div class="row tight" style="width: 120px; flex: none">
@@ -539,3 +557,43 @@ onMounted(async () => {
     </section>
   </template>
 </template>
+
+<style scoped>
+.corpus-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding-top: 8px; }
+.corpus-overview { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, .75fr); gap: 18px; margin-bottom: 22px; }
+.library-browser { min-width: 0; padding: 22px 24px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; }
+.browser-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+.browser-kicker, .guide-index { color: var(--accent-ink); font: 10px/1.4 var(--font-mono); letter-spacing: .12em; }
+.browser-head h2 { margin-top: 4px; font: 21px/1.3 var(--font-serif); }
+.book-count { color: var(--fg-faint); font-size: var(--fs-xs); }
+.book-list { display: flex; flex-direction: column; max-height: 390px; overflow-y: auto; }
+.book-row { display: grid; grid-template-columns: 4px minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 15px 8px; text-align: left; color: var(--fg); background: none; border: 0; border-bottom: 1px solid var(--border); cursor: pointer; }
+.book-row:last-child { border-bottom: 0; }
+.book-row:hover, .book-row.active { background: var(--bg); }
+.book-spine { width: 3px; height: 32px; background: var(--border-strong); border-radius: 2px; }
+.book-row.active .book-spine { background: var(--accent); }
+.book-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.book-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 16px/1.4 var(--font-serif); }
+.book-copy small { color: var(--fg-faint); font-size: 10px; }
+.book-enter { color: var(--accent-ink); opacity: 0; }
+.book-row:hover .book-enter, .book-row.active .book-enter { opacity: 1; }
+.ingest-guide { padding: 24px; color: #ece8de; background: #2b2c27; border-radius: 10px; }
+.ingest-guide .guide-index { color: #d8836f; }
+.ingest-guide h2 { margin-top: 12px; font: 23px/1.45 var(--font-serif); }
+.ingest-guide > p { margin: 12px 0 18px; color: #aaa99f; font-size: 12px; line-height: 1.8; }
+.ingest-guide ol { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 14px; margin: 0; padding: 16px 0; list-style: none; border-top: 1px solid #484940; border-bottom: 1px solid #484940; }
+.ingest-guide li { display: flex; align-items: center; gap: 7px; color: #d0cfc5; font-size: 11px; }
+.ingest-guide li span { color: #818278; font: 9px/1 var(--font-mono); }
+.ingest-guide small { display: block; margin-top: 14px; color: #85867c; font-size: 10px; line-height: 1.7; }
+.corpus-empty { min-height: 220px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--fg-muted); text-align: center; }
+.corpus-empty > span { color: var(--border-strong); font: 34px/1 var(--font-serif); }
+.corpus-empty strong { margin-top: 10px; }
+.corpus-empty p { max-width: 36em; margin: 6px 0 0; color: var(--fg-faint); font-size: var(--fs-sm); }
+.link-btn { margin-left: 10px; padding: 0; color: inherit; background: none; border: 0; text-decoration: underline; cursor: pointer; }
+@media (max-width: 980px) { .corpus-overview { grid-template-columns: 1fr; } }
+@media (max-width: 640px) {
+  .corpus-head { align-items: flex-start; flex-direction: column; }
+  .library-browser, .ingest-guide { padding: 18px 16px; }
+  .book-copy strong { white-space: normal; }
+}
+</style>

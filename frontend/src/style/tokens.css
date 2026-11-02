@@ -12,14 +12,14 @@
   color-scheme: light;
 
   /* 表面 */
-  --bg: #f6f3ec;          /* 暖纸 */
+  --bg: #f4f1ea;          /* 暖纸 */
   --bg-elev: #fffdf8;     /* 卡片/抬升面 */
-  --bg-sunken: #ece7dc;   /* 凹陷/代码/表头 */
-  --fg: #1c1a17;          /* 墨 */
-  --fg-muted: #57504a;
-  --fg-faint: #6b6357;     /* 5.3:1 on --bg，满足 AA（原 #8d857a 仅 3.2:1 不达标） */
-  --border: #ded7c9;
-  --border-strong: #c9c0ad;
+  --bg-sunken: #ebe7dd;   /* 凹陷/代码/表头 */
+  --fg: #22211e;          /* 墨 */
+  --fg-muted: #59564e;
+  --fg-faint: #706b60;
+  --border: #ddd7ca;
+  --border-strong: #c7bfae;
 
   /* 强调（朱红） */
   --accent: #bf3b26;        /* 图形/填充：白字其上 5.2:1 */
@@ -65,7 +65,7 @@
   --fs-md: 15px;
   --fs-lg: 18px;
   --fs-xl: 24px;
-  --fs-2xl: 32px;
+  --fs-2xl: 34px;
 
   /* 节奏 */
   --gap: 16px;

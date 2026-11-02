@@ -44,6 +44,8 @@ import type {
   GeneratePlan,
   GenerateResult,
   GenerationOut,
+  GenerationTiersResponse,
+  GenerationTier,
   Graph,
   KgBibleApplyResult,
   KgBibleRevisionListItem,
@@ -60,6 +62,8 @@ import type {
   LlmTestResult,
   NovelOut,
   NarrativeTiersResponse,
+  OutlineCandidate,
+  PlanExtensionResponse,
   PlotBible,
   PremiseProposal,
   ProjectCreate,
@@ -647,6 +651,18 @@ export const api = {
       jsonInit("POST", answers ? { answers } : {}),
     ),
 
+  generateOutline: (projectId: number, body: { confirm_bible: true; goals: string[]; node_count: number; preview: true }) =>
+    request<OutlineCandidate>(`/projects/${projectId}/generate-outline`, jsonInit("POST", body)),
+
+  clarifyOutline: (projectId: number, candidate: OutlineCandidate, answers: Record<string, string>) =>
+    request<OutlineCandidate>(`/projects/${projectId}/outline/clarify`, jsonInit("POST", { candidate, answers })),
+
+  applyOutline: (projectId: number, candidate: OutlineCandidate) =>
+    request<OutlineCandidate>(`/projects/${projectId}/outline/apply`, jsonInit("POST", { candidate })),
+
+  extendPlan: (projectId: number, count: number) =>
+    request<PlanExtensionResponse>(`/projects/${projectId}/plan-extension`, jsonInit("POST", { count })),
+
   buildKgFromGenerations: (projectId: number) =>
     request<{ characters: number; plotholes: number; relationships: number; chunks: number }>(
       `/projects/${projectId}/build-kg-from-generations`,
@@ -884,6 +900,14 @@ export const api = {
   },
 
   // ---------- 模型设置（渠道 / key / 模型，持久化 + 热切换） ----------
+  getGenerationTiers: () => request<GenerationTiersResponse>("/settings/generation-tiers"),
+
+  setGenerationTier: (tier: string) =>
+    request<{ tier: GenerationTier; applied: Record<string, unknown> }>(
+      "/settings/generation-tier",
+      jsonInit("POST", { tier }),
+    ),
+
   getLlmConfig: () => request<LlmConfig>("/settings/llm"),
 
   saveLlmConfig: (body: LlmConfigIn) =>

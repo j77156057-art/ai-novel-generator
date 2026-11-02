@@ -10,7 +10,7 @@
  * 三个角色的表单状态**各自独立**（RoleModelPanel 每实例一份 reactive），
  * 保存 A 绝不改动 B / C，也不清掉它们未保存的编辑。
  */
-import { onMounted, reactive } from "vue";
+import { onMounted, reactive, ref } from "vue";
 import { ApiError, api } from "@/api/client";
 import RoleModelPanel from "@/components/RoleModelPanel.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
@@ -19,10 +19,45 @@ import type {
   LlmRoleSavePayload,
   LlmRoleTestPayload,
   LlmTestResult,
+  GenerationTiersResponse,
 } from "@/api/types";
 import { LLM_ROLES, roleMeta } from "@/utils/llmRoles";
 
 const { config, loading, error, rolesReady, missingRoles, load, roleConfig } = useLlmConfig();
+const generationTiers = ref<GenerationTiersResponse | null>(null);
+const tiersLoading = ref(false);
+const tiersError = ref<string | null>(null);
+const tierBusy = ref<string | null>(null);
+const tierNotice = ref<string | null>(null);
+
+async function loadTiers(): Promise<void> {
+  tiersLoading.value = true;
+  tiersError.value = null;
+  try {
+    generationTiers.value = await api.getGenerationTiers();
+  } catch (err) {
+    tiersError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    tiersLoading.value = false;
+  }
+}
+
+async function applyGenerationTier(tier: string): Promise<void> {
+  if (tierBusy.value || generationTiers.value?.current === tier) return;
+  tierBusy.value = tier;
+  tierNotice.value = null;
+  tiersError.value = null;
+  try {
+    const result = await api.setGenerationTier(tier);
+    if (generationTiers.value) generationTiers.value.current = result.tier.key;
+    tierNotice.value = `已切换到「${result.tier.name}」档，后续生成使用新配置。`;
+    await load();
+  } catch (err) {
+    tiersError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    tierBusy.value = null;
+  }
+}
 
 interface RoleNotice {
   kind: "ok" | "err" | "warn";
@@ -105,7 +140,9 @@ async function onTest(payload: LlmRoleTestPayload): Promise<void> {
   }
 }
 
-onMounted(load);
+onMounted(() => {
+  void Promise.all([load(), loadTiers()]);
+});
 </script>
 
 <template>
@@ -118,6 +155,35 @@ onMounted(load);
       （.gitignore 保护），页面不显示明文。
     </p>
   </header>
+
+  <section class="tier-section" aria-labelledby="tier-title">
+    <div class="tier-heading">
+      <div><span class="tier-kicker">GENERATION PRESET</span><h2 id="tier-title">生成档位</h2></div>
+      <span v-if="generationTiers && !generationTiers.current" class="tag">当前为自定义配置</span>
+    </div>
+    <p class="tier-intro">按速度、改写与调用成本选择预设。切换会写入生成模型配置，并在后续生成中生效。</p>
+    <div v-if="tiersLoading" class="empty"><span class="spinner" /> 正在读取生成档位…</div>
+    <div v-if="tiersError" class="notice err" role="alert">{{ tiersError }}<button class="link-btn" type="button" @click="loadTiers">重试</button></div>
+    <div v-if="tierNotice" class="notice ok" role="status">{{ tierNotice }}</div>
+    <div v-if="generationTiers?.tiers.length" class="tier-grid">
+      <button
+        v-for="tier in generationTiers.tiers"
+        :key="tier.key"
+        class="tier-card"
+        :class="{ active: generationTiers.current === tier.key }"
+        type="button"
+        :disabled="!!tierBusy || generationTiers.current === tier.key"
+        @click="applyGenerationTier(tier.key)"
+      >
+        <span class="tier-top"><strong>{{ tier.name }}</strong><span v-if="generationTiers.current === tier.key">当前档位</span></span>
+        <span class="tier-description">{{ tier.description }}</span>
+        <span class="tier-facts"><span>{{ tier.cost_hint }}</span><span>{{ tier.speed_hint }}</span></span>
+        <span class="tier-model mono">{{ tier.provider }} / {{ tier.model }}</span>
+        <span class="tier-action">{{ tierBusy === tier.key ? "切换中…" : generationTiers.current === tier.key ? "已生效" : "使用此档位 →" }}</span>
+      </button>
+    </div>
+    <div v-else-if="!tiersLoading && !tiersError" class="empty">后端暂未提供生成档位。</div>
+  </section>
 
   <!-- 后端未就绪：如实标注「下面回显的是同一份单模型生效值」，不伪造三份配置 -->
   <div v-if="!rolesReady && config" class="notice warn" style="margin-bottom: var(--gap-lg); line-height: 1.8">
@@ -159,6 +225,24 @@ onMounted(load);
 </template>
 
 <style scoped>
+.tier-section { margin-bottom: 26px; padding: 22px 24px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; }
+.tier-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.tier-kicker { color: var(--accent-ink); font: 10px/1.4 var(--font-mono); letter-spacing: .12em; }
+.tier-heading h2 { margin-top: 4px; font: 21px/1.3 var(--font-serif); }
+.tier-intro { margin: 8px 0 18px; color: var(--fg-muted); font-size: var(--fs-sm); }
+.tier-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.tier-card { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 12px; padding: 17px; text-align: left; color: var(--fg); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.tier-card:hover:not(:disabled) { border-color: var(--accent); }
+.tier-card.active { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.tier-card:disabled { cursor: default; opacity: 1; }
+.tier-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tier-top strong { font: 18px/1.3 var(--font-serif); }
+.tier-top span { color: var(--accent-ink); font-size: 10px; }
+.tier-description { min-height: 4.8em; color: var(--fg-muted); font-size: 11px; line-height: 1.65; }
+.tier-facts { display: flex; flex-direction: column; gap: 4px; color: var(--fg-faint); font-size: 10px; }
+.tier-model { overflow: hidden; text-overflow: ellipsis; color: var(--fg-faint); font-size: 9px; white-space: nowrap; }
+.tier-action { margin-top: auto; padding-top: 10px; color: var(--accent-ink); border-top: 1px solid var(--border); font-size: 11px; font-weight: 600; }
+.link-btn { margin-left: 8px; padding: 0; color: inherit; background: none; border: 0; text-decoration: underline; cursor: pointer; }
 .effective-banner {
   margin-bottom: var(--gap-lg);
 }
@@ -170,8 +254,7 @@ onMounted(load);
   margin-bottom: var(--gap-lg);
 }
 @media (max-width: 960px) {
-  .panels {
-    grid-template-columns: 1fr;
-  }
+  .panels, .tier-grid { grid-template-columns: 1fr; }
+  .tier-description { min-height: 0; }
 }
 </style>

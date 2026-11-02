@@ -343,6 +343,7 @@ export interface ProjectOut {
   premise: string | null;
   reference_novel_ids: number[] | null;
   plot_bible: PlotBible | null;
+  plot_timeline?: Record<string, unknown> | null;
   generation_length: number;
   segment_count: number;
   /** 故事锚定方式：generated_branch = 自己的故事；reference_anchor = 接着参考书写。 */
@@ -353,6 +354,63 @@ export interface ProjectOut {
   narrative_tier: string | null;
   /** 已落库文风档案（蒸馏库「应用」写入的单槽缓存）；null = 尚未蒸馏/应用。 */
   style_narrative?: Record<string, unknown> | null;
+}
+
+export interface OutlineNode {
+  title: string;
+  premise: string;
+  motivation: string;
+  action: string;
+  result: string;
+  cost: string;
+  time: string;
+  location: string;
+  participants: string[];
+  state_before: string;
+  state_after: string;
+}
+
+export interface OutlineCandidate {
+  status: string;
+  model_participated?: boolean;
+  degraded?: boolean;
+  error?: Record<string, unknown> | null;
+  nodes?: OutlineNode[];
+  outline?: string[];
+  structurally_complete?: boolean;
+  verified?: boolean;
+  unknown_fields?: { node_id: string; field: string; value: unknown }[];
+  clarifications?: { question: string; field: string; dependent_nodes?: string[] }[];
+  source_fingerprint?: string;
+  plot_structure_note?: string;
+  saved?: boolean;
+}
+
+export interface PlanExtensionResponse {
+  status: string;
+  message: string;
+  nodes: { node_id: string; title: string; time: string }[];
+  contracts: { segment_no: number; node_id: string }[];
+}
+
+export interface GenerationTier {
+  key: string;
+  name: string;
+  description: string;
+  provider: string;
+  model: string;
+  max_tokens: number;
+  style_rewrite: boolean;
+  cost_hint: string;
+  speed_hint: string;
+}
+
+export interface GenerationTiersResponse {
+  tiers: GenerationTier[];
+  current: string | null;
+  current_provider: string;
+  current_model: string;
+  current_style_rewrite: boolean;
 }
 
 export interface KgNode {
