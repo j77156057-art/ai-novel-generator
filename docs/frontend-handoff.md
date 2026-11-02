@@ -8,7 +8,7 @@
 ## 0. 一分钟上手
 
 ```powershell
-cd frontend
+cd <REPO_ROOT>/frontend
 npm ci            # 首次
 npm run dev       # dev server → http://localhost:5173
 npm run typecheck # vue-tsc --noEmit（必须过）
@@ -29,18 +29,22 @@ python -m uvicorn app.main:app --port 8000 --host 127.0.0.1
 
 ---
 
+
+> ⚠️ **本仓库不写本机绝对路径**：上面的 `<REPO_ROOT>` / `<WORKSPACE>` / `<TMP>`
+> 都是**占位符**（本机上的真实路径每次可能不同，由助手在当次对话里给出）。
+
 ## 0'. 本轮怎么干（**先读这一节**）
 
 | 项 | 值 |
 |---|---|
-| **仓库路径（就用这棵）** | `C:\Work\ai-novel-generator-pub` |
+| **仓库路径（就用这棵）** | `<REPO_ROOT>` |
 | **分支** | `feat/ui-trae`（已从 `main` 建好，**别在 `main` 上直接改**） |
-| 上一轮那版 UI 的**参考补丁** | `D:\Temp\trae_ui_reference.patch`（196KB，`git apply` 可看全貌；**不要直接 apply 到发布版**） |
+| 上一轮那版 UI 的**参考补丁** | `<TMP>/trae_ui_reference.patch`（196KB，`git apply` 可看全貌；**不要直接 apply 到发布版**） |
 | 上一轮那版 UI 的**原始提交** | dev 树 `ai-novel-generator` 的 `91c4970`（10 个文件，+1267 / −515） |
 
 ### ⚠️ 为什么不能直接拷文件 / 直接 apply 补丁
 
-上一轮那版 UI 是在**另一棵更旧的树**上做的（dev 树：`...\WorkBuddy6-10-12-11-59-30i-novel-generator`）。
+上一轮那版 UI 是在**另一棵更旧的树**上做的（dev 树：`<WORKSPACE>/ai-novel-generator`）。
 两棵树已经**双向分叉**：
 
 | | 仅发布版有 | 仅 dev 树有 | 两边都有但内容不同 |
@@ -65,14 +69,14 @@ python -m uvicorn app.main:app --port 8000 --host 127.0.0.1
 
 ### 本轮该做的三件事
 
-1. **UI 改版在发布版这棵树上重做**（上一轮那版可作视觉参考，补丁在 `D:\Temp\trae_ui_reference.patch`）；
+1. **UI 改版在发布版这棵树上重做**（上一轮那版可作视觉参考，补丁在 `<TMP>/trae_ui_reference.patch`）；
 2. **G1 导出三件套** —— 正文之外还有大纲 / 人物表 / 坑清单（数据都在，缺拼装与入口）；
 3. **G2 登录占位** —— 第一屏是登录（单用户占位，**不做真鉴权**，也**不要**用登录态去拦 `/api/*`）。
 
 ### 本轮不能弄红的东西（与上一版交接单相同，再强调一次）
 
 ```powershell
-cd C:\Worki-novel-generator-pubrontend
+cd <REPO_ROOT>/frontend
 npm run typecheck   # vue-tsc --noEmit，必须 0 错误
 npm test            # 58 + 33，必须全绿
 npm run build       # 上面两条都过才产出 dist/
@@ -121,7 +125,7 @@ npm run build       # 上面两条都过才产出 dist/
 
 ```powershell
 # 后端已在 8000 时
-curl http://127.0.0.1:8000/openapi.json -o D:\Temp\openapi.json
+curl http://127.0.0.1:8000/openapi.json -o <TMP>/openapi.json
 # 或者直接在浏览器打开 http://127.0.0.1:8000/docs （Swagger UI，可交互）
 ```
 
@@ -216,7 +220,7 @@ curl http://127.0.0.1:8000/openapi.json -o D:\Temp\openapi.json
 ## 5. 提交前自检清单
 
 ```
-cd frontend
+cd <REPO_ROOT>/frontend
 npm run typecheck   # 必须 0 错误
 npm test            # 必须 58 + 33 全绿
 npm run build       # 必须产出 dist/

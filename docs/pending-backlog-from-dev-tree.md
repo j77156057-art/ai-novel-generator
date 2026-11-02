@@ -1,7 +1,11 @@
+
+> ⚠️ **本仓库不写本机绝对路径**：上面的 `<REPO_ROOT>` / `<WORKSPACE>` / `<TMP>`
+> 都是**占位符**（本机上的真实路径每次可能不同，由助手在当次对话里给出）。
+
 # 待办清单：dev 树（`ai-novel-generator`）独有的后端改动（2026-11-02 记录）
 
-> **为什么有这份清单**：仓库分成了两棵 —— **发布版**（`C:\Work\ai-novel-generator-pub`，
-> 即 GitHub 上那份）与**工作区 dev 树**（`C:\Users\h'h'h\WorkBuddy\2026-10-12-11-59-30\ai-novel-generator`）。
+> **为什么有这份清单**：仓库分成了两棵 —— **发布版**（`<REPO_ROOT>`，
+> 即 GitHub 上那份）与**工作区 dev 树**（`<WORKSPACE>/ai-novel-generator`）。
 > 两棵树**双向分叉**（后端 59/75 文件不同、发布版独有 83 个文件；前端 22/23 不同、发布版独有 8 个）。
 > 前端已决定**在发布版上重做**（见 `docs/frontend-handoff.md`）；
 > **后端这一批修复按主人决定：先不移植，只记录清单。**
@@ -35,7 +39,7 @@
 ## 复现命令（要拿 dev 树的原始改动时）
 
 ```powershell
-$W = "C:\Users\h'h'h\WorkBuddy\2026-10-12-11-59-30\ai-novel-generator"
+$W = "<WORKSPACE>/ai-novel-generator"
 git -C $W show 75fea74 --stat
-git -C $W format-patch -1 75fea74 --stdout > D:\Temp\kg_fix_speech_attrib.patch
+git -C $W format-patch -1 75fea74 --stdout > <TMP>/kg_fix_speech_attrib.patch
 ```

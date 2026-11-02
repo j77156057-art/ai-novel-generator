@@ -1,6 +1,6 @@
 # 任务书对照：MVP Spec v2 逐条现状（2026-11-02）
 
-> 任务书 = `C:\Users\h'h'h\WorkBuddy\2026-10-12-11-59-30\ai-novel-generator-plan.md`
+> 任务书 = `<WORKSPACE>/ai-novel-generator-plan.md`
 > （2026-10-12 的 wayfinder 关图产物：`/wayfinder` → to-spec → **MVP Spec v2**）。
 > ⚠️ **发布版仓库按规矩不含 PRD**（任务书、语料、含原文的验收产物都不进仓库），
 > 所以这份对照表放在这里，作为「任务书要求 ↔ 现状」的**唯一落点**。

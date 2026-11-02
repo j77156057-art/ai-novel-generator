@@ -83,4 +83,4 @@
 
 ---
 
-复算脚本：`D:\Temp\e1_score\recompute_ruler.py`；指纹识别：`D:\Temp\e1_score\identify_arms.py`。
+复算脚本：`<TMP>/e1_score\recompute_ruler.py`；指纹识别：`<TMP>/e1_score\identify_arms.py`。
