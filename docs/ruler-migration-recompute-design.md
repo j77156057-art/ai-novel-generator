@@ -28,9 +28,9 @@
 
 | 组 | 产出目录 | 参考书 | 旧结论出处 |
 |---|---|---|---|
-| 六本书臂 | `cross_book/{1980,shiRi,juZhong,shenMi,haoMen,xiShen}` | 各自那一本 | §9.5 判决 1/3/3c/4 |
+| 六本书臂 | `cross_book/{liangJie,shiRi,juZhong,shenMi,haoMen,xiShen}` | 各自那一本 | §9.5 判决 1/3/3c/4 |
 | 裸写基准 | `cross_book/bare` | 无（`own_band` 0/0） | §9.5 判决 4 |
-| E1 两臂 | `arm3_dushi` / `arm3_xianxia` | 记忆曝光 / 魔道祖师 | §8.3 / §9.5 |
+| E1 两臂 | `arm3_dushi` / `arm3_xianxia` | 《回声年代》 / 《道途魔典》 | §8.3 / §9.5 |
 | §10 改写 A/B/C | `cross_ab{,2}/config_*` | 用指纹匹配查（见 §4） | §10.6 |
 | 六本书裸写臂 | `cross_book_side/*` | 各自那一本 | §9.5 判决 4 的裸写侧 |
 
