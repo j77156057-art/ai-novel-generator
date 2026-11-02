@@ -660,6 +660,18 @@ export const api = {
   applyOutline: (projectId: number, candidate: OutlineCandidate) =>
     request<OutlineCandidate>(`/projects/${projectId}/outline/apply`, jsonInit("POST", { candidate })),
 
+  reviseBudget: (projectId: number, body: {
+    source_fingerprint: string;
+    node_id: string;
+    segment_budget: number;
+    reason: string;
+    confirm: true;
+  }) =>
+    request<{ saved: boolean; plot_timeline: Record<string, unknown>; source_fingerprint: string; verified: boolean }>(
+      `/projects/${projectId}/outline/revise-budget`,
+      jsonInit("POST", body),
+    ),
+
   extendPlan: (projectId: number, count: number) =>
     request<PlanExtensionResponse>(`/projects/${projectId}/plan-extension`, jsonInit("POST", { count })),
 

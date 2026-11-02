@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from "vue";
+import { onBeforeUnmount, onMounted, ref, computed } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "@/api/client";
 import type {
@@ -66,6 +66,8 @@ const digestMode = ref<"auto" | "whole" | "retrieval">("auto");
 /** 压缩比目标（输出 ≤ 输入 / 该值）。 */
 const digestRatio = ref(10);
 const projects = ref<ProjectOut[]>([]);
+const projectsLoading = ref(false);
+const projectsError = ref<string | null>(null);
 const digestProjectId = ref<number | null>(null);
 let digestTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -184,8 +186,8 @@ async function pollDigest(projectId: number, jobId: number): Promise<void> {
       }
     }
   } catch (err) {
-    // 轮询失败不打断主流程：下一 tick 会再试，结论由服务端任务状态兜底。
-    console.warn("摘要进度轮询失败，下个周期重试：", err);
+    stopDigestPolling();
+    digestErr.value = `摘要进度读取失败，自动刷新已停止：${err instanceof Error ? err.message : String(err)}。重新选择这本书可重试。`;
   }
 }
 
@@ -220,6 +222,7 @@ async function startDigest(): Promise<void> {
 }
 
 async function openChunks(n: NovelOut) {
+  stopDigestPolling();
   selected.value = n;
   hits.value = null;
   q.value = "";
@@ -253,16 +256,27 @@ async function runSearch() {
   }
 }
 
-// 提交需要项目归属（任务表的项目列必填）。项目列表只加载一次。
-onMounted(async () => {
-  await reloadNovels();
+// 提交需要项目归属（任务表的项目列必填）。
+async function loadProjects(): Promise<void> {
+  projectsLoading.value = true;
+  projectsError.value = null;
   try {
     projects.value = await api.listProjects();
-    if (projects.value.length) digestProjectId.value = projects.value[0].id;
-  } catch {
-    // 拿不到项目列表就提交不了：表单里会显示「需要先有一个项目」。
+    if (projects.value.length && !digestProjectId.value) digestProjectId.value = projects.value[0].id;
+  } catch (err) {
+    projects.value = [];
+    digestProjectId.value = null;
+    projectsError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    projectsLoading.value = false;
   }
+}
+
+onMounted(async () => {
+  await reloadNovels();
+  await loadProjects();
 });
+onBeforeUnmount(stopDigestPolling);
 </script>
 
 <template>
@@ -495,7 +509,11 @@ onMounted(async () => {
             {{ digestSubmitting ? "提交中…" : digestState === "none" ? "生成全书摘要" : "重新生成全书摘要" }}
           </button>
         </div>
-        <div v-if="!projects.length" class="notice warn" style="margin-top: 10px">
+        <div v-if="projectsLoading" class="empty" style="margin-top: 10px"><span class="spinner" /> 正在读取发起项目…</div>
+        <div v-else-if="projectsError" class="notice err" role="alert" style="margin-top: 10px">
+          发起项目加载失败：{{ projectsError }}<button class="link-btn" type="button" @click="loadProjects">重试</button>
+        </div>
+        <div v-else-if="!projects.length" class="notice warn" style="margin-top: 10px">
           还没有任何项目。摘要任务需要归属到一个项目，请先在「创作」里新建一个。
         </div>
         <div class="faint" style="margin-top: 10px; font-size: var(--fs-xs); line-height: 1.7">

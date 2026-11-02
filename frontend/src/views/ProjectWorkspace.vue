@@ -18,6 +18,7 @@ import type {
   PlotBible,
   ProjectOut,
   StoryBackground,
+  StyleDistillDetail,
   StyleDistillSummary,
   StyleNarrativeConflict,
 } from "@/api/types";
@@ -51,6 +52,8 @@ const projectId = Number(route.params.id);
 const project = ref<ProjectOut | null>(null);
 const loadError = ref<string | null>(null);
 const novels = ref<NovelOut[]>([]);
+const novelsLoading = ref(false);
+const novelsError = ref<string | null>(null);
 
 // 当前生效的 LLM 渠道（工作台徽标，点击去模型设置）
 const llmConfig = ref<LlmConfig | null>(null);
@@ -1247,6 +1250,8 @@ const streaming = ref(false);
 const streamedText = ref("");
 const liveBox = ref<HTMLElement | null>(null);
 const generations = ref<{ id: number; segment_no: number; text: string | null; measure?: Measure }[]>([]);
+const generationsLoading = ref(false);
+const generationsError = ref<string | null>(null);
 const lastText = ref<string | null>(null);
 
 /**
@@ -1328,14 +1333,21 @@ async function loadProject() {
 }
 
 async function loadNovels() {
+  novelsLoading.value = true;
+  novelsError.value = null;
   try {
     novels.value = await api.listNovels();
-  } catch {
+  } catch (err) {
     novels.value = [];
+    novelsError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    novelsLoading.value = false;
   }
 }
 
 async function loadGenerations() {
+  generationsLoading.value = true;
+  generationsError.value = null;
   try {
     const gens = await api.listGenerations(projectId);
     generations.value = gens.map((g) => ({
@@ -1346,8 +1358,11 @@ async function loadGenerations() {
       measure: toMeasure(g.measure) ?? measureText(g.text || ""),
     }));
     if (page.value > totalPages.value) page.value = totalPages.value;
-  } catch {
+  } catch (err) {
     generations.value = [];
+    generationsError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    generationsLoading.value = false;
   }
 }
 
@@ -1619,6 +1634,14 @@ let distillTimer: ReturnType<typeof setInterval> | null = null;
 // ── 文风蒸馏库（跨项目复用）状态 ──
 const styleDistills = ref<StyleDistillSummary[]>([]);
 const styleDistillsLoading = ref(false);
+const styleDetail = ref<StyleDistillDetail | null>(null);
+const styleDetailId = ref<number | null>(null);
+const styleDetailLoading = ref(false);
+const styleDetailError = ref<string | null>(null);
+const styleDetailOpen = ref(false);
+const styleDetailText = computed(() => styleDetail.value?.style_narrative
+  ? JSON.stringify(styleDetail.value.style_narrative, null, 2)
+  : "该档案没有可显示的规则内容。");
 /** 正在被「应用」到本项目的库条目 id（按钮禁用 + 文案用）。 */
 const styleDistillApplying = ref<number | null>(null);
 const styleDistillMsg = ref<string | null>(null);
@@ -1852,6 +1875,21 @@ async function loadStyleDistills() {
     styleDistills.value = [];
   } finally {
     styleDistillsLoading.value = false;
+  }
+}
+
+async function openStyleDistill(id: number) {
+  styleDetailId.value = id;
+  styleDetailOpen.value = true;
+  styleDetailLoading.value = true;
+  styleDetailError.value = null;
+  try {
+    styleDetail.value = await api.getStyleDistill(id);
+  } catch (err) {
+    styleDetail.value = null;
+    styleDetailError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    styleDetailLoading.value = false;
   }
 }
 
@@ -2166,7 +2204,7 @@ const exportOptions: { key: ProjectExportType; description: string }[] = [
 ];
 
 function runExport() {
-  exportSelection.text = generations.value.length > 0;
+  exportSelection.text = generations.value.length > 0 && !generationsError.value;
   exportErr.value = null;
   exportNotice.value = null;
   exportOpen.value = true;
@@ -2181,33 +2219,101 @@ async function runSelectedExport() {
     const current = await api.getProject(projectId);
     project.value = current;
     const title = sanitizeFilename(current.title) || "未命名作品";
-    let count = 0;
+    const triggeredFiles: string[] = [];
     if (exportSelection.text) {
-      await api.exportTxt(projectId, `${title}-正文.txt`);
-      count += 1;
+      const filename = `${title}-正文.txt`;
+      await api.exportTxt(projectId, filename);
+      triggeredFiles.push(filename);
     }
     if (exportSelection.outline) {
-      downloadTextFile(projectExportFilename(current, "outline"), formatOutlineMarkdown(current.outline));
-      count += 1;
+      const filename = projectExportFilename(current, "outline");
+      downloadTextFile(filename, formatOutlineMarkdown(current.outline));
+      triggeredFiles.push(filename);
     }
     if (exportSelection.characters) {
       const result = await api.listCharacterCards(projectId);
-      downloadTextFile(
-        projectExportFilename(current, "characters"),
-        formatCharacterCardsMarkdown(result.characters || []),
-      );
-      count += 1;
+      const filename = projectExportFilename(current, "characters");
+      downloadTextFile(filename, formatCharacterCardsMarkdown(result.characters || []));
+      triggeredFiles.push(filename);
     }
     if (exportSelection.reminders) {
       const result = await api.getReminders(projectId);
-      downloadTextFile(projectExportFilename(current, "reminders"), formatRemindersMarkdown(result));
-      count += 1;
+      const filename = projectExportFilename(current, "reminders");
+      downloadTextFile(filename, formatRemindersMarkdown(result));
+      triggeredFiles.push(filename);
     }
-    exportNotice.value = `已生成 ${count} 份文件，浏览器将按下载权限逐份保存。`;
+    exportNotice.value = `已触发下载：${triggeredFiles.join("、")}。请在浏览器下载列表确认保存结果；若被拦截，请允许多文件下载后重试。`;
   } catch (err) {
     exportErr.value = err instanceof Error ? err.message : String(err);
   } finally {
     exportBusy.value = false;
+  }
+}
+
+interface CurrentNodeBudget {
+  nodeId: string;
+  title: string;
+  original: number;
+  used: number;
+  fingerprint: string;
+}
+const currentNodeBudget = computed<CurrentNodeBudget | null>(() => {
+  const timeline = project.value?.plot_timeline as any;
+  const nodeId = typeof timeline?.current_node === "string" ? timeline.current_node : "";
+  const node = nodeId ? timeline?.nodes?.[nodeId] : null;
+  const fingerprint = timeline?.planning?.source_fingerprint;
+  if (!nodeId || !node || typeof fingerprint !== "string" || !fingerprint) return null;
+  return {
+    nodeId,
+    title: typeof node.title === "string" && node.title ? node.title : nodeId,
+    original: Number(node.segment_budget || 1),
+    used: Number(timeline?.seg_counts?.[nodeId] || 0),
+    fingerprint,
+  };
+});
+const budgetSegmentCount = ref(2);
+const budgetReason = ref("");
+const budgetBusy = ref(false);
+const budgetError = ref<string | null>(null);
+const budgetNotice = ref<string | null>(null);
+
+function openBudgetEditor() {
+  const current = currentNodeBudget.value;
+  if (!current) return;
+  budgetSegmentCount.value = Math.max(current.original, current.used) + 1;
+  budgetReason.value = "";
+  budgetError.value = null;
+  budgetNotice.value = null;
+}
+
+async function runReviseBudget() {
+  const current = currentNodeBudget.value;
+  if (!current) return;
+  if (!budgetReason.value.trim()) {
+    budgetError.value = "请填写增加预算的原因。";
+    return;
+  }
+  if (budgetSegmentCount.value <= Math.max(current.original, current.used)) {
+    budgetError.value = "新预算必须大于原预算和已用段数。";
+    return;
+  }
+  budgetBusy.value = true;
+  budgetError.value = null;
+  budgetNotice.value = null;
+  try {
+    await api.reviseBudget(projectId, {
+      source_fingerprint: current.fingerprint,
+      node_id: current.nodeId,
+      segment_budget: budgetSegmentCount.value,
+      reason: budgetReason.value.trim(),
+      confirm: true,
+    });
+    project.value = await api.getProject(projectId);
+    budgetNotice.value = `已将「${current.title}」预算从 ${current.original} 段调整为 ${budgetSegmentCount.value} 段。`;
+  } catch (err) {
+    budgetError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    budgetBusy.value = false;
   }
 }
 
@@ -2762,7 +2868,11 @@ onUnmounted(() => {
       选中哪些，生成时<strong>只</strong>抽取这些语料的风格；不选则完全自由生成，不会混入任何语料。
       每本语料后续会建成<strong>各自独立</strong>的图谱。
     </p>
-    <div v-if="!novels.length" class="empty">语料库为空，可跳过本步。</div>
+    <div v-if="novelsLoading" class="empty"><span class="spinner" /> 正在读取语料…</div>
+    <div v-else-if="novelsError" class="notice err" role="alert">
+      语料加载失败：{{ novelsError }}<button class="link-btn" type="button" @click="loadNovels">重试</button>
+    </div>
+    <div v-else-if="!novels.length" class="empty">语料库为空，可跳过本步。</div>
     <div class="chips">
       <button
         v-for="n in novels"
@@ -3000,6 +3110,7 @@ onUnmounted(() => {
             <span class="faint">蒸馏程度：{{ d.tier_name || d.tier }}档 · {{ d.n_chapters ?? 0 }} 章 · {{ d.rule_count ?? 0 }} 条规则</span>
           </div>
           <div class="lib-actions">
+            <button class="btn sm ghost" type="button" @click="openStyleDistill(d.id)">预览全文规则</button>
             <button
               class="btn sm"
               :disabled="styleDistillApplying === d.id"
@@ -3381,11 +3492,15 @@ onUnmounted(() => {
             <option :value="3">3 节</option><option :value="5">5 节</option><option :value="8">8 节</option><option :value="12">12 节</option>
           </select>
         </div>
-        <button class="btn primary" type="button" :disabled="!!outlineBusy || !!generations.length" @click="runGenerateOutline">
+        <button class="btn primary" type="button" :disabled="!!outlineBusy || !!generations.length || !!generationsError || generationsLoading" @click="runGenerateOutline">
           {{ outlineBusy === "generate" ? "生成中…" : "生成大纲草案" }}
         </button>
       </div>
-      <p v-if="generations.length" class="faint outline-lock">已有正文，不能覆盖剧情规划；可在生成控制台按需扩展后续规划。</p>
+      <p v-if="generationsError" class="notice err outline-lock" role="alert">
+        正文记录加载失败，暂不能生成或覆盖大纲。{{ generationsError }}<button class="link-btn" type="button" @click="loadGenerations">重试</button>
+      </p>
+      <p v-else-if="generationsLoading" class="faint outline-lock">正在核对正文记录，完成后才能覆盖大纲。</p>
+      <p v-else-if="generations.length" class="faint outline-lock">已有正文，不能覆盖剧情规划；可在生成控制台按需扩展后续规划。</p>
       <div v-if="outlineErr" class="notice err" role="alert">{{ outlineErr }}</div>
       <div v-if="outlineNotice" class="notice ok" role="status">{{ outlineNotice }}</div>
 
@@ -3417,7 +3532,7 @@ onUnmounted(() => {
         <div class="draft-actions">
           <span v-if="outlineCandidate.structurally_complete" class="tag ok">结构完整，待保存</span>
           <span v-else class="tag warn">仍有 {{ outlineCandidate.unknown_fields?.length || 0 }} 项待确认</span>
-          <button class="btn primary" type="button" :disabled="!!outlineBusy || !outlineCandidate.structurally_complete || !!generations.length" @click="runApplyOutline">
+          <button class="btn primary" type="button" :disabled="!!outlineBusy || !outlineCandidate.structurally_complete || !!generations.length || !!generationsError || generationsLoading" @click="runApplyOutline">
             {{ outlineBusy === "apply" ? "保存中…" : "确认并保存大纲" }}
           </button>
           <button class="btn ghost" type="button" @click="goStep(6)">前往生成控制台 →</button>
@@ -3572,6 +3687,23 @@ onUnmounted(() => {
       </button>
       <button class="btn" :disabled="!project" @click="runExport">导出作品</button>
     </div>
+
+    <details v-if="currentNodeBudget" class="plan-extension">
+      <summary @click="openBudgetEditor">当前节点预算 <span>{{ currentNodeBudget.title }} · 原预算 {{ currentNodeBudget.original }} 段 · 已用 {{ currentNodeBudget.used }} 段</span></summary>
+      <div class="extension-body">
+        <p>只能增加当前未完成节点的预算，且不得小于已用段数。修订会记录原因与当前规划指纹，不会改动其他节点。</p>
+        <div class="budget-facts">
+          <span>节点：<strong>{{ currentNodeBudget.nodeId }}</strong></span><span>原预算：<strong>{{ currentNodeBudget.original }} 段</strong></span><span>已用：<strong>{{ currentNodeBudget.used }} 段</strong></span>
+        </div>
+        <div class="row tight">
+          <div class="field"><label for="budget-count">新总预算（段）</label><input id="budget-count" class="input" type="number" :min="Math.max(currentNodeBudget.original, currentNodeBudget.used) + 1" v-model.number="budgetSegmentCount" /></div>
+          <div class="field budget-reason"><label for="budget-reason">修订原因</label><input id="budget-reason" class="input" v-model="budgetReason" placeholder="说明为什么当前节点需要更多段落" /></div>
+          <button class="btn" type="button" :disabled="budgetBusy" @click="runReviseBudget">{{ budgetBusy ? "修订中…" : "确认修订预算" }}</button>
+        </div>
+        <div v-if="budgetError" class="notice err" role="alert">{{ budgetError }}</div>
+        <div v-if="budgetNotice" class="notice ok" role="status">{{ budgetNotice }}</div>
+      </div>
+    </details>
 
     <details v-if="project?.plot_timeline" class="plan-extension">
       <summary>后续规划与扩展 <span>用于现有剧情点已写完、仍需继续创作时</span></summary>
@@ -4346,7 +4478,11 @@ onUnmounted(() => {
         <button class="btn sm" :disabled="page >= totalPages" @click="page++">下一页 →</button>
       </div>
 
-      <div v-if="!generations.length" class="empty">还没有生成记录，点「生成一段」开始。</div>
+      <div v-if="generationsLoading" class="empty"><span class="spinner" /> 正在读取生成记录…</div>
+      <div v-else-if="generationsError" class="notice err" role="alert">
+        生成记录加载失败：{{ generationsError }}<button class="link-btn" type="button" @click="loadGenerations">重试</button>
+      </div>
+      <div v-else-if="!generations.length" class="empty">还没有生成记录，点「生成一段」开始。</div>
       <div class="list">
         <div
           v-for="g in pagedGens"
@@ -4568,6 +4704,27 @@ onUnmounted(() => {
 
   </template>
 
+  <div v-if="styleDetailOpen" class="export-mask" @click.self="styleDetailOpen = false">
+    <section class="export-dialog style-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="style-detail-title">
+      <div class="export-head">
+        <div><span class="export-kicker">FULL RULESET</span><h2 id="style-detail-title">文风档案 #{{ styleDetailId }} · 全文规则</h2></div>
+        <button class="btn ghost" type="button" @click="styleDetailOpen = false">关闭</button>
+      </div>
+      <p class="export-intro">此处展示服务端保存的完整 `style_narrative`，用于应用前复核，不会修改档案。</p>
+      <div v-if="styleDetailLoading" class="empty"><span class="spinner" /> 正在读取档案全文…</div>
+      <div v-else-if="styleDetailError" class="notice err" role="alert">
+        档案详情加载失败：{{ styleDetailError }}<button v-if="styleDetailId" class="link-btn" type="button" @click="openStyleDistill(styleDetailId)">重试</button>
+      </div>
+      <template v-else-if="styleDetail">
+        <div class="style-detail-meta">
+          <span class="tag">{{ styleDetail.tier_name || styleDetail.tier }}</span>
+          <span>{{ styleDetail.rule_count }} 条规则 · {{ styleDetail.n_chapters }} 章</span>
+        </div>
+        <pre class="style-detail-content">{{ styleDetailText }}</pre>
+      </template>
+    </section>
+  </div>
+
   <div v-if="exportOpen" class="export-mask" @click.self="!exportBusy && (exportOpen = false)">
     <section class="export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-title">
       <div class="export-head">
@@ -4576,9 +4733,9 @@ onUnmounted(() => {
       </div>
       <p class="export-intro">选择本次需要的文件。正文为 TXT，其余为 Markdown；每份文件自动带作品名与类型。</p>
       <div class="export-options">
-        <label class="export-option" :class="{ disabled: !generations.length }">
-          <input v-model="exportSelection.text" type="checkbox" :disabled="!generations.length || exportBusy" />
-          <span><strong>正文</strong><small>{{ generations.length ? `${generations.length} 段生成正文 · TXT` : "暂无生成正文" }}</small></span>
+        <label class="export-option" :class="{ disabled: !generations.length || !!generationsError }">
+          <input v-model="exportSelection.text" type="checkbox" :disabled="!generations.length || !!generationsError || exportBusy" />
+          <span><strong>正文</strong><small>{{ generationsError ? "正文记录加载失败，不能导出" : generations.length ? `${generations.length} 段生成正文 · TXT` : "暂无生成正文" }}</small></span>
           <em>.txt</em>
         </label>
         <label v-for="option in exportOptions" :key="option.key" class="export-option">
@@ -5551,6 +5708,8 @@ onUnmounted(() => {
 .extension-body { padding: 0 2px 16px; }
 .extension-body > p { max-width: 76ch; margin: 0 0 12px; color: var(--fg-muted); font-size: var(--fs-xs); }
 .extension-body .notice { margin-top: 10px; }
+.budget-facts { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 12px; color: var(--fg-muted); font-size: var(--fs-xs); }
+.budget-reason { min-width: 260px; flex: 1; }
 .export-mask { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 24px; background: rgba(28, 28, 24, .56); }
 .export-dialog { width: min(100%, 600px); max-height: calc(100vh - 48px); overflow-y: auto; padding: 26px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 70px rgba(20, 20, 17, .22); }
 .export-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
@@ -5567,6 +5726,9 @@ onUnmounted(() => {
 .export-dialog .notice { margin-top: 12px; }
 .export-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
 .export-actions > span { color: var(--fg-faint); font-size: var(--fs-xs); }
+.style-detail-dialog { width: min(100%, 820px); }
+.style-detail-meta { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; color: var(--fg-faint); font-size: var(--fs-xs); }
+.style-detail-content { max-height: 55vh; overflow: auto; margin: 0; padding: 16px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fg-muted); background: var(--bg); border: 1px solid var(--border); border-radius: 7px; font: 11px/1.75 var(--font-mono); }
 
 @media (max-width: 980px) {
   .stepper { grid-template-columns: repeat(4, minmax(0, 1fr)); }

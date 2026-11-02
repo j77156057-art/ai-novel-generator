@@ -64,7 +64,7 @@
   （真跑实测：重算 81.4 秒 → 复用 2.0 秒，**一次模型调用都没有**）。
 - **有界前情** —— 段 → 卷 → 主线三层摘要树，按 token 预算裁剪。前情块必须连续覆盖第 1..N 段且无洞，
   而且**覆盖声明写在文本里** —— 外部核对器只读提示词就能算出有没有洞，不必相信模块自报的结果。
-- **混合检索 + 知识图谱防漂移** —— 纯 Python BM25 × 向量 embedding，RRF 融合召回；
+- **混合检索 + 知识图谱防漂移** —— 手写 BM25（中文经 jieba 分词，英文与代码标识符单独保留）× 向量 embedding，RRF 融合召回；
   知识图谱 v3（9 张表：实体 / 事件 / 关系 / 关系演化 / 伏笔 / 角色状态 / 知识条目 / 时间线因果链），
   段落提交后由后台 worker 用模型异步批抽，再经【世界观事实】块回流进下一段的提示词。
 - **三条写作路径，三套可见性边界** —— 只学写法（原创）/ 接着这本书写（续写）/ 角色聊天，
@@ -180,10 +180,10 @@ cd frontend && npm install && npm run dev    # http://localhost:5173 ，/api 代
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/                 # 2,126 项用例（+ 8 项需外部语料/验收库才跳）
+python -m pytest tests/                 # 2,131 项用例（+ 8 项需外部语料/验收库才跳）
 ```
 
-> 结尾会有一行 `2118 passed, 8 skipped in ...` —— **别再给这条命令加 `-q`**：
+> 结尾会有一行 `2123 passed, 8 skipped in ...` —— **别再给这条命令加 `-q`**：
 > `pytest.ini` 的 `addopts` 里已经有 `-q`，两个叠起来变成 `-qq`，
 > pytest 会**静默吞掉那行汇总**。CI 跑的就是这一条命令。
 
@@ -255,7 +255,7 @@ flowchart TD
 |---|---|
 | Backend | **FastAPI** (Python 3.13), SQLAlchemy 2, Pydantic v2 (Strict) |
 | Storage | PostgreSQL + **pgvector** (prod) · SQLite (dev/test) |
-| Retrieval | Pure-Python **BM25 × dense-vector RRF fusion** |
+| Retrieval | Hand-rolled **BM25 (jieba tokenization) × dense-vector RRF fusion** |
 | Knowledge graph | Deterministic rule extractor + LLM batch extraction (async, same interface) |
 | Generation | Bounded-prior engine + segment summary chain + 工序链 |
 | Style | **Globally-shared distillation library**, 3 tiers, idempotent upsert |
@@ -276,7 +276,7 @@ flowchart TD
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **2,126** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `tests/` | **2,131** 项 pytest 用例（单源真源，`pytest tests/`） |
 | `frontend/tests/` | 前端测试：12 个纯逻辑文件（66 项，`node --test`）+ 4 个组件级文件（34 项，vitest + jsdom） |
 | `docs/` | 84 份设计文档与指南（另加 `docs/architecture/` 1 份）：架构怎么定的、判据为什么这么定 |
 | `docs/images/` | README 用的界面截图 |

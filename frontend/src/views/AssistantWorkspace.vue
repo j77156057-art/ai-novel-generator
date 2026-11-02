@@ -38,12 +38,17 @@ import WorkflowStrip from "@/components/WorkflowStrip.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
 import { bodyRepairVerificationText, pendingActionKindLabel, pendingActionRiskMeta, reactNotice, sourceLabel } from "@/utils/assistantDisplay";
 import { distinctChapterTitles } from "@/utils/corpusReport";
+import { username } from "@/utils/auth";
 import type {
   AssistantChoiceOption,
   AssistantEvidence,
   AssistantIssue,
   AssistantPendingAction,
   AssistantReactBlock,
+  AssistantRun,
+  AssistantRunDetailResponse,
+  AssistantVersion,
+  AssistantVersionDiffResponse,
   ForeignBlocksReport,
   ProjectOut,
 } from "@/api/types";
@@ -171,11 +176,56 @@ function onDrop(event: DragEvent): void {
   event.preventDefault();
   addFiles(Array.from(event.dataTransfer.files));
 }
+// 只读历史：运行记录与内容版本共用一个面板，不提供恢复操作。
+// 状态必须先于 immediate watch 初始化，避免切换项目时访问尚未声明的 ref。
+const historyOpen = ref(false);
+const historyTab = ref<"runs" | "versions">("runs");
+const runHistory = ref<AssistantRun[]>([]);
+const runHistoryLoading = ref(false);
+const runHistoryError = ref<string | null>(null);
+const runDetail = ref<AssistantRunDetailResponse | null>(null);
+const runDetailLoading = ref(false);
+const runDetailError = ref<string | null>(null);
+const selectedRunId = ref<number | null>(null);
+const versions = ref<AssistantVersion[]>([]);
+const versionsLoading = ref(false);
+const versionsError = ref<string | null>(null);
+const versionFrom = ref<number | null>(null);
+const versionTo = ref<number | null>(null);
+const versionDiff = ref<AssistantVersionDiffResponse | null>(null);
+const versionDiffLoading = ref(false);
+const versionDiffError = ref<string | null>(null);
+const restorePreviewOpen = ref(false);
+const restoreAcknowledged = ref(false);
+const restoreBusy = ref(false);
+const restoreError = ref<string | null>(null);
+const restoreNotice = ref<string | null>(null);
+const restoreTarget = computed(() => versions.value.find((item) => item.id === versionFrom.value) ?? null);
+const restoreCurrent = computed(() => versions.value.find((item) => item.id === versionTo.value) ?? null);
+const restoreDiffStats = computed(() => {
+  let added = 0;
+  let removed = 0;
+  for (const line of (versionDiff.value?.diff || "").split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) added++;
+    if (line.startsWith("-") && !line.startsWith("---")) removed++;
+  }
+  return { added, removed };
+});
+
 watch(projectId, (id) => {
   scopeEpoch++;
   resetConversation();
   project.value = null;
   dragging.value = false;
+  historyOpen.value = false;
+  runHistory.value = [];
+  runDetail.value = null;
+  selectedRunId.value = null;
+  versions.value = [];
+  versionDiff.value = null;
+  restorePreviewOpen.value = false;
+  restoreNotice.value = null;
+  restoreError.value = null;
   if (!Number.isInteger(id) || id <= 0) return;
   const epoch = scopeEpoch;
   void api.getProject(id).then((value) => {
@@ -194,6 +244,8 @@ onBeforeUnmount(() => { scopeEpoch++; draft.reset(0); });
 
 /** 可切换的语料（项目）列表。 */
 const projects = ref<ProjectOut[]>([]);
+const projectsLoading = ref(false);
+const projectsError = ref<string | null>(null);
 /** 「换语料」面板是否展开。 */
 const showCorpusPicker = ref(false);
 
@@ -232,11 +284,161 @@ function corpusHint(p: ProjectOut): string {
 }
 
 async function loadProjects(): Promise<void> {
+  projectsLoading.value = true;
+  projectsError.value = null;
   try {
     projects.value = await api.listProjects();
-  } catch {
+  } catch (err) {
     projects.value = [];
+    projectsError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    projectsLoading.value = false;
   }
+}
+
+function formatHistoryTime(value: string | null): string {
+  return value ? new Date(value).toLocaleString() : "—";
+}
+
+function formatRunDuration(value: number | null): string {
+  if (value === null) return "进行中";
+  if (value < 1000) return `${value} ms`;
+  return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)} s`;
+}
+
+async function loadRunHistory(): Promise<void> {
+  runHistoryLoading.value = true;
+  runHistoryError.value = null;
+  try {
+    const response = await api.assistantRuns(projectId.value, null, 50);
+    runHistory.value = response.runs;
+  } catch (err) {
+    runHistory.value = [];
+    runHistoryError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    runHistoryLoading.value = false;
+  }
+}
+
+async function openRunDetail(id: number): Promise<void> {
+  selectedRunId.value = id;
+  runDetailLoading.value = true;
+  runDetailError.value = null;
+  try {
+    runDetail.value = await api.assistantRunDetail(id, projectId.value);
+  } catch (err) {
+    runDetail.value = null;
+    runDetailError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    runDetailLoading.value = false;
+  }
+}
+
+async function loadVersions(): Promise<void> {
+  versionsLoading.value = true;
+  versionsError.value = null;
+  versionDiffError.value = null;
+  try {
+    const response = await api.listVersions(projectId.value, null, 100);
+    versions.value = response.versions;
+    versionFrom.value = response.versions[0]?.id ?? null;
+    versionTo.value = response.versions[response.versions.length - 1]?.id ?? null;
+    versionDiff.value = null;
+  } catch (err) {
+    versions.value = [];
+    versionFrom.value = null;
+    versionTo.value = null;
+    versionsError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    versionsLoading.value = false;
+  }
+}
+
+async function compareVersions(): Promise<void> {
+  if (!versionFrom.value || !versionTo.value) return;
+  versionDiffLoading.value = true;
+  versionDiffError.value = null;
+  try {
+    versionDiff.value = await api.diffVersions(versionFrom.value, versionTo.value);
+  } catch (err) {
+    versionDiff.value = null;
+    versionDiffError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    versionDiffLoading.value = false;
+  }
+}
+
+function openRestorePreview(): void {
+  restoreError.value = null;
+  restoreNotice.value = null;
+  restoreAcknowledged.value = false;
+  const target = restoreTarget.value;
+  const current = restoreCurrent.value;
+  if (!versionDiff.value || !target || !current || target.id === current.id) {
+    restoreError.value = "请先比较两个不同版本，再预览恢复影响。";
+    return;
+  }
+  if (target.target_kind !== current.target_kind || target.target_id !== current.target_id) {
+    restoreError.value = "只能恢复同一内容对象的版本，请重新选择。";
+    return;
+  }
+  if (!current.after_hash) {
+    restoreError.value = "当前版本缺少内容哈希，无法建立漂移保护基线。";
+    return;
+  }
+  restorePreviewOpen.value = true;
+}
+
+function closeRestorePreview(): void {
+  if (restoreBusy.value) return;
+  restorePreviewOpen.value = false;
+  restoreAcknowledged.value = false;
+  restoreError.value = null;
+}
+
+function restoreErrorText(err: unknown): string {
+  if (err instanceof ApiError && err.detail && typeof err.detail === "object") {
+    const detail = err.detail as { error?: string; expected_hash?: string; current_hash?: string; message?: string };
+    if (detail.error === "stale") {
+      return `当前内容已偏离预览基线（预期 ${String(detail.expected_hash || "").slice(0, 12)}…，实际 ${String(detail.current_hash || "").slice(0, 12)}…），未执行恢复。请刷新版本后重新预览。`;
+    }
+    if (detail.message) return detail.message;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function runRestoreVersion(): Promise<void> {
+  const target = restoreTarget.value;
+  const current = restoreCurrent.value;
+  if (!target || !current?.after_hash || !restoreAcknowledged.value) return;
+  restoreBusy.value = true;
+  restoreError.value = null;
+  try {
+    const result = await api.restoreVersion(target.id, {
+      action: "restore",
+      actor: username.value || null,
+      note: `从版本 #${target.id} 恢复，预览基线为版本 #${current.id}`,
+      expected_hash: current.after_hash,
+    });
+    restorePreviewOpen.value = false;
+    restoreNotice.value = `已从版本 #${target.id} 恢复，并生成新版本 #${result.version_id}；历史记录未删除。`;
+    await loadVersions();
+  } catch (err) {
+    restoreError.value = restoreErrorText(err);
+  } finally {
+    restoreBusy.value = false;
+  }
+}
+
+function selectHistoryTab(tab: "runs" | "versions"): void {
+  historyTab.value = tab;
+  if (tab === "runs") void loadRunHistory();
+  else void loadVersions();
+}
+
+function toggleHistory(): void {
+  historyOpen.value = !historyOpen.value;
+  if (historyOpen.value) void selectHistoryTab(historyTab.value);
 }
 
 let seq = 0;
@@ -760,6 +962,9 @@ onMounted(async () => {
     <div class="asst-head">
       <h1>助手工作台</h1>
       <div class="row tight">
+        <button class="btn" type="button" @click="toggleHistory">
+          {{ historyOpen ? "收起历史" : "历史记录" }}
+        </button>
         <button
           class="btn"
           type="button"
@@ -789,7 +994,11 @@ onMounted(async () => {
       <div class="faint" style="font-size: var(--fs-xs)">
         换一本语料（会同时开一段新的对话）：
       </div>
-      <div v-if="!projects.length" class="muted">还没有任何项目。</div>
+      <div v-if="projectsLoading" class="muted">正在读取项目…</div>
+      <div v-else-if="projectsError" class="notice err" role="alert">
+        项目列表加载失败：{{ projectsError }}<button class="link-btn" type="button" @click="loadProjects">重试</button>
+      </div>
+      <div v-else-if="!projects.length" class="muted">还没有任何项目。</div>
       <button
         v-for="p in projects"
         :key="p.id"
@@ -802,6 +1011,117 @@ onMounted(async () => {
         <span class="faint">{{ corpusHint(p) }}</span>
         <span v-if="p.id === projectId" class="tag">当前</span>
       </button>
+    </div>
+
+    <section v-if="historyOpen" class="history-panel" aria-labelledby="history-title">
+      <div class="history-head">
+        <div><span class="history-kicker">READ ONLY</span><h2 id="history-title">历史记录</h2></div>
+        <div class="history-tabs" role="tablist" aria-label="历史类型">
+          <button type="button" :class="{ active: historyTab === 'runs' }" role="tab" :aria-selected="historyTab === 'runs'" @click="selectHistoryTab('runs')">运行记录</button>
+          <button type="button" :class="{ active: historyTab === 'versions' }" role="tab" :aria-selected="historyTab === 'versions'" @click="selectHistoryTab('versions')">内容版本</button>
+        </div>
+      </div>
+
+      <div v-if="historyTab === 'runs'" class="run-history-layout">
+        <div class="run-list">
+          <div v-if="runHistoryLoading" class="empty"><span class="spinner" /> 正在读取运行记录…</div>
+          <div v-else-if="runHistoryError" class="notice err" role="alert">
+            运行记录加载失败：{{ runHistoryError }}<button class="link-btn" type="button" @click="loadRunHistory">重试</button>
+          </div>
+          <div v-else-if="!runHistory.length" class="empty">当前项目还没有助手运行记录。</div>
+          <button
+            v-for="run in runHistory"
+            v-else
+            :key="run.id"
+            class="run-row"
+            :class="{ active: selectedRunId === run.id }"
+            type="button"
+            @click="openRunDetail(run.id)"
+          >
+            <span class="run-row-top"><strong>#{{ run.id }}</strong><span class="tag" :class="run.status === 'success' ? 'ok' : run.status === 'failed' ? 'err' : 'info'">{{ run.status }}</span></span>
+            <span class="run-model mono">{{ run.model || "未记录模型" }}</span>
+            <span class="run-meta">{{ formatRunDuration(run.duration_ms) }} · 证据 {{ run.evidence_count }} 条</span>
+            <span class="run-time">{{ formatHistoryTime(run.started_at) }}</span>
+          </button>
+        </div>
+        <div class="run-detail">
+          <div v-if="runDetailLoading" class="empty"><span class="spinner" /> 正在读取运行详情…</div>
+          <div v-else-if="runDetailError" class="notice err" role="alert">
+            详情加载失败：{{ runDetailError }}<button v-if="selectedRunId" class="link-btn" type="button" @click="openRunDetail(selectedRunId)">重试</button>
+          </div>
+          <template v-else-if="runDetail">
+            <div class="detail-title"><strong>AgentRun #{{ runDetail.run.id }}</strong><span>{{ runDetail.run.note || "无备注" }}</span></div>
+            <dl class="run-facts">
+              <div><dt>状态</dt><dd>{{ runDetail.run.status }}</dd></div><div><dt>耗时</dt><dd>{{ formatRunDuration(runDetail.run.duration_ms) }}</dd></div>
+              <div><dt>模型</dt><dd class="mono">{{ runDetail.run.model || "—" }}</dd></div><div><dt>证据</dt><dd>{{ runDetail.evidence.length }} 条</dd></div>
+            </dl>
+            <div v-if="!runDetail.evidence.length" class="empty">这次运行没有留存证据。</div>
+            <div v-else class="history-evidence-list">
+              <article v-for="(evidence, index) in runDetail.evidence" :key="`${evidence.ref_id}-${index}`" class="history-evidence">
+                <div><span class="tag accent">{{ sourceLabel(evidence.source) }}</span><span class="mono">{{ evidence.kind }} · score {{ Number(evidence.score).toFixed(3) }}</span></div>
+                <p class="prose">{{ evidence.snippet }}</p>
+              </article>
+            </div>
+          </template>
+          <div v-else class="history-placeholder">选择左侧一条运行记录，查看模型、耗时与证据。</div>
+        </div>
+      </div>
+
+      <div v-else class="version-history">
+        <div v-if="versionsLoading" class="empty"><span class="spinner" /> 正在读取内容版本…</div>
+        <div v-else-if="versionsError" class="notice err" role="alert">
+          内容版本加载失败：{{ versionsError }}<button class="link-btn" type="button" @click="loadVersions">重试</button>
+        </div>
+        <div v-else-if="!versions.length" class="empty">当前项目还没有内容版本。</div>
+        <template v-else>
+          <div class="version-compare">
+            <div class="field"><label for="version-from">旧版本</label><select id="version-from" class="input" v-model.number="versionFrom"><option v-for="version in versions" :key="version.id" :value="version.id">#{{ version.id }} · {{ version.kind }}</option></select></div>
+            <div class="field"><label for="version-to">新版本</label><select id="version-to" class="input" v-model.number="versionTo"><option v-for="version in versions" :key="version.id" :value="version.id">#{{ version.id }} · {{ version.kind }}</option></select></div>
+            <button class="btn primary" type="button" :disabled="versionDiffLoading || !versionFrom || !versionTo" @click="compareVersions">{{ versionDiffLoading ? "比较中…" : "比较所选版本" }}</button>
+          </div>
+          <div v-if="versionDiffError" class="notice err" role="alert">版本比较失败：{{ versionDiffError }}<button class="link-btn" type="button" @click="compareVersions">重试</button></div>
+          <div v-if="versionDiff" class="version-diff">
+            <div class="detail-title"><strong>#{{ versionDiff.from_version.id }} → #{{ versionDiff.to_version.id }}</strong><button class="btn sm" type="button" @click="openRestorePreview">预览恢复影响</button></div>
+            <pre>{{ versionDiff.diff || "两个版本内容一致。" }}</pre>
+          </div>
+          <div v-if="restoreNotice" class="notice ok" role="status">{{ restoreNotice }}</div>
+          <div v-if="restoreError && !restorePreviewOpen" class="notice err" role="alert">{{ restoreError }}</div>
+          <div class="version-list">
+            <div v-for="version in versions" :key="version.id" class="version-row">
+              <span class="mono">#{{ version.id }}</span><span class="tag">{{ version.kind }}</span>
+              <span class="version-reason">{{ version.reason || "未记录原因" }}</span>
+              <span class="faint">{{ formatHistoryTime(version.created_at) }}</span>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <div v-if="restorePreviewOpen && restoreTarget && restoreCurrent" class="restore-mask" @click.self="closeRestorePreview">
+      <section class="restore-dialog" role="dialog" aria-modal="true" aria-labelledby="restore-title">
+        <div class="restore-head">
+          <div><span class="restore-kicker">RESTORE REVIEW</span><h2 id="restore-title">恢复版本 #{{ restoreTarget.id }} 的影响</h2></div>
+          <button class="btn ghost" type="button" :disabled="restoreBusy" @click="closeRestorePreview">取消</button>
+        </div>
+        <div class="restore-impact">
+          <div><span>将被覆盖</span><strong>版本 #{{ restoreCurrent.id }}</strong><small>{{ restoreCurrent.target_kind }} / {{ restoreCurrent.target_id }}</small></div>
+          <div><span>恢复为</span><strong>版本 #{{ restoreTarget.id }}</strong><small>{{ restoreTarget.target_kind }} / {{ restoreTarget.target_id }}</small></div>
+          <div><span>差异摘要</span><strong>+{{ restoreDiffStats.added }} / −{{ restoreDiffStats.removed }} 行</strong><small>与上方 diff 面板一致</small></div>
+          <div><span>漂移基线</span><strong class="mono">{{ restoreCurrent.after_hash?.slice(0, 12) }}…</strong><small>执行时由后端重新核对</small></div>
+        </div>
+        <p class="restore-warning">恢复会覆盖上述对象的当前内容，但不会删除历史版本；成功后将追加一条恢复版本。若当前内容已偏离此基线，后端会拒绝执行。</p>
+        <label class="restore-confirm">
+          <input v-model="restoreAcknowledged" type="checkbox" :disabled="restoreBusy" />
+          <span>我已核对覆盖对象与差异，确认继续恢复。</span>
+        </label>
+        <div v-if="restoreError" class="notice err" role="alert">{{ restoreError }}</div>
+        <div class="restore-actions">
+          <button class="btn" type="button" :disabled="restoreBusy" @click="closeRestorePreview">返回 diff</button>
+          <button class="btn primary" type="button" :disabled="restoreBusy || !restoreAcknowledged" @click="runRestoreVersion">
+            {{ restoreBusy ? "正在核对并恢复…" : "二次确认并恢复" }}
+          </button>
+        </div>
+      </section>
     </div>
 
     <div v-if="badId" class="notice err">路由缺少有效的项目 id（/projects/:id/assistant）。</div>
@@ -1426,6 +1746,62 @@ onMounted(async () => {
   .composer { padding: 14px 16px 16px; }
   .bubble.user { max-width: 92%; }
   .stream-hint { padding: 22px 18px; }
+}
+/* 只读历史 */
+.history-panel { margin: 18px 0; padding: 20px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; }
+.history-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+.history-kicker { color: var(--accent-ink); font: 10px/1.4 var(--font-mono); letter-spacing: .12em; }
+.history-head h2 { margin-top: 4px; font: 21px/1.3 var(--font-serif); }
+.history-tabs { display: flex; gap: 4px; padding: 3px; background: var(--bg); border-radius: 7px; }
+.history-tabs button { padding: 6px 12px; color: var(--fg-muted); background: none; border: 0; border-radius: 5px; cursor: pointer; font-size: var(--fs-xs); }
+.history-tabs button.active { color: #fffaf1; background: #2b2c27; }
+.run-history-layout { display: grid; grid-template-columns: minmax(240px, .8fr) minmax(0, 1.4fr); gap: 18px; margin-top: 16px; }
+.run-list { max-height: 460px; overflow-y: auto; border-right: 1px solid var(--border); padding-right: 14px; }
+.run-row { width: 100%; display: flex; flex-direction: column; gap: 5px; padding: 12px 10px; text-align: left; color: var(--fg); background: none; border: 0; border-bottom: 1px solid var(--border); cursor: pointer; }
+.run-row:hover, .run-row.active { background: var(--bg); }
+.run-row.active { box-shadow: inset 3px 0 0 var(--accent); }
+.run-row-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.run-model { overflow: hidden; text-overflow: ellipsis; color: var(--fg-muted); font-size: 10px; white-space: nowrap; }
+.run-meta, .run-time { color: var(--fg-faint); font-size: 10px; }
+.run-detail { min-width: 0; max-height: 460px; overflow-y: auto; }
+.detail-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.detail-title > span { color: var(--fg-faint); font-size: var(--fs-xs); }
+.run-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 14px 0; padding: 12px; background: var(--bg); }
+.run-facts dt { color: var(--fg-faint); font-size: 10px; }
+.run-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: var(--fs-xs); }
+.history-evidence-list { display: flex; flex-direction: column; gap: 8px; }
+.history-evidence { padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; }
+.history-evidence > div { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 10px; }
+.history-evidence p { max-height: 9em; overflow-y: auto; margin: 8px 0 0; color: var(--fg-muted); font-size: var(--fs-sm); }
+.history-placeholder { padding: 42px 20px; color: var(--fg-faint); text-align: center; border: 1px dashed var(--border-strong); }
+.version-compare { display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end; margin: 16px 0; }
+.version-diff { margin-bottom: 16px; }
+.version-diff pre { max-height: 300px; overflow: auto; padding: 14px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fg-muted); background: var(--bg); border: 1px solid var(--border); border-radius: 7px; font: 11px/1.7 var(--font-mono); }
+.version-list { max-height: 250px; overflow-y: auto; border-top: 1px solid var(--border); }
+.version-row { display: grid; grid-template-columns: 48px 64px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px 4px; border-bottom: 1px solid var(--border); font-size: var(--fs-xs); }
+.version-reason { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.restore-mask { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 24px; background: rgba(28, 28, 24, .56); }
+.restore-dialog { width: min(100%, 680px); max-height: calc(100vh - 48px); overflow-y: auto; padding: 26px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 70px rgba(20, 20, 17, .22); }
+.restore-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.restore-kicker { color: var(--accent-ink); font: 10px/1.4 var(--font-mono); letter-spacing: .12em; }
+.restore-head h2 { margin-top: 5px; font: 23px/1.4 var(--font-serif); }
+.restore-impact { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 20px 0 16px; }
+.restore-impact > div { display: flex; flex-direction: column; gap: 5px; padding: 13px; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; }
+.restore-impact span { color: var(--fg-faint); font-size: 10px; }
+.restore-impact strong { overflow-wrap: anywhere; font-size: var(--fs-sm); }
+.restore-impact small { color: var(--fg-faint); font-size: 10px; }
+.restore-warning { color: var(--fg-muted); font-size: var(--fs-sm); line-height: 1.8; }
+.restore-confirm { display: flex; align-items: flex-start; gap: 9px; margin: 16px 0; padding: 13px; background: var(--warn-soft); cursor: pointer; font-size: var(--fs-sm); }
+.restore-confirm input { width: 16px; height: 16px; margin-top: 2px; accent-color: var(--accent); }
+.restore-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+@media (max-width: 620px) { .restore-impact { grid-template-columns: 1fr; } .restore-dialog { padding: 20px 16px; } }
+@media (max-width: 800px) {
+  .run-history-layout { grid-template-columns: 1fr; }
+  .run-list { max-height: 280px; padding-right: 0; border-right: 0; border-bottom: 1px solid var(--border); }
+  .run-facts { grid-template-columns: 1fr 1fr; }
+  .version-compare { grid-template-columns: 1fr; }
+  .version-row { grid-template-columns: 44px 60px minmax(0, 1fr); }
+  .version-row > .faint { grid-column: 3; }
 }
 /* 本轮降级标记：结论与解释分两行 —— 结论用粗体，解释是它的展开说明。 */
 .react-notice-detail {

@@ -1,7 +1,7 @@
-"""BM25 关键词检索（纯 Python，离线可用）。
+"""BM25 关键词检索。
 
 用于混合检索的关键词分支；向量分支见 search.py。
-分词复用 app.tokenize（MVP 占位，正式环境换 jieba）。
+中文经 jieba 分词，英文与代码标识符由 app.tokenize 保留。
 """
 
 import math

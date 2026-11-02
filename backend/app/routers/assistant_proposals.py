@@ -222,6 +222,8 @@ class RestoreVersionRequest(StrictRequest):
     action: Literal["restore"]
     actor: str | None = None
     note: str | None = None
+    #: 调用方预览时的当前内容基线；携带后，实际内容漂移会拒绝恢复。
+    expected_hash: str | None = None
 
 
 class ApplySelectedRequest(StrictRequest):
@@ -722,7 +724,9 @@ def restore_version(
     if version is None:
         raise HTTPException(status_code=404, detail=f"Version {version_id} 不存在")
     try:
-        result = proposal_lib.restore_version(db, version=version, actor=body.actor)
+        result = proposal_lib.restore_version(
+            db, version=version, actor=body.actor, expected_hash=body.expected_hash
+        )
     except Exception as exc:  # noqa: BLE001 - restore 内部已自行回滚
         _raise_http(exc)
     db.refresh(version)

@@ -915,6 +915,8 @@ export interface AssistantRestoreRequest {
   action: "restore";
   actor?: string | null;
   note?: string | null;
+  /** 影响预览时当前版本的 after_hash；后端据此拒绝覆盖已漂移内容。 */
+  expected_hash?: string | null;
 }
 
 // ==================================================================

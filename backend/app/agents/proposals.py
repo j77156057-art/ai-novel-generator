@@ -1311,6 +1311,7 @@ def restore_version(
     version: Any,
     actor: str | None = None,
     version_writer: Callable[..., Any] | None = None,
+    expected_hash: str | None = None,
 ) -> dict[str, Any]:
     """从 Version 快照恢复目标内容；**恢复本身也生成一条新 Version**。
 
@@ -1354,6 +1355,10 @@ def restore_version(
         source_proposal.project_id if source_proposal is not None else 0
     ))
     current = read_target(db, project_id, target_kind, target_id)
+    # 恢复会覆盖当前内容。调用方若提供了影响预览时的基线，必须先在
+    # 同一写路径上核对，避免把预览之后发生的并发修改一并覆盖。
+    if expected_hash is not None and current.hash != expected_hash:
+        raise TargetDrifted(expected_hash, current.hash)
 
     restore_snapshot = _build_snapshot(
         target_kind=target_kind,
