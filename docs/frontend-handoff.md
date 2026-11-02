@@ -29,6 +29,57 @@ python -m uvicorn app.main:app --port 8000 --host 127.0.0.1
 
 ---
 
+## 0'. 本轮怎么干（**先读这一节**）
+
+| 项 | 值 |
+|---|---|
+| **仓库路径（就用这棵）** | `C:\Work\ai-novel-generator-pub` |
+| **分支** | `feat/ui-trae`（已从 `main` 建好，**别在 `main` 上直接改**） |
+| 上一轮那版 UI 的**参考补丁** | `D:\Temp\trae_ui_reference.patch`（196KB，`git apply` 可看全貌；**不要直接 apply 到发布版**） |
+| 上一轮那版 UI 的**原始提交** | dev 树 `ai-novel-generator` 的 `91c4970`（10 个文件，+1267 / −515） |
+
+### ⚠️ 为什么不能直接拷文件 / 直接 apply 补丁
+
+上一轮那版 UI 是在**另一棵更旧的树**上做的（dev 树：`...\WorkBuddy6-10-12-11-59-30i-novel-generator`）。
+两棵树已经**双向分叉**：
+
+| | 仅发布版有 | 仅 dev 树有 | 两边都有但内容不同 |
+|---|---|---|---|
+| `backend/app` | **83 个文件** | 2 个 | **59 / 75** |
+| `frontend/src` | **8 个文件** | 0 个 | **22 / 23** |
+
+⇒ 直接覆盖会**删掉发布版的新功能**（见下），必须**在发布版这棵树上重做**。
+
+### 这棵树上比那棵树多出来的东西（**别删、别绕过**）
+
+| 新增 | 位置 | 作用 |
+|---|---|---|
+| 助理附件链路 | `utils/assistantAttachments.ts`、`components/AssistantIssueList.vue` | 上传 → 暂存 → 投喂；`tests/assistantAttachments.test.ts` 在守 |
+| 参考书边界 | `utils/referenceBoundary.ts` | 不许把原文整段带进提示词；`tests/referenceBoundary.test.ts` 在守 |
+| 外文块提示 | `components/ForeignBlocksNotice.vue` | 「混进了别的书」的体检提示；`tests/foreignBlocksUi.test.ts` 在守 |
+| 工作流条 | `components/WorkflowStrip.vue`、`utils/workflowDisplay.ts` | 创作流程可视化；`tests/workflowDisplay.test.ts` 在守 |
+| 角色扮演面板 | `components/RoleplayPanel.vue` | 角色对话 |
+| 语料体检报告 | `utils/corpusReport.ts`、`utils/measure.ts` | 语料度量与报告 |
+| **全书摘要面板** | `views/CorpusView.vue` | 摘要提交/进度/三块内容/四项验收/丢弃原因 |
+| 前端测试体系 | `frontend/tests/`（11 个逻辑用例文件 + 4 个组件 spec） | `npm test` = 58 + 33，**必须全绿** |
+
+### 本轮该做的三件事
+
+1. **UI 改版在发布版这棵树上重做**（上一轮那版可作视觉参考，补丁在 `D:\Temp\trae_ui_reference.patch`）；
+2. **G1 导出三件套** —— 正文之外还有大纲 / 人物表 / 坑清单（数据都在，缺拼装与入口）；
+3. **G2 登录占位** —— 第一屏是登录（单用户占位，**不做真鉴权**，也**不要**用登录态去拦 `/api/*`）。
+
+### 本轮不能弄红的东西（与上一版交接单相同，再强调一次）
+
+```powershell
+cd C:\Worki-novel-generator-pubrontend
+npm run typecheck   # vue-tsc --noEmit，必须 0 错误
+npm test            # 58 + 33，必须全绿
+npm run build       # 上面两条都过才产出 dist/
+```
+
+---
+
 ## 1. 现状（不要凭直觉假设）
 
 | 项 | 实际 |
