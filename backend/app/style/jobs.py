@@ -400,7 +400,8 @@ def run_book_digest_job(
     from app.style.digest import (
         build_book_digest,
         digest_content_hash,
-        latest_digest,
+        digest_plan,
+        find_reusable_digest,
         save_digest,
     )
     from app.style.narrative import resolve_distill_provider
@@ -425,25 +426,40 @@ def run_book_digest_job(
 
         provider = resolve_distill_provider()
         progress = _make_progress_writer(job_id, db)
-        digest = build_book_digest(
-            db, novel_id, provider=provider, mode=mode, progress=progress,
-            target_ratio=target_ratio,
-        )
 
+        # —— 复用判定必须**在花钱之前**（2026-11-02 修）——
+        # 旧顺序是「先 build（整本一次模型调用）→ 再看要不要复用」，
+        # 于是「命中已有摘要，未重新抽取」是假的：模型跑完了、额度花了，只是没保存。
+        # 现在先用 digest_plan() 把参数算出来（纯本地计算），拿它当复用键比对。
+        plan = digest_plan(
+            db, novel_id, provider=provider, mode=mode, target_ratio=target_ratio
+        )
         content_hash = digest_content_hash(db, novel_id)
         if not force:
-            existing = latest_digest(db, novel_id)
-            if existing is not None and existing.content_hash == content_hash:
-                # 同一本书同一版正文已经摘要过 ⇒ 直接复用，不重算（幂等）。
+            existing = find_reusable_digest(db, novel_id, content_hash, plan["plan_key"])
+            if existing is not None:
+                # 同一本书、同一版正文、同一套参数 ⇒ 直接复用，不重算（幂等且不花钱）。
+                payload = existing.payload or {}
+                stats = existing.stats_json or {}
                 run.status = STATUS_SUCCESS
                 run.stage = "命中已有摘要，未重新抽取"
-                run.n_chapters = (digest.get("source") or {}).get("n_chapters")
-                run.rule_count = _digest_entry_count(digest)
-                run.rejected = (digest.get("stats") or {}).get("dropped")
+                run.n_chapters = len(plan["chapters"])
+                run.rule_count = (
+                    len(payload.get("timeline") or [])
+                    + len(payload.get("characters") or [])
+                    + len(payload.get("reactions") or [])
+                )
+                run.rejected = stats.get("dropped")
                 run.progress_total = max(int(run.progress_total or 0), 1)
                 run.progress_current = run.progress_total
                 db.commit()
                 return
+
+        digest = build_book_digest(
+            db, novel_id, provider=provider, progress=progress,
+            target_ratio=target_ratio, plan=plan,
+        )
+
         row = save_digest(db, digest, content_hash)
 
         run.status = STATUS_SUCCESS

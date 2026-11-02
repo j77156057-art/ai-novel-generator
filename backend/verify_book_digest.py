@@ -255,6 +255,28 @@ def main() -> int:
         _bloated_report(kept, CORPUS)["checks"]["compression"]["ok"] is False,
         "把好摘要的条目复制到超出上限 ⇒ compression.ok 必须变 False",
     )
+    # 主线覆盖闸门的判别力：**只留开头几条**的摘要（真实产品里最常见的失败模式：
+    # 模型只读了开头就交差）必须被挡住。
+    truncated = {
+        "timeline": (kept.get("timeline") or [])[:1],
+        "characters": [],
+        "reactions": [],
+    }
+    trunc_report = verify_digest(
+        truncated, CORPUS, chars_in=1200,
+        mainline_candidates=candidates, character_names=names,
+    )
+    trunc_checks = trunc_report["checks"]
+    check(
+        "主线覆盖闸门有判别力（只覆盖开头的摘要必须判不达标）",
+        trunc_checks["mainline_coverage"]["ok"] is False,
+        f"value={trunc_checks['mainline_coverage']['value']}",
+    )
+    check(
+        "主线覆盖闸门对好摘要判达标",
+        good_report["checks"]["mainline_coverage"]["ok"] is True,
+        f"value={good_report['checks']['mainline_coverage']['value']}",
+    )
 
     section("D. 档位选择")
     mode, reason = choose_digest_mode(1200, provider=_Provider())
@@ -269,14 +291,29 @@ def main() -> int:
         mode2 == MODE_WHOLE,
         reason2,
     )
-    mode3, reason3 = choose_digest_mode(900_000, provider=_Provider(max_context_chars=1_500_000))
+    # 真书量级（66 万字）+ 声明 150 万字的渠道 ⇒ 整本。
+    # 门槛原来写死 30 万字，而本机最小的真书也有 43.6 万字 ⇒ 整本档在真书上
+    # 永远不可达 ⇒ 门槛改为跟随渠道声明（见 digest.choose_digest_mode）。
+    mode3, reason3 = choose_digest_mode(663_125, provider=_Provider(max_context_chars=1_500_000))
     check(
-        "书太大 ⇒ 退回切块抽",
-        mode3 == MODE_RETRIEVAL,
+        "真书量级（66 万字）+ 渠道能吃下 ⇒ 整本一次投喂",
+        mode3 == MODE_WHOLE,
         reason3,
     )
-    mode4, _ = choose_digest_mode(900_000, provider=_Provider(), requested=MODE_WHOLE)
-    check("用户显式指定就照办", mode4 == MODE_WHOLE)
+    mode4, reason4 = choose_digest_mode(1_600_000, provider=_Provider(max_context_chars=1_500_000))
+    check(
+        "书超过渠道声明能读的字数 ⇒ 退回切块抽",
+        mode4 == MODE_RETRIEVAL,
+        reason4,
+    )
+    mode5, reason5 = choose_digest_mode(3_000_000, provider=_Provider(max_context_chars=50_000_000))
+    check(
+        "渠道声明得离谱 ⇒ 绝对天花板兜住",
+        mode5 == MODE_RETRIEVAL and "绝对天花板" in reason5,
+        reason5,
+    )
+    mode6, _ = choose_digest_mode(900_000, provider=_Provider(), requested=MODE_WHOLE)
+    check("用户显式指定就照办", mode6 == MODE_WHOLE)
 
     section("E. 提示词与解析")
     caps = digest_caps(1200)

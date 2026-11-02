@@ -26,8 +26,9 @@ if _BACKEND not in sys.path:
 import pytest  # noqa: E402
 
 from app.db import Base, SessionLocal, engine  # noqa: E402
-from app.models import NovelChunk, Project, RawNovel  # noqa: E402
+from app.models import DistillRun, NovelChunk, Project, RawNovel  # noqa: E402
 from app.style.digest import (  # noqa: E402
+    DIGEST_VERSION,
     MODE_AUTO,
     MODE_RETRIEVAL,
     MODE_WHOLE,
@@ -36,6 +37,7 @@ from app.style.digest import (  # noqa: E402
     choose_digest_mode,
     digest_caps,
     digest_content_hash,
+    digest_plan,
     digest_summary,
     enforce_evidence,
     latest_digest,
@@ -44,6 +46,7 @@ from app.style.digest import (  # noqa: E402
     save_digest,
     verify_digest,
 )
+from app.style.jobs import STATUS_SUCCESS  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app as fastapi_app  # noqa: E402
@@ -173,9 +176,33 @@ def test_auto_mode_with_capability_and_small_book_uses_whole():
 
 
 def test_auto_mode_falls_back_when_book_too_large():
-    mode, reason = choose_digest_mode(500_000, provider=WholeProvider())
+    """书超过**渠道声明能读多少字** ⇒ 切块抽（不是「超过某个写死的数」）。"""
+    mode, reason = choose_digest_mode(1_600_000, provider=WholeProvider())
     assert mode == MODE_RETRIEVAL
     assert "超过" in reason
+
+
+def test_auto_mode_whole_for_real_book_scale():
+    """真书量级（66 万字）+ 声明能读 150 万字的渠道 ⇒ 整本一次投喂。
+
+    2026-11-02 真跑前改的门槛：原来写死「书 ≤ 30 万字」，
+    而本机最小的真书也有 43.6 万字 ⇒ 写死的门槛让整本档在真书上**永远不可达**。
+    这条用例把那个事实钉住：门槛由渠道的真实能力推导，不由拍脑袋的数推导。
+    """
+    mode, reason = choose_digest_mode(663_125, provider=WholeProvider())
+    assert mode == MODE_WHOLE
+    assert "整本" in reason
+    assert "渠道单次可读" in reason
+
+
+def test_auto_mode_respects_absolute_ceiling_when_channel_overclaims():
+    """渠道声明得离谱 ⇒ 绝对天花板兜住（否则一次请求会被静默截断）。"""
+    class GreedyProvider:
+        max_context_chars = 50_000_000
+
+    mode, reason = choose_digest_mode(3_000_000, provider=GreedyProvider())
+    assert mode == MODE_RETRIEVAL
+    assert "绝对天花板" in reason
 
 
 def test_explicit_mode_is_honored():
@@ -244,8 +271,15 @@ def test_enforce_evidence_drops_fabricated_entries():
     assert stats["dropped_ratio"] > 0.5
 
 
-def test_enforce_evidence_rejects_wrong_chapter():
-    """引文是真的，但挂在**错的章**上 ⇒ 同样丢弃（归属错了就是编）。"""
+def test_enforce_evidence_reattributes_wrong_chapter():
+    """引文是真的、只是挂错章 ⇒ **改章号、留条目**（不是丢掉）。
+
+    2026-11-02 真跑（66 万字真书）实测：被丢的 34 条**逐条回查原文后发现
+    全部是「引文逐字就在书里，只是章号挂了」**（偏移多为 ±1）。
+
+    引文是**证据**，章号只是**指针**。指针错了应该修指针 ——
+    把证据一起扔掉等于「因为目录页码错了，就说这本书没写过这段」。
+    """
     chapters = {1: REAL_LINES[0], 2: REAL_LINES[1]}
     digest = {
         "timeline": [
@@ -254,8 +288,80 @@ def test_enforce_evidence_rejects_wrong_chapter():
         ]
     }
     kept, stats = enforce_evidence(digest, chapters)
+    assert len(kept["timeline"]) == 1
+    assert stats["dropped"] == 0
+    assert stats["reattributed"] == 1
+    # 章号被就地改成了引文真正所在的那一章
+    assert kept["timeline"][0]["evidence"][0]["chapter_no"] == 1
+
+
+def test_enforce_evidence_drops_quote_far_from_claimed_chapter():
+    """引文离它声称的章**太远** ⇒ 丢弃（那种情况多半不是同一处的事）。
+
+    远处仍能找到的记成 `quote_far`（区别于 `quote_not_found` = 压根不是书里的话），
+    这样界面能分开说「引文是真的只是挂得远」与「这句是编的」。
+    """
+    chapters = {1: REAL_LINES[0], 40: REAL_LINES[1]}
+    digest = {
+        "timeline": [
+            {"event": "离得太远", "chapter_no": 1,
+             "evidence": [{"chapter_no": 1, "quote": "老陶把矿灯递给他，说了句走吧，然后自己走在前面"}]},
+        ]
+    }
+    kept, stats = enforce_evidence(digest, chapters)
     assert kept["timeline"] == []
     assert stats["dropped"] == 1
+    assert stats["drop_reasons"].get("quote_far") == 1
+
+
+def test_enforce_evidence_accepts_short_quote_when_it_is_verbatim():
+    """短引文**逐字出现在它声称的那一章** ⇒ 算证据。
+
+    2026-11-02 第四次真跑实测：被丢的 31 条里 25 条是「引文太短」，
+    而那些短引文确实逐字出现在它声称的章里（一句三字断言落在第 17 章）。
+    ⇒ 证据的强度取决于**能不能定位到那一章**，不取决于引文多长。
+    """
+    chapters = {1: "众人皆道：此处是水脉。"}
+    digest = {
+        "timeline": [
+            {"event": "湖畔遇水脉", "chapter_no": 1,
+             "evidence": [{"chapter_no": 1, "quote": "是水脉。"}]},
+        ]
+    }
+    kept, stats = enforce_evidence(digest, chapters)
+    assert len(kept["timeline"]) == 1
+    assert stats["dropped"] == 0
+
+
+def test_enforce_evidence_drops_empty_quote():
+    """空引文 / 单字引文 ⇒ 当不了证据，但**原因要单独记**。"""
+    chapters = {1: REAL_LINES[0]}
+    digest = {
+        "timeline": [
+            {"event": "引文是空的", "chapter_no": 1,
+             "evidence": [{"chapter_no": 1, "quote": "。"}]},
+        ]
+    }
+    kept, stats = enforce_evidence(digest, chapters)
+    assert kept["timeline"] == []
+    assert stats["drop_reasons"].get("quote_too_short") == 1
+
+
+def test_enforce_evidence_records_drop_reasons():
+    """丢弃要**记下原因**（模型在编 vs 引文写错，处置完全相反）。"""
+    chapters = {1: REAL_LINES[0]}
+    digest = {
+        "timeline": [
+            {"event": "编的", "chapter_no": 1,
+             "evidence": [{"chapter_no": 1, "quote": "这句话原文里根本没有出现过"}]},
+            {"event": "没证据", "chapter_no": 1},
+        ]
+    }
+    _kept, stats = enforce_evidence(digest, chapters)
+    assert stats["drop_reasons"].get("quote_not_found") == 1
+    assert stats["drop_reasons"].get("no_evidence") == 1
+    # 样本也要留（界面要能回答「为什么丢了这么多」）
+    assert stats["drop_samples"]["quote_not_found"]
 
 
 def test_enforce_evidence_accepts_truncated_quote():
@@ -500,3 +606,111 @@ def test_retrieve_digest_entries_is_bounded(db_session):
     assert all(h["chapter_no"] <= 4 for h in hits)
 
     assert retrieve_digest_entries(db_session, nid, "杀人", cutoff=None) == []
+
+
+# ====================================================================
+# 6. 复用判定：必须发生在**花钱之前**
+# ====================================================================
+#
+# 旧顺序是「先 build（整本一次模型调用）→ 再看要不要复用」，
+# 于是任务状态里那句「命中已有摘要，未重新抽取」是假的：模型跑完了、额度花了，
+# 只是产物没保存。真跑 6 次这本真书时每次都付了一次全本调用的钱。
+#
+# 现在：digest_plan() 先把参数算出来（纯本地计算），拿它当复用键比对。
+
+
+def test_digest_plan_costs_nothing(db_session):
+    """算计划**不许调模型** —— 它是复用判定的前置步骤，一调就白花钱了。"""
+    nid = _make_corpus(db_session)
+    provider = WholeProvider()
+    plan = digest_plan(db_session, nid, provider=provider, mode=MODE_WHOLE)
+    assert provider.calls == 0, "算计划时调了模型"
+    assert plan["mode"] == MODE_WHOLE
+    assert plan["plan_key"] == {"mode": MODE_WHOLE, "target_ratio": TARGET_COMPRESSION}
+
+
+def test_plan_key_changes_with_target_ratio(db_session):
+    """压缩比目标变了 ⇒ 条目上限不同 ⇒ 复用键必须跟着变。"""
+    nid = _make_corpus(db_session)
+    a = digest_plan(db_session, nid, provider=WholeProvider(), mode=MODE_WHOLE, target_ratio=10)
+    b = digest_plan(db_session, nid, provider=WholeProvider(), mode=MODE_WHOLE, target_ratio=5)
+    assert a["plan_key"] != b["plan_key"], "改了压缩比目标，复用键却没变"
+
+
+def _digest_job(monkeypatch, db_session, provider, nid, proj, **kwargs):
+    """跑一次后台摘要任务（provider 换成假的那份），返回任务行。"""
+    from app.style import narrative as narrative_mod
+    from app.style.jobs import create_distill_run, run_book_digest_job
+
+    monkeypatch.setattr(narrative_mod, "resolve_distill_provider", lambda: provider)
+    run = create_distill_run(db_session, proj.id, "full", kind="book_digest", novel_id=nid)
+    db_session.commit()
+    run_book_digest_job(run.id, proj.id, nid, **kwargs)
+    db_session.expire_all()
+    return db_session.get(DistillRun, run.id)
+
+
+def test_job_reuses_existing_digest_without_calling_model(db_session, monkeypatch):
+    """同书同参数已有产物 ⇒ **一次模型调用都不该发生**。"""
+    nid = _make_corpus(db_session)
+    proj = _make_project(db_session, nid)
+    first = WholeProvider()
+    digest = build_book_digest(db_session, nid, provider=first, mode=MODE_WHOLE)
+    save_digest(db_session, digest, digest_content_hash(db_session, nid))
+    db_session.commit()
+
+    second = WholeProvider()
+    done = _digest_job(
+        monkeypatch, db_session, second, nid, proj, mode=MODE_WHOLE, force=False
+    )
+    assert second.calls == 0, "命中已有产物却还是调了模型（钱白花了）"
+    assert done.status == STATUS_SUCCESS
+    assert "命中已有摘要" in (done.stage or "")
+
+
+def test_job_recomputes_when_target_ratio_changed(db_session, monkeypatch):
+    """改了压缩比目标 ⇒ 旧产物不能被复用（参数形同虚设是最难查的那种错）。"""
+    nid = _make_corpus(db_session)
+    proj = _make_project(db_session, nid)
+    first = WholeProvider()
+    digest = build_book_digest(
+        db_session, nid, provider=first, mode=MODE_WHOLE, target_ratio=10
+    )
+    save_digest(db_session, digest, digest_content_hash(db_session, nid))
+    db_session.commit()
+
+    second = WholeProvider()
+    _digest_job(
+        monkeypatch, db_session, second, nid, proj,
+        mode=MODE_WHOLE, target_ratio=5, force=False,
+    )
+    assert second.calls == 1, "压缩比目标变了还复用旧产物"
+
+
+def test_job_recomputes_when_digest_version_changed(db_session, monkeypatch):
+    """产物结构版本变了 ⇒ 旧产物不是同一种东西，不能复用。"""
+    nid = _make_corpus(db_session)
+    proj = _make_project(db_session, nid)
+    first = WholeProvider()
+    digest = build_book_digest(db_session, nid, provider=first, mode=MODE_WHOLE)
+    row = save_digest(db_session, digest, digest_content_hash(db_session, nid))
+    row.digest_version = DIGEST_VERSION + 1
+    db_session.commit()
+
+    second = WholeProvider()
+    _digest_job(monkeypatch, db_session, second, nid, proj, mode=MODE_WHOLE, force=False)
+    assert second.calls == 1, "产物版本变了还复用旧产物"
+
+
+def test_job_force_always_recomputes(db_session, monkeypatch):
+    """force=True ⇒ 无条件重算（人明确说了要重跑）。"""
+    nid = _make_corpus(db_session)
+    proj = _make_project(db_session, nid)
+    first = WholeProvider()
+    digest = build_book_digest(db_session, nid, provider=first, mode=MODE_WHOLE)
+    save_digest(db_session, digest, digest_content_hash(db_session, nid))
+    db_session.commit()
+
+    second = WholeProvider()
+    _digest_job(monkeypatch, db_session, second, nid, proj, mode=MODE_WHOLE, force=True)
+    assert second.calls == 1, "force=True 还复用旧产物"
