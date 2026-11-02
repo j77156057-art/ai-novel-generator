@@ -19,7 +19,7 @@ def _seed(db, p, text):
 def test_halfwidth_punctuation_between_chinese_is_an_error():
     from app.agents.text_quality import run_text_quality_audit
     db, p = fixture()
-    # 半角逗号（显式拼出来，免得源码里看���出是哪个）
+    # 半角逗号（显式拼出来，免得源码里看不出是哪个）
     _seed(db, p, '他' + ',' + '将砂粒捏碎，放在鼻下闻了闻。')
     report, stats = run_text_quality_audit(db, p)
     errors = [i for i in report.issues if i.severity == 'error']

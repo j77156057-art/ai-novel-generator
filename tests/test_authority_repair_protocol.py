@@ -70,7 +70,7 @@ def test_real_v2_response_is_locally_accepted_but_keeps_global_obligations():
     这正是上一轮卡住的地方：局部复验要求四维全 supported，而请求标的是 local_only，
     模型对未检查的三维如实返回 unknown —— 于是「正确的局部修复」永远无法被接受。
     现在：目标维度判定通过即构成局部接受；三维的 unknown 记入 deferred_dimensions，
-    整段四维由独立���整段验收负责，全局义务一条都不许因此被清掉。
+    整段四维由独立的整段验收负责，全局义务一条都不许因此被清掉。
     """
     db,p,g,previous,a,payload=setup_review()
     answer=json.loads((Path(__file__).parent/'fixtures/authority_body_repair_review_v2.json').read_text(encoding='utf-8'))

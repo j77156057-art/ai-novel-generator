@@ -297,7 +297,7 @@ def canonical_text(value: Any) -> str:
     - dict / list → `json.dumps(sort_keys=True, ensure_ascii=False)`。
 
     `sort_keys=True` 是哈希稳定的前提：同一个 dict 换了插入顺序也必须得到
-    同一个 content_hash，否则漂移检测会被无��的序列化噪声触发。
+    同一个 content_hash，否则漂移检测会被无关的序列化噪声触发。
     """
     if value is None:
         return ""

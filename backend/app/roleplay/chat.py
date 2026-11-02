@@ -250,7 +250,7 @@ def run_chat(
     evidence_block = render_evidence_block(sources)
 
     # —— 他经历过的事（机械层，零模型调用）——
-    # 档案只覆盖前 N 个主要角色 ⇒ 用户选的角��常常没有 L2 档案 ⇒ 这里兜底。
+    # 档案只覆盖前 N 个主要角色 ⇒ 用户选的角色常常没有 L2 档案 ⇒ 这里兜底。
     timeline_block = ""
     try:
         from app.roleplay.bio import character_timeline, render_timeline

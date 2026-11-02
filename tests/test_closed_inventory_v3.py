@@ -47,7 +47,7 @@ def test_v3_literal_surface_is_repaired_by_deterministic_reanchoring():
     fixed=inv['reanchored_mentions'][0]
     assert fixed['reanchored']['token']=='核对表'
     assert fixed['reanchored']['from_source_id']==sid and fixed['reanchored']['to_source_id']==sid
-    # 修好之后每一�� mention 都仍然逐字可定位
+    # 修好之后每一个 mention 都仍然逐字可定位
     for m in inv['mentions']:
         assert m['surface'] in sources[m['source_id']]['quote']
     assert inv['dimensions']['object']['validated_source_ids']==['G1P025','G1P026']

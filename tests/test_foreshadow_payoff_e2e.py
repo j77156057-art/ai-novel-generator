@@ -69,7 +69,7 @@ def _rows(session):
     return list(session.query(KgForeshadow).order_by(KgForeshadow.id).all())
 
 
-# ── 1. 落库：编出来的回收章不���进账 ──────────────────────────────────────
+# ── 1. 落库：编出来的回收章不进账 ──────────────────────────────────────
 def test_persist_drops_fabricated_payoff(db):
     """模型吐 `pf=50`（无正文证据）⇒ 落库时置空，不写进账。"""
     _persist(db, [{"name": "线索A", "status": "planted", "planted_chapter": 1,
