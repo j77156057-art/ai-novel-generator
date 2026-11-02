@@ -184,12 +184,28 @@ const showBaseUrl = computed(() => needsBaseUrl(form.provider));
  *   MiniMax M3.1 → 只能调档（关不掉；省略 = 最强最慢）
  *   DeepSeek 类   → 能关
  *   其它          → 未验证，不提供（按了没反应的开关比没有更糟）
- * 拿不到或 mode === "none" → null ⇒ 界面上不显示这一块。
+ * 拿不到、mode === "none"、或没有档位 → null ⇒ 界面上不显示下拉。
  */
 const thinkingOptions = computed(() => {
   const ctl = props.providers[form.provider]?.thinking;
   if (!ctl || ctl.mode === "none" || !ctl.levels?.length) return null;
   return ctl;
+});
+
+/**
+ * 「这个模型没有思考开关」要不要说出来。
+ *
+ * 为什么不能只是「不显示控件」：`mode === "none"` 有两种含义 ——
+ * 我们**知道**它不归我们控制（verified），或者我们**没测过**（unverified）。
+ * 只把控件藏起来的后果是用户以为「平台忘了做」，然后去翻文档、去猜，
+ * 甚至绕过界面直接发字段。
+ * ⇒ 只有「未验证」这一档才多说一句（verified 的不打扰）。
+ */
+const thinkingUnverifiedNote = computed(() => {
+  const ctl = props.providers[form.provider]?.thinking;
+  if (!ctl || ctl.mode !== "none") return null;
+  if (ctl.verification !== "unverified") return null;
+  return ctl.note || "该模型没有思考开关（未实测）。";
 });
 
 /** 档位的「人话」标签：不出现 reasoning_effort 这种内部字段名。
@@ -463,6 +479,12 @@ function submitTest(): void {
           建议正文续写选「最省」：实测 2400 字从 66.7 秒降到 36 秒，思考少占九成预算。
         </template>
       </span>
+    </div>
+
+    <!-- 没有开关但要说明白：把「未实测」与「本来不归我们控制」分开 -->
+    <div v-else-if="thinkingUnverifiedNote" class="field thinking-field">
+      <label>思考</label>
+      <span class="faint limit-note">{{ thinkingUnverifiedNote }}</span>
     </div>
 
     <!-- 操作：测试只测这一个角色；保存只保存这一个角色 -->

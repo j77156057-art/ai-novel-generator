@@ -75,143 +75,69 @@ from app.schemas import StrictRequest
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 # 渠道元数据：供前端下拉与说明（key 获取地址 / 免费政策 / 默认候选模型）
-#: 各渠道的「思考控制」方式 —— **按厂家文档与实测**填，没验证过的不写。
 #:
-#: mode 的含义：
-#:   "effort"   只能调档（reasoning_effort），**关不掉**；省略 = 最高档
-#:   "disable"  能开关（thinking={"type":"disabled"}）
-#:   "none"     该渠道/模型不支持控制（不发任何字段）
-#:
-#: 为什么不能给一个全局「思考强度」下拉：三家写法互不相同，且同一渠道的不同模型
-#: 也可能不同（MiniMax M3.1 只能调档，老 M3 能关）。给错字段的后果是
-#: **按了没反应**（服务端静默忽略），比没有这个开关更糟。
-THINKING_CONTROL: dict[str, dict] = {
-    "minimax": {
-        "mode": "effort",
-        "field": "reasoning_effort",
-        # 实测 2026-10-26：M3.1 系（含 Preview）吃这个字段；
-        # 老 M3 不吃（传了反而更慢）—— 见 provider.MiniMaxChatProvider 的注释。
-        "models": ("MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview"),
-        # 只给**实测能写出正文**的三档。xhigh / max 在写手场景写不出正文
-        # （xhigh：reasoning 8190 把 8192 预算吃满，finish=length，正文 0 字；
-        #   max：>300s 未返回）⇒ 不提供。
-        "levels": ("low", "medium", "high"),
-        "note": "M3.1 关不掉思考，只能调档；省略档位 = 最高档（最慢最贵，且写不出正文）",
-    },
-    "deepseek": {
-        "mode": "disable",
-        "field": "thinking",
-        # 实测 2026-10-26：flash 3.4s→2.4s、v4-pro 27.8s→8.2s，且 reasoning 归零。
-        "models": ("deepseek-chat", "deepseek-reasoner", "deepseek-flash", "deepseek-v4-pro"),
-        "levels": ("default", "off"),
-        "note": "能关掉思考（实测 v4-pro 27.8s → 8.2s）",
-    },
-    "openai": {
-        # 通用 OpenAI 兼容渠道：可以为任何厂商服务，所以**按模型名认**。
-        # DeepSeek 走这条渠道时也命中（`/v1` + Bearer，与本渠道同形）。
-        "mode": "disable",
-        "field": "thinking",
-        "models": ("deepseek-chat", "deepseek-reasoner", "deepseek-flash", "deepseek-v4-pro"),
-        "levels": ("default", "off"),
-        "note": "通用渠道：DeepSeek 系可关思考；其它模型不保证，未验证",
-    },
-}
+#: ⚠️ 2026-11-02：「各渠道/模型的思考控制方式」原先在本文件里有一张
+#: `THINKING_CONTROL` 手工表，另有一串 if/elif —— **已搬到
+#: `app/llm/thinking_models.py` 的实测表**（B1 拍板）。
+#: 搬走的原因：同一件事散在三处（本文件管开关、`llm/provider.py` 管预算地板、
+#: `config/providers.yaml` 管默认预算），新加渠道漏一处就是静默失效。
+#: 现在只在那一张表里加行；本文件只负责把表翻译成界面契约。
 
 #: 渠道 → 该渠道下「模型名 → 控制方式」的解析结果。
 def thinking_control_for(provider: str, model: str = "") -> dict:
-    """这个渠道 + 这个模型能用哪种思考控制？拿不准就返回 {"mode": "none"}。
+    """这个渠道 + 这个模型能用哪种思考控制？拿不准就返回 `mode="none"`。
 
-    **宁可返回 none，也不给一个按了没反应的开关** —— 服务端对不认识的字段是
-    静默忽略的，用户会以为生效了。
+    ## 2026-11-02：改为**读实测表**（`app/llm/thinking_models.py`）
 
-    两条容易踩的坑（都实测过）：
+    原先这里是一大串 if/elif，把「谁关得掉」「给哪些档位」「说明文案」写死在这里；
+    而预算地板写在 `llm/provider.py`、默认预算写在 `config/providers.yaml` ——
+    **同一件事散在三处**，新加渠道时漏一处就是静默失效：
+    要么界面上有一个按了没反应的开关，要么正文被思考吃光预算变成空串。
+
+    ⇒ 现在三道问题（是不是思考型 / 关不关得掉 / 预算地板给多少）都查同一张表。
+    本函数只负责把表**翻译成界面契约**。
+
+    ## 新增字段 `verification`
+
+    `mode="none"` 有两种完全不同的含义，原先在界面上分不开：
+    - **模型本来就不思考**（`verified`）；
+    - **我们没测过它能不能关**（`unverified`）。
+
+    分不开的代价很实：用户看到一个没有开关的模型，会以为「平台忘了做」，
+    于是去翻文档、去猜、甚至绕过界面直接发字段。
+    ⇒ 现在 `verification="unverified"` 时前端会明写「该模型没有思考开关（未实测）」，
+    **语义明确，且一个字段都不发**。
+
+    ## 两条容易踩的坑（都实测过，现在由表的「最长前缀优先」守住）
+
     1. **同一个渠道的不同模型规则不同**：MiniMax M3.1 只能调档（关不掉），
        而老 M3 不认 effort（传 low 反而更慢 22.8s vs 19.9s），它走 thinking=disabled。
+       ⚠️ `MiniMax-M3.1` 以 `MiniMax-M3` 开头 —— 按表顺序匹配会判错，所以按**前缀长度**匹配。
     2. **通用兼容渠道按模型名认厂商**：DeepSeek 就是从这条渠道进来的。
     """
-    provider = (provider or "").strip().lower()
-    model = (model or "").strip()
+    from app.llm.thinking_models import (
+        THINK_OFF_CAPABLE,
+        THINK_TUNABLE,
+        lookup,
+    )
 
-    if provider == "minimax":
-        if model.startswith("MiniMax-M3.1"):
-            # 只能调档：关不掉（disabled → 400 "requires adaptive thinking"），省略 = max
-            #
-            # 2026-10-26 两轮实测（写 2400 字，共 15 次调用）：
-            #   档位    成功/总   用时       reasoning    裸台词段(项目尺)
-            #   low      7/7     55~99s    92~398       70~92%
-            #   medium   6/7     40~57s    250~3203     4~98%
-            #   high     6/6     53~127s   429~2835     66~89%
-            #   xhigh    2/3     150~169s  5763~8191    **1 次正文 0 字**（8192 打满）
-            #   max(省略) **0/2  >300s 未返回**
-            # ⇒ 三个可用档位**形态分不出高下**（组内方差远大于组间差异），
-            #   能分辨的只有用时（medium 快约 25%）与思考 token（low 最省）。
-            # ⇒ **xhigh / max 不提供**：它们在写手场景要么正文 0 字，要么读超时。
-            return {"mode": "effort", "field": "reasoning_effort",
-                    "levels": ("low", "medium", "high"),
-                    "note": "关不掉思考，只能调档。实测三档形态差不多；"
-                            "medium 快约 25%，low 最省思考 token。"
-                            "xhigh/max 写手场景会写不出正文（超 300 秒或正文为空），不提供"}
-        if model.startswith("MiniMax-M3"):
-            # 老 M3：不认 effort（实测传了更慢）；能关，代码里已默认关
-            return {"mode": "disable", "field": "thinking",
-                    "levels": ("off",),
-                    "note": "老 M3 只能关思考（它不认 effort，默认就关着）"}
-        return {"mode": "none", "field": None, "levels": (), "note": ""}
+    row = lookup(provider, model)
+    mode = "none"
+    field = None
+    if row.thinking == THINK_TUNABLE:
+        mode, field = "effort", "reasoning_effort"
+    elif row.thinking == THINK_OFF_CAPABLE:
+        mode, field = "disable", "thinking"
 
-    if provider == "opencode-go":
-        # opencode Go 订阅通道，默认模型 deepseek-v4.1-flash。
-        #
-        # 2026-11-01 实测：这个模型是**思考型**的，思考 token 与正文**共用**
-        # 同一份 max_tokens 预算 ⇒ max_tokens=64 时正文**一个字都没有**
-        # （finish_reason=length，只有思维链）。
-        #
-        # ⇒ 渠道层默认关思考（provider.OpenCodeGoChatProvider 的 thinking_off 默认 True），
-        # 界面这里给「开/关」两档，让用户能按需要打开。
-        return {"mode": "disable", "field": "thinking",
-                "levels": ("default", "off"),
-                "note": "默认关（渠道层已关）：思考 token 与正文共用预算，"
-                        "max_tokens 太小会让正文一个字都没有（实测 finish_reason=length）"}
-
-    if provider == "openai":
-        # 通用兼容渠道：只有实测过的 DeepSeek 系给出开关
-        if any(model.startswith(m) for m in ("deepseek-chat", "deepseek-reasoner",
-                                             "deepseek-flash", "deepseek-v4-pro")):
-            # 2026-10-26 真跑（2400 字续写，两种模型各两组）—— 两个模型的**结论相反**：
-            #
-            #   flash   基线 25.8s / reasoning 87 / 纯台词段 41.0%
-            #           关思考 18.6s / 0        / 41.2%      ⇒ **快 28%，质量基本不变**
-            #
-            # v4-pro 上「关思考会毁掉对白形态」这个说法**已被推翻**（同日复测 6 篇）：
-            #   原来记的「基线 4.9% → 关掉 44.0%」不可信 —— 4.9% 那一篇的
-            #   **含引号段只有 20 段**，比例在极小的分母上失真。
-            #   复测 6 篇（3 场景 × 2 次）：纯台词段给出 0.0% / 12.5% / 15.4% /
-            #   42.9% / 71.4% / 100.0% —— 其中 100% 那篇全文 10 段、**1 个引号**。
-            #   换成不吃分母的绝对量：v4-pro 每篇 2400~2900 字只有 **1~13 段对白**，
-            #   对白段长中位 72 字（参考书 30 字）、段内叙述字中位 43 字（参考书 24 字）
-            #   ⇒ **它是对白写得少，不是写得好**。
-            #   用时也顶不住：6 次平均 173s，最长 291s（单段落就快撞 300s 超时线）。
-            #
-            # ⇒ 两个 DeepSeek 模型都给「可关」，但理由不同：
-            #   flash —— 关了又快 28%、质量不变，**建议关**；
-            #   v4-pro —— 关了不省时间，且它本来就少写对白，**建议保持默认**。
-            if model.startswith("deepseek-v4-pro"):
-                return {"mode": "disable", "field": "thinking",
-                        "levels": ("default", "off"),
-                        "note": "建议保持默认：实测关掉几乎不省时间（64.6s→63.9s），"
-                                "而它每篇只有 1~13 段对白、平均 173s，最长 291s。"}
-            return {"mode": "disable", "field": "thinking",
-                    "levels": ("default", "off"),
-                    "note": "可关：实测快 28%（25.8s→18.6s），对白形态基本不变"}
-        return {"mode": "none", "field": None, "levels": (), "note": ""}
-
-    spec = THINKING_CONTROL.get(provider)
-    if spec is None:
-        return {"mode": "none", "field": None, "levels": (), "note": ""}
     return {
-        "mode": spec["mode"],
-        "field": spec["field"],
-        "levels": spec["levels"],
-        "note": spec["note"],
+        "mode": mode,
+        "field": field,
+        "levels": row.levels if mode != "none" else (),
+        "note": row.note,
+        # 界面据此决定「没有开关」这句话怎么说（见上面 docstring）。
+        "verification": "verified" if row.thinking != "unverified" else "unverified",
+        # 实测依据跟着能力一起下发：界面上能答「你凭什么是这样」。
+        "evidence": row.evidence,
     }
 
 

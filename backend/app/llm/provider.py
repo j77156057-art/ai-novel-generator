@@ -692,12 +692,19 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
     #:   120 秒的默认超时线；max_tokens 8192 也不够 —— 思考先把预算吃掉了，
     #:   正文被拦腰截断（finish_reason='length'）。这条对「429 自动切到
     #:   M3.1-Flash」的链路同样要紧 —— 那条路今天就是带着 8192 跑的。
+    #:
+    #: ⚠️ 2026-11-02：这两个常量**已改为从实测表推导**
+    #: （`app/llm/thinking_models.py` 的 `FLOOR_*`，B1 拍板）。
+    #: 保留这两个名字只是为了不改动既有测试与下游引用；它们的值与表里的
+    #: `FLOOR_FULL` 相同，且**不要再单独改这里** —— 改表。
     MIN_ADAPTIVE_MAX_TOKENS = 32768
     MIN_ADAPTIVE_TIMEOUT = 300
     #:
     #: **发了 effort**（思考调低）：思考几乎不占预算 ⇒ 地板可以降一档
     #:   （8192 / 180s）。2026-10-26 真跑（effort=low，写 2400 字正文）：
     #:   36.0 秒、completion 2605、正文完整写出 ⇒ 8192 绰绰有余。
+    #:
+    #: ⚠️ 同 `MIN_ADAPTIVE_*`：这两个也已改由表里的 `FLOOR_THINKS_LESS` 推导。
     MIN_ADAPTIVE_MAX_TOKENS_EFFORT = 8192
     MIN_ADAPTIVE_TIMEOUT_EFFORT = 180
     #:
@@ -746,12 +753,14 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
             #     （实测 2605 token / 36 秒够用；high 档 completion 2584~3058 也够）；
             #   xhigh/max 没压下来 ⇒ 思考照旧吃预算 ⇒ 地板保持最坏情况
             #     （否则正文会被静默截断 —— 实测 xhigh 在 8192 下**正文 0 字**）。
-            if extra.get("reasoning_effort") in self._EFFORT_THINKS_LESS:
-                floor_tokens = self.MIN_ADAPTIVE_MAX_TOKENS_EFFORT
-                floor_timeout = self.MIN_ADAPTIVE_TIMEOUT_EFFORT
-            else:
-                floor_tokens = self.MIN_ADAPTIVE_MAX_TOKENS
-                floor_timeout = self.MIN_ADAPTIVE_TIMEOUT
+            #
+            # 2026-11-02：这两组数字与「哪些档位压得下来」搬进
+            # `app/llm/thinking_models.py` 的实测表（B1 拍板），这里**读表**而不是
+            # 再写一份判断 —— 表里 `FLOOR_*` 两个常量仍是本节实测值的唯一出处。
+            from app.llm.thinking_models import budget_floor
+            _floor = budget_floor("minimax", model,
+                                  effort=extra.get("reasoning_effort"))
+            floor_tokens, floor_timeout = _floor or (0, 0)
             kwargs["max_tokens"] = max(
                 int(kwargs.get("max_tokens") or 0), floor_tokens
             )
@@ -932,8 +941,19 @@ class OpenCodeGoChatProvider(GenericOpenAIChatProvider):
         }
         if extra_headers:
             headers.update(extra_headers)
+        # 预算地板从实测表推导（B1 拍板）：这个模型的「能不能关思考」**未实测**，
+        # 但「思考与正文共用预算」是实测过的 ⇒ 表里按最坏情况给地板
+        # （FLOOR_FULL）。用户显式关掉（thinking_off=False 的情况下思考被关）
+        # 或渠道默认关着时，地板不生效 —— 见 `budget_floor()` 的第 1 条。
+        _off = True if thinking_off is None else thinking_off
+        from app.llm.thinking_models import budget_floor
+        _floor = budget_floor("opencode-go", model, thinking_off=_off)
+        if _floor:
+            kwargs = dict(kwargs)
+            kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), _floor[0])
+            kwargs["timeout"] = max(int(kwargs.get("timeout") or 0), _floor[1])
         super().__init__(api_key, base_url, model, models=models,
-                         thinking_off=True if thinking_off is None else thinking_off,
+                         thinking_off=_off,
                          extra_headers=headers, **kwargs)
 
 
@@ -1141,7 +1161,11 @@ def _thinking_kwargs(provider: str, model: str, thinking: str) -> dict:
 
     if value == "off":
         # 能关的：老 M3（类里本来默认就关）与通用兼容渠道（DeepSeek）
-        if prov == "minimax" or prov == "openai":
+        #
+        # 2026-11-02：opencode-go 也收进来 —— 它渠道层本来默认就关，
+        # 显式「off」应当得到同一个结果，而不是被静默忽略（返回 {} 后靠默认值兜底，
+        # 看起来对、但读代码的人会以为这个渠道不支持关）。
+        if prov in ("minimax", "openai", "opencode-go"):
             return {"thinking_off": True}
     if value == "default":
         # 「开思考」= 显式不关。

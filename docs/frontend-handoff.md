@@ -12,7 +12,7 @@ cd <REPO_ROOT>/frontend
 npm ci            # 首次
 npm run dev       # dev server → http://localhost:5173
 npm run typecheck # vue-tsc --noEmit（必须过）
-npm test          # 66 个纯逻辑用例（node --test）+ 33 个组件用例（vitest）
+npm test          # 66 个纯逻辑用例（node --test）+ 34 个组件用例（vitest）
 npm run build     # 上面两条都过，才会产出 dist/
 ```
 

@@ -139,4 +139,57 @@ describe("RoleModelPanel", () => {
     // 按钮文案也要变（按钮不能看着没事干）
     expect(saveBtn.text()).toContain("保存中");
   });
+
+  it("有思考开关时给下拉；没有开关且**未实测**时要明说，不能只是把控件藏起来", () => {
+    const withSwitch = mountPanel({
+      providers: {
+        minimax: {
+          ...PROVIDERS.minimax,
+          thinking: {
+            mode: "effort",
+            field: "reasoning_effort",
+            levels: ["low", "medium", "high"],
+            note: "关不掉思考，只能调档",
+            verification: "verified",
+          },
+        },
+      },
+    });
+    expect(withSwitch.find("select").exists()).toBe(true);
+
+    // 未实测：没有下拉，但必须有这句话（否则用户以为平台忘了做）
+    const unverified = mountPanel({
+      providers: {
+        minimax: {
+          ...PROVIDERS.minimax,
+          thinking: {
+            mode: "none",
+            field: null,
+            levels: [],
+            note: "这个模型没有思考开关（未实测关不关得掉）",
+            verification: "unverified",
+          },
+        },
+      },
+    });
+    expect(unverified.find("select").exists()).toBe(false);
+    expect(unverified.text()).toContain("没有思考开关");
+
+    // 已确认不归我们控制（verified）⇒ 不打扰用户，不显示这句话
+    const verifiedNone = mountPanel({
+      providers: {
+        minimax: {
+          ...PROVIDERS.minimax,
+          thinking: {
+            mode: "none",
+            field: null,
+            levels: [],
+            note: "该模型本来就不思考",
+            verification: "verified",
+          },
+        },
+      },
+    });
+    expect(verifiedNone.text()).not.toContain("没有思考开关");
+  });
 });

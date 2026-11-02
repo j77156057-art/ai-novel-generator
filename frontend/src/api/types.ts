@@ -503,13 +503,22 @@ export type LlmRole = "writer" | "assistant" | "distiller";
  * mode:
  *   "effort"  → 只能调档（MiniMax M3.1 关不掉思考）
  *   "disable" → 能开关（DeepSeek 类）
- *   "none"    → 未验证/不支持 ⇒ 界面上**不显示**这个控件
+ *   "none"    → 不给这个控件（未验证 / 不支持）
+ *
+ * `verification`（2026-11-02 新增）把 "none" 的两种含义分开：
+ *   "verified"   → 我们**知道**它不归我们控制（例如本来就不思考）
+ *   "unverified" → 我们**没测过**它能不能关
+ * 分不开的代价很实：用户看到一个没有开关的模型，会以为「平台忘了做」。
+ * ⇒ mode 为 none 且 verification 为 unverified 时，界面要**明说**这一点。
  */
 export interface LlmThinkingControl {
   mode: "effort" | "disable" | "none";
   field: string | null;
   levels: string[];
   note: string;
+  verification?: "verified" | "unverified";
+  /** 能力判断的依据（日期 + 一句话），给「你凭什么是这样」一个答案。 */
+  evidence?: string;
 }
 
 export interface LlmProviderMeta {

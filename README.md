@@ -180,10 +180,10 @@ cd frontend && npm install && npm run dev    # http://localhost:5173 ，/api 代
 cd backend
 pip install -r requirements-dev.txt     # 额外的只有 pytest
 cd ..
-python -m pytest tests/                 # 2,111 项用例（+ 8 项需外部语料/验收库才跳）
+python -m pytest tests/                 # 2,126 项用例（+ 8 项需外部语料/验收库才跳）
 ```
 
-> 结尾会有一行 `2103 passed, 8 skipped in ...` —— **别再给这条命令加 `-q`**：
+> 结尾会有一行 `2118 passed, 8 skipped in ...` —— **别再给这条命令加 `-q`**：
 > `pytest.ini` 的 `addopts` 里已经有 `-q`，两个叠起来变成 `-qq`，
 > pytest 会**静默吞掉那行汇总**。CI 跑的就是这一条命令。
 
@@ -276,8 +276,8 @@ flowchart TD
 |---|---|
 | `backend/app/` | 后端全部实现：混合检索 / 知识图谱 / 生成环 / 文体蒸馏 / 助理 agent |
 | `frontend/` | Vue 3 + Vite 前端：创作三板块、助理工作台、模型设置 |
-| `tests/` | **2,111** 项 pytest 用例（单源真源，`pytest tests/`） |
-| `frontend/tests/` | 前端测试：12 个纯逻辑文件（66 项，`node --test`）+ 4 个组件级文件（33 项，vitest + jsdom） |
+| `tests/` | **2,126** 项 pytest 用例（单源真源，`pytest tests/`） |
+| `frontend/tests/` | 前端测试：12 个纯逻辑文件（66 项，`node --test`）+ 4 个组件级文件（34 项，vitest + jsdom） |
 | `docs/` | 84 份设计文档与指南（另加 `docs/architecture/` 1 份）：架构怎么定的、判据为什么这么定 |
 | `docs/images/` | README 用的界面截图 |
 | `skills/` | 可复用的**方法单元**（agent skill）：盲评包脱敏与防泄露（SKILL.md + 事故复盘 + 泄露扫描脚本）、长文本摘要的证据强制与可自动判的验收（SKILL.md + 20 项可证伪验证） |
