@@ -1501,6 +1501,136 @@ export interface DistillJobListResponse {
   items: DistillJob[];
 }
 
+// ---------- 全书摘要（BookDigest） ----------
+
+/**
+ * 摘要的一项验收结论。
+ *
+ * `ok` 是**三态**：
+ * - `true` = 通过；
+ * - `false` = 不通过；
+ * - `null` = **这一项不适用**（根本没跑，比如这本书没抽出角色候选）。
+ *
+ * ⚠️ 为什么不是布尔：2026-11-02 真跑时，角色候选的调用签名写错了
+ * ⇒ 候选一条都没取到 ⇒ 这一项「不适用」⇒ 而旧代码把它算成 `ok=true`
+ * ⇒ 界面显示「通过」，其实**这一项根本没跑**。
+ * ⇒ 不适用必须能和一个「通过」区分开。
+ */
+export interface DigestCheck {
+  ok: boolean | null;
+  value: number | null;
+}
+
+/** 证据强制的诊断信息（为什么丢了这么多）。 */
+export interface DigestEvidenceDetail {
+  /** 保留的条目数。 */
+  kept: number;
+  /** 丢弃的条目数（没有可验证的证据）。 */
+  dropped: number;
+  /** 「章号挂错、已重新归属」的条目数（证据是真的，只是指针错了）。 */
+  reattributed: number;
+  /** 丢弃比例。 */
+  dropped_ratio: number | null;
+  /** 丢弃比例的上限（超过即判失败）。 */
+  threshold: number | null;
+  /** 丢弃原因分布：键是原因码，值是条数。 */
+  drop_reasons: Record<string, number>;
+  /** 按块统计的丢弃数（timeline / characters / reactions）。 */
+  dropped_by_block: Record<string, number>;
+  /** 每种原因最多 5 条样本，供界面展示。 */
+  drop_samples: Record<
+    string,
+    { text: string; quotes: string[]; chapters: (number | null)[] }[]
+  >;
+}
+
+/** 一条摘要的证据（引文必须逐字出现在它声称的那一章里）。 */
+export interface DigestEvidence {
+  chapter_no?: number | null;
+  quote?: string | null;
+}
+
+export interface DigestTimelineItem {
+  seq?: number;
+  chapter_no?: number | null;
+  in_story_time?: string | null;
+  event?: string | null;
+  actors?: string[] | null;
+  weight?: number | null;
+  evidence?: DigestEvidence[] | null;
+}
+
+export interface DigestCharacterItem {
+  name?: string | null;
+  role?: string | null;
+  arc?: string | null;
+  key_events?: number[] | null;
+  relations?: { name?: string | null; kind?: string | null; changed_at?: number | null }[] | null;
+  voice?: { avg_len?: number | null; habits?: string[] | null } | null;
+  evidence?: DigestEvidence[] | null;
+}
+
+export interface DigestReactionItem {
+  character?: string | null;
+  trigger?: string | null;
+  says?: string | null;
+  does?: string | null;
+  evidence?: DigestEvidence[] | null;
+}
+
+/** 一本书的摘要（GET /api/books/{novel_id}/digest）。 */
+export interface DigestOut {
+  id: number;
+  novel_id: number;
+  digest_version: number;
+  /** 抽取档位：whole（整本一次投喂）/ retrieval（切块抽 + 合并）。 */
+  mode: string;
+  /** 为什么是这一档（人话，直接显示给用户）。 */
+  mode_reason: string | null;
+  status: string;
+  stats: {
+    chars_in?: number;
+    chars_out?: number;
+    ratio?: number;
+    kept?: number;
+    dropped?: number;
+  };
+  /** 整体结论（false = 有检查项不通过）。 */
+  verify_passed: boolean | null;
+  checks: Record<string, DigestCheck>;
+  /** 证据强制的诊断信息。 */
+  evidence_detail?: DigestEvidenceDetail;
+  /** 哪些检查项**不适用**（没跑，不是通过）。 */
+  not_applicable?: string[];
+  payload: {
+    timeline?: DigestTimelineItem[];
+    characters?: DigestCharacterItem[];
+    reactions?: DigestReactionItem[];
+  };
+  /** 渲染后的文本（进上下文的就是它）。 */
+  text: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** POST /api/projects/{id}/digests 的响应。 */
+export interface DigestStartResponse {
+  job_id: number;
+  status: string;
+  novel_id: number;
+  /** true = 同一本书已有在跑的摘要，复用了那条任务。 */
+  reused: boolean;
+}
+
+/** GET /api/books/{novel_id}/digest/verify 的响应。 */
+export interface DigestVerifyOut {
+  novel_id: number;
+  digest_id: number;
+  passed: boolean;
+  checks: Record<string, DigestCheck & Record<string, unknown>>;
+  stats: Record<string, unknown>;
+}
+
 // ---------- 文风蒸馏库（跨项目复用） ----------
 
 /**

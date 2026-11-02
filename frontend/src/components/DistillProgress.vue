@@ -30,8 +30,15 @@ const props = withDefaults(
     tierName?: string | null;
     /** 紧凑模式：只画状态条 + 进度条，不画成功后摘要（跨步骤常驻的那个横幅用）。 */
     compact?: boolean;
+    /**
+     * 任务名（标题栏右侧那行字）。
+     *
+     * 这个组件被**不止一种后台任务**复用：文风蒸馏、全书摘要都走同一张任务表
+     * 与同一套轮询协议 ⇒ 标题不能写死成「文风蒸馏」。
+     */
+    title?: string;
   }>(),
-  { tierName: null, compact: false },
+  { tierName: null, compact: false, title: "文风蒸馏" },
 );
 
 /** 每个状态的「文字 + 色标」。**两者必须同时出现**，见文件头。 */
@@ -112,7 +119,7 @@ const summary = computed(() => {
         <span v-if="active" class="spinner" aria-hidden="true"></span>
         {{ meta.label }}
       </span>
-      <span class="distill-title">文风蒸馏</span>
+      <span class="distill-title">{{ props.title }}</span>
       <span v-if="tierName" class="distill-tier">档位：{{ tierName }}</span>
       <span v-if="timeHint" class="faint distill-time">{{ timeHint }}</span>
     </div>

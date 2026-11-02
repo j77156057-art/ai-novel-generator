@@ -36,6 +36,9 @@ import type {
   DistillScope,
   DistillStartResponse,
   DistillCostEstimate,
+  DigestOut,
+  DigestStartResponse,
+  DigestVerifyOut,
   ExpertQuestions,
   GenerateLoopResult,
   GeneratePlan,
@@ -348,6 +351,40 @@ export const api = {
   /** 单条蒸馏任务状态（进度条轮询的就是它）。 */
   getDistillJob: (projectId: number, jobId: number) =>
     request<DistillJob>(`/projects/${projectId}/distill/jobs/${jobId}`),
+
+  // ---------- 全书摘要（BookDigest） ----------
+
+  /**
+   * 提交一次全书摘要（后台跑，立即返回 job_id）。
+   *
+   * 提交挂在**项目**下（任务表的项目列必填），产物按**书**存 ——
+   * 一本书的摘要与哪个项目无关，任何项目都能复用。
+   */
+  startDigest: (
+    projectId: number,
+    body: {
+      novel_id: number;
+      mode?: "auto" | "whole" | "retrieval";
+      target_ratio?: number;
+      force?: boolean;
+    },
+  ) =>
+    request<DigestStartResponse>(
+      `/projects/${projectId}/digests`,
+      jsonInit("POST", body),
+    ),
+
+  /**
+   * 取这本书最新的摘要（含渲染文本与三块结构化内容）。
+   *
+   * 没有摘要时后端返回 404 —— 空对象会被前端当成「有摘要但没内容」，
+   * 而这两种情况要走的路完全不同（前者是「去跑一次」，后者是「内容坏了」）。
+   */
+  getDigest: (novelId: number) => request<DigestOut>(`/books/${novelId}/digest`),
+
+  /** 三项验收的结论（压缩比 / 主线覆盖 / 角色覆盖 / 证据缺失率）。 */
+  getDigestVerify: (novelId: number) =>
+    request<DigestVerifyOut>(`/books/${novelId}/digest/verify`),
 
   /**
    * 工序链状态：助理 agent 编排的全流程走到哪一步、卡在哪儿。
