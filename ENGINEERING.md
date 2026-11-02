@@ -9,6 +9,7 @@ AI 小说生成器（后端 `backend/` FastAPI + 前端 `frontend/`）。
 |------|------|
 | 把正文走到「验收通过 → 派生重建 → 解锁」 | `docs/authority-body-repair-design.md` 与 `docs/acceptance-coverage-contract-design.md` |
 | 外部 LLM 通道配额打满，要让链路照原样跑完 | 用替身 provider 顶替模型（协议 / 判据 / 检索不动，只换 provider），见下文「验证方式」 |
+| 对照任务书（MVP Spec v2）看「还差什么」 | `docs/mvp-spec-gap-analysis.md`（任务书原文在发布版之外，仓库只放对照表） |
 
 这些结论是踩出来的，**不要凭直觉改回去**。
 
