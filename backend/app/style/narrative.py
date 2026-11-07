@@ -2672,6 +2672,151 @@ def resolve_distill_provider():
     return get_llm_provider()
 
 
+# ====================================================================
+# 蒸馏失败的归因（把「全部调用失败」拆成用户能动手的几类）
+# ====================================================================
+#
+# 修复前：所有块都失败时统一报「API key 无效 / 已限流 / 网络不通？」。
+# 实测很大一部分失败既不是 key 也不是网络，而是**模型返回的内容不满足蒸馏的
+# JSON 协议**：没配 key 时的本地兜底模板、thinking 模型吃满 max_tokens 后被截断
+# 的半截 JSON。用户照着提示去查 key 和网络，永远查不到根因。
+#
+# 归因桶：
+#   no_key          —— 没有真实模型可用，拿到的是本地兜底模板
+#   auth            —— 401 / 403，key 无效或无权限
+#   rate_limit      —— 429 / 配额用尽
+#   model_not_found —— 404，模型名不存在
+#   network         —— 超时 / 连接被拒 / DNS
+#   truncated       —— 输出像 JSON 但不完整（典型：被 max_tokens 截断）
+#   protocol        —— 有返回，但既不是 JSON 也没有任何预期维度
+#   unknown         —— 其余异常（保留原始信息，交给日志）
+
+#: 失败桶 → 人话标签。
+_FAILURE_LABELS: dict[str, str] = {
+    "no_key": "没有可用的模型 API key（走的是本地兜底模板）",
+    "auth": "API key 无效或无权限",
+    "rate_limit": "模型限流 / 配额用尽",
+    "model_not_found": "模型名不存在",
+    "network": "网络不可达 / 超时",
+    "truncated": "模型输出被截断（JSON 不完整）",
+    "protocol": "模型返回的不是约定格式的 JSON",
+    "unknown": "未归类的调用失败",
+}
+
+#: 失败桶 → 可执行的下一步（报错里逐条附上，不再让用户猜）。
+_FAILURE_NEXT_STEPS: dict[str, str] = {
+    "no_key": "在 .env 配置 WRITER_API_KEY 或 DISTILLER_API_KEY，或在「模型设置」里"
+              "给蒸馏单独选一个模型；本地兜底模板只产出占位文本，不产出蒸馏规则。",
+    "auth": "核对 distiller / writer 的 api_key 与 base_url 是否配套（换渠道后 key "
+            "也要换），并确认该 key 未被禁用。",
+    "rate_limit": "稍后重试或换一个模型 / 账号；免费档的日限额按账号计，"
+                  "同渠道换其它免费模型无效。",
+    "model_not_found": "核对 config/providers.yaml 与 .env 里的模型名（含大小写与"
+                       "后缀），换成该渠道确实提供的模型。",
+    "network": "检查 base_url 是否可达（curl 一下），确认代理 / 防火墙 / DNS；"
+               "自建服务确认端口已启动。",
+    "truncated": "调高 distiller.max_tokens（providers.yaml 或 DISTILLER_MAX_TOKENS），"
+                 "或换一个不把思维链写进 content 的模型。",
+    "protocol": "换一个指令遵循更好的模型，并确认它没把推理过程混进 content；"
+                "提示词要求纯 JSON，返回散文 / 模板即属此类。",
+    "unknown": "看后端日志里的原始异常（日志会打出 provider 的具体报错），据此再定位。",
+}
+
+#: 报错里列桶的固定顺序（保证同一组失败每次输出一致）。
+_FAILURE_ORDER: tuple[str, ...] = (
+    "no_key", "auth", "rate_limit", "model_not_found",
+    "network", "truncated", "protocol", "unknown",
+)
+
+
+def _classify_provider_error(exc: Exception) -> str:
+    """把一个 provider 调用异常归到可操作的桶里。
+
+    provider 会把底层异常包成 `RuntimeError("<label> chat 调用失败: <原异常>")`，
+    HTTPError 的 `.code` 在那之后已丢失，所以只能同时看异常类型与文本。
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if any(k in text for k in (
+        "401", "403", "unauthorized", "forbidden", "invalid api key",
+        "incorrect api key", "authentication", "invalid_api_key",
+    )):
+        return "auth"
+    if any(k in text for k in (
+        "429", "rate limit", "rate_limit", "too many requests", "quota",
+        "free-models-per-day", "限流",
+    )):
+        return "rate_limit"
+    if any(k in text for k in ("404", "model not found", "does not exist", "not_found")):
+        return "model_not_found"
+    if any(k in text for k in (
+        "urlerror", "timed out", "timeout", "connection refused",
+        "connection reset", "connection aborted", "broken pipe", "getaddrinfo",
+        "name or service not known", "network is unreachable",
+        "nodename nor servname", "ssl",
+    )):
+        return "network"
+    return "unknown"
+
+
+def _classify_chunk_failure(raws: list, provider=None) -> str:
+    """一块语料为什么没产出任何规则。
+
+    真异常优先于「有文本但解析不出来」——前者是调用层面失败，后者是协议层面失败。
+    多个 prompt 同块失败时，取信息量最大的那个桶（auth > rate_limit > 404 > network）。
+    """
+    errors = [r for r in raws if isinstance(r, Exception)]
+    if errors:
+        buckets = [_classify_provider_error(e) for e in errors]
+        for wanted in ("auth", "rate_limit", "model_not_found", "network"):
+            if wanted in buckets:
+                return wanted
+        return buckets[0]
+
+    texts = [r for r in raws if isinstance(r, str)]
+    if any("离线兜底" in t for t in texts):
+        return "no_key"
+    if provider is not None:
+        # 延迟 import：app.llm 依赖 app.config，顶层 import 会形成循环。
+        from app.llm.provider import LocalFallbackLLMProvider
+
+        if isinstance(provider, LocalFallbackLLMProvider):
+            return "no_key"
+    # 有内容、且以 JSON 结构开头却解析失败 → 多半是被 max_tokens 截断的半截 JSON
+    if any(t.lstrip().startswith("{") or "```json" in t for t in texts):
+        return "truncated"
+    return "protocol"
+
+
+def _describe_provider(provider) -> str:
+    """报错里描述本次用的模型（**绝不回显 api_key**）。"""
+    label = getattr(provider, "label", None) or type(provider).__name__
+    bits = [str(label)]
+    model = getattr(provider, "model", None)
+    base_url = getattr(provider, "base_url", None)
+    if model:
+        bits.append(f"model={model}")
+    if base_url:
+        bits.append(f"base_url={base_url}")
+    return " / ".join(bits)
+
+
+def _format_distill_failure(
+    failed: int, reasons: dict[str, int], provider=None
+) -> str:
+    """把「N 块全失败」渲染成按原因分组的报错文本。"""
+    lines = [f"蒸馏失败：{failed} 个语料块全部未产出任何规则。"]
+    for key in _FAILURE_ORDER:
+        count = reasons.get(key, 0)
+        if not count:
+            continue
+        lines.append(
+            f"- {_FAILURE_LABELS[key]}：{count} 块。下一步：{_FAILURE_NEXT_STEPS[key]}"
+        )
+    if provider is not None:
+        lines.append(f"本次使用的蒸馏模型：{_describe_provider(provider)}")
+    return "\n".join(lines)
+
+
 # v2.226：并发蒸馏辅助函数
 # 同步入口，内部 asyncio.run 跑 N 个 chat 真并发（限流由 semaphore 控制）
 # 智谱免费档 ~5 req/s，限流 5；OR nemotron 50 req/day 用尽后可降到 2
@@ -2844,6 +2989,9 @@ def extract_narrative_profile(
     # 它们是增强，单独失败不该判整次蒸馏失败（与原行为一致，仍只记日志）。
     chunks_attempted = 0
     failed_chunks = 0
+    #: 失败块的原因分桶（见 _classify_chunk_failure / _format_distill_failure）。
+    #: 只在「全部块都失败」时用来生成分原因的报错；部分失败仍然只记计数。
+    failed_reasons: dict[str, int] = {}
 
     # —— 进度上报的累计量（只在 progress 非 None 时有意义）——
     # blocks_done：已完成块数（跨语料累计）；
@@ -3074,6 +3222,15 @@ def extract_narrative_profile(
             # 不计失败的话，「LLM 全程返回兜底文案」会静默 success + 0 规则。
             if not parsed or not (set(parsed) & expected_dims):
                 failed_chunks += 1
+                # 记录本块的真实失败原因（异常类型 / 离线兜底 / 协议不符），
+                # 供「全部块失败」时按原因分组报错。
+                block_raws = [
+                    b["raws"][b["kinds"].index(k)]
+                    for k in ("extract_character", "extract_narrative")
+                    if k in b["kinds"]
+                ]
+                reason = _classify_chunk_failure(block_raws, provider)
+                failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
                 continue
 
             for dim in tier_dims:
@@ -3303,10 +3460,7 @@ def extract_narrative_profile(
             "参考语料没有可蒸馏的章节（语料为空或尚未导入完成），未产出任何规则"
         )
     if chunks_attempted and failed_chunks == chunks_attempted:
-        raise ValueError(
-            f"蒸馏失败：{failed_chunks} 个语料块全部调用模型失败"
-            "（API key 无效 / 已限流 / 网络不通？），未产出任何规则"
-        )
+        raise ValueError(_format_distill_failure(failed_chunks, failed_reasons, provider))
 
     return {
         "version": NARRATIVE_VERSION,
