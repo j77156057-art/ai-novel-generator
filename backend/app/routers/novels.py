@@ -39,7 +39,11 @@ def upload(file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
 
 @router.post("/seed", response_model=list[UploadResult])
 def seed(db: Session = Depends(get_db)) -> list[dict]:
-    return run_seed(db)
+    # SEED_DIR 缺失时给 400 + 具体路径，而不是 200 []（后者会被误读成"成功导入 0 本"）。
+    try:
+        return run_seed(db)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.get("", response_model=list[NovelOut])

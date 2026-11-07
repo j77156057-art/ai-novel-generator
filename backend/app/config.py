@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import yaml
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: 仓库根目录（backend/app/config.py → backend → 仓库根）。
+#: 凡是从配置读到的相对路径（如 SEED_DIR）都按它解析，不依赖进程启动时的工作目录——
+#: 否则 `cd backend` 启动与从仓库根启动会解析到两个不同的目录。
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_yaml_defaults(path: str) -> dict:
@@ -58,7 +64,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str = "sqlite:///./novel_dev.db"
-    seed_dir: str = "data/seed"
+    # 相对路径按 REPO_ROOT 解析（见 app/ingestion/seed.py 的 resolve_seed_dir）。
+    seed_dir: str = str(REPO_ROOT / "data" / "seed")
     chunk_size: int = 1200
     chunk_overlap: int = 200
     upload_max_bytes: int = 20_000_000
