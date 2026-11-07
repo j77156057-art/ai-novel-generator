@@ -69,7 +69,7 @@ summary tree (L1→ lazily L2/L3) → next segment reads the tree.
 
 | Layer | Choice |
 |---|---|
-| Backend | **FastAPI** (Python 3.13), SQLAlchemy 2, Pydantic v2 (Strict) |
+| Backend | **FastAPI** (Python 3.11–3.13，3.13 实测), SQLAlchemy 2, Pydantic v2 (Strict) |
 | Storage | PostgreSQL + **pgvector** (prod) · SQLite (dev/test) |
 | Retrieval | Pure-Python **BM25 × dense-vector RRF fusion** |
 | Knowledge graph | Deterministic rule extractor (LLM slot reserved on same interface) |

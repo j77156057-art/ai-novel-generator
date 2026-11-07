@@ -1,8 +1,10 @@
+# Python >=3.11,<3.14（2026-11-07 在 3.13.3 实测安装通过；3.11/3.12 未单独实测）
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 sqlalchemy==2.0.35
 pgvector==0.3.1
-psycopg2-binary==2.9.9
+# 2.9.10 起才提供 cp313 wheel；2.9.9 在 Python 3.13 上会回退源码编译并因缺 pg_config 失败
+psycopg2-binary==2.9.13
 pydantic==2.9.2
 pydantic-settings==2.5.2
 python-multipart==0.0.12
