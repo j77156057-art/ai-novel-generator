@@ -1,7 +1,7 @@
 # 任务 C · 总字数字段 + 节拍规划
 
 > 状态：可独立 worktree 开工。**基线 HEAD = `e5e17a3`**
-> 工作目录：`/c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/`
+> 工作目录：`<仓库根>`（下文路径均相对仓库根）
 > 验收目标：`verify_acceptance.py` C 段新增 C3 PASS → 15/0 + `test_p0_regression.py` 55/55 + `test_ledger.py` 40/40
 > 派单对应：v2 文档 §任务 C
 
@@ -238,7 +238,7 @@ PY
 ## 4. Worktree 流程
 
 ```bash
-cd /c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator
+cd <仓库根>
 git worktree add worktrees/feat-target-total-pacing e5e17a3
 cd worktrees/feat-target-total-pacing
 

@@ -1,7 +1,7 @@
 # 任务 E · 抽取器 3 字名 / 姓氏 / 噪声护栏（独立 BUG）
 
 > 状态：**可独立 worktree 开工**。基线 HEAD = `55a12a2`（派单 v2 已落），从这里拉 worktree。
-> 工作目录：`/c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/`
+> 工作目录：`<仓库根>`（下文路径均相对仓库根）
 > 验收目标：`verify_sentinel.py` 96/1 → **96/0**（G1b 转绿）+ `verify_acceptance.py` 14/0 不变 + `test_p0`/`test_ledger` 不退化
 
 ---
@@ -301,7 +301,7 @@ python test_m3.py && python test_m3_relations.py && python test_m3_api.py
 ## 4. Worktree 流程
 
 ```bash
-cd /c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator
+cd <仓库根>
 
 # 1) 从基线 HEAD 拉 worktree
 git worktree add worktrees/fix-extractor-3char-and-noise 55a12a2

@@ -89,7 +89,7 @@ F (独占 queries.py / build.py，与 D 无文件重叠)
 # 例：B 接单人只看 2026-10-13-TASK-B-WIZARD-CHARACTERS.md
 
 # 2) 从基线拉 worktree
-cd /c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator
+cd <仓库根>
 git worktree add worktrees/<spec 里写的 worktree 名> e5e17a3
 cd worktrees/<worktree 名>
 
@@ -103,14 +103,14 @@ EOF
 git -c commit.gpgsign=false add <changed files>
 git -c commit.gpgsign=false commit -F /tmp/msg.txt
 
-# 6) 通知 WorkBuddy 收口（不需要 push——本仓无 remote）
+# 6) 通知 WorkBuddy 收口（worktree 由主工作区 merge；推送也由主工作区执行）
 ```
 
 ---
 
 ## 7. 注意事项
 
-- **本仓库无 GitHub remote**——所有 worktree 收口走 `git merge --no-ff`（WorkBuddy 做）
+- **本仓库已配置 GitHub remote（origin）**——worktree 收口仍由主工作区走 `git merge --no-ff`，推送也由主工作区执行
 - **schema 变更只能改 `models.py` + `db.py` 的 `migrations` 列表两处**
 - **真 API key 永远不入 commit**（`.env` 始终 gitignored）
 - **不要跨 task 改文件**——违反 ownership matrix 会让其他 task 合并冲突

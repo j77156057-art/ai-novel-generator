@@ -1,7 +1,7 @@
 # 任务 B · wizard 加"主角/关键配角名字+作用"输入步 + 强约束
 
 > 状态：可独立 worktree 开工。**基线 HEAD = `e5e17a3`**（含 E 已修复的 M3-M4-M5 + E 抽取器 8/8 fixture）。
-> 工作目录：`/c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/`
+> 工作目录：`<仓库根>`（下文路径均相对仓库根）
 > 验收目标：`verify_acceptance.py` 仍 ≥ 14/0 + `test_p0_regression.py` 55/55 + `test_ledger.py` 40/40 + 新增 wizard 端点单测全过
 > 派单对应：v2 文档 §任务 B
 
@@ -295,7 +295,7 @@ uvicorn app.main:app --port 8099 &
 ## 4. Worktree 流程
 
 ```bash
-cd /c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator
+cd <仓库根>
 
 # 1) 从基线 HEAD 拉 worktree
 git worktree add worktrees/feat-wizard-characters e5e17a3

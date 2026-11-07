@@ -20,7 +20,7 @@
 
 ## 全局规约
 
-- **路径**：`/c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/`
+- **路径**：`<仓库根>`（下文路径均相对仓库根）
 - **DB**：`backend/novel_dev.db` dev 本地库，**gitignored**，禁止 commit
 - **真 API key**（A 任务）：**永远不入文档、不入 commit**；只在你本机 `.env` 落，verify 通过即生效
 - **schema 迁移**：`backend/app/db.py::_migrate_sqlite_columns` 唯一 ALTER 入口；新列先 `models.py` 后 `migrations` 列表三元组

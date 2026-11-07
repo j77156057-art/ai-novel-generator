@@ -39,7 +39,7 @@ git log --oneline -10 master
 - uvicorn 端口避开 8020/8100/8848/8011/8021/8050/8060
 - **pydantic-settings 不读 os.environ，只读 .env 文件**——见 skill 沉淀
 - **netstat 输出 GBK 编码**——Python 解析用 `encoding="gbk", errors="replace"`
-- **Python 路径用 raw string + h'h'h（不是 h\h\h）**——bash 转义陷阱
+- **Python 路径用 raw string（`r"..."`），不要用普通字符串拼反斜杠**——bash 转义陷阱
 
 ---
 
@@ -163,7 +163,7 @@ providers.yaml writer.max_tokens 4096 → 8192（v2.20 验证段 1 wc 2491→577
 
 - file 里 multi-line string concat 末尾常有字面 `\\n\\n`（4 char backslash + n），patch 时必须用字面 4 字符锚点
 - netstat 输出 GBK 编码
-- Python 路径 raw string 用 `h'h'h`（bash 转义陷阱：`h\h\h` 错）
+- Python 路径 raw string 用 `r"..."`（bash 转义陷阱：普通字符串里的反斜杠会被转义）
 
 ### 5.5 增量设计哲学
 

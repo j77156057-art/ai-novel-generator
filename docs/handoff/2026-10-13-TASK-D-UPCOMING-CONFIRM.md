@@ -1,7 +1,7 @@
 # 任务 D · 即将出场角色确认表（plan 端点响应形状扩展）
 
 > 状态：可独立 worktree 开工。**基线 HEAD = `e5e17a3`**
-> 工作目录：`/c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/`
+> 工作目录：`<仓库根>`（下文路径均相对仓库根）
 > 验收目标：plan 端点响应**新增** `upcoming_characters` 字段 + 新增 `POST /api/projects/{id}/upcoming-characters` 端点 + `build_system_prompt` 在合并后**追加** upcoming 块（**不改 `merged_constraint_items` 签名**）
 > 派单对应：v2 文档 §任务 D
 
@@ -369,7 +369,7 @@ cd ../frontend && npm run typecheck    # 0 error
 ## 4. Worktree 流程
 
 ```bash
-cd /c/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator
+cd <仓库根>
 git worktree add worktrees/feat-upcoming-characters e5e17a3
 cd worktrees/feat-upcoming-characters
 
