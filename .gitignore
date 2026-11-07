@@ -30,3 +30,14 @@ data/seed/【示例·网文】黑市病案-无证证词.txt
 
 # 根目录散落的语料/草稿（真实作品原文、下载的 txt）——绝不进版本库
 /*.txt
+
+# 实验产物 / 派生工作树 / 临时语料（2026-11-07 收尾）
+experiments/
+worktrees/
+minimax-vol1/
+frontend/ui-preview/
+
+# 手工 QA 探针与截图（一次性排查，不入库）
+tests/qa9_shots/
+tests/qa*_probe*
+qa9_audit_*
