@@ -8,6 +8,8 @@ psycopg2-binary==2.9.13
 pydantic==2.9.2
 pydantic-settings==2.5.2
 python-multipart==0.0.12
+# 直接依赖：app/config.py 里 import yaml，不要依赖 uvicorn[standard] 间接带入
+PyYAML==6.0.3
 # 注：Embedding 调用走标准库 urllib，BM25/向量检索为纯 Python，无需新增依赖。
 # 正式中文分词（可选）：jieba
 #
