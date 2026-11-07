@@ -168,12 +168,26 @@ check("event 缺 chapter 兜底", n3["events"][0]["chapter"], None)
 check("entity 缺 aliases 兜底", n3["entities"][0]["aliases"], [])
 check("entity 缺 attrs 兜底", n3["entities"][0]["attrs"], {})
 
+# 3b. 非法枚举值不再静默丢弃，必须进 rejected（2026-11-07）
+raw_bad = {
+    "entities": [{"kind": "artifact", "canonical_name": "镇北王刀"}],
+    "relations": [{"from": "甲", "to": "乙", "rel_type": "loves"}],
+    "events": [{"event_type": "battle_scene", "summary": "混战"}],
+}
+nb = normalize_extraction(raw_bad)
+check("rejected 非法 kind", [r["reason"] for r in nb["rejected"] if r["stage"] == "entity"], ["invalid_kind"])
+check("rejected 非法 rel_type", [r["reason"] for r in nb["rejected"] if r["stage"] == "relation"], ["invalid_rel_type"])
+check("rejected 非法 event_type", [r["reason"] for r in nb["rejected"] if r["stage"] == "event"], ["invalid_event_type"])
+check("rejected 记录原始 kind", [r["raw_kind"] for r in nb["rejected"] if r["stage"] == "entity"], ["artifact"])
+check("非法 event_type 归一 incident", nb["events"][0]["event_type"], "incident")
+check("非法 event_type 保留原始值", nb["events"][0].get("raw_event_type"), "battle_scene")
+
 # ====================================================================
 # 4. 顶层非 dict / None / 空
 # ====================================================================
-check("None 输入空骨架", normalize_extraction(None), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
-check("list 输入空骨架", normalize_extraction([1, 2]), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
-check("空 dict 空骨架", normalize_extraction({}), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
+check("None 输入空骨架", normalize_extraction(None), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
+check("list 输入空骨架", normalize_extraction([1, 2]), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
+check("空 dict 空骨架", normalize_extraction({}), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
 check("顶层 list 值兜底", len(normalize_extraction({"entities": "not a list"})["entities"]), 0)
 
 # ====================================================================
@@ -188,8 +202,8 @@ check("带前后垃圾解析", _parse_and_normalize(messy)["entities"][0]["canon
 think = "让我想想..." + good + "结论如上"
 check("think 块包裹解析", _parse_and_normalize(think)["entities"][0]["canonical_name"], "甲")
 
-check("空字符串兜底", _parse_and_normalize(""), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
-check("垃圾非 JSON 兜底", _parse_and_normalize("完全不是 JSON 的输出"), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": []})
+check("空字符串兜底", _parse_and_normalize(""), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
+check("垃圾非 JSON 兜底", _parse_and_normalize("完全不是 JSON 的输出"), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
 
 # ====================================================================
 # 6. extract_segment / extract_batch（mock provider）
