@@ -208,6 +208,10 @@ class OpenAICompatibleChatProvider(LLMProvider):
         # 最近一次调用的 finish_reason（'length' = 被 max_tokens 截断）。
         # 仅供诊断/测试；provider 是单例，多线程下可能互相覆盖，但用途就是打日志。
         self.last_finish_reason: str | None = None
+        # 最近一次调用的 usage（prompt / completion / total / reasoning）。
+        # 2026-11-07：此前兼容层完全丢弃 usage，导致成本报表里 token 全为 null；
+        # 这里只做解析留痕，不改返回内容，也不改请求体。
+        self.last_usage: dict | None = None
         # chat 路径默认 120s = b58c763 硬编码值；Assistant 可独立调小（诊断必须快速失败）
         self.timeout = timeout
         # stream_chat 路径默认 180s = b58c763 硬编码值；**不能**与 chat 共用默认 120s，
@@ -262,6 +266,7 @@ class OpenAICompatibleChatProvider(LLMProvider):
                 try:
                     with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
+                    self._note_usage(data.get("usage"))
                     choice = data["choices"][0]
                     self._note_finish_reason(
                         choice.get("finish_reason"), self.label, model, self.max_tokens
@@ -284,6 +289,26 @@ class OpenAICompatibleChatProvider(LLMProvider):
                         break
                     time.sleep(_backoff(attempt))
         raise RuntimeError(f"{self.label} chat 调用失败: {last_exc}") from last_exc
+
+    def _note_usage(self, usage: dict | None) -> None:
+        """解析并留痕本次调用的 token 用量（含推理 token）。
+
+        兼容层此前只返回正文，``usage`` 被整块丢弃，成本报表里 prompt /
+        completion / total 全是 null，无法判断「推理吃掉了多少」。
+        这里仅记录，不改请求体、不改返回内容。
+        """
+        if not usage:
+            return
+        details = usage.get("completion_tokens_details") or {}
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        self.last_usage = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "reasoning_tokens": details.get("reasoning_tokens"),
+            "cached_tokens": prompt_details.get("cached_tokens"),
+        }
+        logger.info("%s 模型 %s usage: %s", self.label, self.model, self.last_usage)
 
     def _note_finish_reason(
         self,
@@ -390,6 +415,8 @@ class OpenAICompatibleChatProvider(LLMProvider):
                             except Exception:  # noqa: BLE001 - 跳过不完整/心跳帧
                                 continue
                             choice0 = obj.get("choices", [{}])[0]
+                            if obj.get("usage"):
+                                self._note_usage(obj["usage"])
                             if choice0.get("finish_reason"):
                                 finish_reason = choice0["finish_reason"]
                             delta = choice0.get("delta", {})
