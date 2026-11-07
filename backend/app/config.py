@@ -191,8 +191,12 @@ class Settings(BaseSettings):
     #: 2026-10-19 从 2048 提到 8192。2048 会让叙事规则 JSON 被拦腰截断
     #: （智谱 finish_reason=length），截断的 JSON 解析失败 → 该块所有维度归零，
     #: 表现为 rejected 计数暴涨（雪中悍刀行 990 章实测 rejected=740）。
-    #: 蒸馏要一次输出 11 个维度的规则数组，8192 才够。
-    distiller_max_tokens: int = int(_DISTILLER_DEFAULTS.get("max_tokens", 8192))
+    #: 2026-11-07 KG 抽取链路从 8192 提到 32768：30 章三路对照中 deepseek 有 16 章
+    #: 在 8192 触顶、qwen 30/30 章触顶并有一章整章失败；单章 completion 峰值 32,805
+    #: token、输出文本最长 13,782 字，reasoning 占 completion 的 71%；32768 给
+    #: reasoning 留出余量，调大后两路截断归零。
+    #: 兜底值与 config/providers.yaml 的 distiller.max_tokens 保持一致。
+    distiller_max_tokens: int = int(_DISTILLER_DEFAULTS.get("max_tokens", 32768))
     distiller_timeout: int = int(_DISTILLER_DEFAULTS.get("timeout", 180))
 
     def _legacy_channel_field(self, provider: str, field: str) -> str:
