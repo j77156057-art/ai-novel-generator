@@ -167,7 +167,10 @@ class Settings(BaseSettings):
     writer_api_key: str = _WRITER_DEFAULTS.get("api_key", "")
     writer_base_url: str = _WRITER_DEFAULTS.get("base_url", "")
     writer_model: str = _WRITER_DEFAULTS.get("model", "")
-    writer_max_tokens: int = int(_WRITER_DEFAULTS.get("max_tokens", 2048))
+    #: Writer 单次输出上限。默认值与 config/providers.yaml 的 writer.max_tokens
+    #: 保持一致（2026-11-07 由 8192 提到 65536）：MiniMax M3.1-Flash-Preview 的
+    #: reasoning_content 会先吃 max_tokens，32768 档实测出现整章 0 字正文。
+    writer_max_tokens: int = int(_WRITER_DEFAULTS.get("max_tokens", 65536))
     writer_timeout: int = int(_WRITER_DEFAULTS.get("timeout", 120))
 
     assistant_provider: str = _ASSISTANT_DEFAULTS.get("provider", "zhipu")
