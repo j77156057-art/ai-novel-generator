@@ -32,10 +32,20 @@ data/seed/【示例·网文】黑市病案-无证证词.txt
 /*.txt
 
 # 实验产物 / 派生工作树 / 临时语料（2026-11-07 收尾）
-experiments/
+experiments/*
 worktrees/
 minimax-vol1/
 frontend/ui-preview/
+
+# 例外：被其他实验 import 的共享脚本入库（产物、探针、生成章节仍忽略）。
+# 归属清单见 experiments/2026-11-07-e2e-generation/exp_manifest.py 的 OWNERSHIP。
+!experiments/2026-11-07-e2e-generation/
+experiments/2026-11-07-e2e-generation/*
+!experiments/2026-11-07-e2e-generation/exp_manifest.py
+!experiments/2026-11-07-e2e-generation/quota.py
+!experiments/2026-11-07-e2e-generation/s3_generate.py
+!experiments/2026-11-07-e2e-generation/s8_kg_attrs.py
+!experiments/2026-11-07-e2e-generation/s9_attr_llm.py
 
 # 手工 QA 探针与截图（一次性排查，不入库）
 tests/qa9_shots/
