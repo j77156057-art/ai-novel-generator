@@ -591,6 +591,8 @@ RULES: dict[str, tuple[str, str]] = {
     "dead_acts": ("err", "已记录死亡的角色，在后续段落里又有明确动作出场（且无复活事件）"),
     "item_owner_conflict": ("err", "同一件物品在后续段落被归给另一个角色，中间没有交接事件"),
     "realm_regression": ("err", "角色境界低于已记录的最高境界，中间没有跌落事件"),
+    "realm_jump": ("warn", "细分型体系里，角色在相邻两段内跨越两个及以上境界"),
+    "realm_collision": ("warn", "细分型体系里，同一角色在同一段内出现互相矛盾的境界"),
     "alias_split": ("warn", "出现疑似同一人的新名字（转自账本的待裁决提案）"),
 }
 
@@ -731,10 +733,82 @@ RULE_ORDER = (
     "dead_acts",
     "item_owner_conflict",
     "realm_regression",
+    "realm_jump",
+    "realm_collision",
 )
 
 
-def check_segment(state_before: dict, events: list[Event]) -> list[Finding]:
+def _rule_realm_jump(state: dict, ev: Event, events: list[Event]) -> list[Finding]:
+    """单章跳级：细分型体系里，相邻两段内境界序数跨了 ≥2 级。
+
+    只在**同一把尺子**（同 scale）内比；跨体系不判。已写了明确跌落的本段不判，
+    免得把「破境又跌回」误读成跳级。
+    """
+    if ev.kind != E_REALM_UP or ev.order is None:
+        return []
+    if any(e.kind == E_REALM_DOWN and e.entity == ev.entity for e in events):
+        return []
+    st = state.get((STATE_REALM, ev.entity))
+    if not st or st.get("order") is None or st.get("scale") != ev.scale:
+        return []
+    if ev.order - st["order"] < 2:
+        return []
+    # 「单章」按段号近似：隔了 3 段以上的成长属于正常跨度，不报。
+    if ev.segment_no - st["segment_no"] > 2:
+        return []
+    return [_f(
+        "realm_jump", ev.entity,
+        f"「{ev.entity}」第 {st['segment_no']} 段是「{st['value']}」，"
+        f"本段（第 {ev.segment_no} 段）直接到「{ev.value}」，相邻两段内跨了 "
+        f"{ev.order - st['order']} 级。细分型体系里这属于跳级，请补过渡或改慢。",
+        spans=[_ev_span(ev)],
+        evidence=[{"segment_no": st["segment_no"], "span": st["span"],
+                   "text": st["text"], "kind": "realm"}],
+    )]
+
+
+def _realm_collision_findings(events: list[Event]) -> list[Finding]:
+    """跨阶对撞：同一角色在同一段里被写成两个互相矛盾的境界。
+
+    只在细分型启用。判定条件：
+    - 同一角色、同一段、**同一把尺子**；
+    - 出现 ≥2 个不同序数；
+    - 没有明确的跌落事件（跌落是正当剧情，不是对撞）；
+    - 序数序列不是单调不降（单调上升只是连续破境，不算对撞）。
+    """
+    groups: dict[tuple[str, int, str], list[Event]] = {}
+    for ev in events:
+        if ev.kind in (E_REALM_UP, E_REALM_DOWN) and ev.order is not None:
+            groups.setdefault((ev.entity, ev.segment_no, ev.scale), []).append(ev)
+
+    out: list[Finding] = []
+    for (entity, _seg, _scale), evs in groups.items():
+        if len({e.order for e in evs}) < 2:
+            continue
+        if any(e.kind == E_REALM_DOWN for e in evs):
+            continue
+        evs = sorted(evs, key=lambda e: e.span[0])
+        orders = [int(e.order) for e in evs]
+        if all(a <= b for a, b in zip(orders, orders[1:])):
+            continue
+        last = evs[-1]
+        out.append(_f(
+            "realm_collision", entity,
+            f"「{entity}」在同一段里先后被写成 {orders} 这几个境界，且没有跌落描写："
+            f"「{last.text}」。细分型体系里这属于跨阶对撞。",
+            spans=[_ev_span(e) for e in evs],
+            evidence=[{"segment_no": last.segment_no, "span": last.span,
+                       "text": last.text, "kind": "realm"}],
+        ))
+    return out
+
+
+def check_segment(
+    state_before: dict,
+    events: list[Event],
+    *,
+    system_type: str | None = None,
+) -> list[Finding]:
     """纯函数：按**时间序**推进状态，产出冲突告警。
 
     两个关键语义：
@@ -744,13 +818,27 @@ def check_segment(state_before: dict, events: list[Event]) -> list[Finding]:
        做法是逐事件推进：每条事件先对**它之前**的累计状态判定，再写进状态。
     2. **不修改 `state_before`，不碰正文。** 推进在副本上做；
        `verify_sentinel.py` 有闸门直接验这一点。
+
+    `system_type`（细分型/序列型/粗放型）决定境界类判据的边界：
+    - `None`：沿用改造前的单判据行为（只报倒退），保证老调用方逐字节不变；
+    - 粗放型：不做任何数值比较，只由 `audit_segment` 记录称谓；
+    - 序列型：只做同体系内的相对高低（即倒退），不判跳级/对撞；
+    - 细分型：倒退 + 单章跳级 + 同段跨阶对撞。
     """
     work = {k: dict(v) for k, v in state_before.items()}
     out: list[Finding] = []
     for ev in sorted(events, key=lambda e: e.span[0]):
-        for fn in _RULES_BY_EVENT.get(ev.kind, ()):
-            out.extend(fn(work, ev, events))
+        if system_type is not None and ev.kind in (E_REALM_UP, E_REALM_DOWN):
+            if system_type != "粗放型":
+                out.extend(rule_realm_regression(work, ev, events))
+                if system_type == "细分型":
+                    out.extend(_rule_realm_jump(work, ev, events))
+        else:
+            for fn in _RULES_BY_EVENT.get(ev.kind, ()):
+                out.extend(fn(work, ev, events))
         apply_event(work, ev)
+    if system_type == "细分型":
+        out.extend(_realm_collision_findings(events))
     order = {name: i for i, name in enumerate(RULE_ORDER)}
     out.sort(key=lambda f: (order.get(f.rule, 99), f.spans[0]["segment_no"] if f.spans else 0,
                             f.spans[0]["span"][0] if f.spans else 0))
@@ -1030,13 +1118,18 @@ def realm_order_from_project(project) -> tuple:
 
 def audit_segment(
     db, project, text: str, segment_no: int, *, source: str = "generated",
+    system_type: str | None = None,
 ) -> dict:
     """审计一段：抽事件 → 判冲突 → 把状态推进落库。**只报告，不改正文。**
 
     这是把本模块接进生成环的入口。三件事按顺序做，任何一步失败都不该炸掉生成 ——
     调用方负责兜异常并降级（哨兵是增强，不是生成的前提）。
 
-    返回 `{findings, events, names, state_size, rules}`。`findings` 已序列化，
+    `system_type` 由调用方按项目设定解析后传入（细分型/序列型/粗放型）；
+    不传则沿用旧行为。返回里带 `power` 摘要：体系类型、unknown 数、
+    粗放型的称谓记录，供生成 meta 留痕。
+
+    返回 `{findings, events, names, state_size, rules, power}`。`findings` 已序列化，
     可直接进 API 响应。
     """
     names = known_names(db, project.id, source)
@@ -1047,7 +1140,7 @@ def audit_segment(
              if kind == STATE_LIFE and st.get("value") != "dead"}
     events = extract_events(text, segment_no=segment_no, names=names,
                             realm_order=ladder, alive_entities=alive)
-    findings = check_segment(state, events)
+    findings = check_segment(state, events, system_type=system_type)
     for ev in events:
         apply_event(state, ev)
     # 状态推进过了：生成的正文改变了后续段落要遵守的事实。
@@ -1057,6 +1150,25 @@ def audit_segment(
     # 告警必须落库：只放响应里的告警，用户没盯着那一刻就永远看不到了
     save_findings(db, project.id, findings, segment_no=segment_no, source=source)
     db.commit()
+
+    realm_events = [e for e in events if e.kind in (E_REALM_UP, E_REALM_DOWN)]
+    realm_counts: dict[str, int] = {}
+    for finding in findings:
+        if finding.rule in ("realm_regression", "realm_jump", "realm_collision"):
+            realm_counts[finding.rule] = realm_counts.get(finding.rule, 0) + 1
+    power = None
+    if system_type is not None:
+        power = {
+            "system_type": system_type,
+            # 没有序数证据的一律 unknown：不推定、不补值。
+            "unknown": sum(1 for e in realm_events if e.order is None),
+            "titles": (
+                [{"entity": e.entity, "value": e.value, "segment_no": e.segment_no}
+                 for e in realm_events]
+                if system_type == "粗放型" else []
+            ),
+            "counts": realm_counts,
+        }
     return {
         "findings": [f.to_dict() for f in findings],
         "events": len(events),
@@ -1064,6 +1176,7 @@ def audit_segment(
         "state_size": len(state),
         "rules": _active_rules(),
         "realm_order": len(ladder),
+        "power": power,
     }
 
 

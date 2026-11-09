@@ -1,0 +1,1839 @@
+{
+  "schema": "power-scale-15/v1",
+  "built_at": "2026-11-08",
+  "novel": "大奉打更人 (novel_id=5)",
+  "source_baseline": {
+    "repo": "ai-novel-generator",
+    "ref": "origin/main",
+    "file": "backend/app/generation/power_scale.py",
+    "commit_hint": "123a1d0 feat(style): 心理/场景描写补齐 + 修炼体系与量级标尺",
+    "scale_levels": [
+      "凡人级",
+      "伤人级",
+      "毁物级",
+      "毁城级",
+      "灭世级"
+    ],
+    "scale_hints": {
+      "凡人级": "出手只能伤到眼前的人",
+      "伤人级": "一击能重伤或杀死一个人",
+      "毁物级": "一击能毁掉一间屋子、一段城墙",
+      "毁城级": "一击能抹平一片城区",
+      "灭世级": "出手能改变天象、地貌或一地的存亡"
+    },
+    "scale_fields": [
+      "量级",
+      "出手规模",
+      "压制"
+    ],
+    "note": "五档名、hints、字段名均照录 origin/main，未改写。"
+  },
+  "design": {
+    "seq_range": [
+      1,
+      15
+    ],
+    "per_base": 3,
+    "label_rule": "label = base + '·' + name；label 必含 base，scale_level() 的子串匹配不变。",
+    "parse_rule": "parse_scale() 仍会把 量级 收敛为五档原名；细层放 量级细层/量级序号，不塞进 量级 字段。",
+    "anchor_axes": [
+      "destroy_m（破坏半径）",
+      "influence_m（影响半径）",
+      "hardest_object（最硬破坏对象）",
+      "cost_remaining（余力）",
+      "witness（目睹门槛）"
+    ],
+    "why_two_radii": "原文里「狮子吼方圆五十里」与「震塌一堵墙」不是一回事；一个轴会把影响当破坏，故拆成 destroy_m / influence_m。",
+    "anchor_note": "半径是表值，不是原文测量值；原文有「方圆X里/数百丈」时直接采信，否则按破坏对象反推。"
+  },
+  "scale_levels": [
+    "凡人级",
+    "伤人级",
+    "毁物级",
+    "毁城级",
+    "灭世级"
+  ],
+  "scale_hints": {
+    "凡人级": "出手只能伤到眼前的人",
+    "伤人级": "一击能重伤或杀死一个人",
+    "毁物级": "一击能毁掉一间屋子、一段城墙",
+    "毁城级": "一击能抹平一片城区",
+    "灭世级": "出手能改变天象、地貌或一地的存亡"
+  },
+  "scale_fields": [
+    "量级",
+    "出手规模",
+    "压制"
+  ],
+  "bands": [
+    {
+      "seq": 1,
+      "base": "凡人级",
+      "base_index": 0,
+      "label": "凡人级·凡手",
+      "name": "凡手",
+      "prompt_hint": "一拳只能把眼前的人打退半步，打不断一扇厚木门。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          1
+        ],
+        "influence_m": [
+          0,
+          1
+        ],
+        "hardest_object": "皮肉、薄布衣；打不断 3 cm 木板",
+        "cost_remaining": "10/10（可连打数十次）",
+        "witness": "三步内看清拳路；十步外只见人影"
+      },
+      "realm_span": ""
+    },
+    {
+      "seq": 2,
+      "base": "凡人级",
+      "base_index": 0,
+      "label": "凡人级·健手",
+      "name": "健手",
+      "prompt_hint": "一拳能打断骨头、打裂薄木板，厚木门要砸几下。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          2
+        ],
+        "influence_m": [
+          0,
+          3
+        ],
+        "hardest_object": "骨头、木凳、2 cm 木板；厚木门要砸数下",
+        "cost_remaining": "9/10（十余次后气喘）",
+        "witness": "十步内看清；三十步外看见动作"
+      },
+      "realm_span": "九品·未标注/初期/中期"
+    },
+    {
+      "seq": 3,
+      "base": "凡人级",
+      "base_index": 0,
+      "label": "凡人级·死力",
+      "name": "死力",
+      "prompt_hint": "全力一击能打死一个无甲成年人，能一脚踹裂厚木门。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          4
+        ],
+        "influence_m": [
+          0,
+          6
+        ],
+        "hardest_object": "厚木门、薄土墙、甲片；一击打死无甲成年人",
+        "cost_remaining": "7/10（一次后喘息数息）",
+        "witness": "二十步内看清；百步内看见人倒下"
+      },
+      "realm_span": "九品·后期/巅峰/大圆满/半步；八品·未标注/初期/中期"
+    },
+    {
+      "seq": 4,
+      "base": "伤人级",
+      "base_index": 1,
+      "label": "伤人级·见血",
+      "name": "见血",
+      "prompt_hint": "一刀能划开皮甲，让人当场见血倒地。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          6
+        ],
+        "influence_m": [
+          0,
+          10
+        ],
+        "hardest_object": "皮甲、木盾、陶罐；一击重伤一人",
+        "cost_remaining": "8/10（可连出五六次）",
+        "witness": "三十步内看清血；百步内看见有人倒地"
+      },
+      "realm_span": "八品·后期/巅峰/大圆满/半步；七品·未标注/初期/中期"
+    },
+    {
+      "seq": 5,
+      "base": "伤人级",
+      "base_index": 1,
+      "label": "伤人级·穿甲",
+      "name": "穿甲",
+      "prompt_hint": "一刀能穿透铁甲，隔着刀剑也能伤人。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          10
+        ],
+        "influence_m": [
+          0,
+          20
+        ],
+        "hardest_object": "铁甲、刀剑、薄砖墙；一击穿透甲胄",
+        "cost_remaining": "7/10（可连出四五次）",
+        "witness": "五十步内看清；两百步内看见气机闪光"
+      },
+      "realm_span": "七品·后期/巅峰/大圆满/半步；六品·未标注/初期/中期"
+    },
+    {
+      "seq": 6,
+      "base": "伤人级",
+      "base_index": 1,
+      "label": "伤人级·夺命",
+      "name": "夺命",
+      "prompt_hint": "抬手能把数丈外的人打死，掌风能震裂砖石。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          15
+        ],
+        "influence_m": [
+          0,
+          30
+        ],
+        "hardest_object": "砖墙、石阶、铁门；数丈外取命、震裂砖石",
+        "cost_remaining": "6/10（可连出三四次）",
+        "witness": "百步内看清；一里内看见烟尘/人影"
+      },
+      "realm_span": "六品·后期/巅峰/大圆满/半步"
+    },
+    {
+      "seq": 7,
+      "base": "毁物级",
+      "base_index": 2,
+      "label": "毁物级·破门",
+      "name": "破门",
+      "prompt_hint": "一拳能轰开厚木门，震碎半堵薄石墙。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          20
+        ],
+        "influence_m": [
+          0,
+          40
+        ],
+        "hardest_object": "厚木门、薄石墙、门窗；一击破门",
+        "cost_remaining": "8/10（可连出两三次）",
+        "witness": "百步内看清碎屑；半里内看见门板飞散"
+      },
+      "realm_span": "五品·未标注/初期/中期/后期"
+    },
+    {
+      "seq": 8,
+      "base": "毁物级",
+      "base_index": 2,
+      "label": "毁物级·摧墙",
+      "name": "摧墙",
+      "prompt_hint": "一掌能轰塌一堵砖墙，掀掉一层瓦顶。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          35
+        ],
+        "influence_m": [
+          0,
+          70
+        ],
+        "hardest_object": "砖墙、土墙、瓦顶；一击轰塌一堵墙",
+        "cost_remaining": "7/10（可连出两次）",
+        "witness": "半里内看清；一里内看见尘烟"
+      },
+      "realm_span": "五品·巅峰/大圆满/半步"
+    },
+    {
+      "seq": 9,
+      "base": "毁物级",
+      "base_index": 2,
+      "label": "毁物级·倒楼",
+      "name": "倒楼",
+      "prompt_hint": "一击能推倒一栋楼阁，或者打塌一段城墙垛口。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          60
+        ],
+        "influence_m": [
+          0,
+          120
+        ],
+        "hardest_object": "楼阁、院落、城墙垛口；一击推倒一栋楼/一段墙",
+        "cost_remaining": "5/10（一次后气机见底一半）",
+        "witness": "一里内看清；三里内看见塌尘"
+      },
+      "realm_span": "四品·未标注/初期/中期"
+    },
+    {
+      "seq": 10,
+      "base": "毁城级",
+      "base_index": 3,
+      "label": "毁城级·裂地",
+      "name": "裂地",
+      "prompt_hint": "一击在地面炸出数丈深坑，震裂一条街的石板。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          100
+        ],
+        "influence_m": [
+          0,
+          250
+        ],
+        "hardest_object": "街面、石桥、地基；一击炸出数丈深坑",
+        "cost_remaining": "6/10（还能再出一击）",
+        "witness": "三里内看清；五里内看见尘柱"
+      },
+      "realm_span": "四品·后期/巅峰/大圆满/半步；三品·未标注/初期/中期"
+    },
+    {
+      "seq": 11,
+      "base": "毁城级",
+      "base_index": 3,
+      "label": "毁城级·荡街",
+      "name": "荡街",
+      "prompt_hint": "一击扫平一条街，成排房屋像纸一样倒。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          300
+        ],
+        "influence_m": [
+          0,
+          600
+        ],
+        "hardest_object": "一条街/坊市、成排房屋；一击扫平一片街区",
+        "cost_remaining": "4/10（再出一击即力竭）",
+        "witness": "五里内看清；十里内看见尘墙"
+      },
+      "realm_span": "三品·后期/巅峰/大圆满/半步"
+    },
+    {
+      "seq": 12,
+      "base": "毁城级",
+      "base_index": 3,
+      "label": "毁城级·倾郭",
+      "name": "倾郭",
+      "prompt_hint": "一击能让一段城墙坍塌，半座城变成废墟。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          1000
+        ],
+        "influence_m": [
+          0,
+          2000
+        ],
+        "hardest_object": "城墙一段、城门楼、半座城；一击令城墙坍塌、半城成废墟",
+        "cost_remaining": "2/10（一次后需长时间恢复）",
+        "witness": "全城可见；十里外看见烟尘遮天"
+      },
+      "realm_span": "二品·未标注/初期"
+    },
+    {
+      "seq": 13,
+      "base": "灭世级",
+      "base_index": 4,
+      "label": "灭世级·改天",
+      "name": "改天",
+      "prompt_hint": "出手能改变局部天象：云层裂开、雷柱落下、雨雪骤停。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          3000
+        ],
+        "influence_m": [
+          0,
+          6000
+        ],
+        "hardest_object": "云层、天象、一片城区；一击改变局部天象",
+        "cost_remaining": "3/10（还能再出一击）",
+        "witness": "全城可见；数十里外看见异象"
+      },
+      "realm_span": "二品·中期/后期/巅峰/大圆满"
+    },
+    {
+      "seq": 14,
+      "base": "灭世级",
+      "base_index": 4,
+      "label": "灭世级·覆城",
+      "name": "覆城",
+      "prompt_hint": "一击能抹平整座城，令江河倒卷。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          15000
+        ],
+        "influence_m": [
+          0,
+          30000
+        ],
+        "hardest_object": "整座城、一段江流；一击抹平整座城/令江河倒卷",
+        "cost_remaining": "1/10（一次后需数日恢复）",
+        "witness": "数十里可见；百里外看见天光/尘幕"
+      },
+      "realm_span": "二品·半步；一品·未标注/初期/中期"
+    },
+    {
+      "seq": 15,
+      "base": "灭世级",
+      "base_index": 4,
+      "label": "灭世级·灭世",
+      "name": "灭世",
+      "prompt_hint": "一击能夷平山川，方圆百里化作废土。",
+      "anchors": {
+        "destroy_m": [
+          0,
+          100000
+        ],
+        "influence_m": [
+          0,
+          300000
+        ],
+        "hardest_object": "山川、地貌、一州；一击夷平山川、方圆百里成废土",
+        "cost_remaining": "0/10（力竭/反噬/可能跌境）",
+        "witness": "百里可见；千里可感（地震/天象）"
+      },
+      "realm_span": "一品·后期/巅峰/大圆满/半步；超品·未标注/初期/中期/后期/巅峰/大圆满/半步"
+    }
+  ],
+  "realm_map": {
+    "system_type": "细分型",
+    "stage_names": [
+      "未标注",
+      "初期",
+      "中期",
+      "后期",
+      "巅峰/大圆满",
+      "半步"
+    ],
+    "tiers": [
+      {
+        "tier": 1,
+        "grade": "九品",
+        "representative_name": "炼精境（武夫）",
+        "base_seq": 2,
+        "stage_seq": [
+          2,
+          2,
+          2,
+          3,
+          3,
+          3
+        ],
+        "stage_labels": [
+          "凡人级·健手",
+          "凡人级·健手",
+          "凡人级·健手",
+          "凡人级·死力",
+          "凡人级·死力",
+          "凡人级·死力"
+        ],
+        "base_scale": "凡人级",
+        "status": "原文证据",
+        "note": "九品的两个实拍都落在「凡人级·死力」上缘：青砖崩裂、地面蛛网裂缝。"
+      },
+      {
+        "tier": 2,
+        "grade": "八品",
+        "representative_name": "练气境（武夫）",
+        "base_seq": 3,
+        "stage_seq": [
+          3,
+          3,
+          3,
+          4,
+          4,
+          4
+        ],
+        "stage_labels": [
+          "凡人级·死力",
+          "凡人级·死力",
+          "凡人级·死力",
+          "伤人级·见血",
+          "伤人级·见血",
+          "伤人级·见血"
+        ],
+        "base_scale": "凡人级",
+        "status": "推理填空",
+        "note": "未找到八品的破坏性出手样本，只有境界样本与气息样本；按九品→七品之间线性填空。"
+      },
+      {
+        "tier": 3,
+        "grade": "七品",
+        "representative_name": "炼神境（武夫）",
+        "base_seq": 4,
+        "stage_seq": [
+          4,
+          4,
+          4,
+          5,
+          5,
+          5
+        ],
+        "stage_labels": [
+          "伤人级·见血",
+          "伤人级·见血",
+          "伤人级·见血",
+          "伤人级·穿甲",
+          "伤人级·穿甲",
+          "伤人级·穿甲"
+        ],
+        "base_scale": "伤人级",
+        "status": "原文证据（弱）",
+        "note": "七品的实拍是「一刀威胁/斩杀六品」，属于越阶锋锐，不是范围破坏；落点取伤人级上缘。"
+      },
+      {
+        "tier": 4,
+        "grade": "六品",
+        "representative_name": "铜皮铁骨境（武夫）",
+        "base_seq": 5,
+        "stage_seq": [
+          5,
+          5,
+          5,
+          6,
+          6,
+          6
+        ],
+        "stage_labels": [
+          "伤人级·穿甲",
+          "伤人级·穿甲",
+          "伤人级·穿甲",
+          "伤人级·夺命",
+          "伤人级·夺命",
+          "伤人级·夺命"
+        ],
+        "base_scale": "伤人级",
+        "status": "原文证据",
+        "note": "箭矢不入皮肤、一拳打碎护心镜，落点稳定在「穿甲—夺命」。"
+      },
+      {
+        "tier": 5,
+        "grade": "五品",
+        "representative_name": "化劲境（武夫）",
+        "base_seq": 7,
+        "stage_seq": [
+          7,
+          7,
+          7,
+          7,
+          8,
+          8
+        ],
+        "stage_labels": [
+          "毁物级·破门",
+          "毁物级·破门",
+          "毁物级·破门",
+          "毁物级·破门",
+          "毁物级·摧墙",
+          "毁物级·摧墙"
+        ],
+        "base_scale": "毁物级",
+        "status": "推理填空（仅描述）",
+        "note": "五品是「登堂入室」的分水岭，但原文只写力量控制、无惯性、不惧群攻，没有可量的破坏实拍。"
+      },
+      {
+        "tier": 6,
+        "grade": "四品",
+        "representative_name": "锤炼「意」（原文未给名）",
+        "base_seq": 9,
+        "stage_seq": [
+          9,
+          9,
+          9,
+          10,
+          10,
+          10
+        ],
+        "stage_labels": [
+          "毁物级·倒楼",
+          "毁物级·倒楼",
+          "毁物级·倒楼",
+          "毁城级·裂地",
+          "毁城级·裂地",
+          "毁城级·裂地"
+        ],
+        "base_scale": "毁物级",
+        "status": "原文证据 + 异常",
+        "note": "四品正常落「倒楼」，但杨砚枪意洞穿山丘、四金锣混战毁数里，是全书最大不一致点。"
+      },
+      {
+        "tier": 7,
+        "grade": "三品",
+        "representative_name": "不死之躯（武夫）",
+        "base_seq": 10,
+        "stage_seq": [
+          10,
+          10,
+          10,
+          11,
+          11,
+          11
+        ],
+        "stage_labels": [
+          "毁城级·裂地",
+          "毁城级·裂地",
+          "毁城级·裂地",
+          "毁城级·荡街",
+          "毁城级·荡街",
+          "毁城级·荡街"
+        ],
+        "base_scale": "毁城级",
+        "status": "原文证据",
+        "note": "单体三品落「裂地—荡街」，一群三品混战才毁一城；狮子吼的影响半径远大于破坏半径。"
+      },
+      {
+        "tier": 8,
+        "grade": "二品",
+        "representative_name": "合道境（武夫）",
+        "base_seq": 12,
+        "stage_seq": [
+          12,
+          12,
+          13,
+          13,
+          13,
+          14
+        ],
+        "stage_labels": [
+          "毁城级·倾郭",
+          "毁城级·倾郭",
+          "灭世级·改天",
+          "灭世级·改天",
+          "灭世级·改天",
+          "灭世级·覆城"
+        ],
+        "base_scale": "毁城级",
+        "status": "原文证据（分体系）",
+        "note": "武夫二品落「倾郭—改天」；巫师二品雨师能抽干方圆百里、千里沃土化荒漠，需单列覆盖。"
+      },
+      {
+        "tier": 9,
+        "grade": "一品",
+        "representative_name": "未命名（俗称半步武神）",
+        "base_seq": 14,
+        "stage_seq": [
+          14,
+          14,
+          14,
+          15,
+          15,
+          15
+        ],
+        "stage_labels": [
+          "灭世级·覆城",
+          "灭世级·覆城",
+          "灭世级·覆城",
+          "灭世级·灭世",
+          "灭世级·灭世",
+          "灭世级·灭世"
+        ],
+        "base_scale": "灭世级",
+        "status": "原文证据",
+        "note": "一品对撞让方圆数十里空间皱褶，落「覆城—灭世」。"
+      },
+      {
+        "tier": 10,
+        "grade": "超品",
+        "representative_name": "武神/佛陀/儒圣/巫神/道尊/蛊神",
+        "base_seq": 15,
+        "stage_seq": [
+          15,
+          15,
+          15,
+          15,
+          15,
+          15
+        ],
+        "stage_labels": [
+          "灭世级·灭世",
+          "灭世级·灭世",
+          "灭世级·灭世",
+          "灭世级·灭世",
+          "灭世级·灭世",
+          "灭世级·灭世"
+        ],
+        "base_scale": "灭世级",
+        "status": "原文证据",
+        "note": "儒圣一脚山崩海啸、靖山城成为历史，方圆千里废土，稳定落「灭世级·灭世」。"
+      }
+    ],
+    "cells": [
+      {
+        "tier": 1,
+        "grade": "九品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 2,
+        "label": "凡人级·健手",
+        "base": "凡人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 1,
+        "grade": "九品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 2,
+        "label": "凡人级·健手",
+        "base": "凡人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 1,
+        "grade": "九品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 2,
+        "label": "凡人级·健手",
+        "base": "凡人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 1,
+        "grade": "九品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 3,
+        "label": "凡人级·死力",
+        "base": "凡人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 1,
+        "grade": "九品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 3,
+        "label": "凡人级·死力",
+        "base": "凡人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 1,
+        "grade": "九品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 3,
+        "label": "凡人级·死力",
+        "base": "凡人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 2,
+        "grade": "八品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 3,
+        "label": "凡人级·死力",
+        "base": "凡人级",
+        "status": "推理填空"
+      },
+      {
+        "tier": 2,
+        "grade": "八品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 3,
+        "label": "凡人级·死力",
+        "base": "凡人级",
+        "status": "推理填空"
+      },
+      {
+        "tier": 2,
+        "grade": "八品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 3,
+        "label": "凡人级·死力",
+        "base": "凡人级",
+        "status": "推理填空"
+      },
+      {
+        "tier": 2,
+        "grade": "八品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 4,
+        "label": "伤人级·见血",
+        "base": "伤人级",
+        "status": "推理填空"
+      },
+      {
+        "tier": 2,
+        "grade": "八品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 4,
+        "label": "伤人级·见血",
+        "base": "伤人级",
+        "status": "推理填空"
+      },
+      {
+        "tier": 2,
+        "grade": "八品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 4,
+        "label": "伤人级·见血",
+        "base": "伤人级",
+        "status": "推理填空"
+      },
+      {
+        "tier": 3,
+        "grade": "七品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 4,
+        "label": "伤人级·见血",
+        "base": "伤人级",
+        "status": "原文证据（弱）"
+      },
+      {
+        "tier": 3,
+        "grade": "七品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 4,
+        "label": "伤人级·见血",
+        "base": "伤人级",
+        "status": "原文证据（弱）"
+      },
+      {
+        "tier": 3,
+        "grade": "七品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 4,
+        "label": "伤人级·见血",
+        "base": "伤人级",
+        "status": "原文证据（弱）"
+      },
+      {
+        "tier": 3,
+        "grade": "七品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 5,
+        "label": "伤人级·穿甲",
+        "base": "伤人级",
+        "status": "原文证据（弱）"
+      },
+      {
+        "tier": 3,
+        "grade": "七品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 5,
+        "label": "伤人级·穿甲",
+        "base": "伤人级",
+        "status": "原文证据（弱）"
+      },
+      {
+        "tier": 3,
+        "grade": "七品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 5,
+        "label": "伤人级·穿甲",
+        "base": "伤人级",
+        "status": "原文证据（弱）"
+      },
+      {
+        "tier": 4,
+        "grade": "六品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 5,
+        "label": "伤人级·穿甲",
+        "base": "伤人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 4,
+        "grade": "六品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 5,
+        "label": "伤人级·穿甲",
+        "base": "伤人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 4,
+        "grade": "六品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 5,
+        "label": "伤人级·穿甲",
+        "base": "伤人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 4,
+        "grade": "六品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 6,
+        "label": "伤人级·夺命",
+        "base": "伤人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 4,
+        "grade": "六品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 6,
+        "label": "伤人级·夺命",
+        "base": "伤人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 4,
+        "grade": "六品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 6,
+        "label": "伤人级·夺命",
+        "base": "伤人级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 5,
+        "grade": "五品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 7,
+        "label": "毁物级·破门",
+        "base": "毁物级",
+        "status": "推理填空（仅描述）"
+      },
+      {
+        "tier": 5,
+        "grade": "五品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 7,
+        "label": "毁物级·破门",
+        "base": "毁物级",
+        "status": "推理填空（仅描述）"
+      },
+      {
+        "tier": 5,
+        "grade": "五品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 7,
+        "label": "毁物级·破门",
+        "base": "毁物级",
+        "status": "推理填空（仅描述）"
+      },
+      {
+        "tier": 5,
+        "grade": "五品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 7,
+        "label": "毁物级·破门",
+        "base": "毁物级",
+        "status": "推理填空（仅描述）"
+      },
+      {
+        "tier": 5,
+        "grade": "五品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 8,
+        "label": "毁物级·摧墙",
+        "base": "毁物级",
+        "status": "推理填空（仅描述）"
+      },
+      {
+        "tier": 5,
+        "grade": "五品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 8,
+        "label": "毁物级·摧墙",
+        "base": "毁物级",
+        "status": "推理填空（仅描述）"
+      },
+      {
+        "tier": 6,
+        "grade": "四品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 9,
+        "label": "毁物级·倒楼",
+        "base": "毁物级",
+        "status": "原文证据 + 异常"
+      },
+      {
+        "tier": 6,
+        "grade": "四品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 9,
+        "label": "毁物级·倒楼",
+        "base": "毁物级",
+        "status": "原文证据 + 异常"
+      },
+      {
+        "tier": 6,
+        "grade": "四品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 9,
+        "label": "毁物级·倒楼",
+        "base": "毁物级",
+        "status": "原文证据 + 异常"
+      },
+      {
+        "tier": 6,
+        "grade": "四品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 10,
+        "label": "毁城级·裂地",
+        "base": "毁城级",
+        "status": "原文证据 + 异常"
+      },
+      {
+        "tier": 6,
+        "grade": "四品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 10,
+        "label": "毁城级·裂地",
+        "base": "毁城级",
+        "status": "原文证据 + 异常"
+      },
+      {
+        "tier": 6,
+        "grade": "四品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 10,
+        "label": "毁城级·裂地",
+        "base": "毁城级",
+        "status": "原文证据 + 异常"
+      },
+      {
+        "tier": 7,
+        "grade": "三品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 10,
+        "label": "毁城级·裂地",
+        "base": "毁城级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 7,
+        "grade": "三品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 10,
+        "label": "毁城级·裂地",
+        "base": "毁城级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 7,
+        "grade": "三品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 10,
+        "label": "毁城级·裂地",
+        "base": "毁城级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 7,
+        "grade": "三品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 11,
+        "label": "毁城级·荡街",
+        "base": "毁城级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 7,
+        "grade": "三品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 11,
+        "label": "毁城级·荡街",
+        "base": "毁城级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 7,
+        "grade": "三品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 11,
+        "label": "毁城级·荡街",
+        "base": "毁城级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 8,
+        "grade": "二品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 12,
+        "label": "毁城级·倾郭",
+        "base": "毁城级",
+        "status": "原文证据（分体系）"
+      },
+      {
+        "tier": 8,
+        "grade": "二品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 12,
+        "label": "毁城级·倾郭",
+        "base": "毁城级",
+        "status": "原文证据（分体系）"
+      },
+      {
+        "tier": 8,
+        "grade": "二品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 13,
+        "label": "灭世级·改天",
+        "base": "灭世级",
+        "status": "原文证据（分体系）"
+      },
+      {
+        "tier": 8,
+        "grade": "二品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 13,
+        "label": "灭世级·改天",
+        "base": "灭世级",
+        "status": "原文证据（分体系）"
+      },
+      {
+        "tier": 8,
+        "grade": "二品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 13,
+        "label": "灭世级·改天",
+        "base": "灭世级",
+        "status": "原文证据（分体系）"
+      },
+      {
+        "tier": 8,
+        "grade": "二品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 14,
+        "label": "灭世级·覆城",
+        "base": "灭世级",
+        "status": "原文证据（分体系）"
+      },
+      {
+        "tier": 9,
+        "grade": "一品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 14,
+        "label": "灭世级·覆城",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 9,
+        "grade": "一品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 14,
+        "label": "灭世级·覆城",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 9,
+        "grade": "一品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 14,
+        "label": "灭世级·覆城",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 9,
+        "grade": "一品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 9,
+        "grade": "一品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 9,
+        "grade": "一品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 10,
+        "grade": "超品",
+        "stage_level": 0,
+        "stage_name": "未标注",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 10,
+        "grade": "超品",
+        "stage_level": 1,
+        "stage_name": "初期",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 10,
+        "grade": "超品",
+        "stage_level": 2,
+        "stage_name": "中期",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 10,
+        "grade": "超品",
+        "stage_level": 3,
+        "stage_name": "后期",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 10,
+        "grade": "超品",
+        "stage_level": 4,
+        "stage_name": "巅峰/大圆满",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      },
+      {
+        "tier": 10,
+        "grade": "超品",
+        "stage_level": 5,
+        "stage_name": "半步",
+        "seq": 15,
+        "label": "灭世级·灭世",
+        "base": "灭世级",
+        "status": "原文证据"
+      }
+    ]
+  },
+  "compat": {
+    "headline": "seq（1–15）与五档名是跨体系可比的；tier 与 stage_level 只在同一体系/同一阶梯内可比。",
+    "cross_system": [
+      "seq",
+      "base（五档名）",
+      "anchors（物理锚点）"
+    ],
+    "within_system": [
+      "tier（1–10，本书阶梯）",
+      "stage_level（0–5，仅细分型）",
+      "grade/tier_name（境名）"
+    ],
+    "not_comparable": [
+      "tier 跨不同小说/不同阶梯不可比（本书各体系共用九品→一品，才可跨体系比 tier）",
+      "stage_level 对序列型/粗放型无意义，不能拿来比高低",
+      "境名跨体系不可比（同为五品：化劲/德行/律者/金丹/预言师）"
+    ],
+    "by_system_type": {
+      "细分型": "先比 tier，再比 stage_level；跨体系时改比 seq。",
+      "序列型": "同序列内比序数；跨序列/跨体系只比 seq。",
+      "粗放型": "不比较境界序数，只比 seq/五档；没有 tier 也能用。"
+    },
+    "default_base_by_tier": {
+      "1": "凡人级",
+      "2": "凡人级",
+      "3": "伤人级",
+      "4": "伤人级",
+      "5": "毁物级",
+      "6": "毁物级",
+      "7": "毁城级",
+      "8": "毁城级",
+      "9": "灭世级",
+      "10": "灭世级"
+    },
+    "note": "这个默认五档与 power_scale.py 现有 default_scale_for_realm 的线性结果完全一致；15 层只细化，不改粗档。",
+    "existing_functions": {
+      "normalize_scale": "保留 量级 原文（细分 label 会原样留下）",
+      "parse_scale": "把 量级 收敛为五档原名；细分 label 会被吃掉，所以细层要放独立字段",
+      "scale_level": "返回 0–4；细分 label 仍返回所属五档序号",
+      "compare_scales": "只比五档；同档的两个细分 label 返回 0，不能区分 15 层；细分比较必须用 seq",
+      "default_scale_for_realm": "按体系境界数线性映射；10 境结果与 default_base_by_tier 一致"
+    }
+  },
+  "system_overrides": [
+    {
+      "system": "武夫",
+      "tier": 6,
+      "seq": 15,
+      "why": "杨砚枪意为点/线穿透，洞穿山丘；只用于该招式，不作为四品默认。"
+    },
+    {
+      "system": "佛门",
+      "tier": 7,
+      "seq": 12,
+      "influence_seq": 15,
+      "why": "狮子吼影响方圆五十里，但无物理破坏；破坏按 seq 12，影响另记。"
+    },
+    {
+      "system": "佛门",
+      "tier": 8,
+      "seq": 14,
+      "why": "数百丈金刚法相、佛光数十里，区域压制强于武夫二品。"
+    },
+    {
+      "system": "巫师",
+      "tier": 8,
+      "seq": 14,
+      "why": "雨师方圆百里风暴、千里沃土化荒漠，属天象/生态型区域效果。"
+    },
+    {
+      "system": "术士",
+      "tier": 7,
+      "seq": 12,
+      "why": "三品术士/炮台可洗地，属器械/区域型，不是单体拳脚。"
+    },
+    {
+      "system": "儒家",
+      "tier": 7,
+      "seq": 14,
+      "influence_seq": 14,
+      "why": "赵守画地为牢笼罩方圆数十里，属控制/领域，不是破坏。"
+    },
+    {
+      "system": "儒家",
+      "tier": 10,
+      "seq": 15,
+      "why": "儒圣一脚山崩海啸、靖山城成为历史。"
+    },
+    {
+      "system": "道门",
+      "tier": 9,
+      "seq": 15,
+      "why": "陆地神仙级可引天象/改地貌；原文样本少，按上限记。"
+    }
+  ],
+  "validation": {
+    "method": "从原著 novel_chunks 取各档角色真实出手段落，按四项锚点反推 seq，再与 realm_map 的默认 seq 比对。",
+    "per_tier": [
+      {
+        "tier": 1,
+        "grade": "九品",
+        "mapped_seq_range": [
+          2,
+          3
+        ],
+        "mapped_labels": [
+          "凡人级·健手",
+          "凡人级·死力"
+        ],
+        "samples": [
+          {
+            "chapter": 22,
+            "quote": "脚底青砖咔擦崩裂，身影电射而去。七十二枚铜板在空中擦出厉啸，泼头洒向锦衣公子哥。",
+            "observed_seq": 3,
+            "observed_label": "凡人级·死力",
+            "verdict": "青砖被起步蹬裂，铜板破空；落「死力」。"
+          },
+          {
+            "chapter": 66,
+            "quote": "他凝聚气机于双拳，沉腰下跨，隔空垂在地面。砰！地面发出闷响，崩裂出蛛网般的缝隙，尘埃弥漫。",
+            "observed_seq": 3,
+            "observed_label": "凡人级·死力",
+            "verdict": "隔空一拳震裂地面；落「死力」。"
+          }
+        ],
+        "actionable_samples": 2,
+        "status": "原文证据",
+        "note": "九品的两个实拍都落在「凡人级·死力」上缘：青砖崩裂、地面蛛网裂缝。"
+      },
+      {
+        "tier": 2,
+        "grade": "八品",
+        "mapped_seq_range": [
+          3,
+          4
+        ],
+        "mapped_labels": [
+          "凡人级·死力",
+          "伤人级·见血"
+        ],
+        "samples": [
+          {
+            "chapter": 70,
+            "quote": "刚踏入练气境的新人",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "只有境界句，没有出手。"
+          },
+          {
+            "chapter": 117,
+            "quote": "我是七品风水师，那能瞒过我的望气术的高品武者，少说得五品。六品都不行。",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "八品的气息能被望气术看见；不是破坏样本。"
+          }
+        ],
+        "actionable_samples": 0,
+        "status": "推理填空",
+        "note": "未找到八品的破坏性出手样本，只有境界样本与气息样本；按九品→七品之间线性填空。"
+      },
+      {
+        "tier": 3,
+        "grade": "七品",
+        "mapped_seq_range": [
+          4,
+          5
+        ],
+        "mapped_labels": [
+          "伤人级·见血",
+          "伤人级·穿甲"
+        ],
+        "samples": [
+          {
+            "chapter": 221,
+            "quote": "这一刀锋芒之锐利，迅捷如雷霆，即使初入六品铜皮铁骨境的武者，也无法用肉身硬抗。",
+            "observed_seq": 5,
+            "observed_label": "伤人级·穿甲",
+            "verdict": "七品一刀可威胁六品，落「穿甲」上缘。"
+          },
+          {
+            "chapter": 253,
+            "quote": "黑金长刀斩在拳头上，爆发出刺目的火花，许七安右手虎口崩裂，双腿贴地滑退出十几米。",
+            "observed_seq": 5,
+            "observed_label": "伤人级·穿甲",
+            "verdict": "七品对六品，锋锐够但反震也大；落「穿甲」。"
+          },
+          {
+            "chapter": 290,
+            "quote": "你之前不是一刀斩了一位六品武夫？",
+            "observed_seq": 5,
+            "observed_label": "伤人级·穿甲",
+            "verdict": "越阶斩杀，仍是单点锋锐，不是范围破坏。"
+          }
+        ],
+        "actionable_samples": 3,
+        "status": "原文证据（弱）",
+        "note": "七品的实拍是「一刀威胁/斩杀六品」，属于越阶锋锐，不是范围破坏；落点取伤人级上缘。"
+      },
+      {
+        "tier": 4,
+        "grade": "六品",
+        "mapped_seq_range": [
+          5,
+          6
+        ],
+        "mapped_labels": [
+          "伤人级·穿甲",
+          "伤人级·夺命"
+        ],
+        "samples": [
+          {
+            "chapter": 33,
+            "quote": "蚀骨灼心，你涂抹在箭矢上，能要了炼神境高手的命。铜皮铁骨境无效，因为箭矢根本无法穿透对方的皮肤。",
+            "observed_seq": 5,
+            "observed_label": "伤人级·穿甲",
+            "verdict": "六品的硬指标：箭矢不入皮肤。"
+          },
+          {
+            "chapter": 253,
+            "quote": "胸口炸裂的是打更人衙门分配的法器铜锣，还有宋卿的护心镜。双重防御下，让他挡住了铜皮铁骨高手的全力一击。",
+            "observed_seq": 6,
+            "observed_label": "伤人级·夺命",
+            "verdict": "六品一拳打碎两件法器；落「夺命」。"
+          },
+          {
+            "chapter": 213,
+            "quote": "这位金锣一拳击中横飞过来的杨川南胸口……铜皮铁骨破了。杨川南吐着血横飞出去。",
+            "observed_seq": 6,
+            "observed_label": "伤人级·夺命",
+            "verdict": "六品的防御被四品一拳打穿；六品自身落「夺命」。"
+          }
+        ],
+        "actionable_samples": 3,
+        "status": "原文证据",
+        "note": "箭矢不入皮肤、一拳打碎护心镜，落点稳定在「穿甲—夺命」。"
+      },
+      {
+        "tier": 5,
+        "grade": "五品",
+        "mapped_seq_range": [
+          7,
+          8
+        ],
+        "mapped_labels": [
+          "毁物级·破门",
+          "毁物级·摧墙"
+        ],
+        "samples": [
+          {
+            "chapter": 341,
+            "quote": "化劲不会有颤动，这个境界的武者，可以完美掌握自身的力量，不浪费一丝一毫。",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "描述力量控制，没有破坏后果。"
+          },
+          {
+            "chapter": 416,
+            "quote": "五品化劲是武夫体术的巅峰……五品之后的武者，才是让其他体系的高品恐惧的原因。",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "分水岭描述，无实拍。"
+          },
+          {
+            "chapter": 693,
+            "quote": "宛如炮弹般飞射而来的许七安，在临近儒圣雕塑前，不符合力学规则的一个骤停，把所有惯性化于无形。",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "无惯性描述，无破坏。"
+          }
+        ],
+        "actionable_samples": 0,
+        "status": "推理填空（仅描述）",
+        "note": "五品是「登堂入室」的分水岭，但原文只写力量控制、无惯性、不惧群攻，没有可量的破坏实拍。"
+      },
+      {
+        "tier": 6,
+        "grade": "四品",
+        "mapped_seq_range": [
+          9,
+          10
+        ],
+        "mapped_labels": [
+          "毁物级·倒楼",
+          "毁城级·裂地"
+        ],
+        "samples": [
+          {
+            "chapter": 75,
+            "quote": "四品武夫的枪意……金丹在枪意中化作齑粉，老翁的身体在枪意中绞成肉沫，那抹银色的光芒兀自冲出数百丈，将一座山丘洞穿。",
+            "observed_seq": 15,
+            "observed_label": "灭世级·灭世",
+            "verdict": "点/线穿透把「山丘」打穿；按破坏对象落 seq 15，远超四品默认档。"
+          },
+          {
+            "chapter": 140,
+            "quote": "四名武夫，一名来历不明的怪物，在荒凉的城区厮杀，走到哪里，哪里就化作废墟。气机一团团炸开，掀起了席卷方圆数里的可怕飓风。",
+            "observed_seq": 11,
+            "observed_label": "毁城级·荡街",
+            "verdict": "四名四品 + 怪物合击，方圆数里废墟；群体叠加落 seq 11。"
+          },
+          {
+            "chapter": 183,
+            "quote": "金锣是四品武夫，四品的武者在战场上，个个都是以一挡千的绝顶高手。在凡人的范畴里，凝聚了「意」的四品是巅峰了。",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "定位句：四品是凡人范畴的巅峰，支持 seq 9–10。"
+          },
+          {
+            "chapter": 88,
+            "quote": "要是放开手脚大干一场，打更人衙门都得夷为平地。",
+            "observed_seq": 12,
+            "observed_label": "毁城级·倾郭",
+            "verdict": "转述/夸张，不是实拍；落 seq 12。"
+          }
+        ],
+        "actionable_samples": 2,
+        "status": "原文证据 + 异常",
+        "note": "四品正常落「倒楼」，但杨砚枪意洞穿山丘、四金锣混战毁数里，是全书最大不一致点。"
+      },
+      {
+        "tier": 7,
+        "grade": "三品",
+        "mapped_seq_range": [
+          10,
+          11
+        ],
+        "mapped_labels": [
+          "毁城级·裂地",
+          "毁城级·荡街"
+        ],
+        "samples": [
+          {
+            "chapter": 486,
+            "quote": "三品叫不死之躯……能断肢重生，只要不当场死亡，怎么样的伤势都能复原。",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "防御/恢复锚点，不是破坏。"
+          },
+          {
+            "chapter": 491,
+            "quote": "拳头砸在三品武夫的体魄上，砸起能随意震死铜皮铁骨境之下武夫的气浪。",
+            "observed_seq": 10,
+            "observed_label": "毁城级·裂地",
+            "verdict": "气浪可震死六品以下；杀伤半径落 seq 10，与映射下缘一致。"
+          },
+          {
+            "chapter": 530,
+            "quote": "佛门狮子吼，三品武僧施展的佛门狮子吼……如果全力咆哮，六品以下，当场丧命。四品以下，神智混乱。",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "影响半径极大（方圆五十里），但没有物理破坏；破坏半径记 0。"
+          },
+          {
+            "chapter": 586,
+            "quote": "北境的楚州城，便是在一群三品强者的混战中夷为平地。",
+            "observed_seq": 12,
+            "observed_label": "毁城级·倾郭",
+            "verdict": "一群三品混战毁一城；群体叠加落 seq 12–14。"
+          }
+        ],
+        "actionable_samples": 2,
+        "status": "原文证据",
+        "note": "单体三品落「裂地—荡街」，一群三品混战才毁一城；狮子吼的影响半径远大于破坏半径。"
+      },
+      {
+        "tier": 8,
+        "grade": "二品",
+        "mapped_seq_range": [
+          12,
+          14
+        ],
+        "mapped_labels": [
+          "毁城级·倾郭",
+          "灭世级·改天",
+          "灭世级·覆城"
+        ],
+        "samples": [
+          {
+            "chapter": 636,
+            "quote": "风来！犬戎山方圆百里，刮起飓风……雨来！……乌云盖顶，电闪雷鸣，瓢泼大雨……千里沃土化为荒漠。",
+            "observed_seq": 14,
+            "observed_label": "灭世级·覆城",
+            "verdict": "二品雨师的天象/生态效果；按影响半径落 seq 14–15。"
+          },
+          {
+            "chapter": 640,
+            "quote": "二品武夫的体魄，被法相一击打破。……身高数百丈的金身，佛光万道，将犬戎山方圆数十里染成金色。",
+            "observed_seq": 13,
+            "observed_label": "灭世级·改天",
+            "verdict": "二品武夫被超品级法相打破；法相影响方圆数十里，落 seq 13–14。"
+          }
+        ],
+        "actionable_samples": 2,
+        "status": "原文证据（分体系）",
+        "note": "武夫二品落「倾郭—改天」；巫师二品雨师能抽干方圆百里、千里沃土化荒漠，需单列覆盖。"
+      },
+      {
+        "tier": 9,
+        "grade": "一品",
+        "mapped_seq_range": [
+          14,
+          15
+        ],
+        "mapped_labels": [
+          "灭世级·覆城",
+          "灭世级·灭世"
+        ],
+        "samples": [
+          {
+            "chapter": 797,
+            "quote": "一拳对二十四拳，两者之间霍然炸开一道宛如屏障的气波……让方圆数十里的空间变的宛如皱巴巴的衣服……脚步震裂大地。",
+            "observed_seq": 14,
+            "observed_label": "灭世级·覆城",
+            "verdict": "一品对撞，方圆数十里空间扭曲；落 seq 14。"
+          },
+          {
+            "chapter": 783,
+            "quote": "一人一兽的撞击造成山崩般的可怕声势，方圆数百丈的地面，陡然下沉。",
+            "observed_seq": 13,
+            "observed_label": "灭世级·改天",
+            "verdict": "方圆数百丈地面下沉；按半径落 seq 12–13，比映射低一档。"
+          },
+          {
+            "chapter": 899,
+            "quote": "九尊一品武夫相继炸开，还原成纯粹的黑雾，返回遮天蔽日的幕布中。",
+            "observed_seq": null,
+            "observed_label": null,
+            "verdict": "一品数量/形态锚点，不是破坏尺度。"
+          }
+        ],
+        "actionable_samples": 2,
+        "status": "原文证据",
+        "note": "一品对撞让方圆数十里空间皱褶，落「覆城—灭世」。"
+      },
+      {
+        "tier": 10,
+        "grade": "超品",
+        "mapped_seq_range": [
+          15,
+          15
+        ],
+        "mapped_labels": [
+          "灭世级·灭世"
+        ],
+        "samples": [
+          {
+            "chapter": 472,
+            "quote": "这一脚踏下，汪洋中骤然掀起数百丈高的海啸，靖山彻底坍塌，山崩，海啸……儒圣一脚之威，将山川夷为平地，将大地化作泽国。",
+            "observed_seq": 15,
+            "observed_label": "灭世级·灭世",
+            "verdict": "超品一脚改山川；落 seq 15。"
+          },
+          {
+            "chapter": 473,
+            "quote": "当年儒圣封印巫神。那一次，方圆千里化作废土，此后的三百年里，生灵绝迹。",
+            "observed_seq": 15,
+            "observed_label": "灭世级·灭世",
+            "verdict": "方圆千里废土；落 seq 15。"
+          },
+          {
+            "chapter": 878,
+            "quote": "圣山阿兰陀几乎被夷为平地。",
+            "observed_seq": 15,
+            "observed_label": "灭世级·灭世",
+            "verdict": "超品/一品联手把圣山夷平；落 seq 15。"
+          }
+        ],
+        "actionable_samples": 3,
+        "status": "原文证据",
+        "note": "儒圣一脚山崩海啸、靖山城成为历史，方圆千里废土，稳定落「灭世级·灭世」。"
+      }
+    ],
+    "inconsistencies": [
+      {
+        "id": "I1",
+        "where": "四品 · 杨砚枪意 [75]",
+        "text": "银光冲出数百丈，将一座山丘洞穿。",
+        "problem": "按「破坏对象」是山丘，应落 seq 15；按「影响半径」约 1 km，只到 seq 12；按「单体一击」的常规四品只到 seq 9–10。三个轴给出三个答案。",
+        "cause": "这是点/线穿透，不是面破坏；「洞穿山丘」的硬度锚点与「方圆数里」的范围锚点不可同时满足。",
+        "fix": "给每层加 attack_shape（point/line/area）与 pierce_only 标记；穿甲/穿山按「穿透」轴单列，不用它抬高整档的破坏半径。"
+      },
+      {
+        "id": "I2",
+        "where": "三品 · 佛门狮子吼 [530]",
+        "text": "滚出三花寺方圆五十里……全力咆哮，六品以下当场丧命。",
+        "problem": "影响半径 25 km（seq 15），物理破坏半径几乎为 0（seq 1）。用单一「影响半径」会把三品抬到灭世级。",
+        "cause": "声波/威压是「影响」不是「破坏」；原文没有说狮子吼震塌房屋。",
+        "fix": "把「影响半径」拆成 destroy_m 与 influence_m；seq 只按 destroy_m 落，influence_m 只用于目睹门槛/战场范围。本表已按此拆。"
+      },
+      {
+        "id": "I3",
+        "where": "二品 · 雨师 [636] vs 二品武夫 [640]",
+        "text": "方圆百里飓风、千里沃土化荒漠；二品武夫体魄被法相一击打破。",
+        "problem": "同为二品，巫师的天象/生态效果落 seq 14–15，武夫的单体承伤只落 seq 13。一个 tier 对应两个 seq。",
+        "cause": "体系差异：巫师是区域/仪式型，武夫是单体/近身型；原文明确说「巫师不擅长攻杀」。",
+        "fix": "加 system_overrides：同一 tier 按体系给不同 seq；跨体系比较只用 seq，不用 tier。"
+      },
+      {
+        "id": "I4",
+        "where": "三品 · 群体混战 [586][632]",
+        "text": "一群三品强者的混战中夷为平地；参战超凡多达七位。",
+        "problem": "单体三品落 seq 11–12，七位三品混战落 seq 12–14；把群体战果记到单人头上是抬高。",
+        "cause": "破坏是多人多轮累积，不是一击。",
+        "fix": "加 participants 字段；realm_map 只记单体一击，群体战果单列 event_scale，不进角色默认 seq。"
+      },
+      {
+        "id": "I5",
+        "where": "一品 vs 二品 [783][797]",
+        "text": "方圆数百丈地面下沉（一品）；方圆数十里空间皱褶（一品对撞）。",
+        "problem": "同为一品，783 的半径比 797 小两个数量级；映射取 14–15，783 实测只到 12–13。",
+        "cause": "对手、地形、是否全力都影响落点；单场战斗不能代表整档。",
+        "fix": "每档给「典型值 + 上限」两个数；realm_map 用典型值，validation 用单场值，不把单场上限写进默认。"
+      },
+      {
+        "id": "I6",
+        "where": "407 格 · 姜律中",
+        "text": "CSV 记 tier=3（七品炼神境），依据是「姜律中自己当初晋升炼神境」；同书 [199] 明写「金锣，四品武夫」。",
+        "problem": "realm 线把「当初」的历史境界当成当前境界，tier 错了两档；若按 tier 直接挂量级，会把四品金锣算成七品。",
+        "cause": "抽取规则没有排除「当初/曾经/以前」的时间标记。",
+        "fix": "接入 407 格前先修这类历史时态；量级映射只用「当前境界」证据，不用 raw_value 的裸品级。"
+      }
+    ]
+  },
+  "scale_levels_15": [
+    "凡人级·凡手",
+    "凡人级·健手",
+    "凡人级·死力",
+    "伤人级·见血",
+    "伤人级·穿甲",
+    "伤人级·夺命",
+    "毁物级·破门",
+    "毁物级·摧墙",
+    "毁物级·倒楼",
+    "毁城级·裂地",
+    "毁城级·荡街",
+    "毁城级·倾郭",
+    "灭世级·改天",
+    "灭世级·覆城",
+    "灭世级·灭世"
+  ],
+  "scale_hints_15": {
+    "凡人级·凡手": "一拳只能把眼前的人打退半步，打不断一扇厚木门。",
+    "凡人级·健手": "一拳能打断骨头、打裂薄木板，厚木门要砸几下。",
+    "凡人级·死力": "全力一击能打死一个无甲成年人，能一脚踹裂厚木门。",
+    "伤人级·见血": "一刀能划开皮甲，让人当场见血倒地。",
+    "伤人级·穿甲": "一刀能穿透铁甲，隔着刀剑也能伤人。",
+    "伤人级·夺命": "抬手能把数丈外的人打死，掌风能震裂砖石。",
+    "毁物级·破门": "一拳能轰开厚木门，震碎半堵薄石墙。",
+    "毁物级·摧墙": "一掌能轰塌一堵砖墙，掀掉一层瓦顶。",
+    "毁物级·倒楼": "一击能推倒一栋楼阁，或者打塌一段城墙垛口。",
+    "毁城级·裂地": "一击在地面炸出数丈深坑，震裂一条街的石板。",
+    "毁城级·荡街": "一击扫平一条街，成排房屋像纸一样倒。",
+    "毁城级·倾郭": "一击能让一段城墙坍塌，半座城变成废墟。",
+    "灭世级·改天": "出手能改变局部天象：云层裂开、雷柱落下、雨雪骤停。",
+    "灭世级·覆城": "一击能抹平整座城，令江河倒卷。",
+    "灭世级·灭世": "一击能夷平山川，方圆百里化作废土。"
+  },
+  "scale_seq_by_label": {
+    "凡人级·凡手": 1,
+    "凡人级·健手": 2,
+    "凡人级·死力": 3,
+    "伤人级·见血": 4,
+    "伤人级·穿甲": 5,
+    "伤人级·夺命": 6,
+    "毁物级·破门": 7,
+    "毁物级·摧墙": 8,
+    "毁物级·倒楼": 9,
+    "毁城级·裂地": 10,
+    "毁城级·荡街": 11,
+    "毁城级·倾郭": 12,
+    "灭世级·改天": 13,
+    "灭世级·覆城": 14,
+    "灭世级·灭世": 15
+  }
+}

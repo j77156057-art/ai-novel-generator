@@ -368,10 +368,19 @@ def _merge_segment_into_kg_locked(
 
     # 4) 规则哨兵：零 LLM 的硬冲突检查。**只标红，不改正文。**
     try:
+        from app.config import settings
         from app.kg.sentinel import audit_segment
+        from app.generation.power_system_type import system_type_from_bible
 
         proj = db.get(Project, project_id)
-        stats["sentinel"] = audit_segment(db, proj, text, segment_no)
+        # 三档体系决定境界判据的边界；开关关闭时传 None，退回旧的单判据行为。
+        system_type = None
+        if settings.power_guard_enabled:
+            bible = getattr(proj, "plot_bible", None) or {}
+            system_type, _ = system_type_from_bible(bible)
+        stats["sentinel"] = audit_segment(
+            db, proj, text, segment_no, system_type=system_type
+        )
     except Exception as exc:  # noqa: BLE001 —— 哨兵失败不阻断主流程
         # 同上：哨兵步可能已写了部分 state/alert 行，回滚避免半成品残留。
         db.rollback()
