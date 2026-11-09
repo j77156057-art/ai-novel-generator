@@ -58,6 +58,20 @@ LOCATION_SUFFIXES = (
 NON_ENTITY_NAMES = frozenset({
     "官场", "后宫", "党派", "卫司", "行气法门", "书院", "衙门",
 })
+#: 集合/上位类：关系挂上去等于把人物关系存成集合关系，下游无法使用 → 直接剔除。
+UPPER_LEVEL_NAMES = frozenset({
+    "西域", "西域佛门", "西方佛门", "魏渊阵营", "道门天地人三宗",
+    "道门地宗", "道门天宗",
+})
+UPPER_LEVEL_SUFFIXES = ("阵营",)
+#: 具体场所类：真实体但价值低，不按类型剔，按 mentions 阈值控。
+#: 阈值 3 的依据：venue 候选里 1–2 次的多为一次性布景（山货铺/御膳房/
+#: 桂月楼/景秀宫），3 次以上才开始有复用（灵宝观/观星楼/养生堂）。
+VENUE_SUFFIXES = (
+    "驿", "站", "铺", "坊", "市", "店", "房", "屋", "场", "堂", "楼",
+    "阁", "观", "寺", "庙", "宫", "园", "庄", "斋", "居", "院", "衙门",
+)
+VENUE_MIN_MENTIONS = 3
 _BAD_NAME = re.compile(r"[，。！？、；：“”「」『』（）()\s0-9A-Za-z]")
 
 #: 两层词表产物（实体层 + 称呼层）。测试/部署可用 KG_CANON_LAYERS 覆盖。
@@ -290,8 +304,17 @@ def _nonchar_domain(node: dict) -> str | None:
         return None
     if name in NON_ENTITY_NAMES or name.endswith("官场"):
         return None
+    # 集合/上位：关系会退化成集合关系，直接不要
+    if name in UPPER_LEVEL_NAMES or name.endswith(UPPER_LEVEL_SUFFIXES):
+        return None
+    if ("佛门" in name and name != "佛门") or (name.startswith("道门") and name != "道门"):
+        return None
     if name.endswith(FACTION_SUFFIXES) or name.endswith(LOCATION_SUFFIXES):
-        return "location" if name.endswith(LOCATION_SUFFIXES) else "faction"
+        domain = "location" if name.endswith(LOCATION_SUFFIXES) else "faction"
+        # 具体场所不按类型剔，只用 mentions 阈值控低价值布景
+        if name.endswith(VENUE_SUFFIXES) and (node.get("mentions") or 0) < VENUE_MIN_MENTIONS:
+            return None
+        return domain
     if (node.get("mentions") or 0) >= 50:
         return "faction"
     return None

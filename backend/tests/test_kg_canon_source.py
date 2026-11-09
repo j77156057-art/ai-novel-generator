@@ -340,6 +340,21 @@ def test_mixed_normalizes_character_aliases(monkeypatch):
     assert canon_source.normalize("许郎") == "许七安"
 
 
+def test_mixed_rejects_upper_level_and_low_evidence_venues(monkeypatch):
+    _set_mixed(monkeypatch)
+    # 集合/上位类：关系会退化成集合关系，直接不要
+    for name in ("魏渊阵营", "西方佛门", "西域佛门", "道门天地人三宗", "道门地宗"):
+        assert canon_source._nonchar_domain(
+            {"name": name, "kind": "faction", "mentions": 100}) is None
+    # 具体场所不按类型剔，只按 mentions 阈值（<3 丢，>=3 留）
+    assert canon_source._nonchar_domain(
+        {"name": "山货铺", "kind": "faction", "mentions": 1}) is None
+    assert canon_source._nonchar_domain(
+        {"name": "驿站", "kind": "faction", "mentions": 7}) == "location"
+    assert canon_source._nonchar_domain(
+        {"name": "司天监", "kind": "faction", "mentions": 291}) == "faction"
+
+
 def test_mixed_degrades_to_legacy_when_layers_missing(monkeypatch, caplog, tmp_path):
     db = _mixed_db(tmp_path)
     _set_mixed(monkeypatch, tmp_path / "missing.json")
