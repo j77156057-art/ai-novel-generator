@@ -235,7 +235,11 @@ class KgEntity(Base):
 class KgRelation(Base):
     """v3.0 关系表：带强度（0-1）+ since_chapter。
 
-    rel_type 取值域：ally|enemy|mentor|subordinate|romantic|belongs_to|located_at|owns。
+    rel_type 取值域：ally / enemy / mentor / subordinate / romantic / belongs_to /
+    located_at / owns，以及亲属类 father / mother / elder_brother / younger_brother /
+    elder_sister / younger_sister / son / daughter / kin（2026-11-08 扩容）；
+    通用词 sister / brother / sibling / parent / child 亦合法，其中 sister/brother
+    落库时归一为 sibling（不猜长幼）。
     strength 变化不覆盖本行——每次变化追加 kg_relation_evolution 一行，本行存最新。
     """
 
