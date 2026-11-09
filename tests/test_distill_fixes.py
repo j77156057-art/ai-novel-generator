@@ -217,10 +217,11 @@ def test_all_chunks_failed_raises_instead_of_silent_success(db_session):
     nid = _make_corpus(db_session)
     proj = _make_project(db_session, nid, tier=TIER_FAST)
 
-    with pytest.raises(ValueError, match="全部调用模型失败"):
+    with pytest.raises(ValueError, match="3 个语料块全部未产出任何规则") as exc:
         extract_narrative_profile(
             db_session, proj, [nid], provider=BoomProvider(), tier=TIER_FAST
         )
+    assert "未归类的调用失败" in str(exc.value)
 
 
 def test_all_chunks_unparseable_also_raises(db_session):
@@ -232,10 +233,11 @@ def test_all_chunks_unparseable_also_raises(db_session):
         def chat(self, system: str, user: str, **kwargs) -> str:
             return "我不是 JSON，我是兜底文案"
 
-    with pytest.raises(ValueError, match="全部调用模型失败"):
+    with pytest.raises(ValueError, match="3 个语料块全部未产出任何规则") as exc:
         extract_narrative_profile(
             db_session, proj, [nid], provider=GarbageProvider(), tier=TIER_FAST
         )
+    assert "不是约定格式的 JSON" in str(exc.value)
 
 
 def test_empty_corpus_raises(db_session):

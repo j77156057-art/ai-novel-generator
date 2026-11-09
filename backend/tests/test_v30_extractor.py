@@ -185,9 +185,9 @@ check("非法 event_type 保留原始值", nb["events"][0].get("raw_event_type")
 # ====================================================================
 # 4. 顶层非 dict / None / 空
 # ====================================================================
-check("None 输入空骨架", normalize_extraction(None), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
-check("list 输入空骨架", normalize_extraction([1, 2]), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
-check("空 dict 空骨架", normalize_extraction({}), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
+check("None 输入空骨架", normalize_extraction(None), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": [], "downgraded": [], "conflicts": []})
+check("list 输入空骨架", normalize_extraction([1, 2]), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": [], "downgraded": [], "conflicts": []})
+check("空 dict 空骨架", normalize_extraction({}), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": [], "downgraded": [], "conflicts": []})
 check("顶层 list 值兜底", len(normalize_extraction({"entities": "not a list"})["entities"]), 0)
 
 # ====================================================================
@@ -202,8 +202,8 @@ check("带前后垃圾解析", _parse_and_normalize(messy)["entities"][0]["canon
 think = "让我想想..." + good + "结论如上"
 check("think 块包裹解析", _parse_and_normalize(think)["entities"][0]["canonical_name"], "甲")
 
-check("空字符串兜底", _parse_and_normalize(""), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
-check("垃圾非 JSON 兜底", _parse_and_normalize("完全不是 JSON 的输出"), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": []})
+check("空字符串兜底", _parse_and_normalize(""), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": [], "downgraded": [], "conflicts": []})
+check("垃圾非 JSON 兜底", _parse_and_normalize("完全不是 JSON 的输出"), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": [], "downgraded": [], "conflicts": []})
 
 # ====================================================================
 # 6. extract_segment / extract_batch（mock provider）

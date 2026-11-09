@@ -84,7 +84,47 @@ _KNOWLEDGE_ALIASES = {
 VALID_ENTITY_KINDS = {"character", "location", "faction", "item", "worldrule", "power_system"}
 VALID_REL_TYPES = {
     "ally", "enemy", "mentor", "subordinate", "romantic", "belongs_to", "located_at", "owns",
+    "holds",
+    # 亲属类（2026-11-08 扩容）：原先 family/sibling/brother 等 151 条被 rejected，
+    # 角色卡的「身份社会关系」需要这些边。语义：from → to 表示「from 是 to 的 X」。
+    # 细分值原样保留；通用词 sister/brother 在归一阶段降为 sibling（不猜长幼），
+    # parent/child 本身已是不分性别的通用值，无需再降。
+    "father", "mother", "elder_brother", "younger_brother", "elder_sister", "younger_sister",
+    "son", "daughter", "kin", "sister", "brother", "parent", "child", "sibling",
 }
+
+#: 通用亲属词 → 落库归一值。长幼不明时不许猜，统一落 sibling。
+_GENERIC_KINSHIP = {"sister": "sibling", "brother": "sibling", "sibling": "sibling"}
+
+#: 细分亲属称谓 → 原文中能支撑该称谓的说法（命中任一即算有依据）。
+#: 用于「原文称谓校验」：证据句里找不到对应说法就降级，避免把「妹妹」写成 daughter。
+_KINSHIP_EVIDENCE = {
+    "father": ("父亲", "爹", "父", "爸"),
+    "mother": ("母亲", "娘", "母", "妈"),
+    "elder_brother": ("哥哥", "兄长", "大哥", "兄"),
+    "younger_brother": ("弟弟", "小弟", "弟"),
+    "elder_sister": ("姐姐", "大姐", "姊"),
+    "younger_sister": ("妹妹", "小妹", "妹"),
+    "son": ("儿子", "长子", "次子", "子嗣"),
+    "daughter": ("女儿", "闺女", "长女", "次女"),
+}
+
+#: 细分称谓找不到原文依据时的降级目标：兄弟/姐妹 → sibling，父母/子女 → kin。
+_KINSHIP_FALLBACK = {
+    "father": "kin", "mother": "kin", "son": "kin", "daughter": "kin",
+    "elder_brother": "sibling", "younger_brother": "sibling",
+    "elder_sister": "sibling", "younger_sister": "sibling",
+}
+
+#: 关系枚举别名：holds/hold 一律并入 owns（持有者 → 被持有物）。
+_REL_TYPE_ALIASES = {"holds": "owns", "hold": "owns"}
+
+#: 原文里能支撑「持有」的动词；用于 owns 方向冲突时以触发句为准。
+_OWN_VERBS = ("拿", "持", "握", "攥", "拎", "收", "取", "带", "用", "买", "得", "佩")
+
+#: attrs 里的占位值，不当作真实的持有者。
+_ATTR_PLACEHOLDER = {"无", "未提及", "未知", "none", "unknown", "n/a"}
+
 VALID_EVENT_TYPES = {
     "incident", "revelation", "foreshadow_plant", "foreshadow_payoff", "death",
     "romance_milestone", "battle", "decision", "time_marker",
@@ -151,7 +191,7 @@ def normalize_extraction(raw: dict) -> dict:
     if not isinstance(raw, dict):
         return {"entities": [], "relations": [], "events": [], "event_links": [],
                 "entity_knowledge": [], "state_changes": [], "foreshadows": [],
-                "rejected": []}
+                "rejected": [], "downgraded": [], "conflicts": []}
 
     out = {
         "entities": [],
@@ -164,6 +204,11 @@ def normalize_extraction(raw: dict) -> dict:
         #: 非法枚举值的落盘出口。调用方写 JSONL 即可查询（见 experiments 的
         #: kg_build.py：每批把 rejected 追加到 rejects.jsonl，字段 chapter/reason）。
         "rejected": [],
+        #: 亲属称谓降级记录（细分称谓在原文找不到依据 → sibling/kin），
+        #: 与 rejected 分开，避免把「降级」误算成「丢弃」。
+        "downgraded": [],
+        #: 方向冲突记录（owns 与 attrs.held_by 不一致时的修正/告警）。
+        "conflicts": [],
     }
 
     # —— entities ——
@@ -199,6 +244,8 @@ def normalize_extraction(raw: dict) -> dict:
         if not a or not b:
             # 主体/客体缺失不是枚举问题，属结构性无效，仍按原样丢弃。
             continue
+        # holds/hold 并入 owns（持有者 → 被持有物），再校验取值域。
+        rt = _REL_TYPE_ALIASES.get(rt, rt)
         if rt not in VALID_REL_TYPES:
             # 非法关系类型：保留 + 记录（含两端），便于事后回捞与统计漂移分布。
             out["rejected"].append({"stage": "relation", "reason": "invalid_rel_type",
@@ -206,6 +253,8 @@ def normalize_extraction(raw: dict) -> dict:
             continue
         if a == b:
             continue
+        # 通用亲属词归一：sister/brother 不猜长幼，落 sibling。
+        rt = _GENERIC_KINSHIP.get(rt, rt)
         out["relations"].append({
             "from": a, "to": b, "rel_type": rt,
             "strength": _as_float(_pick(r, _RELATION_ALIASES["strength"]), 0.5),
@@ -311,6 +360,95 @@ def normalize_extraction(raw: dict) -> dict:
     return out
 
 
+def _term_in_text(term: str, text: str) -> bool:
+    """原文里是否出现该称谓。单字词排除「师父/师兄/师弟/师妹/师母」这类非亲属用法。"""
+    idx = text.find(term)
+    while idx != -1:
+        if len(term) > 1 or idx == 0 or text[idx - 1] != "师":
+            return True
+        idx = text.find(term, idx + 1)
+    return False
+
+
+def validate_kinship_terms(result: dict, text: str) -> dict:
+    """原文称谓校验：细分亲属称谓必须能在原文里找到对应说法。
+
+    找不到就降级——兄弟/姐妹降为 sibling，父母/子女降为 kin，并记入
+    result["downgraded"]。用于防「原文写妹妹、模型输出 daughter」这类硬猜。
+    """
+    if not text:
+        return result
+    downs = result.setdefault("downgraded", [])
+    for r in result.get("relations", []):
+        rt = r.get("rel_type")
+        terms = _KINSHIP_EVIDENCE.get(rt)
+        if not terms:
+            continue
+        if any(_term_in_text(t, text) for t in terms):
+            continue
+        fb = _KINSHIP_FALLBACK.get(rt, "kin")
+        downs.append({"stage": "relation", "reason": "kinship_term_mismatch",
+                      "from": r.get("from"), "to": r.get("to"),
+                      "raw_rel_type": rt, "new_rel_type": fb})
+        r["rel_type"] = fb
+    return result
+
+
+def _has_possession_sentence(text: str, holder: str, obj: str) -> bool:
+    """原文里是否存在「持有者 → 持有动词 → 物件」的句子。"""
+    if not text or not holder or not obj:
+        return False
+    for sent in re.split(r"[。！？!?；;\n]", text):
+        if holder in sent and obj in sent and any(v in sent for v in _OWN_VERBS):
+            return sent.find(holder) < sent.find(obj)
+    return False
+
+
+def reconcile_owns(result: dict, text: str) -> dict:
+    """把 owns 边规整为「持有者 → 被持有物」，并与 attrs.held_by 对账。
+
+    - 方向反了（物/体系 → 人）：直接交换，记 owns_reversed；
+    - 起点不是 attrs.held_by：以原文触发句为准改起点（owns_holder_override），
+      改不动则保留并记 owns_holder_mismatch。
+    """
+    kinds = {e["canonical_name"]: e["kind"] for e in result.get("entities", [])}
+    held_by = {}
+    for e in result.get("entities", []):
+        v = (e.get("attrs") or {}).get("held_by")
+        if isinstance(v, str) and v.strip() and v.strip().lower() not in _ATTR_PLACEHOLDER:
+            held_by[e["canonical_name"]] = v.strip()
+    conflicts = result.setdefault("conflicts", [])
+    for r in result.get("relations", []):
+        if r.get("rel_type") != "owns":
+            continue
+        f, t = r.get("from"), r.get("to")
+        # 1) 物/体系 → 人：几乎必然是反向
+        if kinds.get(f) in ("item", "power_system") and kinds.get(t) == "character":
+            r["from"], r["to"] = t, f
+            conflicts.append({"stage": "relation", "reason": "owns_reversed",
+                              "holder": t, "object": f, "action": "swapped"})
+            continue
+        # 2) from 的 attrs.held_by 正好是 to：反向
+        if held_by.get(f) == t:
+            r["from"], r["to"] = t, f
+            conflicts.append({"stage": "relation", "reason": "owns_reversed",
+                              "holder": t, "object": f, "action": "swapped"})
+            continue
+        # 3) to 是物且有 held_by，但起点不是持有者
+        h = held_by.get(t)
+        if h and f != h:
+            if _has_possession_sentence(text, h, t):
+                r["from"] = h
+                conflicts.append({"stage": "relation", "reason": "owns_holder_override",
+                                  "holder": h, "object": t, "raw_from": f,
+                                  "action": "rewritten"})
+            else:
+                conflicts.append({"stage": "relation", "reason": "owns_holder_mismatch",
+                                  "holder": h, "object": t, "raw_from": f,
+                                  "action": "kept"})
+    return result
+
+
 # —— LLM 抽取 prompt ——
 _EXTRACT_SYSTEM = (
     "你是小说知识图谱抽取器。从给定文本中抽取结构化信息，**只输出 JSON**，"
@@ -318,10 +456,9 @@ _EXTRACT_SYSTEM = (
     "输出格式（字段名必须严格一致）：\n"
     "{\n"
     '  "entities": [{"kind": "character|location|faction|item|worldrule|power_system", '
-    '"canonical_name": "规范名", "aliases": ["别名"], "attrs": {"arc": "角色弧", '
-    '"current_goal": "当前目标", "secrets": ["秘密"]}}],\n'
-    '  "relations": [{"from": "角色名", "to": "角色名", "rel_type": '
-    '"ally|enemy|mentor|subordinate|romantic|belongs_to|located_at|owns", "strength": 0.5}],\n'
+    '"canonical_name": "规范名", "aliases": ["别名"], "attrs": {"该 kind 对应的字段": "值"}}],\n'
+    '  "relations": [{"from": "主体名", "to": "客体名", "rel_type": '
+    '"从下方 rel_type 取值表中选一个", "strength": 0.5}],\n'
     '  "events": [{"sequence": 1, "chapter": 1, "event_type": "incident|revelation|foreshadow_plant|'
     'foreshadow_payoff|death|romance_milestone|battle|decision|time_marker", '
     '"summary": "SVO 事件描述", "subject": "主体名", "verb": "动作", "object": "客体名", '
@@ -345,11 +482,24 @@ _EXTRACT_SYSTEM = (
     "- character = 具体的个人：有名有姓，或有唯一指代。\n"
     "  是：许七安、魏渊、陈府尹（ch2 姓+官职，指一个人）、临安公主（ch2 唯一指代）。\n"
     "  不是：刑部郎中（ch23 无姓官衔，指谁不唯一）、老爷（ch18 泛称）、我（代词）。\n"
-    "  官职与身份只写进 attrs：{\"office\": \"刑部郎中\", \"office_type\": \"职官|散衔|泛称\"}；\n"
+    "  官职与身份只写进 attrs：{\"office\": \"刑部郎中\", \"office_type\": \"职官\"}；\n"
+    "  office_type 只能是「职官」「散衔」「泛称」三者之一。\n"
+    "  人物弧光 / 当前目标 / 秘密写进 attrs 的 arc / current_goal / secrets；"
+    "这三个键**只属于 character**，其它 kind 一律不得使用。\n"
     "  不要因为带官职就判成 faction，也不要把纯官衔单独建节点（本 schema 没有官职档）。\n"
     "- item = 具体的物件/实物：刀、丹药、法器、银钱、凭证、秘籍实物。\n"
     "  是：镇北王刀、炼金术秘籍、税银。\n"
     "  不是：炼金术（术法体系）、望气术（能力）、大奉律法（成文规则）。\n"
+    "  attrs 至少给三个键：{\"type\": \"武器\", \"description\": \"刀身乌黑，吹毛断发\", "
+    "\"held_by\": \"镇北王\"}；\n"
+    "  type 从「武器/防具/丹药/法器/银钱/凭证/书籍/服饰/杂物」中选一个；"
+    "description 按原文信息自己概括（≤60 字）；held_by 写当前持有者。\n"
+    "  held_by 只放在 attrs 里，**不要**再镜像成 owns 边；关系按下方方向规则单独抽。\n"
+    "  以上示例只示范字段与写法，**里面的值不要照抄**；\n"
+    "  原文有明确依据时再补 {\"material\": \"材质\", \"grade\": \"品阶/等级\", "
+    "\"crafter\": \"铸造者或炼制者\"}。\n"
+    "  **没有依据就省略该键，或写 \"unknown\"；禁止用「无」「未提及」「未知」这类占位词凑数**；\n"
+    "  物品不得使用 arc / current_goal / secrets（那是 character 的键）。\n"
     "- faction = 有成员、有立场、能作为整体发出动作的组织/机构/门派/教派/朝廷部门/军队编制。\n"
     "  判据：原文里有「说/查/缉拿/下令/表态/派人」这类整体动作，或有编制（长官+属员）。\n"
     "  是：司天监（ch6「我们司天监不干涉朝政」）、"
@@ -367,8 +517,13 @@ _EXTRACT_SYSTEM = (
     "  不是：道门/佛门（是教派，有成员有立场 → faction；它们修的法门才是 power_system）、\n"
     "      京察（ch11「大奉京官考核制度，三年一查」是制度 → worldrule）、\n"
     "      九品到一品的官阶（是官制 → worldrule）。\n"
-    "  attrs 至少给 {\"system\": \"体系名\", \"tier\": \"文本提到的品阶/境界\", "
-    "\"belongs_to\": \"所属势力或职业\"}。\n"
+    "  attrs 至少给 {\"system\": \"体系名\", \"tier\": \"修行品阶/境界\", "
+    "\"held_by\": \"掌握者/持有者名（人物或组织）\"}。\n"
+    "  held_by 写原文中明确掌握/修习这套体系的人或组织（如 许七安、司天监）；"
+    "原文没提就写 \"unknown\"。held_by 也只放在 attrs 里，不要镜像成关系边。\n"
+    "  tier **只放修行品阶/境界**（如炼精境、练气境、八品术士、武道一品）；\n"
+    "  官阶（一品至九品官）、儒生位阶（秀才/举人/进士等）、打更人职级（铜锣/铁锣等）、"
+    "衙门差事**一律不进 tier**；没有修行品阶就写 \"unknown\"，禁止填「无」「未提及」。\n"
     "- worldrule = 约束所有人的成文规则/制度/律法/普遍规律；不修炼、无成员、非物件。\n"
     "  是：大奉律法（ch6「大奉律法规定…」）、京察（ch11）、三百年定律（ch9）。\n"
     "  不是：炼金术（术法体系）、某家的家规（属该家族的内部设定）。\n"
@@ -376,12 +531,42 @@ _EXTRACT_SYSTEM = (
     "  是：京城、长乐县、桂月楼（ch8 酒楼）。\n"
     "  不是：司天监（有监正与弟子，能整体表态 → faction）、"
     "府衙（有吏员、能办案 → faction）。\n"
+    "  attrs 至少给 {\"type\": \"建筑\", \"parent\": \"京城\", \"status\": \"存续\"}：\n"
+    "  type 从「城/镇/村/建筑/房间/野外」中选一个；parent 写所属上级州府或势力名"
+    "（原文没提就写 \"unknown\"）；status 从「存续/损毁/荒废/未知」中选一个。\n"
+    "  以上示例只示范字段与写法，**里面的值不要照抄**；没有依据就省略该键或写 \"unknown\"，"
+    "禁止用「无」「未提及」凑数。\n"
+    "  别名放 entities[].aliases，不要重复塞进 attrs；首次出现章由落库层按出现章统计，"
+    "不要写进 attrs（你拿不到章号）。\n"
     "【三条硬规则】\n"
     "1. 不要只按尾字判 kind。「府/院/司/卫/楼/县/州」这类尾字既可能是场所也可能是机构，"
     "看它有没有成员和整体动作；只有「XX术/XX法/XX功/XX诀/XX境」可作 power_system 的强提示。\n"
     "2. 一个词只取一个 kind。同一 canonical_name 不要同时输出 faction 和 location"
     "（如「司天监」不要既 faction 又 location）；拿不准时取判定顺序更靠前的一类。\n"
     "3. 取主指称：同一实体多个称呼时，canonical_name 用全书最常用的规范称呼，其余放 aliases。\n"
+    "【rel_type 取值（只能从这里选，禁止自造，禁止把整串列表当值填回）】\n"
+    "社交：ally / enemy / mentor / subordinate / romantic\n"
+    "从属与空间：belongs_to / located_at / owns\n"
+    "亲属：father / mother / elder_brother / younger_brother / elder_sister / "
+    "younger_sister / son / daughter / sibling / parent / child / kin\n"
+    "亲属通用词：sister / brother / sibling（不写长幼时用；落库统一归为 sibling）/ kin\n"
+    "【关系方向（from → to 的顺序不能反）】\n"
+    "- belongs_to：成员 → 组织（许七安 → 打更人）；修炼者 → 体系（许七安 → 天地一刀斩）\n"
+    "- 掌握、修习、持有这类关系，方向一律是「人 → 被掌握对象」"
+    "（许七安 → 天地一刀斩、许七安 → 望气术、许七安 → 佩刀）；"
+    "反过来写成「天地一刀斩 → 许七安」「佩刀 → 许七安」就是错的\n"
+    "- owns / holds（落库统一为 owns）：持有者 → 被持有物（许七安 → 佩刀）；"
+    "起点必须等于该物 attrs.held_by 里的名字，二者不一致时以原文触发句为准\n"
+    "- located_at：主体 → 地点（许七安 → 京城）\n"
+    "- mentor：师傅 → 徒弟；subordinate：下属 → 上级\n"
+    "- ally / enemy / romantic 是双向关系，按原文出现顺序取一端即可\n"
+    "- 亲属：from 是 to 的该称谓所指。许玲月 → 许七安（younger_sister）表示"
+    "「许玲月是许七安的妹妹」，不要反向。\n"
+    "  **原文称谓校验**：写具体称谓必须在原文里找得到对应说法——写 younger_sister 要有"
+    "「妹妹/小妹」，写 father 要有「父亲/爹」，写 daughter 要有「女儿/闺女」；"
+    "找不到就降级：兄弟姐妹用 sibling，父母子女用 kin，不许硬猜。\n"
+    "  原文只说「兄妹/姐弟/家人」而没写长幼时，直接用 sibling，不要猜 elder/younger；"
+    "兄弟/姐妹关系也不得写成 parent/child/son/daughter。\n"
     "【event_type 触发条件（按实际情节选，禁止一律 incident）】\n"
     "- battle：武力冲突/斗法/交手，有一方动手\n"
     "- death：角色死亡或确认死亡\n"
@@ -435,7 +620,7 @@ def extract_segment(provider, text: str, segment_no: int, chapter: int | None = 
         raw = provider.chat(_EXTRACT_SYSTEM, user)
     except Exception:  # noqa: BLE001 —— 抽取失败静默兜底
         return normalize_extraction({})
-    return _parse_and_normalize(raw)
+    return validate_kinship_terms(reconcile_owns(_parse_and_normalize(raw), text), text)
 
 
 def extract_batch(provider, texts: list[tuple[int, str, int | None]]) -> dict:
@@ -458,7 +643,9 @@ def extract_batch(provider, texts: list[tuple[int, str, int | None]]) -> dict:
         raw = provider.chat(_EXTRACT_SYSTEM, user)
     except Exception:  # noqa: BLE001
         return normalize_extraction({})
-    return _parse_and_normalize(raw)
+    full_text = "\n".join(t for _s, t, _c in texts)
+    return validate_kinship_terms(reconcile_owns(_parse_and_normalize(raw), full_text),
+                                  full_text)
 
 
 # 定向二遍抽取：主抽里 faction / power_system 为空时的补齐通道。
@@ -474,10 +661,12 @@ _TARGETED_SYSTEM = (
     '"members": ["成员名"], "stance": "立场或目标"}},\n'
     '    {"kind": "power_system", "canonical_name": "体系名", '
     '"aliases": ["别名"], "attrs": {"system": "体系名", "tier": "品阶/境界", '
-    '"belongs_to": "所属势力或职业"}}\n'
+    '"held_by": "掌握/修习该体系的人或组织名"}}\n'
     "  ],\n"
-    '  "relations": [{"from": "成员名", "to": "势力名", "rel_type": "belongs_to", '
-    '"strength": 0.8}]\n'
+    '  "relations": [\n'
+    '    {"from": "成员名", "to": "势力名", "rel_type": "belongs_to", "strength": 0.8},\n'
+    '    {"from": "人物名", "to": "功法或器物名", "rel_type": "belongs_to", "strength": 0.8}\n'
+    "  ]\n"
     "}\n\n"
     "规则：\n"
     "- faction 必须是**有成员、能作为整体发出动作的组织/机构/门派/教派/朝廷部门/军队编制**"
@@ -496,7 +685,14 @@ _TARGETED_SYSTEM = (
     "power_system；本轮不抽 worldrule，遇到直接跳过）。\n"
     "- 同一 canonical_name 只出一类，不要同时给 faction 和 power_system。\n"
     "- 只抽文本中**确实出现**的，文本没有就返回空数组 []，禁止编造。\n"
-    "- relations 只允许 belongs_to（成员→势力、体系→上级势力/职业）。\n"
+    "- relations 只允许 belongs_to。方向：成员 → 势力（宋廷风 → 御刀卫）、"
+    "体系 → 上级势力/职业（望气术 → 司天监）。\n"
+    "- 上面两条示例分别是「成员→势力」和「掌握者→被掌握对象」，不要都写成成员→势力。\n"
+    "- 掌握、修习、持有这类关系，方向一律是「人 → 被掌握对象」"
+    "（许七安 → 天地一刀斩、许七安 → 望气术）；"
+    "反过来写成「天地一刀斩 → 许七安」就是错的。\n"
+    "- power_system 的 held_by 只放在实体 attrs 里，**不要再**把它镜像成一条 "
+    "belongs_to / owns 边；如要表达掌握关系，from 必须是掌握者、to 才是体系。\n"
 )
 
 _TARGETED_USER = (
@@ -526,7 +722,7 @@ def extract_targeted(provider, text: str, segment_no: int, chapter: int | None =
     # 定向通道不产出事件/伏笔，清空避免污染主抽统计
     for k in ("events", "event_links", "entity_knowledge", "state_changes", "foreshadows"):
         out[k] = []
-    return out
+    return validate_kinship_terms(reconcile_owns(out, text), text)
 
 
 def _parse_and_normalize(raw: str) -> dict:
