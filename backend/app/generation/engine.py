@@ -635,6 +635,20 @@ def _enqueue_v3_extraction(db, project: Project, segment_no: int, text: str) -> 
         return {"enqueued": False, "error": str(exc)[:100]}
 
 
+def _shadow_ingest(project: Project, segment_no: int, text: str) -> dict:
+    """KG 分层影子抽取（默认关闭）。
+
+    与 v3 批抽、v2.6 合并完全并行：写独立 sqlite，不注入 prompt，不改任何
+    现有返回值；未启用时零开销直接返回，异常静默兜底。
+    """
+    try:
+        from app.kg import shadow
+
+        return shadow.submit(project.id, text, segment_no)
+    except Exception as exc:  # noqa: BLE001 —— 影子抽取失败不阻断生成
+        return {"queued": False, "error": str(exc)[:100]}
+
+
 def _active_character_names(db, project: Project, current_seg: int) -> list[str]:
     """本段涉及的角色名（mention 反查）。空则用 plot_bible 角色名兜底。"""
     try:
@@ -1478,6 +1492,9 @@ def generate_next_segment(
     # 零 LLM 零阻塞，失败静默兜底。状态透传给前端（v3_extraction 键）。
     v3_extraction = _enqueue_v3_extraction(db, project, segment_no, text)
 
+    # KG 分层影子抽取（默认关闭）：独立库、异步、不参与注入，返回值不外露。
+    _shadow_ingest(project, segment_no, text)
+
     # —— v2.5：支线滚动触发 ——
     # 在 KG 合并后跑——这样能查到本段新产生的角色/钩子。
     # roll_branch 读存档 state、判断 signal、切支线、落库——失败静默兜底。
@@ -1662,6 +1679,8 @@ def generate_next_segment_stream(
 
     # v3.0 异步批抽：与同步版同口径入队
     v3_extraction = _enqueue_v3_extraction(db, project, segment_no, text)
+    # KG 分层影子抽取（默认关闭）：与同步版同口径，独立库、不参与注入。
+    _shadow_ingest(project, segment_no, text)
     _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
     from app.generation.branch import roll_branch as _roll_branch
     _new_state, branch_info = _roll_branch(
