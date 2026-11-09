@@ -82,6 +82,25 @@ class Settings(BaseSettings):
     era_guard_mode: str = "report"  # report | rewrite
     era_guard_max_rounds: int = 2
 
+    # ------------------------------------------------------------------
+    # canon 词表来源（KG_CANON_SOURCE，纯增量开关，默认行为不变）
+    #
+    # legacy：仓库里原来那套 canon —— 从主库已有节点筛出来的约 300 条 v2 词表，
+    #         实际读取的是原著层 sqlite 的 new_nodes / new_edges。
+    #         **它不是抽取链路的版本号**：抽取链路另有 v2（规则式 extractor）
+    #         与 v3（LLM 抽取器），两条并行，与本开关无关。
+    # cleaned：清洗后的 63 条 → app/kg/data/canon_layers.json（实体层 + 称呼层）。
+    #         实体层只放人物；称呼层只收带专名部分的写法（许郎/许公子/许二叔/
+    #         魏公/临安公主/白莲道长），纯称谓（大哥/老爷/师父/夫人）不入称呼层。
+    #         纯封号只有「唯一原文直证 + 全库唯一归属」可破例（长公主 → 怀庆）。
+    # mixed：分域判定，不合成一份名单——人物域用 cleaned，势力/地点域用 legacy
+    #         的 faction 节点，但必须过结构化后缀门，power_system/item 整体退出。
+    # 读取点只有 app/kg/canon_source.py 一处；cleaned 读不出来时降级 legacy
+    # 并记 WARN，绝不当空表（空表会让所有实体被判成 mech_only）。
+    # 默认仍是 legacy；mixed 是可选口径，未翻默认值。
+    # ------------------------------------------------------------------
+    kg_canon_source: str = "legacy"  # legacy | cleaned | mixed
+
     # Embedding（M2 混合检索）
     embedding_provider: str = "dashscope"  # dashscope | local
     embedding_dim: int = 1536

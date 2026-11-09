@@ -44,6 +44,19 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:  # noqa: BLE001 —— 收割是增强，不是启动的前提
         logging.getLogger(__name__).warning("蒸馏任务启动收割失败（已忽略）：%s", exc)
+
+    # —— canon 词表来源记账：启动时打一行「这批用哪份词表」 ——
+    # 默认 legacy（行为不变）；cleaned 需要在 .env 里显式打开。
+    # 读不到 cleaned 词表时 canon_source 自己降级 legacy 并 WARN，不会返回空表。
+    try:
+        from app.kg import canon_source
+        from app.kg.shadow import canon_db
+
+        canon_source.log_effective(
+            logging.getLogger(__name__), path=canon_db(), prefix="启动 ",
+        )
+    except Exception as exc:  # noqa: BLE001 —— 记账失败不该拖垮启动
+        logging.getLogger(__name__).warning("canon 来源记账失败（已忽略）：%s", exc)
     yield
 
 

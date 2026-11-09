@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import json
 import pathlib
-import sqlite3
 from collections import defaultdict
 
-from app.kg.generated_extract import parse_aliases, parse_attrs
+from app.kg import canon_source
 from app.kg.generated_store import load_edges, load_events, load_nodes
 from app.kg.layers import CANON, GENERATED
 
@@ -30,40 +29,12 @@ STATE_KEYS = (
 
 
 def read_canon(path: str | pathlib.Path) -> tuple[list[dict], list[dict]]:
-    """只读打开原著层；只取 active 节点与 resolved 边。"""
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
-    try:
-        nodes = [
-            {
-                "name": row["canonical_name"],
-                "kind": row["kind"],
-                "aliases": parse_aliases(row["aliases"]),
-                "attrs": parse_attrs(row["attrs"]),
-                "mentions": row["mentions"] or 0,
-                "last_chapter": row["last_chapter"],
-            }
-            for row in con.execute(
-                """SELECT canonical_name, kind, aliases, attrs, mentions, last_chapter
-                     FROM new_nodes WHERE review_status = 'active'"""
-            )
-        ]
-        edges = [
-            {
-                "from": row["from_name"],
-                "to": row["to_name"],
-                "rel": row["rel_type"],
-                "strength": float(row["strength"] or 0.5),
-                "chapters": row["chapters"],
-            }
-            for row in con.execute(
-                """SELECT from_name, to_name, rel_type, strength, chapters
-                     FROM new_edges WHERE status = 'resolved'"""
-            )
-        ]
-    finally:
-        con.close()
-    return nodes, edges
+    """canon 唯一读取点：来源由 KG_CANON_SOURCE 决定（legacy|cleaned）。
+
+    具体读取、降级与 hash 记账都在 ``app.kg.canon_source``，这里不重复判断，
+    避免抽取链路上散落「用哪份词表」的分支。
+    """
+    return canon_source.load(path)
 
 
 def _node_index(nodes: list[dict]) -> tuple[dict, dict]:
