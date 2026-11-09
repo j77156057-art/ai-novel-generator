@@ -464,6 +464,38 @@ def test_position_name_requires_no_predecessor_qualifier(monkeypatch):
     assert canon_source.count_forms("洛玉衡是前任人宗道首的女儿", ["人宗道首"]) == 0
 
 
+def test_block_before_is_judged_per_occurrence(monkeypatch):
+    """block_before 是「逐次命中即弃」，不是整句或就近绑定。"""
+    _set_cleaned(monkeypatch)
+    text = "前任人宗道首已死，现任人宗道首是洛玉衡。"
+    # 同句两处：前任那次弃，现任那次折 → 只计 1 次
+    assert canon_source.count_forms(text, ["人宗道首"]) == 1
+    first = text.index("人宗道首")
+    second = text.index("人宗道首", first + 1)
+    assert canon_source.normalize("人宗道首", text, first) == "人宗道首"
+    assert canon_source.normalize("人宗道首", text, second) == "洛玉衡"
+    # 「前任」修饰的是别的成分、不在左侧 4 字窗口内 → 仍会折（已知边界）
+    assert canon_source.count_forms("前任监正人宗道首", ["人宗道首"]) == 1
+    # 无上下文时按成立处理：裸名可折，否则职位称名会被拆成第二个节点
+    assert canon_source.normalize("人宗道首") == "洛玉衡"
+
+
+def test_xudalang_fold_has_auditable_basis(monkeypatch):
+    """许大郎 → 许七安：判据要能逐条复查，反例句要排除。"""
+    _set_cleaned(monkeypatch)
+    row = {r["form"]: r for r in canon_source.load_layers()["aliases"]}["许大郎"]
+    assert row["entity"] == "许七安"
+    basis = row["basis"]
+    assert basis["rule"] == "排行 + 同句指代"
+    assert {c["chapter"] for c in basis["checks"]} >= {304, 443, 360, 232, 108}
+    assert all(c["quote"] for c in basis["checks"])
+    bad = basis["counterexample"]
+    assert (bad["chapter"], bad["referent"]) == (499, "许平峰")
+    # 反例句不折：ch499 的大郎是上一代（许平峰）；其余照折
+    assert canon_source.count_forms("他和许大郎在山海关打仗", ["许大郎"]) == 0
+    assert canon_source.count_forms("还是我许大郎提不起刀了", ["许大郎"]) == 1
+
+
 def test_character_review_boundaries_are_locked():
     """复核结论必须留在词表里：职位称名、典故剔除、去姓简称折叠。"""
     layers = canon_source.load_layers()

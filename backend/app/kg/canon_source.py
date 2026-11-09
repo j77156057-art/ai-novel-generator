@@ -506,7 +506,18 @@ def _edges_from(edges: list[dict], names: set[str]) -> list[dict]:
 # 称呼层归一
 # ---------------------------------------------------------------------------
 def _constraint_ok(row: dict, context: str, offset: int) -> bool:
-    """带上下文约束的写法是否成立（白莲 vs 白莲花 / 平远伯 vs 平远伯府）。"""
+    """带上下文约束的写法是否成立（白莲 vs 白莲花 / 平远伯 vs 平远伯府）。
+
+    ``block_before`` / ``block_follow`` 是**逐次出现**判定的：每次命中单独看
+    左/右 4 字窗口，命中即弃（这一次不折），不是「就近绑定到名词」，也不会
+    因为同句里别处有一处合法命中就把整句都算数。
+
+    - ``block_before`` 只看左侧紧邻 4 字，``endswith`` 命中即弃：
+      「前任人宗道首」「上一代人宗道首」被挡；「前任监正人宗道首」里「前任」
+      修饰的是监正、不在窗口内，仍会折——这是 4 字窗口的已知边界。
+    - 同一句里现任与前任同时出现时，两次命中分别判定：前任那次弃，现任那次折。
+    - ``block_follow`` 看右侧 4 字前缀，命中即弃（平远伯府 / 许大郎在山海关）。
+    """
     constraint = row.get("constraint")
     if not constraint:
         return True
