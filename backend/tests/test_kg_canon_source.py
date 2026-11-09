@@ -355,6 +355,64 @@ def test_mixed_rejects_upper_level_and_low_evidence_venues(monkeypatch):
         {"name": "司天监", "kind": "faction", "mentions": 291}) == "faction"
 
 
+def test_mixed_drops_collective_races_and_sects(monkeypatch):
+    _set_mixed(monkeypatch)
+    # 种族/教派集合：关系挂到集合上无法使用，直接剔（与政权/党派分开口径）
+    for name in ("妖族", "蛊族", "南疆蛊族", "万妖国", "佛门", "道门", "阉党"):
+        assert canon_source._nonchar_domain(
+            {"name": name, "kind": "faction", "mentions": 200}) is None
+    # 政权/党派照旧保留
+    for name in ("大奉王朝", "大奉朝", "齐党", "王党", "梁党"):
+        assert canon_source._nonchar_domain(
+            {"name": name, "kind": "faction", "mentions": 200}) == "faction"
+
+
+def test_mixed_keeps_institutions_with_low_evidence_flag(monkeypatch, caplog, tmp_path):
+    db = tmp_path / "institution_canon.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE new_nodes (
+            canonical_name TEXT, kind TEXT, aliases TEXT, attrs TEXT,
+            mentions INTEGER, last_chapter INTEGER, review_status TEXT
+        );
+        CREATE TABLE new_edges (
+            from_name TEXT, to_name TEXT, rel_type TEXT, strength REAL,
+            chapters TEXT, status TEXT
+        );
+        """
+    )
+    con.executemany(
+        "INSERT INTO new_nodes VALUES (?,?,?,?,?,?,?)",
+        [
+            ("许七安", "character", "", "{}", 900, 12, "active"),
+            # 机构类：提及数低也保留，但必须打 low_evidence
+            ("京城五卫", "faction", "", "{}", 1, 5, "active"),
+            ("禁军五卫", "faction", "", "{}", 2, 5, "active"),
+            ("天门", "faction", "", "{}", 1, 5, "active"),
+            ("六扇门", "faction", "", "{}", 1, 5, "active"),
+            ("卫指挥使司", "faction", "", "{}", 2, 5, "active"),
+            # 高证据节点不该被误标
+            ("司天监", "faction", "", "{}", 291, 30, "active"),
+        ],
+    )
+    con.commit()
+    con.close()
+    _set_mixed(monkeypatch)
+
+    nodes, _ = canon_source.load(db)
+    by_name = {n["name"]: n for n in nodes}
+    institutions = ("京城五卫", "禁军五卫", "天门", "六扇门", "卫指挥使司")
+    assert set(institutions) <= set(by_name), "低证据机构只打标，不加 mentions 地板"
+    assert all(by_name[n].get("low_evidence") is True for n in institutions)
+    assert "low_evidence" not in by_name["司天监"]
+
+    caplog.set_level(logging.INFO, logger="app.kg.canon_source")
+    info = canon_source.log_effective(path=db, prefix="测试 ")
+    assert info["low_evidence"] == 5
+    assert "low_evidence:5" in caplog.text
+
+
 def test_mixed_degrades_to_legacy_when_layers_missing(monkeypatch, caplog, tmp_path):
     db = _mixed_db(tmp_path)
     _set_mixed(monkeypatch, tmp_path / "missing.json")

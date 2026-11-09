@@ -64,6 +64,11 @@ UPPER_LEVEL_NAMES = frozenset({
     "道门地宗", "道门天宗",
 })
 UPPER_LEVEL_SUFFIXES = ("阵营",)
+#: 种族/教派集合：同样是把关系挂到集合上，直接剔。
+#: 注意与「政权/党派」区分：大奉王朝/大奉朝/齐党/王党/梁党保留。
+COLLECTIVE_DROP_NAMES = frozenset({
+    "妖族", "蛊族", "南疆蛊族", "万妖国", "佛门", "道门", "阉党",
+})
 #: 具体场所类：真实体但价值低，不按类型剔，按 mentions 阈值控。
 #: 阈值 3 的依据：venue 候选里 1–2 次的多为一次性布景（山货铺/御膳房/
 #: 桂月楼/景秀宫），3 次以上才开始有复用（灵宝观/观星楼/养生堂）。
@@ -72,6 +77,10 @@ VENUE_SUFFIXES = (
     "阁", "观", "寺", "庙", "宫", "园", "庄", "斋", "居", "院", "衙门",
 )
 VENUE_MIN_MENTIONS = 3
+#: 已知缺口：永镇山河庙在文本里常写作「那座庙」，mentions 被低估为 1，
+#: 会被场所阈值挡掉。这是共指问题，不加白名单，留待共指层解决。
+#: 低证据机构不剔、只打标；阈值只用于场所后缀。
+LOW_EVIDENCE_MENTIONS = 3
 _BAD_NAME = re.compile(r"[，。！？、；：“”「」『』（）()\s0-9A-Za-z]")
 
 #: 两层词表产物（实体层 + 称呼层）。测试/部署可用 KG_CANON_LAYERS 覆盖。
@@ -307,6 +316,9 @@ def _nonchar_domain(node: dict) -> str | None:
     # 集合/上位：关系会退化成集合关系，直接不要
     if name in UPPER_LEVEL_NAMES or name.endswith(UPPER_LEVEL_SUFFIXES):
         return None
+    # 种族/教派集合（妖族/蛊族/万妖国/佛门/道门/阉党）：与政权/党派区分对待
+    if name in COLLECTIVE_DROP_NAMES:
+        return None
     if ("佛门" in name and name != "佛门") or (name.startswith("道门") and name != "道门"):
         return None
     if name.endswith(FACTION_SUFFIXES) or name.endswith(LOCATION_SUFFIXES):
@@ -335,7 +347,10 @@ def mixed_nodes(layers: dict, legacy_nodes: list[dict]
             continue
         seen.add(node["name"])
         stats[domain] += 1
-        kept.append({**node, "domain": domain, "source": "legacy"})
+        # 低证据机构不剔、只打标：机构名本身稳定，但提及数不足，下游引用前需复核
+        extra = ({"low_evidence": True}
+                 if (node.get("mentions") or 0) < LOW_EVIDENCE_MENTIONS else {})
+        kept.append({**node, "domain": domain, "source": "legacy", **extra})
     return char_nodes + kept, stats
 
 
@@ -541,11 +556,12 @@ def describe(path: str | pathlib.Path | None = None) -> dict:
         if not legacy_nodes:
             info.update({"effective": SOURCE_CLEANED, "degraded": True})
             return info
-        _, stats = mixed_nodes(layers, legacy_nodes)
+        nodes, stats = mixed_nodes(layers, legacy_nodes)
         info.update({
             "file": f"{layers_path().name}+new_nodes",
             "sha256": f"{content_hash()}+{legacy_hash(path)}",
             "domains": stats,
+            "low_evidence": sum(1 for n in nodes if n.get("low_evidence")),
         })
         return info
     return {
@@ -570,6 +586,8 @@ def log_effective(logger=None, *, path: str | pathlib.Path | None = None,
             f" domains=character:{domains['character']},faction:{domains['faction']},"
             f"location:{domains['location']},filtered:{domains['filtered_out']}"
         )
+    if "low_evidence" in info:
+        line += f" low_evidence:{info['low_evidence']}"
     if info["degraded"]:
         line += f"（请求 {info['requested']}，已降级 {info['effective']}）"
     (logger or _log).info(line)
