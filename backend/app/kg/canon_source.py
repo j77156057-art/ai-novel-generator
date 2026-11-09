@@ -82,6 +82,24 @@ VENUE_MIN_MENTIONS = 3
 #: 会被场所阈值挡掉。这是共指问题，不加白名单，留待共指层解决。
 #: 低证据机构不剔、只打标；阈值只用于场所后缀。
 LOW_EVIDENCE_MENTIONS = 3
+
+# ---------------------------------------------------------------------------
+# 关系极性
+# ---------------------------------------------------------------------------
+#: 极性关系：只有这两种关系会互相矛盾（ally ↔ enemy）。
+POLARITY_RELS = ("ally", "enemy")
+#: 三态契约（``polarity_state``）：
+#: - 没有该键：不是 ally/enemy，或该对实体只有一个方向（无对照）
+#: - ``stable``：同一对实体只有一个极性方向
+#: - ``conflicting``：同一对实体同时存在 ally 与 enemy
+POLARITY_STABLE = "stable"
+POLARITY_CONFLICTING = "conflicting"
+#: 冲突口径（写死，不要再用「章节区间重叠」混算）：
+#: - SAME_CHAPTER_CLASH：正反两条边的**章号集合有交集**（同章内自相矛盾）
+#: - CROSS_CHAPTER_FLIP：章号集合**无交集**（先敌后友 / 先友后敌，属剧情反转）
+SAME_CHAPTER_CLASH = "same_chapter_clash"
+CROSS_CHAPTER_FLIP = "cross_chapter_flip"
+
 _BAD_NAME = re.compile(r"[，。！？、；：“”「」『』（）()\s0-9A-Za-z]")
 
 #: 两层词表产物（实体层 + 称呼层）。测试/部署可用 KG_CANON_LAYERS 覆盖。
@@ -228,7 +246,73 @@ def load_legacy(path: str | pathlib.Path) -> tuple[list[dict], list[dict]]:
         ]
     finally:
         con.close()
-    return nodes, edges
+    return nodes, annotate_polarity(edges)
+
+
+def chapter_list(raw) -> list[int]:
+    """``chapters`` 字段 → 升序章号列表。
+
+    原著层这个字段是 JSON 数组（如 ``[2,4,8]``），历史数据里也出现过
+    ``"1-30"`` 这种区间写法；两种都容忍，解析不出的值直接跳过。
+    """
+    if raw is None:
+        return []
+    seq = raw
+    if isinstance(raw, str):
+        try:
+            seq = json.loads(raw)
+        except ValueError:
+            seq = re.findall(r"\d+", raw)
+    if not isinstance(seq, (list, tuple, set)):
+        seq = [seq]
+    out: set[int] = set()
+    for item in seq:
+        try:
+            out.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)
+
+
+def annotate_polarity(edges: list[dict]) -> list[dict]:
+    """给 ally/enemy 边打极性状态（原地修改并返回）。
+
+    同一对实体只要同时存在 ally 与 enemy，就判 ``conflicting``（不比较强度、
+    不比较先后——谁强谁弱是业务判断，不是词表能决定的）。其余极性边判
+    ``stable``；非极性边不写键，避免下游把「无 polarity_state」误当稳定。
+
+    冲突细分口径见 ``SAME_CHAPTER_CLASH`` / ``CROSS_CHAPTER_FLIP``：
+    前者是「章号集合有交集」，后者是「无交集」，两者互斥，按有交集优先。
+    """
+    for edge in edges:
+        edge.pop("polarity_state", None)
+        edge.pop("polarity_kind", None)
+        edge.pop("polarity_spans", None)
+
+    groups: dict[frozenset, list[dict]] = defaultdict(list)
+    for edge in edges:
+        if edge.get("rel") in POLARITY_RELS:
+            groups[frozenset((edge["from"], edge["to"]))].append(edge)
+
+    for group in groups.values():
+        by_rel: dict[str, list[dict]] = defaultdict(list)
+        for edge in group:
+            by_rel[edge["rel"]].append(edge)
+        if len(by_rel) < 2:
+            for edge in group:
+                edge["polarity_state"] = POLARITY_STABLE
+            continue
+        spans = {
+            rel: sorted({ch for e in items for ch in chapter_list(e.get("chapters"))})
+            for rel, items in by_rel.items()
+        }
+        overlap = set(spans.get("ally") or []) & set(spans.get("enemy") or [])
+        kind = SAME_CHAPTER_CLASH if overlap else CROSS_CHAPTER_FLIP
+        for edge in group:
+            edge["polarity_state"] = POLARITY_CONFLICTING
+            edge["polarity_kind"] = kind
+            edge["polarity_spans"] = {rel: list(chs) for rel, chs in spans.items()}
+    return edges
 
 
 def legacy_hash(path: str | pathlib.Path | None) -> str:
@@ -415,7 +499,7 @@ def _edges_from(edges: list[dict], names: set[str]) -> list[dict]:
         key = (a, edge["rel"], b)
         if key not in out or edge["strength"] > out[key]["strength"]:
             out[key] = {**edge, "from": a, "to": b}
-    return list(out.values())
+    return annotate_polarity(list(out.values()))
 
 
 # ---------------------------------------------------------------------------

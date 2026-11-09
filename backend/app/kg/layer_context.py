@@ -72,12 +72,32 @@ def _add(lines: list[str], candidate: list[str], budget: int) -> bool:
     return True
 
 
+def _span_text(chapters, limit: int = 6) -> str:
+    """章号列表 → 「ch1、ch2…」；超出上限只显示首尾。"""
+    chs = [str(c) for c in (chapters or [])]
+    if not chs:
+        return "（未记章号）"
+    if len(chs) <= limit:
+        return "、".join(f"ch{c}" for c in chs)
+    return f"ch{chs[0]}…ch{chs[-1]}（{len(chs)} 章）"
+
+
 def build_context(seeds: list[str], canon_db: str | pathlib.Path,
                   generated_con=None, chapter: int = 0, *,
                   max_nodes: int = 24, max_edges: int = 20,
                   max_events: int = 8, budget_chars: int = 1800) -> dict:
     """取本章出场实体的 1–2 跳邻域，canon 优先、generated 只补已写情节。"""
     canon_nodes, canon_edges = read_canon(canon_db)
+    # 极性相反的边不进邻域：同一对实体在不同章里立场相反，任何一跳都可能
+    # 把「昨日盟友」当成「今日盟友」用。冲突边单独渲染成「仅可作曾…表述」。
+    canon_conflicts = [
+        e for e in canon_edges
+        if e.get("polarity_state") == canon_source.POLARITY_CONFLICTING
+    ]
+    canon_edges = [
+        e for e in canon_edges
+        if e.get("polarity_state") != canon_source.POLARITY_CONFLICTING
+    ]
     by_name, alias = _node_index(canon_nodes)
 
     seed_names: list[str] = []
@@ -185,8 +205,9 @@ def build_context(seeds: list[str], canon_db: str | pathlib.Path,
             line += f"：{summary}"
         _add(lines, [line], budget_chars)
 
+    render_names = {n["name"] for n in render_nodes}
+
     if selected_edges:
-        render_names = {n["name"] for n in render_nodes}
         rel_lines = ["【原著层·关系】"]
         for edge in selected_edges:
             if edge["from"] not in render_names or edge["to"] not in render_names:
@@ -196,6 +217,30 @@ def build_context(seeds: list[str], canon_db: str | pathlib.Path,
                 f"（强度 {edge['strength']:.2f}）"
             )
         _add(lines, rel_lines, budget_chars)
+
+    # 极性相反的边不进上面的关系段：只提示「曾经如何」，不许当现状使用。
+    conflict_pairs: dict[frozenset, dict] = {}
+    for edge in canon_conflicts:
+        if edge["from"] not in render_names or edge["to"] not in render_names:
+            continue
+        pair = frozenset((edge["from"], edge["to"]))
+        conflict_pairs.setdefault(pair, edge)
+    if conflict_pairs:
+        clash_lines = ["【原著层·关系（极性相反，仅可作「曾…」表述）】"]
+        rendered = 0
+        for edge in list(conflict_pairs.values())[:4]:
+            spans = edge.get("polarity_spans") or {}
+            kind = ("同章内正反并存"
+                    if edge.get("polarity_kind") == canon_source.SAME_CHAPTER_CLASH
+                    else "跨章反转")
+            clash_lines.append(
+                f"- {edge['from']} / {edge['to']}：{kind}；"
+                f"盟 {_span_text(spans.get('ally'))} vs 敌 {_span_text(spans.get('enemy'))}"
+            )
+            rendered += 1
+        if len(conflict_pairs) > rendered:
+            clash_lines.append(f"- 另有 {len(conflict_pairs) - rendered} 对未展开")
+        _add(lines, clash_lines, budget_chars)
 
     if generated_events or generated_nodes or generated_edges:
         gen_lines = ["【生成层·已写情节（只保证连续性，不得覆盖原著设定）】"]
@@ -224,9 +269,12 @@ def build_context(seeds: list[str], canon_db: str | pathlib.Path,
     return {
         "chapter": chapter,
         "seeds": seed_names,
+        "canon_conflicts": len(conflict_pairs),
         "layers": {
             "canon": len(selected),
             "generated": len(generated_events) + len(generated_nodes) + len(generated_edges),
+            # 冲突对数量（按实体对计，不按边计）：渲染段最多展开 4 对
+            "canon_conflicts": len(conflict_pairs),
         },
         "nodes": [
             {"name": n["name"], "kind": n["kind"], "source": CANON,
@@ -235,7 +283,10 @@ def build_context(seeds: list[str], canon_db: str | pathlib.Path,
         ],
         "edges": [
             {"from": e["from"], "rel": e["rel"], "to": e["to"],
-             "strength": e["strength"], "source": CANON}
+             "strength": e["strength"],
+             # 三态契约：只剩 stable 的边；无极性关系时为空串
+             "polarity_state": e.get("polarity_state") or "",
+             "source": CANON}
             for e in selected_edges
         ],
         "events": [{**e, "source": GENERATED} for e in generated_events],

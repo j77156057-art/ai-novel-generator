@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 
+from app.kg import canon_source
 from app.kg.generated_extract import (
     GENERIC_SUBJECTS,
     GENERATED_NODE_KINDS,
@@ -277,3 +279,59 @@ def scan_text(text: str, chapter: int | None, canon_nodes: list[dict],
         item["chapter"] = chapter
         unique.append(item)
     return unique
+
+
+def scan_polarity(edges: list[dict]) -> dict:
+    """canon 内部极性审计：同一对实体的 ally / enemy 是否自相矛盾。
+
+    两类口径写死在这里，**不要**再用「章节区间重叠」混算：
+
+    - ``same_chapter_clash``：正反两条边的**章号集合有交集**
+      （同一章里既写盟友又写敌人，多半是抽取把不同对象混到一对实体上）；
+    - ``cross_chapter_flip``：**章号集合无交集**
+      （先敌后友或先友后敌，属于剧情反转，可用于「曾…」表述）。
+
+    交集判断用章号集合，不用「最早章–最晚章」区间：区间重叠会把
+    「ch1–200 为敌、ch150 为友」这种真实反转误判成同章矛盾。
+    """
+    groups: dict[frozenset, dict[str, list[dict]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for edge in edges:
+        rel = edge.get("rel") or edge.get("rel_type")
+        if rel not in canon_source.POLARITY_RELS:
+            continue
+        src = edge.get("from") or edge.get("from_name")
+        dst = edge.get("to") or edge.get("to_name")
+        if not src or not dst:
+            continue
+        groups[frozenset((src, dst))][rel].append(edge)
+
+    same: list[dict] = []
+    cross: list[dict] = []
+    for pair, by_rel in groups.items():
+        if len(by_rel) < 2:  # 只有一个极性方向，不算冲突
+            continue
+        ally = sorted({ch for e in by_rel.get("ally", [])
+                       for ch in canon_source.chapter_list(e.get("chapters"))})
+        enemy = sorted({ch for e in by_rel.get("enemy", [])
+                        for ch in canon_source.chapter_list(e.get("chapters"))})
+        item = {
+            "pair": sorted(pair),
+            "ally_chapters": ally,
+            "enemy_chapters": enemy,
+            "overlap": sorted(set(ally) & set(enemy)),
+        }
+        (same if item["overlap"] else cross).append(item)
+
+    same.sort(key=lambda x: x["pair"])
+    cross.sort(key=lambda x: x["pair"])
+    return {
+        "same_chapter_clash": same,
+        "cross_chapter_flip": cross,
+        "counts": {
+            "same_chapter_clash": len(same),
+            "cross_chapter_flip": len(cross),
+            "total": len(same) + len(cross),
+        },
+    }
