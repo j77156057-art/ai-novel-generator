@@ -6,7 +6,8 @@
   实际读取的是原著层 sqlite 的 ``new_nodes`` / ``new_edges``。
   **它不是抽取链路的版本号**：抽取链路另有 v2（规则式 ``extractor``）与
   v3（LLM ``extractor_v3``），两条并行，与本开关无关。
-- ``cleaned``：清洗后的 63 条 → ``data/canon_layers.json``（实体层 + 称呼层）。
+- ``cleaned``：清洗后的 63 条 + 人物层复核并入 53 条（104 实体）
+  → ``data/canon_layers.json``（实体层 + 称呼层）。
 - ``mixed``：分域判定，**不合成一份名单**——人物域用 cleaned 实体层；
   势力/地点域继续用 legacy 的 ``faction`` 节点，但必须过结构化后缀门
   （``FACTION_SUFFIXES`` / ``LOCATION_SUFFIXES``），否则整份 legacy 放回来
@@ -382,6 +383,9 @@ def nodes_from_layers(layers: dict) -> list[dict]:
         if ent.get("no_attrs"):
             node["no_attrs"] = True
             node["no_attrs_reason"] = ent.get("no_attrs_reason") or "not_in_canon_layer"
+        # 职位称名（初代监正/恒清大师）要能一眼看出不是普通专名
+        if ent.get("entity_type") and ent["entity_type"] != "人物专名":
+            node["entity_type"] = ent["entity_type"]
         nodes.append(node)
     return nodes
 
@@ -423,9 +427,17 @@ def _constraint_ok(row: dict, context: str, offset: int) -> bool:
     if not constraint:
         return True
     if not context or offset < 0:
-        # 没有上下文就无法证明成立：保守地不归一（原文词照旧）
-        return False
+        # require_any（白莲 vs 白莲花）必须有上下文才能证明成立，否则不归一；
+        # 只有 block_before/follow 的写法（职位称名）在无上下文时按成立处理，
+        # 否则裸名永远折不动，职位称名会被拆成第二个节点。
+        return not (constraint.get("require_any") or [])
     form = str(row.get("form") or "")
+    before = context[max(0, offset - 4): offset]
+    # block_before：前面带限定词时不属于该实体（「前任人宗道首」是另一个人）。
+    # 用 4 字窗口而不是 startswith：限定词不一定紧贴（「上一代人宗道首」）。
+    for bad in constraint.get("block_before") or []:
+        if before.endswith(bad):
+            return False
     after = context[offset + len(form): offset + len(form) + 4]
     for bad in constraint.get("block_follow") or []:
         if after.startswith(bad):

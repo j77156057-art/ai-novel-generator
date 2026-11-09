@@ -1,7 +1,7 @@
 {
- "version": 2,
- "generated_from": "experiments/2026-11-09-kg-shadow/cleaned_canon.json（63 条）",
- "note": "实体层只放人物；称呼层只收带专名部分的写法。纯称谓不入称呼层，只走共指消解；纯封号仅「唯一原文直证 + 全库唯一归属」可破例（本批：长公主 → 怀庆）。",
+ "version": 3,
+ "generated_from": "experiments/2026-11-09-kg-shadow/cleaned_canon.json（63 条） + character_merge.json（119 条确认表）",
+ "note": "实体层只放人物；称呼层只收带专名部分的写法。纯称谓不入称呼层，只走共指消解；纯封号仅「唯一原文直证 + 全库唯一归属」可破例（本批：长公主 → 怀庆）。职位称名（初代监正/恒清大师）标 entity_type，不当普通专名；变体折叠必须过 app.kg.alias_rules.judge_alias，典故/一次性玩笑自动拦。",
  "classification": {
   "人物专名": 49,
   "称谓式别名": 13,
@@ -778,6 +778,430 @@
     "checked": "evidence_in_chapter+name_in_chapter"
    },
    "no_attrs": false
+  },
+  {
+   "name": "严楷",
+   "kind": "character",
+   "mentions": 13,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "刘汉",
+   "kind": "character",
+   "mentions": 13,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "初代监正",
+   "kind": "character",
+   "mentions": 218,
+   "origin": "character_review",
+   "entity_type": "职位称名",
+   "no_attrs": false
+  },
+  {
+   "name": "南宫倩柔",
+   "kind": "character",
+   "mentions": 455,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "周旻",
+   "kind": "character",
+   "mentions": 141,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "周显平",
+   "kind": "character",
+   "mentions": 20,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "周立",
+   "kind": "character",
+   "mentions": 91,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "周赤雄",
+   "kind": "character",
+   "mentions": 96,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "天蛊婆婆",
+   "kind": "character",
+   "mentions": 332,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "宋长辅",
+   "kind": "character",
+   "mentions": 51,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "平阳郡主",
+   "kind": "character",
+   "mentions": 130,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "张奉",
+   "kind": "character",
+   "mentions": 25,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "张开泰",
+   "kind": "character",
+   "mentions": 172,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "张易",
+   "kind": "character",
+   "mentions": 13,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "张有瑞",
+   "kind": "character",
+   "mentions": 22,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "张杨氏",
+   "kind": "character",
+   "mentions": 14,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "张献",
+   "kind": "character",
+   "mentions": 28,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "张玉英",
+   "kind": "character",
+   "mentions": 13,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "徐虎臣",
+   "kind": "character",
+   "mentions": 43,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "恒慧",
+   "kind": "character",
+   "mentions": 189,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "恒清大师",
+   "kind": "character",
+   "mentions": 7,
+   "origin": "character_review",
+   "entity_type": "职位称名",
+   "no_attrs": false
+  },
+  {
+   "name": "恒远",
+   "kind": "character",
+   "mentions": 1029,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "方鹤",
+   "kind": "character",
+   "mentions": 7,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "明砚",
+   "kind": "character",
+   "mentions": 96,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "朱成铸",
+   "kind": "character",
+   "mentions": 55,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "朱退之",
+   "kind": "character",
+   "mentions": 32,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "朱阳",
+   "kind": "character",
+   "mentions": 91,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "李妙真",
+   "kind": "character",
+   "mentions": 2485,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "李茹",
+   "kind": "character",
+   "mentions": 16,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "杨凌",
+   "kind": "character",
+   "mentions": 18,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "杨峰",
+   "kind": "character",
+   "mentions": 20,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "杨珍珍",
+   "kind": "character",
+   "mentions": 29,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "杨莺莺",
+   "kind": "character",
+   "mentions": 61,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "梁有平",
+   "kind": "character",
+   "mentions": 129,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "武宗",
+   "kind": "character",
+   "mentions": 133,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "洛玉衡",
+   "kind": "character",
+   "mentions": 1868,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "浮香",
+   "kind": "character",
+   "mentions": 620,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "神殊",
+   "kind": "character",
+   "mentions": 1625,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "紫莲",
+   "kind": "character",
+   "mentions": 28,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "紫阳居士",
+   "kind": "character",
+   "mentions": 137,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "绿娥",
+   "kind": "character",
+   "mentions": 72,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "苏苏",
+   "kind": "character",
+   "mentions": 495,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "莫桑",
+   "kind": "character",
+   "mentions": 86,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "誉王",
+   "kind": "character",
+   "mentions": 135,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "赵锐",
+   "kind": "character",
+   "mentions": 10,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "赵龙",
+   "kind": "character",
+   "mentions": 18,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "闵山",
+   "kind": "character",
+   "mentions": 39,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "阿雅",
+   "kind": "character",
+   "mentions": 6,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "陈汉光",
+   "kind": "character",
+   "mentions": 7,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "陈泰",
+   "kind": "character",
+   "mentions": 90,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "陶满",
+   "kind": "character",
+   "mentions": 10,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "飞燕女侠",
+   "kind": "character",
+   "mentions": 226,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
+  },
+  {
+   "name": "红袖",
+   "kind": "character",
+   "mentions": 47,
+   "origin": "character_review",
+   "entity_type": "人物专名",
+   "no_attrs": false
   }
  ],
  "aliases": [
@@ -1388,6 +1812,261 @@
    "canonical": true,
    "in_layer": true,
    "evidence": "长乐县捕头；文本无独立真名，本身即唯一指称"
+  },
+  {
+   "form": "六号恒远",
+   "entity": "恒远",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 21 章（136–831）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 21 章使用（136–831）"
+   }
+  },
+  {
+   "form": "宋卿师兄",
+   "entity": "宋卿",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 11 章（25–794）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 11 章使用（25–794）"
+   }
+  },
+  {
+   "form": "恒慧和尚",
+   "entity": "恒慧",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 13 章（126–335）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 13 章使用（126–335）"
+   }
+  },
+  {
+   "form": "恒远和尚",
+   "entity": "恒远",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 17 章（133–434）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 17 章使用（133–434）"
+   }
+  },
+  {
+   "form": "恒远大师",
+   "entity": "恒远",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 96 章（85–926）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 96 章使用（85–926）"
+   }
+  },
+  {
+   "form": "慕白先生",
+   "entity": "李慕白",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 9 章（25–799）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 9 章使用（25–799）"
+   }
+  },
+  {
+   "form": "明砚花魁",
+   "entity": "明砚",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 10 章（143–433）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 10 章使用（143–433）"
+   }
+  },
+  {
+   "form": "浮香姑娘",
+   "entity": "浮香",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 27 章（15–750）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 27 章使用（15–750）"
+   }
+  },
+  {
+   "form": "浮香花魁",
+   "entity": "浮香",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 21 章（50–521）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 21 章使用（50–521）"
+   }
+  },
+  {
+   "form": "玲月",
+   "entity": "许玲月",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 171 章（7–926）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 171 章使用（7–926）"
+   }
+  },
+  {
+   "form": "神殊和尚",
+   "entity": "神殊",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 54 章（164–770）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 54 章使用（164–770）"
+   }
+  },
+  {
+   "form": "裱裱",
+   "entity": "临安",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 80 章（120–611）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 80 章使用（120–611）"
+   }
+  },
+  {
+   "form": "裱裱公主",
+   "entity": "临安",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 2 章（157–160）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 2 章使用（157–160）"
+   }
+  },
+  {
+   "form": "许大郎",
+   "entity": "许七安",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 45 章（21–823）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 45 章使用（21–823）"
+   }
+  },
+  {
+   "form": "辞旧",
+   "entity": "许辞旧",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 99 章（17–764）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 99 章使用（17–764）"
+   }
+  },
+  {
+   "form": "采薇姑娘",
+   "entity": "褚采薇",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 38 章（5–726）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 38 章使用（5–726）"
+   }
+  },
+  {
+   "form": "金莲师兄",
+   "entity": "金莲",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 8 章（72–761）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 8 章使用（72–761）"
+   }
+  },
+  {
+   "form": "金锣朱阳",
+   "entity": "朱阳",
+   "type": "变体折叠",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "变体折叠：跨 2 章（163–484）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 2 章使用（163–484）"
+   }
+  },
+  {
+   "form": "人宗道首",
+   "entity": "洛玉衡",
+   "type": "职位称名",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "职位称名：跨 72 章（79–893）",
+   "verdict": {
+    "ok": true,
+    "verdict": "alias",
+    "reason": "跨 72 章使用（79–893）"
+   },
+   "constraint": {
+    "block_before": [
+     "前任",
+     "上一代",
+     "历代",
+     "每一代"
+    ]
+   }
   }
  ],
  "excluded": [
@@ -1409,5 +2088,251 @@
    "owner_count": 1,
    "note": "仍是怀庆的别名，不新建实体；全库该写法只指向 1 个实体"
   }
- ]
+ ],
+ "character_review": {
+  "batch": "2026-11-10-character-review",
+  "source": "reports/kg-character-review.md（119 条确认表）",
+  "counts": {
+   "entities": 53,
+   "aliases": 19,
+   "rejected": 47
+  },
+  "rejected": [
+   {
+    "name": "神殊僧人",
+    "bucket": "变体",
+    "reason": "single_chapter：仅在 152 章出现，不足以证明全篇使用"
+   },
+   {
+    "name": "丫鬟",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "中年军官",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "云州知府",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "侍卫长",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "公公",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "刑部官员",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "刘公公",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "周侍郎",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "周公子",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "大当家",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "太子殿下",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "太康县令",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "女子国师",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "女战神",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "威武侯",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "孙大人",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "宋布政使",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "宋师兄",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "巡抚大人",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "张巡抚",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "当朝首辅",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "徐主簿",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "朱县令",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "杨大人",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "梦巫",
+    "bucket": "身份职称",
+    "reason": "品级/群体身份：「巫师四品又叫梦巫」，不是单个角色名"
+   },
+   {
+    "name": "江湖客",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "王首辅",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "白衣术士",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "皇后",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "监正大人",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "稚童",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "花魁娘子",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "赵公子",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "赵县令",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "铺子老板",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "陈府尹",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "陈贵妃",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "青袍官员",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "魏公子",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "黑衣死囚",
+    "bucket": "身份职称",
+    "reason": "身份/职称，不是专名"
+   },
+   {
+    "name": "桑泊",
+    "bucket": "非人物",
+    "reason": "地点/境界，char+powersystem 双挂"
+   },
+   {
+    "name": "桑泊案",
+    "bucket": "非人物",
+    "reason": "案件，char+item+powersystem 三挂"
+   },
+   {
+    "name": "北方妖族",
+    "bucket": "非人物",
+    "reason": "种族集合（本轮已按集合剔除）"
+   },
+   {
+    "name": "九尾天狐",
+    "bucket": "非人物",
+    "reason": "妖物，非人物实体"
+   },
+   {
+    "name": "鲁智深",
+    "bucket": "变体",
+    "reason": "allusion：比喻"
+   },
+   {
+    "name": "陈近南",
+    "bucket": "变体",
+    "reason": "mock：一次性玩笑化名"
+   }
+  ]
+ }
 }

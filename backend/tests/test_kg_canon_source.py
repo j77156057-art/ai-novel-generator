@@ -151,7 +151,8 @@ def test_cleaned_layers_shape():
     assert layers is not None
 
     names = [e["name"] for e in layers["entities"]]
-    assert len(names) == 51
+    # 51 条清洗实体 + 人物层扩展 53 条（51 真专名 + 2 职位称名）
+    assert len(names) == 104
     assert len(names) == len(set(names)), "实体层规范名必须唯一"
     assert {e["kind"] for e in layers["entities"]} == {"character"}
 
@@ -273,7 +274,7 @@ def test_cleaned_switches_nodes_and_filters_edges(monkeypatch, tmp_path):
 
     nodes, edges = canon_source.load(db)
     names = {n["name"] for n in nodes}
-    assert len(nodes) == 51
+    assert len(nodes) == len(canon_source.load_layers()["entities"])
     assert "白帝" not in names, "非人物残留不得进实体层"
     assert names == {n["name"] for n in canon_source.load_layers()["entities"]}
 
@@ -290,7 +291,7 @@ def test_layer_context_read_canon_uses_switch(monkeypatch, tmp_path):
     _set_cleaned(monkeypatch)
 
     nodes, _ = layer_context.read_canon(db)
-    assert len(nodes) == 51
+    assert len(nodes) == len(canon_source.load_layers()["entities"])
     assert all(n["kind"] == "character" for n in nodes)
 
 
@@ -304,7 +305,8 @@ def test_mixed_keeps_characters_and_suffix_filtered_noncharacters(monkeypatch, t
     nodes, edges = canon_source.load(db)
     names = {n["name"] for n in nodes}
     # 人物域来自 cleaned 实体层，不是 legacy 的 character 节点
-    assert len([n for n in nodes if n["domain"] == "character"]) == 51
+    assert len([n for n in nodes if n["domain"] == "character"]) == \
+        len(canon_source.load_layers()["entities"])
     # 势力/地点域必须过结构后缀门；法术/物品/抽象词整体退出
     assert {"司天监", "打更人", "云州"} <= names
     assert not ({"秘术", "残卷", "府尹", "云州官场"} & names)
@@ -327,11 +329,13 @@ def test_mixed_records_domain_stats(monkeypatch, caplog, tmp_path):
 
     info = canon_source.log_effective(path=db, prefix="测试 ")
     assert info["effective"] == "mixed"
+    n_char = len(canon_source.load_layers()["entities"])
     assert info["domains"] == {
-        "character": 51, "faction": 2, "location": 1, "filtered_out": 5,
+        "character": n_char, "faction": 2, "location": 1, "filtered_out": 5,
     }
     assert "+" in info["sha256"]
-    assert "domains=character:51,faction:2,location:1,filtered:5" in caplog.text
+    assert (f"domains=character:{n_char},faction:2,location:1,filtered:5"
+            in caplog.text)
 
 
 def test_mixed_normalizes_character_aliases(monkeypatch):
@@ -428,7 +432,8 @@ def test_mixed_degrades_to_cleaned_without_canon_db(monkeypatch, caplog):
     _set_mixed(monkeypatch)
 
     nodes, edges = canon_source.load(None)
-    assert len(nodes) == 51, "原著层不可用时保人物域，不能返回空表"
+    assert len(nodes) == len(canon_source.load_layers()["entities"]), \
+        "原著层不可用时保人物域，不能返回空表"
     assert edges == []
     assert "降级 cleaned" in caplog.text
     assert canon_source.describe(None)["effective"] == "cleaned"
@@ -448,6 +453,40 @@ def test_normalize_maps_alias_to_entity(monkeypatch):
     assert canon_source.normalize("皇帝") == "皇帝"
     # 长公主是带条件破例：唯一原文直证 + 全库唯一归属 → 归一为怀庆
     assert canon_source.normalize("长公主") == "怀庆"
+
+
+def test_position_name_requires_no_predecessor_qualifier(monkeypatch):
+    _set_cleaned(monkeypatch)
+    # 人宗道首是职位称名，折到现任持有者；「上一代/前任」是另一个人
+    assert canon_source.normalize("人宗道首") == "洛玉衡"
+    assert canon_source.count_forms("这位是人宗道首，大奉国师", ["人宗道首"]) == 1
+    assert canon_source.count_forms("上一代人宗道首", ["人宗道首"]) == 0
+    assert canon_source.count_forms("洛玉衡是前任人宗道首的女儿", ["人宗道首"]) == 0
+
+
+def test_character_review_boundaries_are_locked():
+    """复核结论必须留在词表里：职位称名、典故剔除、去姓简称折叠。"""
+    layers = canon_source.load_layers()
+    names = {e["name"] for e in layers["entities"]}
+    forms = {a["form"]: a for a in layers["aliases"] if a.get("in_layer") is not False}
+
+    # 职位称名：实体带 entity_type，不能当普通专名
+    assert {e["name"] for e in layers["entities"]
+            if e.get("entity_type") == "职位称名"} == {"初代监正", "恒清大师"}
+    assert forms["人宗道首"]["entity"] == "洛玉衡"
+    assert forms["人宗道首"]["type"] == "职位称名"
+
+    # 典故 / 一次性玩笑 / 单章写法不进称呼层
+    assert not ({"鲁智深", "陈近南", "神殊僧人"} & set(forms))
+
+    # 去姓简称折到实体层已有的规范名，而不是新建实体
+    assert forms["玲月"]["entity"] == "许玲月"
+    assert forms["辞旧"]["entity"] == "许辞旧"
+    assert not ({"玲月", "辞旧"} & names)
+
+    # 红袖按原文直证是真角色名；梦巫是品级/群体身份
+    assert "红袖" in names
+    assert "梦巫" not in names and "梦巫" not in forms
 
 
 def test_constraint_keeps_whitelotus_out(monkeypatch):
@@ -520,7 +559,7 @@ def test_log_effective_reports_source_and_hash(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="app.kg.canon_source")
     info = canon_source.log_effective(prefix="测试 ")
     assert info["effective"] == "cleaned"
-    assert info["entities"] == 51
+    assert info["entities"] == len(canon_source.load_layers()["entities"])
     assert info["sha256"] == canon_source.content_hash()
     assert "canon source=cleaned" in caplog.text
     assert "sha256=" in caplog.text

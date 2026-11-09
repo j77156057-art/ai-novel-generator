@@ -89,7 +89,8 @@ class Settings(BaseSettings):
     #         实际读取的是原著层 sqlite 的 new_nodes / new_edges。
     #         **它不是抽取链路的版本号**：抽取链路另有 v2（规则式 extractor）
     #         与 v3（LLM 抽取器），两条并行，与本开关无关。
-    # cleaned：清洗后的 63 条 → app/kg/data/canon_layers.json（实体层 + 称呼层）。
+    # cleaned：清洗后的 63 条 + 人物层复核并入 53 条（104 实体）
+    #         → app/kg/data/canon_layers.json（实体层 + 称呼层）。
     #         实体层只放人物；称呼层只收带专名部分的写法（许郎/许公子/许二叔/
     #         魏公/临安公主/白莲道长），纯称谓（大哥/老爷/师父/夫人）不入称呼层。
     #         纯封号只有「唯一原文直证 + 全库唯一归属」可破例（长公主 → 怀庆）。
