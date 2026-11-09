@@ -2031,14 +2031,20 @@
      "why": "上一代的大郎：二叔的兄长、许七安生父（ch132 对话：父辈死于山海关战役），不是许七安"
     },
     "constraint": {
-     "block_follow": [
-      "在山海关"
+     "except_chapters": [
+      [
+       499,
+       499
+      ]
      ]
     }
    },
    "constraint": {
-    "block_follow": [
-     "在山海关"
+    "except_chapters": [
+     [
+      499,
+      499
+     ]
     ]
    }
   },

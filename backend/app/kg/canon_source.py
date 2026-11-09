@@ -505,7 +505,8 @@ def _edges_from(edges: list[dict], names: set[str]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # 称呼层归一
 # ---------------------------------------------------------------------------
-def _constraint_ok(row: dict, context: str, offset: int) -> bool:
+def _constraint_ok(row: dict, context: str, offset: int,
+                   chapter: int | None = None) -> bool:
     """带上下文约束的写法是否成立（白莲 vs 白莲花 / 平远伯 vs 平远伯府）。
 
     ``block_before`` / ``block_follow`` 是**逐次出现**判定的：每次命中单独看
@@ -516,11 +517,17 @@ def _constraint_ok(row: dict, context: str, offset: int) -> bool:
       「前任人宗道首」「上一代人宗道首」被挡；「前任监正人宗道首」里「前任」
       修饰的是监正、不在窗口内，仍会折——这是 4 字窗口的已知边界。
     - 同一句里现任与前任同时出现时，两次命中分别判定：前任那次弃，现任那次折。
-    - ``block_follow`` 看右侧 4 字前缀，命中即弃（平远伯府 / 许大郎在山海关）。
+    - ``block_follow`` 看右侧 4 字前缀，命中即弃（平远伯府）。
+    - ``except_chapters`` 按章节范围弃：同一写法在别的章节指另一个人时
+      （许大郎在 ch499 指上一代的许平峰），只弃该段，不用地名/字面去猜。
     """
     constraint = row.get("constraint")
     if not constraint:
         return True
+    if chapter is not None:
+        for span in constraint.get("except_chapters") or []:
+            if span[0] <= chapter <= span[1]:
+                return False
     if not context or offset < 0:
         # require_any（白莲 vs 白莲花）必须有上下文才能证明成立，否则不归一；
         # 只有 block_before/follow 的写法（职位称名）在无上下文时按成立处理，
@@ -546,14 +553,18 @@ def _constraint_ok(row: dict, context: str, offset: int) -> bool:
     return True
 
 
-def normalize(form: str, context: str = "", offset: int = -1) -> str:
-    """称呼写法 → 实体规范名；未命中或约束不成立时原样返回。"""
+def normalize(form: str, context: str = "", offset: int = -1,
+              chapter: int | None = None) -> str:
+    """称呼写法 → 实体规范名；未命中或约束不成立时原样返回。
+
+    ``chapter`` 用于 ``except_chapters``：同一写法在指定章节里另有所指。
+    """
     if not form:
         return form
     row = _index().get(form)
     if row is None:
         return form
-    if not _constraint_ok(row, context, offset):
+    if not _constraint_ok(row, context, offset, chapter):
         return form
     return row.get("entity") or form
 
@@ -569,12 +580,12 @@ def entity_forms(name: str) -> list[str]:
     return forms
 
 
-def count_forms(text: str, forms: list[str]) -> int:
+def count_forms(text: str, forms: list[str], chapter: int | None = None) -> int:
     """最长优先计数，且对带约束的写法逐个校验上下文。
 
     与 ``generated_extract._count_forms`` 的差别只有一个：带 constraint 的
     写法（如「白莲」）在「白莲花」里不会被计数。legacy 模式下索引为空，
-    行为与原来完全一致。
+    行为与原来完全一致。``chapter`` 用于 ``except_chapters`` 的章节范围排除。
     """
     cleaned = sorted({str(f) for f in forms if f}, key=len, reverse=True)
     if not cleaned or not text:
@@ -584,16 +595,17 @@ def count_forms(text: str, forms: list[str]) -> int:
     total = 0
     for match in pattern.finditer(text):
         row = index.get(match.group(0))
-        if row is not None and not _constraint_ok(row, text, match.start()):
+        if row is not None and not _constraint_ok(
+                row, text, match.start(), chapter):
             continue
         total += 1
     return total
 
 
-def text_mention(text: str, name: str) -> str | None:
+def text_mention(text: str, name: str, chapter: int | None = None) -> str | None:
     """该实体在本段文本里命中的第一个写法；没命中返回 None。"""
     for form in entity_forms(name):
-        if count_forms(text, [form]) > 0:
+        if count_forms(text, [form], chapter) > 0:
             return form
     return None
 
@@ -610,11 +622,12 @@ def normalize_extraction(result: dict) -> dict:
     """
     if source() not in (SOURCE_CLEANED, SOURCE_MIXED) or not _index():
         return result
+    chapter = _chapter_of(result)
     for ent in result.get("entities") or []:
         raw = ent.get("canonical_name")
         if not raw:
             continue
-        canonical = normalize(raw)
+        canonical = normalize(raw, chapter=chapter)
         if canonical == raw:
             continue
         aliases = [a for a in (ent.get("aliases") or []) if a != raw]
@@ -624,11 +637,21 @@ def normalize_extraction(result: dict) -> dict:
         for row in result.get(key) or []:
             if not isinstance(row, dict):
                 continue
+            row_chapter = _chapter_of(row) or chapter
             for field in _REF_KEYS:
                 value = row.get(field)
                 if isinstance(value, str) and value:
-                    row[field] = normalize(value)
+                    row[field] = normalize(value, chapter=row_chapter)
     return result
+
+
+def _chapter_of(row: dict) -> int | None:
+    """从抽取结果里取章号（不同来源用 chapter / source_chapter）。"""
+    value = row.get("chapter") or row.get("source_chapter")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------

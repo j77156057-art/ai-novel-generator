@@ -481,7 +481,7 @@ def test_block_before_is_judged_per_occurrence(monkeypatch):
 
 
 def test_xudalang_fold_has_auditable_basis(monkeypatch):
-    """许大郎 → 许七安：判据要能逐条复查，反例句要排除。"""
+    """许大郎 → 许七安：判据要能逐条复查，反例按章节范围排除。"""
     _set_cleaned(monkeypatch)
     row = {r["form"]: r for r in canon_source.load_layers()["aliases"]}["许大郎"]
     assert row["entity"] == "许七安"
@@ -491,9 +491,38 @@ def test_xudalang_fold_has_auditable_basis(monkeypatch):
     assert all(c["quote"] for c in basis["checks"])
     bad = basis["counterexample"]
     assert (bad["chapter"], bad["referent"]) == (499, "许平峰")
-    # 反例句不折：ch499 的大郎是上一代（许平峰）；其余照折
-    assert canon_source.count_forms("他和许大郎在山海关打仗", ["许大郎"]) == 0
-    assert canon_source.count_forms("还是我许大郎提不起刀了", ["许大郎"]) == 1
+    assert row["constraint"] == {"except_chapters": [[499, 499]]}
+    # 反例句（ch499）不折：那里的大郎是上一代（许平峰）
+    assert canon_source.count_forms("他和许大郎在山海关打仗", ["许大郎"], 499) == 0
+    # 许七安自己出现在山海关的句子照折：排除靠章节范围，不靠地名
+    assert canon_source.count_forms("许大郎在山海关大杀四方", ["许大郎"], 700) == 1
+    assert canon_source.count_forms("他和许大郎在山海关打仗", ["许大郎"], 700) == 1
+    # 同一句不传章号时按成立处理（没有章节证据不臆断排除）
+    assert canon_source.count_forms("他和许大郎在山海关打仗", ["许大郎"]) == 1
+    text = "他和许大郎在山海关打仗"
+    offset = text.index("许大郎")
+    assert canon_source.normalize(
+        "许大郎", text, offset, chapter=499) == "许大郎"
+    assert canon_source.normalize(
+        "许大郎", text, offset, chapter=700) == "许七安"
+
+
+def test_normalize_extraction_respects_except_chapters(monkeypatch):
+    """抽取结果归一也要带章号，否则 ch499 的许大郎又被折回许七安。"""
+    _set_cleaned(monkeypatch)
+    result = {
+        "chapter": 499,
+        "entities": [{"canonical_name": "许大郎"}],
+        "relations": [{"from": "许大郎", "to": "许平峰", "rel": "child"}],
+    }
+    canon_source.normalize_extraction(result)
+    assert result["entities"][0]["canonical_name"] == "许大郎"
+    assert result["relations"][0]["from"] == "许大郎"
+
+    ok = {"chapter": 700, "entities": [{"canonical_name": "许大郎"}],
+          "relations": []}
+    canon_source.normalize_extraction(ok)
+    assert ok["entities"][0]["canonical_name"] == "许七安"
 
 
 def test_character_review_boundaries_are_locked():
