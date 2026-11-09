@@ -1,0 +1,1413 @@
+{
+ "version": 2,
+ "generated_from": "experiments/2026-11-09-kg-shadow/cleaned_canon.json（63 条）",
+ "note": "实体层只放人物；称呼层只收带专名部分的写法。纯称谓不入称呼层，只走共指消解；纯封号仅「唯一原文直证 + 全库唯一归属」可破例（本批：长公主 → 怀庆）。",
+ "classification": {
+  "人物专名": 49,
+  "称谓式别名": 13,
+  "非人物残留": 1,
+  "歧义待定": 0
+ },
+ "source_items": [
+  {
+   "name": "许七安",
+   "category": "人物专名",
+   "entity": "许七安",
+   "unique": true
+  },
+  {
+   "name": "魏渊",
+   "category": "人物专名",
+   "entity": "魏渊",
+   "unique": true
+  },
+  {
+   "name": "怀庆",
+   "category": "人物专名",
+   "entity": "怀庆",
+   "unique": true
+  },
+  {
+   "name": "金莲",
+   "category": "人物专名",
+   "entity": "金莲",
+   "unique": true
+  },
+  {
+   "name": "元景帝",
+   "category": "人物专名",
+   "entity": "元景帝",
+   "unique": true
+  },
+  {
+   "name": "临安",
+   "category": "人物专名",
+   "entity": "临安",
+   "unique": true
+  },
+  {
+   "name": "许新年",
+   "category": "人物专名",
+   "entity": "许新年",
+   "unique": true
+  },
+  {
+   "name": "许银锣",
+   "category": "称谓式别名",
+   "entity": "许七安",
+   "unique": true
+  },
+  {
+   "name": "宋廷风",
+   "category": "人物专名",
+   "entity": "宋廷风",
+   "unique": true
+  },
+  {
+   "name": "许二郎",
+   "category": "称谓式别名",
+   "entity": "许新年",
+   "unique": true
+  },
+  {
+   "name": "丽娜",
+   "category": "人物专名",
+   "entity": "丽娜",
+   "unique": true
+  },
+  {
+   "name": "魏公",
+   "category": "称谓式别名",
+   "entity": "魏渊",
+   "unique": true
+  },
+  {
+   "name": "许平峰",
+   "category": "人物专名",
+   "entity": "许平峰",
+   "unique": true
+  },
+  {
+   "name": "许铃音",
+   "category": "人物专名",
+   "entity": "许铃音",
+   "unique": true
+  },
+  {
+   "name": "宁宴",
+   "category": "称谓式别名",
+   "entity": "许七安",
+   "unique": true
+  },
+  {
+   "name": "赵守",
+   "category": "人物专名",
+   "entity": "赵守",
+   "unique": true
+  },
+  {
+   "name": "许玲月",
+   "category": "人物专名",
+   "entity": "许玲月",
+   "unique": true
+  },
+  {
+   "name": "姬玄",
+   "category": "人物专名",
+   "entity": "姬玄",
+   "unique": true
+  },
+  {
+   "name": "褚采薇",
+   "category": "人物专名",
+   "entity": "褚采薇",
+   "unique": true
+  },
+  {
+   "name": "许宁宴",
+   "category": "称谓式别名",
+   "entity": "许七安",
+   "unique": true
+  },
+  {
+   "name": "宋卿",
+   "category": "人物专名",
+   "entity": "宋卿",
+   "unique": true
+  },
+  {
+   "name": "杨砚",
+   "category": "人物专名",
+   "entity": "杨砚",
+   "unique": true
+  },
+  {
+   "name": "许大人",
+   "category": "称谓式别名",
+   "entity": "许七安",
+   "unique": true
+  },
+  {
+   "name": "姜律中",
+   "category": "人物专名",
+   "entity": "姜律中",
+   "unique": true
+  },
+  {
+   "name": "长公主",
+   "category": "称谓式别名",
+   "entity": "怀庆",
+   "unique": true
+  },
+  {
+   "name": "许二叔",
+   "category": "称谓式别名",
+   "entity": "许平志",
+   "unique": true
+  },
+  {
+   "name": "白帝",
+   "category": "非人物残留",
+   "entity": null,
+   "unique": false,
+   "reason": "云州瑞兽/神兽，不是人物；「白帝」569 次里 94 句与「城」同句（白帝城），另有白帝庙、白帝庇佑等用法"
+  },
+  {
+   "name": "曹青阳",
+   "category": "人物专名",
+   "entity": "曹青阳",
+   "unique": true
+  },
+  {
+   "name": "许平志",
+   "category": "人物专名",
+   "entity": "许平志",
+   "unique": true
+  },
+  {
+   "name": "朱广孝",
+   "category": "人物专名",
+   "entity": "朱广孝",
+   "unique": true
+  },
+  {
+   "name": "柴贤",
+   "category": "人物专名",
+   "entity": "柴贤",
+   "unique": true
+  },
+  {
+   "name": "白姬",
+   "category": "人物专名",
+   "entity": "白姬",
+   "unique": true
+  },
+  {
+   "name": "柴杏儿",
+   "category": "人物专名",
+   "entity": "柴杏儿",
+   "unique": true
+  },
+  {
+   "name": "许元霜",
+   "category": "人物专名",
+   "entity": "许元霜",
+   "unique": true
+  },
+  {
+   "name": "李玉春",
+   "category": "人物专名",
+   "entity": "李玉春",
+   "unique": true
+  },
+  {
+   "name": "张慎",
+   "category": "人物专名",
+   "entity": "张慎",
+   "unique": true
+  },
+  {
+   "name": "杨恭",
+   "category": "人物专名",
+   "entity": "杨恭",
+   "unique": true
+  },
+  {
+   "name": "徐谦",
+   "category": "人物专名",
+   "entity": "徐谦",
+   "unique": true
+  },
+  {
+   "name": "杨川南",
+   "category": "人物专名",
+   "entity": "杨川南",
+   "unique": true
+  },
+  {
+   "name": "王贞文",
+   "category": "人物专名",
+   "entity": "王贞文",
+   "unique": true
+  },
+  {
+   "name": "孙尚书",
+   "category": "人物专名",
+   "entity": "孙尚书",
+   "unique": true
+  },
+  {
+   "name": "广贤",
+   "category": "人物专名",
+   "entity": "广贤",
+   "unique": true
+  },
+  {
+   "name": "龙图",
+   "category": "人物专名",
+   "entity": "龙图",
+   "unique": true
+  },
+  {
+   "name": "李慕白",
+   "category": "人物专名",
+   "entity": "李慕白",
+   "unique": true
+  },
+  {
+   "name": "郑兴怀",
+   "category": "人物专名",
+   "entity": "郑兴怀",
+   "unique": true
+  },
+  {
+   "name": "元槐",
+   "category": "人物专名",
+   "entity": "元槐",
+   "unique": true
+  },
+  {
+   "name": "许公子",
+   "category": "称谓式别名",
+   "entity": "许七安",
+   "unique": true
+  },
+  {
+   "name": "戚广伯",
+   "category": "人物专名",
+   "entity": "戚广伯",
+   "unique": true
+  },
+  {
+   "name": "姬远",
+   "category": "人物专名",
+   "entity": "姬远",
+   "unique": true
+  },
+  {
+   "name": "吕青",
+   "category": "人物专名",
+   "entity": "吕青",
+   "unique": true
+  },
+  {
+   "name": "阙永修",
+   "category": "人物专名",
+   "entity": "阙永修",
+   "unique": true
+  },
+  {
+   "name": "平远伯",
+   "category": "人物专名",
+   "entity": "平远伯",
+   "unique": true
+  },
+  {
+   "name": "许辞旧",
+   "category": "人物专名",
+   "entity": "许辞旧",
+   "unique": true
+  },
+  {
+   "name": "慕白",
+   "category": "称谓式别名",
+   "entity": "李慕白",
+   "unique": true
+  },
+  {
+   "name": "袁雄",
+   "category": "人物专名",
+   "entity": "袁雄",
+   "unique": true
+  },
+  {
+   "name": "白莲",
+   "category": "人物专名",
+   "entity": "白莲",
+   "unique": true
+  },
+  {
+   "name": "卓浩然",
+   "category": "人物专名",
+   "entity": "卓浩然",
+   "unique": true
+  },
+  {
+   "name": "尤尸",
+   "category": "人物专名",
+   "entity": "尤尸",
+   "unique": true
+  },
+  {
+   "name": "公孙秀",
+   "category": "人物专名",
+   "entity": "公孙秀",
+   "unique": true
+  },
+  {
+   "name": "杨师兄",
+   "category": "称谓式别名",
+   "entity": "杨千幻",
+   "unique": true
+  },
+  {
+   "name": "王捕头",
+   "category": "人物专名",
+   "entity": "王捕头",
+   "unique": true
+  },
+  {
+   "name": "孙师兄",
+   "category": "称谓式别名",
+   "entity": "孙玄机",
+   "unique": true
+  },
+  {
+   "name": "许郎",
+   "category": "称谓式别名",
+   "entity": "许七安",
+   "unique": true
+  }
+ ],
+ "entities": [
+  {
+   "name": "许七安",
+   "kind": "character",
+   "mentions": 41132,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "魏渊",
+   "kind": "character",
+   "mentions": 5180,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "怀庆",
+   "kind": "character",
+   "mentions": 4126,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "金莲",
+   "kind": "character",
+   "mentions": 3191,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "元景帝",
+   "kind": "character",
+   "mentions": 2895,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "临安",
+   "kind": "character",
+   "mentions": 2428,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "许新年",
+   "kind": "character",
+   "mentions": 2251,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "宋廷风",
+   "kind": "character",
+   "mentions": 1555,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "丽娜",
+   "kind": "character",
+   "mentions": 1506,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "许平峰",
+   "kind": "character",
+   "mentions": 1375,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "许铃音",
+   "kind": "character",
+   "mentions": 1288,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "赵守",
+   "kind": "character",
+   "mentions": 1254,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "许玲月",
+   "kind": "character",
+   "mentions": 1239,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "姬玄",
+   "kind": "character",
+   "mentions": 1178,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "褚采薇",
+   "kind": "character",
+   "mentions": 1083,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "宋卿",
+   "kind": "character",
+   "mentions": 969,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "杨砚",
+   "kind": "character",
+   "mentions": 909,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "姜律中",
+   "kind": "character",
+   "mentions": 877,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "曹青阳",
+   "kind": "character",
+   "mentions": 809,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "许平志",
+   "kind": "character",
+   "mentions": 739,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "朱广孝",
+   "kind": "character",
+   "mentions": 670,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "柴贤",
+   "kind": "character",
+   "mentions": 648,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "白姬",
+   "kind": "character",
+   "mentions": 642,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "柴杏儿",
+   "kind": "character",
+   "mentions": 609,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "许元霜",
+   "kind": "character",
+   "mentions": 599,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "李玉春",
+   "kind": "character",
+   "mentions": 581,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "张慎",
+   "kind": "character",
+   "mentions": 574,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "杨恭",
+   "kind": "character",
+   "mentions": 569,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "徐谦",
+   "kind": "character",
+   "mentions": 535,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "杨川南",
+   "kind": "character",
+   "mentions": 449,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "王贞文",
+   "kind": "character",
+   "mentions": 424,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "孙尚书",
+   "kind": "character",
+   "mentions": 415,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "广贤",
+   "kind": "character",
+   "mentions": 414,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "龙图",
+   "kind": "character",
+   "mentions": 402,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "李慕白",
+   "kind": "character",
+   "mentions": 400,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "郑兴怀",
+   "kind": "character",
+   "mentions": 383,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "元槐",
+   "kind": "character",
+   "mentions": 350,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "戚广伯",
+   "kind": "character",
+   "mentions": 327,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "姬远",
+   "kind": "character",
+   "mentions": 327,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "吕青",
+   "kind": "character",
+   "mentions": 324,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "阙永修",
+   "kind": "character",
+   "mentions": 290,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "平远伯",
+   "kind": "character",
+   "mentions": 287,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "许辞旧",
+   "kind": "character",
+   "mentions": 282,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "袁雄",
+   "kind": "character",
+   "mentions": 251,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "白莲",
+   "kind": "character",
+   "mentions": 247,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "卓浩然",
+   "kind": "character",
+   "mentions": 236,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "尤尸",
+   "kind": "character",
+   "mentions": 236,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "公孙秀",
+   "kind": "character",
+   "mentions": 230,
+   "origin": "cleaned",
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "王捕头",
+   "kind": "character",
+   "mentions": 214,
+   "origin": "cleaned",
+   "no_attrs": false
+  },
+  {
+   "name": "孙玄机",
+   "kind": "character",
+   "mentions": 649,
+   "origin": "alias_evidence",
+   "supplement": {
+    "rule": "direct_evidence_and_in_batch_chapter",
+    "evidence": "他是监正的二弟子，孙玄机孙师兄",
+    "chapter": 523,
+    "checked": "evidence_in_chapter+name_in_chapter"
+   },
+   "no_attrs": true,
+   "no_attrs_reason": "not_in_canon_layer"
+  },
+  {
+   "name": "杨千幻",
+   "kind": "character",
+   "mentions": 764,
+   "origin": "alias_evidence",
+   "supplement": {
+    "rule": "direct_evidence_and_in_batch_chapter",
+    "evidence": "杨千幻杨师兄，是监正大人的第几位弟子",
+    "chapter": 158,
+    "checked": "evidence_in_chapter+name_in_chapter"
+   },
+   "no_attrs": false
+  }
+ ],
+ "aliases": [
+  {
+   "form": "许七安",
+   "entity": "许七安",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "宁宴",
+   "entity": "许七安",
+   "type": "字",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "3 处同句：姓名与字并出（叙述）"
+  },
+  {
+   "form": "许宁宴",
+   "entity": "许七安",
+   "type": "字",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "询问字号的对话等 26 处同句（姓+字）"
+  },
+  {
+   "form": "许银锣",
+   "entity": "许七安",
+   "type": "姓+官职",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "51 处与许七安同句；银锣是打更人品秩"
+  },
+  {
+   "form": "许大人",
+   "entity": "许七安",
+   "type": "姓+官职",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "45 处与许七安同句"
+  },
+  {
+   "form": "许公子",
+   "entity": "许七安",
+   "type": "昵称",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "15 处同句；司天监人称「许公子」"
+  },
+  {
+   "form": "许郎",
+   "entity": "许七安",
+   "type": "昵称",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "8 处同句；浮香以「许郎」相称（对话）"
+  },
+  {
+   "form": "七安",
+   "entity": "许七安",
+   "type": "真名",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "去姓简称；既有 SUBJECT_ALIASES 已收录"
+  },
+  {
+   "form": "许白嫖",
+   "entity": "许七安",
+   "type": "昵称",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "绰号；既有 SUBJECT_ALIASES 已收录"
+  },
+  {
+   "form": "许平志",
+   "entity": "许平志",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "许二叔",
+   "entity": "许平志",
+   "type": "亲属称谓",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "4 处同句：许平志父子与「许二叔」并提（叙述）"
+  },
+  {
+   "form": "魏渊",
+   "entity": "魏渊",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "魏公",
+   "entity": "魏渊",
+   "type": "封号",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "26 处同句：魏渊与「魏公」并提（叙述）"
+  },
+  {
+   "form": "李慕白",
+   "entity": "李慕白",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "慕白",
+   "entity": "李慕白",
+   "type": "真名",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "去姓简称；237 处同句"
+  },
+  {
+   "form": "许新年",
+   "entity": "许新年",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "许二郎",
+   "entity": "许新年",
+   "type": "亲属称谓",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "9 处同句：许新年与「许二郎」动作同句（叙述）"
+  },
+  {
+   "form": "怀庆",
+   "entity": "怀庆",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "怀庆公主",
+   "entity": "怀庆",
+   "type": "封号",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "205 处"
+  },
+  {
+   "form": "长公主",
+   "entity": "怀庆",
+   "type": "封号",
+   "canonical": false,
+   "in_layer": true,
+   "title_exception": {
+    "rule": "唯一原文直证 + 全库唯一归属",
+    "direct_evidence": "怀庆是长公主的封号",
+    "evidence_chapter": 98,
+    "unique_owner": true,
+    "owner_count": 1,
+    "note": "仍是怀庆的别名，不新建实体；全库该写法只指向 1 个实体"
+   },
+   "evidence": "原文直证「怀庆是长公主的封号」（ch98，全库 1 处）；全库唯一归属怀庆"
+  },
+  {
+   "form": "临安",
+   "entity": "临安",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "临安公主",
+   "entity": "临安",
+   "type": "封号",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "145 处；二公主"
+  },
+  {
+   "form": "金莲",
+   "entity": "金莲",
+   "type": "道号",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "1 处：前辈道号金莲（叙述）"
+  },
+  {
+   "form": "金莲道长",
+   "entity": "金莲",
+   "type": "道号",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "1349 处"
+  },
+  {
+   "form": "白莲",
+   "entity": "白莲",
+   "type": "道号",
+   "canonical": true,
+   "in_layer": true,
+   "constraint": {
+    "require_any": [
+     "道号",
+     "道长"
+    ],
+    "window": 6,
+    "block_follow": [
+     "花"
+    ]
+   },
+   "evidence": "「道号白莲的少妇」「白莲道长」；约束避开「白莲花」隐喻"
+  },
+  {
+   "form": "白莲道长",
+   "entity": "白莲",
+   "type": "道号",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "32 处同句"
+  },
+  {
+   "form": "孙玄机",
+   "entity": "孙玄机",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "同句：监正二弟子 +「孙师兄」并出（叙述）"
+  },
+  {
+   "form": "孙师兄",
+   "entity": "孙玄机",
+   "type": "亲属称谓",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "师门称谓；12 处与孙玄机同句"
+  },
+  {
+   "form": "杨千幻",
+   "entity": "杨千幻",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "对话：以「杨师兄」称杨千幻并问师承"
+  },
+  {
+   "form": "杨师兄",
+   "entity": "杨千幻",
+   "type": "亲属称谓",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "师门称谓；11 处与杨千幻同句"
+  },
+  {
+   "form": "褚采薇",
+   "entity": "褚采薇",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "采薇",
+   "entity": "褚采薇",
+   "type": "真名",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "去姓简称；667 处同句：采薇 + 黄裙少女（叙述）"
+  },
+  {
+   "form": "姜律中",
+   "entity": "姜律中",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "老姜",
+   "entity": "姜律中",
+   "type": "昵称",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "既有 SUBJECT_ALIASES 已收录"
+  },
+  {
+   "form": "许铃音",
+   "entity": "许铃音",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "铃音",
+   "entity": "许铃音",
+   "type": "真名",
+   "canonical": false,
+   "in_layer": true,
+   "evidence": "去姓简称；既有 SUBJECT_ALIASES 已收录"
+  },
+  {
+   "form": "元景帝",
+   "entity": "元景帝",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "大奉皇帝；「皇帝」是纯称谓，不入称呼层"
+  },
+  {
+   "form": "宋廷风",
+   "entity": "宋廷风",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "丽娜",
+   "entity": "丽娜",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "许平峰",
+   "entity": "许平峰",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "赵守",
+   "entity": "赵守",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "许玲月",
+   "entity": "许玲月",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "姬玄",
+   "entity": "姬玄",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "宋卿",
+   "entity": "宋卿",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "六品炼金术师魁首、监正第四弟子；与宋廷风非同一人"
+  },
+  {
+   "form": "杨砚",
+   "entity": "杨砚",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "曹青阳",
+   "entity": "曹青阳",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "朱广孝",
+   "entity": "朱广孝",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "柴贤",
+   "entity": "柴贤",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "白姬",
+   "entity": "白姬",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "狐妖角色（许七安的小姨子）；有名字有戏份，按人物实体保留"
+  },
+  {
+   "form": "柴杏儿",
+   "entity": "柴杏儿",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "许元霜",
+   "entity": "许元霜",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "李玉春",
+   "entity": "李玉春",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "张慎",
+   "entity": "张慎",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "杨恭",
+   "entity": "杨恭",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "徐谦",
+   "entity": "徐谦",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "杨川南",
+   "entity": "杨川南",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "王贞文",
+   "entity": "王贞文",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "首辅；与「王捕头」非同一人（0 同句）"
+  },
+  {
+   "form": "孙尚书",
+   "entity": "孙尚书",
+   "type": "姓+官职",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "刑部尚书；文本无独立真名，本身即唯一指称"
+  },
+  {
+   "form": "广贤",
+   "entity": "广贤",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "佛门菩萨（与伽罗树同列）"
+  },
+  {
+   "form": "龙图",
+   "entity": "龙图",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "力蛊部首领"
+  },
+  {
+   "form": "郑兴怀",
+   "entity": "郑兴怀",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "元槐",
+   "entity": "元槐",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "戚广伯",
+   "entity": "戚广伯",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "姬远",
+   "entity": "姬远",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "吕青",
+   "entity": "吕青",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "阙永修",
+   "entity": "阙永修",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "平远伯",
+   "entity": "平远伯",
+   "type": "封号",
+   "canonical": true,
+   "in_layer": true,
+   "constraint": {
+    "block_follow": [
+     "府",
+     "嫡"
+    ]
+   },
+   "evidence": "同句：平远伯被杀（叙述）；「平远伯府」是地名，靠后缀约束挡掉"
+  },
+  {
+   "form": "许辞旧",
+   "entity": "许辞旧",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "许七安堂弟；与许新年/许七安均非同人（原文直证）"
+  },
+  {
+   "form": "袁雄",
+   "entity": "袁雄",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "卓浩然",
+   "entity": "卓浩然",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "尤尸",
+   "entity": "尤尸",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "尸骨部首领"
+  },
+  {
+   "form": "公孙秀",
+   "entity": "公孙秀",
+   "type": "真名",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "规范名"
+  },
+  {
+   "form": "王捕头",
+   "entity": "王捕头",
+   "type": "姓+官职",
+   "canonical": true,
+   "in_layer": true,
+   "evidence": "长乐县捕头；文本无独立真名，本身即唯一指称"
+  }
+ ],
+ "excluded": [
+  {
+   "name": "白帝",
+   "category": "非人物残留",
+   "reason": "云州瑞兽/神兽，不是人物；「白帝」569 次里 94 句与「城」同句（白帝城），另有白帝庙、白帝庇佑等用法",
+   "evidence": "叙述：朝廷封其为白帝；许七安联想到「白帝」神兽"
+  }
+ ],
+ "ambiguous": [],
+ "title_exceptions": [
+  {
+   "form": "长公主",
+   "rule": "唯一原文直证 + 全库唯一归属",
+   "direct_evidence": "怀庆是长公主的封号",
+   "evidence_chapter": 98,
+   "unique_owner": true,
+   "owner_count": 1,
+   "note": "仍是怀庆的别名，不新建实体；全库该写法只指向 1 个实体"
+  }
+ ]
+}

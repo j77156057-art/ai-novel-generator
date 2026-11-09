@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -26,10 +27,13 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.kg import canon_source
 from app.models import (
     AgentRun, Generation, KgEntity, KgRelation, KgEvent, KgEventLink,
     KgCharacterState, KgForeshadow, KgEntityKnowledge, KgMention, Project,
 )
+
+_log = logging.getLogger(__name__)
 
 #: 批大小：一次抽 5 段。省 LLM 调用（5:1）+ 跨段一致性窗口
 BATCH_SIZE = 5
@@ -239,7 +243,14 @@ def _run_batches(project_id: int) -> None:
         if not batch:
             return
         db = SessionLocal()
+        canon_meta: dict = {}
         try:
+            # —— 记账：回答「这批是用哪份词表抽的」（源 + 内容 hash + 规模）——
+            canon_meta = canon_source.log_effective(
+                _log,
+                prefix=(f"kg v3 批抽 project={project_id} "
+                        f"段={','.join(str(it.segment_no) for it in batch)} "),
+            )
             rows = _rows_for(batch)
             provider = _get_provider()
             if provider is None:
@@ -274,7 +285,8 @@ def _run_batches(project_id: int) -> None:
                 # 这不是失败（有些段落就是没有可抽实体），但要看得出「没抽到东西」。
                 empty = (stats.entities_upserted == 0 and stats.events_added == 0
                          and stats.relations_upserted == 0)
-                note_extra: dict = {"batch_stats": stats.__dict__.copy()}
+                note_extra: dict = {"batch_stats": stats.__dict__.copy(),
+                                    "canon": canon_meta}
                 if empty:
                     note_extra["empty"] = True
                 for row in rows.values():
@@ -288,10 +300,9 @@ def _run_batches(project_id: int) -> None:
                 for row in rows.values():
                     row.status = "failed"
                     row.finished_at = now
-                    _merge_note(row, {"error": err})
+                    _merge_note(row, {"error": err, "canon": canon_meta})
                 db.commit()
-                import logging
-                logging.getLogger(__name__).warning(
+                _log.warning(
                     "kg v3 批抽失败（项目 %s，%s 段）：%s", project_id, len(batch), err)
         finally:
             db.close()
@@ -424,6 +435,10 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
     from app.kg.extractor_v3 import ExtractionStats
 
     stats = ExtractionStats(segments=len(batch))
+    # 称呼层归一（cleaned 源生效时才动手）：许郎/许公子/魏公/许二叔 等写法折到
+    # 实体规范名，原文词进 aliases；关系两端同步归一，避免同一人被拆成两个节点。
+    # legacy 源下 normalize 是恒等函数，行为不变。
+    canon_source.normalize_extraction(result)
     # 段→generation id 映射（mentions 落库用）
     seg_to_gen = _seg_to_gen(db, project_id, batch)
 
@@ -604,7 +619,10 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
     # —— 6. mentions 反向索引（实体×段，context_window 原文片段）——
     for item in batch:
         for name, ent_id in name_to_id.items():
-            if name in item.text:
+            # 命中规范名或其称呼层写法都算（「许郎」也要落到许七安）；
+            # 带约束的写法（白莲 vs 白莲花）在 canon_source 里统一校验。
+            form = canon_source.text_mention(item.text, name)
+            if form:
                 gen_id = seg_to_gen.get(item.segment_no)
                 existing = db.scalar(
                     select(KgMention).where(
@@ -617,7 +635,7 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
                     db.add(KgMention(
                         project_id=project_id, entity_id=ent_id, generation_id=gen_id,
                         segment_no=item.segment_no,
-                        context_window=_window_around(item.text, name),
+                        context_window=_window_around(item.text, form),
                         mention_kind="direct",
                     ))
 

@@ -18,6 +18,7 @@ import json
 import re
 from collections import defaultdict
 
+from app.kg import canon_source
 from app.kg.layers import GENERATED
 
 _CN_RANK = "九八七六五四三二一"
@@ -151,12 +152,15 @@ def _valid_form(form: str) -> bool:
 
 
 def _count_forms(text: str, forms: list[str]) -> int:
-    """按最长优先计数，避免「许七安」被「七安」重复计。"""
+    """按最长优先计数，避免「许七安」被「七安」重复计。
+
+    交给 canon_source 统一做：cleaned 源下带上下文约束的写法（「白莲」）在
+    「白莲花」里不会被计数；legacy 源下索引为空，结果与纯正则计数一致。
+    """
     cleaned = sorted({f for f in forms if _valid_form(f)}, key=len, reverse=True)
     if not cleaned:
         return 0
-    pattern = re.compile("|".join(re.escape(f) for f in cleaned))
-    return len(pattern.findall(text or ""))
+    return canon_source.count_forms(text or "", cleaned)
 
 
 def _preferred_kind(name: str, kinds: set[str]) -> str:
