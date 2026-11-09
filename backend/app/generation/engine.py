@@ -270,6 +270,94 @@ def _constraints_from(reminders: dict, project: Project) -> dict:
     }
 
 
+def _era_guard_block(project: Project) -> tuple[str, dict]:
+    """算时代越界的静态约束块。
+
+    时代与国力是两条互不依赖的特性，各自独立部署：本函数**只**在自身作用域
+    里 import 时代模块，模块缺失（单侧批次）时降级为「不生效」，不向调用方
+    抛 `ModuleNotFoundError`，国力侧照常工作。
+    """
+    try:
+        from app.kg.era_check import constraint_for
+    except ImportError:
+        return "", {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "era_guard_not_installed",
+            "chars": 0,
+        }
+    return constraint_for(project)
+
+
+def _power_guard_block(project: Project) -> tuple[str, dict]:
+    """算量级体系的静态约束块（与时代侧对称，各自独立 import 与降级）。"""
+    try:
+        from app.generation.power_prompt import build_power_constraint
+    except ImportError:
+        return "", {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "power_guard_not_installed",
+            "chars": 0,
+        }
+    power_block = build_power_constraint(project)
+    return power_block, {"enabled": bool(power_block), "chars": len(power_block)}
+
+
+def _guard_blocks(project: Project) -> tuple[str, dict, str, dict]:
+    """生成前算好两段静态约束：时代越界 + 量级体系。
+
+    返回 `(era_block, era_meta, power_block, power_meta)`。两个开关各自独立：
+    任何一个关闭（或对应模块未部署），该侧 block 为空串，system 提示逐字节
+    回到旧版；两侧互不牵连。
+    """
+    era_block, era_meta = _era_guard_block(project)
+    power_block, power_meta = _power_guard_block(project)
+    return era_block, era_meta, power_block, power_meta
+
+
+def _attach_power_meta(db, gen: Generation, power_meta: dict,
+                       kg_stats: dict | None) -> dict:
+    """把哨兵的 `power` 摘要并进本段 meta（粗放型的称谓记录也在此落库）。
+
+    哨兵在 commit 之后才跑（它要读刚落库的正文），所以这里补一次 summary 更新。
+    失败只影响 meta，不影响正文——吞掉异常并保留原有 power 摘要。
+    """
+    power = dict(power_meta or {})
+    sentinel = (kg_stats or {}).get("sentinel") or {}
+    if sentinel.get("power"):
+        power["audit"] = sentinel["power"]
+    try:
+        summary = dict(gen.summary or {})
+        summary["power"] = power
+        gen.summary = summary
+        db.commit()
+    except Exception as exc:  # noqa: BLE001 —— meta 落库失败不影响正文
+        logging.getLogger(__name__).warning("power meta 落库失败: %s", exc)
+    return power
+
+
+def _apply_era_guard(text: str, project: Project, provider, segment_no: int,
+                     reminders: dict) -> tuple[str, dict]:
+    """生成后时代自检；默认 report（只扫描，不改正文）。
+
+    时代模块未部署（只装国力的单侧批次）时直接返回原文，meta 标 disabled，
+    不改正文、不抛 import 错。
+    """
+    try:
+        from app.kg.era_check import apply_to_text
+    except ImportError:
+        return text, {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "era_guard_not_installed",
+        }
+
+    return apply_to_text(
+        text, project, provider, segment_no=segment_no, reminders=reminders
+    )
+
+
 def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -> dict:
     """生成后把本段事实增量合并进 generated 图谱与事实账本（闭环）。
 
@@ -363,12 +451,16 @@ def _require_distill_ready(db, project) -> None:
     )
 
 
-def _commit_segment(db, project: Project, text: str, summary: str) -> tuple[Generation, int]:
+def _commit_segment(db, project: Project, text: str, summary: str,
+                    meta: dict | None = None) -> tuple[Generation, int]:
     """落库一段：写 Generation + 追加 L1 到摘要树 + 同步扁平归档。
 
     `project.summary` **继续维护**，但它已从「注入源」退为「L1 无损归档」：
     前端/旧接口仍读它，而注入提示词的是 compose_prior 拼的有界前情块。
     两份都写不构成双写风险——它们由同一次 record_l1 派生，且树才是权威。
+
+    `meta` 是纯新增的旁路键（如 `era` / `power` 自检摘要），写进
+    `Generation.summary` 的兄弟键，不改 `{"text": ...}` 的既有读法。
     """
     segment_no = _next_segment_no(db, project.id)
     gen = Generation(
@@ -376,7 +468,7 @@ def _commit_segment(db, project: Project, text: str, summary: str) -> tuple[Gene
         segment_no=segment_no,
         chapter_range=f"段{segment_no}",
         text=text,
-        summary={"text": summary},
+        summary={"text": summary, **(meta or {})},
     )
     db.add(gen)
 
@@ -1313,11 +1405,14 @@ def generate_next_segment(
     # —— 时间线：算出当前剧情点提示（有 outline 才启用；无则 None 走原逻辑）——
     written = _next_segment_no(db, project.id) - 1
     node_prompt = current_node_prompt(project, written, provider, db=db)
+    era_block, era_prompt_meta, power_block, power_meta = _guard_blocks(project)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
         _style_profile(db, project), _style_narrative(db, project),
         style_suffix=overrides[PromptKey.STYLE],
         constraint_note=overrides[PromptKey.CONSTRAINT],
+        era_constraint=era_block,
+        power_constraint=power_block,
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -1353,7 +1448,19 @@ def generate_next_segment(
             summary = provider.summarize(text)
             rewrite_info = info
 
-    gen, segment_no = _commit_segment(db, project, text, summary)
+    # 时代越界自检：默认 report（只扫描、落 meta，不改正文）。
+    # 显式 rewrite 模式下才可能改 text；改过就重算摘要，避免摘要与正文脱节。
+    era_before = text
+    text, era_meta = _apply_era_guard(
+        text, project, provider, written + 1, ctx["reminders"]
+    )
+    if text != era_before:
+        summary = provider.summarize(text)
+
+    gen, segment_no = _commit_segment(
+        db, project, text, summary,
+        meta={"era": {**era_prompt_meta, **era_meta}, "power": power_meta},
+    )
 
     # —— v2.1：exit_condition LLM 判定 → 必要时提前切节点（§13 待定项落地）——
     # 此时本段刚 commit 完，state 还没 advance（advance 是下次预检时触发的）。
@@ -1365,6 +1472,7 @@ def generate_next_segment(
     # 每段生成后增量合并事实到 generated 图（不清空、upsert），
     # 使下一次生成的 reminders 能拿到本段新出现的角色 / 新埋的伏笔。
     kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+    power_meta = _attach_power_meta(db, gen, power_meta, kg_stats)
 
     # v3.0 异步批抽：入队 extractor_v3 落 9 张表（Judge/检索切片/读侧 API 的数据源）。
     # 零 LLM 零阻塞，失败静默兜底。状态透传给前端（v3_extraction 键）。
@@ -1474,11 +1582,14 @@ def generate_next_segment_stream(
     # —— 时间线：算出当前剧情点提示（与同步版同口径，db 用于落库）——
     written = _next_segment_no(db, project.id) - 1
     node_prompt = current_node_prompt(project, written, provider, db=db)
+    era_block, era_prompt_meta, power_block, power_meta = _guard_blocks(project)
     system = build_system_prompt(
         project.title, ctx["reminders"], _style_info(project), project.plot_bible,
         _style_profile(db, project), _style_narrative(db, project),
         style_suffix=overrides[PromptKey.STYLE],
         constraint_note=overrides[PromptKey.CONSTRAINT],
+        era_constraint=era_block,
+        power_constraint=power_block,
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -1518,7 +1629,18 @@ def generate_next_segment_stream(
             summary = provider.summarize(text)
             rewrite_info = info
 
-    gen, segment_no = _commit_segment(db, project, text, summary)
+    # 时代越界自检：与同步版同口径；默认 report，不改正文。
+    era_before = text
+    text, era_meta = _apply_era_guard(
+        text, project, provider, written + 1, ctx["reminders"]
+    )
+    if text != era_before:
+        summary = provider.summarize(text)
+
+    gen, segment_no = _commit_segment(
+        db, project, text, summary,
+        meta={"era": {**era_prompt_meta, **era_meta}, "power": power_meta},
+    )
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
     node_judge = _judge_and_advance(db, project, provider, text, written)
 
@@ -1536,6 +1658,7 @@ def generate_next_segment_stream(
         # done 事件必须照样发出，否则前端表现为"生成卡住且无结果"。
         logging.getLogger(__name__).warning("流式 KG 簿记失败，段落已落库: %s", exc)
         kg_stats = {"merged": False, "reason": f"KG 簿记失败：{str(exc)[:100]}"}
+    power_meta = _attach_power_meta(db, gen, power_meta, kg_stats)
 
     # v3.0 异步批抽：与同步版同口径入队
     v3_extraction = _enqueue_v3_extraction(db, project, segment_no, text)
@@ -1574,6 +1697,9 @@ def generate_next_segment_stream(
         "style_warning": style_warning,
         "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
+        # 两条护栏的自检摘要（era 默认 report；power 为体系类型 + unknown 计数）。
+        "era": {**era_prompt_meta, **era_meta},
+        "power": power_meta,
         # 纯新增键：done 的既有字段语义一个都不改。挂簿记统计是为了让
         # 流式路径也能被观测（此前流式完全不做归档，出了问题无从判断）。
         "kg": kg_stats,
@@ -1632,12 +1758,15 @@ def _build_generation_prompts(
     blocks, _ = compose_prior(
         tree, budget_chars=budget_for_generation(project.generation_length)
     )
+    era_block, _, power_block, _ = _guard_blocks(project)
     system = build_system_prompt(
         project.title, reminders,
         _style_info(project), project.plot_bible, _style_profile(db, project),
         _style_narrative(db, project),
         style_suffix=overrides[PromptKey.STYLE],
         constraint_note=overrides[PromptKey.CONSTRAINT],
+        era_constraint=era_block,
+        power_constraint=power_block,
     )
     user = build_user_prompt(
         l1_chain(tree),
@@ -1734,8 +1863,21 @@ def regenerate_segment_stream(
             "rewritten_chars": None,
         }
 
+    # 时代自检在重生成路径同样生效：默认 report，只在显式 rewrite 时改 text。
+    _, era_prompt_meta, _, power_meta = _guard_blocks(project)
+    era_before = text
+    text, era_meta = _apply_era_guard(
+        text, project, provider, segment_no, reminders
+    )
+    if text != era_before:
+        summary = provider.summarize(text)
+
     target.text = text
-    target.summary = {"text": summary}
+    target.summary = {
+        "text": summary,
+        "era": {**era_prompt_meta, **era_meta},
+        "power": power_meta,
+    }
     target.chapter_range = f"段{segment_no}"
 
     # —— 重生成的 KG 簿记（清空 + 全量 replay）——
@@ -1763,6 +1905,8 @@ def regenerate_segment_stream(
         "summary": summary,
         "summary_tree": tree_stats,
         "rewrite_info": rewrite_info,
+        "era": {**era_prompt_meta, **era_meta},
+        "power": power_meta,
         "id": target.id,
         # 与流式续写路径（generate_next_segment_stream）的 done 键对齐，
         # 让重生成也带上簿记统计，可被前端/API 观测。

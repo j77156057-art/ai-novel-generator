@@ -52,6 +52,7 @@ if _BACKEND not in sys.path:
 import pytest  # noqa: E402
 
 import app.generation.engine as engine_mod  # noqa: E402
+from app.config import settings  # noqa: E402
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.generation.engine import (  # noqa: E402
     _build_generation_prompts,
@@ -65,6 +66,20 @@ from app.models import Generation, Project  # noqa: E402
 #: `describe_narrative`（app/style/narrative.py:2123）产出的块首行——用它做路径级断言，
 #: 不依赖具体规则文字，避免测试与档案内容耦合。
 NARRATIVE_BLOCK_HEADER = "【叙事档案：从参考语料提炼，生成时请遵循以下叙事手法】"
+
+
+def _disable_guards(monkeypatch) -> None:
+    """关闭两条护栏，逐字节等价断言不受注入块干扰。
+
+    时代 / 国力在 config 里是物理分开的独立区块：单侧批次可能缺另一侧字段，
+    此时对不存在的 pydantic 字段 setattr 会报错。缺字段意味着该侧模块也不在，
+    护栏天然不生效——跳过即可，另一侧照常关。
+    """
+    fields = type(settings).model_fields
+    for name in ("era_guard_enabled", "power_guard_enabled"):
+        if name in fields:
+            monkeypatch.setattr(settings, name, False)
+
 
 #: 一份形状合法（rules + forbidden）的叙事档案，`describe_narrative` 会渲染出非空块。
 NARRATIVE = {
@@ -235,10 +250,13 @@ def test_no_archive_project_output_unchanged_documented_equivalence(db_session, 
     """
     proj = _make_project(db_session)
     monkeypatch.setattr(engine_mod, "_style_narrative", lambda db, p: None)
+    # 两条护栏都关闭：关闭态的 system 必须与变更前逐字节一致（真断言，
+    # 不靠「有意扩写」的注释放行）。
+    _disable_guards(monkeypatch)
 
     system, _, _ = _build_generation_prompts(db_session, proj, before_segment=1)
 
-    # 逐字节复刻变更前那条调用（engine.py:907-910，只传 5 个位置参数）
+    # 逐字节复刻变更前那条调用（engine.py:907-910，只传 5 个位置参数）。
     legacy = build_system_prompt(
         proj.title, engine_mod.get_reminders(db_session, proj.id, source="generated"),
         engine_mod._style_info(proj), proj.plot_bible,

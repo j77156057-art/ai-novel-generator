@@ -27,6 +27,7 @@ import pytest  # noqa: E402
 
 import app.generation.engine as engine_mod  # noqa: E402
 from app.agents.prompt_overrides import PromptKey, set_active_override  # noqa: E402
+from app.config import settings  # noqa: E402
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.generation.engine import (  # noqa: E402
     _build_generation_prompts,
@@ -54,6 +55,19 @@ DIRECTIVE_TEXT = "额外指令测试串：结尾必须落在意外动作上"
 
 #: 干净正文：不含任何 AI_FLAVOR_PATTERNS，也不触发重写
 CLEAN_TEXT = "林夜走在长街上。夜风微凉，街灯昏黄。他停步回望，身影被拉得很长。"
+
+
+def _disable_guards(monkeypatch) -> None:
+    """关闭两条护栏，逐字节等价断言不受注入块干扰。
+
+    时代 / 国力在 config 里是物理分开的独立区块：单侧批次可能缺另一侧字段，
+    此时对不存在的 pydantic 字段 setattr 会报错。缺字段意味着该侧模块也不在，
+    护栏天然不生效——跳过即可，另一侧照常关。
+    """
+    fields = type(settings).model_fields
+    for name in ("era_guard_enabled", "power_guard_enabled"):
+        if name in fields:
+            monkeypatch.setattr(settings, name, False)
 
 
 class RecordingProvider:
@@ -191,8 +205,11 @@ def test_continue_paths_carry_override_end_to_end(db_session):
 # ---------------------------------------------------------------------------
 
 
-def test_no_override_output_unchanged(db_session):
+def test_no_override_output_unchanged(db_session, monkeypatch):
     """未设置覆写时：无覆写标记，且与「改动前旧参数直调」逐字节一致。"""
+    # 两条护栏都在此显式关闭：关闭态必须与旧版逐字节一致，这是 prompt 漂移
+    # 的唯一自动护栏。护栏打开时的块注入是功能本身，不在本条断言语义内。
+    _disable_guards(monkeypatch)
     proj = _make_project(db_session)
 
     system, user, max_chars = _build_generation_prompts(db_session, proj)

@@ -167,6 +167,12 @@ def _override_section(header: str, text: str | None) -> str:
     return f"【{header}】\n{body}\n"
 
 
+def _inline_block(text: str | None) -> str:
+    """渲染一段自带标题的约束块；空文本返回 `""`（逐字节兼容）。"""
+    body = (text or "").strip()
+    return f"{body}\n\n" if body else ""
+
+
 def build_system_prompt(
     project_title: str,
     reminders: dict,
@@ -177,6 +183,8 @@ def build_system_prompt(
     *,
     style_suffix: str | None = None,
     constraint_note: str | None = None,
+    era_constraint: str | None = None,
+    power_constraint: str | None = None,
 ) -> str:
     """静态系统提示——整轮生成保持不变，置于最前，保证提示词缓存命中率。
 
@@ -193,6 +201,9 @@ def build_system_prompt(
     传入——本函数保持纯函数、不接 db。为空（未设置覆写）时输出与旧版**逐字节
     相同**；非空时分别拼在【风格】区之后与【续写纪律】之后，块标题标明来源
     是「作者助理微调」，防止模型误以为是参考作者的规则。
+
+    `era_constraint` / `power_constraint` 由 engine 从项目设定算好后传入
+    （时代越界约束 / 量级与体系约束）。两者都为空时输出与旧版**逐字节相同**。
     """
     # —— 合并而非遮蔽 ——
     # 旧实现「有 plot_bible 就只取 bible」会让生成后抽取的事实（KG reminders）被静默丢弃：
@@ -224,6 +235,8 @@ def build_system_prompt(
         "你可以在后续段落里慢慢推进、隐晦呼应，或暂时不提；"
         "**不要在本次续写中集中兑现多个伏笔**，也不要用台词直接说出伏笔本身：\n"
         f"{hole_lines}\n\n"
+        f"{_inline_block(era_constraint)}"
+        f"{_inline_block(power_constraint)}"
         f"【风格】{_style_block(style_dims)}\n"
         "（以上维度是倾向参考，不要直接翻译成类型套路或标签化文风。）\n"
         f"{_profile_block(style_profile)}\n"

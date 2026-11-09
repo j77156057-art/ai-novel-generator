@@ -70,6 +70,18 @@ class Settings(BaseSettings):
     chunk_overlap: int = 200
     upload_max_bytes: int = 20_000_000
 
+    # ------------------------------------------------------------------
+    # 时代越界护栏（era_guard，独立区块）
+    #
+    # **默认关闭**，按项目显式打开；打开后默认 report（只扫描、落 meta，
+    # 不改正文）。实验已证明句级独立重写会把语义拼散（铜镜→导航、
+    # 电脑→砚台），所以改写还要再把 ERA_GUARD_MODE 设成 "rewrite"。
+    # 项目没有显式 genre / 世界设定时不注入约束（meta 记 baseline_unknown）。
+    # ------------------------------------------------------------------
+    era_guard_enabled: bool = False
+    era_guard_mode: str = "report"  # report | rewrite
+    era_guard_max_rounds: int = 2
+
     # Embedding（M2 混合检索）
     embedding_provider: str = "dashscope"  # dashscope | local
     embedding_dim: int = 1536
@@ -201,6 +213,14 @@ class Settings(BaseSettings):
     #: 兜底值与 config/providers.yaml 的 distiller.max_tokens 保持一致。
     distiller_max_tokens: int = int(_DISTILLER_DEFAULTS.get("max_tokens", 32768))
     distiller_timeout: int = int(_DISTILLER_DEFAULTS.get("timeout", 180))
+
+    # ------------------------------------------------------------------
+    # 量级与体系护栏（power_guard，独立区块）
+    #
+    # 默认开，但只做与体系类型匹配的检查；关闭后退回改造前的单判据
+    # （realm_regression）行为。
+    # ------------------------------------------------------------------
+    power_guard_enabled: bool = True
 
     def _legacy_channel_field(self, provider: str, field: str) -> str:
         """按渠道名取 legacy 字段值（Assistant / Distiller 的 api_key / base_url 回退用）。
