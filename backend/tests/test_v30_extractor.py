@@ -34,7 +34,8 @@ from sqlalchemy.orm import sessionmaker
 from app.db import Base
 import app.models  # noqa: F401
 from app.kg.extractor_v3 import (
-    normalize_extraction, _parse_and_normalize, extract_segment, extract_batch,
+    ERROR_FIELD, normalize_extraction, _parse_and_normalize, extract_segment,
+    extract_batch,
 )
 from app.models import (
     KgEntity, KgRelation, KgRelationEvolution, KgEvent, KgCharacterState,
@@ -202,8 +203,14 @@ check("带前后垃圾解析", _parse_and_normalize(messy)["entities"][0]["canon
 think = "让我想想..." + good + "结论如上"
 check("think 块包裹解析", _parse_and_normalize(think)["entities"][0]["canonical_name"], "甲")
 
-check("空字符串兜底", _parse_and_normalize(""), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": [], "downgraded": [], "conflicts": []})
-check("垃圾非 JSON 兜底", _parse_and_normalize("完全不是 JSON 的输出"), {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": [], "downgraded": [], "conflicts": []})
+_EMPTY_SKEL = {"entities": [], "relations": [], "events": [], "event_links": [], "entity_knowledge": [], "state_changes": [], "foreshadows": [], "rejected": [], "downgraded": [], "conflicts": []}
+# 空串 / 非 JSON 都是**失败**（不是「抽了但没有」），必须带 ERROR_FIELD
+_r_empty = _parse_and_normalize("")
+check("空字符串带失败标记", _r_empty.pop(ERROR_FIELD, None) is not None, True)
+check("空字符串空骨架", _r_empty, _EMPTY_SKEL)
+_r_garbage = _parse_and_normalize("完全不是 JSON 的输出")
+check("垃圾非 JSON 带失败标记", _r_garbage.pop(ERROR_FIELD, None) is not None, True)
+check("垃圾非 JSON 空骨架", _r_garbage, _EMPTY_SKEL)
 
 # ====================================================================
 # 6. extract_segment / extract_batch（mock provider）
@@ -231,6 +238,7 @@ check("extract_segment 调 1 次 LLM", p.calls, 1)
 p_raise = MockProvider("", raise_exc=True)
 res_err = extract_segment(p_raise, "text", segment_no=1)
 check("extract_segment 异常兜底空骨架", res_err["entities"], [])
+check("extract_segment 异常带失败标记", bool(res_err.get(ERROR_FIELD)), True)
 
 # 批抽：5 段一次
 p2 = MockProvider(mock_reply)

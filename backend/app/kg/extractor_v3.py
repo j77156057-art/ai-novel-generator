@@ -178,7 +178,20 @@ def _as_float(v, default: float) -> float:
         return default
 
 
-def normalize_extraction(raw: dict) -> dict:
+#: 抽取失败标记键。`normalize_extraction` 在「LLM 调用失败 / 响应不可解析」时
+#: 额外写入本键（值为失败原因）；**真实的「这一段确实没有实体」不写本键**。
+#: 调用方（batch_worker）据此把这一批判 failed——否则空骨架会被记成
+#: 「抽了但没有」，把一次抽取失败伪装成一次成功。
+ERROR_FIELD = "_error"
+
+
+def _mark_error(out: dict, error: str | None) -> dict:
+    if error:
+        out[ERROR_FIELD] = str(error)[:300]
+    return out
+
+
+def normalize_extraction(raw: dict, *, error: str | None = None) -> dict:
     """schema 漂移防御：把 LLM 原始输出归一成规范软 schema。
 
     - 字段名别名映射（entities↔characters、from↔source…）
@@ -189,9 +202,10 @@ def normalize_extraction(raw: dict) -> dict:
     - 缺键字段按类型默认值兜底（不阻塞落库）
     """
     if not isinstance(raw, dict):
-        return {"entities": [], "relations": [], "events": [], "event_links": [],
-                "entity_knowledge": [], "state_changes": [], "foreshadows": [],
-                "rejected": [], "downgraded": [], "conflicts": []}
+        return _mark_error({"entities": [], "relations": [], "events": [],
+                            "event_links": [], "entity_knowledge": [],
+                            "state_changes": [], "foreshadows": [], "rejected": [],
+                            "downgraded": [], "conflicts": []}, error)
 
     out = {
         "entities": [],
@@ -357,7 +371,7 @@ def normalize_extraction(raw: dict) -> dict:
             "learned_at_sequence": _as_int(_pick(k, _KNOWLEDGE_ALIASES["learned_at_sequence"])),
         })
 
-    return out
+    return _mark_error(out, error)
 
 
 def _term_in_text(term: str, text: str) -> bool:
@@ -611,16 +625,20 @@ _BATCH_TEMPLATE = (
 
 
 def extract_segment(provider, text: str, segment_no: int, chapter: int | None = None) -> dict:
-    """单段抽取（LLM）。失败返回空骨架（不阻塞主链）。
+    """单段抽取（LLM）。失败返回**带 `_error` 的空骨架**（不抛异常，不阻塞主链）。
 
-    返回 normalize_extraction 后的规范 dict。
+    返回 normalize_extraction 后的规范 dict。调用方必须检查 `ERROR_FIELD`：
+    有值时这一批是抽取失败，不是「抽了但没有」。
     """
     user = _SEGMENT_TEMPLATE.format(segment_no=segment_no, chapter=chapter or "?", text=text)
     try:
         raw = provider.chat(_EXTRACT_SYSTEM, user)
-    except Exception:  # noqa: BLE001 —— 抽取失败静默兜底
-        return normalize_extraction({})
-    return validate_kinship_terms(reconcile_owns(_parse_and_normalize(raw), text), text)
+    except Exception as exc:  # noqa: BLE001 —— 不抛，但必须留失败标记
+        return normalize_extraction({}, error=f"llm_call_failed: {exc}")
+    out = _parse_and_normalize(raw)
+    if out.get(ERROR_FIELD):
+        return out
+    return validate_kinship_terms(reconcile_owns(out, text), text)
 
 
 def extract_batch(provider, texts: list[tuple[int, str, int | None]]) -> dict:
@@ -629,6 +647,7 @@ def extract_batch(provider, texts: list[tuple[int, str, int | None]]) -> dict:
     texts: [(segment_no, text, chapter), ...]
     返回的 entities/events 不带 segment_no（落库时由调用方补：events.segment_no
     在批内无法精确归属，统一记批首段号）。
+    失败返回带 `ERROR_FIELD` 的空骨架，调用方据此判 failed。
     """
     if not texts:
         return normalize_extraction({})
@@ -641,11 +660,13 @@ def extract_batch(provider, texts: list[tuple[int, str, int | None]]) -> dict:
     user = _BATCH_TEMPLATE.format(n=len(texts), joined=joined)
     try:
         raw = provider.chat(_EXTRACT_SYSTEM, user)
-    except Exception:  # noqa: BLE001
-        return normalize_extraction({})
+    except Exception as exc:  # noqa: BLE001 —— 不抛，但必须留失败标记
+        return normalize_extraction({}, error=f"llm_call_failed: {exc}")
+    out = _parse_and_normalize(raw)
+    if out.get(ERROR_FIELD):
+        return out
     full_text = "\n".join(t for _s, t, _c in texts)
-    return validate_kinship_terms(reconcile_owns(_parse_and_normalize(raw), full_text),
-                                  full_text)
+    return validate_kinship_terms(reconcile_owns(out, full_text), full_text)
 
 
 # 定向二遍抽取：主抽里 faction / power_system 为空时的补齐通道。
@@ -711,9 +732,11 @@ def extract_targeted(provider, text: str, segment_no: int, chapter: int | None =
     user = _TARGETED_USER.format(segment_no=segment_no, chapter=chapter or "?", text=text)
     try:
         raw = provider.chat(_TARGETED_SYSTEM, user)
-    except Exception:  # noqa: BLE001
-        return normalize_extraction({})
+    except Exception as exc:  # noqa: BLE001 —— 不抛，但必须留失败标记
+        return normalize_extraction({}, error=f"llm_call_failed: {exc}")
     out = _parse_and_normalize(raw)
+    if out.get(ERROR_FIELD):
+        return out
     keep = set(kinds)
     out["entities"] = [e for e in out["entities"] if e["kind"] in keep]
     # 关系只保留两端都在保留实体里的
@@ -726,9 +749,13 @@ def extract_targeted(provider, text: str, segment_no: int, chapter: int | None =
 
 
 def _parse_and_normalize(raw: str) -> dict:
-    """LLM 输出 → JSON → normalize_extraction。三级兜底。"""
+    """LLM 输出 → JSON → normalize_extraction。三级兜底。
+
+    「模型回了空串」与「回了非 JSON 垃圾」都是**抽取失败**，写 `ERROR_FIELD`；
+    只有「解析出合法 JSON、但里面确实没有实体」才是真空（不写标记）。
+    """
     if not raw:
-        return normalize_extraction({})
+        return normalize_extraction({}, error="empty_response: 模型返回空串")
     data = None
     # 1) 整体就是 JSON
     try:
@@ -747,7 +774,8 @@ def _parse_and_normalize(raw: str) -> dict:
             except (json.JSONDecodeError, ValueError):
                 data = None
     if data is None:
-        return normalize_extraction({})
+        return normalize_extraction(
+            {}, error=f"parse_failed: 无法从模型输出解析出 JSON（前 80 字：{raw[:80]!r}）")
     return normalize_extraction(data)
 
 

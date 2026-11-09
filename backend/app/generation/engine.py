@@ -622,7 +622,10 @@ def _enqueue_v3_extraction(db, project: Project, segment_no: int, text: str) -> 
 
     与 v2.6 同步合并（_merge_segment_into_graph）并存：同步合并喂 reminders（本段
     立即可见），v3.0 批抽落 9 张表（供 Judge/检索切片/读侧 API）。
-    零 LLM、零阻塞：enqueue 只进内存队列，worker 线程后台抽。失败静默兜底。
+    零 LLM、零阻塞：enqueue 只进内存队列，worker 线程后台抽。
+    失败**不阻断生成主链，但必须报出去**：入队行写不进库时 `enqueue_segment`
+    抛 `KgEnqueueError`，这里转成 `{"enqueued": False, "error": ...}` 返回给调用方
+    （随响应下发），并记 error 日志——不再只 warning 一句就吞掉。
     """
     try:
         from app.kg import batch_worker as bw
@@ -632,7 +635,10 @@ def _enqueue_v3_extraction(db, project: Project, segment_no: int, text: str) -> 
         bw.enqueue_segment(db, project.id, segment_no, text, chapter=chapter)
         return {"enqueued": True, "pending": bw._queue.pending_count(project.id)}
     except Exception as exc:  # noqa: BLE001 —— 批抽是增强，失败不阻断
-        return {"enqueued": False, "error": str(exc)[:100]}
+        logging.getLogger(__name__).error(
+            "v3 批抽入队失败（project %s seg %s）：%s", project.id, segment_no, exc,
+            exc_info=True)
+        return {"enqueued": False, "error": str(exc)[:200]}
 
 
 def _shadow_ingest(project: Project, segment_no: int, text: str) -> dict:

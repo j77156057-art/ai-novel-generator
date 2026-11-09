@@ -169,12 +169,13 @@ bw._get_provider = _orig
 row3 = db.scalar(select(AgentRun).where(
     AgentRun.project_id == 1, AgentRun.role == bw.ROLE_KG_EXTRACT,
     AgentRun.request_hash == hashlib.sha256(b"1:3").hexdigest()))
-# 空骨架批：探针通过但 LLM 实际没干活 → 记 success + empty 标记
-# （探针只探「连不连得上」，不探「抽不抽得出」——空骨架代表 LLM 可达但服从性
-# 归零，这种批重试通常也没用，暴露 empty 给人判断比自动重试诚实）
-check("空骨架 → success + empty 标记", row3.status, "success")
+# 非 JSON 响应 = 抽取失败（不是「抽了但没有」）→ 重试 RETRY_LIMIT+1 次 → failed。
+# 以前这里会被 extract_batch 的内部兜底吞成空骨架并记 success + model="(empty)"，
+# 把一次失败伪装成成功；现在靠 extractor_v3.ERROR_FIELD 穿透到 worker。
+check("非 JSON 响应 → failed", row3.status, "failed")
 note3 = _json.loads(row3.note)
-check_true("note 标记 empty", note3.get("empty") is True)
+check_true("note 带解析失败原因", "parse_failed" in (note3.get("error") or ""))
+check("失败行不写 model=(empty)", row3.model != "(empty)", True)
 
 # ====================================================================
 # 3b. 抛异常路径（provider.chat 直接炸）→ 重试 RETRY_LIMIT+1 次 → failed
@@ -211,11 +212,12 @@ check_true("note 带 error", "LLM 炸了" in (note4.get("error") or ""))
 # 4. worker_status：汇总 + pending + alive
 # ====================================================================
 st = bw.worker_status(db, 1)
-# 3 个 success：段 1（FakeProvider 抽到 X）+ 段 2（FakeProvider 抽到 X）+ 段 3（BoomThrough
-# 探针过但整批空骨架 → success + empty 标记；都按 status=success 计 success）
-check("summary success 计数（含 empty 批）", st["summary"]["success"], 3)
-check("summary failed 计数", st["summary"]["failed"], 1)
-check("summary empty 计数", st["summary"]["empty"], 1)
+# 2 个 success：段 1 / 段 2（FakeProvider 同批抽到实体）
+# 2 个 failed：段 3（非 JSON 响应）、段 4（provider 直接抛异常）
+# 0 个 empty：本次没有「LLM 正常返回但确实无实体」的批次
+check("summary success 计数", st["summary"]["success"], 2)
+check("summary failed 计数", st["summary"]["failed"], 2)
+check("summary empty 计数", st["summary"]["empty"], 0)
 check_true("recent_runs 4 行", len(st["recent_runs"]) == 4)
 check_true("recent_runs 新的在前", st["recent_runs"][0]["segment_no"] == 4)
 check_true("worker_alive 是 bool", isinstance(st["worker_alive"], bool))
@@ -243,8 +245,8 @@ check("不存在 id 静默跳过", (r3["requeued"], r3["missing"]), (0, []))
 # 6. 端点：GET /worker/status + POST /worker/requeue
 # ====================================================================
 data = client.get("/api/projects/1/kg-v3/worker/status").json()
-# row4 已被上面 requeue 翻 running；此时 failed=0, running=1（row4）+ stuck 行另计
-check("端点 summary failed+running", data["summary"]["failed"] + data["summary"]["running"], 1)
+# row4 已被上面 requeue 翻 running；此时 failed=1（row3 非 JSON 失败）、running=1（row4）
+check("端点 summary failed+running", data["summary"]["failed"] + data["summary"]["running"], 2)
 check_true("端点返回 worker_alive 键", "worker_alive" in data)
 
 rr = client.post("/api/projects/1/kg-v3/worker/requeue",

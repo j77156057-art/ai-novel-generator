@@ -108,21 +108,31 @@ _worker_started = False
 _worker_lock = threading.Lock()
 
 
+class KgEnqueueError(RuntimeError):
+    """入队失败：AgentRun 入队行没能持久化。
+
+    以前这里是「warning 后 return None」：任务已进内存队列，但库里没有任何痕迹，
+    进程重启后既查不到也捞不回——静默丢任务。现在改为向上抛，由调用方决定
+    是否降级（生成主链不因 KG 失败而中断，但必须把失败报出去）。
+    """
+
+
 def enqueue_segment(db: Session, project_id: int, segment_no: int, text: str,
-                    chapter: int | None = None) -> int | None:
+                    chapter: int | None = None) -> int:
     """段 commit 后调用：入队等待异步批抽。零 LLM、零阻塞。
 
-    同时写一行 AgentRun(role=kg_batch_extract, status=running)——**与 generation
-    共用调用方的事务**（本函数不 commit），随段一起落库：入队即持久化。
-    request_hash = sha256("{project_id}:{segment_no}")，稳定可关联（重捞时按它
-    找回同一行）。失败静默返回 None（可观测性自身不能拖垮生成主链）。
-    返回 AgentRun id（调用方目前不用，测试/调试用）。
+    顺序固定为「先落库、再入队」：
+    1. 写一行 AgentRun(role=kg_batch_extract, status=running) 并**自己 commit**。
+       不再依赖调用方后续（如 `_rollup_summary_tree`）的 commit——那一步之前一旦
+       抛异常，入队行就丢了，worker 捞不到、库里也查不到。
+    2. 行落地成功后才进内存队列，避免 worker 抢在 commit 之前处理、查不到行。
+
+    request_hash = sha256("{project_id}:{segment_no}")，稳定可关联（重捞时按它找回）。
+    失败抛 `KgEnqueueError`（调用方必须感知），不返回 None。
+    返回 AgentRun id。
     """
     from datetime import datetime, timezone
 
-    _queue.put(_QueueItem(project_id=project_id, segment_no=segment_no,
-                          text=text, chapter=chapter))
-    _signal_flush()
     try:
         payload = json.dumps({"segment_no": segment_no, "chapter": chapter},
                              ensure_ascii=False)
@@ -134,13 +144,18 @@ def enqueue_segment(db: Session, project_id: int, segment_no: int, text: str,
             note=payload,
         )
         db.add(row)
-        db.flush()  # 拿 id；commit 由调用方（generation 事务）负责
-        return row.id
-    except Exception:  # noqa: BLE001 —— 可观测性失败不阻断生成
-        import logging
-        logging.getLogger(__name__).warning(
-            "kg 批抽 AgentRun 写入失败（seg %s）", segment_no, exc_info=True)
-        return None
+        db.commit()  # 入队行自己落库：不依赖后续调用方的 commit
+        row_id = row.id
+    except Exception as exc:  # noqa: BLE001 —— 转成调用方可感知的错误
+        db.rollback()
+        raise KgEnqueueError(
+            f"kg 批抽入队行写入失败（project {project_id} seg {segment_no}）：{exc}"
+        ) from exc
+
+    _queue.put(_QueueItem(project_id=project_id, segment_no=segment_no,
+                          text=text, chapter=chapter))
+    _signal_flush()
+    return row_id
 
 
 def _signal_flush() -> None:
@@ -202,7 +217,7 @@ def _run_batches(project_id: int) -> None:
     from datetime import datetime, timezone
 
     from app.db import SessionLocal
-    from app.kg.extractor_v3 import extract_batch, ExtractionStats
+    from app.kg.extractor_v3 import ERROR_FIELD, ExtractionStats, extract_batch
 
     def _rows_for(batch: list[_QueueItem]) -> dict[int, AgentRun]:
         """本批各段对应的 AgentRun 行（request_hash 精确匹配）。"""
@@ -234,16 +249,19 @@ def _run_batches(project_id: int) -> None:
             texts = [(it.segment_no, it.text, it.chapter) for it in batch]
             last_exc: Exception | None = None
             stats: ExtractionStats | None = None
-            # 探针：extract_batch 内部把 LLM 异常吞成空骨架（extract_segment 的
-            # 静默兜底），LLM 挂掉的异常永远到不了这里——会被记成「成功但 0 产出」。
-            # 每次尝试先用 1 次裸 chat 探活：provider 挂则本次尝试失败进重试；
-            # 探针过了才让整批文本进 LLM（省得挂着的 provider 白收 5 段长文）。
-            # 探针只探「连不连得上」，不探「抽不抽得出」——空骨架（可达但服从性
-            # 归零）走下面的 empty 标记，重试通常没用，暴露给人判断更诚实。
+            # 探针：extract_batch 内部不抛异常（避免 KG 拖垮生成主链），失败时
+            # 返回带 ERROR_FIELD 的空骨架。所以这里既有「裸 chat 探活」兜 provider
+            # 连不上，也有「ERROR_FIELD 判定」兜「连得上但抽不出来」——后者以前
+            # 会被记成 success + model="(empty)"，把失败伪装成成功，现已改为 failed。
+            # 注意区分：合法 JSON 但确实没实体（真空）不写 ERROR_FIELD，仍记 success，
+            # 只打 empty 标记。
             for _attempt in range(RETRY_LIMIT + 1):
                 try:
                     provider.chat("连通性探针，请回复 ok", "ok")
                     result = extract_batch(provider, texts)
+                    err = result.get(ERROR_FIELD)
+                    if err:
+                        raise RuntimeError(str(err))
                     stats = _persist_extraction(db, project_id, result, batch)
                     last_exc = None
                     break
@@ -252,7 +270,8 @@ def _run_batches(project_id: int) -> None:
                     last_exc = exc
             now = datetime.now(timezone.utc)
             if last_exc is None and stats is not None:
-                # 空骨架检测：真实小说文本几乎不可能整批 0 产出——大概率 LLM 挂了
+                # 真空：LLM 正常返回、解析成功，但整批确实 0 产出。
+                # 这不是失败（有些段落就是没有可抽实体），但要看得出「没抽到东西」。
                 empty = (stats.entities_upserted == 0 and stats.events_added == 0
                          and stats.relations_upserted == 0)
                 note_extra: dict = {"batch_stats": stats.__dict__.copy()}
@@ -261,7 +280,7 @@ def _run_batches(project_id: int) -> None:
                 for row in rows.values():
                     row.status = "success"
                     row.finished_at = now
-                    row.model = "(empty)" if empty else None
+                    row.model = None
                     _merge_note(row, note_extra)
                 db.commit()
             else:
