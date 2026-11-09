@@ -139,6 +139,23 @@ def db_session():
         s.close()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_batch_worker(monkeypatch):
+    """隔离 v3 异步批抽后台线程，避免它拿到用例里 monkeypatch 的 provider 单例。
+
+    生成段 commit 后会 `_enqueue_v3_extraction` 启一个进程级后台 worker；它
+    `_get_provider()` 走的是同一个 `llm_provider_mod._PROVIDER` 单例。用例用
+    假 Writer 替换该单例后，后台线程会在计数窗口里额外调 `chat`（探活 + 批抽），
+    使「闭环零额外 LLM」断言随调度抖动（HEAD 上 10 次复现 2 次）。
+
+    这里让 worker 取不到 provider：批抽降级为既有的「零 LLM mention 索引」分支，
+    产品行为不变，只是本文件的计数/断言不再被后台线程污染。
+    """
+    from app.kg import batch_worker
+
+    monkeypatch.setattr(batch_worker, "_get_provider", lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # harness
 # ---------------------------------------------------------------------------
