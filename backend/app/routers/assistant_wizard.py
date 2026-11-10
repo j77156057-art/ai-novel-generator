@@ -13,10 +13,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from sqlalchemy import desc
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app import wizard_actions as actions
@@ -26,6 +27,7 @@ from app import wizard_flow as flow
 from app.db import get_db
 from app.models import (
     AssistantWizardSession,
+    DistillRun,
     Generation,
     KgCharacterState,
     KgEntity,
@@ -33,8 +35,16 @@ from app.models import (
     KgRelation,
     Project,
     RawNovel,
+    WizardNotice,
 )
 from app.schemas import StrictRequest
+from app.style.jobs import (
+    ACTIVE_STATUSES,
+    HEALTH_STALLED,
+    distill_health,
+    distill_run_to_dict,
+    emit_notice,
+)
 from app.style.narrative import DEFAULT_TIER, list_tiers
 
 router = APIRouter(prefix="/api/assistant/wizard", tags=["assistant-wizard"])
@@ -247,6 +257,64 @@ def _session_view(session: AssistantWizardSession) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# 蒸馏进度与看护（引导卡片里的一句话进度 + 完成/卡住通知）
+# ---------------------------------------------------------------------------
+
+
+def _latest_run(db: Session, project_id: int) -> DistillRun | None:
+    return db.scalar(
+        select(DistillRun)
+        .where(DistillRun.project_id == project_id)
+        .order_by(desc(DistillRun.id))
+    )
+
+
+def _notice_view(row: WizardNotice) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "kind": row.kind,
+        "job_id": row.job_id,
+        "payload": row.payload or {},
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _materialize_stalled(db: Session, run: DistillRun | None) -> None:
+    """把「疑似卡住」落成一条持久化通知（同一任务只落一次）。
+
+    为什么是**读时物化**而不是后台定时器：卡住的典型形态就是「后台线程已经
+    不干活了」，指望它自己发提醒是不现实的。真正的观察者只能是前端轮询——
+    每次轮询顺带问一句「这个任务按现在的判据算不算卡住」，算就落一条通知，
+    用户下次（哪怕隔一天）打开助手仍能看到这条提醒。
+
+    `emit_notice` 按 (job_id, kind) 去重，所以重复轮询不会刷屏。
+    """
+    if run is None or run.status not in ACTIVE_STATUSES:
+        return
+    health, note = distill_health(run)
+    if health != HEALTH_STALLED or not note:
+        return
+    emit_notice(
+        db,
+        run,
+        "distill_stalled",
+        {
+            "job_id": run.id,
+            "tier": run.tier,
+            "status": run.status,
+            "stage": run.stage,
+            "health": health,
+            "message": f"蒸馏疑似卡住：{note}",
+            "progress_current": int(run.progress_current or 0),
+            "progress_total": int(run.progress_total or 0),
+            "expected_minutes": run.expected_minutes,
+            "elapsed_minutes": distill_run_to_dict(run).get("elapsed_minutes"),
+            "next": "建议：先按上面的分钟数再等一会；仍无进度就重新提交一次（已完成的部分不会丢）。",
+        },
+    )
+
+
 def _state(
     db: Session,
     project: Project,
@@ -265,7 +333,15 @@ def _state(
         question = flow.build_question(session.step_key, answers, ctx)
         if ack:
             question["message"] = ack + "\n\n" + str(question.get("message") or "")
-    out = {"session": _session_view(session), "question": question}
+    run = _latest_run(db, project.id)
+    out = {
+        "session": _session_view(session),
+        "question": question,
+        # 最近一条蒸馏任务（含 health / 已运行分钟 / 预计分钟）。
+        # 卡片里只展示「一句话 + 百分比」，数据全在这里，刷新/断线重连后拿到的
+        # 就是同一份 DB 事实，不靠前端内存续命。
+        "distill": distill_run_to_dict(run) if run is not None else None,
+    }
     if ack:
         out["ack"] = ack
     return out
@@ -281,9 +357,61 @@ def get_state(project_id: int, db: Session = Depends(get_db)) -> dict:
     """恢复引导：没有会话时返回 session=null，前端展示干净的空对话。"""
     project = _require_project(db, project_id)
     session = _any_session(db, project_id)
+    run = _latest_run(db, project.id)
+    distill = distill_run_to_dict(run) if run is not None else None
     if session is None or session.status == "aborted":
-        return {"session": None, "question": None, "project_hint": _project_hint(project)}
+        return {
+            "session": None,
+            "question": None,
+            "distill": distill,
+            "project_hint": _project_hint(project),
+        }
     return _state(db, project, session)
+
+
+@router.get("/{project_id}/notices")
+def list_notices(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """未消费的蒸馏通知 + 最近一条任务状态（一次轮询同时更新进度和回执）。
+
+    这就是「完成唤醒」的**可运行机制**：任务终态时后台把回执写进
+    `wizard_notices`；前端每 3 秒拉这个接口，拿到未消费的行就渲染成助手气泡，
+    然后调 ack 标掉。服务重启后未消费的行仍在库里，下次进助手立刻补发。
+
+    读时还会顺带做一次「疑似卡住」判定（`_materialize_stalled`），所以卡住提醒
+    不依赖后台线程还活着。
+    """
+    _require_project(db, project_id)
+    run = _latest_run(db, project_id)
+    _materialize_stalled(db, run)
+    rows = (
+        db.scalars(
+            select(WizardNotice)
+            .where(
+                WizardNotice.project_id == project_id,
+                WizardNotice.consumed_at.is_(None),
+            )
+            .order_by(WizardNotice.id)
+        )
+        .all()
+    )
+    return {
+        "items": [_notice_view(r) for r in rows],
+        "distill": distill_run_to_dict(run) if run is not None else None,
+    }
+
+
+@router.post("/{project_id}/notices/{notice_id}/ack")
+def ack_notice(
+    project_id: int, notice_id: int, db: Session = Depends(get_db)
+) -> dict:
+    """标记通知已消费（前端渲染完就 ack，避免下次进来重复弹）。"""
+    row = db.get(WizardNotice, notice_id)
+    if row is None or row.project_id != project_id:
+        raise HTTPException(status_code=404, detail="notice 不存在")
+    if row.consumed_at is None:
+        row.consumed_at = datetime.now(timezone.utc)
+        db.commit()
+    return {"ok": True, "id": row.id}
 
 
 @router.post("/start")

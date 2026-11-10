@@ -734,6 +734,59 @@ class DistillRun(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+    # —— 看护用的两个字段（只服务「疑似卡住」判断，不参与蒸馏逻辑）——
+    #
+    # progress_at：最后一次进度**心跳**（每次 progress 回调、以及进入 running 时写）。
+    #   为什么不能拿 started_at 代替：进度可能已经写了很多块，只是最后一块慢；
+    #   只有「最后一次进度时间」才能算出「多久没有动静」。
+    # 为 NULL 的老行按 started_at / created_at 兜底（见 jobs.distill_health）。
+    progress_at = Column(DateTime, nullable=True)
+    # expected_minutes：提交时按语料字数外推的预计耗时（分钟）。**纯估算**，
+    #   界面必须标注「非实测」；NULL 表示算不出来（如语料未统计），此时只做
+    #   「无进度时长」判断，不做「超预计倍数」判断——宁可少报，不许编。
+    expected_minutes = Column(Integer, nullable=True)
+
+
+class WizardNotice(Base):
+    """引导/蒸馏的**持久化通知**（完成回执、疑似卡住提醒的投递队列）。
+
+    ## 为什么不是「前端轮询到终态就直接画一条消息」
+
+    那样确实能显示回执，但**只对当时开着页面的用户有效**：用户关掉页面去睡觉，
+    服务重启后回到助手，那条 message 没有任何地方存着，就永远丢了。用户的原话是
+    「蒸馏完成了会自己唤醒助手吧」——唤醒的消息必须能跨刷新、跨重启被再次捡起。
+
+    所以通知落库、前端轮询、取走即 ack（`consumed_at`）。服务重启后：
+    - 已完成但没被消费的行原样还在 → 下次进助手立刻补发；
+    - 被 `reap_stale_runs` 收割成 failed 的任务 → 由收割逻辑补写一条
+      `distill_failed`（interrupted=True），同样不会丢。
+
+    ## 去重
+
+    `(job_id, kind)` 唯一：同一个任务的成功回执/失败回执/卡住提醒各只有一条。
+    前端 ack 之后即使再次轮询也不会重复弹。
+
+    ## 为什么 payload 是 JSON 而不是若干列
+
+    回执内容随任务类型变化（成功有章数/规则数/失败块，失败有错误原因，卡住有
+    最后阶段和建议），拆成列会有一半永远是 NULL。payload 里存已渲染好的
+    `message` + 结构化数字，前端直接展示，不需要再拼。
+    """
+
+    __tablename__ = "wizard_notices"
+    __table_args__ = (
+        UniqueConstraint("job_id", "kind", name="uq_wizard_notice_job_kind"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    job_id = Column(Integer, ForeignKey("distill_runs.id"), nullable=False)
+    # distill_done | distill_failed | distill_stalled
+    kind = Column(String(32), nullable=False)
+    payload = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    # 前端取走并展示后回填；NULL = 还没被消费（重启后照样会被捡起来）
+    consumed_at = Column(DateTime, nullable=True)
 
 
 class StyleDistill(Base):

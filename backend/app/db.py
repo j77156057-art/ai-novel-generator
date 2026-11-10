@@ -159,6 +159,11 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # —— 引导会话的流程改写（跳过/排序/自定义问题，白名单约束）——
         # 老库补默认空对象，answers/history 语义不受影响。
         ("assistant_wizard_sessions", "overrides", "JSON NOT NULL DEFAULT '{}'"),
+        # —— 蒸馏任务看护：最后一次进度心跳 + 预计耗时（外推，非实测）——
+        # 老库补 NULL：心跳缺省时按 started_at/created_at 兜底，判断不因此静默失效；
+        # expected_minutes 为 NULL 时只做「无进度时长」判断，不编超时倍数。
+        ("distill_runs", "progress_at", "DATETIME"),
+        ("distill_runs", "expected_minutes", "INTEGER"),
         # —— §11.3 时间线状态存档：节点+进度一体化 JSON ——
         # 漏这一项的后果：create_all 只给**新库**建该列，已存在的库永远补不上，
         # 任何 SELECT projects.* 都会 `no such column: projects.plot_timeline`，

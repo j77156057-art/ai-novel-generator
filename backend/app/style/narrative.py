@@ -2863,8 +2863,15 @@ _DEFAULT_MAX_CONCURRENT = 5
 async def _gather_chat_async(
     provider, prompts: list[tuple[str, str, dict | None]],
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+    on_done: Callable[[], None] | None = None,
 ) -> list[str | Exception]:
-    """异步 gather N 个 provider.async_chat 调用（受 semaphore 限流）。"""
+    """异步 gather N 个 provider.async_chat 调用（受 semaphore 限流）。
+
+    `on_done`：每有一条 prompt 返回就回调一次。**只用来打「心跳」**（证明后台
+    线程还活着），不改任何提炼逻辑、更不改返回顺序。没有它的话，一本语料的所有
+    prompt 是一次性 gather 的，中间几十分钟没有任何进度写入——看护会把它误判
+    成「卡住」（见 `app/style/jobs.py` 的 stall 判据）。
+    """
     sem = asyncio.Semaphore(max_concurrent)
 
     async def _one(system: str, user: str, constraints):
@@ -2873,6 +2880,12 @@ async def _gather_chat_async(
                 return await provider.async_chat(system, user, constraints=constraints)
             except Exception as exc:  # noqa: BLE001 —— 单条失败不阻断其余
                 return exc
+            finally:
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception:  # noqa: BLE001 —— 心跳失败不阻断蒸馏
+                        pass
 
     tasks = [_one(s, u, c) for s, u, c in prompts]
     return await asyncio.gather(*tasks, return_exceptions=False)
@@ -2881,6 +2894,7 @@ async def _gather_chat_async(
 def _gather_chat(
     provider, prompts: list[tuple[str, str, dict | None]],
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+    on_done: Callable[[], None] | None = None,
 ) -> list[str | Exception]:
     """同步入口：内部 asyncio.run 跑并发。
 
@@ -2891,7 +2905,7 @@ def _gather_chat(
     """
     if not prompts:
         return []
-    return asyncio.run(_gather_chat_async(provider, prompts, max_concurrent))
+    return asyncio.run(_gather_chat_async(provider, prompts, max_concurrent, on_done))
 
 
 def _ensure_reference_graphs(
@@ -2971,6 +2985,7 @@ def extract_narrative_profile(
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
     tier: str | NarrativeTier | None = None,
     progress: ProgressCallback | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> dict:
     """从参考语料提炼叙事档案。
 
@@ -2982,6 +2997,9 @@ def extract_narrative_profile(
             维度、provider 选择、返回结构一项都不变。
             单位是「块（chunk）」：一本语料切成若干块，每块一次 `provider.chat`，
             这就是用户能感知到的天然粒度。
+        heartbeat: 可选的无参回调，**每有一条 LLM 请求返回就打一次**。只为
+            后台看护的心跳（`progress_at`）服务——块级进度在一次 gather 里是
+            攒着报的，几十分钟没有写入会被误判成卡住。不参与任何提炼决策。
 
     返回结构（可直接 JSON 落库到 `Project.style_narrative`）：
     {
@@ -3173,7 +3191,7 @@ def extract_narrative_profile(
 
         if flat_prompts:
             try:
-                flat_raws = _gather_chat(provider, flat_prompts)
+                flat_raws = _gather_chat(provider, flat_prompts, on_done=heartbeat)
             except Exception as exc:  # noqa: BLE001
                 logging.getLogger(__name__).warning(
                     "叙事提炼全 chunk 失败 novel_id=%s: %s", nid, exc
@@ -3684,6 +3702,7 @@ def project_narrative(
     persist_library: bool = True,
     content_hash: str | None = None,
     sample_chapters: int | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> dict | None:
     """取项目当前该用的叙事档案；没有参考语料则返回 None。
 
@@ -3769,7 +3788,8 @@ def project_narrative(
         if profile is None:
             # 没命中任何缓存/库（或 force 强制重算）→ 真实提取。
             profile = extract_narrative_profile(
-                db, project, ids, max_chapters=max_chapters, tier=cfg, progress=progress
+                db, project, ids, max_chapters=max_chapters, tier=cfg, progress=progress,
+                heartbeat=heartbeat,
             )
             profile["fingerprint"] = want
             project.style_narrative = profile

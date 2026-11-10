@@ -35,7 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
-from app.models import DistillRun, Project
+from app.models import AssistantWizardSession, DistillRun, Project, WizardNotice
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,33 @@ STATUS_FAILED = "failed"
 TERMINAL_STATUSES = (STATUS_SUCCESS, STATUS_FAILED)
 #: 未终态：前端「恢复显示正在跑的任务」时认这两种。
 ACTIVE_STATUSES = (STATUS_PENDING, STATUS_RUNNING)
+
+# ---------------------------------------------------------------------------
+# 看护判据（全部是**具体分钟数**，不写「一段时间」）
+# ---------------------------------------------------------------------------
+#
+# 实测参照：文档里唯一一次计时是 764 块跑 42 分钟，约 3.3 秒/块。单块里包含
+# 该档维度的多次 LLM 调用，慢模型/限流下单块几十秒到几分钟都出现过。所以
+# 「无进度心跳」的阈值必须显著大于单块耗时，又不能长到用户干等一小时。
+#
+# - 排队超过 5 分钟还没被后台线程接手：BackgroundTasks 线程池满/进程异常，
+#   正常提交几秒内就会进 running。
+# - 运行中 15 分钟没有任何进度更新：≈ 单块正常耗时的 20 倍以上，基本可以判定
+#   不是「这一块比较慢」，而是卡住了（LLM 挂死 / 数据库写锁 / 线程没了）。
+# - 已用时超过 max(2.5 × 预计, 预计 + 30 分钟)：预计本身是外推值，2.5 倍还
+#   没跑完就不是「估少了」，而是任务真的异常。
+STALL_PENDING_MINUTES = 5
+STALL_RUNNING_MINUTES = 15
+OVERRUN_FACTOR = 2.5
+OVERRUN_GRACE_MINUTES = 30
+
+#: 健康状态（**派生值，不入库**）：DB 里的 status 状态机保持
+#: pending → running → success|failed 不变，这里只是给它叠一层「观感」。
+HEALTH_QUEUED = "queued"
+HEALTH_RUNNING = "running"
+HEALTH_STALLED = "stalled"
+HEALTH_SUCCESS = "success"
+HEALTH_FAILED = "failed"
 
 #: 进度回调签名：`(阶段人话文本, 已完成数, 总数)`。总数 0 = 还没探明。
 ProgressCallback = Callable[[str, int, int], None]
@@ -76,12 +103,123 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt is not None else None
 
 
+def _aware(dt: datetime | None) -> datetime | None:
+    """SQLite 读回来的是 naive datetime，统一按 UTC 补齐时区再参与计算。
+
+    不做这一步，`now(tz-aware) - created_at(naive)` 会直接抛 TypeError，
+    而这里一旦抛错，整个进度接口就 500——看护功能反而让状态页不可用。
+    """
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _minutes_since(dt: datetime | None, now: datetime) -> float | None:
+    d = _aware(dt)
+    if d is None:
+        return None
+    return max(0.0, (now - d).total_seconds() / 60.0)
+
+
+def format_duration(seconds: float) -> str:
+    """秒 → 人话时长（回执里用，避免「0.4 分钟」这种看不懂的写法）。"""
+    total = max(0, int(round(seconds)))
+    if total < 60:
+        return f"{total} 秒"
+    minutes = total // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    return f"{minutes // 60} 小时 {minutes % 60} 分钟"
+
+
+def distill_health(
+    run: DistillRun, now: datetime | None = None
+) -> tuple[str, str | None]:
+    """把 `status + 时间戳` 派生成「排队 / 运行中 / 疑似卡住 / 完成 / 失败」。
+
+    **不写库**：DB 的状态机仍是 pending → running → success|failed，四个值不变。
+    「疑似卡住」是**按当前时间算出来的观感**，同一行在不同时刻可能从 running
+    变成 stalled 再变回 running（进度又动了）——这正是不该持久化成 status 的原因。
+
+    判据（具体分钟数见文件头常量）：
+    - pending 超过 `STALL_PENDING_MINUTES` → stalled；
+    - running 距最后一次进度心跳超过 `STALL_RUNNING_MINUTES` → stalled；
+    - running 已用时超过 `max(OVERRUN_FACTOR × 预计, 预计 + 宽限)` → stalled；
+    - 其余按 status 映射。
+
+    Returns:
+        `(health, note)`。note 是给用户看的一句人话，**带上具体分钟数**；
+        没有可说的就是 None（例如成功）。
+    """
+    now = now or _utcnow()
+    if run.status == STATUS_SUCCESS:
+        return HEALTH_SUCCESS, None
+    if run.status == STATUS_FAILED:
+        return HEALTH_FAILED, run.error or None
+
+    created = _aware(run.created_at)
+    started = _aware(run.started_at)
+    last_progress = _aware(run.progress_at) or started or created
+
+    if run.status == STATUS_PENDING:
+        waited = _minutes_since(created, now) or 0.0
+        if waited >= STALL_PENDING_MINUTES:
+            return (
+                HEALTH_STALLED,
+                f"已排队 {int(waited)} 分钟仍未被后台线程接手"
+                f"（阈值 {STALL_PENDING_MINUTES} 分钟）。正常提交几秒内就会开始，"
+                "建议重新提交一次。",
+            )
+        return HEALTH_QUEUED, f"已排队 {int(waited)} 分钟，等待后台线程接手。"
+
+    idle = _minutes_since(last_progress, now) or 0.0
+    elapsed = _minutes_since(started, now) or 0.0
+    expected = int(run.expected_minutes or 0)
+
+    if idle >= STALL_RUNNING_MINUTES:
+        return (
+            HEALTH_STALLED,
+            f"{int(idle)} 分钟没有进度更新（阈值 {STALL_RUNNING_MINUTES} 分钟），"
+            f"已跑 {int(elapsed)} 分钟；最后阶段：{run.stage or '未知'}。"
+            f"建议再等 {STALL_RUNNING_MINUTES} 分钟，仍不动就重新提交。",
+        )
+
+    if expected > 0:
+        limit = max(OVERRUN_FACTOR * expected, expected + OVERRUN_GRACE_MINUTES)
+        if elapsed > limit:
+            return (
+                HEALTH_STALLED,
+                f"已跑 {int(elapsed)} 分钟，超过预计 {expected} 分钟的 "
+                f"{OVERRUN_FACTOR} 倍阈值（{int(limit)} 分钟）。"
+                "预计值本身是按字数外推、不是实测；建议重新提交一次。",
+            )
+
+    note = "刚启动" if elapsed < 1 else f"已运行 {int(elapsed)} 分钟"
+    if expected > 0:
+        note += f"，预计约 {expected} 分钟（按字数外推，非实测）"
+    if run.progress_total:
+        note += f"，已处理 {int(run.progress_current or 0)}/{int(run.progress_total)} 块"
+    else:
+        note += "，总块数还没探明"
+    return HEALTH_RUNNING, note
+
+
 def distill_run_to_dict(run: DistillRun) -> dict[str, Any]:
     """`DistillRun` 行 → API 状态对象（前端 `DistillJob` 与之逐字段对应）。
 
     出参**不带** `style_narrative` 全文：那份 JSON 有几万字符，1.5s 一次轮询
     传它是纯浪费。要看结论用这里的摘要字段就够了。
+
+    `health / health_note` 是**派生字段**（不落库），见 `distill_health`。
+    `progress_at` 是最后一次进度心跳，前端可以用它判断「这个百分比是不是刚更新过」。
     """
+    now = _utcnow()
+    health, health_note = distill_health(run, now)
+    started = _aware(run.started_at)
+    end = _aware(run.finished_at) or now
+    elapsed_minutes = (
+        int((end - started).total_seconds() // 60) if started is not None else None
+    )
     return {
         "id": run.id,
         "project_id": run.project_id,
@@ -97,6 +235,12 @@ def distill_run_to_dict(run: DistillRun) -> dict[str, Any]:
         "created_at": _iso(run.created_at),
         "started_at": _iso(run.started_at),
         "finished_at": _iso(run.finished_at),
+        # —— 看护字段 ——
+        "progress_at": _iso(run.progress_at),
+        "expected_minutes": run.expected_minutes,
+        "elapsed_minutes": elapsed_minutes,
+        "health": health,
+        "health_note": health_note,
     }
 
 
@@ -154,6 +298,9 @@ def _make_progress_writer(job_id: int, db: Session) -> ProgressCallback:
             run.stage = str(stage)[:255]
             run.progress_current = max(0, int(current))
             run.progress_total = max(0, int(total))
+            # 心跳：看护判据「多久没有进度更新」唯一的时间源。
+            # 必须在**每次**回调都刷新，否则进度明明在动也会被判成卡住。
+            run.progress_at = _utcnow()
             db.commit()
         except Exception as exc:  # noqa: BLE001 —— 进度写失败不阻断蒸馏
             logger.warning("蒸馏进度写入失败 job_id=%s: %s", job_id, exc)
@@ -163,6 +310,179 @@ def _make_progress_writer(job_id: int, db: Session) -> ProgressCallback:
                 pass
 
     return _write
+
+
+def _make_heartbeat_writer(job_id: int, db: Session) -> Callable[[], None]:
+    """造一个**只刷心跳**的回调（只写 `progress_at`，不动 stage/块数）。
+
+    为什么需要它：叙事提炼是「一本语料的所有 prompt 一次性 gather」，块级进度
+    要等整本书的请求都回来才写一次。一本大语料的 gather 可能十几二十分钟，
+    期间进度表一动不动——只看块级进度会把**正在正常干活**的任务误判成卡住。
+
+    这个回调挂在每条 LLM 请求返回时，只更新时间戳，不改善进度语义：界面上
+    仍然是「已处理 x/y 块」，不会出现假的百分比。
+    """
+
+    def _beat() -> None:
+        try:
+            run = db.get(DistillRun, job_id)
+            if run is None:
+                return
+            run.progress_at = _utcnow()
+            db.commit()
+        except Exception:  # noqa: BLE001 —— 心跳失败不阻断蒸馏
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return _beat
+
+
+def _estimate_expected_minutes(
+    db: Session, project: Project, tier_key: str
+) -> int | None:
+    """提交时按**语料字数**外推预计耗时（分钟）；算不出来就返回 None。
+
+    与外推口径同源：`app.wizard_facts` 的唯一实测点（76.5 万字 → 42 分钟）。
+    这里只用于判「超时倍数」，不写进任何产出，也**不是实测值**。
+    """
+    try:
+        from app import wizard_facts as facts
+        from app.style.narrative import resolve_tier, tier_with_sampling
+
+        ids = [int(i) for i in (project.reference_novel_ids or [])]
+        if not ids:
+            return None
+        books = facts.novel_stats(db, ids)
+        cfg = tier_with_sampling(
+            resolve_tier(tier_key), getattr(project, "narrative_sample_chapters", None)
+        )
+        chars = sum(
+            facts.sampled_chars_for(cfg, b["chapters"], b["chars"]) for b in books
+        )
+        if chars <= 0:
+            return None
+        return int(facts.estimate_minutes(chars)["minutes"])
+    except Exception:  # noqa: BLE001 —— 估算失败只让「超时倍数」判据失效
+        logger.warning("预计耗时估算失败 project_id=%s tier=%s", project.id, tier_key)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 持久化通知（完成回执 / 疑似卡住提醒）
+# ---------------------------------------------------------------------------
+
+
+def _next_prompt(db: Session, project_id: int) -> str:
+    """回执末尾那句「下一步问什么」——按引导会话的真实状态决定，不猜。"""
+    session = db.scalar(
+        select(AssistantWizardSession)
+        .where(AssistantWizardSession.project_id == project_id)
+        .order_by(AssistantWizardSession.id.desc())
+    )
+    if session is not None and session.status == "active":
+        # 注意：不能写「蒸馏在后台跑，跑完我会回报」——这句话出现在**回执本身**里，
+        # 任务已经结束了，那样写会自相矛盾。
+        return "引导还没走完；你可以接着回答刚才那一步，也可以直接说「开始写」。"
+    stage = (session.result or {}).get("stage") if session and session.result else None
+    if stage == "outline":
+        return "接着问：大纲已经生成，现在开始写吗？"
+    if stage in ("ready", "done"):
+        return "接着问：要现在开始写吗？"
+    return "接着问：要现在开始写，还是先去项目工作台核对文风档案？"
+
+
+def _terminal_payload(
+    db: Session,
+    run: DistillRun,
+    kind: str,
+    *,
+    n_dimensions: int | None = None,
+    failed_chunks: int = 0,
+    interrupted: bool = False,
+) -> dict[str, Any]:
+    """终态回执：把用户要求的数字（章/规则/维度/失败块/实际耗时）逐项写全。"""
+    started = _aware(run.started_at)
+    finished = _aware(run.finished_at) or _utcnow()
+    seconds = (finished - started).total_seconds() if started else 0
+    elapsed_text = format_duration(seconds)
+
+    from app.style.narrative import TIER_REGISTRY
+
+    tier_cfg = TIER_REGISTRY.get(run.tier or "")
+    payload: dict[str, Any] = {
+        "job_id": run.id,
+        "tier": run.tier,
+        "tier_name": tier_cfg.name if tier_cfg else run.tier,
+        "status": run.status,
+        "n_chapters": run.n_chapters,
+        "rule_count": run.rule_count,
+        "rejected": run.rejected,
+        "failed_chunks": failed_chunks,
+        "n_dimensions": n_dimensions,
+        "elapsed_seconds": int(round(seconds)),
+        "elapsed_text": elapsed_text,
+        "interrupted": interrupted,
+    }
+
+    if kind == "distill_done":
+        bits = [f"处理 {run.n_chapters or 0} 章"]
+        if n_dimensions:
+            bits.append(f"{n_dimensions} 个维度")
+        bits.append(f"提炼 {run.rule_count or 0} 条规则")
+        if run.rejected:
+            bits.append(f"拒伪 {int(run.rejected)} 条")
+        bits.append(f"失败块 {int(failed_chunks)} 个")
+        bits.append(f"实际用时 {elapsed_text}")
+        head = "蒸馏完成" if not failed_chunks else "蒸馏完成（部分块失败）"
+        payload["message"] = f"{head}：" + "，".join(bits) + "。"
+    elif interrupted:
+        payload["message"] = (
+            "蒸馏被服务重启中断：后台线程随进程一起没了，任务没有跑完。"
+            f"中断前已跑 {elapsed_text}。重跑一次即可（已完成的档案没有被覆盖）。"
+        )
+    else:
+        err = (run.error or "未知错误").strip()
+        payload["message"] = f"蒸馏失败：{err}。已用时 {elapsed_text}。"
+
+    payload["next"] = _next_prompt(db, run.project_id)
+    return payload
+
+
+def emit_notice(
+    db: Session, run: DistillRun, kind: str, payload: dict[str, Any]
+) -> WizardNotice | None:
+    """写一条通知（同一任务同一 type 只写一次）。失败不往外抛。
+
+    去重靠 `(job_id, kind)` 唯一约束 + 先查后插；重复调用返回已有行。
+    """
+    try:
+        existing = db.scalar(
+            select(WizardNotice).where(
+                WizardNotice.job_id == run.id, WizardNotice.kind == kind
+            )
+        )
+        if existing is not None:
+            return existing
+        row = WizardNotice(
+            project_id=run.project_id,
+            job_id=run.id,
+            kind=kind,
+            payload=payload,
+            created_at=_utcnow(),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+    except Exception:  # noqa: BLE001 —— 通知写失败不该让任务本身失败
+        logger.exception("蒸馏通知写入失败 job_id=%s kind=%s", run.id, kind)
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
 
 def _mark_failed(db: Session, job_id: int, exc: BaseException) -> None:
@@ -232,6 +552,19 @@ def reap_stale_runs(db: Session) -> int:
         run.finished_at = now
 
     db.commit()
+
+    # **重启恢复的关键一步**：这些任务是在跑到一半时被进程带走的，用户可能已经
+    # 关掉页面。如果不落一条失败通知，等用户回来时只会看到一条历史 failed 行
+    # （甚至被前端三分钟窗口过滤掉），"完成唤醒"就断了。这里补写一条
+    # interrupted=True 的回执，前端下次轮询就能捡起来。
+    for run in stale:
+        emit_notice(
+            db,
+            run,
+            "distill_failed",
+            _terminal_payload(db, run, "distill_failed", interrupted=True),
+        )
+
     count = len(stale)
     logger.info("启动时收割了 %s 条被中断的蒸馏任务（服务重启导致）", count)
     return count
@@ -267,6 +600,9 @@ def run_distill_job(
 
         run.status = STATUS_RUNNING
         run.started_at = _utcnow()
+        # 进入 running 也是一次心跳：否则「刚开工、还没探明块数」这段时间
+        # 会被当成「从 created_at 开始就没动」，白白多扣掉排队时长。
+        run.progress_at = run.started_at
         run.stage = "已受理，正在准备语料"
         run.progress_current = 0
         run.progress_total = 0
@@ -279,10 +615,15 @@ def run_distill_job(
         if not (project.reference_novel_ids or []):
             raise ValueError("项目未选参考语料，无法蒸馏（请先选语料或走自由生成）")
 
+        # 预计耗时：仅用于「超时倍数」判据，界面上必须标注「非实测」。
+        run.expected_minutes = _estimate_expected_minutes(db, project, tier)
+        db.commit()
+
         progress = _make_progress_writer(job_id, db)
         profile = project_narrative(
             db, project, force=force, tier=tier, progress=progress,
             content_hash=content_hash,
+            heartbeat=_make_heartbeat_writer(job_id, db),
         )
         if not isinstance(profile, dict):
             raise ValueError("蒸馏未产出档案（可能是档位不合法或语料为空）")
@@ -312,12 +653,42 @@ def run_distill_job(
             run.progress_total = max(run.progress_current, 1)
             run.progress_current = run.progress_total
         run.error = None
+        # 终态也要收进 finished_at：回执里的「实际用时」用它，不能等到 finally
+        # 再补——那样通知里会退化成「到今天为止」的时长。
+        run.finished_at = _utcnow()
+        run.progress_at = run.finished_at
         db.commit()
+
+        # 完成唤醒：回执落库（不是只返回给当前页面）。用户关掉页面/服务重启后，
+        # 前端轮询 notices 仍能把这条捡起来。
+        n_dimensions = len(
+            [k for k, v in rules.items() if isinstance(v, list) and v]
+        )
+        emit_notice(
+            db,
+            run,
+            "distill_done",
+            _terminal_payload(
+                db,
+                run,
+                "distill_done",
+                n_dimensions=n_dimensions,
+                failed_chunks=failed_chunks,
+            ),
+        )
     except Exception as exc:  # noqa: BLE001 —— 后台任务不得往外抛
         logger.exception(
             "蒸馏任务失败 job_id=%s project_id=%s tier=%s", job_id, project_id, tier
         )
         _mark_failed(db, job_id, exc)
+        run = db.get(DistillRun, job_id)
+        if run is not None:
+            emit_notice(
+                db,
+                run,
+                "distill_failed",
+                _terminal_payload(db, run, "distill_failed"),
+            )
     finally:
         try:
             run = db.get(DistillRun, job_id)
