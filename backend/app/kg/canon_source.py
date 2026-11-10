@@ -730,7 +730,24 @@ ITEM_ALIASES = {
     "开国皇帝当年使用过的佩剑": "神剑",
     "开国帝君当年征战沙场使用的佩剑": "神剑",
     "黄铜剑": "神剑",
+    # 地书：正文 ch51 摊位「菩提手串和玉石小镜，二选一」拿到，ch72 玖号点明
+    # 「这法宝又叫做地书」，ch73 滴血认主后见八个光点。它只是九块碎片之一
+    # （三号），但实体层按「地书」归并，碎片粒度交给 kg_item_instance。
+    "玉石小镜": "地书",
+    "玉石镜": "地书",
+    # 黑金长刀：ch93 监正炼刀胚、ch227「监正送他的黑金长刀」。
+    "暗金色长刀": "黑金长刀",
+    "刀胚": "黑金长刀",
 }
+
+#: 折叠后仍要剔掉的写法。两类：一是「镜子」「长刀」这种任何物品都可能被叫的
+#: 通名；二是「黑金刀」这种在库里另有一条规范名的写法——收作别名会和那条
+#: 规范名形成双向撞名。只对参与折叠的实体生效，不扩大改动面。
+ITEM_ALIAS_BLOCKLIST = frozenset({
+    "镜子", "镜面", "这面镜子", "破镜子", "小镜",
+    "刀", "长刀", "刀子",
+    "黑金刀",
+})
 
 
 def fold_item_aliases(result: dict) -> dict:
@@ -748,6 +765,18 @@ def fold_item_aliases(result: dict) -> dict:
         new = ITEM_ALIASES.get(raw)
         if new and new != raw:
             mapping[raw] = new
+
+    # 泛称清理：只对折叠家族（地书 / 黑金长刀）的规范名生效。
+    # 即使本批没出现异写也要清——别名是按批合并的，别处的「镜子」会从
+    # 另一章漏回来，只清「本次折叠过的那一条」挡不住。
+    family = set(ITEM_ALIASES) | set(ITEM_ALIASES.values())
+    for ent in ents:
+        if ent.get("kind") != "item":
+            continue
+        if (ent.get("canonical_name") or "").strip() not in family:
+            continue
+        ent["aliases"] = [a for a in (ent.get("aliases") or [])
+                          if a and a not in ITEM_ALIAS_BLOCKLIST]
 
     if not mapping:
         return result
