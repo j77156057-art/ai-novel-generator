@@ -99,6 +99,59 @@ CREATE INDEX IF NOT EXISTS ix_item_holding_item
 CREATE INDEX IF NOT EXISTS ix_item_holding_owner
     ON kg_item_holding (owner_id, valid_to, hold_type);
 
+-- 第二条轴：故事先后。只做旁注，不改上面这张表。
+-- holding_id 非空 = 主线段的旁注；holding_id 空 = 回溯/预叙分支（不进章节轴）。
+-- order_key：同一物品内可比，越大越新；NULL = 正文看不出先后，读侧退到章节序。
+CREATE TABLE IF NOT EXISTS kg_holding_story_segment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    holding_id INTEGER,
+    item_id INTEGER,
+    item_name TEXT NOT NULL CHECK (length(trim(item_name)) > 0),
+    hold_type TEXT NOT NULL CHECK (hold_type IN ('own', 'custody')),
+    owner_id INTEGER,
+    owner_name TEXT,
+    owner_kind TEXT,
+    owner_state TEXT NOT NULL
+        CHECK (owner_state IN ('held', 'unowned', 'unknown', 'sealed')),
+    order_key INTEGER,
+    order_basis TEXT NOT NULL DEFAULT 'chapter'
+        CHECK (order_basis IN ('explicit', 'chapter')),
+    anchor_label TEXT NOT NULL DEFAULT '',
+    narration TEXT NOT NULL DEFAULT 'forward'
+        CHECK (narration IN ('forward', 'retro', 'prefigure')),
+    transfer_from_id INTEGER,
+    transfer_from_name TEXT,
+    evidence_chapter INTEGER NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0.5
+        CHECK (confidence >= 0 AND confidence <= 1),
+    created_at TEXT NOT NULL,
+    CHECK ((order_basis = 'explicit') = (order_key IS NOT NULL)),
+    CHECK (order_key IS NULL OR order_key >= 0),
+    CHECK (narration = 'forward' OR holding_id IS NULL),
+    CHECK (
+        (owner_state = 'held'
+         AND (owner_id IS NOT NULL
+              OR (owner_name IS NOT NULL AND length(trim(owner_name)) > 0)))
+        OR
+        (owner_state IN ('unowned', 'sealed', 'unknown')
+         AND owner_name IS NULL)
+    ),
+    CHECK (transfer_from_name IS NULL OR length(trim(transfer_from_name)) > 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_story_segment_holding
+    ON kg_holding_story_segment (holding_id)
+    WHERE holding_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_story_segment_branch
+    ON kg_holding_story_segment
+       (COALESCE(item_id, -1), item_name, hold_type, COALESCE(order_key, -1))
+    WHERE holding_id IS NULL;
+CREATE INDEX IF NOT EXISTS ix_story_segment_item
+    ON kg_holding_story_segment (item_id, order_key);
+CREATE INDEX IF NOT EXISTS ix_story_segment_owner
+    ON kg_holding_story_segment (owner_id, order_key);
+
 CREATE TABLE IF NOT EXISTS gen_edge_invalidations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     from_name TEXT NOT NULL,
@@ -388,6 +441,15 @@ HOLD_TYPES = frozenset({"own", "custody"})
 OWNER_STATES = frozenset({"held", "unowned", "unknown", "sealed"})
 #: 同章出现多个归属主张且无法用转交事件排序时的候选原因。
 SAME_CHAPTER_CLASH = "same_chapter_clash"
+#: 回溯段的坐标与主线旁注矛盾时的候选原因（只留证据，不裁决）。
+STORY_ORDER_CONFLICT = "story_order_conflict"
+
+#: 叙述关系：forward 顺序讲述 / retro 追述 / prefigure 预叙。
+NARRATIONS = frozenset({"forward", "retro", "prefigure"})
+#: 先后键的来源：explicit 正文看得出先后 / chapter 看不出，退到章节序。
+ORDER_BASES = frozenset({"explicit", "chapter"})
+#: 先后键的刻度：章节序 = chapter * 100，显式相对序用同一刻度插空。
+ORDER_SCALE = 100
 
 
 def _same_owner(row, owner_id: int | None, owner_name: str | None) -> bool:
@@ -535,6 +597,211 @@ def _resolve_same_chapter(con: sqlite3.Connection, open_row, item_name: str,
                   SAME_CHAPTER_CLASH, evidence)
     return {"action": "candidate", "id": None, "closed": 0, "candidates": 2,
             "reason": SAME_CHAPTER_CLASH}
+
+
+def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str,
+                         owner_name: str | None, chapter: int, *,
+                         item_id: int | None = None,
+                         owner_id: int | None = None,
+                         owner_kind: str | None = None,
+                         owner_state: str = "held",
+                         holding_id: int | None = None,
+                         narration: str = "forward",
+                         order_key: int | None = None,
+                         order_basis: str | None = None,
+                         anchor_label: str = "",
+                         transfer_from_id: int | None = None,
+                         transfer_from_name: str | None = None,
+                         evidence: str = "",
+                         confidence: float = 0.5) -> dict:
+    """写一条故事先后轴旁注（``kg_holding_story_segment`` 的唯一写入口）。
+
+    只排先后，不记绝对时间：
+
+    - ``order_key`` 是同一物品内可比的整数，**越大越新**；``NULL`` 表示正文看不出先后，
+      读侧退到章节序（``evidence_chapter``）。刻度约定 ``chapter * 100``，
+      显式相对序用同一刻度插空（如「开国之初」= 0，介于 50 章与 51 章之间 = 5050）。
+    - ``order_basis``：``explicit``（正文有先后）/ ``chapter``（没有，用章节序）。
+    - 年号只作可选证据写在 ``anchor_label``，**缺了不补，不推断年份**。
+
+    两种行，不允许别的方式写入：
+
+    - **主线旁注**：``holding_id`` 指向 ``kg_item_holding.id``，``narration='forward'``；
+      持有者、物品必须与对应持有行一致，否则拒绝（防两轴漂移）。
+    - **回溯/预叙分支**：``holding_id`` 必须为空，不进章节轴，**不调用**
+      ``_close_open_segment``，因此不可能覆盖主线段的 ``valid_to``。
+
+    与主线旁注的先后矛盾时**只记** ``gen_candidates(reason='story_order_conflict')``；
+    不拒写、不裁决——当前持有者由「最新先后键」决定，候选不作为裁决依据。
+
+    返回 ``{"action": inserted|confirmed, "id": ..., "axis": "story",
+    "holding_id": ..., "conflict": bool}``。
+    """
+    item_name = (item_name or "").strip()
+    owner_name = (owner_name or "").strip() or None
+    transfer_from_name = (transfer_from_name or "").strip() or None
+    if not item_name:
+        raise ValueError("item_name 不能为空")
+    if hold_type not in HOLD_TYPES:
+        raise ValueError(f"hold_type 只能是 {sorted(HOLD_TYPES)}")
+    if owner_state not in OWNER_STATES:
+        raise ValueError(f"owner_state 只能是 {sorted(OWNER_STATES)}")
+    if narration not in NARRATIONS:
+        raise ValueError(f"narration 只能是 {sorted(NARRATIONS)}")
+    if owner_state == "held":
+        if owner_id is None and owner_name is None:
+            raise ValueError("held 态要求 owner_id 与 owner_name 至少一个非空")
+    elif owner_name is not None:
+        raise ValueError(f"{owner_state} 态不允许 owner_name（不许造假持有者）")
+    if chapter is None:
+        raise ValueError("chapter 不能为空")
+
+    # 两档：有先后键（explicit）/ 只有叙述序（chapter，键为空）
+    if order_basis is None:
+        order_basis = "explicit" if order_key is not None else "chapter"
+    if order_basis not in ORDER_BASES:
+        raise ValueError(f"order_basis 只能是 {sorted(ORDER_BASES)}")
+    if order_basis == "explicit" and order_key is None:
+        raise ValueError("order_basis=explicit 必须给 order_key")
+    if order_basis == "chapter" and order_key is not None:
+        raise ValueError("order_basis=chapter 时 order_key 必须为空（退到章节序）")
+    if order_key is not None and int(order_key) < 0:
+        raise ValueError("order_key 不能为负")
+
+    # 主线旁注必须真有主线行，且两轴口径一致
+    if narration == "forward" and holding_id is None:
+        raise ValueError("forward 旁注必须给 holding_id；回溯/预叙才写分支行")
+    if holding_id is not None:
+        row = con.execute("SELECT * FROM kg_item_holding WHERE id = ?",
+                          (holding_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"holding_id={holding_id} 不存在")
+        if row["item_name"] != item_name or row["hold_type"] != hold_type:
+            raise ValueError("旁注的 item_name/hold_type 与持有行不一致")
+        if not _same_owner(row, owner_id, owner_name) or row["owner_state"] != owner_state:
+            raise ValueError("旁注的持有者/状态与持有行不一致")
+
+    conflict = False
+    if narration != "forward" and order_key is not None:
+        prev = con.execute(
+            """SELECT MAX(COALESCE(s.order_key, h.valid_from * ?)) AS ord
+                 FROM kg_item_holding h
+                 LEFT JOIN kg_holding_story_segment s ON s.holding_id = h.id
+                WHERE h.item_name = ? AND h.hold_type = ?""",
+            (ORDER_SCALE, item_name, hold_type),
+        ).fetchone()
+        if prev is not None and prev["ord"] is not None and int(order_key) >= int(prev["ord"]):
+            conflict = True
+            add_candidate(con, item_name, owner_name or "", hold_type, chapter,
+                          STORY_ORDER_CONFLICT,
+                          evidence or f"回溯先后键 {order_key} 不早于主线最新 {prev['ord']}")
+
+    try:
+        cur = con.execute(
+            """INSERT INTO kg_holding_story_segment
+               (holding_id, item_id, item_name, hold_type, owner_id, owner_name,
+                owner_kind, owner_state, order_key, order_basis, anchor_label,
+                narration, transfer_from_id, transfer_from_name,
+                evidence_chapter, evidence, confidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (holding_id, item_id, item_name, hold_type, owner_id, owner_name,
+             owner_kind, owner_state, order_key, order_basis, anchor_label,
+             narration, transfer_from_id, transfer_from_name,
+             chapter, (evidence or "")[:400], float(confidence), _now()),
+        )
+        return {"action": "inserted", "id": int(cur.lastrowid), "axis": "story",
+                "holding_id": holding_id, "conflict": conflict}
+    except sqlite3.IntegrityError:
+        # 同一主线行已有旁注 / 同一分支坐标已写过：幂等复述，不重复插
+        if holding_id is not None:
+            row = con.execute(
+                "SELECT id FROM kg_holding_story_segment WHERE holding_id = ?",
+                (holding_id,)).fetchone()
+        else:
+            row = con.execute(
+                """SELECT id FROM kg_holding_story_segment
+                    WHERE holding_id IS NULL AND item_name = ? AND hold_type = ?
+                      AND COALESCE(item_id, -1) = COALESCE(?, -1)
+                      AND COALESCE(order_key, -1) = COALESCE(?, -1)""",
+                (item_name, hold_type, item_id, order_key),
+            ).fetchone()
+        return {"action": "confirmed", "id": int(row["id"]) if row else None,
+                "axis": "story", "holding_id": holding_id, "conflict": conflict}
+
+
+def item_story_timeline(con: sqlite3.Connection, item_name: str, *,
+                        item_id: int | None = None) -> list[dict]:
+    """某物品的故事先后轴：主线旁注 + 回溯/预叙分支，按先后键从早到晚。
+
+    先后键 ``COALESCE(order_key, evidence_chapter * 100)``：有明确先后的按键排，
+    看不出的退到章节序。这个键**只表示先后，不表示距离**。
+    """
+    sql = "SELECT * FROM kg_holding_story_segment WHERE item_name = ?"
+    params: list = [item_name]
+    if item_id is not None:
+        sql += " AND item_id IS ?"
+        params.append(item_id)
+    rows = _rows(con.execute(sql, params))
+    for row in rows:
+        row["order_effective"] = _effective_order(row)
+    rows.sort(key=lambda r: (r["order_effective"], r["evidence_chapter"], r["id"]))
+    return rows
+
+
+def _effective_order(row) -> int:
+    """先后键的读取口径：显式键优先，缺了退到章节序（chapter*100）。"""
+    if row["order_key"] is not None:
+        return int(row["order_key"])
+    return int(row["evidence_chapter"]) * ORDER_SCALE
+
+
+def current_holder(con: sqlite3.Connection, item_name: str,
+                   hold_type: str | None = None) -> list[dict]:
+    """当前持有者：每一类持有线取**最新先后键**的那一段，不按置信度挑。
+
+    只看先后，不看距离；段落已结束也照样参与（「最新一段」就是当前口径）。
+    主线旁注（``holding_id`` 非空）不重复计入，它的先后键通过 JOIN 覆盖主线行。
+
+    返回 ``[{"item_name", "hold_type", "owner_name", "owner_id", "owner_state",
+    "chapter", "order_key", "narration"}]``，每个 ``hold_type`` 一条。
+    """
+    sql = """
+        SELECT h.item_name AS item_name, h.hold_type AS hold_type,
+               h.owner_name AS owner_name, h.owner_id AS owner_id,
+               h.owner_state AS owner_state, h.valid_from AS chapter,
+               COALESCE(s.order_key, h.valid_from * ?) AS ord,
+               'forward' AS narration, h.id AS row_id
+          FROM kg_item_holding h
+          LEFT JOIN kg_holding_story_segment s ON s.holding_id = h.id
+         WHERE h.item_name = ?
+        UNION ALL
+        SELECT s.item_name, s.hold_type, s.owner_name, s.owner_id,
+               s.owner_state, s.evidence_chapter,
+               COALESCE(s.order_key, s.evidence_chapter * ?),
+               s.narration, s.id
+          FROM kg_holding_story_segment s
+         WHERE s.holding_id IS NULL AND s.item_name = ?
+    """
+    params: list = [ORDER_SCALE, item_name, ORDER_SCALE, item_name]
+    if hold_type is not None:
+        sql = f"SELECT * FROM ({sql}) WHERE hold_type = ?"
+        params.append(hold_type)
+    rows = _rows(con.execute(sql, params))
+    best: dict[str, dict] = {}
+    for row in rows:
+        key = row["hold_type"]
+        cur = best.get(key)
+        if cur is None or (row["ord"], row["chapter"], row["row_id"]) > \
+                (cur["ord"], cur["chapter"], cur["row_id"]):
+            best[key] = row
+    out = []
+    for row in best.values():
+        out.append({"item_name": row["item_name"], "hold_type": row["hold_type"],
+                    "owner_name": row["owner_name"], "owner_id": row["owner_id"],
+                    "owner_state": row["owner_state"], "chapter": row["chapter"],
+                    "order_key": row["ord"], "narration": row["narration"]})
+    out.sort(key=lambda r: r["hold_type"])
+    return out
 
 
 def item_holding_timeline(con: sqlite3.Connection, item_name: str, *,
