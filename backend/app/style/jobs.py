@@ -69,6 +69,15 @@ STALL_RUNNING_MINUTES = 15
 OVERRUN_FACTOR = 2.5
 OVERRUN_GRACE_MINUTES = 30
 
+#: 心跳刷新 `stage` 文本的最小间隔（秒）。
+#:
+#: 为什么是 15：前提是「progress_at 每条必刷」，这里节流的只是那一句人话
+#: （「已完成 37/92」）。界面上进度是 3 秒轮询一次，15 秒 ≈ 5 个轮询周期，
+#: 用户能稳定看到计数在动；再密（<10 秒）只是同一个数字闪几下、白写一列
+#: 255 字符；再疏（>30 秒）又容易在两次刷新之间看成「没变化」。
+#: 首条与收尾（done == total）不受这个间隔限制，避免收尾停在「已完成 80/92」。
+HEARTBEAT_STAGE_MIN_SECONDS = 15
+
 #: 健康状态（**派生值，不入库**）：DB 里的 status 状态机保持
 #: pending → running → success|failed 不变，这里只是给它叠一层「观感」。
 HEALTH_QUEUED = "queued"
@@ -312,23 +321,51 @@ def _make_progress_writer(job_id: int, db: Session) -> ProgressCallback:
     return _write
 
 
-def _make_heartbeat_writer(job_id: int, db: Session) -> Callable[[], None]:
-    """造一个**只刷心跳**的回调（只写 `progress_at`，不动 stage/块数）。
+def _make_heartbeat_writer(
+    job_id: int, db: Session
+) -> Callable[[int, int, str], None]:
+    """造一个心跳回调：刷新 `progress_at`，并按间隔更新一句人话 `stage`。
 
     为什么需要它：叙事提炼是「一本语料的所有 prompt 一次性 gather」，块级进度
     要等整本书的请求都回来才写一次。一本大语料的 gather 可能十几二十分钟，
     期间进度表一动不动——只看块级进度会把**正在正常干活**的任务误判成卡住。
 
-    这个回调挂在每条 LLM 请求返回时，只更新时间戳，不改善进度语义：界面上
-    仍然是「已处理 x/y 块」，不会出现假的百分比。
-    """
+    回调入参是 `(本批已完成数, 本批总数, 阶段前缀)`：
 
-    def _beat() -> None:
+    - `progress_at` **每条请求返回都刷**。卡住判据只看这一列，省掉它等于把
+      看护弄坏；这里没有任何「攒够几条再写」的优化。
+    - `stage` 只是顺带的人话（「语料 2/2：并发提炼中（已完成 37/92）」），
+      按 `HEARTBEAT_STAGE_MIN_SECONDS` 节流：一批几十条调用眨眼间回来时，
+      没必要把同一列反复改几十遍。
+    - 首条与 `done == total` 强制写 stage：首条让用户立刻看到「开始了」，
+      收尾保证不会停在「已完成 80/92」这种少一截的数字上（随后块级进度
+      写入会接着把 stage 改成「提炼第 n/n 块」，不会卡住）。
+
+    心跳失败一律吞掉：它只是观测，绝不能因为写库失败中断一次已经跑了半小时的蒸馏。
+    """
+    # 上次写 stage 文本的时刻（None = 还没写过）。只活在这次任务的进程内，
+    # 不需要落库——重启后任务本来就会被收割（reap），不存在跨进程续用。
+    last_stage_at: datetime | None = None
+
+    def _beat(done: int, total: int, prefix: str) -> None:
+        nonlocal last_stage_at
         try:
             run = db.get(DistillRun, job_id)
             if run is None:
                 return
-            run.progress_at = _utcnow()
+            now = _utcnow()
+            # 硬要求：每条请求都刷新心跳，不受 stage 节流影响。
+            run.progress_at = now
+            elapsed = (
+                (now - last_stage_at).total_seconds() if last_stage_at else None
+            )
+            if (
+                elapsed is None  # 首条：立刻给人看到「已开始」
+                or done >= total  # 收尾：保证最后一条不被节流吃掉
+                or elapsed >= HEARTBEAT_STAGE_MIN_SECONDS
+            ):
+                run.stage = f"{prefix}（已完成 {done}/{total}）"[:255]
+                last_stage_at = now
             db.commit()
         except Exception:  # noqa: BLE001 —— 心跳失败不阻断蒸馏
             try:

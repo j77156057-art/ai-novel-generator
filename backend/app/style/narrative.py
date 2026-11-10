@@ -52,6 +52,16 @@ from sqlalchemy.orm import Session
 #: 一共有多少块。前端据此渲染不确定态，绝不拿 0 当分母。
 ProgressCallback = Callable[[str, int, int], None]
 
+#: 心跳回调签名：`(本批已完成数, 本批总数, 阶段前缀)`。
+#:
+#: 与 `ProgressCallback` 的分工：进度回调报「块」，块级进度要等一本语料的全部
+#: 并发调用回来才动；心跳按**每一条 LLM 调用返回**触发，只回答「后台线程还活着
+#: 吗、这一批完成了几个」。阶段前缀由提炼侧给出人话（如「语料 2/2：并发提炼中」），
+#: 后台任务负责拼上「（已完成 37/92）」并按间隔节流写 `stage`。
+#:
+#: 不传心跳时整条链路行为与引入心跳之前逐字节一致（生成路径就是这条）。
+HeartbeatCallback = Callable[[int, int, str], None]
+
 #: 叙事档案的形状修订号。**任何会改变档案字段的改动都必须把它 +1。**
 #:
 #: 与 `style/pipeline.py` 的 `PIPELINE_SCHEMA` 同理：指纹只有 `source_ids + narrative_version`，
@@ -2497,6 +2507,7 @@ def _extract_character_voices(
     char_names: list[str] | None = None,
     voice_mode: str = "targeted",
     cleaning: str = "full",
+    on_done: Callable[[int, int], None] | None = None,
 ) -> list[dict]:
     """混合方案：主要角色逐个提取，配角分批提取。
 
@@ -2512,6 +2523,10 @@ def _extract_character_voices(
         voice_mode: "targeted"（完整/平衡档，逐个 + 分批）或
             "single_batch"（快速档，一次调用搞定，对应 docs 的 v3「单批浅层」）。
         cleaning: 传给 _build_character_name_index 的清洗强度。
+        on_done: 心跳回调 `(已完成, 本批总数)`，透传给内部 `_gather_chat`。
+            这一批是 8+4=12 个并发调用，是整条蒸馏里除主提炼外唯一可能连续
+            十几分钟没有进度写入的段落——不传心跳就会被看护误判成卡住。
+            单批模式（快速档）只有 1 次调用，不需要心跳。
     """
     if voice_mode == "single_batch":
         if char_names is None:
@@ -2584,7 +2599,7 @@ def _extract_character_voices(
     # 一次 gather 跑所有 prompt
     if all_prompts:
         try:
-            raws = _gather_chat(provider, all_prompts)
+            raws = _gather_chat(provider, all_prompts, on_done=on_done)
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning(
                 "角色声音批量提取失败: %s", exc
@@ -2863,27 +2878,34 @@ _DEFAULT_MAX_CONCURRENT = 5
 async def _gather_chat_async(
     provider, prompts: list[tuple[str, str, dict | None]],
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
-    on_done: Callable[[], None] | None = None,
+    on_done: Callable[[int, int], None] | None = None,
 ) -> list[str | Exception]:
     """异步 gather N 个 provider.async_chat 调用（受 semaphore 限流）。
 
-    `on_done`：每有一条 prompt 返回就回调一次。**只用来打「心跳」**（证明后台
-    线程还活着），不改任何提炼逻辑、更不改返回顺序。没有它的话，一本语料的所有
-    prompt 是一次性 gather 的，中间几十分钟没有任何进度写入——看护会把它误判
-    成「卡住」（见 `app/style/jobs.py` 的 stall 判据）。
+    `on_done`：每有一条 prompt 返回就回调一次，入参是 `(已完成数, 本批总数)`。
+    **只用来打「心跳」**（证明后台线程还活着、顺便让人看到这一批的计数），不改
+    任何提炼逻辑、更不改返回顺序。没有它的话，一本语料的所有 prompt 是一次性
+    gather 的，中间几十分钟没有任何进度写入——看护会把它误判成「卡住」（见
+    `app/style/jobs.py` 的 stall 判据）。
+
+    计数在事件循环的单线程里自增，天然无竞态；返回（含异常）都会触发回调。
     """
     sem = asyncio.Semaphore(max_concurrent)
+    total = len(prompts)
+    done = 0
 
     async def _one(system: str, user: str, constraints):
+        nonlocal done
         async with sem:
             try:
                 return await provider.async_chat(system, user, constraints=constraints)
             except Exception as exc:  # noqa: BLE001 —— 单条失败不阻断其余
                 return exc
             finally:
+                done += 1
                 if on_done is not None:
                     try:
-                        on_done()
+                        on_done(done, total)
                     except Exception:  # noqa: BLE001 —— 心跳失败不阻断蒸馏
                         pass
 
@@ -2891,10 +2913,27 @@ async def _gather_chat_async(
     return await asyncio.gather(*tasks, return_exceptions=False)
 
 
+def _bind_heartbeat(
+    heartbeat: HeartbeatCallback | None, prefix: str
+) -> Callable[[int, int], None] | None:
+    """把人话阶段前缀绑到心跳上，交给 `_gather_chat` 的 `on_done`。
+
+    提炼侧知道「这是第几本语料、当前在干什么」，后台任务只负责拼计数与写库；
+    前缀在这里绑死，回调签名就能保持 `(已完成, 总数)` 这种最小形状。
+    """
+    if heartbeat is None:
+        return None
+
+    def _beat(done: int, total: int) -> None:
+        heartbeat(done, total, prefix)
+
+    return _beat
+
+
 def _gather_chat(
     provider, prompts: list[tuple[str, str, dict | None]],
     max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
-    on_done: Callable[[], None] | None = None,
+    on_done: Callable[[int, int], None] | None = None,
 ) -> list[str | Exception]:
     """同步入口：内部 asyncio.run 跑并发。
 
@@ -2985,7 +3024,7 @@ def extract_narrative_profile(
     max_chapters: int = 180,  # v6: 默认 30% × 600 章 ≈ 180
     tier: str | NarrativeTier | None = None,
     progress: ProgressCallback | None = None,
-    heartbeat: Callable[[], None] | None = None,
+    heartbeat: HeartbeatCallback | None = None,
 ) -> dict:
     """从参考语料提炼叙事档案。
 
@@ -2997,9 +3036,10 @@ def extract_narrative_profile(
             维度、provider 选择、返回结构一项都不变。
             单位是「块（chunk）」：一本语料切成若干块，每块一次 `provider.chat`，
             这就是用户能感知到的天然粒度。
-        heartbeat: 可选的无参回调，**每有一条 LLM 请求返回就打一次**。只为
-            后台看护的心跳（`progress_at`）服务——块级进度在一次 gather 里是
-            攒着报的，几十分钟没有写入会被误判成卡住。不参与任何提炼决策。
+        heartbeat: 可选的心跳回调 `(已完成, 本批总数, 阶段前缀)`，**每有一条
+            LLM 请求返回就打一次**。只为后台看护的心跳（`progress_at`）与一句
+            人话计数服务——块级进度在一次 gather 里是攒着报的，几十分钟没有写入
+            会被误判成卡住。不参与任何提炼决策。
 
     返回结构（可直接 JSON 落库到 `Project.style_narrative`）：
     {
@@ -3191,7 +3231,12 @@ def extract_narrative_profile(
 
         if flat_prompts:
             try:
-                flat_raws = _gather_chat(provider, flat_prompts, on_done=heartbeat)
+                flat_raws = _gather_chat(
+                    provider, flat_prompts,
+                    on_done=_bind_heartbeat(
+                        heartbeat, f"语料 {book_idx}/{total_books}：并发提炼中"
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001
                 logging.getLogger(__name__).warning(
                     "叙事提炼全 chunk 失败 novel_id=%s: %s", nid, exc
@@ -3414,6 +3459,9 @@ def extract_narrative_profile(
                 char_names=[n for n, _ in canonical],
                 voice_mode=cfg.voice_mode,
                 cleaning=cfg.fake_character_cleaning,
+                on_done=_bind_heartbeat(
+                    heartbeat, f"语料 {book_idx}/{total_books}：提取角色声音"
+                ),
             )
             # 去重 + 角色名归一化（小落→安小落、宫爵→南宫爵、过滤角色A/时间）
             voice_results = _dedup_character_voices(
@@ -3702,7 +3750,7 @@ def project_narrative(
     persist_library: bool = True,
     content_hash: str | None = None,
     sample_chapters: int | None = None,
-    heartbeat: Callable[[], None] | None = None,
+    heartbeat: HeartbeatCallback | None = None,
 ) -> dict | None:
     """取项目当前该用的叙事档案；没有参考语料则返回 None。
 
