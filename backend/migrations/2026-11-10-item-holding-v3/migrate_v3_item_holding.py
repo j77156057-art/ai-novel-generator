@@ -36,10 +36,21 @@ DEFAULT_JSON = HERE / "holdings_v3.json"
 DEFAULT_DB = BACKEND / "data" / "generated.db"
 
 
-def load_rows(path: pathlib.Path) -> list[dict]:
+def _read(path: pathlib.Path) -> list[dict]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    rows = payload["rows"] if isinstance(payload, dict) else payload
-    return [r for r in rows if r["verdict"] == "转持有"]
+    return payload["rows"] if isinstance(payload, dict) else payload
+
+
+def load_rows(path: pathlib.Path) -> list[dict]:
+    """只取「转持有」；判错与存疑一条都不进持有表。"""
+    return [r for r in _read(path) if r["verdict"] == "转持有"]
+
+
+def load_same_chapter_doubts(path: pathlib.Path) -> list[dict]:
+    """同章竞争/同章重复的存疑行：不猜胜负，只进 gen_candidates。"""
+    return [r for r in _read(path)
+            if r["verdict"] == "存疑"
+            and r["reason_code"] in ("doubt_same_chapter", "dup_in_chapter")]
 
 
 def order_rows(rows: list[dict]) -> list[dict]:
@@ -103,6 +114,16 @@ def apply(con, rows: list[dict]) -> dict:
     return {"stats": dict(stats), "items": len(items), "clashes": clashes}
 
 
+def write_candidates(con, rows: list[dict]) -> int:
+    """同章竞争无事件 = 谁都不判胜；两条主张都进候选，不进持有表。"""
+    before = con.total_changes
+    for r in rows:
+        store.add_candidate(con, r["holder_name"], r["item_name"], "owns",
+                            r["valid_from"], r["reason_code"],
+                            r.get("evidence", ""))
+    return con.total_changes - before
+
+
 def verify(con, rows: list[dict]) -> list[tuple[str, bool, str]]:
     out: list[tuple[str, bool, str]] = []
 
@@ -152,6 +173,7 @@ def main() -> int:
     ap.add_argument("--verify-only", action="store_true")
     args = ap.parse_args()
 
+    doubts = load_same_chapter_doubts(pathlib.Path(args.json))
     rows = order_rows(load_rows(pathlib.Path(args.json)))
     db_path = pathlib.Path(args.db)
     exists = db_path.exists()
@@ -176,16 +198,21 @@ def main() -> int:
     if args.dry_run:
         con.execute("BEGIN")
         result = apply(con, rows)
+        cands = write_candidates(con, doubts)
         con.rollback()
     else:
         result = apply(con, rows)
+        cands = write_candidates(con, doubts)
         con.commit()
 
     print("actions:", json.dumps(result["stats"], ensure_ascii=False, sort_keys=True))
     print("items covered:", result["items"])
     print("same-chapter clashes:", json.dumps(result["clashes"], ensure_ascii=False))
+    print(f"doubt candidates (same-chapter, no event): {cands} / {len(doubts)}")
     total = con.execute("SELECT COUNT(*) FROM kg_item_holding").fetchone()[0]
     print("kg_item_holding rows:", total)
+    print("gen_candidates rows:",
+          con.execute("SELECT COUNT(*) FROM gen_candidates").fetchone()[0])
 
     if not args.dry_run:
         print("--- verify ---")
