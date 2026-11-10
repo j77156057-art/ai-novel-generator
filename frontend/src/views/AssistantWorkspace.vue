@@ -40,8 +40,10 @@ import type {
   AssistantIssue,
   AssistantPendingAction,
   ProjectOut,
+  WizardActionEcho,
   WizardCommitResult,
   WizardQuestion,
+  WizardSayResponse,
   WizardSessionView,
 } from "@/api/types";
 
@@ -102,6 +104,14 @@ interface Turn {
   wizard?: WizardStepState | null;
   /** 引导里的一次「追问/没听懂」：只有解释文字，没有卡片，也不推进流程。 */
   note?: boolean;
+  /** 引导里助理真的改了一次配置（mode=action）：回执前后值 + 可撤销。 */
+  action?: WizardActionEcho | null;
+  /** 撤销这次写操作用的审计 id；null = 不可撤销或已撤销。 */
+  undoId?: number | null;
+  /** 后端声明的可撤销性（触发蒸馏等为 false）。 */
+  undoable?: boolean;
+  undoBusy?: boolean;
+  undoDone?: boolean;
   /** 引导提交后的执行结果（大纲 / 已就绪 / 已写完 / 角色模式）。 */
   wizardResult?: WizardCommitResult | null;
 }
@@ -368,10 +378,12 @@ function backStep(turn: Turn): void {
 /**
  * 引导进行中的一句话：交给后端的引导解析器。
  *
- * 三种结局（mode）：
+ * 四种结局（mode）：
  *   answered —— 真在作答：收起当前卡片，下一条回复开头带回执；
  *   explain / clarify —— 追问或没听懂：**不推进**，当前卡片保持可点，
- *     只追加一条解释气泡。这是「对话流」和「一问一卡」的核心差别。
+ *     只追加一条解释气泡。这是「对话流」和「一问一卡」的核心差别；
+ *   action —— 助理改了一次配置（档位 / 采样章数 / 字数 / 流程）：不推进
+ *     作答语义，回执里带「旧值 → 新值 + 影响」，并给出可撤销 id。
  */
 async function sayInWizard(text: string): Promise<void> {
   if (wizardBusy.value) return;
@@ -392,6 +404,17 @@ async function sayInWizard(text: string): Promise<void> {
       }
       if (res.done && res.result) applyCommitResult(res.result);
       else if (res.question) pushWizardTurn(res.question);
+    } else if (res.mode === "action") {
+      if (ws) ws.busy = false;
+      const t = makeAssistantTurn();
+      t.loading = false;
+      t.note = true;
+      t.text = res.message || "";
+      t.action = res.action ?? null;
+      t.undoId = res.undo_id ?? null;
+      t.undoable = res.undoable === true;
+      turns.value.push(t);
+      refreshQuestionAfterAction(ws, res);
     } else {
       if (ws) ws.busy = false;
       const t = makeAssistantTurn();
@@ -408,6 +431,60 @@ async function sayInWizard(text: string): Promise<void> {
     turns.value.push(t);
   } finally {
     wizardBusy.value = false;
+    await scrollToBottom();
+  }
+}
+
+/**
+ * 写操作之后刷新卡片。
+ *
+ * 动作**不推进作答**，但可能改掉当前题的内容（例如采样章数改了，蒸馏卡的
+ * 章数/耗时都要重算），也可能把当前题跳走（skip_step）。所以：
+ *   - 还是同一题 → 就地换掉 question（卡片保持可点）；
+ *   - 换题了 → 旧卡收起成只读，追加新卡。
+ */
+function refreshQuestionAfterAction(
+  ws: WizardStepState | null,
+  res: WizardSayResponse,
+): void {
+  const nextQ = res.question;
+  if (!nextQ) return;
+  if (ws && ws.question.step === nextQ.step) {
+    ws.question = nextQ;
+    ws.answeredLabel = null;
+    return;
+  }
+  if (ws) {
+    ws.busy = false;
+    ws.disabled = true;
+  }
+  pushWizardTurn(nextQ);
+}
+
+/** 撤销上一次写操作（审计 id 来自 action 回执）。 */
+async function undoAction(turn: Turn): Promise<void> {
+  if (turn.undoBusy || !turn.undoId) return;
+  turn.undoBusy = true;
+  try {
+    const res = await api.undoWizard(projectId, turn.undoId);
+    turn.undoBusy = false;
+    turn.undoDone = true;
+    turn.undoId = null;
+    wizard.value = res.session;
+    const t = makeAssistantTurn();
+    t.loading = false;
+    t.note = true;
+    t.text = res.message || "已撤销。";
+    turns.value.push(t);
+    const current = [...turns.value].reverse().find((x) => x.wizard && !x.wizard.disabled);
+    refreshQuestionAfterAction(current?.wizard ?? null, res);
+  } catch (err) {
+    turn.undoBusy = false;
+    const t = makeAssistantTurn();
+    t.loading = false;
+    t.error = `撤销失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+    turns.value.push(t);
+  } finally {
     await scrollToBottom();
   }
 }
@@ -743,6 +820,12 @@ function formatDetailValue(raw: unknown): string {
   }
 }
 
+/** 写操作回执里的旧值/新值：null 明确显示「未设置」，不渲染成空行。 */
+function echoValue(raw: unknown): string {
+  if (raw === null || raw === undefined || raw === "") return "（未设置）";
+  return formatDetailValue(raw);
+}
+
 // ==================================================================
 // 长文本展开态（回答 / 证据 / detail 复用同一套）
 // ==================================================================
@@ -876,6 +959,47 @@ onMounted(async () => {
         >
           <div v-if="turn.error" class="notice err">{{ turn.error }}</div>
           <p v-if="turn.text" class="wz-prose" :class="{ note: turn.note }">{{ turn.text }}</p>
+
+          <!-- 写操作回执：改了什么、从什么改成什么、影响是什么，可撤销 -->
+          <div v-if="turn.action" class="wz-action">
+            <div class="row tight" style="align-items: center">
+              <span class="tag accent mono">{{ turn.action.action }}</span>
+              <span class="tag mono">target={{ turn.action.target }}</span>
+              <span class="tag mono">审计 #{{ turn.action.id ?? "—" }}</span>
+            </div>
+            <div class="wz-action-diff">
+              <div>
+                <span class="blk-head">旧值</span>
+                <span class="mono">{{ echoValue(turn.action.old) }}</span>
+              </div>
+              <div>
+                <span class="blk-head">新值</span>
+                <span class="mono">{{ echoValue(turn.action.new) }}</span>
+              </div>
+              <div v-if="turn.action.impact">
+                <span class="blk-head">影响</span>
+                <span>{{ turn.action.impact }}</span>
+              </div>
+            </div>
+            <div class="row tight" style="align-items: center">
+              <button
+                v-if="turn.undoId && !turn.undoDone"
+                class="btn sm"
+                :disabled="turn.undoBusy"
+                @click="undoAction(turn)"
+              >
+                {{ turn.undoBusy ? "撤销中…" : "撤销这次修改" }}
+              </button>
+              <span v-else-if="turn.undoDone" class="tag ok">已撤销</span>
+              <span
+                v-else-if="turn.undoable === false"
+                class="faint"
+                style="font-size: var(--fs-xs)"
+              >
+                这一步不可撤销（已提交后台任务）
+              </span>
+            </div>
+          </div>
 
           <WizardStepCard
             v-if="turn.wizard"
@@ -1103,7 +1227,7 @@ onMounted(async () => {
     <!-- ==================== 输入 ==================== -->
     <form class="composer" @submit.prevent="send">
       <div v-if="wizardActive" class="composer-hint">
-        引导进行中：直接打字回答，或问「为什么」我就地解释；也可以点卡片。
+        引导进行中：直接打字回答，或问「为什么」我就地解释；缺参数就让我改（如「采样改成 200 章」「跳过风格」），改完可撤销。
         <button type="button" class="link-btn" @click="startWizardFlow('重新开始，先定方向。', true)">
           重新开始
         </button>
@@ -1121,7 +1245,7 @@ onMounted(async () => {
           roleMode
             ? `对${roleMode.character}说点什么…`
             : wizardActive
-              ? '直接回答这一步，或问我「为什么」——例如：快速档和完整档差多少？'
+              ? '直接回答这一步，或问我「为什么」；也可以让我改：采样改成 200 章 / 跳过风格'
               : '问助手一个问题，例如：主角第 3 段的动机和第 1 段一致吗？'
         "
         @keydown="onKeydown"
@@ -1131,7 +1255,7 @@ onMounted(async () => {
           {{ sending ? "思考中…" : "提问" }}
         </button>
         <span class="faint" style="font-size: var(--fs-xs)">
-          Enter 发送 · Shift+Enter 换行。助手只走只读工具；检索不到证据时会明说。
+          Enter 发送 · Shift+Enter 换行。写操作只限本项目配置与会话状态，每次改动都有审计、可撤销。
         </span>
       </div>
     </form>
@@ -1375,6 +1499,30 @@ onMounted(async () => {
 }
 .wz-prose.note {
   color: var(--fg-muted);
+}
+/* 写操作回执：与解释文字区分开，一眼看出「这次真的改了东西」 */
+.wz-action {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-sm);
+  margin: var(--gap-sm) 0;
+  padding: 10px 12px;
+  border: var(--border-w) solid var(--border-strong);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+}
+.wz-action-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+.wz-action-diff > div {
+  display: flex;
+  gap: var(--gap-sm);
+  flex-wrap: wrap;
 }
 .wz-done {
   display: flex;

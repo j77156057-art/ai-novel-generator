@@ -810,6 +810,18 @@ export const api = {
       jsonInit("POST", { text }),
     ),
 
+  /**
+   * 撤销一次引导内写操作（档位 / 采样章数 / 字数 / 题材 / 风格 / 大纲 / 流程改写）。
+   *
+   * 不传 `auditId` = 撤销最近一次可撤销的操作。触发蒸馏不可撤销
+   * （后端返回 `undoable:false`），这类操作只能等任务跑完再看结果。
+   */
+  undoWizard: (projectId: number, auditId?: number | null) =>
+    request<WizardSayResponse>(
+      `/assistant/wizard/${projectId}/undo`,
+      jsonInit("POST", auditId ? { audit_id: auditId } : {}),
+    ),
+
   /** 从汇总卡片跳回已答过的某一步。 */
   gotoWizard: (projectId: number, stepKey: string) =>
     request<WizardStateResponse>(

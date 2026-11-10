@@ -1442,9 +1442,30 @@ export interface WizardAnswerResponse {
   result?: WizardCommitResult;
 }
 
-/** 自由输入的结果：作答 / 就地解释（不推进）/ 没听懂 / 回退。 */
+/**
+ * 一次写操作的审计回执（后端 `wizard_actions._ok` 的 `action` 字段）。
+ *
+ * 与 `WizardActionAudit` 表一一对应：谁（actor 固定 assistant）、哪一步、
+ * 动作、旧值、新值、影响。`old` / `new` 是 JSON 原样，可能是数字、字符串、
+ * 对象或 null —— 前端只做展示，不参与解释。
+ */
+export interface WizardActionEcho {
+  id: number | null;
+  action: string;
+  target: string;
+  old: unknown;
+  new: unknown;
+  impact: string | null;
+}
+
+/**
+ * 自由输入的结果：作答 / 就地解释（不推进）/ 没听懂 / 回退 / 执行了一次写操作。
+ *
+ * `mode="action"` 是「助理受控写权限」的落点：不推进引导步骤，只改项目级
+ * 配置或本次会话的流程改写，回执带前后值与可撤销 id。
+ */
 export interface WizardSayResponse {
-  mode: "answered" | "explain" | "clarify";
+  mode: "answered" | "explain" | "clarify" | "action";
   message?: string;
   ack?: string;
   /** 解析出的选项文案（收起卡片时显示「已选：3000 字」）。 */
@@ -1453,6 +1474,12 @@ export interface WizardSayResponse {
   question: WizardQuestion | null;
   done?: boolean;
   result?: WizardCommitResult;
+  /** 仅 mode="action"：这次改了什么（旧值 → 新值 + 影响）。 */
+  action?: WizardActionEcho | null;
+  /** 仅 mode="action" 且可撤销：审计行 id，传给撤销接口。 */
+  undo_id?: number | null;
+  /** 本次写操作是否可撤销（触发蒸馏这类不可撤销的为 false）。 */
+  undoable?: boolean;
 }
 
 export interface WizardRunResponse {
