@@ -69,6 +69,11 @@ import type {
   StyleDistillListResponse,
   SearchHit,
   UploadResult,
+  WizardAnswerRequest,
+  WizardAnswerResponse,
+  WizardRoleChatResponse,
+  WizardRunResponse,
+  WizardStateResponse,
 } from "./types";
 
 const BASE = "/api";
@@ -772,5 +777,49 @@ export const api = {
     request<{ requeued: number; missing: number[] }>(
       `/projects/${projectId}/kg-v3/worker/requeue`,
       jsonInit("POST", { run_ids: runIds }),
+    ),
+
+  // ---------- 对话式创作引导 ----------
+
+  /** 恢复引导：没有会话时 session=null（前端展示干净的空对话）。 */
+  getWizard: (projectId: number) =>
+    request<WizardStateResponse>(`/assistant/wizard/${projectId}`),
+
+  /** 开始/恢复：restart=true 会放弃当前会话重新问。 */
+  startWizard: (projectId: number, restart = false) =>
+    request<WizardStateResponse>(
+      "/assistant/wizard/start",
+      jsonInit("POST", { project_id: projectId, restart }),
+    ),
+
+  /** 提交一步答案；skip=true 表示采用卡片默认值。 */
+  answerWizard: (projectId: number, body: WizardAnswerRequest) =>
+    request<WizardAnswerResponse>(
+      `/assistant/wizard/${projectId}/answer`,
+      jsonInit("POST", body),
+    ),
+
+  backWizard: (projectId: number) =>
+    request<WizardStateResponse>(`/assistant/wizard/${projectId}/back`, jsonInit("POST", {})),
+
+  /** 从汇总卡片跳回已答过的某一步。 */
+  gotoWizard: (projectId: number, stepKey: string) =>
+    request<WizardStateResponse>(
+      `/assistant/wizard/${projectId}/goto`,
+      jsonInit("POST", { step_key: stepKey }),
+    ),
+
+  commitWizard: (projectId: number) =>
+    request<WizardAnswerResponse>(`/assistant/wizard/${projectId}/commit`, jsonInit("POST", {})),
+
+  /** 按已确认的配置开写（复用 generate_loop，串行逐段）。可能跑几分钟。 */
+  runWizard: (projectId: number) =>
+    request<WizardRunResponse>(`/assistant/wizard/${projectId}/run`, jsonInit("POST", {})),
+
+  /** 角色对话：一次一问，不写正文。 */
+  wizardRoleChat: (projectId: number, message: string, history: { role: string; content: string }[]) =>
+    request<WizardRoleChatResponse>(
+      `/assistant/wizard/${projectId}/role-chat`,
+      jsonInit("POST", { message, history }),
     ),
 };

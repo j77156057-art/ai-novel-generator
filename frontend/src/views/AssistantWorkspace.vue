@@ -32,6 +32,7 @@ import { computed, nextTick, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ApiError, api } from "@/api/client";
 import AssistantIssueList from "@/components/AssistantIssueList.vue";
+import WizardStepCard from "@/components/WizardStepCard.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
 import { pendingActionKindLabel, pendingActionRiskMeta, sourceLabel } from "@/utils/assistantDisplay";
 import type {
@@ -39,6 +40,9 @@ import type {
   AssistantIssue,
   AssistantPendingAction,
   ProjectOut,
+  WizardCommitResult,
+  WizardQuestion,
+  WizardSessionView,
 } from "@/api/types";
 
 const route = useRoute();
@@ -94,6 +98,19 @@ interface Turn {
   cards: ActionCard[];
   error: string | null;
   loading: boolean;
+  /** 创作引导的一步（卡片）；与普通问答互斥。 */
+  wizard?: WizardStepState | null;
+  /** 引导提交后的执行结果（大纲 / 已就绪 / 已写完 / 角色模式）。 */
+  wizardResult?: WizardCommitResult | null;
+}
+
+interface WizardStepState {
+  question: WizardQuestion;
+  /** 已作答的选项文案；有值时卡片收起成一行。 */
+  answeredLabel: string | null;
+  busy: boolean;
+  /** 已翻页/已回退的历史卡片：只读，防止重复提交。 */
+  disabled: boolean;
 }
 
 // ==================================================================
@@ -187,12 +204,240 @@ function textOf(err: unknown): string {
 }
 
 // ==================================================================
+// 创作引导（对话式一步步生成）
+// ==================================================================
+
+/** 当前引导会话（服务端落库，刷新可续）。 */
+const wizard = ref<WizardSessionView | null>(null);
+const wizardBusy = ref(false);
+const runBusy = ref(false);
+/** 角色对话模式：进入后 composer 的每句话都发给角色，而不是问答 agent。 */
+const roleMode = ref<{ character: string; scene: string } | null>(null);
+
+const wizardActive = computed(() => wizard.value?.status === "active");
+
+/** 「我想生成一本小说」这类说法直接进引导，不用用户去找按钮。 */
+const WIZARD_INTENT = /(我想|我要|帮我|想)?\s*(生成|写|创作|开)\s*(一|1)?\s*本?\s*(小说|书)/;
+
+function looksLikeWizardIntent(text: string): boolean {
+  return WIZARD_INTENT.test(text);
+}
+
+function makeWizardTurn(text: string): Turn {
+  const t = makeAssistantTurn();
+  t.loading = false;
+  t.text = text;
+  return t;
+}
+
+function pushWizardTurn(question: WizardQuestion, intro = ""): Turn {
+  const t = makeWizardTurn(intro);
+  t.wizard = { question, answeredLabel: null, busy: false, disabled: false };
+  turns.value.push(t);
+  void scrollToBottom();
+  return t;
+}
+
+function pushResultTurn(result: WizardCommitResult, intro = ""): Turn {
+  const t = makeWizardTurn(intro);
+  t.wizardResult = result;
+  turns.value.push(t);
+  void scrollToBottom();
+  return t;
+}
+
+function applyCommitResult(result: WizardCommitResult): void {
+  if (result.kind === "role_chat" && result.character) {
+    roleMode.value = {
+      character: result.character,
+      scene: result.scene || "当前剧情时间线",
+    };
+  }
+  pushResultTurn(result);
+}
+
+/** 开始（或恢复）引导；restart=true 放弃旧会话从头问。 */
+async function startWizardFlow(intro = "", restart = false): Promise<void> {
+  if (wizardBusy.value) return;
+  wizardBusy.value = true;
+  try {
+    const st = await api.startWizard(projectId, restart);
+    wizard.value = st.session;
+    if (st.question) pushWizardTurn(st.question, intro);
+  } catch (err) {
+    const t = makeAssistantTurn();
+    t.loading = false;
+    t.error = `无法开始引导（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+    turns.value.push(t);
+  } finally {
+    wizardBusy.value = false;
+  }
+}
+
+/** 进入页面时恢复上次进度：停在哪一步就画哪一步。 */
+async function loadWizard(): Promise<void> {
+  try {
+    const st = await api.getWizard(projectId);
+    wizard.value = st.session;
+    if (!st.session) return;
+    if (st.session.status === "active" && st.question) {
+      pushWizardTurn(st.question, "上次问到这一步，接着来。");
+    } else if (st.session.status === "committed" && st.session.result) {
+      applyCommitResult(st.session.result);
+    }
+  } catch {
+    /* 忽略：引导不可用不影响问答 */
+  }
+}
+
+async function answerStep(turn: Turn, value: unknown, label: string): Promise<void> {
+  const ws = turn.wizard;
+  if (!ws || ws.busy) return;
+  ws.busy = true;
+  const question = ws.question;
+  turns.value.push(makeUserTurn(label));
+  await scrollToBottom();
+  try {
+    const res = await api.answerWizard(projectId, {
+      step_key: question.step,
+      value,
+    });
+    ws.busy = false;
+    ws.disabled = true;
+    ws.answeredLabel = label;
+    wizard.value = res.session;
+    if (res.done && res.result) applyCommitResult(res.result);
+    else if (res.question) pushWizardTurn(res.question);
+  } catch (err) {
+    ws.busy = false;
+    turn.error = `这一步没提交成功（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+  }
+}
+
+async function skipStep(turn: Turn): Promise<void> {
+  const ws = turn.wizard;
+  if (!ws || ws.busy) return;
+  ws.busy = true;
+  turns.value.push(makeUserTurn("使用默认值"));
+  try {
+    const res = await api.answerWizard(projectId, {
+      step_key: ws.question.step,
+      skip: true,
+    });
+    ws.busy = false;
+    ws.disabled = true;
+    ws.answeredLabel = "使用默认值";
+    wizard.value = res.session;
+    if (res.done && res.result) applyCommitResult(res.result);
+    else if (res.question) pushWizardTurn(res.question);
+  } catch (err) {
+    ws.busy = false;
+    turn.error = `跳过失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+  }
+}
+
+/** 上一步 / 点汇总行跳回：都走同一个「重新画当前题」的路径。 */
+async function revisitStep(
+  turn: Turn,
+  fetcher: () => Promise<{ session: WizardSessionView | null; question: WizardQuestion | null }>,
+  intro: string,
+): Promise<void> {
+  const ws = turn.wizard;
+  if (!ws || ws.busy) return;
+  ws.busy = true;
+  try {
+    const st = await fetcher();
+    ws.busy = false;
+    ws.disabled = true;
+    wizard.value = st.session;
+    if (st.question) pushWizardTurn(st.question, intro);
+  } catch (err) {
+    ws.busy = false;
+    turn.error = `无法回到上一步（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+  }
+}
+
+function backStep(turn: Turn): void {
+  void revisitStep(turn, () => api.backWizard(projectId), "回到上一步，改完继续。");
+}
+
+function gotoStep(turn: Turn, step: string): void {
+  void revisitStep(
+    turn,
+    () => api.gotoWizard(projectId, step),
+    "跳回这一项，改完继续。",
+  );
+}
+
+function canRun(result: WizardCommitResult | null | undefined): boolean {
+  if (!result) return false;
+  if (result.kind === "role_chat") return false;
+  return result.stage === "ready" || result.stage === "outline";
+}
+
+async function runGeneration(turn: Turn): Promise<void> {
+  if (runBusy.value) return;
+  runBusy.value = true;
+  try {
+    const res = await api.runWizard(projectId);
+    if (turn.wizardResult) turn.wizardResult = res.result;
+    pushResultTurn(res.result, "写好了，下面是本次落笔的段落。");
+  } catch (err) {
+    const t = makeAssistantTurn();
+    t.loading = false;
+    t.error = `开写失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+    turns.value.push(t);
+  } finally {
+    runBusy.value = false;
+    await scrollToBottom();
+  }
+}
+
+function exitRole(): void {
+  roleMode.value = null;
+  const t = makeAssistantTurn();
+  t.loading = false;
+  t.answer = "已退出角色对话，回到普通问答。想再聊，点输入框上方的「重新开始创作引导」。";
+  turns.value.push(t);
+  void scrollToBottom();
+}
+
+function prettyJson(value: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+/** 角色对话的历史只带最近 8 句，避免提示词无限膨胀。 */
+function recentRoleHistory(): { role: string; content: string }[] {
+  return turns.value
+    .slice(-9, -1)
+    .filter((t) => t.role === "user" || t.answer)
+    .map((t) => ({
+      role: t.role,
+      content: t.role === "user" ? t.text : t.answer,
+    }));
+}
+
+// ==================================================================
 // 问答
 // ==================================================================
 
 async function send(): Promise<void> {
   const q = query.value.trim();
   if (!q || sending.value) return;
+
+  // 「我想生成一本小说」= 引导入口：不丢给问答 agent，直接开状态机。
+  // 已经在引导里时不再抢话，用户可能是想顺便问别的问题。
+  if (!wizardActive.value && !roleMode.value && looksLikeWizardIntent(q)) {
+    turns.value.push(makeUserTurn(q));
+    query.value = "";
+    await startWizardFlow("好，我一步一步问你。先定这次要做哪一种作品。");
+    await scrollToBottom();
+    return;
+  }
 
   // 先把 user 气泡插进去，assistant 占位气泡同时置 loading：
   // 否则「提问 → 等待 → 出结果」之间界面是空的，用户会以为没点上。
@@ -204,6 +449,13 @@ async function send(): Promise<void> {
   await scrollToBottom();
 
   try {
+    if (roleMode.value) {
+      // 角色对话：只读角色卡 + 助手模型，不触发问答 agent 的检索/工具。
+      const res = await api.wizardRoleChat(projectId, q, recentRoleHistory());
+      turn.answer = res.answer;
+      turn.loading = false;
+      return;
+    }
     const res = await api.assistantQa({ project_id: projectId, query: q });
     turn.answer = res.answer || "";
     turn.evidence = res.evidence ?? [];
@@ -471,6 +723,8 @@ onMounted(async () => {
   } catch {
     /* 忽略：助手能力不依赖项目名 */
   }
+  // 恢复未完成的创作引导（会话在服务端，刷新/关页不丢）。
+  await loadWizard();
 });
 </script>
 
@@ -480,7 +734,7 @@ onMounted(async () => {
     <div class="asst-head">
       <h1>助手工作台</h1>
       <button class="link-btn back-link" @click="router.push(`/projects/${projectId}`)">
-        ← 返回项目工作台
+        ← 返回项目工作台 · 直接填表（高级）
       </button>
     </div>
 
@@ -522,13 +776,9 @@ onMounted(async () => {
       </span>
     </div>
 
-    <p>
-      这里只有问答。助手回答时会去检索<strong>本项目正文</strong>与<strong>参考语料</strong>，
-      并把知识图谱里的未填坑与角色约束一并带上；它给出的每一条证据都可以在回答里展开核对。
-      <strong>诊断、日志分析、语料 / 图谱 / 生成物审核不是助手自己决定跑的</strong>——
-      这几项在各自的入口按需触发（助手页只做问答）。
-      <strong>助手不会未经确认就改动你的正文</strong>：需要写操作时，它会在回答里给一张
-      待确认卡片，你点「确认」才会执行，点「取消」什么都不发生。
+    <p class="asst-intro">
+      想写小说就说一句「我想生成一本小说」，我一步一步问你；
+      不想走引导，也可以直接问正文、语料或图谱上的问题。
     </p>
   </header>
 
@@ -536,14 +786,21 @@ onMounted(async () => {
     <!-- ==================== 对话流 ==================== -->
     <div ref="streamEl" class="stream">
       <div v-if="!hasHistory" class="stream-hint">
-        <p>
-          直接问就行 —— 助手会去检索本项目正文、参考语料，并带上知识图谱里的
-          未填坑与角色约束。诊断、日志分析和三类审核请在各自的入口触发，
-          助手不会在问答里替你决定要不要跑。
-        </p>
+        <p><strong>要写小说？</strong>我一步步问：参考语料、蒸馏档位、题材、字数、章节。</p>
+        <div class="row tight">
+          <button
+            class="btn primary sm"
+            :disabled="wizardBusy || badId"
+            @click="startWizardFlow('好，我一步一步问你。先定这次要做哪一种作品。')"
+          >
+            {{ wizardBusy ? "准备中…" : "开始创作引导" }}
+          </button>
+          <span class="faint" style="font-size: var(--fs-xs)">
+            或者说一句「我想生成一本小说」
+          </span>
+        </div>
         <p class="faint">
-          提问建议：<span class="mono">第 3 段和第 1 段的动机是不是重复了？</span>
-          <span class="mono">主角的名字前后有没有不一致？</span>
+          也可以直接问：<span class="mono">第 3 段和第 1 段的动机是不是重复了？</span>
         </p>
       </div>
 
@@ -553,7 +810,80 @@ onMounted(async () => {
           {{ turn.text }}
         </div>
 
-        <!-- 助手气泡 -->
+        <!-- 助手气泡：创作引导（卡片 / 结果） -->
+        <div
+          v-else-if="turn.wizard || turn.wizardResult"
+          class="bubble assistant wizard-bubble"
+        >
+          <div v-if="turn.error" class="notice err">{{ turn.error }}</div>
+          <p v-if="turn.text" class="wz-intro">{{ turn.text }}</p>
+
+          <WizardStepCard
+            v-if="turn.wizard"
+            :question="turn.wizard.question"
+            :busy="turn.wizard.busy"
+            :disabled="turn.wizard.disabled"
+            :answered-label="turn.wizard.answeredLabel"
+            @answer="(v, l) => answerStep(turn, v, l)"
+            @skip="skipStep(turn)"
+            @back="backStep(turn)"
+            @goto="(step) => gotoStep(turn, step)"
+          />
+
+          <template v-if="turn.wizardResult">
+            <p class="wz-intro">{{ turn.wizardResult.message }}</p>
+
+            <div v-if="turn.wizardResult.stage === 'outline' && turn.wizardResult.bible" class="blk">
+              <button
+                class="link-btn"
+                @click="toggle(`bible-${turn.key}`)"
+              >
+                {{ isOpen(`bible-${turn.key}`) ? "收起大纲" : "查看生成的大纲" }}
+              </button>
+              <pre
+                v-if="isOpen(`bible-${turn.key}`)"
+                class="diffbox snippet expanded mono"
+              >{{ prettyJson(turn.wizardResult.bible) }}</pre>
+            </div>
+
+            <div v-if="turn.wizardResult.segments?.length" class="wz-done">
+              <div
+                v-for="seg in turn.wizardResult.segments"
+                :key="String(seg.segment_no)"
+                class="wz-seg"
+              >
+                <span class="tag mono">第 {{ seg.segment_no }} 段 · {{ seg.chars }} 字</span>
+                <div class="prose snippet expanded">{{ seg.excerpt }}…</div>
+              </div>
+            </div>
+
+            <div class="row tight" style="margin-top: var(--sp-2)">
+              <button
+                v-if="canRun(turn.wizardResult)"
+                class="btn primary sm"
+                :disabled="runBusy"
+                @click="runGeneration(turn)"
+              >
+                {{ runBusy ? "正在写，别关页面…" : "开始写" }}
+              </button>
+              <button
+                v-if="turn.wizardResult.stage === 'role'"
+                class="btn sm"
+                @click="exitRole"
+              >
+                结束角色对话
+              </button>
+              <button
+                class="btn ghost sm"
+                @click="router.push(`/projects/${projectId}`)"
+              >
+                {{ turn.wizardResult.stage === "done" ? "看全文 →" : "去项目工作台 →" }}
+              </button>
+            </div>
+          </template>
+        </div>
+
+        <!-- 助手气泡：普通问答 -->
         <div v-else class="bubble assistant">
           <div class="row tight" style="align-items: center">
             <span class="tag info mono">AgentRun #{{ turn.agentRunId || "—" }}</span>
@@ -713,12 +1043,26 @@ onMounted(async () => {
 
     <!-- ==================== 输入 ==================== -->
     <form class="composer" @submit.prevent="send">
+      <div v-if="wizardActive" class="composer-hint">
+        引导进行中：点上面的卡片继续；也可以直接问我别的问题。
+        <button type="button" class="link-btn" @click="startWizardFlow('重新开始，先定方向。', true)">
+          重新开始
+        </button>
+      </div>
+      <div v-else-if="roleMode" class="composer-hint">
+        正在与「{{ roleMode.character }}」对话 · 情境：{{ roleMode.scene }}
+        <button type="button" class="link-btn" @click="exitRole">结束对话</button>
+      </div>
       <textarea
         v-model="query"
         class="input"
         rows="3"
         :disabled="badId"
-        placeholder="问助手一个问题，例如：主角第 3 段的动机和第 1 段一致吗？"
+        :placeholder="
+          roleMode
+            ? `对${roleMode.character}说点什么…`
+            : '问助手一个问题，例如：主角第 3 段的动机和第 1 段一致吗？'
+        "
         @keydown="onKeydown"
       ></textarea>
       <div class="row tight" style="align-items: center">
@@ -787,10 +1131,10 @@ onMounted(async () => {
   flex-direction: column;
   gap: var(--gap-sm);
   padding: var(--gap);
-  border: 1px solid var(--accent-line);
+  border: 1px dashed var(--border-strong);
   border-radius: var(--radius-md);
   color: var(--fg-muted);
-  background: var(--accent-soft);
+  background: var(--bg-elev);
 }
 .stream-hint p {
   margin: 0;
@@ -941,6 +1285,45 @@ onMounted(async () => {
 }
 .composer .input { background: var(--bg-elev); border-color: var(--border-strong); min-height: 84px; }
 .composer .input::placeholder { color: var(--fg-faint); }
+
+/* ---- 创作引导 ---- */
+.asst-intro {
+  margin: 0;
+  max-width: 720px;
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  color: var(--fg-muted);
+}
+.wizard-bubble {
+  max-width: min(720px, 92%);
+}
+.wz-intro {
+  margin: 0 0 var(--gap-sm);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  color: var(--fg);
+}
+.wz-done {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-sm);
+  margin-top: var(--gap-sm);
+}
+.wz-seg .prose {
+  margin-top: 4px;
+}
+.composer-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  flex-wrap: wrap;
+  padding: 7px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
 @media (max-width: 720px) {
   .meta-grid {
     grid-template-columns: 1fr;

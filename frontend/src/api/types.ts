@@ -1328,3 +1328,124 @@ export interface KgV3StyleWarningsResponse {
   total: number;
   truncated: boolean;
 }
+
+// ======================================================================
+// 对话式创作引导（/api/assistant/wizard/*）
+// ======================================================================
+
+/** 卡片选项值：单选用字符串/数字，确认题用布尔。 */
+export type WizardValue = string | number | boolean;
+
+export interface WizardOption {
+  value: WizardValue;
+  label: string;
+  desc?: string;
+}
+
+/** 汇总卡片的一行；step 让前端能跳回该步修改。 */
+export interface WizardSummaryRow {
+  step: string;
+  label: string;
+  value: string;
+}
+
+/**
+ * 一步一张卡片。字段随 type 变化，后端只下发当前类型需要的键：
+ * single / multi 用 options，number 用 min/max/step/quick，
+ * text 用 placeholder/suggestions，confirm 用 options 或 summary。
+ */
+export interface WizardCard {
+  type: "single" | "multi" | "number" | "text" | "confirm";
+  field: string;
+  options?: WizardOption[];
+  default?: unknown;
+  min?: number;
+  max?: number;
+  step?: number;
+  unit?: string;
+  quick?: number[];
+  placeholder?: string;
+  suggestions?: string[];
+  /** 多选里的互斥项（例如「不投喂」= 0）。 */
+  exclusive_value?: WizardValue;
+  empty_hint?: string;
+  summary?: WizardSummaryRow[];
+  action_label?: string;
+}
+
+export interface WizardQuestion {
+  step: string;
+  title: string;
+  why: string;
+  progress: { index: number; total: number };
+  can_back: boolean;
+  can_skip: boolean;
+  card: WizardCard;
+}
+
+export interface WizardSessionView {
+  id: number;
+  kind: string | null;
+  step_key: string;
+  status: "active" | "committed" | "aborted";
+  answers: Record<string, unknown>;
+  result: WizardCommitResult | null;
+  can_back: boolean;
+}
+
+export interface WizardCommitSegment {
+  segment_no: number | null;
+  chars: number;
+  excerpt: string;
+}
+
+export interface WizardCommitResult {
+  kind: string;
+  stage: "outline" | "ready" | "role" | "done";
+  applied: string[];
+  message?: string;
+  distill?: Record<string, unknown> | null;
+  bible?: Record<string, unknown> | null;
+  character?: string;
+  scene?: string;
+  segments?: WizardCommitSegment[];
+}
+
+export interface WizardStateResponse {
+  session: WizardSessionView | null;
+  question: WizardQuestion | null;
+  project_hint?: {
+    id: number;
+    title: string;
+    genre: string | null;
+    style: string | null;
+    generation_length: number;
+    has_corpus: boolean;
+    has_style_archive: boolean;
+  };
+}
+
+export interface WizardAnswerRequest {
+  step_key: string;
+  value?: unknown;
+  skip?: boolean;
+}
+
+export interface WizardAnswerResponse {
+  session: WizardSessionView;
+  question: WizardQuestion | null;
+  done?: boolean;
+  result?: WizardCommitResult;
+}
+
+export interface WizardRunResponse {
+  done: boolean;
+  result: WizardCommitResult;
+  segments: WizardCommitSegment[];
+}
+
+export interface WizardRoleChatResponse {
+  answer: string;
+  character: string;
+  scene: string;
+}
