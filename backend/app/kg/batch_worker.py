@@ -46,6 +46,13 @@ WORKER_THREADS = 1
 RETRY_LIMIT = 2
 #: AgentRun 里 kg 批抽行的 role 标识（assistant 端点按 role 过滤，互不污染）
 ROLE_KG_EXTRACT = "kg_batch_extract"
+#: mention 来源标记（读侧不区分，统计可分开看）：
+#: - ``llm``：本批 LLM 抽到的实体在段文本里命中
+#: - ``alias``：降级路径用库里**已有**实体（规范名 + aliases）做的别名匹配
+MENTION_KIND_LLM = "llm"
+MENTION_KIND_ALIAS = "alias"
+#: 降级 mention 索引覆盖的实体类型（生成侧只消费 item 与 character）
+MENTION_KINDS = ("item", "character")
 #: running 行超过这个分钟数视为 stuck（进程重启的残留/真卡死）
 STUCK_MINUTES = 30
 
@@ -253,9 +260,23 @@ def _run_batches(project_id: int) -> None:
             )
             rows = _rows_for(batch)
             provider = _get_provider()
-            if provider is None:
-                # 无 provider：段直接落 v3.0 mention 索引（零 LLM 部分仍做）
-                _index_mentions_only(db, batch)
+            if _provider_unavailable(provider):
+                # provider 不可用（None / 本地模板兜底）：抽不出实体，但**仍要落
+                # mention**——用库里已有实体做别名匹配，不能「一条 mention 都没有」。
+                added = _index_mentions_only(db, project_id, batch)
+                for row in rows.values():
+                    row.status = "failed"
+                    row.finished_at = datetime.now(timezone.utc)
+                    _merge_note(row, {
+                        "error": ("provider 不可用（"
+                                  f"{type(provider).__name__ if provider else 'None'}）"),
+                        "alias_only": True, "mentions_added": added,
+                        "canon": canon_meta,
+                    })
+                db.commit()
+                _log.warning(
+                    "kg v3 批抽降级为 alias mention（项目 %s，%s 段）：provider 不可用，"
+                    "落 %d 条 mention", project_id, len(batch), added)
                 continue
             texts = [(it.segment_no, it.text, it.chapter) for it in batch]
             last_exc: Exception | None = None
@@ -297,13 +318,18 @@ def _run_batches(project_id: int) -> None:
                 db.commit()
             else:
                 err = str(last_exc)[:200] if last_exc else "unknown"
+                # 抽取失败也必须留 mention：`_persist_extraction` 的 rollback 会把
+                # 本批已写的 mention 一起丢，这里用库里已有实体补一次别名索引。
+                added = _index_mentions_only(db, project_id, batch)
                 for row in rows.values():
                     row.status = "failed"
                     row.finished_at = now
-                    _merge_note(row, {"error": err, "canon": canon_meta})
+                    _merge_note(row, {"error": err, "alias_only": True,
+                                      "mentions_added": added, "canon": canon_meta})
                 db.commit()
                 _log.warning(
-                    "kg v3 批抽失败（项目 %s，%s 段）：%s", project_id, len(batch), err)
+                    "kg v3 批抽失败（项目 %s，%s 段）：%s；已补 %d 条 alias mention",
+                    project_id, len(batch), err, added)
         finally:
             db.close()
 
@@ -428,6 +454,24 @@ def _get_provider():
         return get_llm_provider()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _provider_unavailable(provider) -> bool:  # noqa: ANN001
+    """provider 是否抽不出东西：None，或本地模板兜底。
+
+    ``get_llm_provider()`` 在没配 key 时**不会**返回 None——它兜底
+    ``LocalFallbackLLMProvider``（确定性模板），所以原来 `provider is None`
+    是一条永远走不到的死分支。这里把「兜底模板」也算作不可用：它确实能返回
+    JSON，但不会真的从正文里抽实体，用它跑 ``extract_batch`` 只会产出噪声。
+    """
+    if provider is None:
+        return True
+    try:
+        from app.llm.provider import LocalFallbackLLMProvider
+
+        return isinstance(provider, LocalFallbackLLMProvider)
+    except Exception:  # noqa: BLE001 —— 导入失败按「可用」处理，不影响主链
+        return False
 
 
 def _item_mention_guards(db: Session, project_id: int) -> frozenset[str]:
@@ -686,13 +730,56 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
                         project_id=project_id, entity_id=ent_id, generation_id=gen_id,
                         segment_no=item.segment_no,
                         context_window=_window_around(item.text, form),
-                        mention_kind="direct",
+                        mention_kind=MENTION_KIND_LLM,
                     ))
 
-    # entity mention_count 更新
+    _refresh_mention_counts(db, project_id, set(name_to_id.values()))
+    db.commit()
+    return stats
+
+
+def _mention_candidates(db: Session, project_id: int) -> list[tuple[int, list[str]]]:
+    """库里**已有**实体的 mention 匹配写法：规范名 + aliases（item 与 character）。
+
+    降级路径不依赖本批 LLM 结果——这是「抽取失败也还能落 mention」的前提。
+    """
+    rows = db.execute(
+        select(KgEntity.id, KgEntity.canonical_name, KgEntity.aliases).where(
+            KgEntity.project_id == project_id,
+            KgEntity.kind.in_(MENTION_KINDS),
+        )
+    ).all()
+    out: list[tuple[int, list[str]]] = []
+    for ent_id, canonical, aliases in rows:
+        forms: list[str] = []
+        for raw in [canonical, *(aliases or [])]:
+            form = raw.strip() if isinstance(raw, str) else ""
+            if form and form not in forms:
+                forms.append(form)
+        if forms:
+            out.append((ent_id, forms))
+    return out
+
+
+def _first_mentioned_form(text: str, forms: list[str],
+                          guards: frozenset[str]) -> str | None:
+    """按 ``forms`` 顺序找第一个在文本里独立命中的写法。
+
+    独立命中由 ``canon_source.count_forms`` 判：最长优先 + 材质字边界，
+    「地书」不会被「地书碎片」算成命中。
+    """
+    for form in forms:
+        if canon_source.count_forms(text, [form], guards=guards) > 0:
+            return form
+    return None
+
+
+def _refresh_mention_counts(db: Session, project_id: int,
+                            entity_ids: set[int]) -> None:
+    """按 ``kg_mentions`` 实际行数回写 ``entity.mention_count``（两条写路径共用）。"""
     from sqlalchemy import func
 
-    for name, ent_id in name_to_id.items():
+    for ent_id in entity_ids:
         cnt = db.scalar(
             select(func.count()).select_from(KgMention).where(
                 KgMention.project_id == project_id, KgMention.entity_id == ent_id
@@ -702,14 +789,57 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         if ent is not None:
             ent.mention_count = cnt or 0
 
+
+def _index_mentions_only(db: Session, project_id: int,
+                         batch: list[_QueueItem]) -> int:
+    """降级路径：零 LLM 落 mention 索引，返回新增行数。
+
+    抽取失败 / provider 不可用（含本地模板兜底）时调用。实体来自
+    ``kg_entities`` 里**已有**的 item 与 character（规范名 + aliases），不看本批
+    LLM 结果——所以「抽取失败」不再等于「一条 mention 都没有」。
+
+    ``mention_kind='alias'`` 与 LLM 路径的 ``'llm'`` 区分，读侧不区分。
+    幂等：同一 (project, entity, segment_no) 已有行（不论 kind）就跳过。
+    """
+    candidates = _mention_candidates(db, project_id)
+    if not candidates:
+        return 0
+    guards = _item_mention_guards(db, project_id)
+    seg_to_gen = _seg_to_gen(db, project_id, batch)
+    added = 0
+    touched: set[int] = set()
+    for item in batch:
+        text = item.text or ""
+        if not text:
+            continue
+        for ent_id, forms in candidates:
+            existing = db.scalar(
+                select(KgMention.id).where(
+                    KgMention.project_id == project_id,
+                    KgMention.entity_id == ent_id,
+                    KgMention.segment_no == item.segment_no,
+                )
+            )
+            if existing is not None:
+                continue
+            form = _first_mentioned_form(text, forms, guards)
+            if form is None:
+                continue
+            db.add(KgMention(
+                project_id=project_id, entity_id=ent_id,
+                generation_id=seg_to_gen.get(item.segment_no),
+                segment_no=item.segment_no,
+                context_window=_window_around(text, form),
+                mention_kind=MENTION_KIND_ALIAS,
+            ))
+            added += 1
+            touched.add(ent_id)
+    if not added:
+        return 0
+    db.flush()
+    _refresh_mention_counts(db, project_id, touched)
     db.commit()
-    return stats
-
-
-def _index_mentions_only(db: Session, batch: list[_QueueItem]) -> None:
-    """无 provider 时的降级：只落 mention 索引（零 LLM 部分仍可用）。"""
-    # 无实体可索引（抽取需要 LLM），直接跳过——mention 需要 entity 先存在
-    return
+    return added
 
 
 def _lookup_entity_id(db: Session, project_id: int, name: str) -> int | None:

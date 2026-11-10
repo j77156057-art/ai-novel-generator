@@ -441,7 +441,7 @@ class KgMention(Base):
     generation_id = Column(Integer, ForeignKey("generations.id"), nullable=True)
     segment_no = Column(Integer, nullable=True)
     context_window = Column(String(500), nullable=True)  # 提及处原文片段
-    mention_kind = Column(String(16), nullable=True)  # direct|alias|reference
+    mention_kind = Column(String(16), nullable=True)  # llm|alias|reference
 
     __table_args__ = (
         UniqueConstraint("project_id", "entity_id", "generation_id", name="uq_kg_mention"),
