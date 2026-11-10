@@ -34,6 +34,10 @@ from datetime import datetime, timezone
 
 HERE = pathlib.Path(__file__).resolve().parent
 PROJ = HERE.parents[2]
+if str(PROJ / "backend") not in sys.path:
+    sys.path.insert(0, str(PROJ / "backend"))
+
+from app.kg.item_generic import alias_verdict  # noqa: E402
 GEN_DB = PROJ / "backend" / "data" / "generated.db"
 APP_DB = PROJ / "backend" / "novel_dev.db"
 BACKUP_DIR = PROJ / "backend" / "backups"
@@ -162,7 +166,13 @@ def load_items(app_db: pathlib.Path, project_id: int) -> list[dict]:
 
 def build_plan(items: list[dict]) -> dict:
     canon = {it["canonical_name"] for it in items}
-    groups, surfaces, conflicts = [], [], []
+    all_names = set(canon)
+    alias_owners: dict[str, set[str]] = {}
+    for it in items:
+        for alias in it["aliases"]:
+            all_names.add(alias)
+            alias_owners.setdefault(alias, set()).add(it["canonical_name"])
+    groups, surfaces, conflicts, suspected = [], [], [], []
 
     for it in items:
         groups.append({"canonical_name": it["canonical_name"], "status": "active",
@@ -181,6 +191,20 @@ def build_plan(items: list[dict]) -> dict:
             if alias in canon and alias != it["canonical_name"]:
                 conflicts.append({"surface": alias, "owner": it["canonical_name"],
                                   "winner": alias, "why": "与另一实体规范名同名，规范名优先"})
+                continue
+            # 泛称拦截：只看写法形态与跨组关系，不维护具体物品名名单。
+            verdict = alias_verdict(alias, it["canonical_name"], all_names, alias_owners)
+            if verdict["blocked"]:
+                suspected.append({"surface": alias, "owner": it["canonical_name"],
+                                  "rules": verdict["rules"], "detail": verdict["detail"]})
+                surfaces.append({
+                    "surface": alias, "group": it["canonical_name"], "status": "pending",
+                    "confidence": 0.2, "source": "migration",
+                    "instance_label": INSTANCE_LABELS.get(alias),
+                    "evidence_chapter": None, "evidence": "",
+                    "note": "疑似泛称（{}）：{}；未登记为单件写法".format(
+                        ",".join(verdict["rules"]), verdict["detail"]),
+                })
                 continue
             if alias in PENDING_SURFACES:
                 surfaces.append({
@@ -216,7 +240,8 @@ def build_plan(items: list[dict]) -> dict:
             "evidence_chapter": spec["evidence_chapter"], "evidence": spec["evidence"],
             "note": f"通称「{base}」的同义写法",
         })
-    return {"groups": groups, "surfaces": surfaces, "conflicts": conflicts}
+    return {"groups": groups, "surfaces": surfaces, "conflicts": conflicts,
+            "suspected": suspected}
 
 
 # ─── 写库 ──────────────────────────────────────────────────────────────

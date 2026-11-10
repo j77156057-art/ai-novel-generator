@@ -39,6 +39,7 @@ import sqlite3
 from collections import defaultdict
 
 from app.config import settings
+from app.kg.item_generic import MATERIAL_BOUNDARY_CHARS
 
 SOURCE_LEGACY = "legacy"
 SOURCE_CLEANED = "cleaned"
@@ -118,6 +119,8 @@ _log = logging.getLogger(__name__)
 _cache: dict = {"key": None, "layers": None, "index": None, "hash": ""}
 #: 原著层词表 hash 缓存（只记内容，不记文件名）
 _legacy_hash_cache: dict = {}
+#: count_forms 的「更长写法」守卫缓存：requested forms → 需要一起参与匹配的长写法
+_guard_cache: dict[frozenset, frozenset] = {}
 
 
 class CanonSourceError(RuntimeError):
@@ -144,6 +147,7 @@ def reset_cache() -> None:
     """清空缓存（测试与热更新用）。"""
     _cache.update({"key": None, "layers": None, "index": None, "hash": ""})
     _legacy_hash_cache.clear()
+    _guard_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -680,23 +684,55 @@ def entity_forms(name: str) -> list[str]:
     return forms
 
 
+def _longer_guards(requested: frozenset) -> frozenset:
+    """比 ``requested`` 更长、且包含其中某个写法的已知名字。
+
+    计数时要把它们一起放进正则：否则 ``forms=["铜剑"]`` 会把「黄铜剑」
+    「青铜剑」里的「铜剑」也数成命中（子串误匹配）。这里只看「已知名字」，
+    不引入任何具体物品名。
+    """
+    cached = _guard_cache.get(requested)
+    if cached is not None:
+        return cached
+    known = set(ITEM_ALIASES) | set(ITEM_ALIASES.values()) | set(_index())
+    guards = frozenset(
+        f for f in known
+        if f not in requested and any(c and c in f for c in requested)
+    )
+    _guard_cache[requested] = guards
+    return guards
+
+
 def count_forms(text: str, forms: list[str], chapter: int | None = None) -> int:
     """最长优先计数，且对带约束的写法逐个校验上下文。
 
-    与 ``generated_extract._count_forms`` 的差别只有一个：带 constraint 的
-    写法（如「白莲」）在「白莲花」里不会被计数。legacy 模式下索引为空，
+    与 ``generated_extract._count_forms`` 的差别有两个：带 constraint 的写法
+    （如「白莲」）在「白莲花」里不会被计数；短写法嵌在更长已知写法里时
+    （「铜剑」⊂「黄铜剑/青铜剑」）也不算独立命中。legacy 模式下索引为空，
     行为与原来完全一致。``chapter`` 用于 ``except_chapters`` 的章节范围排除。
     """
     cleaned = sorted({str(f) for f in forms if f}, key=len, reverse=True)
     if not cleaned or not text:
         return 0
-    pattern = re.compile("|".join(re.escape(f) for f in cleaned))
+    requested = frozenset(cleaned)
+    guards = _longer_guards(requested)
+    pattern = re.compile("|".join(
+        re.escape(f) for f in sorted(requested | guards, key=len, reverse=True)))
     index = _index()
     total = 0
     for match in pattern.finditer(text):
-        row = index.get(match.group(0))
+        form = match.group(0)
+        if form in guards:
+            # 命中的是更长的写法，不属于本次要数的短写法
+            continue
+        start = match.start()
+        if (start > 0 and form and form[0] in MATERIAL_BOUNDARY_CHARS
+                and text[start - 1] in MATERIAL_BOUNDARY_CHARS):
+            # 「青铜剑/黄铜剑」里的「铜剑」：左侧紧邻材质/颜色字，属更长写法
+            continue
+        row = index.get(form)
         if row is not None and not _constraint_ok(
-                row, text, match.start(), chapter):
+                row, text, start, chapter):
             continue
         total += 1
     return total
