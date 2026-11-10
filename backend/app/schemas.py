@@ -117,6 +117,9 @@ class ProjectOut(BaseModel):
     segment_count: int = 0
     # 叙事蒸馏档位（项目级偏好，空=默认完整档）
     narrative_tier: Optional[str] = None
+    # 采样章数覆盖：None = 按档位默认口径；0 = 全本；N = 最多 N 章。
+    # 必须出现在这里，否则助理改完采样，前端只能从引导上下文里猜。
+    narrative_sample_chapters: Optional[int] = None
     # 已落库文风档案（蒸馏库「应用」写入的单槽缓存，生成链路直接读它）。
     # 列表也带它：项目数不多、单条档案体量可控，且前端要据此反映「已应用」状态。
     style_narrative: Optional[dict] = None
