@@ -699,12 +699,12 @@ def _lookup_entity_id(db: Session, project_id: int, name: str) -> int | None:
     """
     if not name:
         return None
-    # 1) 精确匹配 canonical_name
-    ent = db.scalar(
-        select(KgEntity).where(
-            KgEntity.project_id == project_id, KgEntity.canonical_name == name
-        )
-    )
+    # 1) 精确匹配 canonical_name（不限 kind：关系端点可以是物品，最终 kind 由
+    #    _endpoint_kind 另行判定）。同名跨 kind 时不能交给 db.scalar 抛
+    #    MultipleResultsFound，走确定性解析。
+    from app.kg.entity_lookup import resolve_entity_by_name
+
+    ent = resolve_entity_by_name(db, project_id, name)
     if ent is not None:
         return ent.id
     # 2) aliases 反查

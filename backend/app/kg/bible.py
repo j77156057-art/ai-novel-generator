@@ -18,6 +18,7 @@ from typing import Any
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
+from app.kg.entity_lookup import resolve_entity_by_name
 from app.models import KgBibleRevision, KgEntity, KgForeshadow, Project
 
 
@@ -126,16 +127,18 @@ def detect_conflicts(db: Session, project_id: int, new_bible: Any) -> list[dict]
             new_type = (r.get("type") or r.get("rel_type") or "").strip()
             if not (a and b and new_type):
                 continue
-            ea = db.scalar(select(KgEntity).where(
-                KgEntity.project_id == project_id, KgEntity.canonical_name == a))
-            eb = db.scalar(select(KgEntity).where(
-                KgEntity.project_id == project_id, KgEntity.canonical_name == b))
+            # 关系端点**不限 kind**：owner→item（owns）与人物关系都合法。
+            # 但同名跨 kind 时不能交给 db.scalar 抛 MultipleResultsFound，
+            # 统一走确定性的解析（人物优先，其次物品，再按 KIND_ORDER/id）。
+            ea = resolve_entity_by_name(db, project_id, a)
+            eb = resolve_entity_by_name(db, project_id, b)
             if ea is None or eb is None:
                 continue
             from app.models import KgRelation
             # 双向查（KG 不区分 from/to）
             existing = db.scalars(select(KgRelation).where(
                 KgRelation.project_id == project_id,
+                KgRelation.status == "active",  # 候选边不参与冲突扫描
                 ((KgRelation.from_id == ea.id) & (KgRelation.to_id == eb.id))
                 | ((KgRelation.from_id == eb.id) & (KgRelation.to_id == ea.id))
             )).all()

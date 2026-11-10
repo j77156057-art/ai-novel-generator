@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from sqlalchemy import select, func
 
+from app.kg.entity_lookup import resolve_entity_by_name
 from app.models import (
     KgCharacterState, KgEntity, KgEntityKnowledge, KgEvent, KgForeshadow, KgMention,
 )
@@ -80,11 +81,11 @@ def slice_for_prompt(
     char_states: list[dict] = []
     if active_characters:
         for name in active_characters:
-            ent = db.scalar(
-                select(KgEntity).where(
-                    KgEntity.project_id == project_id, KgEntity.canonical_name == name
-                )
-            )
+            # 必须限定 kind：同一 project 里 item 与 character 可以同名
+            # （「长刀」「黄金」这类），不带 kind 时 db.scalar 在两者并存后
+            # 会直接抛 MultipleResultsFound；本块语义是「角色的最新状态」，
+            # 只认 character。
+            ent = resolve_entity_by_name(db, project_id, name, kind="character")
             if ent is None:
                 continue
             latest: dict[str, KgCharacterState] = {}
@@ -123,11 +124,8 @@ def slice_for_prompt(
     known_facts: list[dict] = []
     if active_characters:
         for name in active_characters:
-            ent = db.scalar(
-                select(KgEntity).where(
-                    KgEntity.project_id == project_id, KgEntity.canonical_name == name
-                )
-            )
+            # 同上：情报的归属者是角色，kind 必须限定，否则同名 item 会串味/多结果。
+            ent = resolve_entity_by_name(db, project_id, name, kind="character")
             if ent is None:
                 continue
             knows: list[str] = []
@@ -234,14 +232,13 @@ def relation_curve(db, project_id: int, from_name: str, to_name: str) -> list[di
     """关系演变曲线：两角色 rel 的 strength 历史（kg_relation_evolution）。"""
     from app.models import KgRelation, KgRelationEvolution
 
-    a = db.scalar(select(KgEntity).where(
-        KgEntity.project_id == project_id, KgEntity.canonical_name == from_name))
-    b = db.scalar(select(KgEntity).where(
-        KgEntity.project_id == project_id, KgEntity.canonical_name == to_name))
+    a = resolve_entity_by_name(db, project_id, from_name)
+    b = resolve_entity_by_name(db, project_id, to_name)
     if a is None or b is None:
         return []
     rels = db.scalars(select(KgRelation).where(
         KgRelation.project_id == project_id,
+        KgRelation.status == "active",  # 候选边（集合端点门降级）不进演变曲线
         KgRelation.from_id.in_([a.id, b.id]),
         KgRelation.to_id.in_([a.id, b.id]),
     )).all()
@@ -272,8 +269,8 @@ def can_character_know(db, project_id: int, character_name: str, fact_name: str)
     """
     from app.kg.knowledge_match import normalize_fact, event_summary_match
 
-    ent = db.scalar(select(KgEntity).where(
-        KgEntity.project_id == project_id, KgEntity.canonical_name == character_name))
+    # 人物情报的主体是角色，kind 必须限定（同名 item 不能当角色用）。
+    ent = resolve_entity_by_name(db, project_id, character_name, kind="character")
     if ent is None:
         return False
     fact = (fact_name or "").strip()
