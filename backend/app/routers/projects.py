@@ -217,6 +217,64 @@ def start_distill(
     }
 
 
+@router.post("/{project_id}/distill/resume")
+def resume_distill(
+    project_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> dict:
+    """从断点继续一次被中断的蒸馏（**不自动续跑**，由用户点「继续蒸馏」触发）。
+
+    与 `POST /{id}/distill` 的差别只有两点：
+
+    1. 明确带 `resume=True` —— 复用 `distill_chunks` 里已完成的块，
+       已完成的块不会再调一次 LLM；
+    2. `force` 永远是 False —— 续跑的意义就是接着上次，而不是清空重算。
+
+    为什么不做「服务重启后自动续跑」：那等于无人值守地烧 LLM 费用；如果中断
+    是确定性的（某块必炸），会变成「重启→续跑→再崩」的循环，且用户毫不知情。
+    留痕（failed + interrupted 回执）+ 一键继续，既不丢结果也不失控。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    if not (proj.reference_novel_ids or []):
+        raise HTTPException(status_code=400, detail="项目未选参考语料，无法续跑")
+
+    from app.style.narrative import resolve_tier, tier_with_sampling
+
+    try:
+        cfg = resolve_tier(getattr(proj, "narrative_tier", None))
+        cfg = tier_with_sampling(cfg, getattr(proj, "narrative_sample_chapters", None))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 已有未终态任务：直接复用，不重复起线程（同 start_distill 的并发防重口径）。
+    active = find_active_run(db, project_id)
+    if active is not None:
+        return {
+            "job_id": active.id,
+            "status": active.status,
+            "tier": active.tier,
+            "reused": True,
+            "from_cache": False,
+            "cache_source": None,
+        }
+
+    run = create_distill_run(db, project_id, cfg.key)
+    background_tasks.add_task(
+        run_distill_job, run.id, project_id, cfg.key, False, None, True
+    )
+    return {
+        "job_id": run.id,
+        "status": run.status,
+        "tier": run.tier,
+        "reused": False,
+        "from_cache": False,
+        "cache_source": None,
+    }
+
+
 @router.get("/{project_id}/distill/jobs")
 def list_distill_jobs(
     project_id: int,

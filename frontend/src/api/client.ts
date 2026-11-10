@@ -74,6 +74,7 @@ import type {
   WizardRoleChatResponse,
   WizardRunResponse,
   WizardNoticeListResponse,
+  WizardMessageListResponse,
   WizardSayResponse,
   WizardStateResponse,
 } from "./types";
@@ -250,6 +251,19 @@ export const api = {
     request<DistillStartResponse>(
       `/projects/${projectId}/distill`,
       jsonInit("POST", { tier: tier ?? null, force }),
+    ),
+
+  /**
+   * 从断点继续一次被中断的蒸馏。
+   *
+   * 与 `startDistill` 的差别只有两点：必定复用已完成块（resume=True）、
+   * 必定不清空断点（force=False）。**重启后不会自动续跑**——由用户在中断
+   * 回执上点「继续蒸馏」触发，避免无人值守烧模型费用。
+   */
+  resumeDistill: (projectId: number) =>
+    request<DistillStartResponse>(
+      `/projects/${projectId}/distill/resume`,
+      jsonInit("POST", {}),
     ),
 
   /**
@@ -838,6 +852,17 @@ export const api = {
     request<{ ok: boolean; id: number }>(
       `/assistant/wizard/${projectId}/notices/${noticeId}/ack`,
       jsonInit("POST", {}),
+    ),
+
+  /**
+   * 对话记录（跨退出存活）：进入助手时用它重建历史气泡。
+   *
+   * `GET /{project_id}` 只给「当前停在哪一题」，本接口给「之前说过什么」。
+   * 两者拼起来才是完整对话。
+   */
+  listWizardMessages: (projectId: number, limit = 200) =>
+    request<WizardMessageListResponse>(
+      `/assistant/wizard/${projectId}/messages?limit=${encodeURIComponent(String(limit))}`,
     ),
 
   /** 从汇总卡片跳回已答过的某一步。 */

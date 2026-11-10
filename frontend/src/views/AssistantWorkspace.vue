@@ -43,7 +43,9 @@ import type {
   ProjectOut,
   WizardActionEcho,
   WizardCommitResult,
+  WizardMessage,
   WizardNotice,
+  WizardNoticePayload,
   WizardQuestion,
   WizardSayResponse,
   WizardSessionView,
@@ -333,6 +335,31 @@ async function pollDistill(): Promise<void> {
   scheduleDistillPoll();
 }
 
+/**
+ * 中断回执上的「继续蒸馏」：从已落库的块接着跑，不用从头再来。
+ *
+ * 为什么必须点一下而不是重启自动接上：自动续跑等于无人值守烧模型费用；
+ * 若是「某块必炸」的确定性中断，还会变成重启→续跑→再崩的死循环。
+ */
+const resumeBusy = ref(false);
+async function resumeDistill(turn: Turn): Promise<void> {
+  if (resumeBusy.value) return;
+  resumeBusy.value = true;
+  try {
+    await api.resumeDistill(projectId);
+    // 按钮是一次性入口：提交成功就收回，进度条接手。
+    if (turn.notice) turn.notice.payload.resumable = false;
+    await pollDistill();
+  } catch (err) {
+    const t = makeAssistantTurn();
+    t.loading = false;
+    t.error = `继续蒸馏没提交成功（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+    turns.value.push(t);
+  } finally {
+    resumeBusy.value = false;
+  }
+}
+
 onUnmounted(() => {
   pageAlive = false;
   if (distillTimer) clearTimeout(distillTimer);
@@ -399,8 +426,76 @@ async function startWizardFlow(intro = "", restart = false): Promise<void> {
   }
 }
 
-/** 进入页面时恢复上次进度：停在哪一步就画哪一步。 */
+/**
+ * 用后端返回的对话记录重建气泡（跨退出存活）。
+ *
+ * 历史里的引导卡片一律 `disabled`：它们代表「当时问过、已经答过」，不能再点
+ * 一次提交。当前要答的那一题由 `loadWizard` 随后追加/启用在最末尾。
+ *
+ * 返回历史里是否已经有过「执行结果」气泡——`loadWizard` 据此避免重复画一次。
+ */
+function restoreTurns(items: WizardMessage[]): boolean {
+  let pendingQuestion: Turn | null = null;
+  let restoredResult = false;
+  for (const m of items) {
+    if (m.role === "user") {
+      turns.value.push(makeUserTurn(m.text));
+      // 用户这句话就是对上一张卡片的作答：把它收成一行已答状态，
+      // 而不是让卡片停在「待选择」——历史卡片不该看起来还能点。
+      if (pendingQuestion?.wizard) {
+        pendingQuestion.wizard.answeredLabel = m.text;
+        pendingQuestion.wizard.disabled = true;
+      }
+      pendingQuestion = null;
+      continue;
+    }
+    const t = makeAssistantTurn();
+    t.loading = false;
+    t.text = m.text;
+    if (m.kind === "wizard_question" && m.payload?.question) {
+      t.wizard = {
+        question: m.payload.question,
+        answeredLabel: null,
+        busy: false,
+        disabled: true,
+      };
+      pendingQuestion = t;
+    } else if (m.kind === "wizard_result" && m.payload?.result) {
+      t.wizardResult = m.payload.result;
+      restoredResult = true;
+    } else if (m.kind === "notice") {
+      const p = (m.payload || {}) as Record<string, unknown>;
+      const noticeId = Number(p.notice_id ?? 0);
+      // 记进 seenNotices：这条回执已经以历史气泡出现，轮询不要再补一遍。
+      if (noticeId) seenNotices.add(noticeId);
+      t.notice = {
+        id: noticeId,
+        kind: (p.notice_kind as WizardNotice["kind"]) || "distill_done",
+        job_id: Number(p.job_id ?? 0),
+        payload: p as WizardNoticePayload,
+        created_at: m.created_at,
+      };
+      // 这条回执已经在历史里展示过了：顺手标掉，避免它永远以「未消费」的身份
+      // 跟着每次历史回放重复出现。标失败无所谓，下次进来还会再标一次。
+      if (noticeId) void api.ackWizardNotice(projectId, noticeId).catch(() => {});
+    }
+    turns.value.push(t);
+  }
+  void scrollToBottom();
+  return restoredResult;
+}
+
+/** 进入页面时恢复上次进度：先回放历史对话，再画「现在停在哪一步」。 */
 async function loadWizard(): Promise<void> {
+  // 历史与当前状态是两次读：历史要「说过什么」，state 要「停在哪一题」。
+  // 历史读失败不该挡住当前题——两者互不依赖，失败就只少一段回放。
+  let restoredResult = false;
+  try {
+    const hist = await api.listWizardMessages(projectId);
+    if (hist.items.length) restoredResult = restoreTurns(hist.items);
+  } catch {
+    /* 忽略：没有历史不影响继续问 */
+  }
   try {
     const st = await api.getWizard(projectId);
     wizard.value = st.session;
@@ -408,8 +503,22 @@ async function loadWizard(): Promise<void> {
     if (st.distill) distillJob.value = st.distill;
     if (!st.session) return;
     if (st.session.status === "active" && st.question) {
-      pushWizardTurn(st.question, "上次问到这一步，接着来。");
-    } else if (st.session.status === "committed" && st.session.result) {
+      const last = turns.value[turns.value.length - 1];
+      const isCurrent =
+        !!last?.wizard &&
+        last.wizard.question.step === st.question.step &&
+        !last.wizard.answeredLabel;
+      if (isCurrent && last.wizard) {
+        // 历史最后一条就是当前题：解除只读，让用户接着答，别再画一张重复的。
+        last.wizard.disabled = false;
+      } else {
+        pushWizardTurn(st.question, "上次问到这一步，接着来。");
+      }
+    } else if (
+      st.session.status === "committed" &&
+      st.session.result &&
+      !restoredResult
+    ) {
       applyCommitResult(st.session.result);
     }
   } catch {
@@ -1120,6 +1229,14 @@ onMounted(async () => {
               {{ turn.notice.payload.next }}
             </p>
             <div class="row tight">
+              <button
+                v-if="turn.notice.payload.resumable"
+                class="btn primary sm"
+                :disabled="resumeBusy || distillActive"
+                @click="resumeDistill(turn)"
+              >
+                {{ resumeBusy || distillActive ? "正在接着跑…" : "继续蒸馏" }}
+              </button>
               <button
                 v-if="turn.notice.kind === 'distill_done' && canRun(wizard?.result)"
                 class="btn primary sm"

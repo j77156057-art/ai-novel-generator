@@ -24,6 +24,7 @@ from app import wizard_actions as actions
 from app import wizard_chat as chat
 from app import wizard_facts as facts
 from app import wizard_flow as flow
+from app.assistant_store import list_messages, record_message
 from app.db import get_db
 from app.models import (
     AssistantWizardSession,
@@ -310,7 +311,7 @@ def _materialize_stalled(db: Session, run: DistillRun | None) -> None:
             "progress_total": int(run.progress_total or 0),
             "expected_minutes": run.expected_minutes,
             "elapsed_minutes": distill_run_to_dict(run).get("elapsed_minutes"),
-            "next": "建议：先按上面的分钟数再等一会；仍无进度就重新提交一次（已完成的部分不会丢）。",
+            "next": "建议：先按上面的分钟数再等一会；仍无进度就点「继续蒸馏」接着跑（已完成的块不会重跑）。",
         },
     )
 
@@ -367,6 +368,36 @@ def get_state(project_id: int, db: Session = Depends(get_db)) -> dict:
             "project_hint": _project_hint(project),
         }
     return _state(db, project, session)
+
+
+@router.get("/{project_id}/messages")
+def get_messages(
+    project_id: int, limit: int = 200, db: Session = Depends(get_db)
+) -> dict:
+    """对话记录（跨退出存活）：前端进入助手时用它重建历史气泡。
+
+    `GET /{project_id}` 只给「当前停在哪一题」，本接口给「之前说过什么」。
+    两者拼起来才是完整对话：历史（本接口，全部只读）+ 当前题卡（state）。
+
+    只读，不改任何状态。`limit` 取尾部 N 条（`list_messages` 内部会夹到 1~500）。
+    """
+    _require_project(db, project_id)
+    rows = list_messages(db, project_id, limit)
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "session_id": r.session_id,
+                "role": r.role,
+                "kind": r.kind,
+                "text": r.text or "",
+                "payload": r.payload or {},
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
 
 
 @router.get("/{project_id}/notices")
@@ -445,7 +476,9 @@ def start(body: WizardStartIn, db: Session = Depends(get_db)) -> dict:
     db.add(session)
     db.commit()
     db.refresh(session)
-    return _state(db, project, session)
+    out = _state(db, project, session)
+    _record_question(db, project.id, session, out.get("question"))
+    return out
 
 
 @router.post("/{project_id}/answer")
@@ -469,9 +502,11 @@ def answer(
 
     answers = dict(session.answers or {})
     ctx = _context(db, project, session.history or [], session.overrides or {})
+    # 只为「用户气泡显示什么」重建一次当前题（纯内存，不查库）。
+    question = flow.build_question(session.step_key, answers, ctx)
 
     if body.skip:
-        if not flow.build_question(session.step_key, answers, ctx).get("can_skip"):
+        if not question.get("can_skip"):
             raise HTTPException(status_code=400, detail="这一步不能跳过")
         value = flow.default_for(session.step_key, answers, ctx)
     else:
@@ -482,14 +517,92 @@ def answer(
     except flow.AnswerError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    echo = _choice_label(question, value)
     if session.step_key == "confirm":
         if value is not True:
             raise HTTPException(status_code=400, detail="确认卡片只能选择开始")
         ack = flow.ack_for(session.step_key, value, answers, ctx)
-        return _advance(db, project, session, session.step_key, value, background_tasks, ack)
+        return _advance(
+            db, project, session, session.step_key, value, background_tasks, ack, echo=echo
+        )
 
     ack = flow.ack_for(session.step_key, value, answers, ctx)
-    return _advance(db, project, session, session.step_key, value, background_tasks, ack)
+    return _advance(
+        db, project, session, session.step_key, value, background_tasks, ack, echo=echo
+    )
+
+
+# ---------------------------------------------------------------------------
+# 对话记录（跨退出存活）
+# ---------------------------------------------------------------------------
+
+
+def _record_question(
+    db: Session,
+    project_id: int,
+    session: AssistantWizardSession,
+    question: dict | None,
+) -> None:
+    """把「刚推到用户面前的那张题卡」写进对话记录。
+
+    幂等键用 `(会话, 步骤, 已走步数)`：回退/跳回同一题时不重复记一张卡，
+    但换了位置再看到同一题（步数不同）会正常记。
+    """
+    if not question:
+        return
+    record_message(
+        db,
+        project_id,
+        role="assistant",
+        kind="wizard_question",
+        text=str(question.get("message") or ""),
+        payload={"step": session.step_key, "question": question},
+        session_id=session.id,
+        dedupe_key=f"wq:{session.id}:{session.step_key}:{len(session.history or [])}",
+    )
+
+
+def _record_reply(
+    db: Session,
+    project_id: int,
+    session: AssistantWizardSession,
+    text: str,
+    *,
+    kind: str = "plain",
+    payload: dict | None = None,
+) -> None:
+    record_message(
+        db,
+        project_id,
+        role="assistant",
+        kind=kind,
+        text=text,
+        payload=payload,
+        session_id=session.id,
+    )
+
+
+def _record_user(
+    db: Session,
+    project_id: int,
+    session: AssistantWizardSession,
+    text: str,
+    *,
+    kind: str = "plain",
+) -> None:
+    record_message(
+        db, project_id, role="user", kind=kind, text=text, session_id=session.id
+    )
+
+
+def _choice_label(question: dict | None, value: Any) -> str:
+    """把用户点的选项还原成人话（用于对话记录里的用户气泡）。"""
+    if isinstance(value, str) and value:
+        return value
+    for opt in (question or {}).get("options") or []:
+        if opt.get("value") == value:
+            return str(opt.get("label") or "")
+    return "（已选择）"
 
 
 def _advance(
@@ -500,13 +613,29 @@ def _advance(
     value: Any,
     background_tasks: BackgroundTasks,
     ack: str,
+    echo: str | None = None,
 ) -> dict:
-    """把一次作答写进会话并推进到下一题（卡片点击与自由输入共用）。"""
+    """把一次作答写进会话并推进到下一题（卡片点击与自由输入共用）。
+
+    `echo` 是用户气泡要显示的话：点卡片时是选项文案，自由输入时由调用方
+    先单独记录原话（传 None 表示「用户消息已记过，这里不再重复」）。
+    """
+    if echo is not None:
+        _record_user(db, project.id, session, echo, kind="choice")
+
     if step == "confirm":
         out = _commit(db, project, session, background_tasks)
         if out.get("result"):
             out["result"]["message"] = ack + str(out["result"].get("message") or "")
         out["ack"] = ack
+        _record_reply(
+            db,
+            project.id,
+            session,
+            str((out.get("result") or {}).get("message") or ack),
+            kind="wizard_result",
+            payload={"result": out.get("result")},
+        )
         return out
 
     answers = dict(session.answers or {})
@@ -529,7 +658,9 @@ def _advance(
     session.step_key = nxt
     db.commit()
     db.refresh(session)
-    return _state(db, project, session, ack=ack)
+    out = _state(db, project, session, ack=ack)
+    _record_question(db, project.id, session, out.get("question"))
+    return out
 
 
 @router.post("/{project_id}/say")
@@ -561,6 +692,8 @@ def say(
         try:
             res = actions.apply(db, project, session, act, ctx, background_tasks)
         except (ValueError, flow.AnswerError) as exc:
+            _record_user(db, project.id, session, body.text)
+            _record_reply(db, project.id, session, str(exc))
             return {
                 "mode": "clarify",
                 "message": str(exc),
@@ -568,6 +701,20 @@ def say(
                 "session": _session_view(session),
             }
         out = _state(db, project, session)
+        _record_user(db, project.id, session, body.text)
+        _record_reply(
+            db,
+            project.id,
+            session,
+            res["message"],
+            kind="wizard_action",
+            payload={
+                "action": res.get("action"),
+                "undo_id": res.get("undo_id"),
+                "undoable": res.get("undoable", False),
+            },
+        )
+        _record_question(db, project.id, session, out.get("question"))
         return {
             "mode": "action",
             "message": res["message"],
@@ -581,14 +728,19 @@ def say(
     parsed = chat.parse(step, body.text, answers, ctx, question)
 
     if parsed["kind"] == "question":
+        message = chat.explain(step, body.text, answers, ctx, question)
+        _record_user(db, project.id, session, body.text)
+        _record_reply(db, project.id, session, message)
         return {
             "mode": "explain",
-            "message": chat.explain(step, body.text, answers, ctx, question),
+            "message": message,
             "question": question,
             "session": _session_view(session),
         }
 
     if parsed["kind"] == "clarify":
+        _record_user(db, project.id, session, body.text)
+        _record_reply(db, project.id, session, parsed["message"])
         return {
             "mode": "clarify",
             "message": parsed["message"],
@@ -600,9 +752,12 @@ def say(
         history = list(session.history or [])
         prev = flow.prev_step(history, step)
         if prev is None:
+            message = "这已经是第一步了，没有更早的可退。你直接答这一题就行。"
+            _record_user(db, project.id, session, body.text)
+            _record_reply(db, project.id, session, message)
             return {
                 "mode": "clarify",
-                "message": "这已经是第一步了，没有更早的可退。你直接答这一题就行。",
+                "message": message,
                 "question": question,
                 "session": _session_view(session),
             }
@@ -610,15 +765,22 @@ def say(
         session.history = history[:-1] if history else history
         db.commit()
         db.refresh(session)
-        return {"mode": "answered", **_state(db, project, session, ack="好，退回上一步，之前选的还在。")}
+        out = _state(db, project, session, ack="好，退回上一步，之前选的还在。")
+        _record_user(db, project.id, session, body.text)
+        _record_reply(db, project.id, session, "好，退回上一步，之前选的还在。")
+        _record_question(db, project.id, session, out.get("question"))
+        return {"mode": "answered", **out}
 
     value = parsed["value"]
     try:
         value = flow.validate(step, value, answers.get("branch"), answers, ctx)
     except flow.AnswerError as exc:
+        message = f"{exc}。换个说法，或者直接点上面的卡片。"
+        _record_user(db, project.id, session, body.text)
+        _record_reply(db, project.id, session, message)
         return {
             "mode": "clarify",
-            "message": f"{exc}。换个说法，或者直接点上面的卡片。",
+            "message": message,
             "question": question,
             "session": _session_view(session),
         }
@@ -626,7 +788,10 @@ def say(
     ack = flow.ack_for(step, value, answers, ctx)
     if parsed.get("note"):
         ack = ack + str(parsed["note"])
-    out = _advance(db, project, session, step, value, background_tasks, ack)
+    # 用户原话先落库（自由输入保留原话，比只记选项文案更有信息量）；
+    # 传 echo=None 告诉 `_advance`「用户消息已经记过，别重复记」。
+    _record_user(db, project.id, session, body.text)
+    out = _advance(db, project, session, step, value, background_tasks, ack, echo=None)
     out["echo"] = parsed.get("label") or ack
     return {"mode": "answered", **out}
 
@@ -648,7 +813,9 @@ def back(project_id: int, db: Session = Depends(get_db)) -> dict:
     # 回退不删答案：卡片会带回上次的选择，用户可以直接改。
     db.commit()
     db.refresh(session)
-    return _state(db, project, session)
+    out = _state(db, project, session)
+    _record_question(db, project.id, session, out.get("question"))
+    return out
 
 
 @router.post("/{project_id}/goto")
@@ -667,7 +834,9 @@ def goto(project_id: int, body: WizardGotoIn, db: Session = Depends(get_db)) -> 
     session.history = history[:idx]
     db.commit()
     db.refresh(session)
-    return _state(db, project, session)
+    out = _state(db, project, session)
+    _record_question(db, project.id, session, out.get("question"))
+    return out
 
 
 @router.post("/{project_id}/commit")
@@ -681,7 +850,16 @@ def commit(
     session = _active_session(db, project_id)
     if session is None:
         raise HTTPException(status_code=409, detail="没有进行中的引导")
-    return _commit(db, project, session, background_tasks)
+    out = _commit(db, project, session, background_tasks)
+    _record_reply(
+        db,
+        project.id,
+        session,
+        str((out.get("result") or {}).get("message") or ""),
+        kind="wizard_result",
+        payload={"result": out.get("result")},
+    )
+    return out
 
 
 def _project_hint(project: Project) -> dict:
@@ -823,6 +1001,15 @@ def undo_action(
     else:
         res = actions.undo_last(db, project, session)
     out = _state(db, project, session)
+    _record_reply(
+        db,
+        project.id,
+        session,
+        res["message"],
+        kind="wizard_action",
+        payload={"action": res.get("action"), "undo_id": None, "undoable": False},
+    )
+    _record_question(db, project.id, session, out.get("question"))
     return {
         "mode": "action",
         "message": res["message"],
@@ -926,8 +1113,22 @@ def role_chat(project_id: int, body: RoleChatIn, db: Session = Depends(get_db)) 
     except Exception as exc:  # noqa: BLE001 —— 模型侧失败要如实告诉用户
         raise HTTPException(status_code=502, detail=f"角色对话调用失败：{exc}") from exc
 
+    sid = getattr(session, "id", None)
+    answer = (reply or "").strip() or "（角色沉默了一会儿）"
+    record_message(
+        db, project.id, role="user", kind="plain", text=message, session_id=sid
+    )
+    record_message(
+        db,
+        project.id,
+        role="assistant",
+        kind="role_chat",
+        text=answer,
+        payload={"character": name, "scene": scene},
+        session_id=sid,
+    )
     return {
-        "answer": (reply or "").strip() or "（角色沉默了一会儿）",
+        "answer": answer,
         "character": name,
         "scene": scene,
     }

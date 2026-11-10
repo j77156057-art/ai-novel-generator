@@ -1497,6 +1497,51 @@ export interface WizardNoticePayload {
   message?: string;
   /** 「接着问：要现在开始写吗？」——完成/失败后的下一步问句。 */
   next?: string;
+  /** 中断回执专用：还有已完成的块可复用，前端据此显示「继续蒸馏」按钮。 */
+  resumable?: boolean;
+  /** 中断时已落库的完成块数 / 总数（续跑进度）。 */
+  completed_chunks?: number;
+  total_chunks?: number;
+}
+
+/**
+ * 一条对话记录（`assistant_messages` 表的一行）。
+ *
+ * 为什么要有它：`GET /api/assistant/wizard/{id}` 只恢复「当前停在哪一题」，
+ * 之前说过的话全在前端内存里，刷新就没了。进入助手时先用本接口重建历史气泡，
+ * 再拼上当前题卡。历史里的题卡一律只读（不能重新提交）。
+ */
+export interface WizardMessage {
+  id: number;
+  session_id: number | null;
+  role: "user" | "assistant";
+  kind:
+    | "plain"
+    | "choice"
+    | "wizard_question"
+    | "wizard_action"
+    | "wizard_result"
+    | "notice"
+    | "role_chat";
+  text: string;
+  payload: {
+    step?: string;
+    question?: WizardQuestion;
+    result?: WizardCommitResult;
+    action?: string;
+    undo_id?: number | null;
+    undoable?: boolean;
+    character?: string;
+    scene?: string;
+    /** kind=notice 时是通知正文，形状同 WizardNoticePayload。 */
+    [key: string]: unknown;
+  } | null;
+  created_at: string | null;
+}
+
+export interface WizardMessageListResponse {
+  items: WizardMessage[];
+  count: number;
 }
 
 /** GET .../notices 的响应：未消费通知 + 最近一条任务（一次轮询双用途）。 */

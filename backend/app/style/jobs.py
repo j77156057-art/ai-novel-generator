@@ -98,7 +98,7 @@ _MAX_ERROR_LEN = 4000
 #: 真正的原因是进程没了，重跑一次即可。写错原因会让人去查根本不存在的配置问题。
 REAPED_ERROR = (
     "服务重启中断：蒸馏跑在进程内的后台线程里，服务重启/重载后不会自动续跑。"
-    "任务本身没有失败，重新提交一次即可。"
+    "任务本身没有失败，已完成的块已保留——点「继续蒸馏」从断点接着跑。"
 )
 
 
@@ -430,6 +430,39 @@ def _next_prompt(db: Session, project_id: int) -> str:
     return "接着问：要现在开始写，还是先去项目工作台核对文风档案？"
 
 
+def _resume_progress(db: Session, run: DistillRun) -> tuple[int, int]:
+    """中断任务「已保留多少块 / 一共多少块」，用于回执里的续跑提示。
+
+    返回 `(已完成块数, 总块数)`。总块数取「心跳里估算的总数」与「已完成数」的
+    较大者——估算偏小时也不能报出 `8/6` 这种自相矛盾的数字。
+    任何一步算不出来都退化成 `(0, 心跳总数)`：回执里少一个数字可以接受，
+    因为算不出来而发不出回执不行。
+    """
+    try:
+        from app.style.narrative import (
+            count_done_chunks,
+            distill_resume_scope,
+            resolve_tier,
+            tier_with_sampling,
+        )
+
+        project = db.get(Project, run.project_id)
+        if project is None:
+            return 0, int(run.progress_total or 0)
+        ids = [int(i) for i in (project.reference_novel_ids or [])]
+        if not ids:
+            return 0, int(run.progress_total or 0)
+        cfg = resolve_tier(run.tier or getattr(project, "narrative_tier", None))
+        cap = getattr(project, "narrative_sample_chapters", None)
+        if cap is not None:
+            cfg = tier_with_sampling(cfg, int(cap))
+        done = count_done_chunks(db, project.id, distill_resume_scope(ids, cfg))
+        return done, max(int(run.progress_total or 0), done)
+    except Exception:  # noqa: BLE001 —— 回执不能因为算不出块数就发不出去
+        logger.warning("续跑进度读取失败 job_id=%s", run.id)
+        return 0, int(run.progress_total or 0)
+
+
 def _terminal_payload(
     db: Session,
     run: DistillRun,
@@ -475,9 +508,25 @@ def _terminal_payload(
         head = "蒸馏完成" if not failed_chunks else "蒸馏完成（部分块失败）"
         payload["message"] = f"{head}：" + "，".join(bits) + "。"
     elif interrupted:
+        # 中断要**留痕**（用户必须知道这次没跑完），但留痕不等于作废：已完成的
+        # 块都在 `distill_chunks` 里。回执把「还能接着跑」说清楚，并带上可点
+        # 「继续蒸馏」的标记；不做自动续跑（无人值守烧 LLM 费用且可能崩溃循环）。
+        done, total = _resume_progress(db, run)
+        payload["completed_chunks"] = done
+        payload["total_chunks"] = total
+        payload["resumable"] = done > 0
+        if done and total:
+            keep = (
+                f"已保留 {done}/{total} 块，可从这里继续——点「继续蒸馏」接着跑，"
+                "已完成的块不会重跑。"
+            )
+        elif done:
+            keep = f"已保留 {done} 块，可从这里继续——点「继续蒸馏」接着跑。"
+        else:
+            keep = "这次还没跑完任何块，重新提交一次即可。"
         payload["message"] = (
             "蒸馏被服务重启中断：后台线程随进程一起没了，任务没有跑完。"
-            f"中断前已跑 {elapsed_text}。重跑一次即可（已完成的档案没有被覆盖）。"
+            f"中断前已跑 {elapsed_text}。{keep}"
         )
     else:
         err = (run.error or "未知错误").strip()
@@ -512,6 +561,24 @@ def emit_notice(
         db.add(row)
         db.commit()
         db.refresh(row)
+        # 同时进对话历史：用户关掉页面再回来，回执仍在对话流里（不是只活在前端内存）。
+        # 幂等键用 notice:{id}，重复投递不会写第二条。
+        try:
+            from app.assistant_store import record_message
+
+            record_message(
+                db,
+                row.project_id,
+                role="assistant",
+                kind="notice",
+                text=str(payload.get("message") or ""),
+                # notice_id / notice_kind 让前端在回放历史时能识别「这条回执
+                # 已经出现过」，从而不把它再当作未消费通知补一遍。
+                payload=dict(payload or {}, notice_id=row.id, notice_kind=kind),
+                dedupe_key=f"notice:{row.id}",
+            )
+        except Exception:  # noqa: BLE001 —— 历史是增强，不能影响通知投递
+            logger.warning("通知同步进对话历史失败 notice_id=%s", row.id)
         return row
     except Exception:  # noqa: BLE001 —— 通知写失败不该让任务本身失败
         logger.exception("蒸馏通知写入失败 job_id=%s kind=%s", run.id, kind)
@@ -609,7 +676,7 @@ def reap_stale_runs(db: Session) -> int:
 
 def run_distill_job(
     job_id: int, project_id: int, tier: str, force: bool = False,
-    content_hash: str | None = None,
+    content_hash: str | None = None, resume: bool = True,
 ) -> None:
     """后台蒸馏的执行体（跑在 FastAPI BackgroundTasks 的线程池里）。
 
@@ -621,6 +688,9 @@ def run_distill_job(
         content_hash: 调用方（`start_distill` 的缓存预测）已算好的
             `corpus_content_hash`。None 时由 `project_narrative` 自行计算——
             同一条提交链路里重复全量加载语料算哈希是纯浪费。
+        resume: 是否复用 `distill_chunks` 里已完成的块（断点续跑）。默认 True：
+            重新提交与「继续蒸馏」走同一条路，能复用就复用——同 scope 的块
+            是同一份计算的中间结果，复用它不会改变结论。`force=True` 时强制关闭。
 
     成功：写 `status=success` + 摘要字段（n_chapters / rule_count / rejected）。
     失败：写 `status=failed` + `error`。**任何路径都会写 finished_at**——
@@ -661,6 +731,7 @@ def run_distill_job(
             db, project, force=force, tier=tier, progress=progress,
             content_hash=content_hash,
             heartbeat=_make_heartbeat_writer(job_id, db),
+            resume=resume and not force,
         )
         if not isinstance(profile, dict):
             raise ValueError("蒸馏未产出档案（可能是档位不合法或语料为空）")

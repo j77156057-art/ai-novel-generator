@@ -367,6 +367,173 @@ def _tier_signature(tier: NarrativeTier) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
 
+# ====================================================================
+# 断点续跑：块级完成标记
+# ====================================================================
+#
+# 蒸馏 400+ 分钟里几乎全部时间花在「每块一次 LLM 调用」。块级产出原来只活在
+# `extract_narrative_profile` 的内存累加器里，进程一没就全部作废。这一组函数
+# 把「每块的净产出」在块处理完的当下写进 `distill_chunks`，续跑时回灌并跳过。
+#
+# 复用的前提是**输入完全一致**：scope 把语料集合、档位配置、提炼版本号、采样
+# 上限揉成哈希。任一项变了就查不到旧块——宁可重跑，也不能拼出「一半旧档 + 一半
+# 新档」的档案（那是没有任何报错的静默错误）。
+
+#: 辅助阶段的合成 chunk_key 前缀（角色声音 / 文风漂移不是「块」，但同样值得
+#: 跨轮跳过）。带这个前缀的行不计入「已完成块数」。
+_AUX_KEY_PREFIX = "aux_"
+
+
+def distill_resume_scope(
+    source_ids: list[int], cfg: NarrativeTier, max_chapters: int = 180
+) -> str:
+    """一次蒸馏断点的作用域哈希（只有 scope 相同才允许复用已完成块）。"""
+    blob = json.dumps(
+        {
+            "source_ids": sorted(int(i) for i in source_ids),
+            "tier_signature": _tier_signature(cfg),
+            "narrative_version": NARRATIVE_VERSION,
+            "max_chapters": int(max_chapters),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+
+
+def _chunk_key(novel_id: int, chapter_range: str, chunk_text: str) -> str:
+    """块的稳定标识：同一 scope 下同一段章节正文永远得到同一个 key。
+
+    采样是确定性的（本模块无 random），所以「同样的输入 → 同样的块」成立；
+    正文一改（重新导入/清洗），key 就变，旧块不会被错用。
+    """
+    blob = f"{int(novel_id)}|{chapter_range}|{chunk_text}"
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _load_done_chunks(db: Session, project_id: int, scope: str) -> dict[str, dict]:
+    """读本 scope 下所有已完成块（key → payload）。读失败按「没有断点」处理。"""
+    try:
+        from app.models import DistillChunk
+
+        rows = db.scalars(
+            select(DistillChunk).where(
+                DistillChunk.project_id == project_id,
+                DistillChunk.scope == scope,
+            )
+        ).all()
+        return {str(r.chunk_key): (r.payload or {}) for r in rows}
+    except Exception as exc:  # noqa: BLE001 —— 断点读不到就退化成全新跑
+        logging.getLogger(__name__).warning(
+            "读取蒸馏断点失败 project_id=%s: %s", project_id, exc
+        )
+        return {}
+
+
+def _save_done_chunk(
+    db: Session,
+    project_id: int,
+    scope: str,
+    novel_id: int,
+    chunk_key: str,
+    chapter_range: str,
+    payload: dict,
+) -> None:
+    """落一个块的完成标记（幂等 upsert）。
+
+    失败只记日志：存断点是增强，不能因为存断点失败就把整次蒸馏搞挂。
+    """
+    try:
+        from app.models import DistillChunk
+
+        existing = db.scalar(
+            select(DistillChunk).where(
+                DistillChunk.project_id == project_id,
+                DistillChunk.scope == scope,
+                DistillChunk.chunk_key == chunk_key,
+            )
+        )
+        if existing is not None:
+            existing.payload = payload
+        else:
+            start = end = None
+            parts = (chapter_range or "").split("-")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                start, end = int(parts[0]), int(parts[1])
+            db.add(
+                DistillChunk(
+                    project_id=project_id,
+                    scope=scope,
+                    novel_id=int(novel_id),
+                    chunk_key=chunk_key,
+                    chapter_start=start,
+                    chapter_end=end,
+                    payload=payload,
+                )
+            )
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "写入蒸馏断点失败 key=%s: %s", chunk_key, exc
+        )
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _clear_scope_chunks(db: Session, project_id: int, scope: str) -> None:
+    """清掉本 scope 的断点（force 重算时调用，避免拿半成品拼新档案）。"""
+    try:
+        from app.models import DistillChunk
+
+        db.query(DistillChunk).filter(
+            DistillChunk.project_id == project_id, DistillChunk.scope == scope
+        ).delete(synchronize_session=False)
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "清理蒸馏断点失败 project_id=%s: %s", project_id, exc
+        )
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def count_done_chunks(db: Session, project_id: int, scope: str) -> int:
+    """已完成的主提炼块数（不含辅助阶段），供中断回执报「已保留 X/Y 块」。"""
+    try:
+        from app.models import DistillChunk
+
+        return int(
+            db.scalar(
+                select(func.count(DistillChunk.id)).where(
+                    DistillChunk.project_id == project_id,
+                    DistillChunk.scope == scope,
+                    ~DistillChunk.chunk_key.like(f"{_AUX_KEY_PREFIX}%"),
+                )
+            )
+            or 0
+        )
+    except Exception:  # noqa: BLE001 —— 回执里的数字缺失不该影响通知本身
+        return 0
+
+
+def _apply_chunk_payload(
+    payload: dict,
+    all_rules: dict[str, list[dict]],
+    all_forbidden: dict[str, list[str]],
+) -> None:
+    """把已完成块的净产出回灌进累加器（不做二次校验——入账时已校验过）。"""
+    for dim, items in (payload.get("rules") or {}).items():
+        if isinstance(items, list):
+            all_rules.setdefault(str(dim), []).extend(items)
+    for dim, items in (payload.get("forbidden") or {}).items():
+        if isinstance(items, list):
+            all_forbidden.setdefault(str(dim), []).extend(items)
+
+
 def _load_novel_chapters(db: Session, novel_id: int) -> list[tuple[int, str]]:
     """加载一本语料的全部章节，返回 [(chapter_no, text), ...]，按章节号排序。"""
     from app.models import NovelChunk
@@ -3025,6 +3192,7 @@ def extract_narrative_profile(
     tier: str | NarrativeTier | None = None,
     progress: ProgressCallback | None = None,
     heartbeat: HeartbeatCallback | None = None,
+    resume: bool = False,
 ) -> dict:
     """从参考语料提炼叙事档案。
 
@@ -3040,6 +3208,9 @@ def extract_narrative_profile(
             LLM 请求返回就打一次**。只为后台看护的心跳（`progress_at`）与一句
             人话计数服务——块级进度在一次 gather 里是攒着报的，几十分钟没有写入
             会被误判成卡住。不参与任何提炼决策。
+        resume: 是否复用 `distill_chunks` 里已完成的块（断点续跑）。True 时
+            已完成块不建 prompt、不调 LLM，直接回灌净产出；False（默认）时
+            行为与引入续跑之前逐字节一致——生成路径走的就是不传的那条。
 
     返回结构（可直接 JSON 落库到 `Project.style_narrative`）：
     {
@@ -3097,8 +3268,23 @@ def extract_narrative_profile(
     books_seen = 0
     est_total = 0
 
+    # —— 断点续跑：先读本 scope 下已完成的块 ——
+    # 只有 resume=True 才回灌；False 时整条链路与引入续跑之前一致。
+    scope = distill_resume_scope(novel_ids, cfg, max_chapters)
+    done_chunks: dict[str, dict] = (
+        _load_done_chunks(db, project.id, scope) if resume else {}
+    )
+    #: 起始进度 = 已保留的主提炼块数。不归零——续跑的进度条要从上次停的地方接着走。
+    blocks_done = sum(1 for k in done_chunks if not k.startswith(_AUX_KEY_PREFIX))
+
     if progress is not None:
         progress("正在准备参考语料", 0, 0)
+    if blocks_done and progress is not None:
+        progress(
+            f"继续上次：已保留 {blocks_done} 块，跳过已完成部分",
+            blocks_done,
+            0,
+        )
 
     # —— 前置自检：参考语料图谱（v2.228）——
     # 角色声音维度依赖 KgNode(type="character", source=f"novel:{nid}")——
@@ -3124,25 +3310,66 @@ def extract_narrative_profile(
         chunk_starts = list(range(0, len(sampled), chunk_size))
         n_chunks = len(chunk_starts)
 
+        # —— 先切块并算稳定 key（只做切片 + 拼接，不调 LLM，开销可忽略）——
+        # 必须先切完才知道哪些块已完成，才能算出本次真正要跑的块数。
+        prepared: list[dict] = []
+        for ci, i in enumerate(chunk_starts):
+            chunk = sampled[i : i + chunk_size]
+            chunk_text = "\n\n".join(text for _, text in chunk if text)
+            if not chunk_text:
+                continue
+            chapter_range = f"{chunk[0][0]}-{chunk[-1][0]}"
+            prepared.append({
+                "ci": ci,
+                "chunk": chunk,
+                "text": chunk_text,
+                "cr": chapter_range,
+                "key": _chunk_key(nid, chapter_range, chunk_text),
+            })
+
+        # 已完成块回灌：净产出直接进累加器，不再建 prompt、不再调 LLM。
+        # 失败块（上次没写进断点）会落到 pending 里，这次重新尝试。
+        pending_chunks: list[dict] = []
+        restored_here = 0
+        for spec in prepared:
+            stored = done_chunks.get(spec["key"])
+            if stored is None:
+                pending_chunks.append(spec)
+                continue
+            _apply_chunk_payload(stored, all_rules, all_forbidden)
+            rejected += int(stored.get("rejected") or 0)
+            chunks_attempted += 1
+            restored_here += 1
+
         # 估算总块数：已探明语料的**平均块数** × 剩余未探明语料数。
         # 为什么是估算而不是精确值：精确值要先把每本语料都加载+采样一遍，
         # 那等于把最贵的一步做两次。估算法的性质是——跑到最后一本时剩余项
         # 归零，est_total 自动收敛成精确值，进度条不会停在 97%。
-        # 下限兜底 `blocks_done + n_chunks`：后一本语料若比已探明的平均值厚重，
-        # 估算值会小于实际会跑的块数，进度百分比就会越过 100%。这里保证
+        # 下限兜底取「已完成 + 本次还要跑的块数」：后一本语料若比已探明的平均值
+        # 厚重，估算值会小于实际要跑的块数，进度百分比就会越过 100%。这里保证
         # 「当前已跑 ≤ 总数」这条不变量成立，前端不必再做防御。
         books_seen += 1
         blocks_seen += n_chunks
         avg_chunks = blocks_seen / books_seen if books_seen else float(n_chunks)
+        remaining_new = len(pending_chunks)
         est_total = max(
-            int(round(blocks_done + n_chunks + (total_books - book_idx) * avg_chunks)),
-            blocks_done + n_chunks,
+            int(
+                round(
+                    blocks_done
+                    + remaining_new
+                    + (total_books - book_idx) * avg_chunks
+                )
+            ),
+            blocks_done + remaining_new,
         )
 
         if progress is not None:
+            resume_note = (
+                f"，继续上次（已保留 {restored_here} 块）" if restored_here else ""
+            )
             progress(
                 f"语料 {book_idx}/{total_books}：已采样 {len(sampled)} 章，"
-                f"切 {n_chunks} 块",
+                f"切 {n_chunks} 块{resume_note}",
                 blocks_done,
                 est_total,
             )
@@ -3152,13 +3379,12 @@ def extract_narrative_profile(
         # （限流 5 req/s 串行排队），然后按 (ci, kind) 切回每 chunk 处理。
         # 之前 chunk 间串行 = 60 chunk × 1 批 = 60 批，1.8x 提速
         # 改后 chunk 间并发 = 60 chunk × 1 批 = 1 批 300 prompt，理论 5x 提速
-        chunk_specs: list[dict] = []  # 每 chunk 的 spec: {ci, text, chunk, cr, prompts, kinds}
-        for ci, i in enumerate(chunk_starts):
-            chunk = sampled[i : i + chunk_size]
-            chunk_text = "\n\n".join(text for _, text in chunk if text)
-            if not chunk_text:
-                continue
-            chapter_range = f"{chunk[0][0]}-{chunk[-1][0]}"
+        chunk_specs: list[dict] = []  # 每 chunk 的 spec: {ci, text, chunk, cr, key, prompts, kinds}
+        for piece in pending_chunks:
+            ci = piece["ci"]
+            chunk = piece["chunk"]
+            chunk_text = piece["text"]
+            chapter_range = piece["cr"]
 
             chunk_prompts: list[tuple[str, str, dict | None]] = []
             chunk_prompt_kinds: list[str] = []
@@ -3217,6 +3443,7 @@ def extract_narrative_profile(
                 "text": chunk_text,
                 "chunk": chunk,
                 "cr": chapter_range,
+                "key": piece["key"],
                 "prompts": chunk_prompts,
                 "kinds": chunk_prompt_kinds,
             })
@@ -3257,6 +3484,7 @@ def extract_narrative_profile(
                     "text": spec["text"],
                     "chunk": spec["chunk"],
                     "cr": spec["cr"],
+                    "key": spec["key"],
                 }
             bucketed[ci]["raws"].append(raw)
             bucketed[ci]["kinds"].append(meta["kind"])
@@ -3265,23 +3493,32 @@ def extract_narrative_profile(
         for ci in sorted(bucketed.keys()):
             b = bucketed[ci]
 
+            # 每处理完一块 blocks_done 就 +1（含失败块——它也算「跑过」）。
+            # blocks_done 起始值已含续跑回灌的块数，所以进度条不会归零。
+            blocks_done += 1
             if progress is not None:
                 progress(
                     f"语料 {book_idx}/{total_books}：提炼第 {ci + 1}/{n_chunks} 块",
-                    blocks_done + ci + 1,
+                    blocks_done,
                     est_total,
                 )
 
             chapter_range = b["cr"]
             chunk_text = b["text"]
             chunk = b["chunk"]
+            chunk_key = b["key"]
+            # 本块净产出先收在局部：解析成功才一次性并入累加器 + 落断点。
+            # 失败块什么都不写（续跑时会被重新尝试），因此 failed_chunks 不会跨轮累加。
+            chunk_rules: dict[str, list[dict]] = {}
+            chunk_forbidden: dict[str, list[str]] = {}
+            chunk_rejected = 0
 
             # v2.230：「文笔量化审计」由确定性指标生成，完全不依赖 LLM。
             # 放在 extract 判空之前——即使这一块的 LLM 调用失败，硬指标仍然产出。
             # 这是该维度从 LLM 输出清单里移除后唯一的数据来源。
             _feats = build_deterministic_features(chunk_text)
             if _feats:
-                all_rules["文笔量化审计"].append({
+                chunk_rules.setdefault("文笔量化审计", []).append({
                     "rule": _format_features_rule(_feats),
                     "novel_id": nid,
                     "chapter_no": chunk[0][0],
@@ -3331,6 +3568,10 @@ def extract_narrative_profile(
                 ]
                 reason = _classify_chunk_failure(block_raws, provider)
                 failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
+                # 失败块不写断点（续跑时重试），但**本块的确定性硬指标仍要保留**——
+                # 「文笔量化审计」不依赖 LLM，没有理由跟着失败一起丢。
+                for dim, items in chunk_rules.items():
+                    all_rules.setdefault(dim, []).extend(items)
                 continue
 
             for dim in tier_dims:
@@ -3342,13 +3583,13 @@ def extract_narrative_profile(
                         continue
                     # 证据验证：伪规则在这里被拦掉
                     if not _validate_evidence(rule, chunk_text):
-                        rejected += 1
+                        chunk_rejected += 1
                         continue
                     # 逐字复制检测：LLM 直接复制原文句子而非抽象规则，信息量极低
                     if _is_verbatim_copy(rule, chunk_text):
-                        rejected += 1
+                        chunk_rejected += 1
                         continue
-                    all_rules[dim].append({
+                    chunk_rules.setdefault(dim, []).append({
                         "rule": rule.strip(),
                         "novel_id": nid,
                         "chapter_no": chunk[0][0],
@@ -3366,7 +3607,7 @@ def extract_narrative_profile(
                         for item in items:
                             if not isinstance(item, str) or not item.strip():
                                 continue
-                            all_forbidden[dim].append(item.strip())
+                            chunk_forbidden.setdefault(dim, []).append(item.strip())
 
             # —— v6：节拍序列提取 ——
             b_raw = _raw_for("beat")
@@ -3378,7 +3619,7 @@ def extract_narrative_profile(
                         if isinstance(beat, dict) and beat.get("步骤") and beat.get("写法"):
                             rule = f"{beat['步骤']}：{beat['写法']}"
                             if not _is_verbatim_copy(rule, chunk_text):
-                                all_rules["节拍序列"].append({
+                                chunk_rules.setdefault("节拍序列", []).append({
                                     "rule": rule,
                                     "novel_id": nid,
                                     "chapter_no": chunk[0][0],
@@ -3398,7 +3639,7 @@ def extract_narrative_profile(
                                 f"动作链={scene.get('动作链','')} "
                                 f"基调={scene.get('基调','')}"
                             )
-                            all_rules["高频场景模板"].append({
+                            chunk_rules.setdefault("高频场景模板", []).append({
                                 "rule": rule,
                                 "novel_id": nid,
                                 "chapter_no": chunk[0][0],
@@ -3414,14 +3655,36 @@ def extract_narrative_profile(
                         if isinstance(pat, dict) and pat.get("模式") and pat.get("写法"):
                             rule = f"{pat['模式']}：{pat['写法']}"
                             if not _is_verbatim_copy(rule, chunk_text):
-                                all_rules["潜台词模式"].append({
+                                chunk_rules.setdefault("潜台词模式", []).append({
                                     "rule": rule,
                                     "novel_id": nid,
                                     "chapter_no": chunk[0][0],
                                 })
 
-        # 本语料的块已全部跑完：把块数计入累计，供下一本语料接着报进度。
-        blocks_done += n_chunks
+            # —— 块完成：并入累加器 + 落断点 ——
+            # 顺序很重要：先并入再落库，落库失败也只是一条 warning，不影响本次产出；
+            # 反过来则可能出现「库里记了完成、内存里没这份规则」的静默丢数据。
+            for dim, items in chunk_rules.items():
+                all_rules.setdefault(dim, []).extend(items)
+            for dim, items in chunk_forbidden.items():
+                all_forbidden.setdefault(dim, []).extend(items)
+            rejected += chunk_rejected
+            _save_done_chunk(
+                db,
+                project.id,
+                scope,
+                nid,
+                chunk_key,
+                chapter_range,
+                {
+                    "rules": chunk_rules,
+                    "forbidden": chunk_forbidden,
+                    "rejected": chunk_rejected,
+                },
+            )
+
+        # 本语料的块已全部跑完。块数已在逐块处理时累加（含续跑回灌的块），
+        # 所以这里不再按 n_chunks 整体补记——否则续跑时会把已完成块重复计数。
 
         # —— v5：角色声音提取（针对性：每个角色检索出场最多的章节）——
         if progress is not None:
@@ -3454,15 +3717,27 @@ def extract_narrative_profile(
             norm_alias = alias if cfg.normalize_character_names else {}
             clean_fake = cfg.fake_character_cleaning != "none"
 
-            voice_results = _extract_character_voices(
-                provider, db, project, nid, chapters,
-                char_names=[n for n, _ in canonical],
-                voice_mode=cfg.voice_mode,
-                cleaning=cfg.fake_character_cleaning,
-                on_done=_bind_heartbeat(
-                    heartbeat, f"语料 {book_idx}/{total_books}：提取角色声音"
-                ),
-            )
+            voice_key = f"{_AUX_KEY_PREFIX}voice_{nid}"
+            stored_voice = done_chunks.get(voice_key)
+            if stored_voice is not None:
+                # 上次已完成：跳过这一轮的全部角色声音调用，直接用存下来的原始结果。
+                # 存的是**去重前**的 LLM 原始产出——去重依赖本轮重算的 canonical/alias，
+                # 存归一化后的结果会让档位或语料微调后对不上名字。
+                voice_results = list(stored_voice.get("voices") or [])
+            else:
+                voice_results = _extract_character_voices(
+                    provider, db, project, nid, chapters,
+                    char_names=[n for n, _ in canonical],
+                    voice_mode=cfg.voice_mode,
+                    cleaning=cfg.fake_character_cleaning,
+                    on_done=_bind_heartbeat(
+                        heartbeat, f"语料 {book_idx}/{total_books}：提取角色声音"
+                    ),
+                )
+                _save_done_chunk(
+                    db, project.id, scope, nid, voice_key, "",
+                    {"voices": voice_results},
+                )
             # 去重 + 角色名归一化（小落→安小落、宫爵→南宫爵、过滤角色A/时间）
             voice_results = _dedup_character_voices(
                 voice_results, norm_canonical, norm_alias, clean_fake=clean_fake
@@ -3492,8 +3767,14 @@ def extract_narrative_profile(
                 blocks_done,
                 est_total,
             )
+        drift_key = f"{_AUX_KEY_PREFIX}drift_{nid}"
+        stored_drift = done_chunks.get(drift_key)
         try:
-            if len(chapters) >= 20:
+            if stored_drift is not None:
+                # 上次已完成：跳过这一次 LLM 调用，回放存下来的漂移结论
+                if stored_drift.get("rules"):
+                    all_rules["文风漂移分析"] = list(stored_drift["rules"])
+            elif len(chapters) >= 20:
                 early = chapters[:5]
                 late = chapters[-5:]
                 early_text = "\n\n".join(t for _, t in early if t)[:2000]
@@ -3546,6 +3827,10 @@ def extract_narrative_profile(
                             "novel_id": nid,
                             "chapter_no": 0,
                     }]
+                        _save_done_chunk(
+                            db, project.id, scope, nid, drift_key, "",
+                            {"rules": all_rules["文风漂移分析"]},
+                        )
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning(
                 "文风漂移分析失败 novel_id=%s: %s", nid, exc
@@ -3751,6 +4036,7 @@ def project_narrative(
     content_hash: str | None = None,
     sample_chapters: int | None = None,
     heartbeat: HeartbeatCallback | None = None,
+    resume: bool = False,
 ) -> dict | None:
     """取项目当前该用的叙事档案；没有参考语料则返回 None。
 
@@ -3771,6 +4057,10 @@ def project_narrative(
         content_hash: 调用方已算好的 `corpus_content_hash`（如
             `start_distill` 的缓存预测里算过一次）。传了就不重算——
             同一条提交链路里「预测算一次 + 后台再算一次」是重复劳动。
+        resume: 是否复用 `distill_chunks` 里已完成的块（断点续跑）。
+            **只对后台蒸馏任务传 True**；生成路径不传，行为与引入续跑之前一致。
+            `force=True` 会顺带清掉本 scope 的块级断点——用户明确要求重算时
+            不能拿上一次的半成品拼出新档案。
 
     Raises:
         ValueError: tier / project.narrative_tier 是未知档位 key。
@@ -3795,6 +4085,13 @@ def project_narrative(
     want = narrative_fingerprint(ids, cfg)
     cached = project.style_narrative or {}
     profile = None
+
+    if force:
+        # 用户明确要求重算：清掉本 scope 的块级断点，否则「重算」会跳过已完成块，
+        # 拿上一次的半成品拼出一份看起来全新的档案。
+        _clear_scope_chunks(
+            db, project.id, distill_resume_scope(ids, cfg, max_chapters)
+        )
 
     if not force and isinstance(cached, dict) and cached.get("fingerprint") == want:
         # 命中项目缓存：一次 LLM 都不会调，进度条直接 100%，并把「没重算」写进 stage。
@@ -3837,7 +4134,7 @@ def project_narrative(
             # 没命中任何缓存/库（或 force 强制重算）→ 真实提取。
             profile = extract_narrative_profile(
                 db, project, ids, max_chapters=max_chapters, tier=cfg, progress=progress,
-                heartbeat=heartbeat,
+                heartbeat=heartbeat, resume=resume,
             )
             profile["fingerprint"] = want
             project.style_narrative = profile

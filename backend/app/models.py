@@ -747,6 +747,62 @@ class DistillRun(Base):
     expected_minutes = Column(Integer, nullable=True)
 
 
+class DistillChunk(Base):
+    """蒸馏的**块级完成标记**（断点续跑的落盘点）。
+
+    ## 为什么必须有这张表
+
+    蒸馏 400+ 分钟里几乎全部时间花在「每块一次 LLM 调用」上，但每块解析出的
+    规则原来只累加在 `extract_narrative_profile` 的内存累加器里，整份档案要等
+    全部块跑完才落库。进程一没，已完成的部分就全部作废——这正是用户说的
+    「中断一次等于全部白跑」。
+
+    这块表把**每块的净产出**（通过证据校验的规则 / 禁忌 / 拒伪计数）在块处理
+    完的当下就写进去，续跑时直接把已完成块回灌进累加器、跳过它们的 prompt
+    构建与 LLM 调用。
+
+    ## scope：续跑只在同一次输入内有效
+
+    `scope` 是 `source_ids + 档位配置 + narrative_version + max_chapters` 的
+    稳定哈希。换语料、换档位、改采样章数、提炼逻辑升版，scope 就变了，旧块
+    自然查不到——不会拿旧档的半成品拼出新档的档案。
+
+    ## 失败块不落库
+
+    调用失败 / 解析不出预期维度的块**不写行**。这样续跑会重新尝试它，而不是
+    把「上次超时」永久固化成「这块没有产出」。`failed_chunks` 因此每轮重算，
+    不会跨轮累加。
+
+    ## payload 的形状
+
+    `{"rules": {维度: [{rule, novel_id, chapter_no}]}, "forbidden": {维度: [str]},
+      "rejected": int}`。收尾阶段（角色声音 / 文风漂移）也用本表存：它们的
+    `chunk_key` 是 `aux:voice:{nid}` / `aux:drift:{nid}` 这类合成键，续跑时
+    同样可以跳过已完成的调用。
+    """
+
+    __tablename__ = "distill_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "scope", "chunk_key", name="uq_distill_chunk_scope_key"
+        ),
+        Index("ix_distill_chunks_lookup", "project_id", "scope"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    #: source_ids + 档位配置 + narrative_version + max_chapters 的短哈希
+    scope = Column(String(32), nullable=False)
+    novel_id = Column(Integer, nullable=False)
+    #: 块内容哈希（跨轮稳定：采样确定性，同 scope 下块逐字节一致）
+    chunk_key = Column(String(64), nullable=False)
+    chapter_start = Column(Integer, nullable=True)
+    chapter_end = Column(Integer, nullable=True)
+    payload = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
 class WizardNotice(Base):
     """引导/蒸馏的**持久化通知**（完成回执、疑似卡住提醒的投递队列）。
 
@@ -1029,6 +1085,57 @@ class AssistantWizardSession(Base):
     status = Column(String(16), nullable=False, default="active", index=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
+class AssistantMessage(Base):
+    """助理对话的**逐条记录**（跨退出存活的历史流）。
+
+    用户原话：「agent 对话那里的记录也得保存下来，不能退出就没有了」。
+    之前只有 `AssistantWizardSession` 存了状态机（当前第几步、已选项），
+    前端 `turns` 是纯内存——刷新/关页/换标签页，前面说过的话就全没了。
+
+    ## 为什么和 `AssistantWizardSession` 分开
+
+    会话表是**状态机**（停在哪一题、能退到哪一步），本表是**对话流**
+    （谁说了什么）。合并成一张表会让「上一步」逻辑和「历史回显」互相污染：
+    历史里既有能被重新提交的卡片，也有只该只读回放的解释与通知。
+
+    ## 归属
+
+    按 `project_id` 归属（用户重进的是这个项目的助手，换一轮引导不该把旧对话
+    藏起来），`session_id` 只标注这条消息属于哪一轮引导，可为空（普通问答不
+    属于任何一轮引导）。
+
+    ## kind
+
+    plain（问答/解释文字）| wizard_question（引导出题卡片）|
+    wizard_action（改配置回执）| wizard_result（提交后的执行结果）|
+    notice（蒸馏回执/卡住提醒）| role_chat（角色对话）。
+
+    `payload` 只存重建气泡所需的**结构化最小集**（题面、结果、通知 payload），
+    不存 LLM 原始响应。
+    """
+
+    __tablename__ = "assistant_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "dedupe_key", name="uq_assistant_message_dedupe"
+        ),
+        Index("ix_assistant_messages_project", "project_id", "id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    #: 所属引导会话；普通问答为 NULL
+    session_id = Column(Integer, nullable=True)
+    #: user | assistant
+    role = Column(String(16), nullable=False)
+    kind = Column(String(32), nullable=False, default="plain")
+    text = Column(Text, nullable=False, default="")
+    payload = Column(JSON, nullable=True)
+    #: 幂等键：同一条消息重复写入时靠它去重（如 notice:{id}）。NULL 不参与唯一约束。
+    dedupe_key = Column(String(128), nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
 
 class WizardActionAudit(Base):

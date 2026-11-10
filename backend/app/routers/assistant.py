@@ -69,6 +69,7 @@ from app.agents.log_audit import (
     run_log_audit_rules,
     run_to_dict,
 )
+from app.assistant_store import record_message
 from app.db import get_db
 from app.models import AgentRun, Evidence, Generation, Project
 from app.routers.assistant_shared import (
@@ -458,7 +459,20 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
     #    （执行由用户点确认后前端调既有端点，见 app.agents.pending_actions）
     pending_actions = _collect_pending_actions(db=db, project=project, query=body.query)
 
-    # 6) 出参（每次都包含 answer / evidence[] / confidence / agent_run_id）
+    # 6) 对话记录落库（跨退出存活）：用户问题 + 助手回答。
+    #    只存文本最小集：evidence / 工具结果体量大且会随时间失效，
+    #    历史只需要回答「当时说过什么」。
+    record_message(db, project.id, role="user", kind="plain", text=body.query)
+    record_message(
+        db,
+        project.id,
+        role="assistant",
+        kind="plain",
+        text=answer,
+        payload={"agent_run_id": run_id},
+    )
+
+    # 7) 出参（每次都包含 answer / evidence[] / confidence / agent_run_id）
     return {
         "answer": answer,
         "evidence": evidence_rows_to_dicts(evidence_rows),
