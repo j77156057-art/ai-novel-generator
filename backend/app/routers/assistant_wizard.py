@@ -206,8 +206,13 @@ def _context(
                     k: stats.get(int(n.id), empty)[k]
                     for k in ("chapters", "chars")
                 },
+                # 单本跑完整档（30% 采样）的预计耗时：按字数外推，不是实测。
                 "full_minutes": facts.estimate_minutes(
-                    stats.get(int(n.id), empty)["chapters"]
+                    facts.sampled_chars_for(
+                        facts.tier_by_key("full"),
+                        stats.get(int(n.id), empty)["chapters"],
+                        stats.get(int(n.id), empty)["chars"],
+                    )
                 )["minutes"],
             }
             for n in novels

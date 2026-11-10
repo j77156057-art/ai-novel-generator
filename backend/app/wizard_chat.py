@@ -473,14 +473,16 @@ def _faq_full(ctx: dict[str, Any]) -> str:
     # 全本耗时不能取档位的 estimated_minutes：采样被覆盖成 200 章后，
     # 那个数会变成 200 章的估算，和「全本 1528 章」对不上。
     full_minutes = ctx.get("full_corpus_minutes") or full.get("estimated_minutes") or "?"
+    hours = ctx.get("full_corpus_hours")
+    duration = f"{full_minutes} 分钟" + (f"（约 {hours} 小时）" if hours else "")
     return (
         f"先说现状：代码里没有第四个「全本」档位，只有完整/平衡/快速三档。"
         f"完整档本身是按语料 {ratio}% 采样，不是整本灌进去。\n\n"
         f"你要的「全本完整蒸馏」可以做到：我可以把采样章数覆盖成这批语料共 {total} 章"
         "（0 在我这里表示全本），维度和清洗仍按完整档走。这个覆盖会写进蒸馏指纹，"
         "所以改完必须重跑，不会命中旧档案。\n\n"
-        f"代价是时间随章数线性涨：全本 {total} 章按唯一实测点外推大约 "
-        f"{full_minutes} 分钟；"
+        f"代价是时间随字数线性涨：全本 {total} 章按唯一实测点外推大约 "
+        f"{duration}；"
         "如果只是想验证效果，先压到 200 章更划算，确认方向对了再跑全本。"
     )
 

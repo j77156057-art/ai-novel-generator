@@ -339,7 +339,10 @@ def _ok(message: str, row: WizardActionAudit | None, **extra: Any) -> dict[str, 
         "undo_id": row.id if row and row.undoable else None,
         "undoable": bool(row.undoable) if row else False,
     }
-    out.update(extra)
+    # 用 setdefault：`action` / `target` 这些键上面已经按审计行组成了回执对象，
+    # 不能再被 extra 里的字符串覆盖（历史 bug：无变化时回执变成 "set_sampling"）。
+    for k, v in extra.items():
+        out.setdefault(k, v)
     return out
 
 
@@ -366,11 +369,14 @@ def apply(
         project.narrative_tier = key
         db.commit()
         total = int(ctx.get("corpus_total_chapters") or 0)
+        chars = int(ctx.get("corpus_total_chars") or 0)
         sampled = facts.sampled_chapters_for(cfg, total)
-        est = facts.estimate_minutes(sampled)
+        sampled_chars = facts.sampled_chars_for(cfg, total, chars)
+        est = facts.estimate_minutes(sampled_chars)
         impact = (
-            f"当前档案不变，要重跑蒸馏才会按新档算；按当前语料约 {sampled} 章，"
-            f"预计约 {est['minutes']} 分钟（{est['basis']}）。"
+            f"当前档案不变，要重跑蒸馏才会按新档算；按当前语料约 {sampled} 章 / "
+            f"{sampled_chars / 10000:.0f} 万字，预计约 {est['minutes']} 分钟"
+            f"（{est['basis']}）。"
         )
         row = _audit(
             db, project, session,
@@ -394,14 +400,23 @@ def apply(
             return _ok("采样章数没变。", None, action=kind, target="project.narrative_sample_chapters")
         project.narrative_sample_chapters = n
         db.commit()
-        sampled = total if n == 0 else min(total or n, n)
-        est = facts.estimate_minutes(sampled)
+        chars = int(ctx.get("corpus_total_chars") or 0)
+        # 采样覆盖只对按比例采样的档位生效：按当前偏好档位（没选过就是完整档）
+        # 算“实际会蒸馏多少字”，再折算耗时。
+        from app.style.narrative import tier_with_sampling
+
+        cfg = facts.tier_by_key(getattr(project, "narrative_tier", None) or "full")
+        if cfg.sampling_mode == "percentage":
+            cfg = tier_with_sampling(cfg, n)
+        sampled = facts.sampled_chapters_for(cfg, total)
+        sampled_chars = facts.sampled_chars_for(cfg, total, chars)
+        est = facts.estimate_minutes(sampled_chars)
         new_txt = "全本（不抽样）" if n == 0 else f"最多 {n} 章"
         old_txt = "按档位默认" if old is None else ("全本" if int(old) <= 0 else f"最多 {old} 章")
         impact = (
             f"采样覆盖进蒸馏指纹，改完必须重跑才生效，不会命中旧档案；"
-            f"按当前语料约 {sampled} 章，预计约 {est['minutes']} 分钟"
-            f"（{est['basis']}）。维度和清洗强度不变。"
+            f"按当前语料约 {sampled} 章 / {sampled_chars / 10000:.0f} 万字，"
+            f"预计约 {est['minutes']} 分钟（{est['basis']}）。维度和清洗强度不变。"
         )
         row = _audit(
             db, project, session,

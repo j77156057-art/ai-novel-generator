@@ -33,19 +33,29 @@ from app.style.narrative import (
 )
 
 #: 文档里唯一一次带计时的实测点。**不要**把它当成「833 章 = 42 分钟」。
+#:
+#: 口径辨析（这一条以前被读错过）：文档写的是「采样 764 章（833 × 15% ≈ 125 章，
+#: 分块后 764）」。对照语料 1 的记录（603 章、15% ≈ 90 章、分块后 267），
+#: 764 / 267 都是**分块后的块数**，不是章数——块按约 1000 字切，两本语料的
+#: 块数/章数比值不同（6.1 vs 3.0），正好对得上各自的平均章长。
+#: 所以 42 分钟对应的是「5.1M 字语料的 15%（≈76.5 万字、764 块）」，
+#: 折算约 3.3 秒/块；外推必须按**字数**，不能按章数。
 MEASURED = {
     "novel": "《大奉打更人》",
     "corpus_chapters": 833,
     "corpus_chars": 5_100_000,
-    "sampled_chapters": 764,
+    "sampled_ratio": 0.15,
+    "sampled_chapters": 125,
+    "sampled_chars": int(5_100_000 * 0.15),
+    "blocks": 764,
     "minutes": 42,
     "model": "glm-4-flash",
-    "note": "文档记录 n_ch=764；同段括注 15% 采样≈125 章，口径本身有冲突，"
-    "所以只把 764 章 / 42 分钟当作可用实测点。",
+    "note": "42 分钟对应 15% 采样（≈125 章 / 76.5 万字 / 分块后 764 块），"
+    "不是 833 章全书，也不是 764 章。",
 }
 
-#: 实测点的秒/采样章，用于外推（明确标注为估算）。
-_SECONDS_PER_SAMPLED = MEASURED["minutes"] * 60 / MEASURED["sampled_chapters"]
+#: 实测点的分钟/字，用于按字数外推（明确标注为估算）。
+_MINUTES_PER_CHAR = MEASURED["minutes"] / MEASURED["sampled_chars"]
 
 #: 运行时在 14 个提炼维度之外附加的一维。
 EXTRA_DIMENSION = "文风漂移分析"
@@ -66,17 +76,19 @@ def dimension_inventory() -> dict[str, Any]:
     }
 
 
-def estimate_minutes(sampled_chapters: int) -> dict[str, Any]:
-    """按唯一实测点外推预计耗时（分钟）。"""
-    sampled = max(0, int(sampled_chapters))
-    minutes = max(1, math.ceil(sampled * _SECONDS_PER_SAMPLED / 60))
+def estimate_minutes(sampled_chars: int) -> dict[str, Any]:
+    """按唯一实测点、按**待蒸馏字数**外推预计耗时（分钟）。"""
+    chars = max(0, int(sampled_chars))
+    minutes = max(1, math.ceil(chars * _MINUTES_PER_CHAR))
     return {
-        "sampled_chapters": sampled,
+        "sampled_chars": chars,
         "minutes": minutes,
         "basis": (
-            f"按文档实测点（{MEASURED['novel']}语料 {MEASURED['corpus_chapters']} 章、"
-            f"采样 {MEASURED['sampled_chapters']} 章、{MEASURED['minutes']} 分钟、"
-            f"{MEASURED['model']}）线性外推，不是该档实测值"
+            f"按文档实测点（{MEASURED['novel']}语料 {MEASURED['corpus_chars'] / 10000:.0f} 万字、"
+            f"{MEASURED['sampled_ratio'] * 100:.0f}% 采样约 {MEASURED['sampled_chapters']} 章 / "
+            f"{MEASURED['sampled_chars'] / 10000:.1f} 万字、分块后 {MEASURED['blocks']} 块、"
+            f"{MEASURED['minutes']} 分钟、{MEASURED['model']}）按字数线性外推，"
+            "不是该档实测值"
         ),
     }
 
@@ -98,8 +110,25 @@ def sampled_chapters_for(tier: NarrativeTier, total_chapters: int) -> int:
     return min(total, max(1, int(tier.fixed_chapters or 30)))
 
 
+def sampled_chars_for(
+    tier: NarrativeTier, total_chapters: int, total_chars: int
+) -> int:
+    """估算某档实际要过模型的字数（按采样章数等比例折算）。
+
+    耗时与分块数（≈字数）线性相关，与章数无关——平均章长不同的两本书，
+    同样 30 章的字数差一倍，耗时也差一倍。
+    """
+    total = max(0, int(total_chapters))
+    chars = max(0, int(total_chars))
+    if total <= 0 or chars <= 0:
+        return 0
+    sampled = sampled_chapters_for(tier, total)
+    return int(chars * sampled / total)
+
+
 def tier_facts(
     total_chapters: int,
+    total_chars: int = 0,
     override: int | None = None,
 ) -> list[dict[str, Any]]:
     """三个档位在当前语料上的真实配置与预计耗时。
@@ -116,7 +145,8 @@ def tier_facts(
 
             tier = tier_with_sampling(tier, int(override))
         sampled = sampled_chapters_for(tier, total_chapters)
-        est = estimate_minutes(sampled)
+        sampled_chars = sampled_chars_for(tier, total_chapters, total_chars)
+        est = estimate_minutes(sampled_chars)
         out.append(
             {
                 "key": tier.key,
@@ -135,6 +165,7 @@ def tier_facts(
                 "fake_character_cleaning": tier.fake_character_cleaning,
                 "voice_mode": tier.voice_mode,
                 "sampled_chapters": sampled,
+                "sampled_chars": sampled_chars,
                 "estimated_minutes": est["minutes"],
                 "estimate_basis": est["basis"],
             }
@@ -210,7 +241,7 @@ def distill_context(db: Session, project) -> dict[str, Any]:
     total_chars = sum(b["chars"] for b in books)
     archive = archive_facts(project)
     override = getattr(project, "narrative_sample_chapters", None)
-    tiers = tier_facts(total_chapters, override)
+    tiers = tier_facts(total_chapters, total_chars, override)
     ctx = {
         "corpus_books": books,
         "corpus_total_chapters": total_chapters,
@@ -225,7 +256,8 @@ def distill_context(db: Session, project) -> dict[str, Any]:
     }
     # 全本口径的耗时：**不受采样覆盖影响**。讲解里说「全本 1528 章要多久」
     # 时不能拿被覆盖成 200 章的档位分钟数，那会把 84 分钟说成 11 分钟。
-    ctx["full_corpus_minutes"] = estimate_minutes(total_chapters)["minutes"]
+    ctx["full_corpus_minutes"] = estimate_minutes(total_chars)["minutes"]
+    ctx["full_corpus_hours"] = round(ctx["full_corpus_minutes"] / 60, 1)
     ctx["fact_sheet"] = fact_sheet(ctx)
     return ctx
 
@@ -257,7 +289,8 @@ def fact_sheet(ctx: dict[str, Any]) -> str:
         if t.get("sample_cap") is not None:
             mode = "全本（不抽样）" if int(t["sample_cap"]) <= 0 else f"最多 {t['sample_cap']} 章"
         lines.append(
-            f"- {t['name']}：{mode}，本语料约 {t['sampled_chapters']} 章，"
+            f"- {t['name']}：{mode}，本语料约 {t['sampled_chapters']} 章 / "
+            f"{(t.get('sampled_chars') or 0) / 10000:.0f} 万字，"
             f"{t['dimension_count']} 个维度，预计约 {t['estimated_minutes']} 分钟；"
             f"角色名归一化={'开' if t['normalize_character_names'] else '关'}，"
             f"伪角色清洗={t['fake_character_cleaning']}"
@@ -265,7 +298,7 @@ def fact_sheet(ctx: dict[str, Any]) -> str:
     dim = ctx.get("dimension_inventory") or dimension_inventory()
     lines.append(
         f"- 全本口径（不抽样、整本灌进去）预计约 {ctx.get('full_corpus_minutes')} 分钟"
-        f"（同样按实测点外推，不是实测值）"
+        f"（约 {ctx.get('full_corpus_hours')} 小时；同样按实测点外推，不是实测值）"
     )
     lines.append(
         f"- 维度：{dim['extract_count']} 个提炼维度（NARRATIVE_DIMENSIONS）+ 1 个"
