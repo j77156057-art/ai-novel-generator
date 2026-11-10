@@ -1377,6 +1377,8 @@ export interface WizardQuestion {
   step: string;
   title: string;
   why: string;
+  /** 这一步的对话正文：在问什么、各选项代价、默认值与推荐。卡片只是快捷入口。 */
+  message?: string;
   progress: { index: number; total: number };
   can_back: boolean;
   can_skip: boolean;
@@ -1432,6 +1434,21 @@ export interface WizardAnswerRequest {
 }
 
 export interface WizardAnswerResponse {
+  session: WizardSessionView;
+  question: WizardQuestion | null;
+  /** 答完这一题的回执（已拼进 question.message 开头，这里单独给一份备查）。 */
+  ack?: string;
+  done?: boolean;
+  result?: WizardCommitResult;
+}
+
+/** 自由输入的结果：作答 / 就地解释（不推进）/ 没听懂 / 回退。 */
+export interface WizardSayResponse {
+  mode: "answered" | "explain" | "clarify";
+  message?: string;
+  ack?: string;
+  /** 解析出的选项文案（收起卡片时显示「已选：3000 字」）。 */
+  echo?: string;
   session: WizardSessionView;
   question: WizardQuestion | null;
   done?: boolean;

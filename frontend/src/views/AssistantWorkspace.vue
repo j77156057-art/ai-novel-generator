@@ -100,6 +100,8 @@ interface Turn {
   loading: boolean;
   /** 创作引导的一步（卡片）；与普通问答互斥。 */
   wizard?: WizardStepState | null;
+  /** 引导里的一次「追问/没听懂」：只有解释文字，没有卡片，也不推进流程。 */
+  note?: boolean;
   /** 引导提交后的执行结果（大纲 / 已就绪 / 已写完 / 角色模式）。 */
   wizardResult?: WizardCommitResult | null;
 }
@@ -231,7 +233,9 @@ function makeWizardTurn(text: string): Turn {
 }
 
 function pushWizardTurn(question: WizardQuestion, intro = ""): Turn {
-  const t = makeWizardTurn(intro);
+  // 一条回复 = 解释正文 + 卡片；正文里可能已经带了上一题的回执。
+  const parts = [intro, question.message].filter((s) => s && s.trim());
+  const t = makeWizardTurn(parts.join("\n\n"));
   t.wizard = { question, answeredLabel: null, busy: false, disabled: false };
   turns.value.push(t);
   void scrollToBottom();
@@ -361,6 +365,53 @@ function backStep(turn: Turn): void {
   void revisitStep(turn, () => api.backWizard(projectId), "回到上一步，改完继续。");
 }
 
+/**
+ * 引导进行中的一句话：交给后端的引导解析器。
+ *
+ * 三种结局（mode）：
+ *   answered —— 真在作答：收起当前卡片，下一条回复开头带回执；
+ *   explain / clarify —— 追问或没听懂：**不推进**，当前卡片保持可点，
+ *     只追加一条解释气泡。这是「对话流」和「一问一卡」的核心差别。
+ */
+async function sayInWizard(text: string): Promise<void> {
+  if (wizardBusy.value) return;
+  const current = [...turns.value].reverse().find((t) => t.wizard && !t.wizard.disabled);
+  const ws = current?.wizard ?? null;
+  if (ws) ws.busy = true;
+  wizardBusy.value = true;
+  turns.value.push(makeUserTurn(text));
+  await scrollToBottom();
+  try {
+    const res = await api.sayWizard(projectId, text);
+    wizard.value = res.session;
+    if (res.mode === "answered") {
+      if (ws) {
+        ws.busy = false;
+        ws.disabled = true;
+        ws.answeredLabel = res.echo || res.ack || text;
+      }
+      if (res.done && res.result) applyCommitResult(res.result);
+      else if (res.question) pushWizardTurn(res.question);
+    } else {
+      if (ws) ws.busy = false;
+      const t = makeAssistantTurn();
+      t.loading = false;
+      t.note = true;
+      t.text = res.message || "";
+      turns.value.push(t);
+    }
+  } catch (err) {
+    if (ws) ws.busy = false;
+    const t = makeAssistantTurn();
+    t.loading = false;
+    t.error = `发送失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+    turns.value.push(t);
+  } finally {
+    wizardBusy.value = false;
+    await scrollToBottom();
+  }
+}
+
 function gotoStep(turn: Turn, step: string): void {
   void revisitStep(
     turn,
@@ -436,6 +487,14 @@ async function send(): Promise<void> {
     query.value = "";
     await startWizardFlow("好，我一步一步问你。先定这次要做哪一种作品。");
     await scrollToBottom();
+    return;
+  }
+
+  // 引导进行中：这句话先交给引导解析——可能是作答，也可能是追问（不推进）。
+  if (wizardActive.value && !roleMode.value) {
+    if (wizardBusy.value) return;
+    query.value = "";
+    await sayInWizard(q);
     return;
   }
 
@@ -810,13 +869,13 @@ onMounted(async () => {
           {{ turn.text }}
         </div>
 
-        <!-- 助手气泡：创作引导（卡片 / 结果） -->
+        <!-- 助手气泡：创作引导（解释正文 + 卡片 / 结果） -->
         <div
-          v-else-if="turn.wizard || turn.wizardResult"
+          v-else-if="turn.wizard || turn.wizardResult || turn.note"
           class="bubble assistant wizard-bubble"
         >
           <div v-if="turn.error" class="notice err">{{ turn.error }}</div>
-          <p v-if="turn.text" class="wz-intro">{{ turn.text }}</p>
+          <p v-if="turn.text" class="wz-prose" :class="{ note: turn.note }">{{ turn.text }}</p>
 
           <WizardStepCard
             v-if="turn.wizard"
@@ -831,7 +890,7 @@ onMounted(async () => {
           />
 
           <template v-if="turn.wizardResult">
-            <p class="wz-intro">{{ turn.wizardResult.message }}</p>
+            <p class="wz-prose">{{ turn.wizardResult.message }}</p>
 
             <div v-if="turn.wizardResult.stage === 'outline' && turn.wizardResult.bible" class="blk">
               <button
@@ -1044,7 +1103,7 @@ onMounted(async () => {
     <!-- ==================== 输入 ==================== -->
     <form class="composer" @submit.prevent="send">
       <div v-if="wizardActive" class="composer-hint">
-        引导进行中：点上面的卡片继续；也可以直接问我别的问题。
+        引导进行中：直接打字回答，或问「为什么」我就地解释；也可以点卡片。
         <button type="button" class="link-btn" @click="startWizardFlow('重新开始，先定方向。', true)">
           重新开始
         </button>
@@ -1061,7 +1120,9 @@ onMounted(async () => {
         :placeholder="
           roleMode
             ? `对${roleMode.character}说点什么…`
-            : '问助手一个问题，例如：主角第 3 段的动机和第 1 段一致吗？'
+            : wizardActive
+              ? '直接回答这一步，或问我「为什么」——例如：快速档和完整档差多少？'
+              : '问助手一个问题，例如：主角第 3 段的动机和第 1 段一致吗？'
         "
         @keydown="onKeydown"
       ></textarea>
@@ -1302,6 +1363,18 @@ onMounted(async () => {
   font-size: var(--fs-sm);
   line-height: 1.7;
   color: var(--fg);
+}
+/* 引导正文是「对话」：保留段落换行，别压成一坨 */
+.wz-prose {
+  margin: 0 0 var(--gap-sm);
+  font-size: var(--fs-sm);
+  line-height: 1.78;
+  color: var(--fg);
+  white-space: pre-wrap;
+  max-width: 62ch;
+}
+.wz-prose.note {
+  color: var(--fg-muted);
 }
 .wz-done {
   display: flex;

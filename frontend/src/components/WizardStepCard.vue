@@ -116,7 +116,6 @@ const confirmSummary = computed(() =>
         第 {{ question.progress.index }}<template v-if="question.progress.total > 1">/{{ question.progress.total }}</template> 步
       </span>
       <h4 class="wz-title">{{ question.title }}</h4>
-      <p class="wz-why">{{ question.why }}</p>
     </div>
 
     <!-- 已答：把卡片收成一行，避免历史里堆满按钮 -->
@@ -308,6 +307,11 @@ const confirmSummary = computed(() =>
       </button>
       <span v-if="busy" class="wz-busy">处理中…</span>
     </div>
+
+    <!-- 卡片只是快捷入口：不点也能直接在下面打字作答，或追问 -->
+    <p v-if="!answeredLabel" class="wz-hint">
+      也可以不点卡片，直接在下面打字——说「随便，你定」我按默认走，问「为什么」我就在这一步解释。
+    </p>
   </div>
 </template>
 
@@ -344,11 +348,11 @@ const confirmSummary = computed(() =>
   color: var(--fg);
 }
 
-.wz-why {
-  margin: 0;
+.wz-hint {
+  margin: var(--gap-sm) 0 0;
   font-size: var(--fs-xs);
   line-height: 1.65;
-  color: var(--fg-muted);
+  color: var(--fg-faint);
 }
 
 .wz-options {

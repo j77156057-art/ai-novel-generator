@@ -73,6 +73,7 @@ import type {
   WizardAnswerResponse,
   WizardRoleChatResponse,
   WizardRunResponse,
+  WizardSayResponse,
   WizardStateResponse,
 } from "./types";
 
@@ -801,6 +802,13 @@ export const api = {
 
   backWizard: (projectId: number) =>
     request<WizardStateResponse>(`/assistant/wizard/${projectId}/back`, jsonInit("POST", {})),
+
+  /** 直接打字：可能被解析成作答，也可能是追问（追问不推进流程）。 */
+  sayWizard: (projectId: number, text: string) =>
+    request<WizardSayResponse>(
+      `/assistant/wizard/${projectId}/say`,
+      jsonInit("POST", { text }),
+    ),
 
   /** 从汇总卡片跳回已答过的某一步。 */
   gotoWizard: (projectId: number, stepKey: string) =>
