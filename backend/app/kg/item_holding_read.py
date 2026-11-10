@@ -348,11 +348,17 @@ def _facts_from_rows(unit: dict, rows: list[sqlite3.Row]) -> list[dict]:
     return facts
 
 
-def _fetch_holding_rows(path: pathlib.Path, items: list[dict]) -> list[sqlite3.Row]:
-    """第二次查询：一条 IN 语句取回所有候选段 + 旁注顺序键 + 实例片号。"""
+def _fetch_holding_rows(path: pathlib.Path, group_ids: list[int],
+                        items: list[dict]) -> list[sqlite3.Row]:
+    """第二次查询：一条 IN 语句取回所有候选段 + 旁注顺序键 + 实例片号。
+
+    主路径按 ``group_id`` 取段；``group_id IS NULL`` 的旧行/未登记物品才按
+    名字或 ``item_id`` 兜底，所以新物品不会因为没建组而查不到。
+    """
     names = sorted({it["name"] for it in items if it.get("name")})
     ids = sorted({it["item_id"] for it in items if it.get("item_id") is not None})
-    if not names and not ids:
+    groups = sorted({int(g) for g in group_ids})
+    if not names and not ids and not groups:
         return []
 
     con = _connect_generated(path)
@@ -375,14 +381,23 @@ def _fetch_holding_rows(path: pathlib.Path, items: list[dict]) -> list[sqlite3.R
         label_expr = "i.instance_label" if has_instance else "NULL"
 
         conds, params = [], []
+        has_group = "group_id" in {r[1] for r in con.execute(
+            "PRAGMA table_info(kg_item_holding)")}
+        if has_group and groups:
+            conds.append(f"h.group_id IN ({','.join('?' * len(groups))})")
+            params.extend(groups)
         if names:
-            conds.append(f"h.item_name IN ({','.join('?' * len(names))})")
+            name_cond = f"h.item_name IN ({','.join('?' * len(names))})"
+            conds.append(f"(h.group_id IS NULL AND {name_cond})" if has_group else name_cond)
             params.extend(names)
         if ids:
-            conds.append(f"h.item_id IN ({','.join('?' * len(ids))})")
+            id_cond = f"h.item_id IN ({','.join('?' * len(ids))})"
+            conds.append(f"(h.group_id IS NULL AND {id_cond})" if has_group else id_cond)
             params.extend(ids)
 
+        group_expr = "h.group_id" if has_group else "NULL AS group_id"
         sql = f"""SELECT h.id, h.item_id, h.instance_id, h.item_name,
+                         {group_expr},
                          h.hold_type, h.owner_id, h.owner_name, h.owner_kind,
                          h.owner_state, h.valid_from, h.valid_to,
                          h.reason_code, h.evidence, h.evidence_chapter,
@@ -486,23 +501,30 @@ def current_item_holdings(
                 "ambiguous": [], "members": [], "note": "",
             })
 
+    fetch_gids: list[int] = []
     fetch_items: list[dict] = []
     for unit in units + extras:
         if unit["ambiguous"]:
             continue
-        if unit["group_id"] is not None and registry:
-            for rec in registry["surfaces_by_group"].get(unit["group_id"], []):
-                if rec["status"] == "approved":
-                    fetch_items.append({"name": rec["surface"], "item_id": None})
+        if unit["group_id"] is not None:
+            # 主路径：组已登记，直接按组取段，不再经「组名 → 写法」桥。
+            fetch_gids.append(unit["group_id"])
+            # 兜底名单：group_id 仍为 NULL 的旧行只能按写法匹配，所以把组内
+            # 已审核写法一并带上；它只作用于 NULL 行，不参与主路径。
+            if registry:
+                for rec in registry["surfaces_by_group"].get(unit["group_id"], []):
+                    if rec["status"] == "approved":
+                        fetch_items.append({"name": rec["surface"], "item_id": None})
         elif unit["name"]:
             fetch_items.append({"name": unit["name"], "item_id": unit["item_id"]})
 
     try:
-        rows = _fetch_holding_rows(path, fetch_items) if fetch_items else []
+        rows = _fetch_holding_rows(path, fetch_gids, fetch_items) \
+            if (fetch_gids or fetch_items) else []
     except sqlite3.Error:
         return []
 
-    # 行 → 单位：优先按「这个写法属于哪个组」，再退回 item_id / 原名。
+    # 行 → 单位：优先按行上的 group_id；旧行（NULL）再退回写法/ item_id / 原名。
     # 同一个组可能被查多次（如「地书」和「三号碎片」），所以一个组要挂多个单位。
     uids_by_gid: dict[int, list[int]] = {}
     uids_by_name: dict[str, list[int]] = {}
@@ -518,7 +540,10 @@ def current_item_holdings(
     rows_by_uid: dict[int, list[sqlite3.Row]] = {}
     for row in rows:
         uids: list[int] = []
-        if row["item_id"] is not None and row["item_id"] in uid_by_id:
+        row_gid = row["group_id"] if "group_id" in row.keys() else None
+        if row_gid is not None:
+            uids = uids_by_gid.get(row_gid, [])
+        elif row["item_id"] is not None and row["item_id"] in uid_by_id:
             uids = [uid_by_id[row["item_id"]]]
         elif registry:
             gid = registry["name_to_group"].get(row["item_name"])

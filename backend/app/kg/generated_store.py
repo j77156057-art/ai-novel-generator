@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS kg_item_holding (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id INTEGER,
     instance_id INTEGER,
+    group_id INTEGER,
     item_name TEXT NOT NULL CHECK (length(trim(item_name)) > 0),
     hold_type TEXT NOT NULL CHECK (hold_type IN ('own', 'custody')),
     owner_id INTEGER,
@@ -120,6 +121,7 @@ CREATE TABLE IF NOT EXISTS kg_holding_story_segment (
     holding_id INTEGER,
     item_id INTEGER,
     instance_id INTEGER,
+    group_id INTEGER,
     item_name TEXT NOT NULL CHECK (length(trim(item_name)) > 0),
     hold_type TEXT NOT NULL CHECK (hold_type IN ('own', 'custody')),
     owner_id INTEGER,
@@ -269,6 +271,9 @@ _MIGRATIONS = (
     # 实例维度：旧库用 ALTER 加纯整数列（SQLite 加列加不了 CHECK/UNIQUE，靠入口校验）
     ("kg_item_holding", "instance_id", "INTEGER"),
     ("kg_holding_story_segment", "instance_id", "INTEGER"),
+    # 同物组：可空，未登记组时为 NULL，读侧回退按名字匹配
+    ("kg_item_holding", "group_id", "INTEGER"),
+    ("kg_holding_story_segment", "group_id", "INTEGER"),
 )
 
 #: 实例维度进入唯一索引后，旧库的同名索引要重建（IF NOT EXISTS 不会改已有索引）。
@@ -502,20 +507,50 @@ def _same_owner(row, owner_id: int | None, owner_name: str | None) -> bool:
     return (row["owner_name"] or "").strip() == (owner_name or "").strip()
 
 
+def resolve_group_id(con: sqlite3.Connection, item_name: str) -> int | None:
+    """按「写法 → 组」登记解析同物组；解析不到返回 ``None``，不报错。
+
+    只认 approved 写法且组为 active 单件组：通称组（如「玉石小镜」）不该挂任何
+    单件的持有段；表不存在（旧库）同样返回 ``None``，让读侧按名字兜底。
+    """
+    name = (item_name or "").strip()
+    if not name:
+        return None
+    try:
+        row = con.execute(
+            """SELECT gid FROM (
+                   SELECT s.group_id AS gid, 0 AS pri
+                     FROM kg_item_surface s
+                     JOIN kg_item_group g ON g.id = s.group_id
+                    WHERE s.surface = ? AND s.status = 'approved'
+                      AND g.status = 'active'
+                   UNION ALL
+                   SELECT g.id AS gid, 1 AS pri
+                     FROM kg_item_group g
+                    WHERE g.canonical_name = ? AND g.status = 'active'
+               ) ORDER BY pri, gid LIMIT 1""",
+            (name, name),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row["gid"]) if row else None
+
+
 def _insert_holding(con: sqlite3.Connection, *, item_id: int | None, item_name: str,
                     hold_type: str, owner_id: int | None, owner_name: str | None,
                     owner_kind: str | None, owner_state: str, chapter: int,
                     transfer_event_id: int | None, reason_code: str,
                     evidence: str, confidence: float,
-                    instance_id: int | None = None) -> int:
+                    instance_id: int | None = None,
+                    group_id: int | None = None) -> int:
     cur = con.execute(
         """INSERT INTO kg_item_holding
-           (item_id, instance_id, item_name, hold_type, owner_id, owner_name, owner_kind,
-            owner_state, valid_from, valid_to, transfer_event_id, reason_code,
+           (item_id, instance_id, group_id, item_name, hold_type, owner_id, owner_name,
+            owner_kind, owner_state, valid_from, valid_to, transfer_event_id, reason_code,
             evidence_chapter, evidence, confidence, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)""",
-        (item_id, instance_id, item_name, hold_type, owner_id, owner_name, owner_kind,
-         owner_state, chapter, transfer_event_id, reason_code, chapter,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)""",
+        (item_id, instance_id, group_id, item_name, hold_type, owner_id, owner_name,
+         owner_kind, owner_state, chapter, transfer_event_id, reason_code, chapter,
          (evidence or "")[:400], float(confidence), _now()),
     )
     return int(cur.lastrowid)
@@ -617,6 +652,7 @@ def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
 
     insert_kwargs = dict(
         item_id=item_id, instance_id=instance_id, item_name=item_name,
+        group_id=resolve_group_id(con, item_name),
         hold_type=hold_type,
         owner_id=owner_id, owner_name=owner_name, owner_kind=owner_kind,
         owner_state=owner_state, chapter=chapter,
@@ -812,6 +848,7 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
         raise ValueError("order_key 不能为负")
 
     # 主线旁注必须真有主线行，且两轴口径一致
+    group_id = None
     if narration == "forward" and holding_id is None:
         raise ValueError("forward 旁注必须给 holding_id；回溯/预叙才写分支行")
     if holding_id is not None:
@@ -825,6 +862,9 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
             raise ValueError("旁注的 instance_id 与持有行不一致")
         if not _same_owner(row, owner_id, owner_name) or row["owner_state"] != owner_state:
             raise ValueError("旁注的持有者/状态与持有行不一致")
+        group_id = row["group_id"]
+    if group_id is None:
+        group_id = resolve_group_id(con, item_name)
 
     conflict = False
     if narration != "forward" and order_key is not None:
@@ -845,13 +885,13 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
     try:
         cur = con.execute(
             """INSERT INTO kg_holding_story_segment
-               (holding_id, item_id, instance_id, item_name, hold_type, owner_id,
-                owner_name, owner_kind, owner_state, order_key, order_basis,
+               (holding_id, item_id, instance_id, group_id, item_name, hold_type,
+                owner_id, owner_name, owner_kind, owner_state, order_key, order_basis,
                 anchor_label, narration, transfer_from_id, transfer_from_name,
                 evidence_chapter, evidence, confidence, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (holding_id, item_id, instance_id, item_name, hold_type, owner_id,
-             owner_name, owner_kind, owner_state, order_key, order_basis,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (holding_id, item_id, instance_id, group_id, item_name, hold_type,
+             owner_id, owner_name, owner_kind, owner_state, order_key, order_basis,
              anchor_label, narration, transfer_from_id, transfer_from_name,
              chapter, (evidence or "")[:400], float(confidence), _now()),
         )

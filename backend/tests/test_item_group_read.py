@@ -83,7 +83,6 @@ def _group_schema(con):
             created_at TEXT NOT NULL,
             UNIQUE (project_id, surface)
         );
-        ALTER TABLE kg_item_holding ADD COLUMN group_id INTEGER;
         """
     )
 
@@ -268,12 +267,81 @@ def test_registry_and_holding_are_constant_queries(tmp_path, monkeypatch):
             generated_db=path,
         )
 
-    # sqlite_master 的建表检查不算数据查询。
-    data_q = [s for s in seen if "sqlite_master" not in s]
+    # sqlite_master / PRAGMA 的结构检查不算数据查询。
+    data_q = [s for s in seen
+              if "sqlite_master" not in s and not s.startswith("PRAGMA")]
     registry_q = [s for s in data_q if "FROM kg_item_group" in s]
     holding_q = [s for s in data_q if "FROM kg_item_holding" in s]
     assert len(registry_q) == 1, data_q
     assert len(holding_q) == 1, data_q
     assert len(data_q) == 2, data_q
     assert len(facts) >= 4
+
+
+# ---------------------------------------------------------------------------
+# 写入口：新写入的行自带 group_id，且能直接按组查到
+# ---------------------------------------------------------------------------
+def test_write_sets_group_id_on_holding_and_story_segment(tmp_path):
+    con = store.connect(tmp_path / "gen.db")
+    store.ensure_schema(con)
+    _group_schema(con)
+    _group(con, 45, "黑金长刀")
+    _surface(con, "黑金刀", 45)
+    con.commit()
+
+    holding_id = store.record_holding(con, "黑金刀", "own", "许七安", 102,
+                                      owner_kind="character")["id"]
+    row = con.execute("SELECT group_id FROM kg_item_holding WHERE id = ?",
+                      (holding_id,)).fetchone()
+    assert row["group_id"] == 45
+
+    seg = store.record_story_segment(
+        con, "黑金刀", "own", "许七安", 102, holding_id=holding_id,
+        order_key=10200, order_basis="explicit")
+    seg_row = con.execute(
+        "SELECT group_id FROM kg_holding_story_segment WHERE id = ?",
+        (seg["id"],)).fetchone()
+    assert seg_row["group_id"] == 45
+
+    # 通称组不挂单件：写「长刀」仍是 NULL。
+    _group(con, 47, "长刀", status="generic", members="[45]")
+    _surface(con, "长刀", 47)
+    generic_id = store.record_holding(con, "长刀", "own", "许七安", 103)["id"]
+    assert con.execute("SELECT group_id FROM kg_item_holding WHERE id = ?",
+                       (generic_id,)).fetchone()["group_id"] is None
+
+    con.commit()
+    path = pathlib.Path(con.execute("PRAGMA database_list").fetchone()[2])
+    con.close()
+
+    app = _app_session(tmp_path)
+    with app:
+        facts = read.current_item_holdings(["黑金长刀"], db=app, project_id=5,
+                                           generated_db=path)
+    assert facts[0]["group_id"] == 45
+    assert facts[0]["lines"][0]["owner_name"] == "许七安"
+
+
+def test_read_by_group_id_even_when_name_is_unregistered(tmp_path):
+    """回填/新写行只要带 group_id，名字不认识也能按组查到。"""
+    app = _app_session(tmp_path)
+    path = _gen_db(tmp_path, with_registry=True)
+
+    con = sqlite3.connect(path)
+    cur = con.execute(
+        "INSERT INTO kg_item_holding (group_id, item_name, hold_type, owner_name,"
+        " owner_kind, owner_state, valid_from, reason_code, evidence_chapter,"
+        " evidence, confidence, created_at)"
+        " VALUES (45, '没人登记过的写法', 'own', '许七安', 'character', 'held',"
+        "         200, 'transfer_event', 200, '', 0.5, '2026-11-10')")
+    con.commit()
+    con.close()
+
+    with app:
+        facts = read.current_item_holdings(["黑金长刀"], db=app, project_id=5,
+                                           generated_db=path)
+    owners = {l["owner_name"] for l in facts[0]["lines"]}
+    assert "许七安" in owners
+    assert any(l["valid_from"] == 200 for l in facts[0]["lines"])
+
 
