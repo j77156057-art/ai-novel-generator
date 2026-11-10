@@ -936,3 +936,35 @@ class KgBibleRevision(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "revision_no", name="uq_kg_bible_revision"),
     )
+
+
+class AssistantWizardSession(Base):
+    """助理对话里的「一步步生成」引导会话。
+
+    为什么落库而不是放前端内存：用户问到一半关掉页面、切项目、刷新，
+    回来必须停在同一题上；前端拼出来的状态一旦丢失就只能从头再问一遍。
+    按 `project_id` 一条（同一项目同时只允许一个进行中的引导），
+    `answers` 存已选项、`history` 存走过的步骤（用于「上一步」），
+    `step_key` 指向当前问题。
+
+    status: active | committed | aborted
+      - active：引导进行中，GET 可直接恢复；
+      - committed：已保存配置（可能已启动蒸馏/大纲），不再恢复为问题；
+      - aborted：用户重新开始或放弃，保留行便于追溯。
+    """
+
+    __tablename__ = "assistant_wizard_sessions"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    # original | continuation | role_chat；未选方向前为空。
+    kind = Column(String(16), nullable=True)
+    step_key = Column(String(32), nullable=False, default="branch")
+    answers = Column(JSON, nullable=False, default=dict)
+    history = Column(JSON, nullable=False, default=list)
+    #: 提交后的执行结果（stage: outline / ready / role / done，含蒸馏 job、大纲、
+    #: 生成摘要）。刷新页面后据此恢复「已配置完」的状态，而不是重新问一遍。
+    result = Column(JSON, nullable=True)
+    status = Column(String(16), nullable=False, default="active", index=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)

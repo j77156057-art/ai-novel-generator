@@ -18,6 +18,7 @@ from app.routers import assistant_proposals as assistant_proposals_router
 from app.routers import assistant_audit as assistant_audit_router
 from app.routers import assistant_generation as assistant_generation_router
 from app.routers import assistant_clean as assistant_clean_router
+from app.routers import assistant_wizard as assistant_wizard_router
 from app.routers import kg_v3 as kg_v3_router
 
 
@@ -80,6 +81,8 @@ app.include_router(assistant_audit_router.router)
 app.include_router(assistant_generation_router.router)
 # 第10 步：语料正文清洗（clean-corpus —— 检测+模型复核，产出待批提案）。
 app.include_router(assistant_clean_router.router)
+# 对话式创作引导：/api/assistant/wizard/*（会话落库，复用既有蒸馏/大纲/生成链路）。
+app.include_router(assistant_wizard_router.router)
 
 
 @app.get("/health")
