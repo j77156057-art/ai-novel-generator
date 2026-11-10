@@ -332,10 +332,11 @@ def test_mixed_records_domain_stats(monkeypatch, caplog, tmp_path):
     n_char = len(canon_source.load_layers()["entities"])
     assert info["domains"] == {
         "character": n_char, "faction": 2, "location": 1, "filtered_out": 5,
+        "upper_level": 0,
     }
     assert "+" in info["sha256"]
-    assert (f"domains=character:{n_char},faction:2,location:1,filtered:5"
-            in caplog.text)
+    assert (f"domains=character:{n_char},faction:2,location:1,filtered:5,"
+            f"upper_level:0" in caplog.text)
 
 
 def test_mixed_normalizes_character_aliases(monkeypatch):
@@ -346,7 +347,8 @@ def test_mixed_normalizes_character_aliases(monkeypatch):
 
 def test_mixed_rejects_upper_level_and_low_evidence_venues(monkeypatch):
     _set_mixed(monkeypatch)
-    # 集合/上位类：关系会退化成集合关系，直接不要
+    # 上位/拆名写法仍不进词表：同一教派被拆成多个节点会把成员边摊薄
+    # （对应边由 is_collective 在边级门里兜住，不是漏判）。
     for name in ("魏渊阵营", "西方佛门", "西域佛门", "道门天地人三宗", "道门地宗"):
         assert canon_source._nonchar_domain(
             {"name": name, "kind": "faction", "mentions": 100}) is None
@@ -359,16 +361,98 @@ def test_mixed_rejects_upper_level_and_low_evidence_venues(monkeypatch):
         {"name": "司天监", "kind": "faction", "mentions": 291}) == "faction"
 
 
-def test_mixed_drops_collective_races_and_sects(monkeypatch):
+def test_mixed_keeps_collective_nodes_and_marks_upper_level(monkeypatch, tmp_path):
+    """集合/种族/教派节点**保留**，只打 upper_level 标记，关系交给边级门。
+
+    依据：整批剔节点实测丢掉 52.6% 的正确成员边（A 组 20/38），
+    所以节点必须留下，降级只在边上做。
+    """
+    db = tmp_path / "collective_canon.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE new_nodes (
+            canonical_name TEXT, kind TEXT, aliases TEXT, attrs TEXT,
+            mentions INTEGER, last_chapter INTEGER, review_status TEXT
+        );
+        CREATE TABLE new_edges (
+            from_name TEXT, to_name TEXT, rel_type TEXT, strength REAL,
+            chapters TEXT, status TEXT
+        );
+        """
+    )
+    collectives = ("妖族", "蛊族", "南疆蛊族", "万妖国", "佛门", "道门", "阉党")
+    con.executemany(
+        "INSERT INTO new_nodes VALUES (?,?,?,?,?,?,?)",
+        [("许七安", "character", "", "{}", 900, 30, "active")]
+        + [(n, "faction", "", "{}", 200, 30, "active") for n in collectives]
+        + [("大奉王朝", "faction", "", "{}", 200, 30, "active")],
+    )
+    con.executemany(
+        "INSERT INTO new_edges VALUES (?,?,?,?,?,?)",
+        [
+            ("许七安", "佛门", "belongs_to", 0.8, "1-30", "resolved"),
+            ("妖族", "大奉王朝", "belongs_to", 0.6, "1-30", "resolved"),
+        ],
+    )
+    con.commit()
+    con.close()
     _set_mixed(monkeypatch)
-    # 种族/教派集合：关系挂到集合上无法使用，直接剔（与政权/党派分开口径）
-    for name in ("妖族", "蛊族", "南疆蛊族", "万妖国", "佛门", "道门", "阉党"):
-        assert canon_source._nonchar_domain(
-            {"name": name, "kind": "faction", "mentions": 200}) is None
-    # 政权/党派照旧保留
-    for name in ("大奉王朝", "大奉朝", "齐党", "王党", "梁党"):
-        assert canon_source._nonchar_domain(
-            {"name": name, "kind": "faction", "mentions": 200}) == "faction"
+
+    nodes, edges = canon_source.load(db)
+    by_name = {n["name"]: n for n in nodes}
+    for name in collectives:
+        assert by_name[name]["domain"] == "faction"
+        assert by_name[name]["upper_level"] is True
+    # 政权/党派不是集合，不该被打标
+    assert "upper_level" not in by_name["大奉王朝"]
+    # 集合端点的边不再被节点过滤挡掉（边数回到 legacy 口径）
+    assert {(e["from"], e["to"]) for e in edges} == {
+        ("许七安", "佛门"), ("妖族", "大奉王朝"),
+    }
+    assert not [n for n in nodes if n["name"] == "道门地宗"], "拆名写法不进词表"
+
+
+# ---------------------------------------------------------------------------
+# 4c. 集合端点门：只在边上判，命中只降级、不删边
+# ---------------------------------------------------------------------------
+def test_collection_gate_demotes_only_membership_edges(monkeypatch):
+    monkeypatch.setattr(settings, "kg_collection_gate", True)
+    _set_mixed(monkeypatch)
+    persons = ["许七安"]
+    reason = canon_source.GATE_REASON
+
+    # 1) 成员类 + 集合端点 + 窗口内无人名 → 降级
+    assert canon_source.collection_edge_gate(
+        "belongs_to", "许七安", "佛门", "他拜入此门，从此有了归处。", persons) == reason
+    # 2) 反向条件（硬条件）：窗口内出现具体人名 → 放行
+    assert canon_source.collection_edge_gate(
+        "belongs_to", "许七安", "佛门", "许七安拜入佛门。", persons) is None
+    # 3) 非成员类关系挂在集合上 → 不动
+    assert canon_source.collection_edge_gate(
+        "enemy", "许七安", "佛门", "他与此门为敌。", persons) is None
+    # 4) 两端都不是集合 → 不动
+    assert canon_source.collection_edge_gate(
+        "belongs_to", "许七安", "司天监", "他供职于此处。", persons) is None
+    # 5) 未进词表的拆名写法也算集合端点
+    assert canon_source.collection_edge_gate(
+        "belongs_to", "地书", "道门地宗", "此书归于该宗。", persons) == reason
+
+
+def test_collection_gate_off_keeps_edges_active(monkeypatch):
+    """默认关闭：门直接短路，同一条件在关掉时必须放行（边写 active）。"""
+    monkeypatch.setattr(settings, "kg_collection_gate", False)
+    _set_mixed(monkeypatch)
+    # 这条在门打开时会被降级（见上一个用例第 5 条），关掉时必须返回 None
+    assert canon_source.collection_edge_gate(
+        "belongs_to", "地书", "道门地宗", "此书归于该宗。", ["许七安"]) is None
+
+
+def test_collection_gate_window_prefers_same_sentence():
+    text = "许七安走进大殿。许七安拜入佛门。后来他又离开了。"
+    assert canon_source.gate_window(text, "许七安", "佛门") == "许七安拜入佛门。"
+    # 两端从未同句 → 退回整段（不会变成空窗口，否则等于无条件降级）
+    assert canon_source.gate_window(text, "许七安", "司天监") == text
 
 
 def test_mixed_keeps_institutions_with_low_evidence_flag(monkeypatch, caplog, tmp_path):

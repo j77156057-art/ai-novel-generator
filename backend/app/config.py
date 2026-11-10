@@ -102,6 +102,14 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     kg_canon_source: str = "legacy"  # legacy | cleaned | mixed
 
+    # 集合/上位端点的边级门（canon_source.collection_edge_gate）。
+    # 默认关闭：2026-11-10 形态判据复核显示，三种结构判据在 A/B 两组上都做不到
+    # 「拦住错的、放行对的」（旧门 1 真错/5 误伤、S 判据 2 真错/4 误伤且 A 组 0 拦、
+    # 只按 kind 判组织则 10 真错/41 误伤），门本身净收益为负。
+    # 关闭时门函数直接返回 None，边一律 status='active'；集合/上位节点照样保留
+    # （mixed 边 710→724 的收益与门无关）。保留开关与 status 列，将来能开。
+    kg_collection_gate: bool = False
+
     # Embedding（M2 混合检索）
     embedding_provider: str = "dashscope"  # dashscope | local
     embedding_dim: int = 1536

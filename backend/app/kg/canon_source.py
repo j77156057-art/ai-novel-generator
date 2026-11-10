@@ -38,6 +38,8 @@ import re
 import sqlite3
 from collections import defaultdict
 
+from app.config import settings
+
 SOURCE_LEGACY = "legacy"
 SOURCE_CLEANED = "cleaned"
 SOURCE_MIXED = "mixed"
@@ -59,17 +61,22 @@ LOCATION_SUFFIXES = (
 NON_ENTITY_NAMES = frozenset({
     "官场", "后宫", "党派", "卫司", "行气法门", "书院", "衙门",
 })
-#: 集合/上位类：关系挂上去等于把人物关系存成集合关系，下游无法使用 → 直接剔除。
+#: 集合/种族/教派节点（2026-11-10 口径变更）：**保留为 canon 节点**，不再整批剔除。
+#: 剔除的代价实测是丢掉 52.6% 的正确成员边（A 组 20/38），所以改为「留节点 + 边级门」：
+#: 节点照常进词表，只有挂在集合端点上的成员/归属类边才过 ``collection_edge_gate``。
+#: 注意与「政权/党派」区分：大奉王朝/大奉朝/齐党/王党/梁党一直是普通 faction。
+COLLECTIVE_NAMES = frozenset({
+    "妖族", "蛊族", "南疆蛊族", "万妖国", "佛门", "道门", "阉党",
+})
+#: 上位/拆名写法：同一指称的另一种叫法（西域佛门/道门地宗）或区域名（西域）或
+#: 阵营（魏渊阵营）。**仍不进 canon 节点表**——理由逐条写在
+#: ``reports/kg-norm-mount-audit.md``：留着会把一个教派拆成多个节点、把成员边摊薄。
+#: 但边级门按集合端点处理（``is_collective`` 为 True），所以 v3 侧不会漏判。
 UPPER_LEVEL_NAMES = frozenset({
     "西域", "西域佛门", "西方佛门", "魏渊阵营", "道门天地人三宗",
     "道门地宗", "道门天宗",
 })
 UPPER_LEVEL_SUFFIXES = ("阵营",)
-#: 种族/教派集合：同样是把关系挂到集合上，直接剔。
-#: 注意与「政权/党派」区分：大奉王朝/大奉朝/齐党/王党/梁党保留。
-COLLECTIVE_DROP_NAMES = frozenset({
-    "妖族", "蛊族", "南疆蛊族", "万妖国", "佛门", "道门", "阉党",
-})
 #: 具体场所类：真实体但价值低，不按类型剔，按 mentions 阈值控。
 #: 阈值 3 的依据：venue 候选里 1–2 次的多为一次性布景（山货铺/御膳房/
 #: 桂月楼/景秀宫），3 次以上才开始有复用（灵宝观/观星楼/养生堂）。
@@ -398,11 +405,11 @@ def _nonchar_domain(node: dict) -> str | None:
         return None
     if name in NON_ENTITY_NAMES or name.endswith("官场"):
         return None
-    # 集合/上位：关系会退化成集合关系，直接不要
+    # 集合/种族/教派（妖族/蛊族/万妖国/佛门/道门/阉党）：保留，交给边级门
+    if name in COLLECTIVE_NAMES:
+        return "faction"
+    # 上位/拆名写法：同一指称的另一种叫法，进词表会让一个教派拆成多个节点 → 仍不收
     if name in UPPER_LEVEL_NAMES or name.endswith(UPPER_LEVEL_SUFFIXES):
-        return None
-    # 种族/教派集合（妖族/蛊族/万妖国/佛门/道门/阉党）：与政权/党派区分对待
-    if name in COLLECTIVE_DROP_NAMES:
         return None
     if ("佛门" in name and name != "佛门") or (name.startswith("道门") and name != "道门"):
         return None
@@ -423,7 +430,7 @@ def mixed_nodes(layers: dict, legacy_nodes: list[dict]
     char_nodes = nodes_from_layers(layers)
     seen = {n["name"] for n in char_nodes}
     stats = {"character": len(char_nodes), "faction": 0, "location": 0,
-             "filtered_out": 0}
+             "filtered_out": 0, "upper_level": 0}
     kept: list[dict] = []
     for node in legacy_nodes:
         domain = _nonchar_domain(node)
@@ -435,6 +442,10 @@ def mixed_nodes(layers: dict, legacy_nodes: list[dict]
         # 低证据机构不剔、只打标：机构名本身稳定，但提及数不足，下游引用前需复核
         extra = ({"low_evidence": True}
                  if (node.get("mentions") or 0) < LOW_EVIDENCE_MENTIONS else {})
+        # 集合/上位端点打标：下游据此知道「这条边可能只是集合归属」，配合边级门使用
+        if is_collective(node["name"]):
+            extra["upper_level"] = True
+            stats["upper_level"] += 1
         kept.append({**node, "domain": domain, "source": "legacy", **extra})
     return char_nodes + kept, stats
 
@@ -500,6 +511,95 @@ def _edges_from(edges: list[dict], names: set[str]) -> list[dict]:
         if key not in out or edge["strength"] > out[key]["strength"]:
             out[key] = {**edge, "from": a, "to": b}
     return annotate_polarity(list(out.values()))
+
+
+# ---------------------------------------------------------------------------
+# 集合/上位端点的边级门（只降级、不删边）
+# ---------------------------------------------------------------------------
+#: 门的作用面：只有成员/归属类关系会被判。其余关系（ally/enemy/family/located_at…）
+#: 挂在集合节点上不动——它们不是「成员边」，换成候选反而丢信息。
+MEMBERSHIP_RELS = frozenset({"belongs_to", "member_of", "subordinate", "superior"})
+#: 降级原因（写进 candidate 行，便于复核时按原因筛）。
+GATE_REASON = "collective_endpoint_without_person"
+
+
+def is_collective(name: str) -> bool:
+    """集合/上位端点判定（含未进词表的拆名写法，如「道门地宗」）。"""
+    name = str(name or "").strip()
+    if not name:
+        return False
+    if name in COLLECTIVE_NAMES or name in UPPER_LEVEL_NAMES:
+        return True
+    if name.endswith(UPPER_LEVEL_SUFFIXES):
+        return True
+    return ("佛门" in name and name != "佛门") or (name.startswith("道门") and name != "道门")
+
+
+def character_forms(extra_nodes=()) -> list[str]:
+    """「具体人名」判定用的写法表：词表人物实体 + 调用方传入的人物节点。
+
+    ``extra_nodes`` 用与 canon 节点同构的 dict（``name`` / ``canonical_name`` /
+    ``kind`` / ``aliases``）——v3 抽取结果本身就是这个形状。
+    这里**不看 ``source()``**：门需要一份稳定的人名表，若随来源开关变成空表，
+    所有成员边都会被判成「无人名」而降级。
+    """
+    nodes = list(extra_nodes or ())
+    layers = load_layers()
+    if layers is not None:
+        nodes.extend(layers.get("entities") or [])
+    return person_forms(nodes)
+
+
+def person_forms(nodes) -> list[str]:
+    """从节点集合里取人物写法（规范名 + 别名，≥2 字、不含标点/数字）。"""
+    forms: set[str] = set()
+    for node in nodes or ():
+        if not isinstance(node, dict):
+            continue
+        if (node.get("kind") or node.get("domain") or "") != "character":
+            continue
+        for form in [node.get("name") or node.get("canonical_name")] + list(
+                node.get("aliases") or []):
+            form = str(form or "").strip()
+            if 2 <= len(form) <= 10 and not _BAD_NAME.search(form):
+                forms.add(form)
+    return sorted(forms, key=len, reverse=True)
+
+
+def gate_window(text: str, a: str, b: str) -> str:
+    """门的判定窗口：同时提到两端的那一句；没有同句就退回整段文本。"""
+    for sentence in re.split(r"(?<=[。！？!?])", text or ""):
+        if a and b and a in sentence and b in sentence:
+            return sentence.strip()
+    return text or ""
+
+
+def collection_edge_gate(rel_type: str, from_name: str, to_name: str,
+                         window: str, persons) -> str | None:
+    """集合/上位端点的成员边门：命中返回降级原因，``None`` 表示放行。
+
+    三个条件写死，顺序不可省（缺一条都等于白审）：
+    1. 关系必须是成员/归属类（``MEMBERSHIP_RELS``）；
+    2. 至少一端落在集合/上位节点上；
+    3. 窗口里**没有**出现任何具体人名——反向条件「有人名就放行」是硬条件，
+       省掉就会重演剔节点那一轮丢掉 52.6% 正确成员边的结果。
+
+    命中只表示「这条边该降 candidate、等复核」，**不删边、不删节点**：
+    候选降级不等于修好，剩余错误率要单独报。
+
+    默认关闭（``settings.kg_collection_gate=False``）：关掉时整条门短路返回
+    ``None``，所有边写 ``status='active'``。开关保留是为了将来结构性判据站得住
+    时能重开，不再改动调用方。
+    """
+    if not settings.kg_collection_gate:
+        return None
+    if rel_type not in MEMBERSHIP_RELS:
+        return None
+    if not (is_collective(from_name) or is_collective(to_name)):
+        return None
+    if any(form in (window or "") for form in persons or ()):
+        return None
+    return GATE_REASON
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +814,8 @@ def log_effective(logger=None, *, path: str | pathlib.Path | None = None,
     if domains:
         line += (
             f" domains=character:{domains['character']},faction:{domains['faction']},"
-            f"location:{domains['location']},filtered:{domains['filtered_out']}"
+            f"location:{domains['location']},filtered:{domains['filtered_out']},"
+            f"upper_level:{domains.get('upper_level', 0)}"
         )
     if "low_evidence" in info:
         line += f" low_evidence:{info['low_evidence']}"
