@@ -33,6 +33,7 @@
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import sqlite3
 from collections.abc import Iterable
@@ -50,6 +51,12 @@ NO_RECORD = "no_record"
 #: 聚合状态时谁先露出。held 优先（`own` 有主、`custody` 另说），
 #: 其余按「更接近无主」排序；明细始终在 ``lines`` 里，不丢信息。
 _STATUS_ORDER = (HELD, SEALED, UNOWNED, UNKNOWN)
+
+
+#: 读通道独有的第六种：名字是类通称（如「玉石小镜」是九块碎片共用的写法）。
+GENERIC = "generic"
+#: 读通道独有的第七种：同一个名字命中多个组/实体，不猜。
+AMBIGUOUS = "ambiguous"
 
 
 def _default_generated_db() -> pathlib.Path:
@@ -75,17 +82,26 @@ def _normalize_items(items: Iterable[str | dict]) -> list[dict]:
     return out
 
 
+def _with_candidates(item: dict) -> dict:
+    """补上候选字段：没有实体索引时也不让上层少键。"""
+    out = dict(item)
+    out.setdefault("entity_ids", [])
+    out.setdefault("entity_names", [])
+    out.setdefault("input_name", item.get("name"))
+    return out
+
+
 def _resolve_entities(db, project_id: int | None, items: list[dict]) -> list[dict]:
     """第一次查询：从 ``kg_entities`` 批量解析规范名（按 id / 名 / 别名）。
 
     解析不到就保留调用方给的原名/原 id——读通道不替调用方猜实体。
     """
     if db is None or not items:
-        return [dict(it) for it in items]
+        return [_with_candidates(it) for it in items]
     names = {it["name"] for it in items if it.get("name")}
     ids = {it["item_id"] for it in items if it.get("item_id") is not None}
     if not names and not ids:
-        return [dict(it) for it in items]
+        return [_with_candidates(it) for it in items]
 
     try:
         from sqlalchemy import or_, select
@@ -111,32 +127,51 @@ def _resolve_entities(db, project_id: int | None, items: list[dict]) -> list[dic
             stmt = stmt.where(KgEntity.project_id == project_id)
         rows = db.execute(stmt.where(or_(*conds))).all()
     except Exception:  # noqa: BLE001 - 实体索引读不到时按原名继续，不阻断生成
-        return [dict(it) for it in items]
+        return [_with_candidates(it) for it in items]
 
     by_id: dict[int, tuple[int, str]] = {}
-    by_name: dict[str, tuple[int, str]] = {}
+    by_name: dict[str, set[int]] = {}
+    id_to_name: dict[int, str] = {}
     for row in rows:
         entity_id, canonical = row[0], row[1]
         if not canonical:
             continue
         by_id[entity_id] = (entity_id, canonical)
-        by_name.setdefault(canonical, (entity_id, canonical))
+        id_to_name[entity_id] = canonical
+        by_name.setdefault(canonical, set()).add(entity_id)
         for alias in (row[2] or []):
             if isinstance(alias, str) and alias.strip():
-                by_name.setdefault(alias.strip(), (entity_id, canonical))
+                by_name.setdefault(alias.strip(), set()).add(entity_id)
 
     resolved: list[dict] = []
     seen: set[tuple[int | None, str | None]] = set()
     for it in items:
-        hit = by_id.get(it["item_id"]) if it["item_id"] is not None else None
-        if hit is None and it.get("name"):
-            hit = by_name.get(it["name"])
-        name, item_id = (hit[1], hit[0]) if hit else (it["name"], it["item_id"])
-        key = (item_id, name)
+        candidates: set[int] = set()
+        if it["item_id"] is not None:
+            # 调用方给了 id 就按 id 为准，不再按名扩大候选。
+            candidates = {it["item_id"]} if it["item_id"] in by_id else set()
+        elif it.get("name"):
+            candidates = by_name.get(it["name"], set())
+        if len(candidates) == 1:
+            entity_id = next(iter(candidates))
+            name = id_to_name.get(entity_id) or it["name"]
+            item_id = entity_id
+        else:
+            name, item_id = it["name"], it["item_id"]
+        key = (item_id, name, it.get("name"))
         if key in seen:
             continue
         seen.add(key)
-        resolved.append({"name": name, "item_id": item_id})
+        resolved.append({
+            "name": name,
+            "item_id": item_id,
+            # 调用方原话要留着：别名被解析成规范名之后，写法→组的查找仍按原话走
+            # （如「三号碎片」要按片号收窄，「黑金刀」要落到同一组）。
+            "input_name": it.get("name"),
+            # 名字同时命中多个实体（规范名 + 别人的别名）时原样带出，交给上层报歧义。
+            "entity_ids": sorted(candidates),
+            "entity_names": [id_to_name[i] for i in sorted(candidates) if i in id_to_name],
+        })
     return resolved
 
 
@@ -144,6 +179,173 @@ def _connect_generated(path: pathlib.Path) -> sqlite3.Connection:
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     return con
+
+
+def _load_registry(path: pathlib.Path, project_id: int | None) -> dict | None:
+    """读「同物组 + 写法」登记表（一次 JOIN 批量取回，不按名字循环）。
+
+    表不存在（旧库）返回 ``None``，调用方走原来的按名解析，行为不变。
+    """
+    con = _connect_generated(path)
+    try:
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if not {"kg_item_group", "kg_item_surface"} <= tables:
+            return None
+        sql = (
+            "SELECT g.id AS gid, g.canonical_name, g.status AS g_status,"
+            "       g.generic_members, g.note AS g_note,"
+            "       s.surface, s.status AS s_status, s.instance_label"
+            "  FROM kg_item_group g"
+            "  LEFT JOIN kg_item_surface s ON s.group_id = g.id"
+        )
+        params: tuple = ()
+        if project_id is not None:
+            sql += " WHERE g.project_id = ?"
+            params = (project_id,)
+        rows = con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+
+    groups: dict[int, dict] = {}
+    by_surface: dict[str, dict] = {}
+    surfaces_by_group: dict[int, list[dict]] = {}
+    name_to_group: dict[str, int] = {}
+    raw_members: dict[int, str] = {}
+    for row in rows:
+        gid = row["gid"]
+        if gid not in groups:
+            groups[gid] = {"id": gid, "canonical_name": row["canonical_name"],
+                           "status": row["g_status"], "members": [],
+                           "note": row["g_note"] or ""}
+            raw_members[gid] = row["generic_members"] or "[]"
+        if row["surface"]:
+            rec = {"surface": row["surface"], "status": row["s_status"],
+                   "group_id": gid, "instance_label": row["instance_label"]}
+            surfaces_by_group.setdefault(gid, []).append(rec)
+            by_surface.setdefault(row["surface"], rec)
+            if rec["status"] == "approved":
+                name_to_group.setdefault(row["surface"], gid)
+
+    for gid, raw in raw_members.items():
+        try:
+            groups[gid]["members"] = [int(x) for x in json.loads(raw)]
+        except (TypeError, ValueError):
+            groups[gid]["members"] = []
+        # 规范名本身也是这个组的写法（老库里不一定有对应 surface 行）
+        name_to_group.setdefault(groups[gid]["canonical_name"], gid)
+
+    return {"groups": groups, "by_surface": by_surface,
+            "surfaces_by_group": surfaces_by_group,
+            "name_to_group": name_to_group,
+            "group_by_canonical": {g["canonical_name"]: gid for gid, g in groups.items()}}
+
+
+def _group_name(registry: dict | None, gid: int | None) -> str | None:
+    if not registry or gid is None:
+        return None
+    group = registry["groups"].get(gid)
+    return group["canonical_name"] if group else None
+
+
+def _build_units(resolved: list[dict], registry: dict | None) -> list[dict]:
+    """把实体解析结果落成「组单位」：哪一组、怎么解析到的、要不要报歧义。"""
+    units: list[dict] = []
+    for it in resolved:
+        unit = {
+            "uid": len(units),
+            "name": it["name"], "item_id": it["item_id"], "group_id": None,
+            "group_name": None, "via": "name", "instance_label": None,
+            "generic": False, "ambiguous": [], "members": [], "note": "",
+        }
+        ent_ids = it.get("entity_ids") or []
+        input_name = it.get("input_name") or it["name"]
+        surf = registry["by_surface"].get(input_name) if registry else None
+        surf_group = (registry["groups"].get(surf["group_id"])
+                      if surf and surf["status"] == "approved" else None)
+
+        if surf_group and surf_group["status"] == "generic":
+            # 明确登记成通称的写法：通称优先，不进任何单件。
+            unit["name"] = input_name
+            unit["item_id"] = None
+            unit["group_id"] = surf_group["id"]
+            unit["group_name"] = surf_group["canonical_name"]
+            unit["generic"] = True
+            unit["via"] = "surface"
+            unit["members"] = list(surf_group["members"])
+            unit["note"] = surf_group.get("note") or "类是通称，不对应单件"
+        elif len(ent_ids) > 1:
+            # 同一个名字命中多个实体（规范名 + 别人的别名）：如实报歧义，不猜。
+            unit["ambiguous"] = list(it.get("entity_names") or [])
+            unit["item_id"] = None
+            unit["note"] = "名字同时命中多个实体，未做任何猜测"
+        else:
+            if surf_group:
+                unit["group_id"] = surf_group["id"]
+                unit["group_name"] = surf_group["canonical_name"]
+                unit["via"] = "surface"
+                unit["instance_label"] = surf["instance_label"]
+            elif ent_ids and registry:
+                gid = registry["group_by_canonical"].get(it["name"])
+                if gid is not None:
+                    unit["group_id"] = gid
+                    unit["group_name"] = _group_name(registry, gid)
+                    unit["via"] = "entity"
+            if surf and surf["status"] == "pending" and unit["group_id"] is None:
+                unit["note"] = (f"「{it['name']}」→{_group_name(registry, surf['group_id'])}"
+                                " 是待审映射，本轮不作数")
+            # 写法指向的组和实体指向的组不是同一个：也是歧义。
+            if surf_group and ent_ids and registry:
+                egid = registry["group_by_canonical"].get(it["name"])
+                if egid is not None and egid != surf_group["id"]:
+                    unit["ambiguous"] = [surf_group["canonical_name"],
+                                         _group_name(registry, egid) or it["name"]]
+                    unit["group_id"] = None
+                    unit["note"] = "写法与实体索引指向不同的组，未做任何猜测"
+        units.append(unit)
+    return units
+
+
+def _facts_from_rows(unit: dict, rows: list[sqlite3.Row]) -> list[dict]:
+    """一个单位的事实：按实例拆、每个 hold_type 只留顺序键最大的一段。"""
+    if unit["instance_label"]:
+        # 专指某一号碎片时，组级事实（instance_id 为空，如 own）仍保留。
+        rows = [r for r in rows
+                if r["instance_label"] == unit["instance_label"] or r["instance_id"] is None]
+
+    base = {
+        "item_name": unit["group_name"] or unit["name"],
+        "item_id": unit["item_id"],
+        "group_id": unit["group_id"],
+        "group_name": unit["group_name"],
+        "via": unit["via"],
+        "note": unit["note"],
+    }
+    if not rows:
+        return [{**base, "instance_id": None, "instance_label": None,
+                 "status": NO_RECORD, "lines": []}]
+
+    by_instance: dict[int | None, list[dict]] = {}
+    for row in rows:
+        by_instance.setdefault(row["instance_id"], []).append(_row_to_line(row))
+
+    facts: list[dict] = []
+    for instance_id, lines in sorted(
+            by_instance.items(), key=lambda x: (x[0] is not None, x[0] or 0)):
+        latest: dict[str, dict] = {}
+        for line in lines:
+            old = latest.get(line["hold_type"])
+            if old is None or (line["order_key"], line["chapter"], line["confidence"]) > (
+                    old["order_key"], old["chapter"], old["confidence"]):
+                latest[line["hold_type"]] = line
+        picked = sorted(latest.values(),
+                        key=lambda x: 0 if x["hold_type"] == "own" else 1)
+        label = next((r["instance_label"] for r in rows
+                      if r["instance_id"] == instance_id and r["instance_label"]), None) \
+            if instance_id is not None else None
+        facts.append({**base, "instance_id": instance_id, "instance_label": label,
+                      "status": _status_of(picked), "lines": picked})
+    return facts
 
 
 def _fetch_holding_rows(path: pathlib.Path, items: list[dict]) -> list[sqlite3.Row]:
@@ -242,9 +444,11 @@ def current_item_holdings(
         每个物品（多实例按实例拆分）一条事实，顺序与输入一致：
 
         ``{"item_name", "item_id", "instance_id", "instance_label",
-        "status", "lines": [...]}``
+        "status", "lines": [...], "group_id", "group_name", "via"}``
 
         ``status`` 是聚合值（held > sealed > unowned > unknown > no_record），
+        另有两种不猜的状态：``generic``（名字是类通称，见 ``candidates``）与
+        ``ambiguous``（名字命中多个组/实体，见 ``candidates``）。
         明细以 ``lines`` 为准。库文件不存在 / 没有持有表时返回空列表
         （= 本层不提供任何约束，而不是逐条报无记录）。
     """
@@ -258,63 +462,115 @@ def current_item_holdings(
 
     resolved = _resolve_entities(db, project_id, normalized)
     try:
-        rows = _fetch_holding_rows(path, resolved)
+        registry = _load_registry(path, project_id)
+    except sqlite3.Error:
+        registry = None
+    units = _build_units(resolved, registry)
+
+    # 通称的候选组也一起取（一次批量查询，不按名字循环）。
+    # 已经作为独立物品被查的组不再重复建「候选单位」，否则事实会被覆盖。
+    extras: list[dict] = []
+    seen_gids: set[int] = {u["group_id"] for u in units if u["group_id"] is not None}
+    for unit in units:
+        if not unit["generic"] or not registry:
+            continue
+        for gid in unit["members"]:
+            if gid in seen_gids or gid not in registry["groups"]:
+                continue
+            seen_gids.add(gid)
+            extras.append({
+                "uid": len(units) + len(extras),
+                "name": registry["groups"][gid]["canonical_name"], "item_id": None,
+                "group_id": gid, "group_name": registry["groups"][gid]["canonical_name"],
+                "via": "group_member", "instance_label": None, "generic": False,
+                "ambiguous": [], "members": [], "note": "",
+            })
+
+    fetch_items: list[dict] = []
+    for unit in units + extras:
+        if unit["ambiguous"]:
+            continue
+        if unit["group_id"] is not None and registry:
+            for rec in registry["surfaces_by_group"].get(unit["group_id"], []):
+                if rec["status"] == "approved":
+                    fetch_items.append({"name": rec["surface"], "item_id": None})
+        elif unit["name"]:
+            fetch_items.append({"name": unit["name"], "item_id": unit["item_id"]})
+
+    try:
+        rows = _fetch_holding_rows(path, fetch_items) if fetch_items else []
     except sqlite3.Error:
         return []
 
-    id_to_idx = {it["item_id"]: i for i, it in enumerate(resolved)
-                 if it["item_id"] is not None}
-    name_to_idx: dict[str, int] = {}
-    for i, it in enumerate(resolved):
-        if it.get("name"):
-            name_to_idx.setdefault(it["name"], i)
+    # 行 → 单位：优先按「这个写法属于哪个组」，再退回 item_id / 原名。
+    # 同一个组可能被查多次（如「地书」和「三号碎片」），所以一个组要挂多个单位。
+    uids_by_gid: dict[int, list[int]] = {}
+    uids_by_name: dict[str, list[int]] = {}
+    uid_by_id: dict[int, int] = {}
+    for u in units + extras:
+        if u["group_id"] is not None:
+            uids_by_gid.setdefault(u["group_id"], []).append(u["uid"])
+        if u["name"]:
+            uids_by_name.setdefault(u["name"], []).append(u["uid"])
+        if u.get("item_id") is not None:
+            uid_by_id[u["item_id"]] = u["uid"]
 
-    groups: dict[tuple[int, int | None], list[dict]] = {}
+    rows_by_uid: dict[int, list[sqlite3.Row]] = {}
     for row in rows:
-        idx = None
-        if row["item_id"] is not None:
-            idx = id_to_idx.get(row["item_id"])
-        if idx is None:
-            idx = name_to_idx.get(row["item_name"])
-        if idx is None:  # 查询条件保证不会出现，保险起见不张冠李戴
-            continue
-        groups.setdefault((idx, row["instance_id"]), []).append(_row_to_line(row))
+        uids: list[int] = []
+        if row["item_id"] is not None and row["item_id"] in uid_by_id:
+            uids = [uid_by_id[row["item_id"]]]
+        elif registry:
+            gid = registry["name_to_group"].get(row["item_name"])
+            if gid is not None:
+                # 候选组也参与匹配：通称的 candidates 要能拿到成员组的段。
+                uids = uids_by_gid.get(gid, [])
+        if not uids:
+            uids = uids_by_name.get(row["item_name"], [])
+        for uid in uids:
+            rows_by_uid.setdefault(uid, []).append(row)
+
+    facts_by_uid: dict[int, list[dict]] = {}
+    for unit in units + extras:
+        facts_by_uid[unit["uid"]] = _facts_from_rows(unit, rows_by_uid.get(unit["uid"], []))
 
     facts: list[dict] = []
-    for idx, item in enumerate(resolved):
-        item_groups = [(inst, lines) for (i, inst), lines in groups.items() if i == idx]
-        if not item_groups:
-            facts.append({
-                "item_name": item["name"],
-                "item_id": item["item_id"],
-                "instance_id": None,
-                "instance_label": None,
-                "status": NO_RECORD,
-                "lines": [],
-            })
+    for unit in units:
+        base = {"item_name": unit["group_name"] or unit["name"],
+                "item_id": unit["item_id"], "group_id": unit["group_id"],
+                "group_name": unit["group_name"], "via": unit["via"],
+                "note": unit["note"]}
+        if unit["ambiguous"]:
+            facts.append({**base, "status": AMBIGUOUS, "lines": [],
+                          "instance_id": None, "instance_label": None,
+                          "candidates": [{"item_name": n} for n in unit["ambiguous"]]})
             continue
-        for instance_id, lines in sorted(
-                item_groups, key=lambda x: (x[0] is not None, x[0] or 0)):
-            # 同一 hold_type 只留顺序键最大的一段；own / custody 各自独立。
-            latest: dict[str, dict] = {}
-            for line in lines:
-                old = latest.get(line["hold_type"])
-                if old is None or (line["order_key"], line["chapter"], line["confidence"]) > (
-                        old["order_key"], old["chapter"], old["confidence"]):
-                    latest[line["hold_type"]] = line
-            picked = sorted(latest.values(),
-                            key=lambda x: 0 if x["hold_type"] == "own" else 1)
-            label = next((r["instance_label"] for r in rows
-                          if r["instance_id"] == instance_id and r["instance_label"]),
-                         None) if instance_id is not None else None
-            facts.append({
-                "item_name": item["name"],
-                "item_id": item["item_id"],
-                "instance_id": instance_id,
-                "instance_label": label,
-                "status": _status_of(picked),
-                "lines": picked,
-            })
+        if unit["generic"]:
+            candidates = []
+            for gid in unit["members"]:
+                lines: list[dict] = []
+                seen_lines: set[tuple] = set()
+                name = _group_name(registry, gid) or f"组#{gid}"
+                for uid in uids_by_gid.get(gid, []):
+                    for cand in facts_by_uid.get(uid) or []:
+                        if not cand.get("lines"):
+                            continue
+                        name = cand["item_name"] or name
+                        for line in cand["lines"]:
+                            key = (cand["instance_id"], line["hold_type"],
+                                   line["owner_name"], line["valid_from"])
+                            if key in seen_lines:
+                                continue
+                            seen_lines.add(key)
+                            lines.append(line)
+                candidates.append({"group_id": gid, "item_name": name,
+                                   "status": _status_of(lines) if lines else NO_RECORD,
+                                   "lines": lines})
+            facts.append({**base, "status": GENERIC, "lines": [],
+                          "instance_id": None, "instance_label": None,
+                          "candidates": candidates})
+            continue
+        facts.extend(facts_by_uid.get(unit["uid"], []))
     return facts
 
 
@@ -350,9 +606,40 @@ def format_holding_facts(facts: Iterable[dict]) -> str:
         label = fact.get("instance_label")
         if label and label not in name:
             name = f"{name}·{label}"
+        if fact["status"] == GENERIC:
+            lines.append(f"- {name}：{_render_generic(fact)}")
+            continue
+        if fact["status"] == AMBIGUOUS:
+            lines.append(f"- {name}：{_render_ambiguous(fact)}")
+            continue
         if fact["status"] == NO_RECORD or not fact["lines"]:
             body = "无持有记录（no_record；本层不提供持有约束，不要写成「已确认无主」）"
+            if fact.get("note"):
+                body = f"{body}；{fact['note']}"
         else:
             body = "；".join(_render_line(line) for line in fact["lines"])
         lines.append(f"- {name}：{body}")
     return "\n".join(lines)
+
+
+def _render_generic(fact: dict) -> str:
+    """通称：不谎称是某一件的别名，只给候选与候选的当前状态。"""
+    note = fact.get("note") or "类的通称，不对应单件"
+    candidates = fact.get("candidates") or []
+    if not candidates:
+        return f"{note}；当前没有登记候选"
+    parts = []
+    for cand in candidates:
+        if cand.get("lines"):
+            body = "；".join(_render_line(line) for line in cand["lines"])
+        else:
+            body = "无持有记录"
+        parts.append(f"{cand['item_name']}（{body}）")
+    return f"{note}；候选：" + " / ".join(parts)
+
+
+def _render_ambiguous(fact: dict) -> str:
+    names = [c.get("item_name") or f"实体#{c.get('entity_id')}"
+             for c in (fact.get("candidates") or [])]
+    detail = " / ".join(names) if names else "多个候选"
+    return f"名字有歧义，可能在指：{detail}；不猜，需指定具体是哪一件"
