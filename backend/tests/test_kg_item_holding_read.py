@@ -24,7 +24,7 @@ from app.kg import generated_store as store  # noqa: E402
 from app.kg import item_holding_read as read  # noqa: E402
 
 ITEMS = [
-    (883, 1, "item", "地书", "[]"),
+    (883, 1, "item", "地书", '["玉石小镜", "镜子"]'),
     (1178, 1, "item", "神剑", '["镇国神剑"]'),
     (884, 1, "item", "地书碎片", "[]"),
     (932, 1, "item", "封印物", "[]"),
@@ -138,6 +138,14 @@ def test_id_only_input_resolves_name_via_entity_query(tmp_path):
     facts = _read(tmp_path, [{"name": None, "item_id": 1178}])
     assert facts[0]["item_name"] == "神剑"
     assert facts[0]["lines"][0]["owner_name"] == "元景帝"
+
+
+def test_alias_input_resolves_to_canonical(tmp_path):
+    """只给别名（玉石小镜）也要落到规范名「地书」，否则合并后生成层查不到持有者。"""
+    facts = _read(tmp_path, ["玉石小镜"])
+    assert len(facts) == 1
+    assert facts[0]["item_name"] == "地书"
+    assert facts[0]["status"] == "held"
 
 
 # ---------------------------------------------------------------------------

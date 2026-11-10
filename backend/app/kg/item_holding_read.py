@@ -92,16 +92,23 @@ def _resolve_entities(db, project_id: int | None, items: list[dict]) -> list[dic
 
         from app.models import KgEntity
 
+        conds = []
+        if names:
+            conds.append(KgEntity.canonical_name.in_(sorted(names)))
+            # 别名不在 SQL 条件里时，「玉石小镜 → 地书」这种只给别名的调用会漏。
+            # aliases 是 JSON 列，先用带引号的子串把候选行捞进来，再交给下面的
+            # Python 索引做精确匹配（预筛不当判据）。仍然只打一次库。
+            for name in sorted(names):
+                esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                conds.append(KgEntity.aliases.like(f'%"{esc}"%', escape="\\"))
+        if ids:
+            conds.append(KgEntity.id.in_(sorted(ids)))
+
         stmt = select(KgEntity.id, KgEntity.canonical_name, KgEntity.aliases).where(
             KgEntity.kind == "item"
         )
         if project_id is not None:
             stmt = stmt.where(KgEntity.project_id == project_id)
-        conds = []
-        if names:
-            conds.append(KgEntity.canonical_name.in_(sorted(names)))
-        if ids:
-            conds.append(KgEntity.id.in_(sorted(ids)))
         rows = db.execute(stmt.where(or_(*conds))).all()
     except Exception:  # noqa: BLE001 - 实体索引读不到时按原名继续，不阻断生成
         return [dict(it) for it in items]
