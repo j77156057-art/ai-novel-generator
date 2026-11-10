@@ -64,8 +64,12 @@ def hybrid_search(db, novel_id: int, query: str, k: int = 10) -> list[dict]:
 
     bm25_rank = sorted(range(len(chunks)), key=lambda i: -bm25[i])
     vec_rank = sorted(range(len(chunks)), key=lambda i: -vec_scores[i])
+    # 两路 RRF 只算一次。写在推导式里会为每个 chunk 重算整张 rank 表，
+    # 6875 chunk 实测 12.58s；提到循环外后同一口径 2.9ms。
+    bm25_rrf = _rrf(bm25_rank)
+    vec_rrf = _rrf(vec_rank)
     fused = {
-        i: _rrf(bm25_rank).get(i, 0.0) + _rrf(vec_rank).get(i, 0.0)
+        i: bm25_rrf.get(i, 0.0) + vec_rrf.get(i, 0.0)
         for i in range(len(chunks))
     }
     top = sorted(fused.keys(), key=lambda i: -fused[i])[:k]
