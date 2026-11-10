@@ -37,9 +37,15 @@ import pathlib
 import re
 import sqlite3
 from collections import defaultdict
+from collections.abc import Callable, Iterable
 
 from app.config import settings
 from app.kg.item_generic import MATERIAL_BOUNDARY_CHARS
+
+#: 守卫注入：名字集合，或按「本次要数的写法」返回名字集合的回调。
+#: 归一层**不自己读** ``generated.db``（会把依赖打穿），由调用方（batch_worker /
+#: 迁移脚本 / 测试）按需传入；不传时退回 ``ITEM_ALIASES`` 内置守卫。
+GuardInput = Iterable[str] | Callable[[frozenset[str]], Iterable[str]]
 
 SOURCE_LEGACY = "legacy"
 SOURCE_CLEANED = "cleaned"
@@ -703,26 +709,47 @@ def _longer_guards(requested: frozenset) -> frozenset:
     return guards
 
 
-def count_forms(text: str, forms: list[str], chapter: int | None = None) -> int:
+def _injected_guards(guards: GuardInput | None,
+                     requested: frozenset) -> frozenset:
+    """调用方注入的守卫名里，真正能遮挡本次写法的那些。
+
+    守卫的判据与内置一致：比要求的写法更长、且包含其中某个写法。注入方只管
+    提供「已知名字」，不负责筛；这样 batch_worker 可以把整份物品名集合直接传进来。
+    """
+    if guards is None:
+        return frozenset()
+    names = guards(requested) if callable(guards) else guards
+    return frozenset(
+        str(f) for f in names
+        if f and str(f) not in requested and any(c and c in str(f) for c in requested)
+    )
+
+
+def count_forms(text: str, forms: list[str], chapter: int | None = None,
+                *, guards: GuardInput | None = None) -> int:
     """最长优先计数，且对带约束的写法逐个校验上下文。
 
     与 ``generated_extract._count_forms`` 的差别有两个：带 constraint 的写法
     （如「白莲」）在「白莲花」里不会被计数；短写法嵌在更长已知写法里时
     （「铜剑」⊂「黄铜剑/青铜剑」）也不算独立命中。legacy 模式下索引为空，
     行为与原来完全一致。``chapter`` 用于 ``except_chapters`` 的章节范围排除。
+
+    ``guards`` 是**调用方注入**的已知名字（集合或 ``requested -> names`` 回调）：
+    归一层不读 ``generated.db``，要让「地书」不数「地书碎片」，由 batch_worker
+    之类持有登记表的地方传进来。不传时与原来完全一致（只用 ``ITEM_ALIASES``）。
     """
     cleaned = sorted({str(f) for f in forms if f}, key=len, reverse=True)
     if not cleaned or not text:
         return 0
     requested = frozenset(cleaned)
-    guards = _longer_guards(requested)
+    longer = _longer_guards(requested) | _injected_guards(guards, requested)
     pattern = re.compile("|".join(
-        re.escape(f) for f in sorted(requested | guards, key=len, reverse=True)))
+        re.escape(f) for f in sorted(requested | longer, key=len, reverse=True)))
     index = _index()
     total = 0
     for match in pattern.finditer(text):
         form = match.group(0)
-        if form in guards:
+        if form in longer:
             # 命中的是更长的写法，不属于本次要数的短写法
             continue
         start = match.start()
@@ -738,10 +765,15 @@ def count_forms(text: str, forms: list[str], chapter: int | None = None) -> int:
     return total
 
 
-def text_mention(text: str, name: str, chapter: int | None = None) -> str | None:
-    """该实体在本段文本里命中的第一个写法；没命中返回 None。"""
+def text_mention(text: str, name: str, chapter: int | None = None,
+                 *, guards: GuardInput | None = None) -> str | None:
+    """该实体在本段文本里命中的第一个写法；没命中返回 None。
+
+    ``guards`` 透传给 :func:`count_forms`：mention 索引里「地书」不该被
+    「地书碎片」算成命中时，由调用方注入已知物品名。
+    """
     for form in entity_forms(name):
-        if count_forms(text, [form], chapter) > 0:
+        if count_forms(text, [form], chapter, guards=guards) > 0:
             return form
     return None
 

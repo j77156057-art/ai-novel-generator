@@ -87,6 +87,28 @@ def test_count_forms_longest_match_wins():
     assert canon_source.count_forms("神剑出鞘", ["神剑"]) == 1
 
 
+def test_guard_injection_is_optional_and_opt_in():
+    """守卫只由调用方注入；不注入时行为与注入前完全一致。"""
+    canon_source.reset_cache()
+    text = "地书碎片亮了，地书也在"
+    # 无注入：归一层不读 generated.db，「地书碎片」不在内置守卫里，照旧数 2
+    assert canon_source.count_forms(text, ["地书"]) == 2
+    # 注入登记层名字：短写法被更长写法遮挡，只数独立出现的 1 次
+    assert canon_source.count_forms(text, ["地书"], guards={"地书碎片"}) == 1
+    # 也接受 provider 回调（batch_worker 用回调可以按需取）
+    assert canon_source.count_forms(
+        text, ["地书"], guards=lambda req: {"地书碎片", "地书聊天群"}) == 1
+    # 注入无关名字不影响结果
+    assert canon_source.count_forms(text, ["地书"], guards={"镇国剑"}) == 2
+
+
+def test_text_mention_passes_guards_through():
+    canon_source.reset_cache()
+    assert canon_source.text_mention("地书碎片亮了", "地书") == "地书"
+    assert canon_source.text_mention("地书碎片亮了", "地书",
+                                     guards={"地书碎片"}) is None
+
+
 # ---------------------------------------------------------------------------
 # 写入口：泛称不返回组，新写入 group_id 为 NULL
 # ---------------------------------------------------------------------------

@@ -430,7 +430,28 @@ def _get_provider():
         return None
 
 
-def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[_QueueItem]):
+def _item_mention_guards(db: Session, project_id: int) -> frozenset[str]:
+    """物品实体的规范名 + aliases，作为 mention 计数的「更长写法」守卫。
+
+    ``canon_source`` 有意不读 ``generated.db``；登记层的东西由这里（调用方）
+    取好再注入。作用：mention 索引里「地书」不再被「地书碎片」算成命中。
+    """
+    rows = db.execute(
+        select(KgEntity.canonical_name, KgEntity.aliases).where(
+            KgEntity.project_id == project_id, KgEntity.kind == "item")
+    ).all()
+    names: set[str] = set()
+    for canonical, aliases in rows:
+        if canonical:
+            names.add(canonical.strip())
+        for alias in (aliases or []):
+            if isinstance(alias, str) and alias.strip():
+                names.add(alias.strip())
+    return frozenset(n for n in names if n)
+
+
+def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[_QueueItem],
+                        *, mention_guards: frozenset[str] | None = None):
     """把归一化后的抽取结果落 v3.0 表。幂等 upsert。"""
     from app.kg.extractor_v3 import ExtractionStats
 
@@ -643,11 +664,14 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         stats.foreshadows += 1
 
     # —— 6. mentions 反向索引（实体×段，context_window 原文片段）——
+    guards = (mention_guards if mention_guards is not None
+              else _item_mention_guards(db, project_id))
     for item in batch:
         for name, ent_id in name_to_id.items():
             # 命中规范名或其称呼层写法都算（「许郎」也要落到许七安）；
-            # 带约束的写法（白莲 vs 白莲花）在 canon_source 里统一校验。
-            form = canon_source.text_mention(item.text, name)
+            # 带约束的写法（白莲 vs 白莲花）在 canon_source 里统一校验；
+            # 物品名再用登记集合挡一次（「地书」不吃「地书碎片」）。
+            form = canon_source.text_mention(item.text, name, guards=guards)
             if form:
                 gen_id = seg_to_gen.get(item.segment_no)
                 existing = db.scalar(
