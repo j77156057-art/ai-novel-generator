@@ -713,6 +713,66 @@ def text_mention(text: str, name: str, chapter: int | None = None) -> str | None
 #: 抽取结果里所有「指向实体名」的字段
 _REF_KEYS = ("from", "to", "subject", "object", "location", "character", "knows")
 
+#: 同一件物品的异写（已按原文核过指同一物，才收进来）。
+#: v3 的实体层只做人物归一，物品名跨章不合并，导致同一把剑按章分裂成
+#: 玄武神剑 / 镇国神剑 / 镇国宝剑 / 斩天灭仙的神剑……持有段被拆散。
+#: 这里只收「有专属定语、能确认指同一物」的写法；裸名与泛称（刀/剑/铜剑）不收。
+ITEM_ALIASES = {
+    "玄武神剑": "神剑",
+    "镇国神剑": "神剑",
+    "镇国宝剑": "神剑",
+    "大奉镇国宝剑": "神剑",
+    "镇国剑": "神剑",
+    "斩天灭仙的神剑": "神剑",
+    "镇压气运的神剑": "神剑",
+    "庙里供奉着的神剑": "神剑",
+    "开国皇帝佩剑": "神剑",
+    "开国皇帝当年使用过的佩剑": "神剑",
+    "开国帝君当年征战沙场使用的佩剑": "神剑",
+    "黄铜剑": "神剑",
+}
+
+
+def fold_item_aliases(result: dict) -> dict:
+    """把 item 的异写折到规范名，并把原写法留在 aliases（原地修改并返回）。
+
+    只折 item 实体；关系/事件里指向这些写法的字段一并改写，避免实体折了
+    而边上还挂着旧名，出现「同名无人」的悬空端点。
+    """
+    ents = result.get("entities") or []
+    mapping = {}
+    for ent in ents:
+        if ent.get("kind") != "item":
+            continue
+        raw = (ent.get("canonical_name") or "").strip()
+        new = ITEM_ALIASES.get(raw)
+        if new and new != raw:
+            mapping[raw] = new
+
+    if not mapping:
+        return result
+
+    for ent in ents:
+        if ent.get("kind") != "item":
+            continue
+        raw = (ent.get("canonical_name") or "").strip()
+        new = mapping.get(raw)
+        if not new:
+            continue
+        aliases = [a for a in (ent.get("aliases") or []) if a and a not in (raw, new)]
+        ent["aliases"] = [raw] + aliases
+        ent["canonical_name"] = new
+
+    for key in ("relations", "events", "state_changes", "entity_knowledge"):
+        for row in result.get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            for field in _REF_KEYS:
+                value = row.get(field)
+                if isinstance(value, str) and value in mapping:
+                    row[field] = mapping[value]
+    return result
+
 
 def normalize_extraction(result: dict) -> dict:
     """把 v3 抽取结果的称呼写法折到实体规范名（原地修改并返回）。
@@ -720,6 +780,8 @@ def normalize_extraction(result: dict) -> dict:
     原文词保留：实体原有写法进 aliases，mention 的 context_window 仍是原文。
     关系两端一并归一，避免「许郎 —兄弟→ 许七安」这种同一人被拆成两个节点。
     """
+    # 物品别名折叠与 canon 词表无关（legacy 下也要生效），先做。
+    result = fold_item_aliases(result)
     if source() not in (SOURCE_CLEANED, SOURCE_MIXED) or not _index():
         return result
     chapter = _chapter_of(result)
