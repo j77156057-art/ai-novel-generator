@@ -102,6 +102,16 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     kg_canon_source: str = "legacy"  # legacy | cleaned | mixed
 
+    # ------------------------------------------------------------------
+    # 物品持有事实注入（生成侧读通道，2026-11-10）
+    #
+    # 只读 ``generated.db`` 的 kg_item_holding，不搬表、不 ATTACH、不改数据。
+    # 关掉后 build_context 不组装 item_holding_block，prompt 与旧版逐字节相同，
+    # 便于 A/B 对照「有/无持有约束」的生成差异。
+    # ------------------------------------------------------------------
+    kg_item_holding_inject: bool = True
+    kg_generated_db: str = str(REPO_ROOT / "backend" / "data" / "generated.db")
+
     # 集合/上位端点的边级门（canon_source.collection_edge_gate）。
     # 默认关闭：2026-11-10 形态判据复核显示，三种结构判据在 A/B 两组上都做不到
     # 「拦住错的、放行对的」（旧门 1 真错/5 误伤、S 判据 2 真错/4 误伤且 A 组 0 拦、

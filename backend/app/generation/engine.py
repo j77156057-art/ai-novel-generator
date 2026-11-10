@@ -11,6 +11,7 @@ import logging
 from sqlalchemy import select
 
 from app.agents.prompt_overrides import PromptKey, resolve_prompt_block
+from app.config import settings
 from app.generation.prompts import (
     build_system_prompt,
     build_user_prompt,
@@ -598,6 +599,11 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None) -> d
         # v3.0 KG 切片：按当前剧情点动态取的近期实体/状态/伏笔/情报/事件。
         # 空库（未抽过）时为空串，build_user_prompt 跳过该块。
         "kg_slice": _kg_slice_text(db, project),
+        # 物品持有事实：本章涉及物品「现在在谁手上」（只读 generated.db）。
+        # 关掉 settings.kg_item_holding_inject 或取不到时为空串，prompt 与旧版一致。
+        "item_holding_block": _item_holding_text(
+            db, project, _next_segment_no(db, project.id) - 1
+        ),
     }
 
 
@@ -682,6 +688,58 @@ def _active_character_names(db, project: Project, current_seg: int) -> list[str]
                 if isinstance(c, dict) and c.get("name")]
     except Exception:  # noqa: BLE001
         return []
+
+
+def _active_item_entries(db, project: Project, current_seg: int) -> list[dict]:
+    """本段提及的物品（``{"name", "item_id"}``）。一次批量查询，不逐条 get。"""
+    try:
+        from app.models import KgEntity, KgMention
+
+        ent_ids = sorted({
+            m.entity_id for m in db.scalars(
+                select(KgMention).where(
+                    KgMention.project_id == project.id,
+                    KgMention.segment_no == current_seg,
+                )
+            )
+        })
+        if not ent_ids:
+            return []
+        rows = db.execute(
+            select(KgEntity.id, KgEntity.canonical_name).where(
+                KgEntity.id.in_(ent_ids),
+                KgEntity.kind == "item",
+            )
+        ).all()
+        return [{"name": name, "item_id": ent_id}
+                for ent_id, name in rows if name]
+    except Exception:  # noqa: BLE001 - 物品清单取不到就不注入，不阻断生成
+        return []
+
+
+def _item_holding_text(db, project: Project, current_seg: int) -> str:
+    """本章物品「现在在谁手上」的 prompt 文本；失败/关闭时返回空串。"""
+    if not settings.kg_item_holding_inject or current_seg < 1:
+        return ""
+    items = _active_item_entries(db, project, current_seg)
+    if not items:
+        return ""
+    try:
+        from app.kg.item_holding_read import (
+            current_item_holdings,
+            format_holding_facts,
+        )
+
+        facts = current_item_holdings(
+            items, db=db, project_id=project.id,
+            generated_db=settings.kg_generated_db,
+        )
+        return format_holding_facts(facts)
+    except Exception:  # noqa: BLE001 - 读通道是增强，取不到不阻断生成
+        logging.getLogger(__name__).warning(
+            "物品持有事实读取失败（project %s seg %s）", project.id, current_seg,
+            exc_info=True)
+        return ""
 
 
 def _style_info(project: Project) -> dict | None:
@@ -1447,6 +1505,7 @@ def generate_next_segment(
         directive_suffix=overrides[PromptKey.DIRECTIVE],
         node_prompt=node_prompt,
         kg_slice=ctx.get("kg_slice") or None,
+        item_holding_block=ctx.get("item_holding_block") or None,
     )
 
     # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
@@ -1627,6 +1686,7 @@ def generate_next_segment_stream(
         directive_suffix=overrides[PromptKey.DIRECTIVE],
         node_prompt=node_prompt,
         kg_slice=ctx.get("kg_slice") or None,
+        item_holding_block=ctx.get("item_holding_block") or None,
     )
 
     # v2.6：节点粒度根治——流式版同步传 per-request stop token
@@ -1803,6 +1863,11 @@ def _build_generation_prompts(
         prior_blocks=blocks,
         directive_suffix=overrides[PromptKey.DIRECTIVE],
         node_prompt=node_prompt,
+        item_holding_block=_item_holding_text(
+            db, project,
+            before_segment if before_segment is not None
+            else (_next_segment_no(db, project.id) - 1),
+        ) or None,
     )
     return system, user, max_chars
 

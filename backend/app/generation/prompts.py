@@ -279,6 +279,7 @@ def build_user_prompt(
     directive_suffix: str | None = None,
     node_prompt: str | None = None,
     kg_slice: str | None = None,
+    item_holding_block: str | None = None,
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -428,6 +429,18 @@ def build_user_prompt(
         # 只标红不强制——是给模型的「世界观锚点」，让它别写飞。与 plot_bible 区别：
         # plot_bible 是用户构思（含走向，时间线模式剔除），kg_slice 是已生成事实。
         blocks += ["", "【世界观事实（已发生，续写须保持一致，不得矛盾）】", kg_slice]
+    if item_holding_block:
+        # 物品持有事实：从 kg_item_holding 读出的「现在在谁手上」。
+        # 与 kg_slice 同为已发生事实，但**优先级更低**：只补物品归属，
+        # 不许反过来覆盖剧情圣经 / 世界观事实里的既有 canon 约束。
+        blocks += [
+            "",
+            "【物品持有事实（已写内容最新一段；续写须与此一致）】",
+            item_holding_block,
+            "（本块只补「物品在谁手上」，不改动也不覆盖【剧情圣经】与【世界观事实】"
+            "的既有约束。三者冲突时按「作者设定 > 世界观事实 > 本块」取信，"
+            "行文中回避正面矛盾，不要静默改写物品归属。）",
+        ]
     blocks += ["", "【续写指令】", directive]
     directive_extra = _override_section(_OVERRIDE_DIRECTIVE_HEADER, directive_suffix)
     if directive_extra:
