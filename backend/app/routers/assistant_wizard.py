@@ -19,6 +19,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
+from app import wizard_chat as chat
 from app import wizard_flow as flow
 from app.db import get_db
 from app.models import (
@@ -64,6 +65,12 @@ class RoleChatIn(StrictRequest):
 class WizardGotoIn(StrictRequest):
     #: 从汇总卡片里直接跳回某一步修改。
     step_key: str
+
+
+class WizardSayIn(StrictRequest):
+    """用户直接打字说的话：可能是作答，也可能是追问。"""
+
+    text: str
 
 
 # ---------------------------------------------------------------------------
@@ -203,13 +210,28 @@ def _session_view(session: AssistantWizardSession) -> dict[str, Any]:
     }
 
 
-def _state(db: Session, project: Project, session: AssistantWizardSession) -> dict[str, Any]:
+def _state(
+    db: Session,
+    project: Project,
+    session: AssistantWizardSession,
+    ack: str | None = None,
+) -> dict[str, Any]:
+    """当前会话的可渲染状态。
+
+    `ack` 是「答完上一题」的回执：拼在新问题正文前面，让用户先看到
+    「好，平衡档…」再读下一题，而不是答完立刻被弹一张新卡。
+    """
     ctx = _context(db, project, session.history or [])
     answers = session.answers or {}
     question = None
     if session.status == "active":
         question = flow.build_question(session.step_key, answers, ctx)
-    return {"session": _session_view(session), "question": question}
+        if ack:
+            question["message"] = ack + "\n\n" + str(question.get("message") or "")
+    out = {"session": _session_view(session), "question": question}
+    if ack:
+        out["ack"] = ack
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -298,28 +320,125 @@ def answer(
     if session.step_key == "confirm":
         if value is not True:
             raise HTTPException(status_code=400, detail="确认卡片只能选择开始")
-        return _commit(db, project, session, background_tasks)
+        ack = flow.ack_for(session.step_key, value, answers, ctx)
+        return _advance(db, project, session, session.step_key, value, background_tasks, ack)
 
-    answers[session.step_key] = value
-    if session.step_key == "branch":
+    ack = flow.ack_for(session.step_key, value, answers, ctx)
+    return _advance(db, project, session, session.step_key, value, background_tasks, ack)
+
+
+def _advance(
+    db: Session,
+    project: Project,
+    session: AssistantWizardSession,
+    step: str,
+    value: Any,
+    background_tasks: BackgroundTasks,
+    ack: str,
+) -> dict:
+    """把一次作答写进会话并推进到下一题（卡片点击与自由输入共用）。"""
+    if step == "confirm":
+        out = _commit(db, project, session, background_tasks)
+        if out.get("result"):
+            out["result"]["message"] = ack + str(out["result"].get("message") or "")
+        out["ack"] = ack
+        return out
+
+    answers = dict(session.answers or {})
+    answers[step] = value
+    if step == "branch":
         session.kind = value
         # 换方向等于换一套问题：清掉另一条分支的答案，避免汇总串味。
         answers = {"branch": value}
 
     history = list(session.history or [])
-    history.append(session.step_key)
+    history.append(step)
     session.answers = answers
     session.history = history
 
     ctx = _context(db, project, history)
-    nxt = flow.next_step(session.kind, session.step_key, answers, ctx)
+    nxt = flow.next_step(session.kind, step, answers, ctx)
     if nxt is None:
         # 理论上只有 confirm 会走到末尾，而 confirm 已在上面处理。
         raise HTTPException(status_code=500, detail="引导流程没有下一步")
     session.step_key = nxt
     db.commit()
     db.refresh(session)
-    return _state(db, project, session)
+    return _state(db, project, session, ack=ack)
+
+
+@router.post("/{project_id}/say")
+def say(
+    project_id: int,
+    body: WizardSayIn,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> dict:
+    """用户直接打字：可能是作答、追问，也可能没听懂。
+
+    追问**不推进**流程（返回 mode=explain，当前题原样留着），
+    这是「对话流」与「一问一卡」的关键差别。
+    """
+    project = _require_project(db, project_id)
+    session = _active_session(db, project_id)
+    if session is None:
+        raise HTTPException(status_code=409, detail="没有进行中的引导，请先调用 /start")
+
+    step = session.step_key
+    answers = dict(session.answers or {})
+    ctx = _context(db, project, session.history or [])
+    question = flow.build_question(step, answers, ctx)
+    parsed = chat.parse(step, body.text, answers, ctx, question)
+
+    if parsed["kind"] == "question":
+        return {
+            "mode": "explain",
+            "message": chat.explain(step, body.text, answers, ctx, question),
+            "question": question,
+            "session": _session_view(session),
+        }
+
+    if parsed["kind"] == "clarify":
+        return {
+            "mode": "clarify",
+            "message": parsed["message"],
+            "question": question,
+            "session": _session_view(session),
+        }
+
+    if parsed["kind"] == "back":
+        history = list(session.history or [])
+        prev = flow.prev_step(history, step)
+        if prev is None:
+            return {
+                "mode": "clarify",
+                "message": "这已经是第一步了，没有更早的可退。你直接答这一题就行。",
+                "question": question,
+                "session": _session_view(session),
+            }
+        session.step_key = prev
+        session.history = history[:-1] if history else history
+        db.commit()
+        db.refresh(session)
+        return {"mode": "answered", **_state(db, project, session, ack="好，退回上一步，之前选的还在。")}
+
+    value = parsed["value"]
+    try:
+        value = flow.validate(step, value, answers.get("branch"), answers, ctx)
+    except flow.AnswerError as exc:
+        return {
+            "mode": "clarify",
+            "message": f"{exc}。换个说法，或者直接点上面的卡片。",
+            "question": question,
+            "session": _session_view(session),
+        }
+
+    ack = flow.ack_for(step, value, answers, ctx)
+    if parsed.get("note"):
+        ack = ack + str(parsed["note"])
+    out = _advance(db, project, session, step, value, background_tasks, ack)
+    out["echo"] = parsed.get("label") or ack
+    return {"mode": "answered", **out}
 
 
 @router.post("/{project_id}/back")

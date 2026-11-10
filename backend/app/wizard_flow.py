@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,9 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
     has_default = card.get("default") is not None and card.get("default") != ""
     body.update(
         {
+            # 对话正文：这一步在问什么、各选项代价差在哪、默认值与推荐。
+            # 卡片只是这段话的快捷入口，不能替代解释。
+            "message": _message(step, kind, answers, ctx),
             "step": step,
             "progress": {
                 "index": index,
@@ -180,6 +184,255 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
 
 #: 允许「跳过 = 用默认值」的步骤。必答项（方向、语料、确认）不在其中。
 SKIPPABLE = {"genre", "style", "length", "chapters", "outline", "scene"}
+
+
+# ---------------------------------------------------------------------------
+# 对话正文（每条回复的第一部分）
+# ---------------------------------------------------------------------------
+#
+# 文案口径：先说「这一步在决定什么」，再说各选项的代价（时间/成本/质量/
+# 可控性）与默认值，最后给推荐和「什么情况下该选别的」。数字都来自仓库
+# 里已核实的事实（蒸馏档位定义见 `style/narrative.py::TIER_REGISTRY`，
+# 833 章约 42 分钟见 `docs/style-distillation-tiers.md` 实测），不编造。
+
+
+def _message(step: str, kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """把步骤渲染成两段对话文字（不含卡片）。"""
+    builder = _MESSAGE_BUILDERS.get(step)
+    if builder is None:
+        raise ValueError(f"未知引导步骤：{step}")
+    return builder(kind, answers, ctx)
+
+
+def _msg_branch(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    return (
+        "先定方向，因为三条路要填的参数完全不同：原创是从零起一本新书，后面要定语料、"
+        "蒸馏档位、题材、风格、字数和这次写几段；续写是接着你已有正文的结尾往下写，"
+        "只问起点和篇幅；角色对话不出正文，是我用书里某个角色的口吻跟你聊，只问是谁、"
+        "在什么情境下。\n\n"
+        "如果你手上还没正文、也没想好要不要仿写某本书，选原创最稳——它会把该定的都定下来，"
+        "之后想接着写，直接从已有正文续就行。"
+    )
+
+
+def _msg_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    novels = ctx.get("novels") or []
+    if novels:
+        opening = (
+            f"这里有 {len(novels)} 本已上传的语料可选（可多选）。"
+            "选了会怎样：蒸馏把它的句长、对话密度、场景切换节奏提炼成文风档案，"
+            "写出来更贴那本书；代价是蒸馏要跑模型，一本书用完整档大约几十分钟。"
+        )
+    else:
+        opening = (
+            "语料库里还没有书。不投喂也能写，只是模型完全按题材和风格自由发挥，"
+            "像不像你说的那本就看运气了。想投喂的话，先去「语料库」上传 txt 再回来。"
+        )
+    return (
+        opening
+        + "\n\n"
+        "不投喂的好处是快、可控：生成时不用等蒸馏，风格靠题材和平台调性兜。"
+        "如果你想「像某本书那样写」，就选那本书；只是想要个能读的故事，可以不投喂。"
+    )
+
+
+def _msg_distill(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    text = (
+        "蒸馏是把参考语料的写法压成一份可复用的档案，生成时注入到提示词里。"
+        "三个档位差在采样量和维度：完整档按语料 30% 采样、14 个维度、带角色名归一化和"
+        "全量伪角色清洗，最像原著也最慢——833 章的语料实测约 42 分钟；"
+        "平衡档固定取 30 章、维度一样但不做角色名归一化，简称可能有点噪声，耗时中等；"
+        "快速档也是 30 章，但砍掉节拍序列、高频场景模板、潜台词模式三个维度，"
+        "也不清洗角色名，只适合先验证管线通不通。\n\n"
+        "默认给完整档：既然都投喂了，文风不准等于白投。"
+        "只想快点看到正文效果选平衡；快速档只建议试跑，别拿它出成品。"
+    )
+    if ctx.get("archive_exists"):
+        text += (
+            "\n\n这个项目已经有蒸馏档案了，也可以选「沿用现有档案」——秒级完成、不花模型钱，"
+            "适合你只是想接着上次的文风写。"
+        )
+    return text
+
+
+def _msg_genre(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    return (
+        "题材决定模型对世界观、冲突类型和节奏的默认假设：科幻会先铺设定，悬疑先埋谜团，"
+        "言情把重心放在关系推进，仙侠则默认从凡到仙的成长线。它不影响耗时，只影响"
+        "「写出来的东西像不像你要的那类」。\n\n"
+        "这一项我没有给默认值，因为选错会让后面的风格和字数一起偏。"
+        "拿不准就选你最近读得最多的那类——你对那个题材的「不对劲」最敏感，改起来也最快。"
+    )
+
+
+def _msg_style(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    return (
+        "平台调性决定叙述节奏，不是题材：番茄是短句、强钩子、每章留悬念；起点重设定和"
+        "长线伏笔；晋江偏情感和内心戏；豆瓣阅读更文学、更克制；知乎盐选是短钩子加反转。"
+        "同一本玄幻，番茄和豆瓣读起来是两本书。\n\n"
+        "没主意就选起点——它对设定完整度要求最高，写出来最不容易散。"
+        "如果你要的是「一口气读完」的爽感，选番茄。"
+    )
+
+
+def _msg_length(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    default = ctx.get("generation_length") or 3000
+    return (
+        f"单段字数决定一次生成能铺开多少情节。默认 {default} 字：低于 1500 基本只剩一个场景，"
+        "对话和动作刚展开就得收；超过 5000 模型容易开始注水、重复前面的描写，"
+        "而且单次耗时也会明显变长。\n\n"
+        f"先按 {default} 试一段，觉得节奏拖就降到 1500–2000，觉得没展开就提到 4000。"
+        "这个值之后在项目设置里也能改。"
+    )
+
+
+def _msg_chapters(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    return (
+        "这次连着写几段，是串行跑的：每写完一段会把它压成摘要喂给下一段，"
+        "所以段数越多越容易前后走样，耗时也基本线性增加（2 段大约就是 2 倍）。\n\n"
+        "默认 1 段，建议先写一段看手感，满意再回来加。"
+        "如果你已经想好了完整的几段结构，直接填 2–3 段也行。"
+    )
+
+
+def _msg_outline(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    return (
+        "大纲（剧情圣经）会先列出角色、关系、核心冲突和几条伏笔，你确认后我再写正文。"
+        "多这一轮大概几分钟，但能明显减少写偏和人物走形，改起来也比改正文便宜。\n\n"
+        "默认是先出大纲。如果你已经有很明确的开头想法、只想快点看到正文，"
+        "选「直接开写」也可以——写歪了还能用编辑提案改。"
+    )
+
+
+def _msg_continue_from(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    segments = list(ctx.get("segments") or [])
+    if segments:
+        latest = max(segments)
+        opening = (
+            f"这个项目已经有 {len(segments)} 段正文，最后一段是第 {latest} 段。"
+            "续写只能接在最后一段之后——生成链路本身就是「读前面摘要、往后追加」，"
+            "跳到中间插入会和后面已写的内容对不上，所以我没给这个选项。"
+        )
+    else:
+        opening = (
+            "这个项目还没有正文，续写会从第 1 段开始写，等于先起个头。"
+            "之后每追加一段，都会自动接在最后一段后面。"
+        )
+    return (
+        opening
+        + "\n\n"
+        "想从别的地方开始，可以先在项目工作台删掉后面的段，或者新建一个项目只导入到你要的位置。"
+    )
+
+
+def _msg_character(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    chars = ctx.get("characters") or []
+    if not chars:
+        return (
+            "项目里还没有角色卡，所以这一项得你直接打名字。我会用最基础的设定陪你聊，"
+            "细节靠常识补，可能不够贴原著。\n\n"
+            "想让角色更准，先去 KG 工作台把人物和关系建起来，再回来这里选。"
+        )
+    legacy = ctx.get("character_source") == "legacy"
+    source = (
+        "角色卡来自旧版知识图谱（新图谱里还没有角色），按提及次数排的，"
+        "可能混进「许七」「安小」这类别名碎片，挑完整的人名就行。"
+        if legacy
+        else "角色卡来自本项目的知识图谱，带身份、关系和最近状态。"
+    )
+    return (
+        f"这里按提及次数列了 {min(len(chars), 12)} 个角色。{source}"
+        "选谁决定我用谁的口吻、视角和他已知的信息——比如选一个不知情的角色，"
+        "我就不会让他说出只有主角才知道的事。\n\n"
+        "想聊的人不在列表里也可以直接打名字；某个角色怎么看都不对，多半是图谱里数据有问题，"
+        "可以先去人物情报页核对。"
+    )
+
+
+def _msg_scene(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    return (
+        "情境决定语气、称呼和他该知道多少：同一句台词，在「初次见面」和「一场对峙之后」"
+        "说出来意思完全不同。默认是当前剧情时间线，也就是按你已经写到的地方接着聊。\n\n"
+        "随便给一句就行，比如「大劫之后，他在城头等你来解释」。"
+        "不想定就直接用默认，我会按最近一段的处境来演。"
+    )
+
+
+def _msg_confirm(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    return (
+        "下面是这次的全部参数，确认后我会写回项目：该蒸馏的先起蒸馏任务、"
+        "该出大纲的先出大纲，之后才轮到写正文。\n\n"
+        "想改哪一项，直接点那一行跳回去，或者告诉我「上一步」。"
+    )
+
+
+_MESSAGE_BUILDERS = {
+    "branch": _msg_branch,
+    "corpus": _msg_corpus,
+    "distill": _msg_distill,
+    "genre": _msg_genre,
+    "style": _msg_style,
+    "length": _msg_length,
+    "chapters": _msg_chapters,
+    "outline": _msg_outline,
+    "continue_from": _msg_continue_from,
+    "character": _msg_character,
+    "scene": _msg_scene,
+    "confirm": _msg_confirm,
+}
+
+
+# ---------------------------------------------------------------------------
+# 回执（答完之后先确认一句，再进下一题）
+# ---------------------------------------------------------------------------
+
+
+def _display_title(novel: dict[str, Any]) -> str:
+    """语料标题去掉 .txt 后缀：对话里说「《大奉打更人》」比「.txt」自然。"""
+    title = str(novel.get("title") or novel.get("id") or "")
+    return re.sub(r"\.(txt|md|epub)$", "", title, flags=re.I)
+
+
+def ack_for(step: str, value: Any, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """把「刚答的这一题」说成一句人话，作为下一条回复的开头。"""
+    if step == "branch":
+        return f"好，{KIND_LABELS.get(value, value)}。"
+    if step == "corpus":
+        if not value:
+            return "好，不投喂语料，接下来的文风全靠题材和平台调性。"
+        titles = {int(n["id"]): _display_title(n) for n in (ctx.get("novels") or [])}
+        names = [titles.get(int(v)) or f"#{v}" for v in value]
+        return "好，参考" + "、".join("《" + n + "》" for n in names) + "。"
+    if step == "distill":
+        if value == DISTILL_REUSE:
+            return "好，沿用现有档案，不用重跑蒸馏，秒级完成。"
+        for t in ctx.get("tiers") or []:
+            if t["key"] == value:
+                if t["key"] == "full":
+                    return "好，完整档。833 章的语料大约 42 分钟，跑完才开始写。"
+                if t["key"] == "balanced":
+                    return "好，平衡档，固定取 30 章、维度齐全，比完整档快不少。"
+                return "好，快速档，只够验证管线，出成品前建议换档重跑。"
+        return f"好，蒸馏档位记为 {value}。"
+    if step == "genre":
+        return f"好，{value}。"
+    if step == "style":
+        return f"好，{value}调性。"
+    if step == "length":
+        return f"好，每段 {value} 字。"
+    if step == "chapters":
+        return f"好，这次连着写 {value} 段。" + ("（串行，时间也按倍数走）" if int(value) > 1 else "")
+    if step == "outline":
+        return "好，先出大纲，你确认后我再动笔。" if value else "好，直接开写，跳过大纲确认。"
+    if step == "continue_from":
+        return "好，从第 1 段开始。" if not value else f"好，接在第 {value} 段之后。"
+    if step == "character":
+        return f"好，就和{value}聊。"
+    if step == "scene":
+        return f"好，情境按「{value or '当前剧情时间线'}」。"
+    if step == "confirm":
+        return "好，开始。"
+    return "好。"
 
 
 def _q_branch(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
@@ -216,7 +469,7 @@ def _q_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) ->
     options = [
         {
             "value": int(n["id"]),
-            "label": n.get("title") or f"语料 #{n['id']}",
+            "label": _display_title(n) or f"语料 #{n['id']}",
             "desc": " · ".join(x for x in [n.get("genre") or "", n.get("author") or ""] if x)
             or "已上传语料",
         }
