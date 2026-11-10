@@ -153,6 +153,12 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # nullable：既有项目的 style_narrative 是按默认完整档算的，补 NULL 不破坏它们。
         # 漏这一项的后果与 style_narrative 相同：老库 SELECT projects.* 直接炸。
         ("projects", "narrative_tier", "VARCHAR(16)"),
+        # —— 蒸馏采样章数覆盖：None=档位默认；0=全本；N=最多 N 章 ——
+        # nullable：老项目补 NULL = 继续用档位默认口径，行为不变。
+        ("projects", "narrative_sample_chapters", "INTEGER"),
+        # —— 引导会话的流程改写（跳过/排序/自定义问题，白名单约束）——
+        # 老库补默认空对象，answers/history 语义不受影响。
+        ("assistant_wizard_sessions", "overrides", "JSON NOT NULL DEFAULT '{}'"),
         # —— §11.3 时间线状态存档：节点+进度一体化 JSON ——
         # 漏这一项的后果：create_all 只给**新库**建该列，已存在的库永远补不上，
         # 任何 SELECT projects.* 都会 `no such column: projects.plot_timeline`，

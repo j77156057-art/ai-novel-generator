@@ -76,6 +76,10 @@ class Project(Base):
     # 「用哪一档算」的意图。产出里已经记了 tier，但那是结果不是偏好——用户改档
     # 之后要靠本字段才知道下次该按哪档重算。
     narrative_tier = Column(String(16), nullable=True)
+    # 采样章数覆盖（None = 按档位默认口径；0 = 全本；N > 0 = 最多 N 章）。
+    # 助理在对话里说「只取 200 章」「整本都灌进去」时写这里，并进蒸馏指纹，
+    # 保证改完不会命中旧档案（静默返回旧结果是本项目反复踩过的坑）。
+    narrative_sample_chapters = Column(Integer, nullable=True)
     # 时间线状态存档（§11.3）：替代进程内「已写段数重放 advance」恢复。
     # JSON：{version, nodes, done, current_node, current_beat, branch_used, seg_counts, current_main_idx}
     # 节点内容（title/entry/exit/beats/emotion）首次 §7.3 调 LLM 填实后落库，

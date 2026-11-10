@@ -139,12 +139,15 @@ def start_distill(
     if proj is None:
         raise HTTPException(status_code=404, detail="project 不存在")
 
-    from app.style.narrative import resolve_tier
+    from app.style.narrative import resolve_tier, tier_with_sampling
 
     # 档位优先级：本次显式传的 > 项目已存的偏好 > 默认完整档。
     # 非法档位在这里就 400 —— 不让它变成一个跑 40 分钟才失败的后台任务。
     try:
         cfg = resolve_tier(body.tier or getattr(proj, "narrative_tier", None))
+        # 采样章数覆盖（助理在对话里改的 200 章 / 全本）必须叠在这里，
+        # 否则缓存预测会按旧采样算指纹，误报「命中缓存」。
+        cfg = tier_with_sampling(cfg, getattr(proj, "narrative_sample_chapters", None))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

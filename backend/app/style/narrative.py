@@ -36,7 +36,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from sqlalchemy import func, select
@@ -215,6 +215,12 @@ class NarrativeTier:
     fake_character_cleaning: str = "none"
     #: 角色声音提取方式："targeted"（主要角色逐个 + 配角分批）/ "single_batch"（单批浅层）
     voice_mode: str = "targeted"
+    #: 采样章数的**显式覆盖**（None = 用档位原本的采样口径）。
+    #:
+    #: 语义：0 = 全本（整本语料全部灌进去）；N > 0 = 最多取 N 章。
+    #: 这是「助理按用户要求改采样量」的唯一入口——它必须进指纹，
+    #: 否则把 833 章改成 200 章后仍会命中旧档案（静默返回旧结果）。
+    sample_cap: int | None = None
 
     @property
     def dimension_count(self) -> int:
@@ -232,6 +238,7 @@ class NarrativeTier:
             "normalize_character_names": self.normalize_character_names,
             "fake_character_cleaning": self.fake_character_cleaning,
             "voice_mode": self.voice_mode,
+            "sample_cap": self.sample_cap,
         }
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -247,6 +254,8 @@ class NarrativeTier:
             "dimensions": list(self.dimensions),
             "normalize_character_names": self.normalize_character_names,
             "fake_character_cleaning": self.fake_character_cleaning,
+            # 采样覆盖：0 = 全本；None = 按档位默认口径
+            "sample_cap": self.sample_cap,
             # 相对耗时档位（非实测分钟数，理由见 _COST_HINTS 注释）
             "cost_hint": _COST_HINTS[self.key],
         }
@@ -316,6 +325,20 @@ def resolve_tier(tier: str | None) -> NarrativeTier:
         valid = "、".join(sorted(TIER_REGISTRY))
         raise ValueError(f"未知蒸馏档位 {tier!r}，可选：{valid}")
     return TIER_REGISTRY[key]
+
+
+def tier_with_sampling(tier: NarrativeTier, sample_cap: int | None) -> NarrativeTier:
+    """给档位叠加「采样章数覆盖」。
+
+    ``sample_cap`` 语义：``0`` = 全本（整本语料全部灌进去）；``N > 0`` = 最多
+    取 N 章；``None`` = 不改。覆盖值会进指纹，改完必须重跑蒸馏才会生效。
+    """
+    if sample_cap is None:
+        return tier
+    cap = int(sample_cap)
+    if cap < 0:
+        raise ValueError("采样章数不能为负（0 表示全本）")
+    return replace(tier, sample_cap=cap)
 
 
 def list_tiers() -> list[dict[str, Any]]:
@@ -1096,7 +1119,9 @@ def _scene_type(text: str) -> str:
 
 
 def _sample_chapters_v6(
-    chapters: list[tuple[int, str]], ratio: float = SAMPLE_RATIO
+    chapters: list[tuple[int, str]],
+    ratio: float = SAMPLE_RATIO,
+    cap: int | None = None,
 ) -> list[tuple[int, str]]:
     """按百分比采样 + 对话密集优先 + 场景均衡。
 
@@ -1104,9 +1129,14 @@ def _sample_chapters_v6(
     1. 按 ratio 计算采样量（603 章 × 30% = 180 章）
     2. 按场景类型分组，每种场景至少采样几章（确保覆盖面）
     3. 剩余配额按对话密度排序填充（对白多的章节优先）
+
+    ``cap`` 是用户显式指定的采样章数（0 = 全本），优先级高于比例与字数下限——
+    用户说「只取 200 章」就取 200 章，不再偷偷加到 300。
     """
     if not chapters:
         return []
+    if cap is not None and int(cap) <= 0:
+        return list(chapters)
     total_chars = sum(len(t) for _, t in chapters if t)
 
     # 短篇保护：若全语料字数就不足下限，直接全取（没有砍的空间）。
@@ -1118,7 +1148,10 @@ def _sample_chapters_v6(
     avg_ch = total_chars / max(len(chapters), 1)
     ratio_target = int(len(chapters) * ratio)
     chars_target = int(MIN_SAMPLE_CHARS / max(avg_ch, 1))
-    target = max(10, ratio_target, chars_target)
+    if cap is not None:
+        target = min(len(chapters), max(1, int(cap)))
+    else:
+        target = max(10, ratio_target, chars_target)
     if len(chapters) <= target:
         return list(chapters)
 
@@ -1192,8 +1225,12 @@ def sample_chapters_for_tier(
     chapters: list[tuple[int, str]], tier: NarrativeTier
 ) -> list[tuple[int, str]]:
     """按档位配置采样章节——档位在采样轴上的唯一入口。"""
+    cap = tier.sample_cap
     if tier.sampling_mode == "percentage":
-        return _sample_chapters_v6(chapters, ratio=tier.sample_ratio or SAMPLE_RATIO)
+        return _sample_chapters_v6(
+            chapters, ratio=tier.sample_ratio or SAMPLE_RATIO, cap=cap
+        )
+    # 采样覆盖只作用于比例采样档；固定章数档保持档位定义（30 章）。
     return _sample_chapters_fixed(chapters, tier.fixed_chapters or 30)
 
 
@@ -3646,6 +3683,7 @@ def project_narrative(
     progress: ProgressCallback | None = None,
     persist_library: bool = True,
     content_hash: str | None = None,
+    sample_chapters: int | None = None,
 ) -> dict | None:
     """取项目当前该用的叙事档案；没有参考语料则返回 None。
 
@@ -3678,6 +3716,14 @@ def project_narrative(
     if cfg_tier is None:
         cfg_tier = getattr(project, "narrative_tier", None)
     cfg = cfg_tier if isinstance(cfg_tier, NarrativeTier) else resolve_tier(cfg_tier)
+
+    # 项目级采样覆盖（助理可在对话里改：200 章 / 全本）。
+    # 必须叠在 cfg 上再算指纹——否则「833 → 200 章」会命中旧档案，静默返回旧结果。
+    cap = sample_chapters
+    if cap is None:
+        cap = getattr(project, "narrative_sample_chapters", None)
+    if cap is not None and not isinstance(cfg_tier, NarrativeTier):
+        cfg = tier_with_sampling(cfg, int(cap))
 
     want = narrative_fingerprint(ids, cfg)
     cached = project.style_narrative or {}
