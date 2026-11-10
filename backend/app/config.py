@@ -143,7 +143,7 @@ class Settings(BaseSettings):
     # 智谱 GLM（open.bigmodel.cn）：GLM-4-Flash 系列免费不限 token，中文写作强，国内低延迟。
     # 默认升级到 glm-4-flash-250414（2025-04 快照）：7 类抽取全填，event_type 多样化，
     # in_story_date 100% 填充，knowledge/state/foreshadows 从 0 提升到 8/6/4，速度 -37%。
-    # 依据：docs/kg-nemotron-compare-redirect.md N=4 实测 + docs/journey_glm_versions_compare.json。
+    # 依据：docs/kg-nemotron-compare-redirect.md N=4 实测（raw 数据未入库，仅本地保留）。
     zhipu_api_key: str = ""
     zhipu_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
     zhipu_model: str = "glm-4-flash-250414"

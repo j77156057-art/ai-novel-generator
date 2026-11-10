@@ -218,7 +218,7 @@ def profile_fingerprint(source_ids: list[int], unit_chars: int) -> dict:
 | 切 3 套 unit 耗时 3x | 一次性 fit + 缓存 fingerprint；只在 source_ids/unit_chars 变时重算 |
 | 短语料（< 4 单元）某 bucket 切不出 | 降级：跳过该 bucket；`pick_bucket` 走相邻 bucket |
 | 老 profile 失效，全量重算 | 一次性，background 跑——已有 `force=False` 缓存机制 |
-| percentile 阈值（97.5）需重新校准 | v2.7-v2.10 数据可重跑：参考 `docs/v21-v211_*_smoke_*.json` raw 数据，对比 percentile 分布 |
+| percentile 阈值（97.5）需重新校准 | v2.7-v2.10 数据可重跑：参考同期冒烟 raw 数据（未入库，仅本地保留），对比 percentile 分布 |
 | 6 轮真链路冒烟 raw data 仍可重跑 | 9 段 warning 已落库 `projects.style_narrative` JSON 字段；engine.py:920-926 append_style_warning 路径不需改 |
 
 ---

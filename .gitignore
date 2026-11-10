@@ -51,3 +51,7 @@ experiments/2026-11-07-e2e-generation/*
 tests/qa9_shots/
 tests/qa*_probe*
 qa9_audit_*
+
+# 含第三方作品文本的分析产物与内部派单文档（只留本地，不入库）
+docs/v2*.json
+docs/handoff/

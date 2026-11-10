@@ -242,7 +242,7 @@ providers.yaml writer.max_tokens 4096 → 8192（v2.20 验证段 1 wc 2491→577
 - `docs/style_log_buckets_design.md`：方案 B「对数粒度 profile」设计
 - `docs/style_length_normalize_design.md`：方案 C「features 长度归一化」设计
 - `docs/accept_percentile_as_ui_meter.md`：**D 接受工程常态设计**
-- `docs/v21-v220_*_smoke_*.json`：20 轮真链路冒烟 raw 数据归档
+- 20 轮真链路冒烟 raw 数据：未入库，仅本地保留
 
 ---
 

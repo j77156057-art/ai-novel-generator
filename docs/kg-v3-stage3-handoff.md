@@ -245,7 +245,7 @@ file 里 multi-line string concat 末尾常有字面 `\\n\\n`（4 char backslash
 - `docs/style-distillation-v2-survey.md`：文风蒸馏 v2 背景调研
 - `docs/style-distillation-v2.1-design.md`：文风蒸馏 v2.1 增量设计
 - `docs/style-distillation-session-log.md`：v3→v7 工作记录
-- `docs/v21-v211_*_smoke_*.json`：9 轮真链路冒烟 raw 数据归档
+- 9 轮真链路冒烟 raw 数据：未入库，仅本地保留
 
 ---
 

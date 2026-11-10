@@ -3,7 +3,7 @@
 > 2026-10-16。目标：原候选 #5 是「nemotron 复跑对比智谱弱模型抽取质量」，
 > nemotron 3 款全超时 + 7 款 OpenRouter free 模型全 404 后，转向「同 provider
 > 不同版对比」——glm-4-flash（默认）vs glm-4-flash-250414（更新版）。
-> 完整 raw 数据归档：`docs/journey_glm_versions_compare.json`
+> 完整 raw 数据未入库，仅本地保留。
 
 ## 一、为什么转向 nemotron 路径
 

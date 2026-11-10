@@ -1,6 +1,7 @@
 """test_voice_char_name_filter.py —— 角色声音条目污染防护
 
-数据来源：docs/v236_xuezhong_8k.json（雪中悍刀行 990 章真链路）
+数据来源：v236 雪中悍刀行 990 章真链路产出。该 raw 文件未入库，仅在本地保留；
+缺失时 A–F 六条合成用例仍然生效，只有 G 会跳过。
 那次的 29 条角色声音里混进 18 条垃圾，本测试锁住修复后的行为。
 
 三类污染：
@@ -21,6 +22,7 @@ from app.style.narrative import (  # noqa: E402
     _is_valid_voice_char_name,
 )
 
+#: 可选真链路 fixture（未入库，仅本地保留）；不存在时 test_g 自动跳过。
 FIXTURE = pathlib.Path(__file__).resolve().parents[2] / "docs" / "v236_xuezhong_8k.json"
 
 

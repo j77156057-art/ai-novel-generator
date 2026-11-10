@@ -238,7 +238,7 @@ file 里 multi-line string concat 末尾常有字面 `\\n\\n`（4 char backslash
 - `docs/percentile_root_cause_analysis.md`：percentile 100% 触发架构级根因
 - `docs/style_log_buckets_design.md`：方案 B「对数粒度 profile」设计
 - `docs/style_length_normalize_design.md`：**方案 C「features 长度归一化」设计**
-- `docs/v21-v218_*_smoke_*.json`：14 轮真链路冒烟 raw 数据归档
+- 14 轮真链路冒烟 raw 数据：未入库，仅本地保留
 
 ---
 
