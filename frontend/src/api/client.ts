@@ -73,6 +73,7 @@ import type {
   WizardAnswerResponse,
   WizardRoleChatResponse,
   WizardRunResponse,
+  WizardNoticeListResponse,
   WizardSayResponse,
   WizardStateResponse,
 } from "./types";
@@ -820,6 +821,23 @@ export const api = {
     request<WizardSayResponse>(
       `/assistant/wizard/${projectId}/undo`,
       jsonInit("POST", auditId ? { audit_id: auditId } : {}),
+    ),
+
+  /**
+   * 拉「未消费的蒸馏通知 + 最近一条任务状态」。
+   *
+   * 一次轮询两用：`distill` 更新卡片里的一句话进度，`items` 是待展示的
+   * 完成回执 / 疑似卡住提醒。服务重启后未消费的行仍在库里，所以断线重连、
+   * 隔天回来都能补发。
+   */
+  listWizardNotices: (projectId: number) =>
+    request<WizardNoticeListResponse>(`/assistant/wizard/${projectId}/notices`),
+
+  /** 通知已展示给用户，标掉，避免下次进来重复弹。 */
+  ackWizardNotice: (projectId: number, noticeId: number) =>
+    request<{ ok: boolean; id: number }>(
+      `/assistant/wizard/${projectId}/notices/${noticeId}/ack`,
+      jsonInit("POST", {}),
     ),
 
   /** 从汇总卡片跳回已答过的某一步。 */

@@ -1115,6 +1115,15 @@ export interface AssistantInvokeGenerationResponse {
 export type DistillStatus = "pending" | "running" | "success" | "failed";
 
 /**
+ * 观测态：把 status + 时间戳派生成用户看得懂的五个结论。
+ *
+ * 它**不入库**——DB 的状态机仍是 pending → running → success | failed。
+ * `stalled` 是「按当前时间算出来」的观感，同一行可能在 running / stalled 之间
+ * 来回变（进度又动了就恢复 running），所以不能持久化。
+ */
+export type DistillHealth = "queued" | "running" | "stalled" | "success" | "failed";
+
+/**
  * 一次文风蒸馏任务的状态快照（GET .../distill/jobs/{job_id} 的响应）。
  *
  * 字段与后端 `app.style.jobs.distill_run_to_dict()` 逐一对应。
@@ -1146,6 +1155,25 @@ export interface DistillJob {
   created_at: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /**
+   * 最后一次进度心跳（UTC ISO）。看护判据「多久没有进度更新」的唯一时间源；
+   * null = 老任务还没写过心跳，按 started_at / created_at 兜底。
+   */
+  progress_at?: string | null;
+  /**
+   * 提交时按语料字数外推的预计耗时（分钟）。**不是实测值**，界面必须标注；
+   * null = 算不出来（此时只做「无进度时长」判断）。
+   */
+  expected_minutes?: number | null;
+  /** 已运行分钟数（未结束时按「现在」算）。 */
+  elapsed_minutes?: number | null;
+  /** 派生观测态；老接口没有这个字段时按 status 兜底。 */
+  health?: DistillHealth;
+  /**
+   * 一句话判断（带具体分钟数，如「已运行 12 分钟，预计约 122 分钟（按字数
+   * 外推，非实测）」）。stalled 时说明卡在哪一步、建议等还是重来。
+   */
+  health_note?: string | null;
 }
 
 /** POST /api/projects/{id}/distill 的响应。 */
@@ -1416,6 +1444,8 @@ export interface WizardCommitResult {
 export interface WizardStateResponse {
   session: WizardSessionView | null;
   question: WizardQuestion | null;
+  /** 最近一条蒸馏任务（进度 + 看护结论）；没有任务时为 null。 */
+  distill?: DistillJob | null;
   project_hint?: {
     id: number;
     title: string;
@@ -1427,12 +1457,59 @@ export interface WizardStateResponse {
   };
 }
 
+/**
+ * 一条持久化的蒸馏通知（`wizard_notices` 表的一行）。
+ *
+ * 为什么落库：完成回执 / 疑似卡住提醒必须能跨刷新、跨服务重启被再次捡起。
+ * 前端轮询 `GET /api/assistant/wizard/{project_id}/notices`，拿到未消费的行就
+ * 渲染成助手气泡，然后调 ack 标掉。
+ */
+export interface WizardNotice {
+  id: number;
+  /** distill_done（完成回执）/ distill_failed / distill_stalled（疑似卡住）。 */
+  kind: "distill_done" | "distill_failed" | "distill_stalled";
+  job_id: number;
+  payload: WizardNoticePayload;
+  created_at: string | null;
+}
+
+/** 通知正文（后端已渲染好 `message`，前端不再拼数字）。 */
+export interface WizardNoticePayload {
+  job_id?: number;
+  tier?: string | null;
+  tier_name?: string | null;
+  status?: string;
+  n_chapters?: number | null;
+  rule_count?: number | null;
+  rejected?: number | null;
+  failed_chunks?: number | null;
+  n_dimensions?: number | null;
+  elapsed_seconds?: number | null;
+  elapsed_text?: string | null;
+  interrupted?: boolean;
+  health?: DistillHealth;
+  stage?: string | null;
+  progress_current?: number | null;
+  progress_total?: number | null;
+  expected_minutes?: number | null;
+  elapsed_minutes?: number | null;
+  /** 已渲染好的人话正文（含「处理 N 章 / N 个维度 / 实际用时 …」）。 */
+  message?: string;
+  /** 「接着问：要现在开始写吗？」——完成/失败后的下一步问句。 */
+  next?: string;
+}
+
+/** GET .../notices 的响应：未消费通知 + 最近一条任务（一次轮询双用途）。 */
+export interface WizardNoticeListResponse {
+  items: WizardNotice[];
+  distill: DistillJob | null;
+}
+
 export interface WizardAnswerRequest {
   step_key: string;
   value?: unknown;
   skip?: boolean;
 }
-
 export interface WizardAnswerResponse {
   session: WizardSessionView;
   question: WizardQuestion | null;

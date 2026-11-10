@@ -28,7 +28,7 @@
  * `issues` 回来（agent 自主调的只读工具），待确认写操作通过
  * `pending_actions` 回来。
  */
-import { computed, nextTick, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ApiError, api } from "@/api/client";
 import AssistantIssueList from "@/components/AssistantIssueList.vue";
@@ -39,9 +39,11 @@ import type {
   AssistantEvidence,
   AssistantIssue,
   AssistantPendingAction,
+  DistillJob,
   ProjectOut,
   WizardActionEcho,
   WizardCommitResult,
+  WizardNotice,
   WizardQuestion,
   WizardSayResponse,
   WizardSessionView,
@@ -114,6 +116,13 @@ interface Turn {
   undoDone?: boolean;
   /** 引导提交后的执行结果（大纲 / 已就绪 / 已写完 / 角色模式）。 */
   wizardResult?: WizardCommitResult | null;
+  /**
+   * 一条持久化通知（完成回执 / 疑似卡住提醒）。
+   *
+   * 与 `wizard` 互斥：通知是后端在任务结束时写进 `wizard_notices` 的，
+   * 前端轮询到就变成一条助手气泡，然后 ack 标掉。
+   */
+  notice?: WizardNotice | null;
 }
 
 interface WizardStepState {
@@ -228,6 +237,108 @@ const roleMode = ref<{ character: string; scene: string } | null>(null);
 
 const wizardActive = computed(() => wizard.value?.status === "active");
 
+// ------------------------------------------------------------------
+// 蒸馏进度与看护（引导卡片里的一句话进度 + 完成/卡住通知）
+// ------------------------------------------------------------------
+//
+// ## 数据来源
+//
+// 进度**不靠前端自己算**：`progress_current / progress_total / stage /
+// progress_at / health` 全部来自 `DistillRun` 行。前端只做两件事：
+//   1. 每 3 秒拉一次 `GET .../notices`（同时返回最近一条任务 + 未消费通知）；
+//   2. 把未消费通知渲染成助手气泡并 ack。
+//
+// 这样刷新、断线重连、甚至服务重启后回来，看到的都是同一份 DB 事实：
+// 任务在跑就继续显示实时进度，已经跑完了就把未消费的回执补发出来。
+
+const distillJob = ref<DistillJob | null>(null);
+/** 本页已经展示过的通知 id（ack 失败时下一轮会重试，成功后也不会重复弹）。 */
+const seenNotices = new Set<number>();
+let distillTimer: ReturnType<typeof setTimeout> | null = null;
+let pageAlive = true;
+
+/** 「疑似卡住 / 运行中 / 排队」这三种才需要持续轮询。 */
+const distillActive = computed(() => {
+  const h = distillJob.value?.health;
+  return h === "queued" || h === "running" || h === "stalled";
+});
+
+/**
+ * 百分比只在**总数探明**时才显示；total=0 绝不拿 0 当分母编一个数。
+ *
+ * 运行中上限 99%：块提炼完之后还有「角色声音 / 文风漂移 / 汇总」几段收尾，
+ * 那几段不在块进度里。显示 100% 但状态还是「运行中」就是在撒谎，宁可停在 99%。
+ */
+const distillPercent = computed<number | null>(() => {
+  const j = distillJob.value;
+  if (!j || !j.progress_total) return null;
+  const raw = Math.floor((j.progress_current / j.progress_total) * 100);
+  return Math.max(0, Math.min(distillActive.value ? 99 : 100, raw));
+});
+
+const DISTILL_TAG: Record<string, string> = {
+  queued: "排队",
+  running: "运行中",
+  stalled: "疑似卡住",
+  success: "已完成",
+  failed: "失败",
+};
+
+function distillTag(job: DistillJob | null): string {
+  if (!job) return "";
+  return DISTILL_TAG[job.health ?? job.status] ?? job.status;
+}
+
+/** 进度条里那句话：优先用后端给的 health_note（带具体分钟数）。 */
+function distillSentence(job: DistillJob | null): string {
+  if (!job) return "";
+  if (job.health_note) return job.health_note;
+  if (job.stage) return job.stage;
+  return job.status;
+}
+
+function scheduleDistillPoll(delay = 3000): void {
+  if (!pageAlive) return;
+  if (distillTimer) clearTimeout(distillTimer);
+  distillTimer = setTimeout(() => void pollDistill(), delay);
+}
+
+/** 把一条通知变成助手气泡（内容由后端渲染好，前端不拼数字）。 */
+async function consumeNotice(n: WizardNotice): Promise<void> {
+  if (seenNotices.has(n.id)) return;
+  seenNotices.add(n.id);
+  const t = makeAssistantTurn();
+  t.loading = false;
+  t.text = n.payload.message || "";
+  t.notice = n;
+  turns.value.push(t);
+  void scrollToBottom();
+  try {
+    await api.ackWizardNotice(projectId, n.id);
+  } catch {
+    // ack 失败就下一轮重试：宁可重复补一次，也不能让回执静默消失。
+    seenNotices.delete(n.id);
+  }
+}
+
+async function pollDistill(): Promise<void> {
+  if (!pageAlive) return;
+  try {
+    const res = await api.listWizardNotices(projectId);
+    distillJob.value = res.distill;
+    for (const n of res.items) await consumeNotice(n);
+  } catch {
+    /* 网络闪断：保持上一次的进度，下一轮继续 */
+  }
+  scheduleDistillPoll();
+}
+
+onUnmounted(() => {
+  pageAlive = false;
+  if (distillTimer) clearTimeout(distillTimer);
+});
+
+
 /** 「我想生成一本小说」这类说法直接进引导，不用用户去找按钮。 */
 const WIZARD_INTENT = /(我想|我要|帮我|想)?\s*(生成|写|创作|开)\s*(一|1)?\s*本?\s*(小说|书)/;
 
@@ -293,6 +404,8 @@ async function loadWizard(): Promise<void> {
   try {
     const st = await api.getWizard(projectId);
     wizard.value = st.session;
+    // 刷新后立即恢复蒸馏进度（不用等第一次轮询）。
+    if (st.distill) distillJob.value = st.distill;
     if (!st.session) return;
     if (st.session.status === "active" && st.question) {
       pushWizardTurn(st.question, "上次问到这一步，接着来。");
@@ -856,6 +969,20 @@ function confidenceLabel(c: number): string {
 
 const hasHistory = computed(() => turns.value.length > 0);
 
+/**
+ * 最后一张「引导卡」的 key：进度条只画在它下面。
+ *
+ * 不这么限制的话，同一句实时进度会出现在历史里每一张引导卡上——既吵，
+ * 又会让用户以为有多个任务在跑。
+ */
+const lastWizardTurnKey = computed(() => {
+  for (let i = turns.value.length - 1; i >= 0; i -= 1) {
+    const t = turns.value[i];
+    if (t.wizard || t.wizardResult) return t.key;
+  }
+  return "";
+});
+
 onMounted(async () => {
   if (badId) return;
   await loadLlm();
@@ -867,6 +994,9 @@ onMounted(async () => {
   }
   // 恢复未完成的创作引导（会话在服务端，刷新/关页不丢）。
   await loadWizard();
+  // 引导卡先入列，再开始轮询：回执/卡住提醒是「之后发生的事」，必须排在卡片后面。
+  pageAlive = true;
+  void pollDistill();
 });
 </script>
 
@@ -954,11 +1084,55 @@ onMounted(async () => {
 
         <!-- 助手气泡：创作引导（解释正文 + 卡片 / 结果） -->
         <div
-          v-else-if="turn.wizard || turn.wizardResult || turn.note"
+          v-else-if="turn.wizard || turn.wizardResult || turn.note || turn.notice"
           class="bubble assistant wizard-bubble"
         >
           <div v-if="turn.error" class="notice err">{{ turn.error }}</div>
           <p v-if="turn.text" class="wz-prose" :class="{ note: turn.note }">{{ turn.text }}</p>
+
+          <!--
+            蒸馏进度：只一行结论 + 百分比（没有探明总块数就不显示百分比）。
+            挂在最后一张引导卡下面，刷新后由 GET /wizard 的 distill 字段恢复。
+          -->
+          <div
+            v-if="turn.key === lastWizardTurnKey && distillJob && distillActive"
+            class="wz-distill"
+            :class="{ stalled: distillJob.health === 'stalled' }"
+          >
+            <div class="wz-distill-head">
+              <span class="tag" :class="distillJob.health === 'stalled' ? 'warn' : 'accent'">
+                {{ distillTag(distillJob) }}
+              </span>
+              <span class="wz-distill-stage">{{ distillJob.stage || "蒸馏中" }}</span>
+              <span v-if="distillPercent !== null" class="mono wz-distill-pct">
+                {{ distillPercent }}%
+              </span>
+            </div>
+            <div v-if="distillPercent !== null" class="wz-distill-bar">
+              <span :style="{ width: distillPercent + '%' }" />
+            </div>
+            <p class="faint wz-distill-note">{{ distillSentence(distillJob) }}</p>
+          </div>
+
+          <!-- 完成回执 / 疑似卡住提醒（持久化通知，ack 后不再重复） -->
+          <div v-if="turn.notice" class="wz-notice" :class="turn.notice.kind">
+            <p v-if="turn.notice.payload.next" class="wz-notice-next">
+              {{ turn.notice.payload.next }}
+            </p>
+            <div class="row tight">
+              <button
+                v-if="turn.notice.kind === 'distill_done' && canRun(wizard?.result)"
+                class="btn primary sm"
+                :disabled="runBusy"
+                @click="runGeneration(turn)"
+              >
+                {{ runBusy ? "正在写，别关页面…" : "开始写" }}
+              </button>
+              <button class="btn ghost sm" @click="router.push(`/projects/${projectId}`)">
+                去项目工作台 →
+              </button>
+            </div>
+          </div>
 
           <!-- 写操作回执：改了什么、从什么改成什么、影响是什么，可撤销 -->
           <div v-if="turn.action" class="wz-action">
@@ -1220,6 +1394,30 @@ onMounted(async () => {
               </div>
             </div>
           </template>
+        </div>
+      </div>
+
+      <!--
+        没有引导卡可挂时的常驻进度（例如用户在项目工作台提交蒸馏后切回助手）。
+        有的卡就不重复画：同一份进度在一屏里出现两次会让人以为有两个任务。
+      -->
+      <div v-if="distillActive && !lastWizardTurnKey" class="turn assistant">
+        <div class="bubble assistant wizard-bubble">
+          <div class="wz-distill" :class="{ stalled: distillJob?.health === 'stalled' }">
+            <div class="wz-distill-head">
+              <span class="tag" :class="distillJob?.health === 'stalled' ? 'warn' : 'accent'">
+                {{ distillTag(distillJob) }}
+              </span>
+              <span class="wz-distill-stage">{{ distillJob?.stage || "蒸馏中" }}</span>
+              <span v-if="distillPercent !== null" class="mono wz-distill-pct">
+                {{ distillPercent }}%
+              </span>
+            </div>
+            <div v-if="distillPercent !== null" class="wz-distill-bar">
+              <span :style="{ width: distillPercent + '%' }" />
+            </div>
+            <p class="faint wz-distill-note">{{ distillSentence(distillJob) }}</p>
+          </div>
         </div>
       </div>
     </div>
@@ -1500,7 +1698,80 @@ onMounted(async () => {
 .wz-prose.note {
   color: var(--fg-muted);
 }
-/* 写操作回执：与解释文字区分开，一眼看出「这次真的改了东西」 */
+/* 蒸馏进度：一句话 + 百分比，不占大屏 */
+.wz-distill {
+  margin: var(--gap-sm) 0;
+  padding: 9px 11px;
+  border: var(--border-w) solid var(--border-strong);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+}
+.wz-distill.stalled {
+  border-left-color: var(--warn, #c98a1b);
+}
+.wz-distill-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.wz-distill-stage {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+  color: var(--fg);
+}
+.wz-distill-pct {
+  flex: none;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--fg);
+}
+.wz-distill-bar {
+  margin-top: 6px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-strong);
+  overflow: hidden;
+}
+.wz-distill-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+.wz-distill-note {
+  margin: 6px 0 0;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+}
+/* 完成回执 / 疑似卡住提醒 */
+.wz-notice {
+  margin: var(--gap-sm) 0;
+  padding: 9px 11px;
+  border: var(--border-w) solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+  font-size: var(--fs-sm);
+}
+.wz-notice.distill_stalled {
+  border-left: 3px solid var(--warn, #c98a1b);
+}
+.wz-notice.distill_done {
+  border-left: 3px solid var(--ok, #2f8f5b);
+}
+.wz-notice.distill_failed {
+  border-left: 3px solid var(--danger, #c0392b);
+}
+.wz-notice-next {
+  margin: 0 0 var(--gap-sm);
+  color: var(--fg);
+}
+
 .wz-action {
   display: flex;
   flex-direction: column;
