@@ -244,3 +244,36 @@ def test_without_registry_falls_back_to_entity_alias(tmp_path):
     assert facts[0]["item_name"] == "地书"
     assert facts[0]["status"] == "held"
     assert facts[0]["via"] != "surface"
+
+
+# ---------------------------------------------------------------------------
+# 查询次数：与物品数量无关，generated.db 固定「登记表 1 次 + 持有段 1 次」
+# ---------------------------------------------------------------------------
+def test_registry_and_holding_are_constant_queries(tmp_path, monkeypatch):
+    app = _app_session(tmp_path)
+    path = _gen_db(tmp_path, with_registry=True)
+
+    seen: list[str] = []
+    original = read._connect_generated
+
+    def traced(p):
+        con = original(p)
+        con.set_trace_callback(seen.append)
+        return con
+
+    monkeypatch.setattr(read, "_connect_generated", traced)
+    with app:
+        facts = read.current_item_holdings(
+            ["地书", "玉石小镜", "长刀", "铜锣"], db=app, project_id=5,
+            generated_db=path,
+        )
+
+    # sqlite_master 的建表检查不算数据查询。
+    data_q = [s for s in seen if "sqlite_master" not in s]
+    registry_q = [s for s in data_q if "FROM kg_item_group" in s]
+    holding_q = [s for s in data_q if "FROM kg_item_holding" in s]
+    assert len(registry_q) == 1, data_q
+    assert len(holding_q) == 1, data_q
+    assert len(data_q) == 2, data_q
+    assert len(facts) >= 4
+
