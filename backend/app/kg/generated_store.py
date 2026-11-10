@@ -441,6 +441,7 @@ HOLD_TYPES = frozenset({"own", "custody"})
 OWNER_STATES = frozenset({"held", "unowned", "unknown", "sealed"})
 #: 同章出现多个归属主张且无法用转交事件排序时的候选原因。
 SAME_CHAPTER_CLASH = "same_chapter_clash"
+EXTEND_BACK_OVERLAP = "extend_back_overlap"
 #: 回溯段的坐标与主线旁注矛盾时的候选原因（只留证据，不裁决）。
 STORY_ORDER_CONFLICT = "story_order_conflict"
 
@@ -496,6 +497,9 @@ def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
     1. **先关后插**：同一 (item, hold_type) 已有开放段时，先在 ``chapter``
        关闭它（``valid_to = chapter``，半开区间），再插入新的开放段；
        同一持有者、同一状态的复述不重开段，返回 ``confirmed``。
+       但候选章**早于**开放段起点时不是复述，而是**向前补起点**
+       （``extended_back``）；若前移后会盖住更早的已关段，则不写、
+       落 ``extend_back_overlap`` 候选，并在 ``blocked_by`` 里说明撞的段。
     2. **同章竞争不写史**：同一章内对同一 (item, hold_type) 出现不同持有者时，
        有 ``transfer_event_id`` 且能对上事件对象（``event_object``）的按事件
        对象胜出；否则两条都只进 ``gen_candidates``，持有表不留任何零长度段。
@@ -545,6 +549,10 @@ def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
 
     if _same_owner(open_row, owner_id, owner_name) \
             and open_row["owner_state"] == owner_state:
+        if chapter < open_row["valid_from"]:
+            return _extend_back(con, open_row, item_name, hold_type, chapter,
+                                item_id=item_id, evidence=evidence,
+                                reason_code=reason_code, confidence=confidence)
         return {"action": "confirmed", "id": open_row["id"], "closed": 0,
                 "reason": "same_owner_same_state"}
 
@@ -564,6 +572,49 @@ def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
     rid = _insert_holding(con, **insert_kwargs)
     return {"action": "inserted", "id": rid, "closed": closed,
             "reason": "transfer"}
+
+
+def _extend_back(con: sqlite3.Connection, open_row, item_name: str,
+                 hold_type: str, chapter: int, *, item_id: int | None,
+                 evidence: str, reason_code: str, confidence: float) -> dict:
+    """同主同态、候选章更早：把开放段起点前移，不新增段。
+
+    前移前先查同 (item, hold_type) 更早的已关段：它的 ``valid_to`` 若大于
+    新起点，说明前移会盖住它，此时不写库，只落 ``extend_back_overlap`` 候选。
+    """
+    prev = con.execute(
+        """SELECT id, owner_name, valid_from, valid_to FROM kg_item_holding
+            WHERE item_id IS ? AND item_name = ? AND hold_type = ?
+              AND valid_to IS NOT NULL
+              AND valid_to > ? AND valid_from < ?
+            ORDER BY valid_to DESC, id DESC LIMIT 1""",
+        (item_id, item_name, hold_type, chapter, open_row["valid_from"]),
+    ).fetchone()
+    if prev is not None:
+        add_candidate(
+            con, item_name, (open_row["owner_name"] or ""), hold_type, chapter,
+            EXTEND_BACK_OVERLAP,
+            evidence or (f"向前补起点 {chapter} 会盖住已关段 "
+                         f"[{prev['valid_from']},{prev['valid_to']})"))
+        return {"action": "conflict", "id": open_row["id"], "closed": 0,
+                "reason": "extend_back_overlap",
+                "blocked_by": {"id": prev["id"],
+                               "owner_name": prev["owner_name"],
+                               "valid_from": prev["valid_from"],
+                               "valid_to": prev["valid_to"]}}
+
+    old = int(open_row["valid_from"])
+    con.execute(
+        """UPDATE kg_item_holding
+              SET valid_from = ?, evidence_chapter = ?, evidence = ?,
+                  reason_code = CASE WHEN ? = '' THEN reason_code ELSE ? END,
+                  confidence = ?
+            WHERE id = ?""",
+        (chapter, chapter, (evidence or open_row["evidence"])[:400],
+         reason_code, reason_code, float(confidence), open_row["id"]),
+    )
+    return {"action": "extended_back", "id": open_row["id"], "closed": 0,
+            "reason": "backfill_start", "from": old, "to": chapter}
 
 
 def _resolve_same_chapter(con: sqlite3.Connection, open_row, item_name: str,

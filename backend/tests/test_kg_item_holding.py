@@ -303,3 +303,52 @@ def test_current_holdings_at_chapter(tmp_path):
         _assert_contiguous(_rows(con, "佩刀"))
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. 同主同态、章更早：向前补起点，不当复述吞掉
+# ---------------------------------------------------------------------------
+def test_extend_back_moves_start(tmp_path):
+    con = _db(tmp_path)
+    try:
+        first = store.record_holding(con, "金牌", "own", "许七安", 110,
+                                     evidence="许七安亮出金牌")
+        back = store.record_holding(con, "金牌", "own", "许七安", 108,
+                                    reason_code="gift",
+                                    evidence="陛下赐下了一面金牌")
+        assert back["action"] == "extended_back"
+        assert back["id"] == first["id"] and back["from"] == 110 and back["to"] == 108
+
+        rows = _rows(con, "金牌")
+        assert [(r["owner_name"], r["valid_from"], r["valid_to"]) for r in rows] == [
+            ("许七安", 108, None)]
+        assert rows[0]["reason_code"] == "gift"
+        assert rows[0]["evidence"] == "陛下赐下了一面金牌"
+        _assert_contiguous(rows)
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
+# 9. 补起点会盖住更早的已关段：不写，落 extend_back_overlap 候选
+# ---------------------------------------------------------------------------
+def test_extend_back_overlap_goes_to_candidate(tmp_path):
+    con = _db(tmp_path)
+    try:
+        store.record_holding(con, "某物", "own", "甲", 10, evidence="甲持有")
+        store.record_holding(con, "某物", "own", "乙", 50, evidence="乙接手")
+        before = _rows(con, "某物")
+
+        res = store.record_holding(con, "某物", "own", "乙", 40, evidence="乙更早持有")
+        assert res["action"] == "conflict"
+        assert res["reason"] == "extend_back_overlap"
+        assert res["blocked_by"]["owner_name"] == "甲"
+        assert res["blocked_by"]["valid_from"] == 10
+        assert res["blocked_by"]["valid_to"] == 50
+        assert _rows(con, "某物") == before  # 一行没动
+
+        cand = [dict(r) for r in con.execute(
+            "SELECT * FROM gen_candidates WHERE reason = ?", (store.EXTEND_BACK_OVERLAP,))]
+        assert [c["from_name"] for c in cand] == ["某物"]
+    finally:
+        con.close()
