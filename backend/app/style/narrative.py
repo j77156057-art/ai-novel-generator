@@ -4024,6 +4024,69 @@ def _persist_style_distill(
     db.add(row)
 
 
+def _usable_narrative(profile) -> bool:
+    """档案是否有可注入内容（有规则或反向禁忌）。空壳不算「能用」。"""
+    return (isinstance(profile, dict)
+            and bool(profile.get("rules") or profile.get("forbidden")))
+
+
+def _degraded_narrative(db: Session, project, ids: list[int], cfg,
+                        want: dict, cached) -> dict | None:
+    """生成路径（``persist_library=False``）的降级取档：**绝不**同步蒸馏。
+
+    修的是「tier 与缓存指纹不匹配就静默起一次几十分钟全量蒸馏」：
+    生成请求里没有等蒸馏的预算，静默起蒸馏只会把请求挂到超时。
+
+    取档顺序（全部只读）：
+    1. 项目缓存：同一批参考语料且内容可用 → 直接复用（哪怕档位/版本与
+       期望不符）。这是 p5 的情形（项目要 balanced、缓存是 fast）。
+    2. 蒸馏库：同语料集合 + **同正文 hash** + active，档位不限 → 复用。
+       要求正文 hash 一致，避免把「语料被重新导入/清洗后」的旧档案当新的用。
+    3. 都没有 → 返回 None（调用方按「不注入」处理）。
+
+    每次降级都 WARN 写明「期望档位 / 实际档位 / 未触发蒸馏」，不静默。
+    """
+    log = logging.getLogger(__name__)
+    if _usable_narrative(cached):
+        fp = cached.get("fingerprint") or {}
+        cached_ids = sorted(int(i) for i in (fp.get("source_ids") or []))
+        if cached_ids == sorted(int(i) for i in ids):
+            log.warning(
+                "生成路径叙事档案降级：项目 %s 期望 tier=%s（指纹 %s），"
+                "实际使用项目缓存 tier=%s（指纹 %s）；未触发同步蒸馏。"
+                "如需目标档位请先 POST /api/projects/%s/distill。",
+                getattr(project, "id", None), cfg.key, want.get("tier_signature"),
+                fp.get("tier"), fp.get("tier_signature"), getattr(project, "id", None),
+            )
+            return cached
+
+    from app.models import StyleDistill
+
+    # 先按「同语料集合」轻查（只读索引列），**没有候选就不算正文 hash**——
+    # corpus_content_hash 要加载全部语料，不能为了一个注定空手的结果付这笔钱。
+    rows = db.scalars(
+        select(StyleDistill).where(
+            StyleDistill.source_ids_hash == _source_ids_hash(ids),
+            StyleDistill.status == "active",
+        ).order_by(StyleDistill.applied_at.desc(), StyleDistill.id.desc())
+    ).all()
+    usable = [r for r in rows if _usable_narrative(r.style_narrative)]
+    if not usable:
+        return None
+    content_hash = corpus_content_hash(ids, db)
+    for row in usable:
+        # 正文 hash 必须一致，避免把「语料被重新导入/清洗后」的旧档案当新的用。
+        if row.content_hash == content_hash:
+            log.warning(
+                "生成路径叙事档案降级：项目 %s 期望 tier=%s，蒸馏库命中 tier=%s；"
+                "未触发同步蒸馏。如需目标档位请先 POST /api/projects/%s/distill。",
+                getattr(project, "id", None), cfg.key, row.tier,
+                getattr(project, "id", None),
+            )
+            return dict(row.style_narrative)
+    return None
+
+
 def project_narrative(
     db: Session,
     project,
@@ -4112,6 +4175,22 @@ def project_narrative(
         # 所以：不在此 early return，而是 fall through 到下面的统一收尾；并把收尾里的
         # 落库改成**非致命**（见下方 try/except）——档案永远不会因为「写库失败」被丢。
     else:
+        if not persist_library:
+            # 生成路径：只做「降级或拒绝」，**绝不**在这里同步蒸馏。
+            # 以前指纹不匹配会一路走到 extract_narrative_profile（分钟级），
+            # 生成请求被静默挂到超时；现在改为复用可用旧档并 WARN，或返回
+            # None 让调用方按「不注入」处理。
+            profile = _degraded_narrative(db, project, ids, cfg, want, cached)
+            if profile is None:
+                logging.getLogger(__name__).warning(
+                    "生成路径拒绝同步蒸馏：项目 %s 期望 tier=%s（指纹 %s），"
+                    "项目缓存与蒸馏库都没有可用档案。请先调用 "
+                    "POST /api/projects/%s/distill 完成蒸馏后再生成。",
+                    getattr(project, "id", None), cfg.key,
+                    want["tier_signature"], getattr(project, "id", None),
+                )
+            return profile
+
         # ── 蒸馏库复用（跨项目共享层）── 同语料+同档位+同正文 已蒸馏过 → 直接复用。
         # force 时跳过（force = 用户明确要求重算，不复用任何缓存/库）。
         if not force:
@@ -4138,10 +4217,6 @@ def project_narrative(
             )
             profile["fingerprint"] = want
             project.style_narrative = profile
-            if not persist_library:
-                # 生成路径也要把新档案落进项目缓存（否则下次生成又全量重跑），
-                # 只是不写全局库。
-                db.commit()
 
     # —— 统一收尾：任何一次「完成的蒸馏」都把产物落进全局蒸馏库（幂等 upsert）——
     # 「蒸馏完成的加一个库」的核心：无论命中项目缓存、命中蒸馏库、还是真实提取，
