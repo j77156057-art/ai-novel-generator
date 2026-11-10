@@ -451,11 +451,30 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             stats.entities_upserted += 1
 
     # —— 2. relations upsert（两端名字解析为 id，缺失跳过）——
+    # 集合端点门（与 v2.6 同一条判定逻辑）：成员/归属类边挂在集合/上位节点、
+    # 且窗口里没有任何具体人名 → 落 status='candidate'，不删边。
+    # 窗口取本批文本里同时提到两端的那一句；人名表用词表人物 + 本批抽到的人物。
+    persons = canon_source.character_forms(result.get("entities") or [])
+    batch_text = "\n".join(item.text or "" for item in batch)
+    kind_by_name = {e.get("canonical_name"): e.get("kind")
+                    for e in result.get("entities", []) if e.get("canonical_name")}
     for r in result.get("relations", []):
         a_id = name_to_id.get(r["from"]) or _lookup_entity_id(db, project_id, r["from"])
         b_id = name_to_id.get(r["to"]) or _lookup_entity_id(db, project_id, r["to"])
         if a_id is None or b_id is None:
             continue
+        gate_reason = canon_source.collection_edge_gate(
+            r["rel_type"], r["from"], r["to"],
+            canon_source.gate_window(batch_text, r["from"], r["to"]), persons,
+        )
+        # 物品不是 belongs_to 的合法端点（人物/组织 ↔ 物品是「持有」，该走 owns）。
+        # 不建正式边，落 candidate 留人工复核；reason 记在 description（该列此前
+        # 未使用），与 v2.6 侧 gen_candidates.reason='item_endpoint' 同口径。
+        item_endpoint = r["rel_type"] == "belongs_to" and (
+            _endpoint_kind(db, r["from"], a_id, kind_by_name) == "item"
+            or _endpoint_kind(db, r["to"], b_id, kind_by_name) == "item"
+        )
+        status = "candidate" if (gate_reason or item_endpoint) else "active"
         rel = db.scalar(
             select(KgRelation).where(
                 KgRelation.project_id == project_id,
@@ -465,18 +484,25 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         )
         if rel is None:
             rel = KgRelation(project_id=project_id, from_id=a_id, to_id=b_id,
-                             rel_type=r["rel_type"], strength=r.get("strength", 0.5))
+                             rel_type=r["rel_type"], strength=r.get("strength", 0.5),
+                             status=status,
+                             description="item_endpoint" if item_endpoint else None)
             db.add(rel)
             stats.relations_upserted += 1
-        elif abs((rel.strength or 0.5) - r.get("strength", 0.5)) > 0.01:
-            # strength 变化 → 追加 evolution 行（记过程不记快照）
-            from app.models import KgRelationEvolution
+        else:
+            if rel.status != "active" and status == "active":
+                # 只升不降：同一对实体在别的章里有明确人名支撑时转正；
+                # 单章上下文弱不足以把已有正式边降级。
+                rel.status = "active"
+            if abs((rel.strength or 0.5) - r.get("strength", 0.5)) > 0.01:
+                # strength 变化 → 追加 evolution 行（记过程不记快照）
+                from app.models import KgRelationEvolution
 
-            db.add(KgRelationEvolution(
-                project_id=project_id, edge_id=rel.id,
-                strength=r.get("strength", 0.5), note="批抽更新",
-            ))
-            rel.strength = r.get("strength", 0.5)
+                db.add(KgRelationEvolution(
+                    project_id=project_id, edge_id=rel.id,
+                    strength=r.get("strength", 0.5), note="批抽更新",
+                ))
+                rel.strength = r.get("strength", 0.5)
 
     # —— 3. events 追加（sequence 项目内连续）——
     # seq_map：LLM 给的批内 sequence → 落库后的实际 event.id。
@@ -691,6 +717,17 @@ def _lookup_entity_id(db: Session, project_id: int, name: str) -> int | None:
         if should_merge(name, e.canonical_name):
             return e.id
     return None
+
+
+def _endpoint_kind(db: Session, name: str, ent_id: int | None,
+                   kind_by_name: dict[str, str]) -> str | None:
+    """关系端点实体的 kind：本批抽到的直接取，跨批已存在的回库查一次。"""
+    kind = kind_by_name.get(name)
+    if kind:
+        return kind
+    if ent_id is None:
+        return None
+    return db.scalar(select(KgEntity.kind).where(KgEntity.id == ent_id))
 
 
 def _lookup_event_id(db: Session, project_id: int, summary: str) -> int | None:

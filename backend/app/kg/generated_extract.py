@@ -93,7 +93,7 @@ REL_TRIGGERS = {
 #: 方位/移动触发词；located_at 必须靠它把主语和地点连起来。
 LOCATIVE = r"(?:在|到|回|进|抵|往|从|至|落脚|住进|赶到|送入|送到|带到|赶往|前往)"
 
-DEATH_MARKERS = r"(?:已死|死了|身亡|断气|咽气|身死|毙命|被杀|阵亡)"
+DEATH_MARKERS = r"(?:已死|死了|身亡|战死|殒命|遇害|断气|咽气|身死|毙命|被杀|阵亡)"
 
 #: 非当章时态/历史关系标记：保留边，但置信度下调，供上层决定是否当“当前关系”用。
 PAST_MARKERS = re.compile(r"曾是|旧部|旧属|旧上司|老部下|老下属|当年|原先|原为|旧日")
@@ -115,7 +115,7 @@ _CLAUSE_DELIMS = "，。！？；：\n“”「」『』（）()"
 _QUESTION = re.compile(
     r"[？?]|难道|岂(?:能|敢|会|有)|何曾|怎能|怎么可能|是否|能不能|会不会"
 )
-_HYPOTHETICAL = re.compile(r"如果|若是|要是|万一|假如|倘若|假设|除非")
+_HYPOTHETICAL = re.compile(r"如果|若是|要不是|若不是|若非|要是|万一|假如|倘若|假设|除非")
 _REPORTED_CN = re.compile(
     r"据说|听说|传言|据传|声称|扬言|谎称|都说|传说|外头说|有人说|"
     r"闻说|听闻|传闻|相传"
@@ -147,6 +147,39 @@ _ROLE_VERB_TRIGGERS = (
 )
 #: 「两位同僚」「他们二人」这类同位语，只有前一小句的并列名单能解。
 _APPELLATION = re.compile(r"^(?:这)?(?:两位|二位|两人|二人|俩|他们|她们)")
+
+#: 关系失效触发词：与建边触发词分表，命中只「关旧边」，不新增边。
+INVALIDATION_TRIGGERS: dict[str, tuple[str, ...]] = {
+    "ally": ("反目", "决裂", "翻脸", "断交", "分道扬镳", "恩断义绝", "反戈", "倒戈",
+             "投敌", "兵戎相见", "背叛", "出卖"),
+    "enemy": ("化敌为友", "冰释前嫌", "和解", "重归于好"),
+    "subordinate": ("罢官", "革职", "逐出", "除名", "脱离", "叛出", "自立门户",
+                    "卸任", "调离", "辞官"),
+    "superior": ("罢官", "革职", "逐出", "除名", "脱离", "叛出", "自立门户",
+                 "卸任", "调离", "辞官"),
+    "mentor": ("逐出师门", "叛出师门", "断绝师徒关系", "断了师徒名分"),
+    "student": ("逐出师门", "叛出师门", "断绝师徒关系", "断了师徒名分"),
+    "family": ("和离", "休书", "断绝关系", "逐出家门", "脱离父子关系"),
+    "sibling": ("断绝关系", "逐出家门"),
+}
+
+#: 失效/死亡的「未遂 + 否定」标记。建边那套四类硬拒管不住「并未」「差点」，
+#: 这两类词会把「差点反目」「并未背叛」「九死一生」读成既成事实。
+_UNREALIZED = re.compile(
+    r"差点|差一点|险些|几乎|几近|眼看(?:就要|要)?|就要|正要|未遂|九死一生|"
+    r"死里逃生|捡回.{0,2}命|并未|尚未|从未|从不|绝不|不曾|未曾|没能|没有|"
+    r"并非|不是|不再|无法|不能|不会|不肯"
+)
+
+#: 一条边怎么被确认的；落库时写进 ``confirm_method``。
+_CONFIRM_METHOD = {
+    "verb": "role_verb",
+    "postposition": "postposition",
+    "copula": "copula",
+    "mutual": "mutual",
+    "noun": "noun",
+    "other": "trigger",
+}
 
 
 def parse_attrs(raw) -> dict:
@@ -520,6 +553,134 @@ def _attribution_gate(text: str, a: str, b: str, rel: str, trigger: str,
     return (True, "") if (subject, obj) == (a, b) else (False, "endpoint_mismatch")
 
 
+def _assertion_rejected(sentence: str, pos: int) -> str:
+    """失效/死亡断言的共同硬拒：与建边同一套四类，另加未遂与否定。
+
+    返回拒绝原因；空串表示这句可以当既成事实用。
+    """
+    c_start, _c_end = _clause_span(sentence, pos)
+    before = sentence[c_start:pos]
+    if _QUESTION.search(sentence):
+        return "question"
+    if _HYPOTHETICAL.search(sentence):
+        return "hypothetical"
+    if _REPORTED_CN.search(sentence):
+        return "reported"
+    if _NEGATED.search(before):
+        return "negated"
+    if _UNREALIZED.search(before):
+        return "unrealized"
+    return ""
+
+
+def _forms_ctx(names: set[str], alias: dict[str, str],
+               ) -> tuple[re.Pattern, dict[str, str]]:
+    forms = {name: name for name in names}
+    forms.update({form: canon for form, canon in alias.items() if canon in names})
+    pattern = re.compile("|".join(
+        re.escape(form) for form in sorted(forms, key=len, reverse=True)))
+    return pattern, forms
+
+
+def detect_invalidations(text: str, chapter: int, canon_edges: list[dict],
+                         mentioned: dict[str, dict],
+                         canon_nodes: list[dict]) -> list[dict]:
+    """本章是否明确推翻了某条 canon 关系（反目/背叛/罢官/和离…）。
+
+    只做减法：命中只关旧边，不新增边。触发词与建边共用同一套硬拒
+    （否定/疑问/假设/转述），并额外挡「差点」「险些」「并未」这类未遂与否定；
+    两个端点必须同句出现，避免把「A 反目，B 旁观」挂到 A-B 上。
+    """
+    names = set(mentioned)
+    if not names:
+        return []
+    _by_name, alias, _kinds = _canon_index(canon_nodes)
+    form_re, forms = _forms_ctx(names, alias)
+
+    pair_index: dict[frozenset, list[dict]] = defaultdict(list)
+    for edge in canon_edges:
+        if (edge.get("status") or "resolved") != "resolved":
+            continue
+        a = alias.get(edge.get("from_name") or edge.get("from"), 
+                      edge.get("from_name") or edge.get("from"))
+        b = alias.get(edge.get("to_name") or edge.get("to"), 
+                      edge.get("to_name") or edge.get("to"))
+        rel = edge.get("rel_type") or edge.get("rel")
+        if not a or not b or a == b or rel not in EDGE_RELS:
+            continue
+        if a not in names or b not in names:
+            continue
+        pair_index[frozenset((a, b))].append({"from": a, "to": b, "rel": rel})
+
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for sent in _sentences(text):
+        present = list(dict.fromkeys(
+            name for _s, _e, name in _mentions_in(sent, (0, len(sent)), form_re, forms)))
+        if len(present) < 2:
+            continue
+        for idx, a in enumerate(present):
+            for b in present[idx + 1:]:
+                for edge in pair_index.get(frozenset((a, b)), []):
+                    for word in INVALIDATION_TRIGGERS.get(edge["rel"], ()):
+                        pos = sent.find(word)
+                        if pos < 0:
+                            continue
+                        if _assertion_rejected(sent, pos):
+                            continue
+                        key = (edge["from"], edge["to"], edge["rel"], word)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out.append({
+                            "from": edge["from"],
+                            "to": edge["to"],
+                            "rel": edge["rel"],
+                            "chapter": chapter,
+                            "reason": "relation_changed",
+                            "trigger": word,
+                            "evidence": sent[:200],
+                        })
+                        break
+    return out
+
+
+_DEATH_RE = re.compile(DEATH_MARKERS)
+
+
+def detect_deaths(text: str, chapter: int, claims: list[dict]) -> list[dict]:
+    """从死亡断言里挑出「可确认」的：未遂、否定、假设、传言一律不算。
+
+    「差点死」「险些丧命」「九死一生」不切 historical；
+    只有明确身亡/战死/殒命这类既成事实才返回。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for claim in claims:
+        if claim.get("type") != "death":
+            continue
+        if claim.get("subject_status") != "resolved" or claim.get("reported"):
+            continue
+        name = claim.get("subject") or ""
+        if not name or name in seen:
+            continue
+        evidence = claim.get("evidence") or ""
+        match = _DEATH_RE.search(evidence)
+        if not match:
+            continue
+        if _assertion_rejected(evidence, match.start()):
+            continue
+        seen.add(name)
+        out.append({
+            "name": name,
+            "chapter": chapter,
+            "reason": "death",
+            "trigger": match.group(0),
+            "evidence": evidence[:200],
+        })
+    return out
+
+
 def _edge_conf(sent: str, base: float, trigger: str = "") -> float:
     """历史/过去时态的关系保留，但下调置信度。
 
@@ -566,6 +727,10 @@ def _edge_trigger(sent: str, a: str, b: str, rel: str,
         return True, match.group(0), "locative", _edge_conf(sent, 0.7, match.group(0))
 
     if rel in ("belongs_to", "member_of"):
+        # 物品不是 belongs_to 的合法端点：人物/组织 ↔ 物品是「持有」，该走 owns。
+        # 不建正式边，落 candidate 留人工复核（与 v3 写入侧同一口径）。
+        if rel == "belongs_to" and ({"item"} & ka or {"item"} & kb):
+            return False, "", "item_endpoint", 0.0
         if "location" in kb or _looks_like_location(b):
             return False, "", "target_is_location", 0.0
         if rel == "member_of" and not ({"faction", "power_system"} & kb):
@@ -622,6 +787,12 @@ def _collect_edges(text: str, canon_edges: list[dict], mentioned: dict[str, dict
     form_re = re.compile("|".join(
         re.escape(form) for form in sorted(forms, key=len, reverse=True)))
     ctx = (form_re, forms)
+    # 集合端点门要的「具体人名」写法表：词表人物 + 本章出现的人物写法。
+    # 只在成员/归属类边上用，见 canon_source.collection_edge_gate。
+    persons = canon_source.character_forms([
+        {"name": form, "kind": "character"}
+        for form, canon in forms.items() if "character" in kinds.get(canon, ())
+    ])
     out: list[dict] = []
     candidates: list[dict] = []
     rejected: list[dict] = []
@@ -655,13 +826,13 @@ def _collect_edges(text: str, canon_edges: list[dict], mentioned: dict[str, dict
         if not hits:
             continue
 
-        chosen: tuple[str, str, float] | None = None
+        chosen: tuple[str, str, float, str] | None = None
         first_fail: tuple[str, str, str] | None = None
         gate_fail: tuple[str, str, str] | None = None
         for evidence in hits:
             ok, trigger, reason, score = _edge_trigger(evidence, a, b, rel, kinds, ctx)
             if ok:
-                chosen = (evidence, trigger, score)
+                chosen = (evidence, trigger, score, reason)
                 break
             if reason in ATTRIBUTION_REASONS and gate_fail is None:
                 gate_fail = (evidence, trigger, reason)
@@ -687,7 +858,23 @@ def _collect_edges(text: str, canon_edges: list[dict], mentioned: dict[str, dict
                 _push_candidate(row)
             continue
 
-        evidence, trigger, score = chosen
+        evidence, trigger, score, reason = chosen
+        # 集合端点门：成员/归属类边挂在集合/上位节点上、且证据句里没有任何具体人名
+        # → 降候选等复核。不删边：剔掉集合节点那一轮实测丢掉 52.6% 的正确成员边。
+        window = canon_source.gate_window(evidence, a, b)
+        gate_reason = canon_source.collection_edge_gate(rel, a, b, window, persons)
+        if gate_reason:
+            _push_candidate({
+                "from": a,
+                "to": b,
+                "rel": rel,
+                "strength": float(edge.get("strength") or 0.5),
+                "confidence": 0.0,
+                "trigger": trigger,
+                "evidence": window,
+                "reason": gate_reason,
+            })
+            continue
         row = {
             "from": a,
             "to": b,
@@ -696,6 +883,7 @@ def _collect_edges(text: str, canon_edges: list[dict], mentioned: dict[str, dict
             "confidence": score,
             "trigger": trigger,
             "evidence": evidence,
+            "confirm_method": _CONFIRM_METHOD.get(_trigger_kind(trigger), reason),
         }
 
         if rel in SYMMETRIC_RELS:
@@ -863,6 +1051,9 @@ def extract_from_text(text: str, chapter: int, canon_nodes: list[dict],
     subject_names = [name for name, node in mentioned.items()
                      if node["kind"] == "character"]
     claims, rejected = extract_claims(text, subject_names, with_rejected=True)
+    invalidations = detect_invalidations(text, chapter, canon_edges, mentioned,
+                                         canon_nodes)
+    deaths = detect_deaths(text, chapter, claims)
 
     nodes = [{**node, "source": GENERATED, "source_chapter": chapter}
              for node in mentioned.values()]
@@ -891,4 +1082,6 @@ def extract_from_text(text: str, chapter: int, canon_nodes: list[dict],
         "candidates": candidates,
         "rejected_subjects": rejected,
         "rejected_edges": rejected_edges,
+        "invalidations": invalidations,
+        "deaths": deaths,
     }

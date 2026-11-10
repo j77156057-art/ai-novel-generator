@@ -565,8 +565,9 @@ _EXTRACT_SYSTEM = (
     "younger_sister / son / daughter / sibling / parent / child / kin\n"
     "亲属通用词：sister / brother / sibling（不写长幼时用；落库统一归为 sibling）/ kin\n"
     "【关系方向（from → to 的顺序不能反）】\n"
-    "- belongs_to：成员 → 组织（许七安 → 打更人）；修炼者 → 体系（许七安 → 天地一刀斩）\n"
-    "- 掌握、修习、持有这类关系，方向一律是「人 → 被掌握对象」"
+    "- belongs_to：成员 → 组织（许七安 → 打更人）、下级组织 → 上级组织"
+    "（御刀卫 → 打更人）；只用于人物与组织之间，器物、功法、术法一律不用 belongs_to\n"
+    "- 掌握、修习、持有这类关系，方向一律是「人 → 被掌握对象」，一律用 owns"
     "（许七安 → 天地一刀斩、许七安 → 望气术、许七安 → 佩刀）；"
     "反过来写成「天地一刀斩 → 许七安」「佩刀 → 许七安」就是错的\n"
     "- owns / holds（落库统一为 owns）：持有者 → 被持有物（许七安 → 佩刀）；"
@@ -686,7 +687,7 @@ _TARGETED_SYSTEM = (
     "  ],\n"
     '  "relations": [\n'
     '    {"from": "成员名", "to": "势力名", "rel_type": "belongs_to", "strength": 0.8},\n'
-    '    {"from": "人物名", "to": "功法或器物名", "rel_type": "belongs_to", "strength": 0.8}\n'
+    '    {"from": "人物名", "to": "功法或器物名", "rel_type": "owns", "strength": 0.8}\n'
     "  ]\n"
     "}\n\n"
     "规则：\n"
@@ -706,14 +707,15 @@ _TARGETED_SYSTEM = (
     "power_system；本轮不抽 worldrule，遇到直接跳过）。\n"
     "- 同一 canonical_name 只出一类，不要同时给 faction 和 power_system。\n"
     "- 只抽文本中**确实出现**的，文本没有就返回空数组 []，禁止编造。\n"
-    "- relations 只允许 belongs_to。方向：成员 → 势力（宋廷风 → 御刀卫）、"
-    "体系 → 上级势力/职业（望气术 → 司天监）。\n"
+    "- relations 只允许 belongs_to 和 owns。方向：belongs_to 只用于成员 → 势力"
+    "（宋廷风 → 御刀卫）、下级势力 → 上级势力（御刀卫 → 打更人）；"
+    "owns 用于掌握者/修习者 → 功法或器物（许七安 → 天地一刀斩）。\n"
     "- 上面两条示例分别是「成员→势力」和「掌握者→被掌握对象」，不要都写成成员→势力。\n"
     "- 掌握、修习、持有这类关系，方向一律是「人 → 被掌握对象」"
     "（许七安 → 天地一刀斩、许七安 → 望气术）；"
     "反过来写成「天地一刀斩 → 许七安」就是错的。\n"
-    "- power_system 的 held_by 只放在实体 attrs 里，**不要再**把它镜像成一条 "
-    "belongs_to / owns 边；如要表达掌握关系，from 必须是掌握者、to 才是体系。\n"
+    "- power_system 的 held_by 只放在实体 attrs 里，**不要只凭 held_by** 就补一条 "
+    "belongs_to / owns 边；原文另有掌握/修习表述时才抽，from 必须是掌握者、to 才是体系。\n"
 )
 
 _TARGETED_USER = (
