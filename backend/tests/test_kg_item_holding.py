@@ -352,3 +352,58 @@ def test_extend_back_overlap_goes_to_candidate(tmp_path):
         assert [c["from_name"] for c in cand] == ["某物"]
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# 10. 实例维度：同名多实物各自开段，不互相占线
+# ---------------------------------------------------------------------------
+def test_instances_do_not_block_each_other(tmp_path):
+    con = _db(tmp_path)
+    try:
+        three = store.record_item_instance(con, "地书碎片", "三号", 100,
+                                           evidence="您将三号碎片赠予我时")
+        six = store.record_item_instance(con, "地书碎片", "六号", 153,
+                                         evidence="这面玉石小镜是恒远的六号碎片")
+        assert three != six
+        # 同一片号重复注册是幂等
+        assert store.record_item_instance(con, "地书碎片", "三号", 100) == three
+
+        a = store.record_holding(con, "地书碎片", "own", "许七安", 100,
+                                 instance_id=three, evidence="三号碎片在我这里")
+        b = store.record_holding(con, "地书碎片", "own", "恒远", 153,
+                                 instance_id=six, evidence="恒远的六号碎片")
+        assert a["action"] == "inserted" and b["action"] == "inserted"
+
+        rows = _rows(con, "地书碎片")
+        assert len(rows) == 2 and all(r["valid_to"] is None for r in rows)
+        assert [r["instance_id"] for r in rows] == [three, six]
+
+        assert [r["owner_name"] for r in store.current_holder(
+            con, "地书碎片", instance_id=three)] == ["许七安"]
+        assert [r["owner_name"] for r in store.current_holder(
+            con, "地书碎片", instance_id=six)] == ["恒远"]
+
+        # 片号对不上物品名要被拒
+        try:
+            store.record_holding(con, "别的物品", "own", "许七安", 110,
+                                 instance_id=three)
+        except ValueError as exc:
+            assert "instance_id" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("instance_id 与物品名不一致竟然被接受")
+    finally:
+        con.close()
+
+
+def test_instance_without_label_is_refused(tmp_path):
+    con = _db(tmp_path)
+    try:
+        try:
+            store.record_item_instance(con, "地书碎片", "  ", 100)
+        except ValueError as exc:
+            assert "instance_label" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("空片号竟然建了实例")
+        assert con.execute("SELECT COUNT(*) FROM kg_item_instance").fetchone()[0] == 0
+    finally:
+        con.close()

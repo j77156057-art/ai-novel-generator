@@ -58,9 +58,21 @@ CREATE TABLE IF NOT EXISTS gen_edges (
     UNIQUE(from_name, to_name, rel_type)
 );
 
+CREATE TABLE IF NOT EXISTS kg_item_instance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_name TEXT NOT NULL CHECK (length(trim(item_name)) > 0),
+    item_id INTEGER,
+    instance_label TEXT NOT NULL CHECK (length(trim(instance_label)) > 0),
+    evidence_chapter INTEGER NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE (item_name, instance_label)
+);
+
 CREATE TABLE IF NOT EXISTS kg_item_holding (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id INTEGER,
+    instance_id INTEGER,
     item_name TEXT NOT NULL CHECK (length(trim(item_name)) > 0),
     hold_type TEXT NOT NULL CHECK (hold_type IN ('own', 'custody')),
     owner_id INTEGER,
@@ -92,7 +104,8 @@ CREATE TABLE IF NOT EXISTS kg_item_holding (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_item_holding_open
-    ON kg_item_holding (COALESCE(item_id, -1), item_name, hold_type)
+    ON kg_item_holding (COALESCE(item_id, -1), item_name, hold_type,
+                        COALESCE(instance_id, -1))
     WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS ix_item_holding_item
     ON kg_item_holding (item_id, valid_from);
@@ -106,6 +119,7 @@ CREATE TABLE IF NOT EXISTS kg_holding_story_segment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     holding_id INTEGER,
     item_id INTEGER,
+    instance_id INTEGER,
     item_name TEXT NOT NULL CHECK (length(trim(item_name)) > 0),
     hold_type TEXT NOT NULL CHECK (hold_type IN ('own', 'custody')),
     owner_id INTEGER,
@@ -145,7 +159,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_story_segment_holding
     WHERE holding_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_story_segment_branch
     ON kg_holding_story_segment
-       (COALESCE(item_id, -1), item_name, hold_type, COALESCE(order_key, -1))
+       (COALESCE(item_id, -1), item_name, hold_type,
+        COALESCE(instance_id, -1), COALESCE(order_key, -1))
     WHERE holding_id IS NULL;
 CREATE INDEX IF NOT EXISTS ix_story_segment_item
     ON kg_holding_story_segment (item_id, order_key);
@@ -251,6 +266,24 @@ _MIGRATIONS = (
     ("gen_edges", "status", "TEXT NOT NULL DEFAULT 'active'"),
     ("gen_events", "subject_status", "TEXT NOT NULL DEFAULT 'resolved'"),
     ("gen_events", "raw_subject", "TEXT"),
+    # 实例维度：旧库用 ALTER 加纯整数列（SQLite 加列加不了 CHECK/UNIQUE，靠入口校验）
+    ("kg_item_holding", "instance_id", "INTEGER"),
+    ("kg_holding_story_segment", "instance_id", "INTEGER"),
+)
+
+#: 实例维度进入唯一索引后，旧库的同名索引要重建（IF NOT EXISTS 不会改已有索引）。
+_UNIQUE_INDEXES = (
+    ("ux_item_holding_open",
+     """CREATE UNIQUE INDEX ux_item_holding_open
+        ON kg_item_holding (COALESCE(item_id, -1), item_name, hold_type,
+                            COALESCE(instance_id, -1))
+        WHERE valid_to IS NULL"""),
+    ("ux_story_segment_branch",
+     """CREATE UNIQUE INDEX ux_story_segment_branch
+        ON kg_holding_story_segment
+           (COALESCE(item_id, -1), item_name, hold_type,
+            COALESCE(instance_id, -1), COALESCE(order_key, -1))
+        WHERE holding_id IS NULL"""),
 )
 
 
@@ -263,6 +296,15 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     for table, column, decl in _MIGRATIONS:
         if column not in _columns(con, table):
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    for name, ddl in _UNIQUE_INDEXES:
+        row = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (name,)).fetchone()
+        if row is None:
+            con.execute(ddl)
+        elif "instance_id" not in (row["sql"] or ""):
+            con.execute(f"DROP INDEX {name}")
+            con.execute(ddl)
     con.commit()
 
 
@@ -464,23 +506,53 @@ def _insert_holding(con: sqlite3.Connection, *, item_id: int | None, item_name: 
                     hold_type: str, owner_id: int | None, owner_name: str | None,
                     owner_kind: str | None, owner_state: str, chapter: int,
                     transfer_event_id: int | None, reason_code: str,
-                    evidence: str, confidence: float) -> int:
+                    evidence: str, confidence: float,
+                    instance_id: int | None = None) -> int:
     cur = con.execute(
         """INSERT INTO kg_item_holding
-           (item_id, item_name, hold_type, owner_id, owner_name, owner_kind,
+           (item_id, instance_id, item_name, hold_type, owner_id, owner_name, owner_kind,
             owner_state, valid_from, valid_to, transfer_event_id, reason_code,
             evidence_chapter, evidence, confidence, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)""",
-        (item_id, item_name, hold_type, owner_id, owner_name, owner_kind,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)""",
+        (item_id, instance_id, item_name, hold_type, owner_id, owner_name, owner_kind,
          owner_state, chapter, transfer_event_id, reason_code, chapter,
          (evidence or "")[:400], float(confidence), _now()),
     )
     return int(cur.lastrowid)
 
 
+def record_item_instance(con: sqlite3.Connection, item_name: str,
+                         instance_label: str, chapter: int, *,
+                         item_id: int | None = None, evidence: str = "") -> int:
+    """注册一个实物实例（同名多实物时用），返回 ``kg_item_instance.id``。
+
+    片号必须来自原文（「三号碎片」「第一块」）。抽不到片号就**不建**，
+    也不许自行编号——调用方应保持「有物无号、暂不建段」。
+    """
+    label = (instance_label or "").strip()
+    if not label:
+        raise ValueError("instance_label 不能为空；抽不到片号就不建实例")
+    if chapter is None:
+        raise ValueError("chapter 不能为空")
+    try:
+        cur = con.execute(
+            """INSERT INTO kg_item_instance
+               (item_name, item_id, instance_label, evidence_chapter, evidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (item_name, item_id, label, chapter, (evidence or "")[:400], _now()),
+        )
+        return int(cur.lastrowid)
+    except sqlite3.IntegrityError:
+        row = con.execute(
+            "SELECT id FROM kg_item_instance WHERE item_name = ? AND instance_label = ?",
+            (item_name, label)).fetchone()
+        return int(row["id"])
+
+
 def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
                    owner_name: str | None, chapter: int, *,
                    item_id: int | None = None,
+                   instance_id: int | None = None,
                    owner_id: int | None = None, owner_kind: str | None = None,
                    owner_state: str = "held",
                    transfer_event_id: int | None = None,
@@ -524,18 +596,28 @@ def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
         raise ValueError(f"{owner_state} 态不允许 owner_name（不许造假持有者）")
     if chapter is None:
         raise ValueError("chapter 不能为空")
+    if instance_id is not None:
+        inst = con.execute("SELECT item_name FROM kg_item_instance WHERE id = ?",
+                           (instance_id,)).fetchone()
+        if inst is None:
+            raise ValueError(f"instance_id={instance_id} 不存在")
+        if inst["item_name"] != item_name:
+            raise ValueError("instance_id 与 item_name 不是同一物品")
 
-    key = {"item_id": item_id, "item_name": item_name, "hold_type": hold_type}
+    key = {"item_id": item_id, "item_name": item_name, "hold_type": hold_type,
+           "instance_id": instance_id}
     open_row = con.execute(
         """SELECT * FROM kg_item_holding
             WHERE item_id IS ? AND item_name = ? AND hold_type = ?
+              AND instance_id IS ?
               AND valid_to IS NULL
             ORDER BY id DESC LIMIT 1""",
-        (item_id, item_name, hold_type),
+        (item_id, item_name, hold_type, instance_id),
     ).fetchone()
 
     insert_kwargs = dict(
-        item_id=item_id, item_name=item_name, hold_type=hold_type,
+        item_id=item_id, instance_id=instance_id, item_name=item_name,
+        hold_type=hold_type,
         owner_id=owner_id, owner_name=owner_name, owner_kind=owner_kind,
         owner_state=owner_state, chapter=chapter,
         transfer_event_id=transfer_event_id, reason_code=reason_code,
@@ -585,10 +667,12 @@ def _extend_back(con: sqlite3.Connection, open_row, item_name: str,
     prev = con.execute(
         """SELECT id, owner_name, valid_from, valid_to FROM kg_item_holding
             WHERE item_id IS ? AND item_name = ? AND hold_type = ?
+              AND instance_id IS ?
               AND valid_to IS NOT NULL
               AND valid_to > ? AND valid_from < ?
             ORDER BY valid_to DESC, id DESC LIMIT 1""",
-        (item_id, item_name, hold_type, chapter, open_row["valid_from"]),
+        (item_id, item_name, hold_type, open_row["instance_id"],
+         chapter, open_row["valid_from"]),
     ).fetchone()
     if prev is not None:
         add_candidate(
@@ -653,6 +737,7 @@ def _resolve_same_chapter(con: sqlite3.Connection, open_row, item_name: str,
 def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str,
                          owner_name: str | None, chapter: int, *,
                          item_id: int | None = None,
+                         instance_id: int | None = None,
                          owner_id: int | None = None,
                          owner_kind: str | None = None,
                          owner_state: str = "held",
@@ -706,6 +791,13 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
         raise ValueError(f"{owner_state} 态不允许 owner_name（不许造假持有者）")
     if chapter is None:
         raise ValueError("chapter 不能为空")
+    if instance_id is not None:
+        inst = con.execute("SELECT item_name FROM kg_item_instance WHERE id = ?",
+                           (instance_id,)).fetchone()
+        if inst is None:
+            raise ValueError(f"instance_id={instance_id} 不存在")
+        if inst["item_name"] != item_name:
+            raise ValueError("instance_id 与 item_name 不是同一物品")
 
     # 两档：有先后键（explicit）/ 只有叙述序（chapter，键为空）
     if order_basis is None:
@@ -729,6 +821,8 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
             raise ValueError(f"holding_id={holding_id} 不存在")
         if row["item_name"] != item_name or row["hold_type"] != hold_type:
             raise ValueError("旁注的 item_name/hold_type 与持有行不一致")
+        if row["instance_id"] != instance_id:
+            raise ValueError("旁注的 instance_id 与持有行不一致")
         if not _same_owner(row, owner_id, owner_name) or row["owner_state"] != owner_state:
             raise ValueError("旁注的持有者/状态与持有行不一致")
 
@@ -738,8 +832,9 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
             """SELECT MAX(COALESCE(s.order_key, h.valid_from * ?)) AS ord
                  FROM kg_item_holding h
                  LEFT JOIN kg_holding_story_segment s ON s.holding_id = h.id
-                WHERE h.item_name = ? AND h.hold_type = ?""",
-            (ORDER_SCALE, item_name, hold_type),
+                WHERE h.item_name = ? AND h.hold_type = ?
+                  AND h.instance_id IS ?""",
+            (ORDER_SCALE, item_name, hold_type, instance_id),
         ).fetchone()
         if prev is not None and prev["ord"] is not None and int(order_key) >= int(prev["ord"]):
             conflict = True
@@ -750,14 +845,14 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
     try:
         cur = con.execute(
             """INSERT INTO kg_holding_story_segment
-               (holding_id, item_id, item_name, hold_type, owner_id, owner_name,
-                owner_kind, owner_state, order_key, order_basis, anchor_label,
-                narration, transfer_from_id, transfer_from_name,
+               (holding_id, item_id, instance_id, item_name, hold_type, owner_id,
+                owner_name, owner_kind, owner_state, order_key, order_basis,
+                anchor_label, narration, transfer_from_id, transfer_from_name,
                 evidence_chapter, evidence, confidence, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (holding_id, item_id, item_name, hold_type, owner_id, owner_name,
-             owner_kind, owner_state, order_key, order_basis, anchor_label,
-             narration, transfer_from_id, transfer_from_name,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (holding_id, item_id, instance_id, item_name, hold_type, owner_id,
+             owner_name, owner_kind, owner_state, order_key, order_basis,
+             anchor_label, narration, transfer_from_id, transfer_from_name,
              chapter, (evidence or "")[:400], float(confidence), _now()),
         )
         return {"action": "inserted", "id": int(cur.lastrowid), "axis": "story",
@@ -773,8 +868,9 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
                 """SELECT id FROM kg_holding_story_segment
                     WHERE holding_id IS NULL AND item_name = ? AND hold_type = ?
                       AND COALESCE(item_id, -1) = COALESCE(?, -1)
+                      AND COALESCE(instance_id, -1) = COALESCE(?, -1)
                       AND COALESCE(order_key, -1) = COALESCE(?, -1)""",
-                (item_name, hold_type, item_id, order_key),
+                (item_name, hold_type, item_id, instance_id, order_key),
             ).fetchone()
         return {"action": "confirmed", "id": int(row["id"]) if row else None,
                 "axis": "story", "holding_id": holding_id, "conflict": conflict}
@@ -807,11 +903,13 @@ def _effective_order(row) -> int:
 
 
 def current_holder(con: sqlite3.Connection, item_name: str,
-                   hold_type: str | None = None) -> list[dict]:
+                   hold_type: str | None = None,
+                   instance_id: int | None = None) -> list[dict]:
     """当前持有者：每一类持有线取**最新先后键**的那一段，不按置信度挑。
 
     只看先后，不看距离；段落已结束也照样参与（「最新一段」就是当前口径）。
     主线旁注（``holding_id`` 非空）不重复计入，它的先后键通过 JOIN 覆盖主线行。
+    同名多实物用 ``instance_id`` 收窄到某一块；不传则把该名字下所有实例一起排。
 
     返回 ``[{"item_name", "hold_type", "owner_name", "owner_id", "owner_state",
     "chapter", "order_key", "narration"}]``，每个 ``hold_type`` 一条。
@@ -824,16 +922,17 @@ def current_holder(con: sqlite3.Connection, item_name: str,
                'forward' AS narration, h.id AS row_id
           FROM kg_item_holding h
           LEFT JOIN kg_holding_story_segment s ON s.holding_id = h.id
-         WHERE h.item_name = ?
+         WHERE h.item_name = ? AND h.instance_id IS ?
         UNION ALL
         SELECT s.item_name, s.hold_type, s.owner_name, s.owner_id,
                s.owner_state, s.evidence_chapter,
                COALESCE(s.order_key, s.evidence_chapter * ?),
                s.narration, s.id
           FROM kg_holding_story_segment s
-         WHERE s.holding_id IS NULL AND s.item_name = ?
+         WHERE s.holding_id IS NULL AND s.item_name = ? AND s.instance_id IS ?
     """
-    params: list = [ORDER_SCALE, item_name, ORDER_SCALE, item_name]
+    params: list = [ORDER_SCALE, item_name, instance_id,
+                    ORDER_SCALE, item_name, instance_id]
     if hold_type is not None:
         sql = f"SELECT * FROM ({sql}) WHERE hold_type = ?"
         params.append(hold_type)
