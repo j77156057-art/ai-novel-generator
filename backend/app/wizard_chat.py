@@ -392,26 +392,116 @@ def parse(
 # 追问：就地解释（不推进流程）
 # ---------------------------------------------------------------------------
 
-_FAQ_DISTILL = (
-    "全量蒸馏就是完整档，也是我这的默认：按语料 30% 的篇幅抽样（撒开抽，不是只取开头），"
-    "跑 14 个维度——句长节奏、对话密度、场景模板、潜台词、章末钩子这些——"
-    "再拿语料本身校验角色名，把「许七」「安小」这种别名碎片和明显不是人的名字清掉。\n\n"
-    "833 章的实测大约 42 分钟。平衡档固定取 30 章、维度一样但不做角色名归一化，快不少；"
-    "快速档只跑 11 个维度、不清洗，只够验证管线。差的不是「能不能写」，是「像不像」。"
-)
+def _corpus_phrase(ctx: dict[str, Any]) -> str:
+    books = ctx.get("corpus_books") or []
+    if not books:
+        return "当前项目还没投喂语料"
+    names = "、".join(
+        f"《{re.sub(r'\.(txt|md|epub)$', '', str(b.get('title') or b.get('id')), flags=re.I)}》"
+        f"（{b.get('chapters', 0)} 章）"
+        for b in books
+    )
+    return f"当前项目投喂的是 {names}"
+
+
+def _tier_phrase(ctx: dict[str, Any], key: str) -> str:
+    for t in ctx.get("tiers") or []:
+        if t["key"] == key:
+            return (
+                f"约 {t['sampled_chapters']} 章、{t['dimension_count']} 个维度、"
+                f"预计约 {t['estimated_minutes']} 分钟"
+            )
+    return ""
+
+
+def _faq_distill(ctx: dict[str, Any]) -> str:
+    full = _tier_phrase(ctx, "full")
+    balanced = _tier_phrase(ctx, "balanced")
+    fast = _tier_phrase(ctx, "fast")
+    dim = ctx.get("dimension_inventory") or {}
+    measured = ctx.get("measured") or {}
+    return (
+        f"{_corpus_phrase(ctx)}。三个档位不是「准/中/快」三个形容词，差别落在四个"
+        "可实现的轴上：采样多少章、跑哪些维度、要不要做角色名归一化、伪角色清洗多狠。\n\n"
+        f"完整档：{full}。14 个提炼维度全开，角色名会做归一化（小落→安小落），"
+        "伪角色也按词频自证全量清洗。\n"
+        f"平衡档：{balanced}。维度一样，但不归一化角色名——简称会各算一个角色。\n"
+        f"快速档：{fast}。砍掉节拍序列、高频场景模板、潜台词模式三维（14→11），"
+        "角色名完全不清洗，只适合试跑。\n\n"
+        f"耗时口径要说明白：仓库里唯一一次带计时的实测是《{measured.get('novel', '').strip('《》')}》"
+        f"语料 {measured.get('corpus_chapters')} 章、n_ch={measured.get('sampled_chapters')}、"
+        f"{measured.get('minutes')} 分钟（{measured.get('model')}）；上面每档的分钟数是按这一刻"
+        "线性外推的估算，不是该档实测值。"
+    )
+
+
+def _faq_dimensions(ctx: dict[str, Any]) -> str:
+    dim = ctx.get("dimension_inventory") or {}
+    extract = "、".join(dim.get("extract") or [])
+    forbidden = "、".join(dim.get("forbidden") or [])
+    return (
+        f"维度不是一个孤零零的「14」。代码里的口径是：\n"
+        f"- {dim.get('extract_count', 14)} 个提炼维度（NARRATIVE_DIMENSIONS）：{extract}\n"
+        f"- 运行时额外算 1 个「文风漂移分析」（开头与结尾的文风差多少），"
+        f"落库合计 {dim.get('stored_count', 15)} 个维度——docs 表格里的「维度数 15」就是它\n"
+        f"- 另有 {dim.get('forbidden_count', 4)} 个反向禁忌维度：{forbidden}\n\n"
+        f"所以全部维度键是 {dim.get('total_keys', 19)} 个。快速档砍的是节拍序列、"
+        "高频场景模板、潜台词模式这三个提炼维度，落库维度随之从 15 降到 12。"
+    )
+
+
+def _faq_normalize(ctx: dict[str, Any]) -> str:
+    measured = ctx.get("measured") or {}
+    return (
+        "归一化干的事是「把同一个人的简称并回全名」。不做的直接后果不是文风差一点，"
+        "而是角色声音词典会把一个人拆成好几个人：\n\n"
+        "图谱是按提及次数抽角色的。书里「小落」出现得比「安小落」多，两个名字就各占一个名额，"
+        "各自学一套口头禅和句长。生成时你写「安小落」，档案里可能只匹配到「小落」那一份，"
+        "或者两份打架——同一个人一会儿冷嘲一会儿软语。\n\n"
+        "完整档的做法是拿语料词频做包含关系自证：短名如果高频出现在长名里，就并进长名。"
+        f"实测里真截断的占比 ≤1.1%、真名 ≥67%，分得很开；《大奉打更人》那种 "
+        f"{measured.get('corpus_chapters', 833)} 章的语料，513 个角色节点最后收敛成 19 个规范名"
+        "+12 条别名映射，还把「相信/冷声」这种伪角色清掉了。平衡档不做这一步，所以快，"
+        "但简称噪声会留在档案里。"
+    )
+
+
+def _faq_full(ctx: dict[str, Any]) -> str:
+    total = int(ctx.get("corpus_total_chapters") or 0)
+    full = next((t for t in (ctx.get("tiers") or []) if t["key"] == "full"), {})
+    ratio = int((full.get("sample_ratio") or 0) * 100)
+    # 全本耗时不能取档位的 estimated_minutes：采样被覆盖成 200 章后，
+    # 那个数会变成 200 章的估算，和「全本 1528 章」对不上。
+    full_minutes = ctx.get("full_corpus_minutes") or full.get("estimated_minutes") or "?"
+    return (
+        f"先说现状：代码里没有第四个「全本」档位，只有完整/平衡/快速三档。"
+        f"完整档本身是按语料 {ratio}% 采样，不是整本灌进去。\n\n"
+        f"你要的「全本完整蒸馏」可以做到：我可以把采样章数覆盖成这批语料共 {total} 章"
+        "（0 在我这里表示全本），维度和清洗仍按完整档走。这个覆盖会写进蒸馏指纹，"
+        "所以改完必须重跑，不会命中旧档案。\n\n"
+        f"代价是时间随章数线性涨：全本 {total} 章按唯一实测点外推大约 "
+        f"{full_minutes} 分钟；"
+        "如果只是想验证效果，先压到 200 章更划算，确认方向对了再跑全本。"
+    )
+
+
+def _faq_cost(ctx: dict[str, Any]) -> str:
+    full = _tier_phrase(ctx, "full")
+    balanced = _tier_phrase(ctx, "balanced")
+    return (
+        f"耗时分两段。蒸馏：{_corpus_phrase(ctx)}，完整档 {full}；平衡档 {balanced}；"
+        "快速档分钟级。生成：一段 3000 字通常一两分钟，段数是串行的，2 段基本就是 2 倍。\n\n"
+        "钱按 token 算，语料越长蒸馏越贵——这也是快速档存在的意义：先确认管线通不通，"
+        "再决定要不要花完整档的时间。所有分钟数都是按文档里唯一一次实测外推的估算，"
+        "换模型或限流会变。"
+    )
+
 
 _FAQ_CONTINUE = (
     "不能。生成链路是「读前面已写内容的摘要，然后往后追加」，它没有在前面某段插入、"
     "再重写后续的能力，所以我只把最后一段作为起点。\n\n"
     "想从中间开始，得先在项目工作台把后面的段删掉，或者新建一个项目只导入到你要的位置，"
     "再回来续写。这样不会破坏已有正文。"
-)
-
-_FAQ_COST = (
-    "耗时主要在两处：蒸馏和生成。蒸馏完整档 833 章约 42 分钟；平衡/快速固定 30 章，分钟级。"
-    "生成按段算，一段 3000 字通常一两分钟，具体看模型和限流；段数是串行的，时间基本按倍数走。\n\n"
-    "钱按 token 算，语料越长蒸馏越贵——这也是快速档存在的意义：先确认管线通不通，"
-    "再决定要不要花完整档的时间。"
 )
 
 _FAQ_CORPUS = (
@@ -437,15 +527,32 @@ _FAQ_BACK = (
     "在最后的汇总页，点任意一行也能直接跳回那一项改。刷新页面也不会丢——进度存在服务端。"
 )
 
+_FAQ_ARCHIVE = (
+    "「沿用现有档案」不是重新蒸馏，而是直接拿项目里已经算好的那份文风档案来写："
+    "秒级完成、不花模型钱，适合你只是想接着上次的文风写。\n\n"
+    "它的风险是可能和现在的语料/档位不一致（比如你后来加了参考书），"
+    "想确认一致就说「重新蒸馏」，我会按当前参数重跑。"
+)
 
-def _faq(text: str) -> str | None:
+
+def _faq(text: str, ctx: dict[str, Any]) -> str | None:
     t = text.strip()
-    if re.search(r"(全量|完整).*(蒸馏|档)|蒸馏.*(区别|差别|档位|是什么|啥)|42\s*分钟", t):
-        return _FAQ_DISTILL
+    if re.search(r"(归一化|别名|简称|小落|安小落|角色名).*(不准|为什么|影响|怎么|啥|什么)|"
+                 r"为什么.*(不|没).*归一化", t):
+        return _faq_normalize(ctx)
+    if re.search(r"(维度|多少维|14\s*维|15\s*维|19\s*维|维数)", t):
+        return _faq_dimensions(ctx)
+    if re.search(r"(全本|全量|整本|全部.*灌|完整语料)", t):
+        return _faq_full(ctx)
+    if re.search(r"(全量|完整).*(蒸馏|档)|蒸馏.*(区别|差别|档位|是什么|啥)|42\s*分钟|"
+                 r"三个档|三档", t):
+        return _faq_distill(ctx)
     if re.search(r"(续写|接着写|往下写).*(中间|指定|某段|跳|第几段)|能.*从.*段.*开始", t):
         return _FAQ_CONTINUE
     if re.search(r"(耗时|多久|多长时间|成本|多少钱|贵|慢|快)\s*(呢|吗|？|\?)?$", t) or "要多久" in t:
-        return _FAQ_COST
+        return _faq_cost(ctx)
+    if re.search(r"(沿用|现有档案|复用|不重跑)", t):
+        return _FAQ_ARCHIVE
     if re.search(r"语料.*(什么|哪|怎么|上传|来源|干|用)|语料库", t):
         return _FAQ_CORPUS
     if re.search(r"大纲|剧情圣经|bible", t):
@@ -465,7 +572,7 @@ def explain(
     question: dict[str, Any],
 ) -> str:
     """就地回答追问；无论答成什么，调用方都不会推进流程。"""
-    fixed = _faq(text)
+    fixed = _faq(text, ctx)
     if fixed:
         return fixed
 
@@ -502,8 +609,12 @@ def explain(
             + str(question.get("title") or "")
             + "」这一步。\n\n这一步的说明是：\n"
             + str(question.get("message") or "")
-            + "\n\n要求：只回答用户的问题，不要替用户做选择，不要催促，"
-            "不要编造上面没有的数字或承诺。150 字以内，直接说结论。"
+            + "\n\n【可用事实清单（唯一允许引用的数字）】\n"
+            + str(ctx.get("fact_sheet") or "（无事实清单，不要给任何具体数字）")
+            + "\n\n要求：1) 只回答用户的问题，不替用户做选择、不催促；"
+            "2) 可以往下追一层——先给结论，再解释机制或后果，但不要写成条款列表；"
+            "3) 只能使用上面事实清单里的数字/章数/维度数/耗时，清单没有就说不知道，"
+            "严禁自己编；4) 200 字以内，直接说。"
         )
         reply = get_assistant_provider().chat(system, text)
         reply = (reply or "").strip()

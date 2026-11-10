@@ -966,9 +966,51 @@ class AssistantWizardSession(Base):
     step_key = Column(String(32), nullable=False, default="branch")
     answers = Column(JSON, nullable=False, default=dict)
     history = Column(JSON, nullable=False, default=list)
+    #: 本轮引导的流程改写（白名单约束，见 wizard_flow）：
+    #: {"skip": ["outline"], "order": ["length", "style"], "custom": [{key,title,question,field,after}]}
+    #: 与 answers/history 分开存：后两者的语义（已选项/回退栈）不能被流程编辑污染。
+    overrides = Column(JSON, nullable=False, default=dict)
     #: 提交后的执行结果（stage: outline / ready / role / done，含蒸馏 job、大纲、
     #: 生成摘要）。刷新页面后据此恢复「已配置完」的状态，而不是重新问一遍。
     result = Column(JSON, nullable=True)
     status = Column(String(16), nullable=False, default="active", index=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
+class WizardActionAudit(Base):
+    """助理在引导里执行的每一次写操作（审计 + 撤销依据）。
+
+    产品约束：助理可以改**项目级配置与会话状态**（档位、采样章数、字数、
+    题材、风格、大纲、本次引导流程），但不能改全局配置、代码、其他项目，
+    也不能删除/覆盖已有正文。每次写操作都落一行，回复里必须能说出
+    「改了什么、从什么改成什么、影响是什么」，并且可以撤销。
+
+    ``undo_payload`` 是撤销时回写的旧值（结构因 target 而异）；
+    ``trigger_distill`` 这类已经开始跑的任务标 ``undoable=False``——
+    撤销只能恢复参数，不能假装任务没跑过。
+    """
+
+    __tablename__ = "wizard_action_audits"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    session_id = Column(Integer, nullable=True)
+    # assistant | user（当前只由助理在对话里触发；保留字段便于以后区分）
+    actor = Column(String(16), nullable=False, default="assistant")
+    # 触发时所在步骤（branch / distill / genre…），便于按对话回看
+    step_key = Column(String(32), nullable=True)
+    # set_tier | set_sampling | trigger_distill | set_length | set_genre |
+    # set_style | set_outline | skip_step | move_step | insert_question
+    action = Column(String(32), nullable=False)
+    # 被改的对象：project.narrative_tier / project.generation_length /
+    # session.answers.outline / session.overrides …
+    target = Column(String(64), nullable=False)
+    old_value = Column(JSON, nullable=True)
+    new_value = Column(JSON, nullable=True)
+    # 给人看的一句影响说明（耗时、生效时机、不可逆点）
+    impact = Column(Text, nullable=True)
+    undoable = Column(Boolean, nullable=False, default=True)
+    undo_payload = Column(JSON, nullable=True)
+    undone_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)

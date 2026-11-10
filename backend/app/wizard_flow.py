@@ -70,6 +70,18 @@ LENGTH_MAX = 8000
 CHAPTERS_MIN = 1
 CHAPTERS_MAX = 10
 
+#: 自定义问题的 key 前缀。自定义步骤只能来自 `overrides.custom`，
+#: 不能让模型凭空发明一个不在白名单里的步骤（否则 next_step 直接断）。
+CUSTOM_PREFIX = "custom:"
+
+#: 受保护的步骤：不允许跳过、不允许被排序挪走。
+#: 方向是分支入口，语料决定后面问什么，确认是提交前的最后一道闸。
+PROTECTED_STEPS = {"branch", "corpus", "confirm"}
+
+#: 自定义问题只允许落到这些真实字段（当前只有「这本书大概讲什么」）。
+#: 想加新字段必须先改这里 + 提交流程，模型不能自己填。
+CUSTOM_FIELDS = {"premise"}
+
 
 # ---------------------------------------------------------------------------
 # 步骤序列
@@ -81,7 +93,17 @@ def step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
 
     序列是**动态**的：选了语料才问蒸馏；项目本来就有参考语料或文风档案
     才问「是否沿用原风格」。回退时用同一条序列反查上一题，保证前后一致。
+
+    本轮引导的流程改写（`ctx["overrides"]`）在这里叠加，但**只做白名单
+    内的三种操作**：跳过可跳步骤、在可动步骤间换序、插入字段已登记的自定义
+    问题。branch / corpus / confirm 永远在首位/末位，answers/history 的语义
+    完全不变。
     """
+    base = _base_step_order(kind, answers, ctx)
+    return _apply_overrides(base, ctx)
+
+
+def _base_step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> list[str]:
     if kind == KIND_ORIGINAL:
         steps = [FIRST_STEP, "corpus"]
         if _has_corpus(answers, ctx):
@@ -98,6 +120,43 @@ def step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
         return [FIRST_STEP, "character", "scene", "confirm"]
     # 还没选方向：只有第一题
     return [FIRST_STEP]
+
+
+def _apply_overrides(steps: list[str], ctx: dict[str, Any]) -> list[str]:
+    """把白名单内的流程改写叠到基础序列上（保证每一步仍可渲染/可校验）。"""
+    ov = ctx.get("overrides") or {}
+    skip = {
+        s
+        for s in (ov.get("skip") or [])
+        if s in SKIPPABLE and s not in PROTECTED_STEPS
+    }
+    base = [s for s in steps if s not in skip]
+    confirm = "confirm" if "confirm" in base else None
+    core = [s for s in base if s != confirm]
+
+    # 换序：只动可动步骤，受保护步骤保持原相对位置（branch/corpus 在头部）。
+    seq = [s for s in (ov.get("order") or []) if s in core and s not in PROTECTED_STEPS]
+    if seq:
+        head = [s for s in core if s in PROTECTED_STEPS]
+        movable = [s for s in core if s not in PROTECTED_STEPS]
+        rest = [s for s in movable if s not in seq]
+        core = head + seq + rest
+
+    # 插入自定义问题：只能插在已有步骤之后，key 必须来自 overrides.custom。
+    valid_keys = {
+        str(item.get("key"))
+        for item in (ov.get("custom") or [])
+        if item.get("key") and item.get("field") in CUSTOM_FIELDS
+    }
+    for item in ov.get("custom") or []:
+        key = str(item.get("key") or "")
+        if key not in valid_keys or key in core:
+            continue
+        after = item.get("after")
+        idx = core.index(after) + 1 if after in core else len(core)
+        core.insert(idx, key)
+
+    return core + ([confirm] if confirm else [])
 
 
 def _has_corpus(answers: dict[str, Any], ctx: dict[str, Any]) -> bool:
@@ -159,8 +218,11 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
     }
     builder = builders.get(step)
     if builder is None:
-        raise ValueError(f"未知引导步骤：{step}")
-    body = builder(kind, answers, ctx)
+        if not step.startswith(CUSTOM_PREFIX):
+            raise ValueError(f"未知引导步骤：{step}")
+        body = _q_custom(step, answers, ctx)
+    else:
+        body = builder(kind, answers, ctx)
     card = body.get("card") or {}
     has_default = card.get("default") is not None and card.get("default") != ""
     body.update(
@@ -191,13 +253,14 @@ SKIPPABLE = {"genre", "style", "length", "chapters", "outline", "scene"}
 # ---------------------------------------------------------------------------
 #
 # 文案口径：先说「这一步在决定什么」，再说各选项的代价（时间/成本/质量/
-# 可控性）与默认值，最后给推荐和「什么情况下该选别的」。数字都来自仓库
-# 里已核实的事实（蒸馏档位定义见 `style/narrative.py::TIER_REGISTRY`，
-# 833 章约 42 分钟见 `docs/style-distillation-tiers.md` 实测），不编造。
+# 可控性）与默认值，最后给推荐和「什么情况下该选别的」。数字一律来自
+# `wizard_facts`（档位定义 + 唯一实测点 + 当前项目语料），这里不再硬编码。
 
 
 def _message(step: str, kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
     """把步骤渲染成两段对话文字（不含卡片）。"""
+    if step.startswith(CUSTOM_PREFIX):
+        return _msg_custom(step, ctx)
     builder = _MESSAGE_BUILDERS.get(step)
     if builder is None:
         raise ValueError(f"未知引导步骤：{step}")
@@ -218,10 +281,15 @@ def _msg_branch(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) 
 def _msg_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
     novels = ctx.get("novels") or []
     if novels:
+        sizes = "、".join(
+            f"《{_display_title(n)}》{n['chapters']} 章"
+            + (f"（完整档约 {n['full_minutes']} 分钟）" if n.get("full_minutes") else "")
+            for n in novels[:4]
+        )
         opening = (
-            f"这里有 {len(novels)} 本已上传的语料可选（可多选）。"
-            "选了会怎样：蒸馏把它的句长、对话密度、场景切换节奏提炼成文风档案，"
-            "写出来更贴那本书；代价是蒸馏要跑模型，一本书用完整档大约几十分钟。"
+            f"这里有 {len(novels)} 本已上传的语料可选（可多选）：{sizes}。"
+            "选了会怎样：蒸馏把它的句长、对话密度、场景切换节奏和角色说话方式提炼成文风档案，"
+            "写出来更贴那本书；代价是蒸馏要跑模型，选中几本就按合计章数叠时间。"
         )
     else:
         opening = (
@@ -237,22 +305,93 @@ def _msg_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) 
 
 
 def _msg_distill(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
-    text = (
-        "蒸馏是把参考语料的写法压成一份可复用的档案，生成时注入到提示词里。"
-        "三个档位差在采样量和维度：完整档按语料 30% 采样、14 个维度、带角色名归一化和"
-        "全量伪角色清洗，最像原著也最慢——833 章的语料实测约 42 分钟；"
-        "平衡档固定取 30 章、维度一样但不做角色名归一化，简称可能有点噪声，耗时中等；"
-        "快速档也是 30 章，但砍掉节拍序列、高频场景模板、潜台词模式三个维度，"
-        "也不清洗角色名，只适合先验证管线通不通。\n\n"
-        "默认给完整档：既然都投喂了，文风不准等于白投。"
-        "只想快点看到正文效果选平衡；快速档只建议试跑，别拿它出成品。"
-    )
-    if ctx.get("archive_exists"):
-        text += (
-            "\n\n这个项目已经有蒸馏档案了，也可以选「沿用现有档案」——秒级完成、不花模型钱，"
-            "适合你只是想接着上次的文风写。"
+    books = ctx.get("corpus_books") or []
+    total = int(ctx.get("corpus_total_chapters") or 0)
+    tiers = {t["key"]: t for t in (ctx.get("tiers") or [])}
+
+    if books:
+        names = "、".join(f"《{_display_title(b)}》" for b in books)
+        opening = (
+            f"你这个项目投喂的是{names}，合计 {total} 章 / "
+            f"{(int(ctx.get('corpus_total_chars') or 0)) / 10000:.1f} 万字。"
+            "蒸馏会把它的句长、对白密度、场景切换节奏、角色说话方式压成一份档案，"
+            "写正文时注入提示词。"
         )
-    return text
+    else:
+        opening = (
+            "这个项目还没投喂语料，没有东西可蒸。想仿某本书，先去「语料库」上传 txt，"
+            "回来再选这一档。"
+        )
+
+    full = tiers.get("full")
+    balanced = tiers.get("balanced")
+    fast = tiers.get("fast")
+
+    def line(t: dict[str, Any] | None, what: str) -> str:
+        if not t:
+            return ""
+        return (
+            f"{t['name']}：约 {t['sampled_chapters']} 章、{t['dimension_count']} 个维度，"
+            f"预计约 {t['estimated_minutes']} 分钟。{what}"
+        )
+
+    parts = [
+        opening,
+        "三档在这批语料上的实际差别（耗时按仓库里唯一一次实测外推，不是每档实测）：",
+        line(
+            full,
+            "14 个提炼维度全开，带角色名归一化和全量伪角色清洗——"
+            "「小落→安小落」「宫爵→南宫爵」会并回同一个角色，声音词典才不至于张冠李戴。",
+        ),
+        line(
+            balanced,
+            "维度一样，但关掉角色名归一化：简称会各算一个角色，配角台词可能串；"
+            "清洗也只做词表那层。",
+        ),
+        line(
+            fast,
+            "砍掉节拍序列、高频场景模板、潜台词模式三个维度（14→11），角色名完全不清洗；"
+            "只适合先验证管线通不通，不建议拿它出成品。",
+        ),
+        "选哪一档，接下来都是同一条链：起后台蒸馏任务 → 项目工作台显示逐块进度 → "
+        "跑完才允许写正文（没跑完去生成会直接 409）。",
+    ]
+
+    if full:
+        parts.append(
+            "另外，你之前提过「全本完整蒸馏」：代码里并没有第四个档位，完整档本身就是"
+            f"按语料 {int((full.get('sample_ratio') or 0) * 100)}% 采样。"
+            f"但我可以直接把采样章数覆盖成这批语料共 {total} 章（说「采样改成全本」），"
+            "或者压到 200 章（说「采样改成 200 章」）。这个覆盖会进蒸馏指纹，"
+            "改完必须重跑才会生效——不会偷偷复用旧档案。"
+        )
+
+    archive = ctx.get("archive")
+    if archive:
+        parts.append(
+            "这个项目已经有档案了："
+            f"{archive.get('tier_name') or archive.get('tier')}档，"
+            f"{archive.get('n_chapters')} 章，{archive.get('rule_count')} 条规则 / "
+            f"{archive.get('dimension_count')} 个维度。"
+            "也可以选「沿用现有档案」——秒级复用、不花模型钱，适合接着上次的文风写。"
+        )
+
+    last = ctx.get("last_tier")
+    override = ctx.get("sampling_override")
+    if last or override is not None:
+        bits = []
+        if last:
+            bits.append(f"上次选的是 {last} 档")
+        if override is not None:
+            cap = int(override)
+            bits.append("采样覆盖是全本" if cap <= 0 else f"采样覆盖是 {cap} 章")
+        parts.append("；".join(bits) + "。要改直接说，不用重新答一遍。")
+
+    parts.append(
+        "我的建议：既然都投喂了，默认走完整档——文风不准等于白投。"
+        "只想快点看到正文效果选平衡；快速档只用来试跑。"
+    )
+    return "\n\n".join(p for p in parts if p)
 
 
 def _msg_genre(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
@@ -366,6 +505,25 @@ def _msg_confirm(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
     )
 
 
+def _custom_item(step: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    """从 overrides 里取自定义问题的定义；拿不到就报错，不静默编一个。"""
+    for item in (ctx.get("overrides") or {}).get("custom") or []:
+        if str(item.get("key")) == step:
+            return item
+    raise ValueError(f"找不到自定义问题：{step}")
+
+
+def _msg_custom(step: str, ctx: dict[str, Any]) -> str:
+    item = _custom_item(step, ctx)
+    question = str(item.get("question") or item.get("title") or "这个问题是你自己加的")
+    return (
+        f"{question}\n\n"
+        "这是你在本轮引导里自己加的问题，答案会写进项目简介（premise），"
+        "后面的写作和对话都会参考它。不想答可以说「跳过这步」；"
+        "想删掉这个问题，说「撤销这次流程修改」。"
+    )
+
+
 _MESSAGE_BUILDERS = {
     "branch": _msg_branch,
     "corpus": _msg_corpus,
@@ -408,12 +566,21 @@ def ack_for(step: str, value: Any, answers: dict[str, Any], ctx: dict[str, Any])
             return "好，沿用现有档案，不用重跑蒸馏，秒级完成。"
         for t in ctx.get("tiers") or []:
             if t["key"] == value:
+                est = t.get("estimated_minutes")
+                sampled = t.get("sampled_chapters")
+                detail = (
+                    f"{sampled} 章、预计约 {est} 分钟"
+                    if est is not None
+                    else "耗时按档位默认口径"
+                )
                 if t["key"] == "full":
-                    return "好，完整档。833 章的语料大约 42 分钟，跑完才开始写。"
+                    return f"好，完整档，{detail}，跑完才开始写。"
                 if t["key"] == "balanced":
-                    return "好，平衡档，固定取 30 章、维度齐全，比完整档快不少。"
-                return "好，快速档，只够验证管线，出成品前建议换档重跑。"
+                    return f"好，平衡档，{detail}（维度齐全，但不做角色名归一化）。"
+                return f"好，快速档，{detail}，只够验证管线，出成品前建议换档重跑。"
         return f"好，蒸馏档位记为 {value}。"
+    if step.startswith(CUSTOM_PREFIX):
+        return "好，记下了，会写进项目简介。" if value else "好，这条先空着。"
     if step == "genre":
         return f"好，{value}。"
     if step == "style":
@@ -470,7 +637,17 @@ def _q_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) ->
         {
             "value": int(n["id"]),
             "label": _display_title(n) or f"语料 #{n['id']}",
-            "desc": " · ".join(x for x in [n.get("genre") or "", n.get("author") or ""] if x)
+            "desc": " · ".join(
+                x
+                for x in [
+                    f"{n['chapters']} 章 / {n['chars'] / 10000:.1f} 万字"
+                    if n.get("chapters")
+                    else "",
+                    n.get("genre") or "",
+                    n.get("author") or "",
+                ]
+                if x
+            )
             or "已上传语料",
         }
         for n in novels
@@ -507,18 +684,24 @@ def _q_distill(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
         "none": "不清洗伪角色",
     }
     for t in tiers:
-        if t.get("sampling_mode") == "percentage":
+        if t.get("sample_cap") is not None:
+            cap = int(t["sample_cap"])
+            sampling = "全本（不抽样）" if cap <= 0 else f"最多 {cap} 章"
+        elif t.get("sampling_mode") == "percentage":
             sampling = f"按语料 {int(round(float(t.get('sample_ratio') or 0) * 100))}% 采样"
         else:
             sampling = f"固定 {t.get('fixed_chapters') or 30} 章"
-        desc = f"{sampling}｜{t['dimension_count']} 维｜{t['cost_hint']}"
+        desc = f"{sampling}｜{t['dimension_count']} 维｜{t.get('cost_hint') or ''}"
         if t.get("normalize_character_names"):
             desc += "｜角色名归一化"
         else:
             desc += "｜不做角色名归一化"
         desc += "｜" + cleaning.get(t.get("fake_character_cleaning"), "")
-        if t["key"] == "full":
-            desc += "｜参考：833 章语料约 42 分钟（docs 实测）"
+        if t.get("estimated_minutes") is not None:
+            desc += (
+                f"｜本语料约 {t.get('sampled_chapters')} 章、"
+                f"预计约 {t['estimated_minutes']} 分钟"
+            )
         options.append(
             {
                 "value": t["key"],
@@ -721,6 +904,21 @@ def _q_scene(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> 
     }
 
 
+def _q_custom(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """渲染用户自己插入的问题（字段已登记，答案落到 premise）。"""
+    item = _custom_item(step, ctx)
+    return {
+        "title": str(item.get("title") or "补充一个问题"),
+        "why": str(item.get("question") or "这个问题是你自己加的。"),
+        "card": {
+            "type": "text",
+            "field": "premise",
+            "default": answers.get(step, ""),
+            "placeholder": "直接打字回答；不想答就说「跳过这步」",
+        },
+    }
+
+
 def _q_confirm(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     rows = summary_rows(kind, answers, ctx)
     label = {
@@ -758,6 +956,12 @@ def validate(
     ctx: dict[str, Any],
 ) -> Any:
     """校验并归一化用户提交的值。非法一律抛 AnswerError。"""
+    if step.startswith(CUSTOM_PREFIX):
+        value = str(raw or "").strip()
+        if len(value) > 500:
+            raise AnswerError("自定义问题的回答最多 500 字")
+        return value
+
     if step == "branch":
         value = str(raw or "").strip()
         if value not in KINDS:
@@ -876,6 +1080,8 @@ def default_for(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> Any:
 
 def echo_label(step: str, value: Any, kind: str | None, ctx: dict[str, Any]) -> str:
     """把提交的值翻成一句人话，作为用户气泡回显。"""
+    if step.startswith(CUSTOM_PREFIX):
+        return str(value) if value else "未填"
     if step == "branch":
         return KIND_LABELS.get(value, str(value))
     if step == "corpus":
@@ -906,8 +1112,11 @@ def echo_label(step: str, value: Any, kind: str | None, ctx: dict[str, Any]) -> 
 def summary_rows(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> list[dict[str, str]]:
     """汇总卡片逐行展示「这一步选了什么」。`step` 让前端能点回去改。"""
     rows: list[dict[str, str]] = []
+    skipped = set((ctx.get("overrides") or {}).get("skip") or [])
 
     def add(step: str, label: str, value: Any) -> None:
+        if step in skipped:
+            return
         rows.append({"step": step, "label": label, "value": echo_label(step, value, kind, ctx)})
 
     add("branch", "方向", kind or KIND_LABELS.get(kind or "", "未选"))
@@ -929,4 +1138,14 @@ def summary_rows(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
     elif kind == KIND_ROLE:
         add("character", "角色", answers.get("character") or "未选")
         add("scene", "情境", answers.get("scene") or "当前剧情时间线")
+
+    # 自定义问题：只展示本轮真正插入过的（白名单字段在 step_order 里已过滤）。
+    for item in (ctx.get("overrides") or {}).get("custom") or []:
+        key = str(item.get("key") or "")
+        if key and item.get("field") in CUSTOM_FIELDS:
+            add(key, str(item.get("label") or item.get("title") or "补充"), answers.get(key, ""))
+
+    # 按本轮真实顺序排，流程改写后汇总行也跟着动。
+    order = step_order(kind, answers, ctx)
+    rows.sort(key=lambda r: order.index(r["step"]) if r["step"] in order else 999)
     return rows

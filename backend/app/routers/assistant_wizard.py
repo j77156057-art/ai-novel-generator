@@ -19,7 +19,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
+from app import wizard_actions as actions
 from app import wizard_chat as chat
+from app import wizard_facts as facts
 from app import wizard_flow as flow
 from app.db import get_db
 from app.models import (
@@ -68,9 +70,15 @@ class WizardGotoIn(StrictRequest):
 
 
 class WizardSayIn(StrictRequest):
-    """用户直接打字说的话：可能是作答，也可能是追问。"""
+    """用户直接打字说的话：可能是作答，也可能是追问，也可能是「帮我改 X」。"""
 
     text: str
+
+
+class WizardUndoIn(StrictRequest):
+    """撤销一次写操作；不传 audit_id 就撤销最近一次可撤销的。"""
+
+    audit_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +118,16 @@ def _context(
     db: Session,
     project: Project,
     history: list[str] | None = None,
+    overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把项目现状压成状态机需要的 ctx。
 
     只做只读查询；`needs_distill` 用「有参考语料但项目没有档案」近似，
     不在这里跑指纹/全量哈希——那会把每次提问拖成秒级 IO。真的命中
     蒸馏库时，多问一次档位也只是返回一次 `from_cache: True`。
+
+    讲解需要的**硬事实**（语料章数/字数、已有档案、各档预计耗时、维度清单）
+    全部来自 `wizard_facts`，不在这里手写数字。
     """
     novels = (
         db.query(RawNovel)
@@ -179,10 +191,25 @@ def _context(
 
     corpus = [int(i) for i in (project.reference_novel_ids or [])]
     archive_exists = bool(project.style_narrative)
-    return {
+    stats = {int(b["id"]): b for b in facts.novel_stats(db, [n.id for n in novels])}
+    empty = {"chapters": 0, "chars": 0}
+    ctx = {
         "history": history or [],
+        "overrides": overrides or {},
         "novels": [
-            {"id": n.id, "title": n.title, "author": n.author, "genre": n.genre}
+            {
+                "id": n.id,
+                "title": n.title,
+                "author": n.author,
+                "genre": n.genre,
+                **{
+                    k: stats.get(int(n.id), empty)[k]
+                    for k in ("chapters", "chars")
+                },
+                "full_minutes": facts.estimate_minutes(
+                    stats.get(int(n.id), empty)["chapters"]
+                )["minutes"],
+            }
             for n in novels
         ],
         "tiers": list_tiers(),
@@ -196,6 +223,10 @@ def _context(
         "character_source": character_source,
         "generation_length": project.generation_length or 3000,
     }
+    # 语料真实章数/字数、已有档案、各档预计耗时、维度清单、模型可用事实清单。
+    ctx.update(facts.distill_context(db, project))
+    ctx["overrides"] = overrides or {}
+    return ctx
 
 
 def _session_view(session: AssistantWizardSession) -> dict[str, Any]:
@@ -205,6 +236,7 @@ def _session_view(session: AssistantWizardSession) -> dict[str, Any]:
         "step_key": session.step_key,
         "status": session.status,
         "answers": session.answers or {},
+        "overrides": session.overrides or {},
         "result": session.result or None,
         "can_back": bool(flow.prev_step(session.history or [], session.step_key)),
     }
@@ -221,7 +253,7 @@ def _state(
     `ack` 是「答完上一题」的回执：拼在新问题正文前面，让用户先看到
     「好，平衡档…」再读下一题，而不是答完立刻被弹一张新卡。
     """
-    ctx = _context(db, project, session.history or [])
+    ctx = _context(db, project, session.history or [], session.overrides or {})
     answers = session.answers or {}
     question = None
     if session.status == "active":
@@ -303,7 +335,7 @@ def answer(
         )
 
     answers = dict(session.answers or {})
-    ctx = _context(db, project, session.history or [])
+    ctx = _context(db, project, session.history or [], session.overrides or {})
 
     if body.skip:
         if not flow.build_question(session.step_key, answers, ctx).get("can_skip"):
@@ -356,7 +388,7 @@ def _advance(
     session.answers = answers
     session.history = history
 
-    ctx = _context(db, project, history)
+    ctx = _context(db, project, history, session.overrides or {})
     nxt = flow.next_step(session.kind, step, answers, ctx)
     if nxt is None:
         # 理论上只有 confirm 会走到末尾，而 confirm 已在上面处理。
@@ -386,8 +418,33 @@ def say(
 
     step = session.step_key
     answers = dict(session.answers or {})
-    ctx = _context(db, project, session.history or [])
+    ctx = _context(db, project, session.history or [], session.overrides or {})
     question = flow.build_question(step, answers, ctx)
+
+    # 先看是不是「帮我改 X」：档位、采样章数、字数、题材、风格、大纲、流程。
+    # 动作不推进引导步骤，只改项目/会话配置，并返回可撤销的审计 id。
+    act = actions.plan(body.text, ctx, step)
+    if act:
+        try:
+            res = actions.apply(db, project, session, act, ctx, background_tasks)
+        except (ValueError, flow.AnswerError) as exc:
+            return {
+                "mode": "clarify",
+                "message": str(exc),
+                "question": question,
+                "session": _session_view(session),
+            }
+        out = _state(db, project, session)
+        return {
+            "mode": "action",
+            "message": res["message"],
+            "action": res.get("action"),
+            "undo_id": res.get("undo_id"),
+            "undoable": res.get("undoable", False),
+            "question": out.get("question"),
+            "session": out["session"],
+        }
+
     parsed = chat.parse(step, body.text, answers, ctx, question)
 
     if parsed["kind"] == "question":
@@ -562,6 +619,14 @@ def _commit(
     else:
         raise HTTPException(status_code=400, detail="还没有选择方向")
 
+    # 本轮自定义问题（字段已在 wizard_flow 白名单校验过）落到项目真实字段。
+    for item in (session.overrides or {}).get("custom") or []:
+        if item.get("field") == "premise":
+            value = str(answers.get(item.get("key")) or "").strip()
+            if value:
+                project.premise = value
+                result["applied"].append("premise")
+
     session.status = "committed"
     session.result = result
     db.commit()
@@ -600,6 +665,40 @@ def _start_distill(db: Session, project: Project, tier: str, bg: BackgroundTasks
     from app.routers.projects import DistillStartRequest, start_distill
 
     return start_distill(project.id, DistillStartRequest(tier=tier), bg, db)
+
+
+@router.get("/{project_id}/actions")
+def list_actions(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """本项目的写操作审计（谁、哪一步、动作、旧值、新值、时间、是否已撤销）。"""
+    _require_project(db, project_id)
+    return {"items": actions.history(db, project_id)}
+
+
+@router.post("/{project_id}/undo")
+def undo_action(
+    project_id: int,
+    body: WizardUndoIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    """撤销一次写操作：不传 audit_id 就撤最近一次可撤销的。"""
+    project = _require_project(db, project_id)
+    session = _active_session(db, project_id)
+    if session is None:
+        raise HTTPException(status_code=409, detail="没有进行中的引导")
+    if body.audit_id is not None:
+        res = actions.undo_by_id(db, project, session, body.audit_id)
+    else:
+        res = actions.undo_last(db, project, session)
+    out = _state(db, project, session)
+    return {
+        "mode": "action",
+        "message": res["message"],
+        "action": res.get("action"),
+        "undo_id": None,
+        "undoable": False,
+        "question": out.get("question"),
+        "session": out["session"],
+    }
 
 
 def _build_bible(db: Session, project: Project) -> dict:
