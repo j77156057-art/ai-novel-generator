@@ -359,9 +359,44 @@ def requeue_worker(project_id: int, body: RequeueRequest, db: Session = Depends(
     """重捞失败的段：从 Generation 回读正文重新入队，行重置 running。
 
     自动重试只覆盖网络抖动；持续挂（key 失效/配额耗尽）修复后由人手动重捞——
-    毒批不自动重入队。
+    毒批不自动重入队。**超时 running 行（stuck）也可用本端点重捞**：
+    进程重启后内存队列丢失，库里只剩 running 行，不能只统计不处理。
     """
     _require_project(db, project_id)
     from app.kg.batch_worker import requeue_failed
 
     return requeue_failed(db, project_id, body.run_ids)
+
+
+@router.post("/worker/recover")
+def recover_worker(
+    project_id: int,
+    stuck_only: bool = Query(True, description="只重捞超过 STUCK_MINUTES 的 running 行"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """把停在 running 的批抽行重新入队（正文从 Generation 回读）。
+
+    ``stuck_only=false`` 等同启动恢复语义：本项目所有 running 行都重入队
+    （进程重启后内存队列一定为空，不必等 30 分钟超时）。
+    正文缺失的行会被标 failed + error，不会静默跳过。
+    """
+    _require_project(db, project_id)
+    from app.kg.batch_worker import ensure_worker, recover_running
+
+    ensure_worker()
+    return recover_running(db, project_id=project_id, stuck_only=stuck_only)
+
+
+@router.post("/worker/backfill")
+def backfill_worker(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """为「压根没有入队行」的已生成段主动补建 AgentRun 并入队。
+
+    覆盖 ``requeue`` 够不到的一类：段早于入队功能生成（或入队行随进程/事务
+    丢失），库里一行都没有。返回逐段 enqueued/skipped 明细；已存在行的段
+    不会被覆盖（reason 带现有 status）。
+    """
+    _require_project(db, project_id)
+    from app.kg.batch_worker import backfill_project, ensure_worker
+
+    ensure_worker()
+    return backfill_project(db, project_id)

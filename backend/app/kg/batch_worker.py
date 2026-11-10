@@ -402,49 +402,242 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
     }
 
 
-def requeue_failed(db: Session, project_id: int, run_ids: list[int]) -> dict:
-    """重捞失败的段（POST /kg-v3/worker/requeue 的数据源）。
+def _aware(dt):
+    """把 naive datetime 当 UTC（SQLite 读回来常是 naive）。"""
+    from datetime import timezone
 
-    按 run_id 找本项目的 failed 行 → 段文本从 Generation 表回读（enqueue 时
-    的文本没存，正文才是事实源）→ 重新入队 + 行重置 running。
-    文本已不存在的段报 missing（不静默丢）。
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_stuck(row: AgentRun, now=None) -> bool:
+    """running 且 started_at 超过 STUCK_MINUTES = 进程残留/真卡死。"""
+    from datetime import datetime, timezone
+
+    now = now or datetime.now(timezone.utc)
+    started = _aware(row.started_at)
+    return (row.status == "running" and started is not None
+            and (now - started).total_seconds() > STUCK_MINUTES * 60)
+
+
+def _note_dict(row: AgentRun) -> dict:
+    try:
+        value = json.loads(row.note) if row.note else {}
+    except (ValueError, TypeError):
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def _requeue_row(db: Session, row: AgentRun, *, reason: str) -> tuple[str, int | None]:
+    """把一行 AgentRun 重新入队（正文从 Generation 回读）。
+
+    返回 ``(outcome, segment_no)``：
+    - ``"requeued"``：已重新入队，行重置 running
+    - ``"missing"``：正文不存在/为空，行标 failed 并写 error（**不静默丢**）
     """
     from datetime import datetime, timezone
 
+    note = _note_dict(row)
+    seg_no = note.get("segment_no")
+    gen = db.scalar(select(Generation).where(
+        Generation.project_id == row.project_id,
+        Generation.segment_no == seg_no,
+    )) if seg_no is not None else None
+    if seg_no is None or gen is None or not (gen.text or "").strip():
+        row.status = "failed"
+        row.finished_at = datetime.now(timezone.utc)
+        _merge_note(row, {"error": f"{reason}_text_missing", "segment_no": seg_no})
+        _log.warning(
+            "kg 批抽重捞失败：项目 %s run %s 段 %s 的正文不存在，已标 failed 留痕",
+            row.project_id, row.id, seg_no)
+        return "missing", seg_no
+    _queue.put(_QueueItem(project_id=row.project_id, segment_no=seg_no,
+                          text=gen.text, chapter=note.get("chapter")))
+    row.status = "running"
+    row.started_at = datetime.now(timezone.utc)
+    row.finished_at = None
+    _merge_note(row, {"requeued_at": row.started_at.isoformat(),
+                      "requeue_reason": reason, "error": None})
+    return "requeued", seg_no
+
+
+def requeue_failed(db: Session, project_id: int, run_ids: list[int]) -> dict:
+    """重捞失败的段（POST /kg-v3/worker/requeue 的数据源）。
+
+    按 run_id 找本项目的 **failed 行或超时 running 行**（stuck）→ 段文本从
+    Generation 表回读（enqueue 时的文本没存，正文才是事实源）→ 重新入队 +
+    行重置 running。
+
+    为什么必须收 stuck running：进程重启后内存队列没了，库里只剩 status=running
+    的行；以前这些行只能被统计成 stuck，永远捞不回来（永久静默丢失）。
+
+    正文已不存在的段报 missing 并把行标 failed（不静默丢）。
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
     requeued = 0
     missing: list[int] = []
+    skipped: list[dict] = []
     for rid in run_ids:
         row = db.scalar(select(AgentRun).where(
             AgentRun.id == rid,
             AgentRun.project_id == project_id,
             AgentRun.role == ROLE_KG_EXTRACT,
         ))
-        if row is None or row.status != "failed":
+        if row is None:
+            skipped.append({"run_id": rid, "reason": "not_found"})
+            continue
+        if row.status != "failed" and not _is_stuck(row, now):
+            skipped.append({"run_id": rid, "reason": f"status:{row.status}"})
+            continue
+        outcome, _seg = _requeue_row(db, row, reason="manual_requeue")
+        if outcome == "requeued":
+            requeued += 1
+        else:
+            missing.append(rid)
+    if requeued or missing:
+        db.commit()
+    if requeued:
+        _signal_flush()
+    return {"requeued": requeued, "missing": missing, "skipped": skipped}
+
+
+def recover_running(db: Session, project_id: int | None = None, *,
+                    stuck_only: bool = False) -> dict:
+    """把库里停在 running 的批抽行重新入队（启动恢复 / 手动超时重捞）。
+
+    - ``stuck_only=False``（启动时用）：**所有** running 行都重入队。启动那一刻
+      本进程的内存队列一定是空的，所以「running 行」等价于「上一进程留下的、
+      永远没人处理的段」——不需要等它超时（30 分钟）才恢复。
+    - ``stuck_only=True``（手动 API）：只重捞超过 STUCK_MINUTES 的 running 行。
+
+    同一段存在多条 running 行时只重入队一次，其余标 failed（duplicate 留痕），
+    避免同一段被重复抽取。
+
+    返回 ``{"requeued", "missing", "skipped", "segments"}`` 并在日志里留痕；
+    正文缺失的行会被标 failed + error，而不是静默跳过。
+    """
+    stmt = select(AgentRun).where(
+        AgentRun.role == ROLE_KG_EXTRACT,
+        AgentRun.status == "running",
+    )
+    if project_id is not None:
+        stmt = stmt.where(AgentRun.project_id == project_id)
+    rows = db.scalars(stmt.order_by(AgentRun.id)).all()
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    requeued = 0
+    missing: list[int] = []
+    skipped: list[dict] = []
+    segments: list[dict] = []
+    seen: set[tuple[int, int | None]] = set()
+    for row in rows:
+        if stuck_only and not _is_stuck(row, now):
+            skipped.append({"run_id": row.id, "reason": "not_stuck"})
+            continue
+        note = _note_dict(row)
+        key = (row.project_id, note.get("segment_no"))
+        if key in seen:
+            row.status = "failed"
+            row.finished_at = now
+            _merge_note(row, {"error": "duplicate_running_row"})
+            skipped.append({"run_id": row.id, "reason": "duplicate_segment"})
+            continue
+        seen.add(key)
+        outcome, seg_no = _requeue_row(
+            db, row,
+            reason="startup_recover" if not stuck_only else "stuck_recover",
+        )
+        if outcome == "requeued":
+            requeued += 1
+            segments.append({"run_id": row.id, "project_id": row.project_id,
+                             "segment_no": seg_no})
+        else:
+            missing.append(row.id)
+    if requeued or missing or skipped:
+        db.commit()
+    if requeued:
+        _signal_flush()
+    if requeued or missing:
+        _log.info(
+            "kg 批抽恢复（%s）：重入队 %d 段，正文缺失 %d 行，跳过 %d 行%s",
+            "启动" if not stuck_only else "超时重捞", requeued, len(missing),
+            len(skipped), f"：{segments}" if segments else "",
+        )
+    return {"requeued": requeued, "missing": missing, "skipped": skipped,
+            "segments": segments}
+
+
+def backfill_project(db: Session, project_id: int) -> dict:
+    """为「压根没有入队行」的已生成段补建 AgentRun 并重新入队。
+
+    修的是 ``requeue_failed`` 够不到的那一类：段正文早就生成过，但当时
+    **还没有入队功能**（或入队行随进程/事务一起丢了）——库里一行 AgentRun 都
+    没有，于是既查不到也重捞不了，永久静默补不回来。
+
+    行为：
+    - 逐段（按 segment_no 去重，同段多行取最早一条）检查 request_hash 是否已有
+      AgentRun 行；有则跳过（reason 带现有 status），**不覆盖**已成功/已失败的账。
+    - 没有行且正文非空 → ``enqueue_segment`` 建行入队。
+    - 没有行但正文为空 → 跳过并 WARN（不伪造空任务）。
+
+    返回完整明细（enqueued / skipped），调用方负责 ``ensure_worker()`` 或
+    在脚本里 ``flush_project()``。幂等：重复调用不会为同一段建第二行。
+    """
+    gens = db.scalars(
+        select(Generation)
+        .where(Generation.project_id == project_id)
+        .order_by(Generation.segment_no, Generation.id)
+    ).all()
+    by_seg: dict[int, Generation] = {}
+    for g in gens:
+        by_seg.setdefault(g.segment_no, g)
+
+    enqueued: list[dict] = []
+    skipped: list[dict] = []
+    for seg_no, gen in sorted(by_seg.items()):
+        h = hashlib.sha256(f"{project_id}:{seg_no}".encode("utf-8")).hexdigest()
+        existing = db.scalar(select(AgentRun).where(
+            AgentRun.project_id == project_id,
+            AgentRun.role == ROLE_KG_EXTRACT,
+            AgentRun.request_hash == h,
+        ))
+        if existing is not None:
+            skipped.append({"segment_no": seg_no,
+                            "reason": f"already_has_run:{existing.status}",
+                            "run_id": existing.id})
+            continue
+        if not (gen.text or "").strip():
+            skipped.append({"segment_no": seg_no, "reason": "empty_text"})
+            _log.warning("kg 回填跳过：项目 %s 段 %s 正文为空（不伪造空任务）",
+                         project_id, seg_no)
             continue
         try:
-            note = json.loads(row.note) if row.note else {}
-        except (ValueError, TypeError):
-            note = {}
-        seg_no = note.get("segment_no")
-        gen = db.scalar(select(Generation).where(
-            Generation.project_id == project_id,
-            Generation.segment_no == seg_no,
-        )) if seg_no is not None else None
-        if seg_no is None or gen is None or not gen.text:
-            missing.append(rid)
+            rid = enqueue_segment(db, project_id, seg_no, gen.text, chapter=seg_no)
+        except KgEnqueueError as exc:
+            skipped.append({"segment_no": seg_no,
+                            "reason": f"enqueue_failed:{str(exc)[:120]}"})
+            _log.error("kg 回填入队失败：项目 %s 段 %s：%s", project_id, seg_no, exc)
             continue
-        _queue.put(_QueueItem(project_id=project_id, segment_no=seg_no,
-                              text=gen.text, chapter=None))
-        row.status = "running"
-        row.started_at = datetime.now(timezone.utc)
-        row.finished_at = None
-        _merge_note(row, {"requeued_at": row.started_at.isoformat(),
-                          "error": None})
-        requeued += 1
-    if requeued:
-        db.commit()
-        _signal_flush()
-    return {"requeued": requeued, "missing": missing}
+        enqueued.append({"segment_no": seg_no, "run_id": rid})
+
+    report = {
+        "project_id": project_id,
+        "total_segments": len(by_seg),
+        "enqueued": enqueued,
+        "skipped": skipped,
+        "counts": {"enqueued": len(enqueued), "skipped": len(skipped)},
+    }
+    _log.info(
+        "kg 回填：项目 %s 共 %d 段，补建入队 %d 段，跳过 %d 段%s",
+        project_id, len(by_seg), len(enqueued), len(skipped),
+        f"（跳过原因：{skipped}）" if skipped else "",
+    )
+    return report
 
 
 def _get_provider():
@@ -802,16 +995,18 @@ def _index_mentions_only(db: Session, project_id: int,
     幂等：同一 (project, entity, segment_no) 已有行（不论 kind）就跳过。
     """
     candidates = _mention_candidates(db, project_id)
-    if not candidates:
-        return 0
     guards = _item_mention_guards(db, project_id)
     seg_to_gen = _seg_to_gen(db, project_id, batch)
     added = 0
     touched: set[int] = set()
+    per_seg: dict[int, int] = {}
+    empty_segments: list[int] = []
     for item in batch:
         text = item.text or ""
         if not text:
+            empty_segments.append(item.segment_no)
             continue
+        per_seg[item.segment_no] = 0
         for ent_id, forms in candidates:
             existing = db.scalar(
                 select(KgMention.id).where(
@@ -822,6 +1017,7 @@ def _index_mentions_only(db: Session, project_id: int,
             )
             if existing is not None:
                 continue
+            # 正文命中守卫：必须真实命中规范名/aliases，绝不放宽成「按实体存在就算提及」
             form = _first_mentioned_form(text, forms, guards)
             if form is None:
                 continue
@@ -834,6 +1030,17 @@ def _index_mentions_only(db: Session, project_id: int,
             ))
             added += 1
             touched.add(ent_id)
+            per_seg[item.segment_no] += 1
+    # 可观测：哪些段补到了、哪些段一个物品名都没命中、哪些段连正文都没有。
+    # 「补不上」本身也是结论，不能只留一个 added=0 让人以为跑过了。
+    _log.info(
+        "kg alias mention 索引：项目 %s 候选实体 %d 个，命中段 %s，"
+        "未命中段 %s，空正文段 %s，共新增 %d 条",
+        project_id, len(candidates),
+        {s: n for s, n in per_seg.items() if n},
+        [s for s, n in per_seg.items() if not n],
+        empty_segments, added,
+    )
     if not added:
         return 0
     db.flush()

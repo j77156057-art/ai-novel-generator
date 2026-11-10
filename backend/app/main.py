@@ -46,6 +46,25 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 —— 收割是增强，不是启动的前提
         logging.getLogger(__name__).warning("蒸馏任务启动收割失败（已忽略）：%s", exc)
 
+    # —— KG 批抽启动恢复 ——
+    # 批抽队列是内存态：进程退出后，上一进程 enqueue 的段只剩库里
+    # status=running 的 AgentRun 行。启动时把 running 行按 Generation.text
+    # 重新入队，否则它们会永远停在 running（以前只被统计成 stuck，捞不回来）。
+    # 放在 init_db() 之后、用独立 session；失败不拖垮启动（恢复本身有日志留痕）。
+    try:
+        from app.kg.batch_worker import ensure_worker, recover_running
+
+        ensure_worker()
+        with SessionLocal() as db:
+            recovered = recover_running(db)
+        if recovered["requeued"] or recovered["missing"]:
+            logging.getLogger(__name__).warning(
+                "启动恢复 KG 批抽：重入队 %s 段，正文缺失 %s 行",
+                recovered["requeued"], len(recovered["missing"]),
+            )
+    except Exception as exc:  # noqa: BLE001 —— 恢复是增强，不是启动的前提
+        logging.getLogger(__name__).warning("KG 批抽启动恢复失败（已忽略）：%s", exc)
+
     # —— canon 词表来源记账：启动时打一行「这批用哪份词表」 ——
     # 默认 legacy（行为不变）；cleaned 需要在 .env 里显式打开。
     # 读不到 cleaned 词表时 canon_source 自己降级 legacy 并 WARN，不会返回空表。
