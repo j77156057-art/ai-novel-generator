@@ -58,6 +58,13 @@ ACTIONS: dict[str, dict[str, Any]] = {
         "undoable": True,
         "note": "下一段生成生效，不改已写正文。",
     },
+    "set_chapters": {
+        "target": "session.answers.chapters",
+        "params": f"{flow.CHAPTERS_MIN}..{flow.CHAPTERS_MAX}",
+        "confirm": False,
+        "undoable": True,
+        "note": "只改本轮这一提交写几段，不改已有正文。",
+    },
     "set_genre": {
         "target": "project.genre",
         "params": "flow.GENRE_HINTS 的键",
@@ -242,6 +249,14 @@ def plan(text: str, ctx: dict[str, Any], current_step: str | None = None) -> dic
         n = _first_int(t)
         if n is not None:
             return {"action": "set_length", "value": n}
+    # 「这次写几段」= 引导里的 chapters 步；与「采样 200 章」区分（上面已先判采样）
+    if re.search(r"段数|章节数", t) and (has_edit_verb or current_step != "chapters"):
+        n = _first_int(t)
+        if n is not None:
+            return {"action": "set_chapters", "value": n}
+    m = re.search(r"(?:这次|本轮)?\s*(?:写|生成)\s*(\d+)\s*(?:段|章)", t)
+    if m:
+        return {"action": "set_chapters", "value": int(m.group(1))}
     if re.search(r"题材|类型", t) and (has_edit_verb or current_step != "genre"):
         for genre in flow.GENRE_HINTS:
             if genre in t:
@@ -470,6 +485,29 @@ def apply(
         )
         return _ok(f"改了：单段字数 {old or '默认'} → {n}。影响：{impact}", row)
 
+    if kind == "set_chapters":
+        n = int(action.get("value") or 0)
+        if not (flow.CHAPTERS_MIN <= n <= flow.CHAPTERS_MAX):
+            raise ValueError(
+                f"段数要在 {flow.CHAPTERS_MIN}–{flow.CHAPTERS_MAX} 之间"
+            )
+        before = _capture(session)
+        answers = dict(before["answers"])
+        old = answers.get("chapters")
+        answers["chapters"] = n
+        session.answers = answers
+        db.commit()
+        impact = "只影响本轮提交时一次写几段；已写正文不改。"
+        row = _audit(
+            db, project, session,
+            action=kind, target="session.answers.chapters", old=old, new=n,
+            impact=impact, undo_payload=before,
+        )
+        return _ok(
+            f"改了：这次写 {old if old is not None else '默认'} → {n} 段。影响：{impact}",
+            row,
+        )
+
     if kind in ("set_genre", "set_style"):
         field = "genre" if kind == "set_genre" else "style"
         value = str(action.get("value") or "")
@@ -489,7 +527,8 @@ def apply(
 
     if kind == "set_outline":
         value = bool(action.get("value"))
-        answers = dict(getattr(session, "answers", None) or {})
+        before = _capture(session)
+        answers = dict(before["answers"])
         old = answers.get("outline")
         answers["outline"] = value
         session.answers = answers
@@ -498,7 +537,7 @@ def apply(
         row = _audit(
             db, project, session,
             action=kind, target="session.answers.outline", old=old, new=value,
-            impact=impact, undo_payload={"answers": dict(answers)},
+            impact=impact, undo_payload=before,
         )
         return _ok(
             f"改了：大纲 {'开' if value else '关'}（原值 {old if old is not None else '未设置'}）。影响：{impact}",
