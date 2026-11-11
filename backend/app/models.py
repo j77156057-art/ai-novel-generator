@@ -594,6 +594,14 @@ class GenerationSnapshot(Base):
     before_hash = Column(String(64), nullable=False)  # sha256(before_text)
     after_hash = Column(String(64), nullable=True)
     instruction = Column(Text, nullable=True)  # 本次重写要求，解释「为什么变成这样」
+    # 「指令限定局部、结果却像整段重写」的提示结构（JSON：公共前后缀长度、
+    # 字数变化、阈值）。None = 未命中。**只留痕、不阻断落库**，用于统计模型
+    # 对局部指令的服从度（见 app/generation/scope_guard.py）。
+    scope_mismatch = Column(JSON, nullable=True)
+    # 「重写后篇幅跌幅 >20%」的提示结构（JSON：前后字数/比例/阈值）。
+    # 与 scope_mismatch **分开记账**：首尾保留 ≠ 篇幅没被压缩。None = 未命中，
+    # 或用户明确要求精简/压缩。同样只留痕，不阻断落库。
+    length_drop = Column(JSON, nullable=True)
     agent_run_id = Column(Integer, ForeignKey("agent_runs.id"), nullable=True)
     # 快照时点的 plot_bible 指纹：回滚前比对，防「正文退了、名字没退」。
     bible_hash = Column(String(64), nullable=True)

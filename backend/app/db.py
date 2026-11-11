@@ -243,6 +243,13 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("generation_snapshots", "owner_pid", "INTEGER"),
         ("generation_snapshots", "owner_started_at", "VARCHAR(64)"),
         ("generation_snapshots", "heartbeat_at", "DATETIME"),
+        # —— 重写的局部范围校验（2026-11-12）——
+        # 「指令限定局部、结果却像整段重写」的提示结构。只加列、不回填：
+        # 存量快照的 NULL 语义是「未做过这项判定」，而不是「没有偏差」。
+        ("generation_snapshots", "scope_mismatch", "JSON"),
+        # —— 重写的篇幅跌幅（2026-11-12）——
+        # 与 scope_mismatch 分列：首尾是否保留、篇幅是否缩水是两类问题。
+        ("generation_snapshots", "length_drop", "JSON"),
     ]
     # v3.0 KG 索引定义（ensure_schema 同步建，_migrate_sqlite_columns 老库补建）
     v30_indexes = [

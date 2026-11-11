@@ -10,7 +10,8 @@
 
 停止条件（脚本内硬校验，触发即退出）：
 
-- ``--apply`` 时表已存在但缺的**不是**租约三列 → 不试图改表，报出来让人判断；
+- ``--apply`` 时表已存在但缺的**不是**租约三列/局部范围校验列 → 不试图改表，
+  报出来让人判断；
 - ``--rollback`` 时表不存在 → 直接返回「无需回滚」，不报错。
 
 v2（2026-11-12）加在途租约：``owner_pid`` / ``owner_started_at`` /
@@ -73,10 +74,17 @@ EXPECTED_COLS = (
     ("owner_pid", "INTEGER", 1),
     ("owner_started_at", "VARCHAR(64)", 1),
     ("heartbeat_at", "DATETIME", 1),
+    # v3 局部范围校验：存量行 NULL = 「未做过这项判定」，不是「没有偏差」
+    ("scope_mismatch", "JSON", 1),
+    # v4 篇幅跌幅提示：与 scope_mismatch 分列
+    ("length_drop", "JSON", 1),
 )
 
-#: 允许在已存在的表上自动 ADD COLUMN 的列（只限租约三列）。
-LEASE_COLS = ("owner_pid", "owner_started_at", "heartbeat_at")
+#: 允许在已存在的表上自动 ADD COLUMN 的列（租约三列 + 局部范围/篇幅跌幅）。
+AUTO_ADD_COLS = (
+    "owner_pid", "owner_started_at", "heartbeat_at",
+    "scope_mismatch", "length_drop",
+)
 
 CREATE_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS generation_snapshots (
@@ -104,6 +112,8 @@ CREATE TABLE IF NOT EXISTS generation_snapshots (
     owner_pid INTEGER,
     owner_started_at VARCHAR(64),
     heartbeat_at DATETIME,
+    scope_mismatch JSON,
+    length_drop JSON,
     PRIMARY KEY (id),
     FOREIGN KEY(project_id) REFERENCES projects (id),
     FOREIGN KEY(generation_id) REFERENCES generations (id),
@@ -210,12 +220,12 @@ def apply(db: pathlib.Path, backup_dir: pathlib.Path) -> dict:
     before = state(con)
     alters: list[tuple[str, str]] = []
     if before["table_exists"]:
-        # v2：只允许自动补租约三列；其它结构差异（缺非租约列、类型不符、
-        # 多余列）仍然停下来让人判断——迁移脚本不能变成隐式改表工具。
+        # v2/v3：只允许自动补租约三列与局部范围校验列；其它结构差异（缺其它
+        # 列、类型不符、多余列）仍然停下来让人判断——迁移脚本不能变成隐式改表工具。
         have = {name for name, _typ, _nullable in _cols(con)}
         alters = [
             (name, typ) for name, typ, _nullable in EXPECTED_COLS
-            if name in LEASE_COLS and name not in have
+            if name in AUTO_ADD_COLS and name not in have
         ]
         allowed = {f"缺列 {name} {typ}" for name, typ in alters}
         problems = [p for p in _check_columns(con) if p not in allowed]

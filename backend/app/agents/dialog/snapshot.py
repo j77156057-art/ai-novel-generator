@@ -583,8 +583,17 @@ def finalize_snapshot(
     expected_before: str | None,
     new_text: str,
     new_summary: Any,
+    scope_mismatch: dict | None = None,
+    length_drop: dict | None = None,
 ) -> None:
     """CAS 写正文 + 置 applied。**不 commit**，由调用方那次事务一起落。
+
+    Args:
+        scope_mismatch: 「指令限定局部、结果却像整段重写」的提示结构
+            （见 ``app.generation.scope_guard``）。只留痕，不参与任何拦截或
+            重试；与 applied 同一事务写入快照行，便于统计模型服从度。
+        length_drop: 「篇幅跌幅超过 20%」的提示结构，**单独一列**——与
+            scope_mismatch 分开记账，避免两类模型不服从混在一起。
 
     Raises:
         ConcurrentEdit: 正文已被别的入口改过（rowcount != 1）。
@@ -618,6 +627,8 @@ def finalize_snapshot(
             after_text=new_text,
             after_hash=text_hash(new_text),
             after_summary=new_summary,
+            scope_mismatch=scope_mismatch,
+            length_drop=length_drop,
             finished_at=now,
         )
         .execution_options(synchronize_session=False)
@@ -793,6 +804,10 @@ def snapshot_to_dict(snap: GenerationSnapshot) -> dict:
         "before_hash": snap.before_hash,
         "after_hash": snap.after_hash,
         "instruction": snap.instruction,
+        # 局部指令被整段重写的提示（None = 未命中）。只读留痕，不阻断。
+        "scope_mismatch": snap.scope_mismatch,
+        # 篇幅跌幅提示（None = 未命中/用户要求精简）。与 scope_mismatch 分列。
+        "length_drop": snap.length_drop,
         "agent_run_id": snap.agent_run_id,
         "bible_hash": snap.bible_hash,
         "error_reason": snap.error_reason,
