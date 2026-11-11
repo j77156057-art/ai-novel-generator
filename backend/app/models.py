@@ -477,6 +477,40 @@ class KgMention(Base):
     )
 
 
+class KgIngestQuarantine(Base):
+    """写侧文本归属门的隔离区（2026-11-19）。
+
+    入队正文与目标 ``generations.text`` 未能逐字一致时，本应落 kg_mentions /
+    kg_events / kg_relations 等业务表的行**不写入业务表**，整行快照转存到这里：
+
+    - 业务表保持干净 → 所有提示词读路径天然看不到隔离数据（默认排除）
+    - ``detail`` 是完整行快照 → 可查询、可统计、可回放/回滚
+    - ``run_id`` + ``segment_no`` → 可追溯到哪一次批抽、哪一段
+
+    拦截是正常分支：本表写入失败也不允许中断生成/抽取主链（调用方吞异常）。
+    """
+
+    __tablename__ = "kg_ingest_quarantine"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    #: AgentRun.id（哪一次批抽）；历史/手工调用可能为 NULL
+    run_id = Column(Integer, nullable=True)
+    segment_no = Column(Integer, nullable=True)
+    #: mention / event / relation / event_link / entity_knowledge / state_change /
+    #: foreshadow / entity
+    kind = Column(String(24), nullable=False)
+    #: text_mismatch（正文不一致）/ batch_tainted（同批有正文不一致段，本段无法比对）
+    reason = Column(String(32), nullable=False)
+    detail = Column(JSON, nullable=True)  # 完整行快照（回放用）
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("ix_kg_quarantine_project_kind", "project_id", "kind", "reason"),
+        Index("ix_kg_quarantine_run", "run_id"),
+    )
+
+
 class Generation(Base):
     """分段生成产物：每轮落库，支持段级续写。"""
 

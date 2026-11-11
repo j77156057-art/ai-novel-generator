@@ -330,6 +330,20 @@ def get_worker_status(project_id: int, db: Session = Depends(get_db)) -> dict:
     return worker_status(db, project_id)
 
 
+@router.get("/text-gate/no-generation")
+def get_text_gate_no_generation(project_id: int,
+                                db: Session = Depends(get_db)) -> dict:
+    """写侧文本归属门的 no_generation 累计（不阻断，只留痕报警）。
+
+    段号写错 / 写到不存在的段都会落进 no_generation；同项目累计超过阈值时
+    ``AgentRun.note.text_gate_alert`` 置告警，本端点给出同一口径的汇总。
+    """
+    _require_project(db, project_id)
+    from app.kg.batch_worker import text_gate_no_generation_summary
+
+    return text_gate_no_generation_summary(db, project_id)
+
+
 @router.get("/style-warnings")
 def get_style_warnings(project_id: int, db: Session = Depends(get_db)) -> dict:
     """v2.1：文风告警历史（按 segment_no 倒序）。

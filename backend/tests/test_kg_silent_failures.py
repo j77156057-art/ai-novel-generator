@@ -142,6 +142,37 @@ def test_worker_keeps_success_for_genuine_empty(monkeypatch, mem):
     assert "error" not in json.loads(row.note)
 
 
+def test_worker_marks_failed_when_projection_fails(monkeypatch, mem):
+    """抽取 + v3.0 落库都成功、但持有投影失败：批必须 failed 且错误可见。
+
+    以前这种情况会返回 success 然后 generated.db 一行没写，等于静默丢事实。
+    """
+
+    class ItemProvider:
+        def chat(self, system, user):
+            if "连通性探针" in system:
+                return "ok"
+            return ('{"entities": [{"kind": "item", "canonical_name": "神剑",'
+                    ' "aliases": [], "attrs": {"held_by": "许七安"}}],'
+                    ' "relations": [], "events": []}')
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("generated.db 写不进去")
+
+    Session, db = mem
+    monkeypatch.setattr(bw, "_get_provider", lambda: ItemProvider())
+    monkeypatch.setattr(bw, "_project_holdings", _boom)
+    rid = bw.enqueue_segment(db, 1, 1, "许七安握着神剑。", chapter=1)
+
+    bw._run_batches(1)
+
+    row = db.get(AgentRun, rid)
+    assert row.status == "failed"
+    note = json.loads(row.note)
+    assert "projection_failed" in note["error"]
+    assert "generated.db 写不进去" in note["error"]
+
+
 # ====================================================================
 # 3. enqueue_segment：入队行自己 commit
 # ====================================================================

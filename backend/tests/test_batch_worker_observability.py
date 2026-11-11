@@ -136,6 +136,12 @@ check_true("finished_at 已写", row2.finished_at is not None)
 note2 = _json.loads(row2.note)
 check_true("note 有 batch_stats", "batch_stats" in note2)
 check("batch_stats entities", note2["batch_stats"]["entities_upserted"], 1)
+# 门留痕：note 里带 no_generation 统计与告警槽（本批正文逐字一致 → 0 段）
+check("note no_generation 段清单",
+      note2["batch_stats"]["text_gate"]["no_generation"]["segments"], [])
+check("note no_generation 累计",
+      note2["batch_stats"]["text_gate"]["no_generation"]["cumulative_count"], 0)
+check_true("note 有 text_gate_alert 槽", "text_gate_alert" in note2)
 
 # ====================================================================
 # 3. LLM 失败 → 重试 ≤ RETRY_LIMIT 次 → failed
