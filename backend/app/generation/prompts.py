@@ -127,17 +127,25 @@ def merged_constraint_items(
     **bible 删除权威**（kg-cascade-protocol 阶段 2-3）：bible.characters **显式列了**
     名字时，未列入的 KG 角色约束整条剔除——用户在 bible 里删掉「顾辰逸」后，
     旧抽取事实再把他说成锁定角色，会与新设定矛盾（旧段不可改，但未来段必须只认新设定）。
-    保守边界：bible 无 characters 键或空列表 = 未显式宣告清册，不过滤
-    （老项目 bible 只有 relationships/foreshadowing 时不误伤全表）。
+
+    **空列表 ≠ 未宣告**（B3，2026-11-11）：`"characters": []` 是作者显式声明
+    「本项目现在没有任何角色」，必须把 KG 角色约束全部剔除；只有**没有**
+    `characters` 键（老项目 bible 只有 relationships/foreshadowing）才不过滤。
+    旧实现用 `if bible_chars` 把两者混为一谈，删光角色后旧 KG 角色会回流。
     """
-    bible_chars = (plot_bible.get("characters") or []) if plot_bible else []
+    bible = plot_bible if isinstance(plot_bible, dict) else None
+    has_roster = bible is not None and "characters" in bible
+    raw_chars = bible.get("characters") if bible else []
+    bible_chars = raw_chars if isinstance(raw_chars, list) else []
     kg_chars = reminders.get("character_constraints") or []
-    bible_fores = (plot_bible.get("foreshadowing") or []) if plot_bible else []
+    bible_fores = (bible.get("foreshadowing") or []) if bible else []
     kg_fores = [h.get("question") for h in (reminders.get("unresolved_plotholes") or [])]
-    if bible_chars and isinstance(bible_chars, list):
-        declared: set[str] = set()
-        for c in bible_chars:
-            declared.add(str((c.get("name") if isinstance(c, dict) else c) or "").strip())
+    if has_roster:
+        declared: set[str] = {
+            str((c.get("name") if isinstance(c, dict) else c) or "").strip()
+            for c in bible_chars
+        }
+        declared.discard("")
         if declared:
             kg_chars = [
                 c for c in kg_chars
@@ -145,6 +153,9 @@ def merged_constraint_items(
                 or not str(c.get("name") or "").strip()
                 or str(c.get("name")).strip() in declared
             ]
+        else:
+            # 显式空清册：本项目现在没有任何角色 → 不再带任何 KG 角色约束。
+            kg_chars = []
     return _merge_named(bible_chars, kg_chars), _merge_text(bible_fores, kg_fores)
 
 
@@ -197,6 +208,25 @@ def _inline_block(text: str | None) -> str:
     return f"{body}\n\n" if body else ""
 
 
+def _char_line(card: dict) -> str:
+    """一个角色一行。只渲染 bible 键契约里**登记为支持**的字段（B2）。
+
+    字段顺序固定：role → motivation → background。后两项没有时输出与旧版
+    逐字节相同（旧版只渲染 name/role/motivation）。
+    """
+    bits = [str(card.get("role") or "角色")]
+    motivation = card.get("motivation")
+    if motivation:
+        bits.append("动机：" + str(motivation))
+    background = (
+        card.get("background") or card.get("身世")
+        or card.get("来历") or card.get("背景")
+    )
+    if background:
+        bits.append("背景：" + str(background))
+    return f"  · {card.get('name')}（{'；'.join(bits)}）"
+
+
 def build_system_prompt(
     project_title: str,
     reminders: dict,
@@ -237,8 +267,7 @@ def build_system_prompt(
 
     char_lines = (
         "\n".join(
-            f"  · {c.get('name')}（{c.get('role') or '角色'}"
-            f"{('；动机：' + c.get('motivation') + '）') if c.get('motivation') else '）'}"
+            _char_line(c)
             for c in chars
             if isinstance(c, dict) and c.get("name")
         )

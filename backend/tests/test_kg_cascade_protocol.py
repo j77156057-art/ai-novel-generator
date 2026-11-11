@@ -239,9 +239,10 @@ check_true("删除权威: 伏笔不受影响（本轮只做角色侧）", "账�
 chars2, _ = merged_constraint_items(rem, {"relationships": []})
 check("保守: 无 characters 键不过滤", len(chars2), 3)
 
-# 保守边界 2：bible.characters 空列表 → 不过滤（未显式宣告清册）
+# B3（2026-11-11）：bible.characters **显式空列表** = 本项目现在没有任何角色，
+# 必须把 KG 角色约束全部剔除（旧语义「空列表不过滤」会让删掉的角色回流）。
 chars3, _ = merged_constraint_items(rem, {"characters": []})
-check("保守: characters 空列表不过滤", len(chars3), 3)
+check("B3: characters 空列表 = 无角色，KG 角色不回流", len(chars3), 0)
 
 # 保守边界 3：bible=None → 不过滤
 chars4, _ = merged_constraint_items(rem, None)

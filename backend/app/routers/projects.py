@@ -557,6 +557,23 @@ def patch_project(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
     _validate_book_fields(db, proj, updates)
+    if isinstance(updates.get("plot_bible"), dict):
+        # 老 PATCH 路径也要告警（B2）：ProjectOut 契约不动，告警放响应头。
+        # 主编辑路径是 POST /bible/apply（回执里直接带 warnings），这里只是
+        # 防止向导/老客户端写进无效键后完全无声。
+        from app.kg.bible import validate_bible_keys
+
+        warnings = validate_bible_keys(updates["plot_bible"])
+        if warnings:
+            logger.warning(
+                "project %s 的 plot_bible 含不会被使用的键：%s",
+                project_id,
+                [w["path"] for w in warnings],
+            )
+            response.headers["X-Bible-Warnings"] = quote(
+                json.dumps(warnings, ensure_ascii=False)
+            )
+            response.headers["X-Bible-Warnings-Count"] = str(len(warnings))
     for field, value in updates.items():
         setattr(proj, field, value)
     db.commit()
@@ -577,6 +594,44 @@ class BibleApplyRequest(BaseModel):
 
     bible: dict
     note: str | None = None  # 备注（"为什么改"留痕）
+
+
+class CharacterRenameRequest(StrictRequest):
+    """`POST /api/projects/{id}/bible/characters/rename` 的请求体。
+
+    继承 `StrictRequest`（未知字段 422）：把 `new_name` 拼成 `newname` 会被
+    立刻拒掉，而不是静默用空名去改名。
+    """
+
+    old_name: str
+    new_name: str
+    note: str | None = None
+
+
+class CharacterAddRequest(StrictRequest):
+    """`POST /api/projects/{id}/bible/characters/add` 的请求体。
+
+    `card` 原样走 `validate_bible_keys` 的封闭表——键不在支持清单里直接 400，
+    而不是写进去以后静默失效。
+    """
+
+    card: dict
+    note: str | None = None
+
+
+class CharacterRemoveRequest(StrictRequest):
+    """`POST /api/projects/{id}/bible/characters/remove` 的请求体。"""
+
+    name: str
+    note: str | None = None
+
+
+class CharacterRealmRequest(StrictRequest):
+    """`POST /api/projects/{id}/bible/characters/realm` 的请求体。"""
+
+    name: str
+    realm: str
+    note: str | None = None
 
 
 @router.post("/{project_id}/bible/apply")
@@ -602,6 +657,79 @@ def apply_bible_revision(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return r
+
+
+@router.post("/{project_id}/bible/characters/rename")
+def rename_bible_character(
+    project_id: int, body: CharacterRenameRequest, db: Session = Depends(get_db)
+) -> dict:
+    """角色改名：影响面判定 + bible / KG 实体联动。
+
+    拒绝也返回 200（`ok=false`）：这是业务判定结果，不是请求错误——回执里带
+    命中段号 / 次数 / 原因 / 替代路径，前端直接展开给用户看。
+
+    参数非法、目标角色不存在、图谱撞名走 400。
+    """
+    if db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.kg.character_rename import rename_character
+
+    try:
+        return rename_character(
+            db, project_id, body.old_name, body.new_name, note=body.note
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/bible/characters/add")
+def add_bible_character(
+    project_id: int, body: CharacterAddRequest, db: Session = Depends(get_db)
+) -> dict:
+    """加角色：写 `plot_bible.characters[]`，新卡必须过封闭键表。
+
+    新角色没有正文出场（total=0），后续改名无条件允许。
+    """
+    if db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.kg.character_edit import add_character
+
+    try:
+        return add_character(db, project_id, body.card, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/bible/characters/remove")
+def remove_bible_character(
+    project_id: int, body: CharacterRemoveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """删角色：从清册移除；删到空时保留 `characters=[]`（B3 的空清册语义）。"""
+    if db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.kg.character_edit import remove_character
+
+    try:
+        return remove_character(db, project_id, body.name, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/bible/characters/realm")
+def set_bible_character_realm(
+    project_id: int, body: CharacterRealmRequest, db: Session = Depends(get_db)
+) -> dict:
+    """改境界：写 `characters[].境界`（或 `修炼.当前境界`），走 power 块注入。"""
+    if db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.kg.character_edit import set_character_realm
+
+    try:
+        return set_character_realm(
+            db, project_id, body.name, body.realm, note=body.note
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{project_id}/bible/revisions")

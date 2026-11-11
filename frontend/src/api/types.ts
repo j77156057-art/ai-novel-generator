@@ -143,6 +143,15 @@ export interface KgBibleApplyResult {
   diff: KgBibleDiff;
   conflicts: KgBibleConflict[];
   conflicts_count: number;
+  /** 写入但不会被生成链路读取的键（B2）：unsupported / unknown / shape。 */
+  warnings?: KgBibleKeyWarning[];
+  warnings_count?: number;
+}
+
+export interface KgBibleKeyWarning {
+  path: string;
+  disposition: "unsupported" | "unknown" | "shape";
+  message: string;
 }
 
 export interface KgBibleRevisionListItem {
@@ -154,6 +163,61 @@ export interface KgBibleRevisionListItem {
   source: string;
   note: string | null;
   created_at: string | null;
+}
+
+/**
+ * POST /projects/{id}/bible/characters/rename 响应。
+ *
+ * 拒绝是业务判定（200 + ok=false），不是请求错误；`receipt` 是给人看的原因，
+ * `alternatives` 是替代路径。`scope` 是判定依据（正文逐段精确计数）。
+ */
+export interface KgCharacterRenameScope {
+  source: "generations.text";
+  segment_count: number;
+  last_segment: number | null;
+  hits: { segment_no: number; count: number }[];
+  segments: number[];
+  total: number;
+  only_last_segment: boolean;
+  summary_occurrences: number;
+  threshold: number;
+  allowed: boolean;
+}
+
+export interface KgCharacterRenameResult {
+  ok: boolean;
+  decision: "allowed" | "denied";
+  old_name: string;
+  new_name: string;
+  scope: KgCharacterRenameScope;
+  receipt: string;
+  alternatives: string[];
+  bible: KgBibleApplyResult | null;
+  entity: {
+    updated: boolean;
+    entity_id: number | null;
+    canonical_name: string;
+    aliases: string[];
+  } | null;
+}
+
+/**
+ * 角色编辑三入口（加 / 删 / 改境界）的响应。
+ *
+ * `receipt` 是人话回执；`bible` 是 apply 的结果（revision + diff + 冲突 + 键告警）。
+ * `roster_empty` 为 true 时表示清册已删空（B3 语义：提示词会剔除所有旧图谱角色）。
+ */
+export interface KgCharacterEditResult {
+  ok: boolean;
+  action: "add" | "remove" | "set_realm";
+  name: string;
+  receipt: string;
+  roster_size?: number;
+  roster_empty?: boolean;
+  relationships_removed?: number;
+  field?: "境界" | "修炼.当前境界";
+  validated?: boolean;
+  bible: KgBibleApplyResult;
 }
 
 export interface ProjectOut {

@@ -9,6 +9,7 @@ import type {
   Graph,
   KgMergeResult,
   KgRebuildResult,
+  KgCharacterRenameResult,
   KgStatus,
   LlmConfig,
   NarrativeTier,
@@ -99,6 +100,7 @@ const bibleEditResult = ref<{
   diff_removed: number;
   diff_changed: number;
   conflicts: { kind: string; kg_key: string; kg_value: string; bible_field: string; bible_value: string }[];
+  warnings: { path: string; disposition: string; message: string }[];
 } | null>(null);
 const bibleRevisions = ref<{ revision_no: number; created_at: string | null; note: string | null; conflicts_count: number }[]>([]);
 const bibleRevisionsOpen = ref(false);
@@ -154,6 +156,7 @@ async function applyBibleEdit() {
       diff_removed: Object.keys(r.diff.removed).length,
       diff_changed: Object.keys(r.diff.changed).length,
       conflicts: r.conflicts,
+      warnings: r.warnings ?? [],
     };
     // 同步 project.plot_bible（KG 工作台读它）
     if (project.value) {
@@ -170,6 +173,181 @@ async function applyBibleEdit() {
 function dismissBibleResult() {
   bibleEditResult.value = null;
 }
+
+// ===== 角色改名（只允许影响不大的改名）=====
+// 口径：旧名从未出现在正文，或只出现在最后一段且 ≤3 次。后端算覆盖并回执；
+// 拒绝也返回 200 + ok=false，这里原样展示原因和替代路径，不吞掉。
+const renameOpen = ref(false);
+const renameOld = ref("");
+const renameNew = ref("");
+const renameBusy = ref(false);
+const renameErr = ref<string | null>(null);
+const renameResult = ref<KgCharacterRenameResult | null>(null);
+
+function openRename(oldName: string) {
+  renameOpen.value = true;
+  renameOld.value = oldName;
+  renameNew.value = "";
+  renameErr.value = null;
+  renameResult.value = null;
+}
+
+async function submitRename() {
+  const next = renameNew.value.trim();
+  if (!next) return;
+  renameBusy.value = true;
+  renameErr.value = null;
+  renameResult.value = null;
+  try {
+    const r = await api.renameBibleCharacter(projectId, renameOld.value, next);
+    renameResult.value = r;
+    if (!r.ok) return;
+    // 与后端一致地更新本地 bible（不重新拉整项目）
+    if (bible.value) {
+      const nextBible: PlotBible = JSON.parse(JSON.stringify(bible.value));
+      for (const c of nextBible.characters ?? []) {
+        if (c.name === renameOld.value) c.name = next;
+      }
+      for (const rel of nextBible.relationships ?? []) {
+        if (rel.a === renameOld.value) rel.a = next;
+        if (rel.b === renameOld.value) rel.b = next;
+      }
+      bible.value = nextBible;
+      if (project.value) {
+        project.value = { ...project.value, plot_bible: nextBible };
+      }
+    }
+  } catch (e) {
+    renameErr.value = errorText(e);
+  } finally {
+    renameBusy.value = false;
+  }
+}
+
+// ===== 角色编辑三入口（加 / 删 / 改境界）=====
+// 三者都不改已有正文，只改 bible 清册；后端写 revision 并回执。
+const charAddOpen = ref(false);
+const charAddName = ref("");
+const charAddRole = ref("");
+const charAddMotivation = ref("");
+const charAddBackground = ref("");
+const charAddBusy = ref(false);
+const charAddErr = ref<string | null>(null);
+
+function openCharAdd() {
+  charAddOpen.value = true;
+  charAddName.value = "";
+  charAddRole.value = "";
+  charAddMotivation.value = "";
+  charAddBackground.value = "";
+  charAddErr.value = null;
+  charEditReceipt.value = null;
+}
+
+async function submitCharAdd() {
+  const name = charAddName.value.trim();
+  if (!name) {
+    charAddErr.value = "角色名不能为空";
+    return;
+  }
+  const card: Record<string, unknown> = { name };
+  if (charAddRole.value.trim()) card.role = charAddRole.value.trim();
+  if (charAddMotivation.value.trim()) card.motivation = charAddMotivation.value.trim();
+  if (charAddBackground.value.trim()) card.背景 = charAddBackground.value.trim();
+  charAddBusy.value = true;
+  charAddErr.value = null;
+  try {
+    await api.addBibleCharacter(projectId, card);
+    charAddOpen.value = false;
+    await loadProject();
+  } catch (e) {
+    charAddErr.value = errorText(e);
+  } finally {
+    charAddBusy.value = false;
+  }
+}
+
+const realmOpen = ref(false);
+const realmName = ref("");
+const realmValue = ref("");
+const realmBusy = ref(false);
+const realmErr = ref<string | null>(null);
+const realmOptions = computed<string[]>(() => {
+  const raw = bible.value?.realm_order;
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const group of raw as unknown[]) {
+    if (Array.isArray(group)) {
+      for (const r of group) if (String(r || "").trim()) out.push(String(r).trim());
+    } else if (String(group || "").trim()) {
+      out.push(String(group).trim());
+    }
+  }
+  return out;
+});
+
+function openRealm(name: string) {
+  realmOpen.value = true;
+  realmName.value = name;
+  const card = bible.value?.characters?.find((c) => c.name === name) as
+    | { 境界?: string; 修炼?: { 当前境界?: string } }
+    | undefined;
+  realmValue.value = card?.修炼?.当前境界 || card?.境界 || "";
+  realmErr.value = null;
+  charEditReceipt.value = null;
+}
+
+async function submitRealm() {
+  const realm = realmValue.value.trim();
+  if (!realm) {
+    realmErr.value = "境界不能为空";
+    return;
+  }
+  realmBusy.value = true;
+  realmErr.value = null;
+  try {
+    const r = await api.setBibleCharacterRealm(projectId, realmName.value, realm);
+    realmOpen.value = false;
+    await loadProject();
+    charEditReceipt.value = r.receipt;
+  } catch (e) {
+    realmErr.value = errorText(e);
+  } finally {
+    realmBusy.value = false;
+  }
+}
+
+const delOpen = ref(false);
+const delName = ref("");
+const delBusy = ref(false);
+const delErr = ref<string | null>(null);
+
+function openCharDelete(name: string) {
+  delOpen.value = true;
+  delName.value = name;
+  delErr.value = null;
+  charEditReceipt.value = null;
+}
+
+async function submitCharDelete() {
+  delBusy.value = true;
+  delErr.value = null;
+  try {
+    const r = await api.removeBibleCharacter(projectId, delName.value);
+    delOpen.value = false;
+    await loadProject();
+    charEditReceipt.value = r.receipt;
+  } catch (e) {
+    delErr.value = errorText(e);
+  } finally {
+    delBusy.value = false;
+  }
+}
+
+// 编辑回执（改名以外的加 / 删 / 改境界）要在页面上留一句：
+// 角色标签只显示「名字 · 身份」，境界是否写进、清册是否删空都看不出来，
+// 只关弹窗会让用户以为「点了但没生效」。
+const charEditReceipt = ref<string | null>(null);
 
 // 生成前的「让模型出方案」回调后回填
 function pickProposal(text: string) {
@@ -2011,10 +2189,31 @@ onUnmounted(stopDistillPolling);
       </div>
       <div class="bible-row"><span class="k">梗概</span><span class="v prose">{{ bible.synopsis }}</span></div>
       <div class="bible-row"><span class="k">走向</span><span class="v prose">{{ bible.direction }}</span></div>
-      <div class="bible-row" v-if="bible.characters?.length">
+      <div class="bible-row">
         <span class="k">角色</span>
         <span class="v">
-          <span v-for="c in bible.characters" :key="c.name" class="tag accent">{{ c.name }} · {{ c.role }}</span>
+          <span
+            v-for="(c, i) in bible.characters || []"
+            :key="`${c.name || 'role'}-${i}`"
+            class="tag accent"
+          >
+            {{ c.name }} · {{ c.role }}
+            <button v-if="c.name" class="tag-rename" title="改名（只允许影响不大的改名）" @click="openRename(c.name)">
+              改名
+            </button>
+            <button v-if="c.name" class="tag-rename" title="改境界（走量级块）" @click="openRealm(c.name)">
+              境界
+            </button>
+            <button v-if="c.name" class="tag-rename" title="从剧情圣经删除" @click="openCharDelete(c.name)">
+              删除
+            </button>
+          </span>
+          <button class="btn ghost" style="font-size: var(--fs-xs)" @click="openCharAdd">
+            ＋ 加角色
+          </button>
+          <span v-if="!bible.characters?.length" class="hint">
+            清册为空：生成时会剔除所有旧图谱角色
+          </span>
         </span>
       </div>
       <div class="bible-row" v-if="bible.relationships?.length">
@@ -2032,6 +2231,12 @@ onUnmounted(stopDistillPolling);
         <span class="v"><span v-for="f in bible.foreshadowing" :key="f" class="tag">{{ f }}</span></span>
       </div>
       <div v-if="bible.note" class="notice warn" style="margin-top: 12px">{{ bible.note }}</div>
+      <div v-if="charEditReceipt" class="notice info" style="margin-top: 12px">
+        {{ charEditReceipt }}
+        <button class="btn ghost" style="font-size: var(--fs-xs)" @click="charEditReceipt = null">
+          知道了
+        </button>
+      </div>
     </div>
 
     <!-- ===== plot_bible 编辑模态（kg-cascade-protocol）===== -->
@@ -2057,6 +2262,157 @@ onUnmounted(stopDistillPolling);
           <button class="btn" @click="loadBibleRevisions">查看历史 ({{ bibleRevisions.length }})</button>
           <button class="btn primary" :disabled="bibleEditBusy" @click="applyBibleEdit">
             {{ bibleEditBusy ? "应用中…" : "Apply" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 角色改名模态（影响面判定 + 回执）===== -->
+    <div v-if="renameOpen" class="bible-modal-mask" @click.self="renameOpen = false">
+      <div class="bible-modal" style="max-width: 560px">
+        <div class="card-title">
+          角色改名
+          <span class="hint">旧名从未出现在正文，或只在最后一段且不超过 3 次</span>
+        </div>
+        <div class="bible-row">
+          <span class="k">旧名</span>
+          <span class="v"><strong>{{ renameOld }}</strong></span>
+        </div>
+        <input
+          class="input"
+          v-model="renameNew"
+          placeholder="新名字"
+          style="width: 100%; margin-top: 8px"
+          @keyup.enter="submitRename"
+        />
+        <div v-if="renameErr" class="notice err" style="margin-top: 12px">{{ renameErr }}</div>
+        <div
+          v-if="renameResult"
+          class="notice"
+          :class="renameResult.ok ? 'info' : 'warn'"
+          style="margin-top: 12px"
+        >
+          {{ renameResult.receipt }}
+        </div>
+        <ul
+          v-if="renameResult && !renameResult.ok"
+          class="hint"
+          style="margin: 8px 0 0 18px; line-height: 1.7"
+        >
+          <li v-for="(a, i) in renameResult.alternatives" :key="i">{{ a }}</li>
+        </ul>
+        <div
+          v-if="renameResult && !renameResult.ok && renameResult.scope.segments.length"
+          class="faint"
+          style="font-size: var(--fs-xs); margin-top: 8px"
+        >
+          命中段：第 {{ renameResult.scope.segments.join("、") }} 段，共
+          {{ renameResult.scope.total }} 次（阈值 {{ renameResult.scope.threshold }} 次，且只能是最后一段）
+        </div>
+        <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+          <button class="btn ghost" @click="renameOpen = false">关闭</button>
+          <button class="btn primary" :disabled="renameBusy || !renameNew.trim()" @click="submitRename">
+            {{ renameBusy ? "判定中…" : "确认改名" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 新增角色模态 ===== -->
+    <div v-if="charAddOpen" class="bible-modal-mask" @click.self="charAddOpen = false">
+      <div class="bible-modal" style="max-width: 520px">
+        <div class="card-title">
+          新增角色
+          <span class="hint">只接受会进提示词的字段</span>
+        </div>
+        <input
+          class="input"
+          v-model="charAddName"
+          placeholder="角色名（必填）"
+          style="width: 100%; margin-top: 8px"
+          @keyup.enter="submitCharAdd"
+        />
+        <input
+          class="input"
+          v-model="charAddRole"
+          placeholder="身份 / 角色定位（可选）"
+          style="width: 100%; margin-top: 8px"
+        />
+        <input
+          class="input"
+          v-model="charAddMotivation"
+          placeholder="动机（可选）"
+          style="width: 100%; margin-top: 8px"
+        />
+        <textarea
+          class="input"
+          v-model="charAddBackground"
+          rows="3"
+          placeholder="背景（可选，会进系统提示词）"
+          style="width: 100%; margin-top: 8px"
+        />
+        <div v-if="charAddErr" class="notice err" style="margin-top: 12px">{{ charAddErr }}</div>
+        <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+          <button class="btn ghost" @click="charAddOpen = false">取消</button>
+          <button class="btn primary" :disabled="charAddBusy || !charAddName.trim()" @click="submitCharAdd">
+            {{ charAddBusy ? "添加中…" : "添加" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 改境界模态（走量级块）===== -->
+    <div v-if="realmOpen" class="bible-modal-mask" @click.self="realmOpen = false">
+      <div class="bible-modal" style="max-width: 480px">
+        <div class="card-title">
+          改境界
+          <span class="hint">写入角色卡，由量级块注入系统提示词</span>
+        </div>
+        <div class="bible-row">
+          <span class="k">角色</span>
+          <span class="v"><strong>{{ realmName }}</strong></span>
+        </div>
+        <input
+          class="input"
+          v-model="realmValue"
+          list="realm-options"
+          placeholder="境界名"
+          style="width: 100%; margin-top: 8px"
+          @keyup.enter="submitRealm"
+        />
+        <datalist id="realm-options">
+          <option v-for="r in realmOptions" :key="r" :value="r" />
+        </datalist>
+        <div v-if="!realmOptions.length" class="faint" style="font-size: var(--fs-xs); margin-top: 8px">
+          项目没有配置 realm_order，后端不会校验这个名字是否在阶梯里。
+        </div>
+        <div v-if="realmErr" class="notice err" style="margin-top: 12px">{{ realmErr }}</div>
+        <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+          <button class="btn ghost" @click="realmOpen = false">取消</button>
+          <button class="btn primary" :disabled="realmBusy || !realmValue.trim()" @click="submitRealm">
+            {{ realmBusy ? "写入中…" : "确认修改" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 删除角色模态 ===== -->
+    <div v-if="delOpen" class="bible-modal-mask" @click.self="delOpen = false">
+      <div class="bible-modal" style="max-width: 480px">
+        <div class="card-title">删除角色</div>
+        <p>
+          确定从剧情圣经里删除 <strong>{{ delName }}</strong>？
+        </p>
+        <p class="hint" style="line-height: 1.7">
+          同时会移除以该角色为端点的关系。若这是最后一个角色，清册会变成空数组
+          —— 生成时会剔除所有旧图谱角色，删掉的人不会再回流。
+          已生成正文不会被改写。
+        </p>
+        <div v-if="delErr" class="notice err" style="margin-top: 12px">{{ delErr }}</div>
+        <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+          <button class="btn ghost" @click="delOpen = false">取消</button>
+          <button class="btn primary" :disabled="delBusy" @click="submitCharDelete">
+            {{ delBusy ? "删除中…" : "确认删除" }}
           </button>
         </div>
       </div>
@@ -2102,6 +2458,14 @@ onUnmounted(stopDistillPolling);
           <span class="tag">+{{ bibleEditResult.diff_added }} added</span>
           <span class="tag">~{{ bibleEditResult.diff_changed }} changed</span>
           <span class="tag warn" v-if="bibleEditResult.diff_removed > 0">-{{ bibleEditResult.diff_removed }} removed</span>
+        </div>
+        <div v-if="bibleEditResult.warnings.length" class="notice warn" style="margin-bottom: var(--gap)">
+          <strong>{{ bibleEditResult.warnings.length }} 个键不会被生成使用</strong>——已保存，但模型看不到：
+          <ul style="margin: 6px 0 0 18px">
+            <li v-for="(w, i) in bibleEditResult.warnings" :key="i">
+              <code>{{ w.path }}</code>：{{ w.message }}
+            </li>
+          </ul>
         </div>
         <div v-if="bibleEditResult.conflicts.length === 0" class="notice ok">
           无 KG 冲突。下次生成会注入新 bible。
@@ -2979,6 +3343,20 @@ onUnmounted(stopDistillPolling);
 }
 
 /* ===== plot_bible 编辑模态 + 冲突 toast（kg-cascade-protocol）===== */
+.tag-rename {
+  margin-left: 6px;
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  text-decoration: underline;
+  opacity: 0.75;
+}
+.tag-rename:hover {
+  opacity: 1;
+}
 .bible-modal-mask {
   position: fixed;
   inset: 0;

@@ -44,6 +44,8 @@ import type {
   KgRebuildResult,
   KgBibleApplyResult,
   KgBibleRevisionListItem,
+  KgCharacterEditResult,
+  KgCharacterRenameResult,
   KgV3Character,
   KgV3ExemptRequest,
   KgV3JudgeFindingsResponse,
@@ -228,6 +230,53 @@ export const api = {
   listBibleRevisions: (projectId: number, limit = 20) =>
     request<{ revisions: KgBibleRevisionListItem[] }>(
       `/projects/${projectId}/bible/revisions?limit=${limit}`,
+    ),
+
+  /**
+   * 角色改名：先量正文覆盖，影响前文时返回 ok=false 的回执（不写库）。
+   *
+   * 允许时改 bible.name + 同步 KG 实体，旧名登记为别名。拒绝也返回 200，
+   * 用 `ok` 区分，避免前端把业务判定当成网络错误吞掉原因。
+   */
+  renameBibleCharacter: (
+    projectId: number,
+    oldName: string,
+    newName: string,
+    note?: string | null,
+  ) =>
+    request<KgCharacterRenameResult>(
+      `/projects/${projectId}/bible/characters/rename`,
+      jsonInit("POST", { old_name: oldName, new_name: newName, note: note ?? null }),
+    ),
+
+  /** 加角色：card 必须过后端封闭键表（未知 / 不支持字段直接 400）。 */
+  addBibleCharacter: (
+    projectId: number,
+    card: Record<string, unknown>,
+    note?: string | null,
+  ) =>
+    request<KgCharacterEditResult>(
+      `/projects/${projectId}/bible/characters/add`,
+      jsonInit("POST", { card, note: note ?? null }),
+    ),
+
+  /** 删角色：删到空时后端保留 characters=[]（空清册语义）。 */
+  removeBibleCharacter: (projectId: number, name: string, note?: string | null) =>
+    request<KgCharacterEditResult>(
+      `/projects/${projectId}/bible/characters/remove`,
+      jsonInit("POST", { name, note: note ?? null }),
+    ),
+
+  /** 改境界：写 characters[].境界（或 修炼.当前境界），走 power 块。 */
+  setBibleCharacterRealm: (
+    projectId: number,
+    name: string,
+    realm: string,
+    note?: string | null,
+  ) =>
+    request<KgCharacterEditResult>(
+      `/projects/${projectId}/bible/characters/realm`,
+      jsonInit("POST", { name, realm, note: note ?? null }),
     ),
 
   /**

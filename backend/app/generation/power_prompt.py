@@ -171,7 +171,19 @@ def build_power_constraint(project, max_chars: int = 900) -> str:
         )
 
     rows = _character_scale_rows(bible)
-    rows_block = ["本作已登记（无证据的一律 unknown）："] + rows if rows else []
+    characters = bible.get("characters")
+    has_characters = isinstance(characters, list) and any(
+        isinstance(card, dict) and _as_text(card.get("name") or card.get("名字"))
+        for card in characters
+    )
+    if rows:
+        rows_block = ["本作已登记（无证据的一律 unknown）："] + rows
+    elif has_characters:
+        # 有角色但一个境界/量级都没登记：不能静默消失，否则提示词里整块「量级与体系」
+        # 都不存在，用户看不出这里本该有约束；也不能为了凑这一行去编造数值。
+        rows_block = ["本段涉及角色未登记境界与量级，不要自行编造等级称谓。"]
+    else:
+        rows_block = []
 
     def render(with_ladder: bool, with_rows: bool) -> str:
         parts = list(head)
@@ -186,7 +198,7 @@ def build_power_constraint(project, max_chars: int = 900) -> str:
     while len(text) > max_chars and rows:
         rows.pop()
         rows_block = ["本作已登记（无证据的一律 unknown）："] + rows if rows else []
-        text = render(True, bool(rows))
+        text = render(True, bool(rows_block))
     if len(text) > max_chars:
-        text = render(False, bool(rows))
+        text = render(False, bool(rows_block))
     return text
