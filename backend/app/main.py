@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 
 from app.db import init_db, SessionLocal
+from app import health as health_mod
 from app.routers import novels
 from app.routers import projects
 from app.routers import generation
@@ -107,3 +108,9 @@ app.include_router(assistant_wizard_router.router)
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    """进程是否旧于当前代码：`started_at >= build_time` 才是新代码。"""
+    return health_mod.snapshot()
