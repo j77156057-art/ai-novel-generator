@@ -18,6 +18,11 @@ from app.generation.prompts import (
     merged_constraint_items,
     render_item_holding_section,
 )
+from app.generation.scope_guard import (
+    declared_local,
+    detect_length_drop,
+    detect_scope_mismatch,
+)
 from app.generation.timeline import (
     TimelineState,
     advance,
@@ -439,6 +444,11 @@ def _require_distill_ready(db, project) -> None:
     那条路会**同步**触发全量蒸馏（分钟级），HTTP 请求 240s 必超时，
     用户看到的是无限转圈、无从判断是卡死还是在跑（live 实测复现）。
 
+    判据**不在本函数里**：直接问 `reusable_narrative`——与取档路径同一份规则。
+    2026-11-12 修：此前这里自己写了一份「指纹必须完全相等」，而取档侧已放宽
+    到「档案来源覆盖当前参考书即可复用」（refs 收窄后渲染侧会过滤掉多出的书）。
+    预检先 raise，放宽的代码永远走不到，项目 5 收窄到 [5] 后真实生成 500。
+
     无参考语料的自由生成不受影响（project_narrative 对它返回 None，
     本来就不蒸馏）。
 
@@ -448,21 +458,11 @@ def _require_distill_ready(db, project) -> None:
     ids = [int(i) for i in (project.reference_novel_ids or [])]
     if not ids:
         return
-    from app.style.narrative import (
-        corpus_content_hash,
-        find_style_distill,
-        narrative_fingerprint,
-        resolve_tier,
-    )
+    from app.style.narrative import reusable_narrative, resolve_tier
 
     cfg = resolve_tier(getattr(project, "narrative_tier", None))
-    want = narrative_fingerprint(ids, cfg)
-    cached = project.style_narrative or {}
-    if isinstance(cached, dict) and cached.get("fingerprint") == want:
-        return  # 项目缓存命中
-    content_hash = corpus_content_hash(ids, db)
-    if find_style_distill(db, ids, cfg.key, want["tier_signature"], content_hash) is not None:
-        return  # 蒸馏库命中（生成链路会直接复用）
+    if reusable_narrative(db, project, ids, cfg) is not None:
+        return  # 项目缓存（含来源超集）或蒸馏库命中；生成链路会直接复用
     raise ValueError(
         f"项目尚未蒸馏文风档案（当前档位：{cfg.name}）。请先调用 "
         f"POST /api/projects/{project.id}/distill 完成蒸馏后再生成——"
@@ -817,6 +817,18 @@ def _style_profile(db, project: Project) -> dict | None:
     return project_profile_safe(
         db, project, unit_chars=int(project.generation_length or 3000)
     )
+
+
+def _style_source_ids(project: Project) -> set[int] | None:
+    """叙事档案的来源范围：续写项目只看续写书，原创项目看参考书集合。
+
+    续写时「参考书」就是源文本，别的参考书的角色口吻/桥段是噪音；原创项目
+    没有「本书」，只能按当前参考书集合取。返回 None = 不过滤（保持旧行为）。
+    """
+    if project.continuation_novel_id:
+        return {int(project.continuation_novel_id)}
+    ids = {int(x) for x in (project.reference_novel_ids or [])}
+    return ids or None
 
 
 #: 生成后文风告警的高分位阈值：percentile 高于此值报"文风偏离档案"。
@@ -1563,6 +1575,7 @@ def generate_next_segment(
         constraint_note=overrides[PromptKey.CONSTRAINT],
         era_constraint=era_block,
         power_constraint=power_block,
+        style_source_ids=_style_source_ids(project),
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -1748,6 +1761,7 @@ def generate_next_segment_stream(
         constraint_note=overrides[PromptKey.CONSTRAINT],
         era_constraint=era_block,
         power_constraint=power_block,
+        style_source_ids=_style_source_ids(project),
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -1887,6 +1901,7 @@ def _build_generation_prompts(
     reminders: dict | None = None,
     node_prompt: str | None = None,
     instruction: str | None = None,
+    rewrite_before_chars: int | None = None,
 ):
     """组装提示词；`before_segment` 给定时的前情**只取该段之前**（重生成用）。
 
@@ -1933,6 +1948,7 @@ def _build_generation_prompts(
         constraint_note=overrides[PromptKey.CONSTRAINT],
         era_constraint=era_block,
         power_constraint=power_block,
+        style_source_ids=_style_source_ids(project),
     )
     user = build_user_prompt(
         l1_chain(tree),
@@ -1950,6 +1966,9 @@ def _build_generation_prompts(
             else (_next_segment_no(db, project.id) - 1),
         ) or None,
         instruction_suffix=instruction,
+        # 重写：用原文长度替换续写预算（80%–120%），避免「续写 ≥max_chars*0.8」
+        # 与「重写要贴近原文篇幅」两条预算互相打架。
+        rewrite_before_chars=rewrite_before_chars,
     )
     return system, user, max_chars
 
@@ -2001,6 +2020,9 @@ def regenerate_segment_stream(
     target = next((g for g in gens if g.segment_no == segment_no), None)
     if target is None:
         raise ValueError(f"段 {segment_no} 不存在，无法重新生成")
+    # 改前正文（B 的范围校验基线）。在旧路径里 target.text 随后会被直接赋值，
+    # 快照路径则由 SQL UPDATE 改库，故必须在这里先留一份内存副本。
+    before_text = target.text or ""
 
     # 提醒包**只加载一次**，同一个对象同时喂 system 提示与尾部 constraints：
     # 除了省一次查询，更是防止两次查询之间发生并发写入，导致「system 列了一套
@@ -2016,6 +2038,9 @@ def regenerate_segment_stream(
         db, project, before_segment=segment_no, novel_ids=novel_ids,
         max_chars=max_chars, provider=provider, reminders=reminders,
         node_prompt=node_prompt, instruction=instruction,
+        # 原文长度已知（before_text 在上面捕获）：重写提示词据此给出
+        # 80%–120% 的篇幅区间，而不是续写的「不少于 max_chars*0.8」。
+        rewrite_before_chars=len(before_text) or None,
     )
     # 指令是否**真的**出现在发出的 user prompt 里（只看渲染后的文本，不看入参）。
     # 空/纯空白指令一律 False，与改动前「不注入」行为一致。
@@ -2037,25 +2062,94 @@ def regenerate_segment_stream(
 
         lease = SnapshotLease(snapshot_id)
         lease.touch(db)  # 开流前刷新一次（begin 之后可能已过一段时间）
-    try:
-        for piece in provider.stream_chat(system, user, constraints=constraints):
+
+    # —— 意图分流：局部指令走句子索引补丁（2026-11-12）——
+    # 判定复用 scope_guard.declared_local，不另造关键词表（两套口径必漂）。
+    # Tier A：位置词（段尾/最后一句/段首/第 N 句…）由程序解析成编号，
+    # 模型只写替换文本；Tier B（某处/此处/这一句）仍由模型给编号。
+    # 两条路都只把替换文本拼回原文，其余文字逐字不动，压缩没有发生的空间。
+    local_patch = bool(_instruction) and declared_local(_instruction)
+    patch_meta = None
+    if local_patch:
+        from app.generation.patch import (
+            PatchError,
+            build_patch_user_prompt,
+            parse_patch_reply,
+            resolve_scope,
+        )
+
+        # Tier A：范围词（段尾/最后一句/段首/第 N 句…）先由程序解析成编号，
+        # 模型只写替换文本；Tier B（某处/此处/这一句）仍由模型给编号。
+        # 范围解析失败同样失败关闭，不把「改哪一句」退回去让模型猜。
+        try:
+            scope = resolve_scope(_instruction, before_text)
+            patch_user = build_patch_user_prompt(
+                before_text, _instruction, scope=scope
+            )
+        except PatchError as exc:
+            logging.getLogger("generation.engine").warning(
+                "局部补丁范围解析失败 code=%s；指令：%r", exc.code, _instruction
+            )
+            if snapshot_id is not None:
+                from app.agents.dialog.snapshot import fail_snapshot
+
+                fail_snapshot(db, snapshot_id, exc.code)
+            raise
+        # 指令确实进了本次发出的 prompt（补丁 prompt 里也有【本次要求】区）。
+        instruction_injected = _instruction in patch_user
+        try:
             if lease is not None:
                 lease.touch(db)
-            pieces.append(piece)
-            yield {"type": "chunk", "text": piece}
-    except BaseException as exc:  # noqa: BLE001 —— 含客户端断开（GeneratorExit）
-        # 快照留痕：模型报错/超时/客户端中断都置 failed，正文一行没动。
-        # 不做这两行的话，残留的 pending 会变成一条没有心跳的租约，该段要等
-        # 心跳判据超时后由用户显式接管才能重写。
-        if snapshot_id is not None:
-            from app.agents.dialog.snapshot import fail_snapshot
+            reply = provider.chat(system, patch_user, constraints=constraints)
+        except BaseException as exc:  # noqa: BLE001 —— 含客户端断开
+            if snapshot_id is not None:
+                from app.agents.dialog.snapshot import fail_snapshot
 
-            reason = ("client_disconnect" if isinstance(exc, GeneratorExit)
-                      else type(exc).__name__)
-            fail_snapshot(db, snapshot_id, reason)
-        raise
+                reason = ("client_disconnect" if isinstance(exc, GeneratorExit)
+                          else type(exc).__name__)
+                fail_snapshot(db, snapshot_id, reason)
+            raise
+        try:
+            text, patch_meta = parse_patch_reply(reply, before_text, scope=scope)
+        except PatchError as exc:
+            # 直接失败，**不回退整段重写**：回退会重新打开压缩的口子，而且
+            # 「成功的整段重写」与「局部改写」在正文上不可区分。失败保证
+            # 「局部指令要么精确补丁，要么正文一行不动」。
+            # 留痕：快照 error_reason 只存 code；模型原始返回截一段进日志，
+            # 否则事后无法解释「为什么这句补丁失败了」。
+            logging.getLogger("generation.engine").warning(
+                "局部补丁失败 code=%s；模型返回前 400 字：%r",
+                exc.code, (reply or "")[:400],
+            )
+            if snapshot_id is not None:
+                from app.agents.dialog.snapshot import fail_snapshot
 
-    text = _strip_thinking("".join(pieces))
+                fail_snapshot(db, snapshot_id, exc.code)
+            raise
+        # 补丁完成后一次性把完整正文发给客户端：UI 拿到的仍是「整段新正文」，
+        # 但模型从未收到「重写整段」的请求。
+        yield {"type": "chunk", "text": text}
+    else:
+        try:
+            for piece in provider.stream_chat(system, user, constraints=constraints):
+                if lease is not None:
+                    lease.touch(db)
+                pieces.append(piece)
+                yield {"type": "chunk", "text": piece}
+        except BaseException as exc:  # noqa: BLE001 —— 含客户端断开（GeneratorExit）
+            # 快照留痕：模型报错/超时/客户端中断都置 failed，正文一行没动。
+            # 不做这两行的话，残留的 pending 会变成一条没有心跳的租约，该段要等
+            # 心跳判据超时后由用户显式接管才能重写。
+            if snapshot_id is not None:
+                from app.agents.dialog.snapshot import fail_snapshot
+
+                reason = ("client_disconnect" if isinstance(exc, GeneratorExit)
+                          else type(exc).__name__)
+                fail_snapshot(db, snapshot_id, reason)
+            raise
+
+        text = _strip_thinking("".join(pieces))
+
     summary = provider.summarize(text)
 
     # —— 零成本 AI 腔检测 + 告警（方案 b，见 docs/architecture/2026-10-17-phase1-writer-tool-calling-assessment.md §4.2 ③）——
@@ -2089,6 +2183,13 @@ def regenerate_segment_stream(
         "power": power_meta,
     }
 
+    # 局部指令 vs 整段重写：只留痕（响应 / done / 快照行），不阻断、不重试。
+    # 用户可能真的想整段重写，所以这里绝不据此拒绝落库。
+    scope_mismatch = detect_scope_mismatch(instruction, before_text, text)
+    # 篇幅跌幅单独一条（不与 scope_mismatch 混账）：首尾保留情况与「整段被压短」
+    # 是两类不同的模型不服从。用户明确要求精简/压缩时本函数返回 None。
+    length_drop = detect_length_drop(instruction, before_text, text)
+
     if snapshot_id is None:
         # —— 旧路径（/regenerate-stream、测试）：逐字节不变 ——
         target.text = text
@@ -2116,10 +2217,20 @@ def regenerate_segment_stream(
                 expected_before=expected_before,
                 new_text=text,
                 new_summary=new_summary,
+                # 与 applied 同一事务落快照行（只留痕，不参与任何拦截）。
+                scope_mismatch=scope_mismatch,
+                length_drop=length_drop,
             )
             # 与上面旧路径同一个提交点：正文与快照一起落，中间崩了都不会出现
             # 「正文变了但快照还是 pending」。
             db.commit()
+            # ⚠️ 必须立刻刷新：finalize_snapshot 是 SQL 级 UPDATE
+            # （synchronize_session=False），而 SessionLocal 是
+            # expire_on_commit=False——commit 后 identity map 里的 target 仍是
+            # 旧正文。下面的 rebuild_generated_kg / rebuild_summary_tree 都用
+            # select(Generation) 读段，不刷新就会把**旧正文/旧摘要**重新灌回
+            # KG 与摘要树（实测复现：replay 后 facts 仍只剩旧正文独有句）。
+            db.refresh(target)
         except ConcurrentEdit:
             db.rollback()
             fail_snapshot(db, snapshot_id, "concurrent_edit")
@@ -2143,6 +2254,19 @@ def regenerate_segment_stream(
     tree_stats = rebuild_summary_tree(db, project, provider)
     db.refresh(target)
 
+    # 文风一致性校验 · L1 影子记录（重写路径）：与 _commit_segment 同口径。
+    # 必须在 refresh 之后调用，否则采到的是 identity map 里的旧正文。
+    # record_segment_check 内部吞异常，这里再包一层防 import 失败——校验器
+    # 任何故障都不得影响已经成功的重写。
+    try:
+        from app.style.consistency import record_segment_check
+
+        record_segment_check(db, project, target)
+    except Exception:  # noqa: BLE001 —— 影子采样失败不影响重写
+        logging.getLogger(__name__).warning(
+            "style shadow check skipped", exc_info=True
+        )
+
     yield {
         "type": "done",
         "segment_no": segment_no,
@@ -2153,6 +2277,13 @@ def regenerate_segment_stream(
         # 本次重写要求是否真的进了发出的 prompt（供 API/测试事后核对；
         # 空指令恒为 False）。正文已落库，此标记只描述提示词，不改文本。
         "instruction_injected": instruction_injected,
+        # 局部指令 vs 整段重写：仅提示（含前后缀长度/字数变化），不阻断。
+        "scope_mismatch": scope_mismatch,
+        # 篇幅跌幅 >20% 的单独提示（用户要求精简时不出现），同样不阻断。
+        "length_drop": length_drop,
+        # 句子级补丁的落地明细（仅局部指令路径）：锚点/替换长度、未涉及部分
+        # 由构造保证逐字不变。整段重写路径为 None。
+        "patch": patch_meta,
         "era": {**era_prompt_meta, **era_meta},
         "power": power_meta,
         "id": target.id,

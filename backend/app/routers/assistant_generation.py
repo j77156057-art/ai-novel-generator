@@ -772,6 +772,14 @@ def assistant_invoke_generation(
             "summary_tree": done.get("summary_tree") or {},
             # 指令是否真的进了发出的 prompt（空指令恒为 False，与改前一致）。
             "instruction_injected": instruction_injected,
+            # 局部指令 vs 整段重写的提示（含公共前后缀长度/字数变化）。
+            # None = 未命中；命中也只提示，不拦截、不重试（结果已落库）。
+            "scope_mismatch": done.get("scope_mismatch"),
+            # 篇幅跌幅 >20% 的提示（与 scope_mismatch 分列；用户要求精简时为 None）。
+            "length_drop": done.get("length_drop"),
+            # 句子级补丁明细（仅局部指令路径）：锚点/替换长度、补丁句数。
+            # 整段重写路径为 None。
+            "patch": done.get("patch"),
             # 闭环摘要（旁路观测）：与 generate_next 分支同键同形状，
             # 异常/未达记忆线时为 None。前端据此提示「本次已沉淀 AI 腔教训」。
             "ai_flavor_feedback": flavor_feedback,
@@ -800,6 +808,16 @@ def assistant_invoke_generation(
                 status_code=409,
                 detail={"code": exc.code, "message": str(exc),
                         "segment_no": getattr(exc, "segment_no", body.segment_no)},
+            ) from exc
+        # 局部补丁失败（锚点找不到 / 多处命中 / 返回脏了）→ 422 + 可解释原因。
+        # 引擎不回退整段重写，正文一行未动；调用方可原样重试或改成整段指令。
+        from app.generation.patch import PatchError
+
+        if isinstance(exc, PatchError):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": exc.code, "message": str(exc),
+                        "segment_no": body.segment_no},
             ) from exc
         raise HTTPException(
             status_code=500, detail=f"助手调动生成失败：{str(exc)[:200]}"

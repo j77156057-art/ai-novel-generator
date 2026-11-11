@@ -43,7 +43,10 @@ from app.main import app as fastapi_app  # noqa: E402
 from app.models import Generation, Project  # noqa: E402
 from app.routers import assistant_generation as ag  # noqa: E402
 
-INSTRUCTION = "把这一段写得更紧凑，删掉环境描写，只保留两人对峙的动作。"
+#: 刻意不含「只/仅/保留/段尾」等局部关键词——含局部关键词的指令现在会分流
+#: 到句子级补丁（见 test_local_patch.py），那条路径不经过这里要钉的整段
+#: 重写提示词。
+INSTRUCTION = "把这一段写得更紧凑，减少环境描写，突出两人对峙的动作。"
 
 ITEM_FACT = "铜钥匙（现在在林夜手上）"
 

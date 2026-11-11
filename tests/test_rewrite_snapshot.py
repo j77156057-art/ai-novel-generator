@@ -31,7 +31,7 @@ if _BACKEND not in sys.path:
     sys.path.insert(0, _BACKEND)
 
 import pytest  # noqa: E402
-from sqlalchemy import select, update  # noqa: E402
+from sqlalchemy import func, select, update  # noqa: E402
 
 from app.agents.dialog import rollback as rb  # noqa: E402
 from app.agents.dialog.snapshot import (  # noqa: E402
@@ -888,3 +888,322 @@ def test_engine_touches_lease_while_streaming(db, monkeypatch):
     _seed_segment(db, project, 2, SEG2_OLD)
     _rewrite(db, project, 2)
     assert calls["n"] >= 2, f"引擎没有接心跳，touch 只被调用 {calls['n']} 次"
+
+
+# ---------------------------------------------------------------------------
+# T8：重写后 replay 必须读新正文（A 的回归测试）
+# ---------------------------------------------------------------------------
+
+_OLD_HOLE = "这背后究竟藏着什么秘密？"
+_NEW_HOLE = "他究竟为什么回来？"
+# ≥100 字：让同一组文本也能用于 T9 的范围校验（短文本不参与判定）。
+SEG2_OLD_LONG = "白光抬起头，望向窗外，天色尚未完全亮起。" * 5 + "\n" + _OLD_HOLE
+SEG2_NEW_LONG = "秦九走进院子，院里的枯叶被风卷起。" * 6 + "\n" + _NEW_HOLE
+
+
+def test_rewrite_replay_uses_new_text(db):
+    """快照式重写后，KG replay / 摘要树读到的都必须是**新**正文。
+
+    修复前实测：`finalize_snapshot` 的 SQL UPDATE 不走 identity map，而
+    `expire_on_commit=False`，replay 的 `select(Generation)` 拿到的仍是旧对象——
+    facts 里残留旧正文独有句。这里直接断言结果，不 mock 任何被测逻辑。
+    """
+    from app.generation.summary_tree import l1_chain
+    from app.models import Fact
+
+    project = _make_project(db, title="replay-新正文")
+    _seed_segment(db, project, 1, SEG1)
+    _seed_segment(db, project, 2, SEG2_OLD_LONG)
+    _seed_segment(db, project, 3, SEG3)
+
+    _rewrite(db, project, 2, reply=SEG2_NEW_LONG, instruction="换一种语气")
+
+    keys = set(db.scalars(
+        select(Fact.key).where(
+            Fact.project_id == project.id,
+            Fact.type == "plothole",
+            Fact.source == "generated",
+        )
+    ).all())
+    assert _NEW_HOLE in keys, f"新正文独有句没进 facts：{keys}"
+    assert _OLD_HOLE not in keys, f"旧正文独有句仍留在 facts：{keys}"
+
+    # 摘要树走的是同一批 Generation 对象：也必须是新摘要，否则「future」续写会
+    # 基于旧内容。
+    db.refresh(project)
+    assert "测试摘要" in l1_chain(project.summary_tree)
+
+
+# ---------------------------------------------------------------------------
+# T9：局部指令 vs 整段重写 —— 只提示、不拦截
+# ---------------------------------------------------------------------------
+
+
+def test_scope_guard_unit():
+    from app.generation.scope_guard import (
+        SCOPE_MIN_CHARS,
+        declared_local,
+        detect_scope_mismatch,
+    )
+    assert declared_local("只收拾段尾")
+    assert declared_local("保留开头，改最后一句")
+    assert declared_local("第 3 句语气硬一点")
+    assert not declared_local("换一种语气")
+
+    before = "甲" * 150
+    after = "乙" * 120
+    hit = detect_scope_mismatch("只收拾段尾", before, after)
+    assert hit is not None
+    assert hit["declared_local"] is True
+    assert hit["common_prefix_chars"] == 0
+    assert hit["common_suffix_chars"] == 0
+    assert hit["before_chars"] == 150
+    assert hit["after_chars"] == 120
+    assert hit["chars_delta"] == -30
+    assert "已正常保存" in hit["message"], "提示必须说明结果已落库，不是拒绝"
+
+    # 保留了开头一大段 → 不是整段重写，不提示
+    kept = before[:100] + "新增内容" * 10
+    assert detect_scope_mismatch("只收拾段尾", before, kept) is None
+
+    # 指令没声明局部 → 不提示（用户可能就是想整段改）
+    assert detect_scope_mismatch("整段重写", before, after) is None
+
+    # 文本太短 → 不判定（碎片/测试段，比例失真）
+    short = "甲" * (SCOPE_MIN_CHARS - 1)
+    assert detect_scope_mismatch("只收拾段尾", short, "乙" * 50) is None
+
+
+def test_scope_mismatch_reported_and_snapshot_persisted(db):
+    """scope_mismatch 的落库通道仍在（局部指令已改走补丁，此路径供防御/旧数据）。
+
+    2026-11-12 起，``declared_local`` 的指令在引擎里分流到句子级补丁，
+    这条提示在真实生成路径上不再可能命中——但快照列与 ``finalize_snapshot``
+    的入参必须保持可用，避免回滚/旧行读取时缺字段。
+    """
+    from app.agents.dialog.snapshot import finalize_snapshot
+
+    project = _make_project(db, title="局部指令-整段重写")
+    gen = _seed_segment(db, project, 2, SEG2_OLD_LONG)
+    snap = begin_snapshot(db, project, gen, instruction="只收拾段尾")
+    info = {
+        "declared_local": True,
+        "before_chars": len(SEG2_OLD_LONG),
+        "after_chars": len(SEG2_NEW_LONG),
+        "common_prefix_chars": 0,
+        "common_suffix_chars": 1,
+    }
+    finalize_snapshot(
+        db, snapshot_id=snap.id, generation_id=gen.id, segment_no=2,
+        expected_before=snap.before_text, new_text=SEG2_NEW_LONG,
+        new_summary={"text": "段2摘要"}, scope_mismatch=info,
+    )
+    db.commit()
+
+    db.expire_all()
+    row = db.get(GenerationSnapshot, snap.id)
+    assert row.scope_mismatch == info, "提示结构必须能写进快照行"
+    assert row.status == "applied"
+
+
+def test_local_patch_in_http_response(db, monkeypatch):
+    """局部指令走补丁后，HTTP 响应带 patch 明细，两个旧提示均为 None。"""
+    from fastapi.testclient import TestClient
+
+    import app.llm.provider as provider_mod
+    from app.db import get_db
+    from app.main import app
+
+    before = "开场第一句。中间第二句。收尾第三句。"
+    after = "开场第一句。中间第二句。改过的收尾。"
+    monkeypatch.setattr(
+        provider_mod, "get_llm_provider",
+        lambda: StubProvider('{"index": 3, "replacement": "改过的收尾。"}'),
+    )
+
+    project = _make_project(db, title="局部补丁-HTTP")
+    _seed_segment(db, project, 1, SEG1)
+    _seed_segment(db, project, 2, before)
+    _seed_segment(db, project, 3, SEG3)
+
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        resp = TestClient(app).post("/api/assistant/invoke-generation", json={
+            "project_id": project.id,
+            "action": "regenerate_segment",
+            "segment_no": 2,
+            "instruction": "只改最后一句，其余内容保留不要动。",
+        })
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["patch"] and body["patch"]["patch_count"] == 1, body
+    # 补丁路径不会整段重排：两个旧提示都不该触发
+    assert body["scope_mismatch"] is None
+    assert body["length_drop"] is None
+    assert body["chars"] == len(after)
+    assert _gen(db, project, 2).text == after
+
+
+# ---------------------------------------------------------------------------
+# T10：文风影子接入重写路径（C）
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_writes_style_shadow(db):
+    from app.models import StyleCheck
+
+    project = _make_project(db, title="重写-文风影子")
+    _seed_segment(db, project, 1, SEG1)
+    _seed_segment(db, project, 2, SEG2_OLD)
+    _seed_segment(db, project, 3, SEG3)
+
+    before = db.scalar(select(func.count()).select_from(StyleCheck))
+    _rewrite(db, project, 2)
+    after = db.scalar(select(func.count()).select_from(StyleCheck))
+    assert after == before + 1, f"重写没有新增文风影子记录：{before} → {after}"
+
+    row = db.scalars(select(StyleCheck).order_by(StyleCheck.id.desc())).first()
+    assert row.verdict == "shadow"
+    assert row.segment_no == 2
+    assert row.text_md5 == _md5(SEG2_NEW), "影子记录必须采新正文，不能采旧正文"
+
+
+def test_rewrite_survives_style_check_failure(db, monkeypatch):
+    """校验器故障不得影响重写成功（与 _commit_segment 同一条护栏）。"""
+    import app.style.consistency as consistency_mod
+
+    def boom(*a, **kw):
+        raise RuntimeError("style checker down")
+
+    monkeypatch.setattr(consistency_mod, "record_segment_check", boom)
+
+    project = _make_project(db, title="重写-文风故障")
+    _seed_segment(db, project, 1, SEG1)
+    _seed_segment(db, project, 2, SEG2_OLD)
+    _seed_segment(db, project, 3, SEG3)
+
+    _rewrite(db, project, 2)
+    assert _gen(db, project, 2).text == SEG2_NEW, "校验器异常把重写也拖垮了"
+
+
+# ---------------------------------------------------------------------------
+# T11：重写提示词的篇幅要求（祈使句单向下限，替换续写预算）
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_prompt_uses_imperative_length_floor():
+    from app.generation.prompts import build_user_prompt
+
+    user = build_user_prompt(
+        [], [], None, 3000,  # max_chars=3000：旧逻辑会要求「不少于 2400 字」
+        rewrite_before_chars=2273,
+    )
+    assert "原文共 2273 字" in user
+    assert "不得短于原文 2273 字" in user
+    # 关键：不再出现区间表述——区间会被模型当作「可以取低值」的许可
+    assert "80%–120%" not in user
+    assert "1818" not in user and "2727" not in user
+    # 关键：续写预算必须**消失**，否则两条字数要求互相打架
+    assert "请续写不少于" not in user
+    # 非重写路径（有前情 → 续写指令）逐字节保留原续写预算
+    normal = build_user_prompt(["上一段摘要"], [], None, 3000)
+    assert "请续写不少于 2400 字" in normal
+
+
+# ---------------------------------------------------------------------------
+# T12：篇幅跌幅（length_drop）—— 独立提示、明确要求精简时不提示
+# ---------------------------------------------------------------------------
+
+
+def test_length_drop_unit():
+    from app.generation.scope_guard import (
+        declared_compression,
+        detect_length_drop,
+    )
+
+    before = "甲" * 2273
+    after = "乙" * 851
+    hit = detect_length_drop("只收拾段尾", before, after)
+    assert hit is not None
+    assert hit["before_chars"] == 2273
+    assert hit["after_chars"] == 851
+    assert hit["ratio"] == round(851 / 2273, 4)
+    assert hit["drop_ratio"] == round(1 - 851 / 2273, 4)
+    assert "已正常保存" in hit["message"]
+
+    # 跌幅未到 20%（2273 → 2000，约 88%）→ 不提示
+    assert detect_length_drop("只收拾段尾", before, "乙" * 2000) is None
+    # 用户明确要求缩短 → 不提示（不同关键词都要覆盖）
+    for instruction in ("精简一下", "压缩到 800 字", "缩短篇幅",
+                        "控制字数在 900 字", "短一点"):
+        assert declared_compression(instruction), instruction
+        assert detect_length_drop(instruction, before, after) is None, instruction
+    # 文本太短 → 不判定
+    assert detect_length_drop("只收拾段尾", "甲" * 50, "乙" * 20) is None
+
+
+def test_length_drop_reported_and_snapshot_persisted(db):
+    """done 事件 + 快照行都要带 length_drop；与 scope_mismatch 分列。
+
+    指令刻意用**非局部**措辞（不含「只/仅/保留/段尾…」）：局部指令现在会
+    分流到句子级补丁，只有整段重写路径才会产出 length_drop。
+    """
+    old_text = "甲" * 300
+    new_text = "乙" * 150  # 50%，跌幅 50%
+
+    project = _make_project(db, title="篇幅跌幅")
+    _seed_segment(db, project, 1, SEG1)
+    gen = _seed_segment(db, project, 2, old_text)
+    _seed_segment(db, project, 3, SEG3)
+
+    snap = begin_snapshot(db, project, gen, instruction="换一种语气")
+    events = list(regenerate_segment_stream(
+        db, project, 2,
+        provider=StubProvider(new_text),
+        instruction="换一种语气",
+        snapshot_id=snap.id,
+        expected_before=snap.before_text,
+    ))
+    done = next(e for e in events if e.get("type") == "done")
+    info = done.get("length_drop")
+    assert info is not None, "跌幅 50% 必须给 length_drop 提示"
+    assert info["ratio"] == 0.5
+    assert info["before_chars"] == 300 and info["after_chars"] == 150
+    # 两个问题分列：这里是整段压缩，不是首尾丢失
+    assert done.get("scope_mismatch") is None or isinstance(
+        done.get("scope_mismatch"), dict
+    )
+
+    # 不阻断：正文按模型输出落库
+    assert _gen(db, project, 2).text == new_text
+
+    db.expire_all()
+    row = db.get(GenerationSnapshot, snap.id)
+    assert row.length_drop == info
+    assert row.scope_mismatch == done.get("scope_mismatch")
+
+
+def test_explicit_compression_not_flagged_as_length_drop(db):
+    """用户要求「压缩到 150 字」时不提示，正文照常落库。"""
+    old_text = "甲" * 300
+    new_text = "乙" * 150
+
+    project = _make_project(db, title="明确要求压缩")
+    _seed_segment(db, project, 1, SEG1)
+    gen = _seed_segment(db, project, 2, old_text)
+    _seed_segment(db, project, 3, SEG3)
+
+    snap = begin_snapshot(db, project, gen, instruction="压缩到 150 字")
+    events = list(regenerate_segment_stream(
+        db, project, 2,
+        provider=StubProvider(new_text),
+        instruction="压缩到 150 字",
+        snapshot_id=snap.id,
+        expected_before=snap.before_text,
+    ))
+    done = next(e for e in events if e.get("type") == "done")
+    assert done.get("length_drop") is None
+    assert _gen(db, project, 2).text == new_text
