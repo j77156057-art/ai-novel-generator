@@ -479,10 +479,19 @@ def test_list_jobs_is_descending_and_project_scoped(db_session):
 
 
 def test_api_shape_matches_frontend_distill_job_contract(db_session):
-    """自己在 total=0 时不许显示 0% —— 前端靠 total===0 判不确定态。
+    """出参形状与前端 `DistillJob` 逐字段对齐；pending 行不许显示 0%。
 
-    这里钉住「pending 行的 total 必须是 0」：如果以后改成 1，前端的判断会
-    从「不确定态」悄悄变成「已完成 0/1」，语义就错了。
+    这里钉住三件事：
+
+    1. 键集与前端契约一致——包含「看护字段」`progress_at / expected_minutes /
+       elapsed_minutes / health / health_note`。这五个是 99814bb 加的可观测字段，
+       前端 `types.ts` 已声明、`AssistantWorkspace.vue` 真的在读（tag、stalled
+       样式、进度条旁那句人话）；本断言早先漏了它们，属于契约锁过期。
+    2. pending 行的 `progress_total` 必须是 0：前端靠 `total === 0` 判不确定态，
+       改成 1 会从「不确定态」悄悄变成「已完成 0/1」。
+    3. 派生字段在 pending 时的取值必须是「不知道就说不知道」，不能编：
+       `health=queued`、`health_note` 带排队分钟数、`progress_at / expected_minutes
+       / elapsed_minutes` 全为 null（没开跑、没语料可外推、没有起点）。
     """
     proj = Project(title="形状测试", target_length=5000, mode="quick", status="created")
     db_session.add(proj)
@@ -497,6 +506,9 @@ def test_api_shape_matches_frontend_distill_job_contract(db_session):
         "id", "project_id", "tier", "status", "stage", "progress_current",
         "progress_total", "n_chapters", "rule_count", "rejected", "error",
         "created_at", "started_at", "finished_at",
+        # —— 看护字段（前端 DistillJob 契约的一部分）——
+        "progress_at", "expected_minutes", "elapsed_minutes", "health",
+        "health_note",
     }
     assert set(shape) == expected_keys
     assert shape["progress_total"] == 0, "pending 行总数只能是 0（= 未探明）"
@@ -506,6 +518,12 @@ def test_api_shape_matches_frontend_distill_job_contract(db_session):
     assert shape["n_chapters"] is None
     assert shape["rule_count"] is None
     assert shape["rejected"] is None
+    # 看护字段：pending 就是排队，别的不该有值
+    assert shape["health"] == "queued"
+    assert shape["health_note"] and "已排队" in shape["health_note"]
+    assert shape["progress_at"] is None
+    assert shape["expected_minutes"] is None  # 本项目没参考语料，外推不出来
+    assert shape["elapsed_minutes"] is None  # started_at 还没写
 
 
 # —— distiller 角色隔离的回归锁（与下一节「provider 选型」配套的护栏）——

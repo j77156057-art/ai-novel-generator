@@ -311,7 +311,13 @@ def _materialize_stalled(db: Session, run: DistillRun | None) -> None:
             "progress_total": int(run.progress_total or 0),
             "expected_minutes": run.expected_minutes,
             "elapsed_minutes": distill_run_to_dict(run).get("elapsed_minutes"),
-            "next": "建议：先按上面的分钟数再等一会；仍无进度就点「继续蒸馏」接着跑（已完成的块不会重跑）。",
+            # 这条路**不给「继续蒸馏」按钮**：卡住的任务仍是 running，点续跑会被
+            # find_active_run 复用成同一个任务（等于没点）。真正的出口是重启后端：
+            # 重启后 reap_stale_runs 把它转成「中断」回执，那条上才有按钮。
+            "next": (
+                "建议：先按上面的分钟数再等一会。若仍无进度，重启后端——重启会把这条"
+                "任务转成「中断」回执，点那条回执上的「继续蒸馏」接着跑（已完成的块不会重跑）。"
+            ),
         },
     )
 

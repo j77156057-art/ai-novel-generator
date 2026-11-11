@@ -190,7 +190,11 @@ def distill_health(
             HEALTH_STALLED,
             f"{int(idle)} 分钟没有进度更新（阈值 {STALL_RUNNING_MINUTES} 分钟），"
             f"已跑 {int(elapsed)} 分钟；最后阶段：{run.stage or '未知'}。"
-            f"建议再等 {STALL_RUNNING_MINUTES} 分钟，仍不动就重新提交。",
+            # 不能建议「重新提交」：running 任务会被 start_distill 的
+            # find_active_run 复用成同一个任务，重新提交等于没提交。
+            # 真正的出口是重启后端 → 该任务被 reap 成「中断」→ 回执上再续跑。
+            f"建议再等 {STALL_RUNNING_MINUTES} 分钟；仍不动就重启后端，"
+            "重启后点「中断」回执上的「继续蒸馏」接着跑。",
         )
 
     if expected > 0:
@@ -200,7 +204,8 @@ def distill_health(
                 HEALTH_STALLED,
                 f"已跑 {int(elapsed)} 分钟，超过预计 {expected} 分钟的 "
                 f"{OVERRUN_FACTOR} 倍阈值（{int(limit)} 分钟）。"
-                "预计值本身是按字数外推、不是实测；建议重新提交一次。",
+                "预计值本身是按字数外推、不是实测；建议再等一会，仍不动就重启后端，"
+                "在「中断」回执上点「继续蒸馏」续跑（已完成的块不会重跑）。",
             )
 
     note = "刚启动" if elapsed < 1 else f"已运行 {int(elapsed)} 分钟"
