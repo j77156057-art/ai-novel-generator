@@ -140,6 +140,14 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("projects", "style", "VARCHAR(32)"),
         ("projects", "premise", "TEXT"),
         ("projects", "reference_novel_ids", "JSON"),
+        # —— 「当前书」：单值、可空。NULL = 未指定，读侧不按书过滤（现有行为）——
+        # 与 reference_novel_ids（多值参考语料集合）区分：后者回答「用了哪些书」，
+        # 这一列回答「此刻按哪一本」。漏这一项的后果与 style_narrative 相同：
+        # 老库 SELECT projects.* 会 no such column: projects.active_novel_id。
+        ("projects", "active_novel_id", "INTEGER"),
+        # —— 「续写书」：单值、可空。NULL = 原创/未指定 ——
+        # 回答的是「从哪本书往后写」，与 active_novel_id（事实来自哪本书）分开。
+        ("projects", "continuation_novel_id", "INTEGER"),
         ("projects", "plot_bible", "JSON"),
         ("projects", "generation_length", "INTEGER NOT NULL DEFAULT 3000"),
         ("projects", "summary_tree", "JSON"),
@@ -177,6 +185,13 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # —— 第 8 步：语料清洗报告（导入时剔除水印的留痕）——
         ("raw_novels", "clean_report", "JSON"),
         ("kg_nodes", "source", "VARCHAR(64)"),
+        # —— v3.0 KG 书维度：实体/提及归属哪本书 ——
+        # NULL = 项目级通配（归不出书的行 / 老数据），读侧与加列前完全一致。
+        # 漏这一项的后果：老库 SELECT kg_entities.* 直接 no such column: novel_id。
+        ("kg_entities", "novel_id", "INTEGER"),
+        ("kg_mentions", "novel_id", "INTEGER"),
+        # 事件同样要能区分「本项目原创」与「从某本书迁入/借用」；NULL = 项目级通配。
+        ("kg_events", "novel_id", "INTEGER"),
         # —— ADR-2026-10-12 第 5 步第 4 步：EditProposal 补齐提案生命周期字段——
         # 全部 nullable：既有行（第 2/3 步写入的）不该被 NOT NULL 破坏。
         ("edit_proposals", "project_id", "INTEGER"),
@@ -266,3 +281,32 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # 老库补建 v3.0 索引（IF NOT EXISTS 幂等，新库 create_all 已建则跳过）
         for table, idx_name, cols_sql, _note in v30_indexes:
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({cols_sql})"))
+        # 实体唯一键改「含书维度」的表达式索引：同名不同书各成一行，NULL 折成 -1
+        # 才挡得住同名通配行重复（与 kg_item_group 的表达式索引同口径）。
+        # 注意：老库若仍是表级 UNIQUE(project_id, kind, canonical_name)，这句只是
+        # 多建一个索引、**去不掉旧约束**——真正换键要跑
+        # migrations/2026-11-17-kg-entity-mention-novel-v1/apply_kg_book.py。
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_kg_entity ON kg_entities"
+            " (project_id, kind, canonical_name, COALESCE(novel_id, -1))"))
+
+        # —— 重写快照表（generation_snapshots）索引兜底 ——
+        # 表本身由 create_all 建（新库/老库都一样），这里只补索引：部分唯一索引
+        # uq_gs_pending 是「同段并发重写」的唯一闸门，缺了它两个请求会各写各的
+        # 快照、正文互相覆盖。手工建过表的库（见迁移脚本 DDL）也不重复报错。
+        exists = conn.execute(text(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type='table' AND name='generation_snapshots'")).fetchone()
+        if exists:
+            for stmt in (
+                "CREATE INDEX IF NOT EXISTS ix_gs_project_segment"
+                " ON generation_snapshots (project_id, segment_no, id)",
+                "CREATE INDEX IF NOT EXISTS ix_gs_batch"
+                " ON generation_snapshots (batch_id, segment_no)",
+                "CREATE INDEX IF NOT EXISTS ix_gs_status_created"
+                " ON generation_snapshots (status, created_at)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_gs_pending"
+                " ON generation_snapshots (project_id, segment_no)"
+                " WHERE status = 'pending'",
+            ):
+                conn.execute(text(stmt))

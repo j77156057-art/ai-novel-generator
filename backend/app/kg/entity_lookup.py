@@ -23,14 +23,18 @@ from app.models import KgEntity
 KIND_ORDER = ("character", "item", "faction", "location", "power_system", "worldrule")
 
 
-def resolve_entity_by_name(db, project_id: int, name: str, *, kind: str | None = None):
+def resolve_entity_by_name(db, project_id: int, name: str, *,
+                           kind: str | None = None,
+                           novel_id: int | None = None):
     """按规范名取一个实体；没有返回 ``None``，同名多行时行为确定。
 
     Args:
         db: SQLAlchemy session。
         project_id: 项目隔离，绝不跨项目解析。
         name: 规范名（不是别名——别名归并属于写入口的职责）。
-        kind: 指定类别时只在该类里查（唯一键保证至多一行）。
+        kind: 指定类别时只在该类里查。
+        novel_id: 传了才按书收窄（**这本书 + NULL 通配**），且同名时真书行优先；
+            不传 = 只按项目隔离，与加书维度之前逐字一致。
 
     Returns:
         ``KgEntity`` 或 ``None``。
@@ -39,7 +43,7 @@ def resolve_entity_by_name(db, project_id: int, name: str, *, kind: str | None =
     if not name:
         return None
 
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
 
     stmt = select(KgEntity).where(
         KgEntity.project_id == project_id,
@@ -47,10 +51,17 @@ def resolve_entity_by_name(db, project_id: int, name: str, *, kind: str | None =
     )
     if kind is not None:
         stmt = stmt.where(KgEntity.kind == kind)
-        return db.scalar(stmt)
+    if novel_id is not None:
+        stmt = stmt.where(or_(KgEntity.novel_id.is_(None),
+                              KgEntity.novel_id == novel_id))
 
     rows = db.scalars(stmt).all()
     if not rows:
         return None
     rank = {k: i for i, k in enumerate(KIND_ORDER)}
-    return min(rows, key=lambda e: (rank.get(e.kind, len(rank)), e.id))
+    # 真书行优先于 NULL 通配行：同一个名字在书里与项目级都有时，按书取书里的。
+    return min(rows, key=lambda e: (
+        e.novel_id is None,
+        rank.get(e.kind, len(rank)),
+        e.id,
+    ))

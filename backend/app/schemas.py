@@ -96,6 +96,10 @@ class ProjectPatch(StrictRequest):
     # 叙事蒸馏档位（full/balanced/fast）。校验在 router 层做（要回 400 而不是 422），
     # 见 app.style.narrative.resolve_tier。
     narrative_tier: Optional[str] = None
+    # 事实来源书 / 续写书（可空；None = 清空）。取值优先级的唯一实现见
+    # app.generation.engine._book_for_project。校验（书存在 + 在可写范围内）在 router 层。
+    active_novel_id: Optional[int] = None
+    continuation_novel_id: Optional[int] = None
 
 
 class ProjectOut(BaseModel):
@@ -123,6 +127,9 @@ class ProjectOut(BaseModel):
     # 已落库文风档案（蒸馏库「应用」写入的单槽缓存，生成链路直接读它）。
     # 列表也带它：项目数不多、单条档案体量可控，且前端要据此反映「已应用」状态。
     style_narrative: Optional[dict] = None
+    # 事实来源书 / 续写书（NULL = 未指定）。前端两个选择器据此回填。
+    active_novel_id: Optional[int] = None
+    continuation_novel_id: Optional[int] = None
 
     model_config = {"from_attributes": True}
 

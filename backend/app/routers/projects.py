@@ -1,10 +1,12 @@
 """项目 + 知识图谱路由：建项目 → 分步更新 → 建图谱 → 查询角色/坑 → 生成前提醒 → 导出txt。"""
 
+import json
+import logging
 import re
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -22,6 +24,8 @@ from app.style.jobs import (
     find_active_run,
     run_distill_job,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -466,9 +470,64 @@ def get_project(project_id: int, db: Session = Depends(get_db)) -> Project:
     return proj
 
 
+#: 两个「书」字段的人话名。校验报错时直接用，避免前端只看到裸字段名。
+_BOOK_FIELD_LABELS = {
+    "active_novel_id": "事实来源书",
+    "continuation_novel_id": "续写书",
+}
+
+
+def _normalize_novel_ids(raw) -> set[int]:
+    """把 ``reference_novel_ids`` 归一成 int 集合（脏值跳过，不抛）。"""
+    out: set[int] = set()
+    for x in (raw or []):
+        try:
+            out.add(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _validate_book_fields(db: Session, proj: Project, updates: dict) -> None:
+    """校验 PATCH 里的 ``active_novel_id`` / ``continuation_novel_id``。
+
+    规则（对应报告 §H）：
+
+    1. ``None`` = 清空回 NULL，放行（原创/不按书过滤的合法状态）；
+    2. 书必须存在（``raw_novels`` 有这一行）；
+    3. 书必须在本项目的可写范围内——即 ``reference_novel_ids``；同一次 PATCH 里
+       若也改了 ``reference_novel_ids``，按**新值**判断。列表为空 = 没有可写的书，
+       此时指定任何书都拒。
+
+    两个字段各查各的，互不依赖（可以只设续写书，也可以只设事实来源书）。
+    """
+    from app.models import RawNovel
+
+    scope = _normalize_novel_ids(
+        updates.get("reference_novel_ids", proj.reference_novel_ids))
+    for field, label in _BOOK_FIELD_LABELS.items():
+        if field not in updates:
+            continue
+        value = updates[field]
+        if value is None:
+            continue  # 清空
+        if db.get(RawNovel, value) is None:
+            raise HTTPException(status_code=400,
+                                detail=f"{label}指定的书 #{value} 不存在")
+        if value not in scope:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"{label}指定的书 #{value} 不在本项目的可写范围内"
+                        f"（参考语料={sorted(scope) or '空'}）"),
+            )
+
+
 @router.patch("/{project_id}", response_model=ProjectOut)
 def patch_project(
-    project_id: int, body: ProjectPatch, db: Session = Depends(get_db)
+    project_id: int,
+    body: ProjectPatch,
+    response: Response,
+    db: Session = Depends(get_db),
 ) -> Project:
     """分步更新项目字段（向导每步调一次）。
 
@@ -497,6 +556,7 @@ def patch_project(
                 updates["narrative_tier"] = resolve_tier(tier).key
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _validate_book_fields(db, proj, updates)
     for field, value in updates.items():
         setattr(proj, field, value)
     db.commit()

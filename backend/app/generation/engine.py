@@ -8,7 +8,7 @@
 import copy
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.agents.prompt_overrides import PromptKey, resolve_prompt_block
 from app.config import settings
@@ -39,6 +39,7 @@ from app.generation.summary_tree import (
     tree_before,
     tree_from_flat_summaries,
 )
+from app.kg.book_scope import book_for_project as _book_for_project
 from app.kg.queries import get_reminders
 from app.models import Generation, Project
 from app.retrieval.search import hybrid_search
@@ -703,18 +704,24 @@ def _active_character_names(db, project: Project, current_seg: int) -> list[str]
 
 
 def _active_item_entries(db, project: Project, current_seg: int) -> list[dict]:
-    """本段提及的物品（``{"name", "item_id"}``）。一次批量查询，不逐条 get。"""
+    """本段提及的物品（``{"name", "item_id"}``）。一次批量查询，不逐条 get。
+
+    书维度落在 ``kg_mentions.novel_id``：传了书时只取「这本书的提及」+
+    「``novel_id IS NULL`` 的项目级通配提及」；没传书则不过滤（与加列前一致）。
+    提及是**段级**事实，段属于哪本书由写侧落库时写死，这里不反推。
+    """
     try:
         from app.models import KgEntity, KgMention
 
-        ent_ids = sorted({
-            m.entity_id for m in db.scalars(
-                select(KgMention).where(
-                    KgMention.project_id == project.id,
-                    KgMention.segment_no == current_seg,
-                )
-            )
-        })
+        book = _book_for_project(project)
+        stmt = select(KgMention).where(
+            KgMention.project_id == project.id,
+            KgMention.segment_no == current_seg,
+        )
+        if book is not None:
+            stmt = stmt.where(
+                or_(KgMention.novel_id.is_(None), KgMention.novel_id == book))
+        ent_ids = sorted({m.entity_id for m in db.scalars(stmt)})
         if not ent_ids:
             return []
         rows = db.execute(
@@ -745,6 +752,7 @@ def _item_holding_text(db, project: Project, current_seg: int) -> str:
         facts = current_item_holdings(
             items, db=db, project_id=project.id,
             generated_db=settings.kg_generated_db,
+            novel_id=_book_for_project(project),
         )
         return format_holding_facts(facts)
     except Exception:  # noqa: BLE001 - 读通道是增强，取不到不阻断生成

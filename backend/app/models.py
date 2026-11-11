@@ -52,6 +52,17 @@ class Project(Base):
     style = Column(String(32), nullable=True)  # 风格平台调性：番茄/起点/晋江/豆瓣阅读/知乎盐选…
     premise = Column(Text, nullable=True)  # 小说大概内容（用户填写，可空）
     reference_novel_ids = Column(JSON, nullable=True)  # 选中的参考语料 novel_id 列表（空=自由生成）
+    # 「当前书」：本项目此刻按哪本书收窄书级事实（物品组/写法/持有）。
+    # 可空；NULL = 未指定，读侧不按书过滤 —— 与加这一列之前的行为逐字一致。
+    # 指向 raw_novels.id（同库；SQLite 的 ALTER ADD COLUMN 加不了外键，故只在
+    # 迁移脚本里校验取值存在）。与 reference_novel_ids 的区别：后者是「参考语料
+    # 集合」（多值、可两本同时用），前者是「当前这一本」（单值）。
+    active_novel_id = Column(Integer, nullable=True)
+    # 「续写书」：本项目正在从哪本书往后写。原创项目为 NULL。
+    # 与 active_novel_id（书级事实来源）是两个问题，允许同时为空、也允许不一致；
+    # 两者不同时的行为见 reports/...§G（只告警，不报错）。同样无外键（ADD COLUMN
+    # 加不了），取值由写入方保证 ∈ raw_novels.id。
+    continuation_novel_id = Column(Integer, nullable=True)
     plot_bible = Column(JSON, nullable=True)  # 动态剧情圣经：角色关系/后续走向/剧情冲突/伏笔
     generation_length = Column(Integer, nullable=False, default=3000)  # 单次生成字数（长文，避免多段压缩）
     # 层级摘要树（L1 段 / L2 卷 / L3 主线骨架）。
@@ -217,7 +228,11 @@ class KgEntity(Base):
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
-    kind = Column(String(16), nullable=False)  # character|location|faction|item|worldrule|power_system
+    # 书维度：这条实体的事实来自哪本书。NULL = 项目级通配（归不出书 / 老数据）。
+    # 分槽规则：同名不同书是**两条**实体，唯一键含 COALESCE(novel_id, -1)；
+    # 与 kg_item_group.novel_id 同一口径（那边也是 NULL=通配）。
+    novel_id = Column(Integer, nullable=True)
+    kind = Column(String(16), nullable=False)  # character|location|faction|item|info|worldrule|power_system
     canonical_name = Column(String(128), nullable=False)
     aliases = Column(JSON, nullable=True, default=list)  # 已归并到 canonical_name 的其它书写形态
     attrs = Column(JSON, nullable=True, default=dict)  # 软 schema：arc/current_goal/secrets/power_level/region/leader_id
@@ -229,7 +244,11 @@ class KgEntity(Base):
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     __table_args__ = (
-        UniqueConstraint("project_id", "kind", "canonical_name", name="uq_kg_entity"),
+        # 唯一键必须含书维度，否则「书 5 的镇北王」与「书 6 的镇北王」会撞行。
+        # 用表达式索引而非 UniqueConstraint：NULL 在唯一约束里互不相等，两行
+        # 同名的 NULL 通配实体只靠 COALESCE(...,-1) 才挡得住（组表同口径）。
+        Index("uq_kg_entity", "project_id", "kind", "canonical_name",
+              text("COALESCE(novel_id, -1)"), unique=True),
         # 检索切片/批抽扫描：WHERE project_id=? + 归一 by canonical_name
         Index("ix_kg_entity_project_kind", "project_id", "kind"),
         Index("ix_kg_entity_project_canonical", "project_id", "canonical_name"),
@@ -438,6 +457,9 @@ class KgMention(Base):
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
     entity_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
+    # 书维度：这段正文讲的是哪本书的事。NULL = 归不出（项目级通配），读侧仍可见。
+    # 来源：写侧取「当前书」；回填取所属实体的 novel_id（提及没有 chunk 链路）。
+    novel_id = Column(Integer, nullable=True)
     generation_id = Column(Integer, ForeignKey("generations.id"), nullable=True)
     segment_no = Column(Integer, nullable=True)
     context_window = Column(String(500), nullable=True)  # 提及处原文片段

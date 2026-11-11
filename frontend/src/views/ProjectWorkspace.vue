@@ -59,6 +59,16 @@ const maxStep = ref(1);
 
 // 选择态
 const selectedRefs = ref<number[]>([]);
+// 书级事实（项目设置）：事实来源书 / 续写书。存成字符串以配合 <select> 的
+// "" = 不限/原创；保存时再转成 number | null（null 在 API 里就是「清空」）。
+const activeNovelChoice = ref<string>("");
+const continuationNovelChoice = ref<string>("");
+const bookSaving = ref(false);
+// 只能从本项目已选的参考语料里挑（服务端按 reference_novel_ids 校验可写范围）。
+const bookOptions = computed(() => {
+  const ids = new Set(selectedRefs.value);
+  return novels.value.filter((n) => ids.has(n.id));
+});
 const GENRES = ["科幻", "都市", "悬疑", "言情", "奇幻", "仙侠", "历史", "游戏"];
 const STYLES = ["番茄", "起点", "晋江", "豆瓣阅读", "知乎盐选"];
 
@@ -274,6 +284,10 @@ async function loadProject() {
   try {
     project.value = await api.getProject(projectId);
     selectedRefs.value = (project.value.reference_novel_ids as number[]) || [];
+    activeNovelChoice.value = project.value.active_novel_id != null
+      ? String(project.value.active_novel_id) : "";
+    continuationNovelChoice.value = project.value.continuation_novel_id != null
+      ? String(project.value.continuation_novel_id) : "";
     premiseDraft.value = project.value.premise || "";
     generationLength.value = project.value.generation_length || 3000;
     bible.value = (project.value.plot_bible as PlotBible) || null;
@@ -609,6 +623,29 @@ async function saveRefs() {
   if (known) body.narrative_tier = effectiveTier.value;
   await patch(body);
   kgSourceOptions.value = buildSourceOptions();
+}
+
+/**
+ * 保存「事实来源书 / 续写书」。
+ *
+ * 空选项 = null，服务端语义是清空（回到不按书过滤 / 原创）。两个字段一起提交，
+ * 因为它们是同一块设置；服务端逐字段校验「书存在 + 在本项目参考语料内」。
+ */
+async function saveBookScope() {
+  actionNotice.value = null;
+  bookSaving.value = true;
+  try {
+    const toId = (v: string) => (v === "" ? null : Number(v));
+    project.value = await api.patchProject(projectId, {
+      active_novel_id: toId(activeNovelChoice.value),
+      continuation_novel_id: toId(continuationNovelChoice.value),
+    });
+    actionNotice.value = { kind: "ok", text: "书级事实已保存。" };
+  } catch (err) {
+    showActionError("书设置保存失败", err);
+  } finally {
+    bookSaving.value = false;
+  }
 }
 
 // ── 文风蒸馏库（跨项目复用）──
@@ -1678,6 +1715,44 @@ onUnmounted(stopDistillPolling);
       :tier-name="distillTierName"
       class="distill-inline"
     />
+
+    <!-- ============ 书级事实（项目设置）：事实来源书 / 续写书 ============ -->
+    <div class="tier-block">
+      <div class="card-title" style="font-size: var(--fs-md)">
+        项目设置 · 书级事实<span class="hint">物品「现在在谁手上」按哪本书读</span>
+      </div>
+      <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
+        <strong>事实来源书</strong>：物品组 / 写法 / 持有事实按哪本书收窄；
+        <strong>续写书</strong>：正在从哪本书往后写（原创留空）。
+        两者都空 = 不按书过滤（与不设之前一致）。同时设置时<strong>续写书优先</strong>。
+      </p>
+      <div class="row" style="flex-wrap: wrap; align-items: flex-end">
+        <div class="field" style="flex: 1; min-width: 220px">
+          <label for="active-novel">事实来源书</label>
+          <select id="active-novel" class="input" v-model="activeNovelChoice">
+            <option value="">不限（不按书过滤）</option>
+            <option v-for="n in bookOptions" :key="n.id" :value="String(n.id)">
+              {{ n.title || "无题" }} #{{ n.id }}
+            </option>
+          </select>
+        </div>
+        <div class="field" style="flex: 1; min-width: 220px">
+          <label for="continuation-novel">续写书</label>
+          <select id="continuation-novel" class="input" v-model="continuationNovelChoice">
+            <option value="">原创 / 不续写</option>
+            <option v-for="n in bookOptions" :key="n.id" :value="String(n.id)">
+              {{ n.title || "无题" }} #{{ n.id }}
+            </option>
+          </select>
+        </div>
+        <button class="btn" :disabled="bookSaving" @click="saveBookScope">
+          {{ bookSaving ? "保存中…" : "保存书设置" }}
+        </button>
+      </div>
+      <p v-if="!bookOptions.length" class="faint" style="font-size: var(--fs-xs); margin-top: var(--gap-sm)">
+        先在上方选择参考语料，才可选书（服务端按参考语料校验可写范围）。
+      </p>
+    </div>
 
     <!-- ============ 蒸馏档位（与选语料同一步落库） ============ -->
     <div class="tier-block">

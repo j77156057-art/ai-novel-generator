@@ -100,6 +100,10 @@ export interface ProjectPatch {
   status?: string | null;
   /** 文风蒸馏档位（full / balanced / fast）。空 = 用服务端默认档。 */
   narrative_tier?: string | null;
+  /** 事实来源书：本项目按哪本书收窄书级事实（物品组/写法/持有）。null = 清空。 */
+  active_novel_id?: number | null;
+  /** 续写书：正在从哪本书往后写；null = 原创/清空。读侧优先级高于事实来源书。 */
+  continuation_novel_id?: number | null;
 }
 
 export interface PlotBible {
@@ -173,6 +177,10 @@ export interface ProjectOut {
   narrative_tier: string | null;
   /** 已落库文风档案（蒸馏库「应用」写入的单槽缓存）；null = 尚未蒸馏/应用。 */
   style_narrative?: Record<string, unknown> | null;
+  /** 事实来源书（NULL = 未指定，读侧不按书过滤）。 */
+  active_novel_id: number | null;
+  /** 续写书（NULL = 原创）。 */
+  continuation_novel_id: number | null;
 }
 
 export interface KgNode {
