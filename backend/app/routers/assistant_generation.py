@@ -79,6 +79,7 @@ from app.generation.engine import (
     generate_next_segment,
     regenerate_segment_stream,
 )
+from app.generation.repetition import parse_quality
 from app.models import AgentRun, Evidence, Generation, Project
 from app.routers.assistant_shared import (
     _build_evidence_row,
@@ -1007,6 +1008,9 @@ def assistant_invoke_generation(
                 # 闭环摘要（旁路观测）：记账/微调做了什么、异常时为 None。
                 # 没有它，调用方无从得知「这次自动微调到底发生了什么」。
                 "ai_flavor_feedback": flavor_feedback,
+                # 复读闸门（D7）：落库仍是 200，只把结论带回来。
+                "repetition": result.get("repetition"),
+                "warnings": result.get("warnings") or [],
                 "debug": {
                     "system_prompt": result.get("system_prompt") or "",
                     "user_prompt": result.get("user_prompt") or "",
@@ -1106,6 +1110,9 @@ def assistant_invoke_generation(
             # 闭环摘要（旁路观测）：与 generate_next 分支同键同形状，
             # 异常/未达记忆线时为 None。前端据此提示「本次已沉淀 AI 腔教训」。
             "ai_flavor_feedback": flavor_feedback,
+            # 复读闸门（D7）：与 generate_next 分支同键同形。
+            "repetition": done.get("repetition"),
+            "warnings": done.get("warnings") or [],
             # 撤销入口：这段正文现在可以退回到 snapshot 的 before_text。
             "snapshot_id": snapshot.id if snapshot is not None else None,
             "batch_id": snapshot.batch_id if snapshot is not None else None,
@@ -1158,4 +1165,6 @@ def _segment_out(gen: Generation) -> dict:
         "chapter_range": gen.chapter_range,
         "text": gen.text,
         "summary": gen.summary,
+        # 与 GET /api/generations/{pid} 同形：NULL → verdict="undetected"。
+        "quality": parse_quality(gen.quality_json),
     }

@@ -24,6 +24,7 @@ from app.generation import (
 )
 from app.generation.engine import _style_info, _style_narrative, _style_profile, _next_segment_no, current_node_prompt
 from app.generation.prompts import build_system_prompt, build_user_prompt
+from app.generation.repetition import parse_quality
 from app.models import Generation, Project
 from app.schemas import StrictRequest
 
@@ -80,6 +81,8 @@ def _to_generation_out(gen: Generation) -> dict:
         "chapter_range": gen.chapter_range,
         "text": gen.text,
         "summary": gen.summary,
+        # 复读闸门结论。`NULL` → verdict="undetected"（未检测），**不是**「正常」。
+        "quality": parse_quality(gen.quality_json),
     }
 
 
@@ -97,6 +100,9 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         **_to_generation_out(_last_generation(db, proj.id)),
+        # 落库仍是 200：复读只标记不拒绝（D7）。
+        "repetition": result.get("repetition"),
+        "warnings": result.get("warnings") or [],
         "debug": {
             "system_prompt": result["system_prompt"],
             "user_prompt": result["user_prompt"],
@@ -190,7 +196,9 @@ def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)
     return {
         "segments": [
             {**_to_generation_out(_generation_by_no(db, proj.id, r["segment_no"])),
-             "summary": r["summary"]}
+             "summary": r["summary"],
+             "repetition": r.get("repetition"),
+             "warnings": r.get("warnings") or []}
             for r in results
         ],
         "last_system_prompt": results[-1]["system_prompt"],
