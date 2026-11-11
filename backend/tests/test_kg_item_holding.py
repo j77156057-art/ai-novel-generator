@@ -407,3 +407,100 @@ def test_instance_without_label_is_refused(tmp_path):
         assert con.execute("SELECT COUNT(*) FROM kg_item_instance").fetchone()[0] == 0
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# 11. 重跑不叠段：reset_chapter 必须连持有轴一起清（原缺口）
+# ---------------------------------------------------------------------------
+def _holding_counts(con):
+    n = lambda sql: con.execute(sql).fetchone()[0]
+    return {
+        "holdings": n("SELECT COUNT(*) FROM kg_item_holding"),
+        "story": n("SELECT COUNT(*) FROM kg_holding_story_segment"),
+        "open": n("SELECT COUNT(*) FROM kg_item_holding WHERE valid_to IS NULL"),
+        "orphan_story": n(
+            "SELECT COUNT(*) FROM kg_holding_story_segment s "
+            "WHERE s.holding_id IS NOT NULL AND NOT EXISTS ("
+            "  SELECT 1 FROM kg_item_holding h WHERE h.id = s.holding_id)"),
+        "instances": n("SELECT COUNT(*) FROM kg_item_instance"),
+    }
+
+
+def _write_chapter(con, item, owner, chapter):
+    """模拟一章的持有投影：持有段 + 主线旁注。"""
+    res = store.record_holding(con, item, "own", owner, chapter,
+                              evidence=f"{owner}持有{item}")
+    assert res["action"] in ("inserted", "extended_back"), res
+    seg = store.record_story_segment(con, item, "own", owner, chapter,
+                                     holding_id=res["id"], narration="forward",
+                                     evidence=f"{owner}持有{item}")
+    assert seg["action"] in ("inserted", "confirmed"), seg
+    return res["id"]
+
+
+def test_reset_chapter_clears_holdings_and_story_segments(tmp_path):
+    """同章重写（A→B→A，每轮先 reset）：行数恒定、旁注不叠、无孤儿。
+
+    改前：reset 只清 gen_*，本章持有段与旁注全留着；换持有者重写时
+    ``_resolve_same_chapter`` 会撤掉零长度持有行、留下悬空旁注，旁注逐轮累加。
+    """
+    con = _db(tmp_path)
+    try:
+        for round_no, owner in enumerate(("许七安", "许新年", "许七安"), 1):
+            if round_no > 1:
+                out = store.reset_chapter(con, 3)
+                assert out["chapter"] == 3
+            _write_chapter(con, "镇北王刀", owner, 3)
+            assert _holding_counts(con) == {
+                "holdings": 1, "story": 1, "open": 1,
+                "orphan_story": 0, "instances": 0}, f"第{round_no}轮残留"
+        # 段链只有本章这一行，没有叠出来的历史
+        rows = store.item_holding_timeline(con, "镇北王刀")
+        assert len(rows) == 1 and rows[0]["owner_name"] == "许七安"
+        assert rows[0]["valid_from"] == 3 and rows[0]["valid_to"] is None
+    finally:
+        con.close()
+
+
+def test_reset_chapter_reopens_segment_closed_by_that_chapter(tmp_path):
+    """重跑后一章：本章关掉的上一段要重新打开，不能留下幻影空洞。"""
+    con = _db(tmp_path)
+    try:
+        _write_chapter(con, "镇北王刀", "许七安", 3)
+        _write_chapter(con, "镇北王刀", "许新年", 4)
+
+        out = store.reset_chapter(con, 4)
+        assert out["holdings"] == 1 and out["story_segments"] == 1
+        assert out["reopened"] == 1
+        rows = store.item_holding_timeline(con, "镇北王刀")
+        assert len(rows) == 1
+        assert rows[0]["owner_name"] == "许七安" and rows[0]["valid_to"] is None
+
+        # 重跑本章两次：段链回到 [3,4) + [4,∞)，不增量、无孤儿
+        for _ in range(2):
+            store.reset_chapter(con, 4)
+            _write_chapter(con, "镇北王刀", "许新年", 4)
+            assert _holding_counts(con) == {
+                "holdings": 2, "story": 2, "open": 1,
+                "orphan_story": 0, "instances": 0}
+        _assert_contiguous(store.item_holding_timeline(con, "镇北王刀"))
+    finally:
+        con.close()
+
+
+def test_reset_chapter_keeps_instance_referenced_by_other_chapter(tmp_path):
+    """本章登记但被别的章引用的实例不能删；没人引用的才随章清掉。"""
+    con = _db(tmp_path)
+    try:
+        used = store.record_item_instance(con, "地书碎片", "三号", 120)
+        store.record_holding(con, "地书碎片", "own", "许七安", 150,
+                             instance_id=used)
+        store.record_item_instance(con, "地书碎片", "六号", 120)
+
+        out = store.reset_chapter(con, 120)
+        assert out["instances"] == 1, "只应删掉本章登记、无人引用的那个实例"
+        left = [r["instance_label"] for r in con.execute(
+            "SELECT instance_label FROM kg_item_instance ORDER BY id")]
+        assert left == ["三号"]
+    finally:
+        con.close()

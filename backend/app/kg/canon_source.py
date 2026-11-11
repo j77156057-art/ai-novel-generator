@@ -785,19 +785,21 @@ _REF_KEYS = ("from", "to", "subject", "object", "location", "character", "knows"
 #: v3 的实体层只做人物归一，物品名跨章不合并，导致同一把剑按章分裂成
 #: 玄武神剑 / 镇国神剑 / 镇国宝剑 / 斩天灭仙的神剑……持有段被拆散。
 #: 这里只收「有专属定语、能确认指同一物」的写法；裸名与泛称（刀/剑/铜剑）不收。
+#: 规范目标 2026-11-10 起是「镇国剑」：「神剑」是歧义名（至少指镇国剑 / 洛玉衡
+#: 祖传神剑 / 佛门金身黄金神剑三件），不能再做折叠目标。
 ITEM_ALIASES = {
-    "玄武神剑": "神剑",
-    "镇国神剑": "神剑",
-    "镇国宝剑": "神剑",
-    "大奉镇国宝剑": "神剑",
-    "镇国剑": "神剑",
-    "斩天灭仙的神剑": "神剑",
-    "镇压气运的神剑": "神剑",
-    "庙里供奉着的神剑": "神剑",
-    "开国皇帝佩剑": "神剑",
-    "开国皇帝当年使用过的佩剑": "神剑",
-    "开国帝君当年征战沙场使用的佩剑": "神剑",
-    "黄铜剑": "神剑",
+    "玄武神剑": "镇国剑",
+    "镇国神剑": "镇国剑",
+    "镇国宝剑": "镇国剑",
+    "大奉镇国宝剑": "镇国剑",
+    "镇国剑": "镇国剑",
+    "斩天灭仙的神剑": "镇国剑",
+    "镇压气运的神剑": "镇国剑",
+    "庙里供奉着的神剑": "镇国剑",
+    "开国皇帝佩剑": "镇国剑",
+    "开国皇帝当年使用过的佩剑": "镇国剑",
+    "开国帝君当年征战沙场使用的佩剑": "镇国剑",
+    "黄铜剑": "镇国剑",
     # 地书：正文 ch51 摊位「菩提手串和玉石小镜，二选一」拿到，ch72 玖号点明
     # 「这法宝又叫做地书」。注意「玉石小镜 / 玉石镜」**不在这里**：ch596
     # 「跌出一件同款玉石小镜」说明它是九块碎片共用的类通称，不是某一件的别名，
@@ -818,6 +820,29 @@ ITEM_ALIAS_BLOCKLIST = frozenset({
     "镜子", "镜面", "这面镜子", "破镜子", "小镜",
     "刀", "长刀", "刀子",
     "黑金刀",
+})
+
+#: 派生 item 实体：抽取链路会把它们当独立物品抽出来，但它们不是物品。
+#: 「地书碎片」指地书本身（碎片粒度走 ``kg_item_instance``），「地书聊天群」指
+#: 地书的群聊通道（通信手段，不可持有）。在 ``normalize_extraction`` 入口整条
+#: 摘掉，关系/状态/情报里的引用一并清，避免悬空端点。
+#:
+#: 为什么不复用另外三张表（各管一段，语义不能混）：
+#: - ``NON_ENTITY_NAMES``：**建词表时**剔抽象词（cleaned/mixed 源），命中就进不了
+#:   canon；但这两个是专指某件东西的派生名，进了词表也拦不住 v3 抽取。
+#: - ``ITEM_ALIAS_BLOCKLIST``：**折叠之后**剔别名，只动 ``aliases``、不删实体，
+#:   而且剔的是「镜子/长刀」这类任何物品都可能被叫的通名。
+#: - ``ITEM_ALIASES``：把异写折到同一规范名。这里不能折——「地书碎片」折成
+#:   「地书」会把碎片粒度（九面镜子各一件）与本体混成一件，与 2026-11-10
+#:   「九件套通称不折」的既有口径直接冲突。
+#: - ``GENERIC_ALIASES``（迁移脚本 ``apply_item_merge.py`` 内）是泛称组别名，
+#:   运行时不读，也不承载「写侧直接丢弃」这个动作。
+#:
+#: 已知事实（2026-11-11 核过真实库）：这两个词当前 0 持有 / 0 提及 / 0 关系 /
+#: 0 事件，**本次不清理任何历史数据**；它拦的是「以后重跑/新批再把它们抽出来」。
+DERIVED_ITEM_NAMES = frozenset({
+    "地书碎片",
+    "地书聊天群",
 })
 
 
@@ -874,12 +899,74 @@ def fold_item_aliases(result: dict) -> dict:
     return result
 
 
+def drop_derived_items(result: dict) -> dict:
+    """丢弃 ``DERIVED_ITEM_NAMES`` 里的派生 item 实体（原地修改并返回）。
+
+    为什么放在同步层而不是改抽取提示词：提示词管不住模型换说法（碎片/群/
+    聊天群），而历史批已经抽出来了；在归一入口兜底，才能让「不建实体、不建组」
+    对所有路径（批抽、重跑、回放）都成立。
+
+    可见性：命中时记一条 warning，并把计数写回 ``result``
+    （``derived_items_dropped`` / ``derived_refs_dropped``），由
+    ``batch_worker._persist_extraction`` 转进 ``ExtractionStats``，最终落在
+    ``agent_runs.note.batch_stats`` 里可查——不静默消失。
+    """
+    ents = result.get("entities") or []
+    dropped: dict[str, int] = {}
+    kept = []
+    for ent in ents:
+        name = (ent.get("canonical_name") or "").strip() \
+            if isinstance(ent, dict) else ""
+        if name in DERIVED_ITEM_NAMES and (ent.get("kind") or "") == "item":
+            dropped[name] = dropped.get(name, 0) + 1
+            continue
+        kept.append(ent)
+    if not dropped:
+        return result
+    result["entities"] = kept
+
+    def _is_derived(row: dict, field: str) -> bool:
+        value = row.get(field)
+        return isinstance(value, str) and value.strip() in DERIVED_ITEM_NAMES
+
+    # 关系 / 状态变化 / 情报：两端或主语是派生词时整条丢掉（落库也需要端点
+    # 可解析，留着只会是悬空行）；事件保留剧情，只清空指向派生词的字段。
+    refs = 0
+    for key in ("relations", "state_changes", "entity_knowledge"):
+        rows = result.get(key) or []
+        if not rows:
+            continue
+        keep_rows = []
+        for row in rows:
+            if isinstance(row, dict) and any(_is_derived(row, f) for f in _REF_KEYS):
+                refs += 1
+                continue
+            keep_rows.append(row)
+        result[key] = keep_rows
+    for ev in result.get("events") or []:
+        if not isinstance(ev, dict):
+            continue
+        for field in ("subject", "object", "location"):
+            if _is_derived(ev, field):
+                ev[field] = None
+                refs += 1
+    result["derived_items_dropped"] = dropped
+    result["derived_refs_dropped"] = refs
+    _log.warning(
+        "丢弃派生 item 实体 %s（连带清理引用 %d 条）：它们不是物品实体，"
+        "见 canon_source.DERIVED_ITEM_NAMES", dropped, refs)
+    return result
+
+
 def normalize_extraction(result: dict) -> dict:
     """把 v3 抽取结果的称呼写法折到实体规范名（原地修改并返回）。
 
     原文词保留：实体原有写法进 aliases，mention 的 context_window 仍是原文。
     关系两端一并归一，避免「许郎 —兄弟→ 许七安」这种同一人被拆成两个节点。
     """
+    # 派生 item 实体与词表无关（legacy 下也要生效），放在折叠之前：
+    # 先摘掉它们，后面的别名折叠/称呼归一就不会再碰到。
+    result = drop_derived_items(result)
     # 物品别名折叠与 canon 词表无关（legacy 下也要生效），先做。
     result = fold_item_aliases(result)
     if source() not in (SOURCE_CLEANED, SOURCE_MIXED) or not _index():

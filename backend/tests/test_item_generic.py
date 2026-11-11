@@ -14,7 +14,12 @@ if str(BACKEND) not in sys.path:
 from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
-from app.kg import canon_source, generated_store as store, item_generic as ig  # noqa: E402
+from app.kg import (  # noqa: E402
+    canon_source,
+    generated_store as store,
+    item_generic as ig,
+    item_category as icat,
+)
 from app.kg import item_holding_read as read  # noqa: E402
 
 
@@ -50,10 +55,53 @@ def test_shape_none_for_proper_names():
     assert ig.classify_name("玄武神剑").level == ig.NONE
 
 
+def test_canonical_whitelist_records_reasons_not_ids():
+    """白名单每条都要能被复查：正文无专名 + 持有行对应唯一实物。"""
+    for name, reason in ig.CANONICAL_WHITELIST.items():
+        assert ig.classify_name(name).flagged, name  # 形态上确实像类名
+        assert "专名" in reason, name
+        assert "hid=" in reason or "持有" in reason, name
+
+    for name in ("大钢刀", "法器铜锣", "银枪", "长剑", "飞剑", "黑金长刀"):
+        shape = ig.classify_canonical(name)
+        assert shape.level == ig.NONE, name
+        assert shape.detail.startswith("已核定白名单："), name
+
+
+def test_canonical_whitelist_does_not_hide_real_generic():
+    """白名单只覆盖 6 条已定项，真正的类通称仍要报警。"""
+    for name in ("刀", "法宝", "神兵", "铜剑", "长刀", "法器", "玉石小镜", "神剑"):
+        assert ig.classify_canonical(name).level != ig.NONE, name
+    assert ig.whitelist_reason("法宝") is None
+    assert ig.whitelist_reason("飞剑")
+
+
+
 def test_own_abbreviation_is_not_generic():
     assert ig.is_own_abbreviation("黑金刀", "黑金长刀")
     assert ig.alias_verdict("黑金刀", "黑金长刀", {"黑金长刀", "黑金刀"},
                             {"黑金刀": {"黑金长刀"}})["blocked"] is False
+
+
+def test_reference_phrase_rule_blocks_deixis_and_descriptions():
+    for name in ("此兽", "那杆枪", "腰间一把军弩", "水陆两栖的异兽", "许七安的佩刀"):
+        assert ig.is_reference_phrase(name), name
+        assert ig.alias_verdict(name, "灵龙", set(), {})["blocked"], name
+    # 规范名与真别名不能被误伤
+    for name in ("灵龙", "黑金长刀", "半块玉佩", "半圆玉佩", "白马银枪", "水中坐骑"):
+        assert not ig.is_reference_phrase(name), name
+    # 组规范名里的「的」不走这条判据（只作用于写法层）
+    assert ig.is_reference_phrase("周旻的账簿")
+    assert ig.classify_canonical("周旻的账簿").level != ig.HIGH
+
+
+def test_creature_class_rule_does_not_swallow_mount_names():
+    assert ig.classify_name("灵兽").level == ig.HIGH
+    assert ig.classify_name("妖兽").level == ig.HIGH
+    assert ig.classify_name("宝刀").level == ig.HIGH
+    # 坐骑专名与器型专名都必须留在 none/medium，不能被类称语素吃掉
+    assert ig.classify_name("灵龙").level != ig.HIGH
+    assert ig.classify_name("雪蹄乌龙骠").level == ig.NONE
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +219,63 @@ def test_record_holding_generic_keeps_group_id_null():
                           (row["id"],)).fetchone()[0]
         assert got is None
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# 非物品类名（功法 / 生物类称 / 关系概念）：封闭手工标记表
+# ---------------------------------------------------------------------------
+def test_non_item_names_are_registered_with_category_and_evidence():
+    assert icat.category_of("狮子吼") == icat.TECHNIQUE
+    assert icat.category_of("怪物") == icat.CREATURE_CLASS
+    assert icat.category_of("信物") == icat.RELATION_CONCEPT
+    for name in ("狮子吼", "怪物", "信物"):
+        assert icat.is_non_item(name), name
+        assert len(icat.reason_of(name)) >= 20, name
+
+
+def test_non_item_table_is_closed_and_each_row_says_why_not_an_item():
+    """形态判据不可迁移，只能人工封闭登记；每条都要写明「不是哪件实物」。"""
+    assert set(icat.NON_ITEM_NAMES) == {"狮子吼", "怪物", "信物"}
+    for name, (category, reason) in icat.NON_ITEM_NAMES.items():
+        assert category in icat.CATEGORY_LABELS, name
+        assert "不是" in reason, name
+
+
+def test_non_item_table_does_not_swallow_real_items():
+    # 同类词形的真物品：坐骑专名、刀法残篇、单件玉佩都必须留在 item 类目。
+    for name in ("灵龙", "天地一刀斩", "《天地一刀斩》", "半块玉佩", "玉佩", "飞剑"):
+        assert not icat.is_non_item(name), name
+    assert icat.category_of("") is None
+    assert icat.reason_of("") is None
+
+
+# ---------------------------------------------------------------------------
+# 描述性写法：指真物品、但不是稳定名字（形态判据覆盖不了，封闭手工表）
+# ---------------------------------------------------------------------------
+def test_descriptive_surface_table_is_closed_and_group_bound():
+    assert set(icat.DESCRIPTIVE_SURFACES) == {
+        "水中坐骑", "修长战刀", "白马银枪", "法器军弩"}
+    for name, (group, reason) in icat.DESCRIPTIVE_SURFACES.items():
+        assert icat.is_descriptive(name), name
+        assert icat.descriptive_group(name) == group, name
+        assert "描述" in reason and len(reason) >= 20, name
+        # 描述性写法不是「非物品」，两张手工表不许混用
+        assert not icat.is_non_item(name), name
+        # 形态判据确实拆不出来，不能声称由 R4/R6 覆盖
+        assert not ig.is_reference_phrase(name), name
+        assert ig.classify_name(name).level != ig.HIGH, name
+
+
+def test_descriptive_table_does_not_swallow_specific_item_names():
+    # 「刀胚」按原文判过：ch93 三次是同一次锻造场景，有动作句和持有者 → 不登记
+    for name in ("刀胚", "灵龙", "黑金长刀", "黑金刀", "银枪", "军弩",
+                 "半块玉佩", "法器铜锣", "大钢刀"):
+        assert not icat.is_descriptive(name), name
+    # 「暗金色长刀」复核后认定是那把刀在 ch843/919/926 的唯一写法，已移出表并恢复 approved，
+    # 不能再被 --step 4 降级
+    assert not icat.is_descriptive("暗金色长刀")
+    assert icat.descriptive_group("") is None
+    assert icat.descriptive_reason("") is None
 
 
 # ---------------------------------------------------------------------------

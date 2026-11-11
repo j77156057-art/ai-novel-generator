@@ -216,6 +216,8 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         prior_blocks=ctx["prior_blocks"],
         style_exemplars=ctx.get("style_exemplars"),
         rag_has_forbidden=ctx.get("rag_has_forbidden", False),
+        # 预检页必须与真实生成同源：漏了这块，人工审阅看到的 prompt 就不是实际下发的那份
+        item_holding_block=ctx.get("item_holding_block") or None,
         node_prompt=current_node_prompt(
             proj, _next_segment_no(db, body.project_id) - 1, get_llm_provider(), db=db
         ),

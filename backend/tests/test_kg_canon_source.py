@@ -672,6 +672,56 @@ def test_normalize_extraction_keeps_original_form(monkeypatch):
     assert result["events"][0]["object"] == "浮香"
 
 
+def test_normalize_extraction_drops_derived_item_entities(caplog):
+    """派生 item 实体（地书碎片/地书聊天群）在入口丢弃，且有计数与日志。"""
+    result = {
+        "entities": [
+            {"canonical_name": "地书", "kind": "item", "aliases": []},
+            {"canonical_name": "地书碎片", "kind": "item", "aliases": []},
+            {"canonical_name": "地书聊天群", "kind": "item", "aliases": []},
+            {"canonical_name": "许七安", "kind": "character", "aliases": []},
+        ],
+        "relations": [
+            {"from": "许七安", "to": "地书碎片", "rel_type": "owns"},
+            {"from": "许七安", "to": "地书", "rel_type": "owns"},
+        ],
+        "events": [
+            {"subject": "许七安", "object": "地书碎片", "summary": "查看碎片"},
+        ],
+        "entity_knowledge": [
+            {"character": "许七安", "knows": "地书聊天群", "known_kind": "entity"},
+            {"character": "许七安", "knows": "地书", "known_kind": "entity"},
+        ],
+    }
+    with caplog.at_level(logging.WARNING):
+        canon_source.normalize_extraction(result)
+
+    assert [e["canonical_name"] for e in result["entities"]] == ["地书", "许七安"]
+    # 计数可查（batch_worker 会转进 ExtractionStats → agent_runs.note）
+    assert result["derived_items_dropped"] == {"地书碎片": 1, "地书聊天群": 1}
+    assert result["derived_refs_dropped"] == 3
+    # 引用一并清理：关系/情报整条丢，事件保留但端点清空
+    assert [(r["from"], r["to"]) for r in result["relations"]] == [("许七安", "地书")]
+    assert result["events"][0]["object"] is None
+    assert [k["knows"] for k in result["entity_knowledge"]] == ["地书"]
+    assert any("派生 item" in rec.getMessage() for rec in caplog.records)
+
+
+def test_derived_item_names_do_not_touch_other_items():
+    """反向：别的物品（镇国剑/太平刀）不受派生表影响。"""
+    result = {
+        "entities": [
+            {"canonical_name": "镇国剑", "kind": "item", "aliases": []},
+            {"canonical_name": "太平刀", "kind": "item", "aliases": []},
+        ],
+        "relations": [],
+        "events": [],
+    }
+    canon_source.normalize_extraction(result)
+    assert [e["canonical_name"] for e in result["entities"]] == ["镇国剑", "太平刀"]
+    assert "derived_items_dropped" not in result
+
+
 def test_legacy_mode_does_not_normalize(monkeypatch):
     result = {
         "entities": [{"canonical_name": "许郎", "kind": "character", "aliases": []}],

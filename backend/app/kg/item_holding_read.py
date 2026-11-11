@@ -16,9 +16,15 @@
 20 个物品也只打这两次库，不按物品循环查询（无 N+1）。
 
 「当前」的口径与写入口一致：同一 ``(物品, 实例, hold_type)`` 取
-``COALESCE(order_key, valid_from * 100)`` 最大的那一段；**旁注表里
-``holding_id IS NULL`` 的回溯/预叙分支不参与判定**（它们挂在 LEFT JOIN 的
-``holding_id`` 上，天然不会成为候选）。不按 confidence 挑。
+``COALESCE(order_key, valid_from * 100)`` 最大的那一段做 ``status`` 聚合；
+**旁注表里 ``holding_id IS NULL`` 的回溯/预叙分支不参与判定**（它们挂在
+LEFT JOIN 的 ``holding_id`` 上，天然不会成为候选）。不按 confidence 挑。
+
+``lines`` 返回该层**全部**段（按顺序键升序）：历史段可见，但不覆盖
+``status``——否则「镇北王 own 99–106 / 元景帝 own 106–∞」只剩后者。
+
+已登记组的单位做组级/碎片级分层：无 ``instance_label`` 只返回组级段
+（``instance_id IS NULL``），有 ``instance_label`` 只返回该碎片的段。
 
 四种状态必须分开渲染，另加一个库里的值不存在的「无记录」：
 
@@ -30,12 +36,26 @@
   生成侧**不下发持有约束**，更不能写成「无人持有 / 已确认无主」。
 
 多实例物品按 ``instance_id`` 分别返回，不合成一条。
+
+读作用域（2026-11-10 定：a 的修订版，不加 novel 归属列）
+--------------------------------------------------------
+
+- **正主**：谁拥有 ``kg_item_group`` 行，组就是谁的——组的 ``project_id`` 即归属
+  项目。不用 ``reference_novel_ids`` 的交集结果直接当归属。
+- ``reference_novel_ids`` 只用来**枚举候选项目**（与本项目共用参考语料的其他项目），
+  再与「真正拥有组行的项目」取交集，避免读到完全无关项目的组。
+- **实体解析锁在组的 ``project_id`` 里**：名字先经写法落到组，再只在组的归属项目
+  里找实体。若按 ``project_id IN (family)`` 解析，项目 5 与项目 7 的两个同名实体
+  会再次撞成 ``ambiguous``。
+- 查不到组的物品仍按**本项目**实体解析，不跨项目合并候选。
+- 产线路径禁止 ``project_id=None``：抛 ``ValueError``，不再静默跨项目合并后判歧义。
 """
 from __future__ import annotations
 
 import json
 import pathlib
 import sqlite3
+from collections import Counter
 from collections.abc import Iterable
 
 from app.config import REPO_ROOT, settings
@@ -91,8 +111,74 @@ def _with_candidates(item: dict) -> dict:
     return out
 
 
-def _resolve_entities(db, project_id: int | None, items: list[dict]) -> list[dict]:
+def _reference_ids(db, project_id: int) -> set[int] | None:
+    """项目的参考语料 id 集合；读不到（无 projects 表 / 无此行 / 非列表）返回 None。"""
+    if db is None:
+        return None
+    try:
+        from sqlalchemy import select
+
+        from app.models import Project
+
+        row = db.execute(
+            select(Project.reference_novel_ids).where(Project.id == project_id)
+        ).first()
+    except Exception:  # noqa: BLE001 - 测试库可能只有 kg_entities，按「无参考语料」处理
+        return None
+    raw = row[0] if row is not None else None
+    if not isinstance(raw, (list, tuple)):
+        return None
+    out: set[int] = set()
+    for x in raw:
+        try:
+            out.add(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _family_project_ids(db, project_id: int) -> set[int]:
+    """与本项目共用参考语料的其他项目（仅用于**枚举候选**，不决定归属）。
+
+    归属由「谁拥有 ``kg_item_group`` 行」决定：加载候选项目的组时，只有真正有
+    组行的项目才会出现在结果里，组的 ``project_id`` 就是它的正主。
+    """
+    if db is None:
+        return {project_id}
+    mine = _reference_ids(db, project_id)
+    if not mine:
+        return {project_id}
+    out: set[int] = {project_id}
+    try:
+        from sqlalchemy import select
+
+        from app.models import Project
+
+        for pid, refs in db.execute(
+                select(Project.id, Project.reference_novel_ids)
+                .where(Project.id != project_id)).all():
+            if not isinstance(refs, (list, tuple)):
+                continue
+            other: set[int] = set()
+            for x in refs:
+                try:
+                    other.add(int(x))
+                except (TypeError, ValueError):
+                    continue
+            if mine & other:
+                out.add(int(pid))
+    except Exception:  # noqa: BLE001 - 枚举失败时退回本项目作用域
+        return {project_id}
+    return out
+
+
+def _resolve_entities(db, primary_project_id: int, scope_projects: set[int],
+                      items: list[dict], registry: dict | None = None) -> list[dict]:
     """第一次查询：从 ``kg_entities`` 批量解析规范名（按 id / 名 / 别名）。
+
+    每个物品的实体解析范围由**组的归属项目**决定：名字先经 approved 写法落到组，
+    就只在那个组的 ``project_id`` 里找实体；查不到组才退回本项目。不跨项目合并
+    候选——那是 ``ambiguous`` 的来源（项目 5 的实体 26 与项目 7 的实体 68 同名）。
 
     解析不到就保留调用方给的原名/原 id——读通道不替调用方猜实体。
     """
@@ -120,54 +206,71 @@ def _resolve_entities(db, project_id: int | None, items: list[dict]) -> list[dic
         if ids:
             conds.append(KgEntity.id.in_(sorted(ids)))
 
-        stmt = select(KgEntity.id, KgEntity.canonical_name, KgEntity.aliases).where(
-            KgEntity.kind == "item"
-        )
-        if project_id is not None:
-            stmt = stmt.where(KgEntity.project_id == project_id)
+        stmt = select(KgEntity.id, KgEntity.project_id, KgEntity.canonical_name,
+                      KgEntity.aliases).where(KgEntity.kind == "item")
+        # 作用域 = 组的正主 + 本项目；不再允许「不加项目过滤」的全局读。
+        stmt = stmt.where(
+            KgEntity.project_id.in_(sorted(scope_projects | {primary_project_id})))
         rows = db.execute(stmt.where(or_(*conds))).all()
     except Exception:  # noqa: BLE001 - 实体索引读不到时按原名继续，不阻断生成
         return [_with_candidates(it) for it in items]
 
     by_id: dict[int, tuple[int, str]] = {}
-    by_name: dict[str, set[int]] = {}
+    by_project_name: dict[tuple[int, str], set[int]] = {}
     id_to_name: dict[int, str] = {}
+    id_to_project: dict[int, int] = {}
     for row in rows:
-        entity_id, canonical = row[0], row[1]
+        entity_id, entity_project, canonical = row[0], row[1], row[2]
         if not canonical:
             continue
         by_id[entity_id] = (entity_id, canonical)
         id_to_name[entity_id] = canonical
-        by_name.setdefault(canonical, set()).add(entity_id)
-        for alias in (row[2] or []):
+        id_to_project[entity_id] = entity_project
+        by_project_name.setdefault((entity_project, canonical), set()).add(entity_id)
+        for alias in (row[3] or []):
             if isinstance(alias, str) and alias.strip():
-                by_name.setdefault(alias.strip(), set()).add(entity_id)
+                by_project_name.setdefault(
+                    (entity_project, alias.strip()), set()).add(entity_id)
+
+    def _target_projects(name: str | None) -> set[int]:
+        """这个名字该在哪个项目里找实体：写法落组 → 组的 project_id；否则本项目。"""
+        if registry and name:
+            surf = registry["by_surface"].get(name)
+            if surf and surf.get("status") == "approved":
+                group = registry["groups"].get(surf["group_id"])
+                if group is not None:
+                    return {group["project_id"]}
+        return {primary_project_id}
 
     resolved: list[dict] = []
     seen: set[tuple[int | None, str | None]] = set()
     for it in items:
+        name = it.get("name")
+        targets = _target_projects(name)
         candidates: set[int] = set()
         if it["item_id"] is not None:
             # 调用方给了 id 就按 id 为准，不再按名扩大候选。
-            candidates = {it["item_id"]} if it["item_id"] in by_id else set()
-        elif it.get("name"):
-            candidates = by_name.get(it["name"], set())
+            if it["item_id"] in by_id and id_to_project.get(it["item_id"]) in targets:
+                candidates = {it["item_id"]}
+        elif name:
+            for pid in targets:
+                candidates |= by_project_name.get((pid, name), set())
         if len(candidates) == 1:
             entity_id = next(iter(candidates))
-            name = id_to_name.get(entity_id) or it["name"]
+            resolved_name = id_to_name.get(entity_id) or name
             item_id = entity_id
         else:
-            name, item_id = it["name"], it["item_id"]
-        key = (item_id, name, it.get("name"))
+            resolved_name, item_id = name, it["item_id"]
+        key = (item_id, resolved_name, name)
         if key in seen:
             continue
         seen.add(key)
         resolved.append({
-            "name": name,
+            "name": resolved_name,
             "item_id": item_id,
             # 调用方原话要留着：别名被解析成规范名之后，写法→组的查找仍按原话走
             # （如「三号碎片」要按片号收窄，「黑金刀」要落到同一组）。
-            "input_name": it.get("name"),
+            "input_name": name,
             # 名字同时命中多个实体（规范名 + 别人的别名）时原样带出，交给上层报歧义。
             "entity_ids": sorted(candidates),
             "entity_names": [id_to_name[i] for i in sorted(candidates) if i in id_to_name],
@@ -181,51 +284,87 @@ def _connect_generated(path: pathlib.Path) -> sqlite3.Connection:
     return con
 
 
-def _load_registry(path: pathlib.Path, project_id: int | None) -> dict | None:
+def _load_registry(path: pathlib.Path, project_ids: int | Iterable[int] | None,
+                   novel_id: int | None = None) -> dict | None:
     """读「同物组 + 写法」登记表（一次 JOIN 批量取回，不按名字循环）。
+
+    ``project_ids``：只加载这些项目的组；``None`` 表示不过滤（仅诊断用，产线不走）。
+    组字典带上 ``project_id``——它既是正主，也是实体解析的作用域。
+
+    ``novel_id``（2026-11-11 切读侧时加）：**显式传才按书收窄**，
+    ``None`` = 不按书过滤（与加参数前逐字一致）。
+
+    - 传了书：加载「这本书的组」+「``novel_id IS NULL`` 的项目级通配组」；
+    - 名字解析：同名时**真书组优先于通配组**（通配组不参与跨书冲突）。
+      没有真书组时通配组单独命中；候选横跨两本以上的书则**不挑**，报歧义，
+      绝不 `ORDER BY ... LIMIT 1` 抽到另一本。
 
     表不存在（旧库）返回 ``None``，调用方走原来的按名解析，行为不变。
     """
+    if project_ids is None:
+        ids: list[int] | None = None
+    elif isinstance(project_ids, int):
+        ids = [project_ids]
+    else:
+        ids = sorted({int(x) for x in project_ids})
+        if not ids:
+            ids = None
     con = _connect_generated(path)
     try:
         tables = {row[0] for row in con.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
         if not {"kg_item_group", "kg_item_surface"} <= tables:
             return None
+        has_novel = any(r[1] == "novel_id" for r in con.execute(
+            "PRAGMA table_info(kg_item_group)"))
+        if novel_id is not None and not has_novel:
+            # 旧库没有书维度：宁可不给组（退回按名解析），也不做假过滤。
+            return None
+        novel_col = "g.novel_id" if has_novel else "NULL"
         sql = (
-            "SELECT g.id AS gid, g.canonical_name, g.status AS g_status,"
+            "SELECT g.id AS gid, g.project_id, g.canonical_name, g.status AS g_status,"
             "       g.generic_members, g.note AS g_note,"
+            f"      {novel_col} AS g_novel_id,"
             "       s.surface, s.status AS s_status, s.instance_label"
             "  FROM kg_item_group g"
             "  LEFT JOIN kg_item_surface s ON s.group_id = g.id"
         )
-        params: tuple = ()
-        if project_id is not None:
-            sql += " WHERE g.project_id = ?"
-            params = (project_id,)
-        rows = con.execute(sql, params).fetchall()
+        conds: list[str] = []
+        params: list = []
+        if ids is not None:
+            conds.append(f"g.project_id IN ({','.join('?' * len(ids))})")
+            params.extend(ids)
+        if novel_id is not None:
+            conds.append("(g.novel_id IS NULL OR g.novel_id = ?)")
+            params.append(int(novel_id))
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        rows = con.execute(sql, tuple(params)).fetchall()
     finally:
         con.close()
 
     groups: dict[int, dict] = {}
-    by_surface: dict[str, dict] = {}
     surfaces_by_group: dict[int, list[dict]] = {}
-    name_to_group: dict[str, int] = {}
     raw_members: dict[int, str] = {}
+    surface_candidates: dict[str, list[dict]] = {}
+    #: 名字 → 候选组 id（approved 写法 + 规范名），按书解析用。
+    name_groups: dict[str, list[int]] = {}
     for row in rows:
         gid = row["gid"]
         if gid not in groups:
-            groups[gid] = {"id": gid, "canonical_name": row["canonical_name"],
+            groups[gid] = {"id": gid, "project_id": row["project_id"],
+                           "canonical_name": row["canonical_name"],
                            "status": row["g_status"], "members": [],
-                           "note": row["g_note"] or ""}
+                           "note": row["g_note"] or "",
+                           "novel_id": row["g_novel_id"]}
             raw_members[gid] = row["generic_members"] or "[]"
         if row["surface"]:
             rec = {"surface": row["surface"], "status": row["s_status"],
                    "group_id": gid, "instance_label": row["instance_label"]}
             surfaces_by_group.setdefault(gid, []).append(rec)
-            by_surface.setdefault(row["surface"], rec)
+            surface_candidates.setdefault(row["surface"], []).append(rec)
             if rec["status"] == "approved":
-                name_to_group.setdefault(row["surface"], gid)
+                name_groups.setdefault(row["surface"], []).append(gid)
 
     for gid, raw in raw_members.items():
         try:
@@ -233,12 +372,64 @@ def _load_registry(path: pathlib.Path, project_id: int | None) -> dict | None:
         except (TypeError, ValueError):
             groups[gid]["members"] = []
         # 规范名本身也是这个组的写法（老库里不一定有对应 surface 行）
-        name_to_group.setdefault(groups[gid]["canonical_name"], gid)
+        name_groups.setdefault(groups[gid]["canonical_name"], []).append(gid)
+
+    def _cand_novel(cand) -> int | None:
+        """候选（组 id 或写法 rec）所属的书；``None`` = 项目级通配。"""
+        gid = cand["group_id"] if isinstance(cand, dict) else cand
+        group = groups.get(gid)
+        return None if group is None else group.get("novel_id")
+
+    def _pick(cands: list) -> tuple[object, bool]:
+        """同名的多个候选按「真书组 > 通配组」收敛；横跨多本书就报歧义。
+
+        通配组（``novel_id IS NULL``）不参与跨书冲突：同名时它只是真书组的兜底，
+        真书组存在就让位；只有它自己命中时才算数。
+        先按组去重：同一个组的「写法 + 规范名」会在候选里出现两次，不是歧义。
+        """
+        uniq: list = []
+        for c in cands:
+            gid = c["group_id"] if isinstance(c, dict) else c
+            if all(gid != (x["group_id"] if isinstance(x, dict) else x) for x in uniq):
+                uniq.append(c)
+        books = [c for c in uniq if _cand_novel(c) is not None]
+        wild = [c for c in uniq if _cand_novel(c) is None]
+        if len(books) == 1:
+            return books[0], True
+        if not books and len(wild) == 1:
+            return wild[0], True
+        return (books[0] if books else wild[0] if wild else None), False
+
+    by_surface: dict[str, dict] = {}
+    name_to_group: dict[str, int] = {}
+    conflicts: dict[str, list[str]] = {}
+    for name, cands in surface_candidates.items():
+        picked, ok = _pick(cands)
+        if ok:
+            by_surface[name] = picked  # type: ignore[assignment]
+    for name, gids in name_groups.items():
+        picked, ok = _pick(gids)
+        if ok:
+            name_to_group[name] = int(picked)  # type: ignore[arg-type]
+        elif len({g for g in gids}) > 1:
+            conflicts[name] = [groups[g]["canonical_name"]
+                               for g in sorted(set(gids)) if g in groups]
+
+    canon_groups: dict[str, list[int]] = {}
+    for gid, group in groups.items():
+        canon_groups.setdefault(group["canonical_name"], []).append(gid)
+    group_by_canonical: dict[str, int] = {}
+    for name, gids in canon_groups.items():
+        # 规范名同名跨书时与写法走同一套裁决，不做 `first wins`。
+        picked, ok = _pick(gids)
+        if ok:
+            group_by_canonical[name] = int(picked)  # type: ignore[arg-type]
 
     return {"groups": groups, "by_surface": by_surface,
             "surfaces_by_group": surfaces_by_group,
             "name_to_group": name_to_group,
-            "group_by_canonical": {g["canonical_name"]: gid for gid, g in groups.items()}}
+            "conflicts": conflicts,
+            "group_by_canonical": group_by_canonical}
 
 
 def _group_name(registry: dict | None, gid: int | None) -> str | None:
@@ -264,7 +455,13 @@ def _build_units(resolved: list[dict], registry: dict | None) -> list[dict]:
         surf_group = (registry["groups"].get(surf["group_id"])
                       if surf and surf["status"] == "approved" else None)
 
-        if surf_group and surf_group["status"] == "generic":
+        conflict = registry["conflicts"].get(input_name) if registry else None
+        if conflict:
+            # 同一个名字在多个组里登记（跨项目也会）：不挑、不猜，如实报歧义。
+            unit["ambiguous"] = list(conflict)
+            unit["item_id"] = None
+            unit["note"] = "名字在多个组里都有登记，未做任何猜测"
+        elif surf_group and surf_group["status"] == "generic":
             # 明确登记成通称的写法：通称优先，不进任何单件。
             unit["name"] = input_name
             unit["item_id"] = None
@@ -307,11 +504,22 @@ def _build_units(resolved: list[dict], registry: dict | None) -> list[dict]:
 
 
 def _facts_from_rows(unit: dict, rows: list[sqlite3.Row]) -> list[dict]:
-    """一个单位的事实：按实例拆、每个 hold_type 只留顺序键最大的一段。"""
+    """一个单位的事实：按实例拆；组级与碎片级分层，明细给完整时间线。
+
+    分层只对「已登记组」的单位生效（``group_id`` 非空；旧库没有登记表时行为不变）：
+
+    - 有 ``instance_label``：只返回该碎片自己的段，不再夹带组级 ``own``；
+    - 无 ``instance_label``：只返回组级段（``instance_id IS NULL``），
+      查「地书」不会再吐出「三号在许七安手上」。
+
+    ``lines`` 是该层全部段（按顺序键升序），历史段可见；``status`` 仍按每个
+    ``hold_type`` 的最新一段聚合——历史不覆盖当前。
+    """
+    layered = unit.get("group_id") is not None
     if unit["instance_label"]:
-        # 专指某一号碎片时，组级事实（instance_id 为空，如 own）仍保留。
-        rows = [r for r in rows
-                if r["instance_label"] == unit["instance_label"] or r["instance_id"] is None]
+        rows = [r for r in rows if r["instance_label"] == unit["instance_label"]]
+    elif layered:
+        rows = [r for r in rows if r["instance_id"] is None]
 
     base = {
         "item_name": unit["group_name"] or unit["name"],
@@ -332,6 +540,7 @@ def _facts_from_rows(unit: dict, rows: list[sqlite3.Row]) -> list[dict]:
     facts: list[dict] = []
     for instance_id, lines in sorted(
             by_instance.items(), key=lambda x: (x[0] is not None, x[0] or 0)):
+        lines.sort(key=lambda x: (x["order_key"] or 0, x["chapter"] or 0))
         latest: dict[str, dict] = {}
         for line in lines:
             old = latest.get(line["hold_type"])
@@ -344,16 +553,19 @@ def _facts_from_rows(unit: dict, rows: list[sqlite3.Row]) -> list[dict]:
                       if r["instance_id"] == instance_id and r["instance_label"]), None) \
             if instance_id is not None else None
         facts.append({**base, "instance_id": instance_id, "instance_label": label,
-                      "status": _status_of(picked), "lines": picked})
+                      "status": _status_of(picked), "lines": lines})
     return facts
 
 
 def _fetch_holding_rows(path: pathlib.Path, group_ids: list[int],
-                        items: list[dict]) -> list[sqlite3.Row]:
+                        items: list[dict], novel_id: int | None = None) -> list[sqlite3.Row]:
     """第二次查询：一条 IN 语句取回所有候选段 + 旁注顺序键 + 实例片号。
 
     主路径按 ``group_id`` 取段；``group_id IS NULL`` 的旧行/未登记物品才按
     名字或 ``item_id`` 兜底，所以新物品不会因为没建组而查不到。
+
+    传了 ``novel_id`` 时**不做名字兜底**：持有行没有书维度，未挂组的老行无法
+    证明属于哪本书，按书查询时宁可少给，也不跨书返回。
     """
     names = sorted({it["name"] for it in items if it.get("name")})
     ids = sorted({it["item_id"] for it in items if it.get("item_id") is not None})
@@ -386,15 +598,17 @@ def _fetch_holding_rows(path: pathlib.Path, group_ids: list[int],
         if has_group and groups:
             conds.append(f"h.group_id IN ({','.join('?' * len(groups))})")
             params.extend(groups)
-        if names:
+        fallback = novel_id is None
+        if names and fallback:
             name_cond = f"h.item_name IN ({','.join('?' * len(names))})"
             conds.append(f"(h.group_id IS NULL AND {name_cond})" if has_group else name_cond)
             params.extend(names)
-        if ids:
+        if ids and fallback:
             id_cond = f"h.item_id IN ({','.join('?' * len(ids))})"
             conds.append(f"(h.group_id IS NULL AND {id_cond})" if has_group else id_cond)
             params.extend(ids)
-
+        if not conds:
+            return []
         group_expr = "h.group_id" if has_group else "NULL AS group_id"
         sql = f"""SELECT h.id, h.item_id, h.instance_id, h.item_name,
                          {group_expr},
@@ -444,6 +658,7 @@ def current_item_holdings(
     db=None,
     project_id: int | None = None,
     generated_db: str | pathlib.Path | None = None,
+    novel_id: int | None = None,
 ) -> list[dict]:
     """批量取「这些物品现在在谁手上」。
 
@@ -452,8 +667,13 @@ def current_item_holdings(
             只要有 item_id 也能解析出规范名。
         db: ``novel_dev.db`` 的 SQLAlchemy session。为 None 时跳过实体解析
             （只按调用方给的名字/ id 查），不推荐在生产路径省掉。
-        project_id: 实体解析时限定项目，避免跨项目同名串味。
+        project_id: **必填**。读作用域的正主是「拥有 ``kg_item_group`` 行的项目」；
+            本参数同时是查不到组时的实体回退范围。传 ``None`` 会抛 ``ValueError``
+            ——不再静默跨项目合并同名候选后判 ``ambiguous``。
         generated_db: 持有库路径，缺省读 ``settings.kg_generated_db``。
+        novel_id: 读哪本书的组。``None``（默认）= 不按书过滤，与加参数前逐字一致；
+            传了就只加载「这本书的组 + ``novel_id IS NULL`` 的项目级通配组」。
+            **注意**：目前没有调用方传它（见报告 §E.7），缺口是「当前书」还没接上。
 
     Returns:
         每个物品（多实例按实例拆分）一条事实，顺序与输入一致：
@@ -470,16 +690,34 @@ def current_item_holdings(
     normalized = _normalize_items(items)
     if not normalized:
         return []
+    if project_id is None:
+        raise ValueError(
+            "current_item_holdings 必须传 project_id：读通道不允许跨项目合并同名候选"
+            "（项目 5 与项目 7 都有「镇国剑」时会从 no_record 变成 ambiguous）。"
+            "全库诊断请直接查库，不要走生成侧读通道。"
+        )
 
     path = pathlib.Path(generated_db) if generated_db else _default_generated_db()
     if not path.exists():
         return []
 
-    resolved = _resolve_entities(db, project_id, normalized)
+    scope: set[int] = {project_id}
     try:
-        registry = _load_registry(path, project_id)
+        registry = _load_registry(path, project_id, novel_id)
     except sqlite3.Error:
         registry = None
+    if registry is not None and not registry["groups"]:
+        # 本项目没有组行：按参考语料枚举候选项目，再加载候选的组。
+        # 只有真正拥有组行的项目才会被加载进来（正主 = 组的 project_id）。
+        family = _family_project_ids(db, project_id)
+        if len(family) > 1:
+            try:
+                candidate = _load_registry(path, family, novel_id)
+            except sqlite3.Error:
+                candidate = None
+            if candidate and candidate["groups"]:
+                registry, scope = candidate, family
+    resolved = _resolve_entities(db, project_id, scope, normalized, registry)
     units = _build_units(resolved, registry)
 
     # 通称的候选组也一起取（一次批量查询，不按名字循环）。
@@ -519,7 +757,7 @@ def current_item_holdings(
             fetch_items.append({"name": unit["name"], "item_id": unit["item_id"]})
 
     try:
-        rows = _fetch_holding_rows(path, fetch_gids, fetch_items) \
+        rows = _fetch_holding_rows(path, fetch_gids, fetch_items, novel_id) \
             if (fetch_gids or fetch_items) else []
     except sqlite3.Error:
         return []
@@ -623,14 +861,63 @@ def _render_line(line: dict) -> str:
     return f"状态未知（{state}）"
 
 
+def _range_text(line: dict) -> str:
+    """章号区间后缀；开区间写「起」。"""
+    start, end = line.get("valid_from"), line.get("valid_to")
+    if start is None and end is None:
+        return ""
+    if end is None:
+        return f"（{start}–∞）"
+    return f"（{start}–{end}）"
+
+
+def _render_lines(lines: list[dict]) -> str:
+    """按时间线渲染；同一 ``hold_type`` 有多段时才补章号区间，单行输出保持原样。"""
+    counts = Counter(line["hold_type"] for line in lines)
+    parts = []
+    for line in lines:
+        text = _render_line(line)
+        if counts[line["hold_type"]] > 1:
+            text += _range_text(line)
+        parts.append(text)
+    return "；".join(parts)
+
+
+#: 无记录行的固定措辞。单条与压缩行共用，保证语义一字不差。
+_NO_RECORD_BODY = "无持有记录（no_record；本层不提供持有约束，不要写成「已确认无主」）"
+
+
+def _fact_name(fact: dict) -> str:
+    name = fact["item_name"] or "（未命名物品）"
+    label = fact.get("instance_label")
+    if label and label not in name:
+        name = f"{name}·{label}"
+    return name
+
+
+def _is_blank_record(fact: dict) -> bool:
+    """这一条是否只会渲染成 no_record（通称/歧义另有分支，不参与压缩）。"""
+    return (fact["status"] not in (GENERIC, AMBIGUOUS)
+            and (fact["status"] == NO_RECORD or not fact["lines"]))
+
+
 def format_holding_facts(facts: Iterable[dict]) -> str:
-    """把事实渲染成 prompt 用的自然语言行（每条物品一行）。"""
+    """把事实渲染成 prompt 用的自然语言行（每条物品一行）。
+
+    全部都是 ``no_record`` 时压成**一行**：逐条列 7 遍同样的「无持有记录」只是
+    白占上下文（2026-11-10 实测 p1：427 字符的块占 user prompt 22.86%），
+    而这一层本来就不提供任何持有约束。只要有任何一条是
+    held / sealed / unowned / unknown（或带 note），就退回逐条明细，一条不省。
+    """
+    facts = list(facts)
+    if facts and all(_is_blank_record(f) and not f.get("note") for f in facts):
+        names = "、".join(_fact_name(f) for f in facts)
+        all_word = "均" if len(facts) > 1 else ""
+        return f"- {names}：{all_word}{_NO_RECORD_BODY}"
+
     lines: list[str] = []
     for fact in facts:
-        name = fact["item_name"] or "（未命名物品）"
-        label = fact.get("instance_label")
-        if label and label not in name:
-            name = f"{name}·{label}"
+        name = _fact_name(fact)
         if fact["status"] == GENERIC:
             lines.append(f"- {name}：{_render_generic(fact)}")
             continue
@@ -638,11 +925,11 @@ def format_holding_facts(facts: Iterable[dict]) -> str:
             lines.append(f"- {name}：{_render_ambiguous(fact)}")
             continue
         if fact["status"] == NO_RECORD or not fact["lines"]:
-            body = "无持有记录（no_record；本层不提供持有约束，不要写成「已确认无主」）"
+            body = _NO_RECORD_BODY
             if fact.get("note"):
                 body = f"{body}；{fact['note']}"
         else:
-            body = "；".join(_render_line(line) for line in fact["lines"])
+            body = _render_lines(fact["lines"])
         lines.append(f"- {name}：{body}")
     return "\n".join(lines)
 
@@ -656,7 +943,7 @@ def _render_generic(fact: dict) -> str:
     parts = []
     for cand in candidates:
         if cand.get("lines"):
-            body = "；".join(_render_line(line) for line in cand["lines"])
+            body = _render_lines(cand["lines"])
         else:
             body = "无持有记录"
         parts.append(f"{cand['item_name']}（{body}）")

@@ -296,6 +296,52 @@ def _columns(con: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
 
 
+#: 组/写法的表与唯一索引：生产库由 2026-11-11 的迁移脚本建，这里 IF NOT EXISTS
+#: 只为新库兜底。**不放进 SCHEMA**——有的测试先 ``ensure_schema`` 再建自己的
+#: 简化版组表（列更少），提前建会撞名字；改由 ``ensure_item_group`` 首次调用时
+#: 建（幂等），只影响真正要写组的链路。
+_GROUP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS kg_item_group (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'item',
+    canonical_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+           CHECK (status IN ('active', 'generic')),
+    generic_members TEXT NOT NULL DEFAULT '[]',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    novel_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS kg_item_surface (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    surface TEXT NOT NULL CHECK (length(trim(surface)) > 0),
+    group_id INTEGER NOT NULL REFERENCES kg_item_group(id),
+    status TEXT NOT NULL DEFAULT 'pending'
+           CHECK (status IN ('pending', 'approved', 'rejected')),
+    source TEXT NOT NULL DEFAULT 'migration'
+           CHECK (source IN ('human', 'candidate', 'migration')),
+    confidence REAL NOT NULL DEFAULT 0.5
+           CHECK (confidence >= 0 AND confidence <= 1),
+    instance_label TEXT,
+    evidence_chapter INTEGER,
+    evidence TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    reviewer TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL,
+    novel_id INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_item_group_project_novel_name
+    ON kg_item_group (project_id, kind, COALESCE(novel_id, -1), canonical_name);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_item_surface_project_novel_surface
+    ON kg_item_surface (project_id, COALESCE(novel_id, -1), surface);
+"""
+
+
 def ensure_schema(con: sqlite3.Connection) -> None:
     con.executescript(SCHEMA)
     for table, column, decl in _MIGRATIONS:
@@ -507,33 +553,251 @@ def _same_owner(row, owner_id: int | None, owner_name: str | None) -> bool:
     return (row["owner_name"] or "").strip() == (owner_name or "").strip()
 
 
-def resolve_group_id(con: sqlite3.Connection, item_name: str) -> int | None:
+def resolve_group_id(con: sqlite3.Connection, item_name: str,
+                     *, novel_id: int | None = None,
+                     project_id: int | None = None) -> int | None:
     """按「写法 → 组」登记解析同物组；解析不到返回 ``None``，不报错。
 
     只认 approved 写法且组为 active 单件组：通称组（如「玉石小镜」）不该挂任何
     单件的持有段；表不存在（旧库）同样返回 ``None``，让读侧按名字兜底。
+
+    ``novel_id``（2026-11-11 切读侧时加）：**显式传才按书过滤**，
+    ``None`` = 不按书过滤（与加参数前逐字一致）。
+
+    ``project_id``（2026-11-11 补写侧签名）：``generated.db`` 的组行是**多项目**
+    共存的，同名组可能属于另一个项目。传了就在候选里再收窄一层；不传 = 与加
+    参数前一致。生产调用方：``holding_projection.project_holdings``（批抽投影）
+    与 ``record_holding`` / ``record_story_segment`` 内部解析。
+
+    - 传了书：候选 = 「这本书的组」+「``novel_id IS NULL`` 的项目级通配组」；
+      同名的真书组优先于通配组。
+    - 没传书而候选横跨两本以上的书：返回 ``None``——**不猜**。旧实现
+      ``ORDER BY pri, gid LIMIT 1`` 会在同名跨书时抽到另一本，这条是本次要堵的洞。
+    - 旧库没有 ``novel_id`` 列：所有候选视为通配，行为与加列前完全一致。
     """
     name = (item_name or "").strip()
     if not name:
         return None
     try:
-        row = con.execute(
-            """SELECT gid FROM (
-                   SELECT s.group_id AS gid, 0 AS pri
-                     FROM kg_item_surface s
-                     JOIN kg_item_group g ON g.id = s.group_id
-                    WHERE s.surface = ? AND s.status = 'approved'
-                      AND g.status = 'active'
-                   UNION ALL
-                   SELECT g.id AS gid, 1 AS pri
-                     FROM kg_item_group g
-                    WHERE g.canonical_name = ? AND g.status = 'active'
-               ) ORDER BY pri, gid LIMIT 1""",
-            (name, name),
-        ).fetchone()
+        cols = {r[1] for r in con.execute("PRAGMA table_info(kg_item_group)")}
+        novel_expr = "g.novel_id" if "novel_id" in cols else "NULL"
+        pcond = " AND g.project_id = ?" if (project_id is not None
+                                            and "project_id" in cols) else ""
+        sql = (
+            "SELECT gid, novel_id, pri FROM ("
+            "    SELECT s.group_id AS gid, {nx} AS novel_id, 0 AS pri"
+            "      FROM kg_item_surface s"
+            "      JOIN kg_item_group g ON g.id = s.group_id"
+            "     WHERE s.surface = ? AND s.status = 'approved'"
+            "       AND g.status = 'active'" + pcond +
+            "    UNION ALL"
+            "    SELECT g.id AS gid, {nx} AS novel_id, 1 AS pri"
+            "      FROM kg_item_group g"
+            "     WHERE g.canonical_name = ? AND g.status = 'active'" + pcond +
+            ") ORDER BY pri, gid"
+        ).format(nx=novel_expr)
+        params: tuple = (name,) + ((project_id,) if pcond else ()) + \
+                        (name,) + ((project_id,) if pcond else ())
+        rows = con.execute(sql, params).fetchall()
     except sqlite3.Error:
         return None
-    return int(row["gid"]) if row else None
+    if not rows:
+        return None
+    books = [r for r in rows if r["novel_id"] is not None]
+    if novel_id is not None:
+        books = [r for r in books if int(r["novel_id"]) == int(novel_id)]
+    if len({int(r["novel_id"]) for r in books}) > 1:
+        # 没传书、同名组却在多本书里：不替调用方挑一本。
+        return None
+    pool = books or [r for r in rows if r["novel_id"] is None]
+    if not pool:
+        return None
+    pool.sort(key=lambda r: (r["pri"], r["gid"]))
+    return int(pool[0]["gid"])
+
+
+def _approved_surface_hit(con: sqlite3.Connection, surface: str, *,
+                          project_id: int,
+                          novel_id: int | None) -> tuple[dict | None, list[dict]]:
+    """按已批准写法找它已登记的组，返回 ``(hit, ambiguous)``。
+
+    这是 ``ensure_item_group`` 的 D 步：名字不是任何组的规范名，但可能已经是
+    某个组的 approved 写法（如「地书碎片」登记在组 9「地书」下）。命中就复用
+    那个组，**不再建第二个组**。
+
+    判定（与 ``resolve_group_id`` 同一条跨书口径，区别只是这里要选组、还要
+    把通配/泛称语义带出去）：
+
+    1. 只认 ``status='approved'`` 的写法行；rejected 行（如「佩刀」挂在
+       「黑金长刀」下且被拒）不参与复用——被拒的写法本来就该另立门户。
+    2. **按书优先**：传了书 → 先取本书显式写法（``novel_id = 书``），没有才
+       退到项目级通配写法（``novel_id IS NULL``）；别的书的写法绝不拿来复用。
+       没传书 → 所有行都是候选。
+    3. 候选仍指向两个以上不同组 → ``([], ambiguous)``，由调用方报错。**不猜**：
+       把 A 物品的持有史挂到 B 组是不可逆的语义污染，而「没复用」最坏只是
+       多一个可见、可修的组。
+    """
+    cols = _columns(con, "kg_item_surface")
+    if not {"surface", "group_id", "status"} <= cols:
+        return None, []
+    gcols = _columns(con, "kg_item_group")
+    snovel = "s.novel_id" if "novel_id" in cols else "NULL"
+    gnovel = "g.novel_id" if "novel_id" in gcols else "NULL"
+    gstatus = "g.status" if "status" in gcols else "'active'"
+    conds = ["s.surface = ?", "s.status = 'approved'"]
+    params: list = [surface]
+    if "project_id" in cols:
+        conds.append("s.project_id = ?")
+        params.append(project_id)
+    if "project_id" in gcols:
+        conds.append("g.project_id = ?")
+        params.append(project_id)
+    sql = (
+        f"SELECT s.id AS sid, s.group_id AS gid, {snovel} AS snovel,"
+        f" {gnovel} AS gnovel, {gstatus} AS gstatus"
+        "  FROM kg_item_surface s JOIN kg_item_group g ON g.id = s.group_id"
+        " WHERE " + " AND ".join(conds)
+    )
+    try:
+        rows = con.execute(sql, tuple(params)).fetchall()
+    except sqlite3.Error:
+        return None, []
+    if not rows:
+        return None, []
+    if novel_id is None:
+        pool = list(rows)
+    else:
+        book = int(novel_id)
+        pool = [r for r in rows if r["snovel"] is not None
+                and int(r["snovel"]) == book]
+        if not pool:
+            pool = [r for r in rows if r["snovel"] is None]
+    gids = {int(r["gid"]) for r in pool}
+    if len(gids) > 1:
+        return None, [dict(r) for r in pool]
+    if not gids:
+        return None, []
+    row = pool[0]
+    return {"group_id": int(row["gid"]), "novel_id": row["gnovel"],
+            "group_status": row["gstatus"],
+            "surface_id": int(row["sid"])}, []
+
+
+def ensure_item_group(con: sqlite3.Connection, item_name: str, *,
+                      project_id: int, novel_id: int | None = None,
+                      evidence: str = "", chapter: int | None = None) -> dict:
+    """按名字**取或建**同物组 + 已批准写法，返回 ``{group_id, ...}``。
+
+    这是写侧投影的登记入口，保证「新投影遇到同名组复用而不是建第二个」：
+
+    - 有书：先找本书的组，再找 ``novel_id IS NULL`` 的项目级通配组；
+    - 没书：任何书下的同名组都复用（同一项目里名字就是唯一键）；
+    - 名字不是任何组的规范名时，再查它是不是某个组的 approved 写法
+      （``_approved_surface_hit``）：是就复用那个组，**不建新组**；泛称组的
+      写法照旧复用泛称组，不会把通称塞进某个单件组；
+    - 都没有才建组，并用组的 ``novel_id`` 落写法（保持槽位一致，不额外造一个
+      另一本书的同名写法）。
+    - 组 / 写法都靠唯一索引兜底：``ux_item_group_project_novel_name``、
+      ``ux_item_surface_project_novel_surface``，并发重复插入也只会有一条。
+    """
+    name = (item_name or "").strip()
+    if not name:
+        raise ValueError("item_name 不能为空")
+    # 新库/测试库兜底建表（幂等；生产库表与索引早已存在，这里只做一次 no-op）
+    con.executescript(_GROUP_SCHEMA)
+    if novel_id is None:
+        cond, args = "1 = 1", ()
+    else:
+        cond, args = "(novel_id IS ? OR novel_id IS NULL)", (novel_id,)
+    row = con.execute(
+        f"""SELECT id, novel_id FROM kg_item_group
+             WHERE project_id = ? AND kind = 'item' AND canonical_name = ?
+               AND {cond}
+             ORDER BY (novel_id IS NULL), id LIMIT 1""",
+        (project_id, name, *args)).fetchone()
+    group_created = False
+    surface_hit: dict | None = None
+    surface_ambiguous: list[dict] = []
+    if row is None:
+        # D：名字不是任何组的规范名，但可能是某个组的 approved 写法（如
+        # 「地书碎片」「地书聊天群」登记在组 9「地书」下）。命中就复用那个组，
+        # 不建新组；泛称组按泛称语义复用（不塞进真书组）。
+        surface_hit, surface_ambiguous = _approved_surface_hit(
+            con, name, project_id=project_id, novel_id=novel_id)
+        if surface_ambiguous:
+            # 同一写法在候选范围内指向多个组：不猜。抛出去让调用方按单条失败
+            # 记录（project_holdings 会收进 stats.errors 进 AgentRun.note），
+            # 绝不静默挑一个组把两件物品的持有史混在一起。
+            detail = ", ".join(
+                f"surface#{r['sid']}->group#{r['gid']}"
+                f"(novel={r['snovel']})" for r in surface_ambiguous)
+            raise RuntimeError(
+                f"写法 {name!r} 命中多个组，无法判定复用哪个：{detail}")
+    if row is None and surface_hit is not None:
+        out = {
+            "group_id": int(surface_hit["group_id"]),
+            "group_created": False,
+            "surface_created": False,
+            "novel_id": surface_hit["novel_id"],
+            "reused_surface_id": int(surface_hit["surface_id"]),
+            "group_status": surface_hit["group_status"],
+        }
+        return out
+    if row is None:
+        con.execute(
+            """INSERT OR IGNORE INTO kg_item_group
+               (project_id, kind, canonical_name, status, generic_members,
+                note, created_at, novel_id)
+               VALUES (?, 'item', ?, 'active', '[]', '写侧投影自动登记', ?, ?)""",
+            (project_id, name, _now(), novel_id))
+        row = con.execute(
+            """SELECT id, novel_id FROM kg_item_group
+                WHERE project_id = ? AND kind = 'item' AND canonical_name = ?
+                  AND COALESCE(novel_id, -1) = COALESCE(?, -1)""",
+            (project_id, name, novel_id)).fetchone()
+        if row is None:  # 唯一索引命中在别的槽位：按名字再取一次，绝不再插
+            row = con.execute(
+                """SELECT id, novel_id FROM kg_item_group
+                    WHERE project_id = ? AND kind = 'item' AND canonical_name = ?
+                    ORDER BY (novel_id IS NULL), id LIMIT 1""",
+                (project_id, name)).fetchone()
+        else:
+            group_created = True
+    if row is None:
+        raise RuntimeError(f"物品组登记失败：{name}")
+    gid = int(row["id"])
+    slot_novel = row["novel_id"]
+    before = con.execute(
+        "SELECT id FROM kg_item_surface WHERE project_id = ? AND surface = ? "
+        "AND COALESCE(novel_id, -1) = COALESCE(?, -1)",
+        (project_id, name, slot_novel)).fetchone()
+    cur = con.execute(
+        """INSERT OR IGNORE INTO kg_item_surface
+           (project_id, surface, group_id, status, source, confidence,
+            evidence_chapter, evidence, note, created_at, novel_id)
+           VALUES (?, ?, ?, 'approved', 'candidate', 0.6, ?, ?,
+                   '写侧投影自动登记', ?, ?)""",
+        (project_id, name, gid, chapter, (evidence or "")[:200], _now(),
+         slot_novel))
+    # INSERT OR IGNORE 可能被唯一索引吃掉（同名写法已在**另一个组**下，且
+    # 状态可能是 rejected）。此时不能报 surface_created=True——那是「说写了
+    # 其实没写」。把冲突原样报出去，让批 note 里看得见。
+    surface_created = before is None and cur.rowcount > 0
+    out = {"group_id": gid, "group_created": group_created,
+           "surface_created": surface_created, "novel_id": slot_novel}
+    other = con.execute(
+        "SELECT id, group_id, status FROM kg_item_surface "
+        "WHERE project_id = ? AND surface = ? AND COALESCE(novel_id, -1) = COALESCE(?, -1)",
+        (project_id, name, slot_novel)).fetchone()
+    if other is not None and int(other["group_id"]) != gid:
+        # 写法槽位被别的组占着（本项目真实数据里「佩刀」就挂在「黑金长刀」下且
+        # 被标 rejected）：组按名字可解析，但这条写法不在本组名下。报出去。
+        out["surface_conflict"] = {
+            "surface_id": int(other["id"]),
+            "group_id": int(other["group_id"]),
+            "status": other["status"],
+        }
+    return out
 
 
 def _insert_holding(con: sqlite3.Connection, *, item_id: int | None, item_name: str,
@@ -592,7 +856,9 @@ def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
                    owner_state: str = "held",
                    transfer_event_id: int | None = None,
                    event_object: str | None = None, reason_code: str = "",
-                   evidence: str = "", confidence: float = 0.5) -> dict:
+                   evidence: str = "", confidence: float = 0.5,
+                   novel_id: int | None = None,
+                   project_id: int | None = None) -> dict:
     """写入一段持有史（唯一写入口）。
 
     ``owner_state`` 决定 ``owner_name`` 的口径：
@@ -615,6 +881,10 @@ def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
 
     返回 ``{"action": ..., "id": ..., "closed": ..., "reason": ...}``；
     ``action`` ∈ inserted / confirmed / replaced / candidate / rejected。
+
+    ``novel_id`` / ``project_id``：透传给 ``resolve_group_id`` 收窄组解析。
+    两者默认 ``None`` = 与加参数前一致。生产调用方：``holding_projection.
+    project_holdings``（v3.0 批抽的持有投影）。
     """
     item_name = (item_name or "").strip()
     owner_name = (owner_name or "").strip() or None
@@ -652,7 +922,8 @@ def record_holding(con: sqlite3.Connection, item_name: str, hold_type: str,
 
     insert_kwargs = dict(
         item_id=item_id, instance_id=instance_id, item_name=item_name,
-        group_id=resolve_group_id(con, item_name),
+        group_id=resolve_group_id(con, item_name, novel_id=novel_id,
+                                  project_id=project_id),
         hold_type=hold_type,
         owner_id=owner_id, owner_name=owner_name, owner_kind=owner_kind,
         owner_state=owner_state, chapter=chapter,
@@ -785,7 +1056,9 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
                          transfer_from_id: int | None = None,
                          transfer_from_name: str | None = None,
                          evidence: str = "",
-                         confidence: float = 0.5) -> dict:
+                         confidence: float = 0.5,
+                         novel_id: int | None = None,
+                         project_id: int | None = None) -> dict:
     """写一条故事先后轴旁注（``kg_holding_story_segment`` 的唯一写入口）。
 
     只排先后，不记绝对时间：
@@ -864,7 +1137,8 @@ def record_story_segment(con: sqlite3.Connection, item_name: str, hold_type: str
             raise ValueError("旁注的持有者/状态与持有行不一致")
         group_id = row["group_id"]
     if group_id is None:
-        group_id = resolve_group_id(con, item_name)
+        group_id = resolve_group_id(con, item_name, novel_id=novel_id,
+                                    project_id=project_id)
 
     conflict = False
     if narration != "forward" and order_key is not None:
@@ -1094,11 +1368,99 @@ def add_rejected_subject(con: sqlite3.Connection, chapter: int | None,
     )
 
 
-def reset_chapter(con: sqlite3.Connection, chapter: int) -> None:
-    """重跑同一章前清掉该章的机械产物，保证计数可复算。
+def _reset_holdings(con: sqlite3.Connection, chapter: int) -> dict:
+    """清掉本章派生/改写的持有数据（``reset_chapter`` 的持有轴部分）。
 
-    只动 source='generated' 的 gen_* 表；模型路 gen_llm_* 不受影响。
+    谱系来源（写侧唯一入口都在本模块）：
+
+    - ``kg_item_holding``：``record_holding`` 写入，``valid_from`` 与
+      ``evidence_chapter`` 都是当章（``_extend_back`` 只把 ``valid_from`` 前移、
+      ``evidence_chapter`` 仍记本章，所以两个条件都要看）；
+    - ``kg_holding_story_segment``：``record_story_segment`` 写入，主线旁注经
+      ``holding_id`` 指向持有主键，回溯/预叙分支没有 ``holding_id``、按
+      ``evidence_chapter`` 归属；
+    - ``kg_item_instance``：``record_item_instance`` 按 ``evidence_chapter`` 登记。
+
+    顺序有硬约束：
+
+    1. **先删旁注再删持有行**：旁注 ``holding_id`` 指向持有主键，先删主键会留
+       悬空引用；本项目没有加 FK，删错顺序不会报错，只会悄悄留孤儿。
+    2. **先删本章新段再回滚关闭**：``ux_item_holding_open`` 是「同一物品同一
+       hold_type 只能有一条开放段」的部分唯一索引；本章新开的段还开着，直接
+       把上一段 ``valid_to`` 清空会撞索引。因此回滚语句带 ``NOT EXISTS`` 兜底，
+       已有开放段时不重开。
+    3. 孤儿旁注单独扫一遍：``record_holding`` 的同章竞争会用 ``DELETE`` 撤掉刚
+       插入的零长度段（见 ``_resolve_same_chapter``），它的旁注可能已经悬空。
+
+    返回各表删除/回滚计数，供测试与批 note 观测；不提交事务，由调用方决定边界。
     """
+    ids = [int(r["id"]) for r in con.execute(
+        "SELECT id FROM kg_item_holding WHERE valid_from = ? OR evidence_chapter = ?",
+        (chapter, chapter))]
+    deleted_holdings = 0
+    deleted_segments = 0
+    if ids:
+        marks = ",".join("?" * len(ids))
+        deleted_segments += con.execute(
+            f"DELETE FROM kg_holding_story_segment "
+            f"WHERE holding_id IN ({marks})", ids).rowcount
+        deleted_holdings = con.execute(
+            f"DELETE FROM kg_item_holding WHERE id IN ({marks})", ids).rowcount
+    # 本章写的回溯/预叙分支（holding_id 为空，只能按章归属）
+    deleted_segments += con.execute(
+        "DELETE FROM kg_holding_story_segment "
+        "WHERE holding_id IS NULL AND evidence_chapter = ?", (chapter,)).rowcount
+    # 回滚本章做过的关闭动作（转交会把上一段的 valid_to 置成本章）
+    reopened = con.execute(
+        """UPDATE kg_item_holding SET valid_to = NULL
+            WHERE valid_to = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM kg_item_holding o
+                   WHERE o.id <> kg_item_holding.id
+                     AND o.valid_to IS NULL
+                     AND COALESCE(o.item_id, -1) = COALESCE(kg_item_holding.item_id, -1)
+                     AND o.item_name = kg_item_holding.item_name
+                     AND o.hold_type = kg_item_holding.hold_type
+                     AND COALESCE(o.instance_id, -1)
+                         = COALESCE(kg_item_holding.instance_id, -1)
+              )""", (chapter,)).rowcount
+    # 孤儿旁注：主键已不存在，任何情况下都不该留
+    orphans = con.execute(
+        """DELETE FROM kg_holding_story_segment
+            WHERE holding_id IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM kg_item_holding h
+                               WHERE h.id = kg_holding_story_segment.holding_id)"""
+    ).rowcount
+    # 本章登记、且已无人引用的实例；仍被别的章引用时保留
+    instances = con.execute(
+        """DELETE FROM kg_item_instance
+            WHERE evidence_chapter = ?
+              AND NOT EXISTS (SELECT 1 FROM kg_item_holding h
+                               WHERE h.instance_id = kg_item_instance.id)
+              AND NOT EXISTS (SELECT 1 FROM kg_holding_story_segment s
+                               WHERE s.instance_id = kg_item_instance.id)""",
+        (chapter,)).rowcount
+    return {"holdings": deleted_holdings, "story_segments": deleted_segments,
+            "reopened": reopened, "orphans": orphans, "instances": instances}
+
+
+def reset_chapter(con: sqlite3.Connection, chapter: int) -> dict:
+    """重跑同一章前清掉该章产生的派生数据，保证重跑可复算、不叠段。
+
+    清两轴：
+
+    - **生成轴**：只动 ``source='generated'`` 的 ``gen_*`` 表；模型路
+      ``gen_llm_*`` 不受影响。
+    - **持有轴**：``kg_item_holding`` / ``kg_holding_story_segment`` /
+      ``kg_item_instance`` 中归本章的段与旁注（见 ``_reset_holdings``）。
+
+    ``kg_item_group`` / ``kg_item_surface`` 是身份登记表、不按章派生
+    （``ensure_item_group`` 本身幂等），不在这里删。
+
+    不提交事务：与调用方（``layer_pipeline.ingest_chapter``）共用同一事务边界。
+    返回各轴删除计数。
+    """
+    holdings = _reset_holdings(con, chapter)
     con.execute("DELETE FROM gen_edges WHERE source_chapter = ? AND source = ?",
                 (chapter, GENERATED))
     con.execute("DELETE FROM gen_events WHERE chapter = ? AND source = ?",
@@ -1129,6 +1491,7 @@ def reset_chapter(con: sqlite3.Connection, chapter: int) -> None:
         "DELETE FROM gen_nodes WHERE source_chapter = ? AND first_chapter = ?",
         (chapter, chapter),
     )
+    return {**holdings, "chapter": chapter}
 
 
 def add_conflict(con: sqlite3.Connection, chapter: int | None, conflict_type: str,

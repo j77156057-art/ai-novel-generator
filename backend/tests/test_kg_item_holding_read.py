@@ -114,6 +114,40 @@ def test_four_states_and_no_record(tmp_path):
     assert "无人持有。" not in no_record_line
 
 
+def test_all_no_record_collapses_to_one_line(tmp_path):
+    """全 no_record 压成一行：语义保住，明细不重复占上下文。"""
+    names = ["文件", "策划书", "笔", "咖啡", "手机", "电脑", "邮件"]
+    facts = _read(tmp_path, names)
+    assert all(f["status"] == read.NO_RECORD for f in facts)
+
+    text = read.format_holding_facts(facts)
+    assert "\n" not in text
+    assert text == (
+        "- 文件、策划书、笔、咖啡、手机、电脑、邮件：均无持有记录"
+        "（no_record；本层不提供持有约束，不要写成「已确认无主」）"
+    )
+
+
+def test_mixed_states_keep_per_item_detail(tmp_path):
+    """只要有一条不是 no_record，就退回逐条明细，一条不省。"""
+    facts = _read(tmp_path, ["地书", "诗碑"])
+    text = read.format_holding_facts(facts)
+    lines = text.splitlines()
+    assert len(lines) == 2
+    assert lines[1].startswith("- 诗碑：无持有记录")
+
+
+def test_no_record_with_note_is_not_collapsed(tmp_path):
+    """带 note 的无记录不能压：压缩会把 note 吞掉。"""
+    facts = _read(tmp_path, ["诗碑", "无字碑"])
+    assert len(facts) == 2
+    facts[0]["note"] = "同名多义"
+    text = read.format_holding_facts(facts)
+    lines = text.splitlines()
+    assert len(lines) == 2
+    assert "同名多义" in text
+
+
 # ---------------------------------------------------------------------------
 # 回溯分支不参与当前判定
 # ---------------------------------------------------------------------------

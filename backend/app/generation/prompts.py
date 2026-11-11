@@ -10,6 +10,30 @@
 
 from typing import Any
 
+#: 物品持有块的标题 / 优先级说明。生成与重写共用同一份渲染，避免两条路径各拼一份、
+#: 重写时漏块或块文本漂移。
+ITEM_HOLDING_HEADER = "【物品持有事实（已写内容最新一段；续写须与此一致）】"
+ITEM_HOLDING_PRIORITY_NOTE = (
+    "（本块只补「物品在谁手上」，不改动也不覆盖【剧情圣经】与【世界观事实】"
+    "的既有约束。三者冲突时按「作者设定 > 世界观事实 > 本块」取信，"
+    "行文中回避正面矛盾，不要静默改写物品归属。）"
+)
+
+
+def render_item_holding_section(item_holding_block: str | None) -> str:
+    """把物品持有事实渲染成完整段落（标题 + 明细 + 优先级说明）。
+
+    生成（`build_user_prompt`）与 AI 味重写（`engine._rewrite_prompt`）共用这一个
+    函数：重写必须携带与初稿**逐字相同**的块，不能另拼一份。
+    """
+    if not item_holding_block:
+        return ""
+    return "\n".join([
+        ITEM_HOLDING_HEADER,
+        item_holding_block,
+        ITEM_HOLDING_PRIORITY_NOTE,
+    ])
+
 
 def _style_block(style_dims: dict | None) -> str:
     if not style_dims:
@@ -433,14 +457,8 @@ def build_user_prompt(
         # 物品持有事实：从 kg_item_holding 读出的「现在在谁手上」。
         # 与 kg_slice 同为已发生事实，但**优先级更低**：只补物品归属，
         # 不许反过来覆盖剧情圣经 / 世界观事实里的既有 canon 约束。
-        blocks += [
-            "",
-            "【物品持有事实（已写内容最新一段；续写须与此一致）】",
-            item_holding_block,
-            "（本块只补「物品在谁手上」，不改动也不覆盖【剧情圣经】与【世界观事实】"
-            "的既有约束。三者冲突时按「作者设定 > 世界观事实 > 本块」取信，"
-            "行文中回避正面矛盾，不要静默改写物品归属。）",
-        ]
+        # 标题/说明/明细统一走 render_item_holding_section——重写路径复用同一份。
+        blocks += ["", render_item_holding_section(item_holding_block)]
     blocks += ["", "【续写指令】", directive]
     directive_extra = _override_section(_OVERRIDE_DIRECTIVE_HEADER, directive_suffix)
     if directive_extra:

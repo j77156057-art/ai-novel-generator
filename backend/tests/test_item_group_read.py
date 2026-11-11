@@ -157,21 +157,53 @@ def _read(tmp_path, items, with_registry=True):
 # ---------------------------------------------------------------------------
 # 按组解析
 # ---------------------------------------------------------------------------
-def test_group_lookup_returns_own_and_instance_custody(tmp_path):
+def test_group_lookup_returns_only_group_level(tmp_path):
+    """组级查询只返回组级段：不再夹带「三号（碎片）在许七安手上」。"""
     facts = _read(tmp_path, ["地书"])
-    assert [f["instance_label"] for f in facts] == [None, "三号"]
-    assert all(f["via"] == "surface" and f["group_id"] == 9 for f in facts)
-    assert facts[0]["lines"][0]["owner_name"] == "天地会"
-    assert facts[1]["lines"][0]["owner_name"] == "许七安"
+    assert [f["instance_label"] for f in facts] == [None]
+    assert facts[0]["via"] == "surface" and facts[0]["group_id"] == 9
+    assert [l["owner_name"] for l in facts[0]["lines"]] == ["天地会"]
+    assert all(l["hold_type"] == "own" for l in facts[0]["lines"])
 
 
 def test_instance_surface_narrows_to_that_instance(tmp_path):
     facts = _read(tmp_path, ["三号碎片"])
-    assert [f["instance_label"] for f in facts] == [None, "三号"]
-    custody = next(l for f in facts for l in f["lines"] if l["hold_type"] == "custody")
-    assert custody["owner_name"] == "许七安"
-    # 三号的写法不许把六号之类别的片号带出来
-    assert all(f["instance_label"] in (None, "三号") for f in facts)
+    assert [f["instance_label"] for f in facts] == ["三号"]
+    custody = [l for f in facts for l in f["lines"] if l["hold_type"] == "custody"]
+    assert [l["owner_name"] for l in custody] == ["许七安"]
+    # 碎片级查询不夹带组级 own（天地会），也不带出别的片号
+    assert all(l["hold_type"] == "custody" for f in facts for l in f["lines"])
+    assert all(f["instance_label"] == "三号" for f in facts)
+
+
+def _gen_timeline(tmp_path):
+    """同一 hold_type 两段：镇北王 99–106（已关）+ 元景帝 106–∞（开放）。"""
+    con = store.connect(tmp_path / "gen.db")
+    store.ensure_schema(con)
+    _group_schema(con)
+    _group(con, 50, "镇国剑")
+    _surface(con, "镇国剑", 50)
+    store.record_holding(con, "镇国剑", "own", "镇北王", 99, reason_code="gift")
+    store.record_holding(con, "镇国剑", "own", "元景帝", 106,
+                         reason_code="transfer")
+    con.commit()
+    path = pathlib.Path(con.execute("PRAGMA database_list").fetchone()[2])
+    con.close()
+    return path
+
+
+def test_full_timeline_keeps_closed_segment(tmp_path):
+    """缺陷修复：同 hold_type 只取最新一行会把「镇北王 99–106」挤掉。"""
+    app = _app_session(tmp_path)
+    path = _gen_timeline(tmp_path)
+    with app:
+        facts = read.current_item_holdings(
+            ["镇国剑"], db=app, project_id=5, generated_db=path)
+    assert len(facts) == 1
+    assert [l["owner_name"] for l in facts[0]["lines"]] == ["镇北王", "元景帝"]
+    assert facts[0]["status"] == "held"
+    text = read.format_holding_facts(facts)
+    assert "镇北王（99–106）" in text and "元景帝（106–∞）" in text
 
 
 def test_alias_surface_maps_to_group_canonical(tmp_path):
@@ -194,7 +226,8 @@ def test_generic_lists_candidates_without_claiming_alias(tmp_path):
     assert fact["item_name"] == "玉石小镜"
     assert [c["item_name"] for c in fact["candidates"]] == ["地书"]
     cand_lines = fact["candidates"][0]["lines"]
-    assert {l["hold_type"] for l in cand_lines} == {"own", "custody"}
+    # 通称候选是组级摘要：只给组级 own，碎片级 custody 由「三号碎片」单独查
+    assert {l["hold_type"] for l in cand_lines} == {"own"}
     # 候选里同一个 (实例, hold_type, 持有人) 只出现一次
     keys = [(l["hold_type"], l["owner_name"]) for l in cand_lines]
     assert len(keys) == len(set(keys))
@@ -202,7 +235,7 @@ def test_generic_lists_candidates_without_claiming_alias(tmp_path):
     text = read.format_holding_facts(facts)
     assert "通称" in text and "不对应单件" in text
     assert "别名" not in text
-    assert "地书（权属（own）归天地会；实物（custody）在许七安手上）" in text
+    assert "地书（权属（own）归天地会）" in text
 
 
 def test_generic_with_two_candidates(tmp_path):

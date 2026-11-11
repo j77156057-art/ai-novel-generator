@@ -15,6 +15,9 @@
 - ``R4_no_proper_noun``：整串能拆成「材质词 + 器型词 / 类别词 / 通用修饰词」，
   没有专名残留（``铜剑``、``神兵``、``长刀``）。
 - ``R5_multi_holder``：同一写法在持有段里对应多个互无交接的持有者。
+- ``R6_reference_phrase``：以指示代词/人称开头、带「的」、或含「数量 + 量词」的
+  描述短语（``此兽``/``许七安的佩刀``/``腰间一把军弩``）。这类是正文里的指代，
+  不是名字。**只用于写法层**，组规范名不走这条（``周旻的账簿`` 不受影响）。
 
 置信分层：
 
@@ -22,9 +25,14 @@
   登记入口直接拒绝登成 approved 单件写法。
 - ``medium``：多字材质/合金 + 器型（``黄铜剑``/``玉石小镜``）。形态上像类名，
   但正文可能被当作唯一指代使用，只报告、不自动拦截，交人工判断。
+
+另有人工核定白名单 ``CANONICAL_WHITELIST``：只对**组规范名**生效，记录「形态像
+类名、但正文只有类称且持有段全部指向同一实物」的已裁定项。白名单不是新判据，
+也不允许凭形态扩充——每条都必须能复查「正文无专名」和「持有行对应唯一实物」。
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 HIGH = "high"
@@ -36,6 +44,7 @@ R2 = "R2_cross_group"
 R3 = "R3_coverage"
 R4 = "R4_no_proper_noun"
 R5 = "R5_multi_holder"
+R6 = "R6_reference_phrase"
 
 #: 材质词。多字在前，保证「青铜/黄铜/黑金」不会被拆成单字。
 MATERIAL_WORDS = frozenset({
@@ -62,6 +71,10 @@ CATEGORY_WORDS = frozenset({
     "兵", "兵器", "神兵", "法宝", "法器", "神器", "宝物", "宝器", "器", "物",
 })
 
+#: 生物类称语素：只表示「一类活物」，落在词尾时没有专名。
+#: 刻意不含「龙/马/骠」——``灵龙`` 是坐骑专名，不能因为带「灵」就被当类称。
+CREATURE_CLASS_WORDS = frozenset({"兽", "禽", "虫", "鱼", "鸟", "坐骑", "妖兽", "灵兽"})
+
 #: 通用修饰词：只起「大/小/长/短/颜色/神异」作用，不构成专名。
 MODIFIER_WORDS = frozenset({
     "大", "小", "长", "短", "粗", "细", "古", "新", "旧", "破",
@@ -78,11 +91,57 @@ MATERIAL_BOUNDARY_CHARS = frozenset(
     "青铜黄赤白黑金银铁玉石骨木竹皮布纸陶瓷冰玄乌紫丹碧墨"
 )
 
-_ALL_WORDS = sorted(MATERIAL_WORDS | TYPE_WORDS | MODIFIER_WORDS | CATEGORY_WORDS,
+_ALL_WORDS = sorted(MATERIAL_WORDS | TYPE_WORDS | MODIFIER_WORDS | CATEGORY_WORDS
+                    | CREATURE_CLASS_WORDS,
                     key=len, reverse=True)
 
 #: 不是「名字」的写法：带指示代词/助词/标点的描述性短语（「昨日新换的铜锣」）。
 _PHRASE_MARKS = frozenset("的这那此其一二三四五六七八九十他她它你们我个枚柄口把件只条面块颗")
+
+
+#: 人工核定的「描述性唯一指代」组规范名。
+#:
+#: 这些名字形态上命中 R4，但正文里没有专名可用，且 ``kg_item_holding`` 的段
+#: 全部指向同一件实物；把它们当作类通称降级，会让唯一可读的持有事实消失。
+#: 每条都写明「正文无专名」和「持有行对应唯一实物」两项证据，便于复查。
+#:
+#: 维护边界：只登记**组规范名**，且必须先确认该组 ``status='active'``、持有段
+#: 指向同一实物。真正的类通称（``刀``/``法宝``/``神兵``…）继续走 ``generic``，
+#: 不允许因为「读起来也像类名」就塞进这里。
+CANONICAL_WHITELIST: dict[str, str] = {
+    "大钢刀": (
+        "正文 1 章 1 次，无专名；kg_item_holding 仅 hid=16"
+        "（own 归「使大钢刀的汉子」193–∞），该称呼就是那汉子手中这一柄的唯一指代"
+    ),
+    "法器铜锣": (
+        "正文 5 章 7 次，无专名；仅 hid=25（own 归许七安 227–∞），"
+        "全书只以「法器铜锣」称呼这一件，没有更专的名字"
+    ),
+    "银枪": (
+        "正文 18 章 34 次，无专名；hid=44/48/45 是同一杆枪的转手链"
+        "（银甲女子 156–228 → 李妙真 227–228 → 杨砚 228–∞），"
+        "写法「银枪/白马银枪」都指它；「那杆枪」唯一出现是比喻，2026-11-10 第四批已摘"
+    ),
+    "长剑": (
+        "正文 27 章 40 次，无专名；仅 hid=47（own 归长公主 106–∞），"
+        "这柄剑在正文里始终只叫「长剑」"
+    ),
+    "飞剑": (
+        "正文 91 章 231 次，类称虽普遍，但唯一持有行 hid=52"
+        "（own 归李妙真 227–∞）锁定的是李妙真那一柄，正文未给这柄剑专名"
+    ),
+    "黑金长刀": (
+        "正文 47 章 88 次，无更专名；hid=23（93–102）与 hid=58（102–∞）"
+        "均归许七安，组内 8 条 surface（黑金刀/暗金色长刀/修长战刀/刀胚…）"
+        "都是这把刀的别名"
+    ),
+}
+
+
+def whitelist_reason(name: str) -> str | None:
+    """组规范名是否已在人工白名单里；返回登记理由（未登记返回 ``None``）。"""
+    return CANONICAL_WHITELIST.get((name or "").strip())
+
 
 
 def is_name_like(form: str) -> bool:
@@ -93,6 +152,29 @@ def is_name_like(form: str) -> bool:
     if any(ch in _PHRASE_MARKS for ch in form):
         return False
     return not any(ch in "，。！？、；：“”「」『』（）()《》 " for ch in form)
+
+
+#: 指示代词/人称开头：只能是正文指代，不可能是物品名。
+_DEICTIC_PREFIXES = ("此", "这", "那", "该", "其", "我", "你", "他", "她", "它")
+
+#: 「数量 + 量词」短语：腰间一把军弩、两柄短刀。
+_QUANTITY_PHRASE = re.compile(r"[一二两三四五六七八九十几数][把杆柄枚口件条面块颗只匹张幅座支]")
+
+
+def is_reference_phrase(form: str) -> bool:
+    """写法是不是正文指代/描述短语，而不是名字（判据 R6）。
+
+    命中任一条即算：指示代词或人称开头、带「的」、含「数量 + 量词」。
+    只用于**写法层**：组规范名（如 ``周旻的账簿``）不进这条判据。
+    """
+    raw = (form or "").strip()
+    if not raw:
+        return False
+    if raw.startswith(_DEICTIC_PREFIXES):
+        return True
+    if "的" in raw:
+        return True
+    return bool(_QUANTITY_PHRASE.search(raw))
 
 
 @dataclass(frozen=True)
@@ -136,6 +218,9 @@ def classify_name(name: str) -> NameShape:
     if last in CATEGORY_WORDS:
         return NameShape(HIGH, R4, tokens,
                          f"纯类别词「{last}」，没有专名")
+    if last in CREATURE_CLASS_WORDS:
+        return NameShape(HIGH, R4, tokens,
+                         f"生物类称语素「{last}」，只有类别没有专名")
     if len(tokens) == 1 and tokens[0] in TYPE_WORDS:
         return NameShape(HIGH, R4, tokens,
                          f"纯器型词「{last}」，没有专名")
@@ -144,6 +229,20 @@ def classify_name(name: str) -> NameShape:
                          f"单字裸材质「{raw[0]}」+ 器型「{last}」")
     return NameShape(MEDIUM, R4, tokens,
                      f"材质/修饰 + 器型「{last}」，形态像类名但可能是正文唯一指代")
+
+
+def classify_canonical(name: str) -> NameShape:
+    """组规范名专用的泛称判定：先查人工白名单，再走形态判据。
+
+    与 :func:`classify_name` 的分工：后者只回答「形态像不像类名」，供写法登记
+    入口使用；组规范名还要叠加人工裁定（白名单）。白名单命中时返回 ``NONE``，
+    ``detail`` 原样带出登记理由，便于报告与复查。
+    """
+    raw = (name or "").strip()
+    reason = whitelist_reason(raw)
+    if reason:
+        return NameShape(NONE, "", _tokens(raw) or (), f"已核定白名单：{reason}")
+    return classify_name(raw)
 
 
 def substring_owners(name: str, known: set[str]) -> list[str]:
@@ -193,6 +292,9 @@ def alias_verdict(name: str, canonical: str, known: set[str],
         return {"blocked": False, "rules": [], "detail": "空写法"}
     if is_own_abbreviation(name, canonical):
         return {"blocked": False, "rules": [], "detail": "所属规范名的缩写"}
+    if is_reference_phrase(name):
+        return {"blocked": True, "rules": [R6],
+                "detail": "正文指代/描述短语（指示代词、「的」或数量短语），不是名字"}
 
     rules: list[str] = []
     details: list[str] = []
