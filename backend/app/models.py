@@ -1174,3 +1174,100 @@ class WizardActionAudit(Base):
     undo_payload = Column(JSON, nullable=True)
     undone_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
+
+
+class StyleBaseline(Base):
+    """文风校验的**基线快照**（阈值随项目演进，必须版本化）。
+
+    设计见 `.trae/documents/style-consistency-check-design.md` §5.1。第一阶段只写
+    `source='self'` 的冷启动基线：用本项目**已落库正文**的最近 N 段算核心 8 项的
+    P1/P10/P50/P90/P99 与 mean/std，作为之后段落的对照。
+
+    ## 为什么版本化
+
+    基线的样本集一换，分位就变；若不存快照，事后无法回答「当时为什么判成这样」。
+    每换一批样本写一行新版本（`(project_id, baseline_version)` 唯一），旧行不更新。
+
+    ## 样本量不足必须写在行上
+
+    `sample_count < MIN_SELF_SEGMENTS` 时 `insufficient_reason` 非空——不允许把
+    只有 2 段的基线静默当成「充分基线」用于判定。第一阶段反正不产出判定，但这条
+    信息必须可查，否则第二阶段会误把冷启动基线当真。
+    """
+
+    __tablename__ = "style_baselines"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    baseline_version = Column(Integer, nullable=False)
+    # 窗口大小（「最近多少段」），与实际参与计算的段数分开记。
+    window_segments = Column(Integer, nullable=False)
+    sample_count = Column(Integer, nullable=False)
+    # self（本项目正文）| reference（参考带）| blend
+    source = Column(String(16), nullable=False, default="self")
+    # 样本范围的人话说明，如「p5 段1–段2（2 段，最近 30 段窗口）」。
+    source_range = Column(String(128), nullable=True)
+    # NULL = 样本量达到 MIN_SELF_SEGMENTS；非空 = 不足的原因（必须可查）。
+    insufficient_reason = Column(Text, nullable=True)
+    # {"core": {指标: {n,p1,p10,p50,p90,p99,mean,std}}, "sample_generation_ids": [...]}
+    metrics_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "baseline_version",
+                         name="uq_style_baseline_version"),
+        Index("ix_style_baseline_project", "project_id", "baseline_version"),
+    )
+
+
+class StyleCheck(Base):
+    """单次文风校验的**影子记录**（第一阶段：只记录，不判定、不阻断）。
+
+    ## 第一阶段硬约束
+
+    `verdict` 固定写 `'shadow'`——**不写** pass/warn/fail。理由：一旦把影子结果
+    写成 pass/fail，之后统计误报率时就要靠「某个字段/时间范围」再过滤一遍，
+    口径必然脏。等影子期攒够样本再引入判定值。
+
+    ## 与 generations 的关联
+
+    `generation_id` 直连（Writer 路径）；`agent_run_id` 为空——`agent_runs` 只记
+    Assistant 调用，Writer 不写该表。正文后续被改由 `stale_at` 表达，不塞进
+    `verdict` 枚举。
+
+    ## 指标缺失
+
+    `metric_json` 只放**算得出**的值；算不出的项（如只有 1 句时的句长 CV）
+    记 `null` 并在 `missing_json` 里写原因，**不填 0 冒充**。
+    """
+
+    __tablename__ = "style_checks"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    # segment | chapter | project
+    scope = Column(String(16), nullable=False, default="segment")
+    generation_id = Column(Integer, ForeignKey("generations.id"), nullable=True)
+    agent_run_id = Column(Integer, ForeignKey("agent_runs.id"), nullable=True)
+    segment_no = Column(Integer, nullable=True)
+    chapter_range = Column(String(32), nullable=True)
+    # 判定时正文的指纹；与重新计算的值不一致时置 stale_at。
+    text_md5 = Column(String(32), nullable=False)
+    check_version = Column(String(16), nullable=False)
+    baseline_id = Column(Integer, ForeignKey("style_baselines.id"), nullable=False)
+    # 冗余版本号：按版本聚合查询不必再 join。
+    baseline_version = Column(Integer, nullable=False)
+    # 第一阶段恒为 'shadow'；后续才可能出现 pass/warn/fail/unknown。
+    verdict = Column(String(16), nullable=False, default="shadow")
+    # {"chars", "judgeable", "core": {...8 项}, "display": {...其余 12 项}}
+    metric_json = Column(JSON, nullable=False)
+    missing_json = Column(JSON, nullable=True)
+    evidence_json = Column(JSON, nullable=True)
+    note = Column(Text, nullable=True)
+    stale_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_style_checks_proj_created", "project_id", "created_at"),
+        Index("idx_style_checks_gen", "generation_id"),
+    )

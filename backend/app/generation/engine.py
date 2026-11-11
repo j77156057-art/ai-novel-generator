@@ -483,6 +483,18 @@ def _commit_segment(db, project: Project, text: str, summary: str,
     project.status = "generating"
     db.commit()
     db.refresh(gen)
+
+    # 文风一致性校验 · 第一阶段（L1 影子记录）：正文已落库之后才写一条记录。
+    # 只记录、不判定、不改正文；record_segment_check 内部吞掉所有异常，
+    # 这里再包一层是防 import 失败——校验器绝不能拖垮生成主流程。
+    try:
+        from app.style.consistency import record_segment_check
+
+        record_segment_check(db, project, gen)
+    except Exception:  # noqa: BLE001 —— 校验器故障不影响生成
+        logging.getLogger(__name__).warning(
+            "style shadow check skipped", exc_info=True
+        )
     return gen, segment_no
 
 
