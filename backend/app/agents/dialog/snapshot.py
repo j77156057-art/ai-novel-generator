@@ -574,6 +574,100 @@ def begin_snapshot(
     return snap
 
 
+def find_clarification_by_fingerprint(
+    db, *, project_id: int, segment_no: int, fingerprint: str,
+) -> GenerationSnapshot | None:
+    rows = db.scalars(
+        select(GenerationSnapshot)
+        .where(
+            GenerationSnapshot.project_id == project_id,
+            GenerationSnapshot.segment_no == segment_no,
+            GenerationSnapshot.status == "needs_clarification",
+        )
+        .order_by(GenerationSnapshot.id.desc())
+    ).all()
+    for snap in rows:
+        data = snap.clarification if isinstance(snap.clarification, dict) else {}
+        if data.get("fingerprint") == fingerprint:
+            return snap
+    return None
+
+
+def begin_clarification(
+    db,
+    project: Project,
+    generation: Generation,
+    *,
+    instruction: str,
+    round_no: int,
+    candidates: list[dict],
+    fingerprint: str,
+    note: str | None = None,
+    agent_run_id: int | None = None,
+) -> GenerationSnapshot:
+    """记一条 ``needs_clarification`` 澄清快照（**不建 pending、不写正文**）。
+
+    幂等：同一 ``fingerprint``（项目/段/正文哈希/指令/轮次/补充说明）已存在
+    澄清行时直接复用，不调模型、不生成第二批候选。澄清行不参与
+    ``uq_gs_pending``（只约束 status='pending'），也不会被 rollback 命中。
+    """
+    existing = find_clarification_by_fingerprint(
+        db, project_id=project.id,
+        segment_no=generation.segment_no, fingerprint=fingerprint,
+    )
+    if existing is not None:
+        return existing
+
+    now = utcnow()
+    snap = GenerationSnapshot(
+        project_id=project.id,
+        generation_id=generation.id,
+        segment_no=generation.segment_no,
+        batch_id=str(uuid.uuid4()),
+        operation="clarify",
+        status="needs_clarification",
+        before_text=generation.text or "",
+        before_summary=generation.summary,
+        before_hash=text_hash(generation.text),
+        instruction=(instruction or "").strip() or None,
+        agent_run_id=agent_run_id,
+        bible_hash=bible_hash(project),
+        owner_pid=os.getpid(),
+        owner_started_at=process_identity(),
+        heartbeat_at=now,
+        created_at=now,
+        finished_at=now,
+        clarification={
+            "round": round_no,
+            "candidates": candidates,
+            "fingerprint": fingerprint,
+            "note": (note or "").strip() or None,
+        },
+    )
+    db.add(snap)
+    db.commit()
+    db.refresh(snap)
+    return snap
+
+
+def find_clarification(db, clarification_id: int) -> GenerationSnapshot | None:
+    return db.get(GenerationSnapshot, clarification_id)
+
+
+def mark_clarification_clarified(db, clarification_id: int) -> None:
+    """选定并成功写入后把澄清行置为 ``clarified``（一次性，best-effort）。"""
+    snap = db.get(GenerationSnapshot, clarification_id)
+    if snap is None or snap.status != "needs_clarification":
+        return
+    try:
+        snap.status = "clarified"
+        snap.finished_at = utcnow()
+        db.commit()
+    except Exception:  # noqa: BLE001 - 留痕失败不能反过来影响已落库的正文
+        db.rollback()
+        log.warning("澄清快照 %s 标记 clarified 失败", clarification_id, exc_info=True)
+
+
 def finalize_snapshot(
     db,
     *,
@@ -811,6 +905,8 @@ def snapshot_to_dict(snap: GenerationSnapshot) -> dict:
         "agent_run_id": snap.agent_run_id,
         "bible_hash": snap.bible_hash,
         "error_reason": snap.error_reason,
+        # 含糊指令的候选澄清（round/candidates/fingerprint/note）；None = 非澄清行。
+        "clarification": snap.clarification,
         "owner_pid": snap.owner_pid,
         "owner_started_at": snap.owner_started_at,
         "heartbeat_at": (

@@ -1983,6 +1983,7 @@ def regenerate_segment_stream(
     instruction: str | None = None,
     snapshot_id: int | None = None,
     expected_before: str | None = None,
+    selected_scope: dict | None = None,
 ):
     """重生成单段（流式）：删除目标段旧内容、依前文摘要链重生成插回、重建摘要链。
 
@@ -2000,6 +2001,10 @@ def regenerate_segment_stream(
     调用方在调模型前已写好 `pending` 快照，这里用 CAS（`WHERE text = expected_before`）
     写正文并与快照 `applied` 同事务提交。两者都为 None 时走原有赋值路径，
     `/regenerate-stream` 的行为逐字节不变。
+    `selected_scope`（2026-11-12 澄清）：用户在候选清单里选定的区间。含糊指令
+    必须由路由层先澄清；这里拿到 `selected_scope` 就直接走 Tier A 的改写提示词，
+    不再让模型定位。未给 `selected_scope` 且 `resolve_scope` 为 None 时抛
+    `clarification_required` 失败关闭（安全网）。
     v2.3：传 `node_prompt` 给 `_build_generation_prompts`——重生成用时间线模式
     剔除全故事信息。**不**调 `_judge_and_advance`——重生成替换第 N 段语义
     上不改 `_next_segment_no`（已存在），不应触发 state advance。
@@ -2066,18 +2071,16 @@ def regenerate_segment_stream(
     # —— 意图分流：局部指令走句子索引补丁（2026-11-12）——
     # 判定复用 scope_guard.declared_local，不另造关键词表（两套口径必漂）。
     # Tier A：位置词（段尾/最后一句/段首/第 N 句…）由程序解析成编号，
-    # 模型只写替换文本；Tier B（某处/此处/这一句）分两段：先只让模型选编号，
-    # 再把编号交给 Tier A 的提示词单独写替换——模型没有「边选边写」的机会，
-    # 指令话术也就抄不进正文。
+    # 改写提示词只给目标句原文、不给任何编号，模型只写替换文本。
+    # 含糊指令（某处/此处/这一句）必须由路由层先澄清候选区间，再把用户选定
+    # 的 selected_scope 传进来；没有选定区间就进入改写属于调用错误，失败关闭。
     # 两条路都只把替换文本拼回原文，其余文字逐字不动，压缩没有发生的空间。
     local_patch = bool(_instruction) and declared_local(_instruction)
     patch_meta = None
     if local_patch:
         from app.generation.patch import (
             PatchError,
-            build_index_user_prompt,
             build_patch_user_prompt,
-            parse_index_reply,
             parse_patch_reply,
             resolve_scope,
         )
@@ -2109,32 +2112,33 @@ def regenerate_segment_stream(
                 fail_snapshot(db, snapshot_id, exc.code)
 
         # Tier A：范围词（段尾/最后一句/段首/第 N 句…）先由程序解析成编号。
-        # 范围解析失败同样失败关闭，不把「改哪一句」退回去让模型猜。
-        try:
-            scope = resolve_scope(_instruction, before_text)
-        except PatchError as exc:
-            logging.getLogger("generation.engine").warning(
-                "局部补丁范围解析失败 code=%s；指令：%r", exc.code, _instruction
-            )
-            if snapshot_id is not None:
-                from app.agents.dialog.snapshot import fail_snapshot
-
-                fail_snapshot(db, snapshot_id, exc.code)
-            raise
-
-        if scope is None:
-            # Tier B 第一步：只选位置，不给写正文的机会。
-            index_reply = ""
+        # 用户已从候选清单选定区间时直接使用，不再解析指令、也不再问模型。
+        if selected_scope is not None:
+            scope = selected_scope
+        else:
             try:
-                index_reply = _chat(
-                    build_index_user_prompt(before_text, _instruction)
-                )
-                scope = parse_index_reply(index_reply, before_text)
+                scope = resolve_scope(_instruction, before_text)
             except PatchError as exc:
-                _fail_patch(exc, index_reply, "选位置")
+                logging.getLogger("generation.engine").warning(
+                    "局部补丁范围解析失败 code=%s；指令：%r", exc.code, _instruction
+                )
+                if snapshot_id is not None:
+                    from app.agents.dialog.snapshot import fail_snapshot
+
+                    fail_snapshot(db, snapshot_id, exc.code)
                 raise
 
-        # 第二步（Tier A 与 Tier B 共用）：目标句由程序标出，模型只写替换文本。
+        if scope is None:
+            # 安全网：含糊指令必须先澄清。路由层会在 begin_snapshot 之前拦截，
+            # 走到这里说明调用方漏了澄清步骤，不能退回「让模型自己选位置」。
+            exc = PatchError(
+                "clarification_required",
+                "含糊指令必须先澄清候选区间，不能直接改写。",
+            )
+            _fail_patch(exc, "", "定位")
+            raise exc
+
+        # Tier A：目标句由程序按编号取出，只把原句放进分隔块；模型只写替换文本。
         patch_user = build_patch_user_prompt(before_text, _instruction, scope)
         # 指令确实进了本次发出的 prompt（补丁 prompt 里也有【本次要求】区）。
         instruction_injected = _instruction in patch_user
@@ -2147,6 +2151,11 @@ def regenerate_segment_stream(
             # 「局部指令要么精确补丁，要么正文一行不动」。
             _fail_patch(exc, reply, "写替换")
             raise
+        # 验收留痕：本次实际发出的改写提示词与模型原始返回前 300 字。
+        # 只进 done 响应，不落快照；用于确认「提示词本来就没有编号」以及
+        # 模型是否仍然写了编号（numbering_stripped 为 True 即触发兜底剥离）。
+        patch_meta["rewrite_prompt"] = patch_user
+        patch_meta["raw_reply_preview"] = (reply or "")[:300]
         # 补丁完成后一次性把完整正文发给客户端：UI 拿到的仍是「整段新正文」，
         # 但模型从未收到「重写整段」的请求。
         yield {"type": "chunk", "text": text}

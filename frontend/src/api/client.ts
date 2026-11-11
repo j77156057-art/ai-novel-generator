@@ -12,7 +12,7 @@ import type {
   AssistantDiagnoseRequest,
   AssistantDiagnoseResponse,
   AssistantInvokeGenerationRequest,
-  AssistantInvokeGenerationResponse,
+  AssistantInvokeGenerationResult,
   AssistantProposalActionResponse,
   AssistantProposalCreate,
   AssistantProposalCreateResponse,
@@ -701,7 +701,7 @@ export const api = {
    * instruction 必填非空；segment_no 仅 regenerate_segment 需要。
    */
   assistantInvokeGeneration: (body: AssistantInvokeGenerationRequest) =>
-    request<AssistantInvokeGenerationResponse>(
+    request<AssistantInvokeGenerationResult>(
       "/assistant/invoke-generation",
       jsonInit("POST", body),
     ),

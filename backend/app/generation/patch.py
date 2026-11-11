@@ -5,25 +5,26 @@
 
 **Tier A（范围词由程序解析）**：指令里出现位置锚点（段尾 / 结尾 / 最后一句 /
 段首 / 开头 / 第一句 / 第 N 句，以及带数量的 最后两句 / 前两句 / 倒数第二句
-等）时，``resolve_scope`` 直接把词映射成编号区间，把目标句逐句标出来交给模型。
-模型只回替换文本；即使它回了编号，编号也必须与程序算的一致，否则
-``index_mismatch`` 失败关闭。**改哪一句不再由模型决定。**
+等）时，``resolve_scope`` 直接把词映射成编号区间。**改写提示词不再出现任何
+编号**：程序按编号取出目标句原文，只把这几句放进分隔块交给模型；模型只回
+替换文本，改哪一句完全由程序决定。模型若仍然回了编号，编号必须与程序算的
+一致，否则 ``index_mismatch`` 失败关闭。
 
-**Tier B（含糊指令，两段式）**：``某处`` / ``此处`` / ``这一句`` 这类无法从
-指令本身定位的说法，``resolve_scope`` 返回 None，然后分两次调用模型：
-第一步 ``build_index_user_prompt`` 只让它回编号（同一份编号清单），第二步把
-第一步的编号交给 Tier A 的 ``build_patch_user_prompt``，只让它写替换文本。
-**两步都必须成功**；第一步的编号校验与第二步的替换校验都失败关闭，各自给
-独立错误码。这样模型没有「一边选位置一边写正文」的机会，也就不会把指令话术
-抄进正文（实测过「这一句确实不太顺，……」）。
+**Tier B（含糊指令，先澄清候选）**：``某处`` / ``此处`` / ``这一句`` 这类无法
+从指令本身定位的说法，``resolve_scope`` 返回 None。此时**不让模型直接写正文**，
+先让模型列出 2–4 个候选区间（``build_candidates_user_prompt``，只回编号），
+程序逐个校验并转成 ``{from,to,preview,reason}``，其中 preview 由程序按编号从
+原文截取。用户选定后，再用 Tier A 的 ``build_patch_user_prompt`` 生成替换文本，
+校验与拼接完全共用。模型没有「一边选位置一边写正文」的机会。
 
-## 剥除行首编号
+## 剥除行首编号（仅兜底）
 
-模型经常无视「不要编号」，把 ``83.`` / ``84.``（或 ``83、`` / ``83)`` /
-``（83）``，中文数字同样认）写进替换文本。程序在 Tier A 第二步统一按行剥除
-行首编号，**剥完再做所有校验**；剥完没有正文（只剩空白/标点）按
-``replacement_numbering_only`` 失败关闭。提示词仍然保留「只写替换文本」，
-但兜底靠程序，不靠模型自觉。
+改写提示词已经从根上不提供任何编号，模型本就不该写。但实测中模型仍可能
+自行补 ``83.`` / ``84.``（或 ``83、`` / ``83)`` / ``（83）``，中文数字同样
+认）。程序在 Tier A 第二步统一按行剥除行首编号，**剥完再做所有校验**；剥完
+没有正文（只剩空白/标点）按 ``replacement_numbering_only`` 失败关闭。
+``parse_patch_reply`` 的 ``numbering_stripped`` 会标记兜底是否被触发：验收
+看的是「模型本来就没写编号」，不是「写了被剥掉」。
 
 ## 多句范围的规则
 
@@ -58,11 +59,15 @@
 ``index_mismatch``           Tier A：模型回的编号 ≠ 程序解析出的编号
 ``scope_count_too_large``    数量词超过上界（防止「最后一百句」滑回整段）
 ``span_whole_segment``       编号范围覆盖全文
+``no_valid_candidate``       所有候选都被丢弃，澄清失败关闭
+``selection_not_in_candidates`` 用户选定区间不在候选清单内
+``clarification_required``   含糊指令未经澄清就进入改写（安全网）
 ``replacement_missing``      缺 replacement 字段
 ``empty_patch``              replacement 为空（或剥编号后没有正文）
 ``replacement_numbering_only`` 剥掉行首编号后只剩空白/标点，没有正文
 ``replacement_whole_segment`` 长度与句数双判据都指向「整段」
 ``replacement_too_long``     相对所选范围明显过长
+``replacement_sentence_mismatch`` 多句跨度改写后句数与待改句数不一致
 ``no_change``                改写结果与原文该范围完全相同
 ``unparsable``               看起来是 JSON 但解析不了
 """
@@ -92,6 +97,15 @@ SCOPE_COUNT_DIVISOR = 4
 WHOLE_SEGMENT_LENGTH_RATIO = 0.8
 #: 「replacement 是整段」的句数判据：达到全句数的 80%。
 WHOLE_SEGMENT_SENTENCE_RATIO = 0.8
+#: 含糊指令的候选区间上界：单次最多 3 句，且不超过全文 10%（向下取整，
+#: 至少 1 句）。依据见模块头「候选上界」。
+CLARIFY_MAX_SENTENCES = 3
+CLARIFY_MAX_RATIO = 0.10
+CLARIFY_MAX_CANDIDATES = 4
+#: 候选理由与预览的展示上限（字符）。preview 仍由程序从原文按编号截取，
+#: 这里只做一行化与截断，不采信模型复述。
+CLARIFY_MAX_REASON = 60
+CLARIFY_MAX_PREVIEW = 160
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 _SENTENCE_END = "。！？!?"
@@ -300,81 +314,84 @@ def resolve_scope(instruction: str, before_text: str) -> dict | None:
     return None
 
 
-def _range_label(scope: dict) -> str:
-    fi, ti = scope["from_index"], scope["to_index"]
-    return f"第 {fi} 句" if fi == ti else f"第 {fi} 句到第 {ti} 句"
+def clarify_span_limit(total: int) -> int:
+    """单个候选最多覆盖多少句：``min(3, total // 10)``，至少 1 句。
+
+    3 句限制「一个完整叙事节拍」；10% 防止短段里 3 句占比过大。向下取整
+    是保守取法：85 句时 10% 为 8，取更小的 3；20 句时为 2；不足 10 句时
+    退化为单句候选，仍可用。
+    """
+    if total <= 0:
+        return 1
+    return max(1, min(CLARIFY_MAX_SENTENCES, int(total * CLARIFY_MAX_RATIO)))
 
 
-def build_index_user_prompt(before_text: str, instruction: str) -> str:
-    """Tier B 第一步：只让模型选位置，不给它写正文的机会。"""
+def build_candidates_user_prompt(
+    before_text: str, instruction: str, note: str | None = None,
+) -> str:
+    """含糊指令第一轮：只让模型列候选区间，不给它写正文的机会。
+
+    与改写提示词不同，这一步**需要**编号清单——模型只回编号，预览由程序
+    按编号从原文截取。返回的编号永远不会进入正文。
+    """
     spans = split_sentences(before_text)
     numbered = _render_numbered(spans)
+    limit = clarify_span_limit(len(spans))
+    note_block = (
+        f"\n【补充说明】\n{note.strip()}\n" if (note and note.strip()) else ""
+    )
     return (
         "下面是一段已定稿的正文，已按句末标点切成编号句子。"
-        "本次只做一件事：**选出要改写的连续若干句**，不要写任何改写内容。\n\n"
-        f"【本次要求】\n{(instruction or '').strip()}\n\n"
+        "本次只做一件事：列出最可能需要改写的候选区间，不要写任何改写内容。\n\n"
+        f"【本次要求】\n{(instruction or '').strip()}\n{note_block}\n"
         f"【编号原文】（共 {len(spans)} 句）\n{numbered}\n\n"
+        "【候选规则】\n"
+        f"- 给出 2 到 {CLARIFY_MAX_CANDIDATES} 个候选，每个是连续的 "
+        "from_index..to_index 区间；\n"
+        f"- 每个候选最多 {limit} 句（全文 10% 与 3 句取更小），"
+        "不要覆盖全文；\n"
+        "- 候选之间不得重叠；\n"
+        "- reason 用一句中文说明为什么这里值得改，不超过 40 字。\n\n"
         "【输出格式（必须严格遵守）】\n"
         "只输出一个 JSON 对象，不要代码块、不要解释、不要任何前后缀文字：\n"
-        '{"from_index": 起始句编号, "to_index": 结束句编号}\n'
-        f"- from_index <= to_index，且都在 1 到 {len(spans)} 之间；"
-        "范围不能覆盖全文；\n"
+        '{"candidates": [{"from_index": 起始句编号, '
+        '"to_index": 结束句编号, "reason": "..."}]}\n'
         "- 不要输出 replacement，不要输出任何正文或改写结果；"
-        "改写文本由下一次请求单独生成。"
+        "改写文本由用户选定区间后单独生成。"
     )
+
+
+#: 待改写片段的起止标记。改写提示词里**不出现任何句子编号**，只靠这两个
+#: 标记圈出允许改写的原文；模型若把标记一并回显，解析时先剥掉。
+_TARGET_BEGIN = "【待改写片段开始】"
+_TARGET_END = "【待改写片段结束】"
 
 
 def build_patch_user_prompt(
     before_text: str, instruction: str, scope: dict
 ) -> str:
+    """Tier A 改写提示词：只给待改句原文，不给任何编号脚手架。
+
+    位置已由 ``resolve_scope`` 解析成编号，程序按编号取原句；模型不需要也
+    不应该看到整段编号列表或 ``>>`` 目标标记——那等于请它抄编号。这里只把
+    目标区间原文放进分隔块，问「只返回改写后的文本」。
+    """
     spans = split_sentences(before_text)
-    numbered = _render_numbered(spans, scope)
-    label = _range_label(scope)
-    start, end = scope["from_index"], scope["to_index"]
-    target_lines = "\n".join(
-        f"{i}. {spans[i - 1]['text']}" for i in range(start, end + 1)
-    )
+    start = spans[scope["from_index"] - 1]["start"]
+    end = spans[scope["to_index"] - 1]["end"]
+    target_text = before_text[start:end]
     return (
-        "下面是一段已定稿的正文，已按句末标点切成编号句子。请做**局部改写**。\n\n"
+        "下面是一段已定稿正文中的几句话。请按【本次要求】改写，"
+        "并且只返回改写后的文本。\n\n"
         f"【本次要求】\n{(instruction or '').strip()}\n\n"
-        f"【目标范围（由程序按指令解析，不可更改）】\n"
-        f"{label}（共 {end - start + 1} 句）：\n{target_lines}\n\n"
-        f"【编号原文】（共 {len(spans)} 句；>> 标记的是本次唯一允许改写的句子）\n"
-        f"{numbered}\n\n"
-        "【输出格式（必须严格遵守）】\n"
-        "只输出改写后的句子文本：不要编号、不要解释、不要代码块。\n"
-        f"不要输出 {label} 以外的任何句子，不要输出整段正文。\n"
-        "如果输出 JSON，只能是 "
-        f'{{"from_index": {start}, "to_index": {end}, "replacement": "..."}}，'
-        "编号必须与目标范围一致，否则本次改写作废。"
+        "【待改写的句子】\n"
+        f"{_TARGET_BEGIN}\n{target_text}\n{_TARGET_END}\n\n"
+        "【输出要求】\n"
+        "- 逐句对应改写，保持句子数量不变；\n"
+        "- 只返回改写后的文本，不要解释、不要代码块、"
+        "不要添加任何列表标记或前后缀；\n"
+        "- 不要输出待改写片段之外的任何句子。"
     )
-
-
-def _clean_json_text(reply: str) -> str:
-    text = (reply or "").strip()
-    fenced = _FENCE_RE.search(text)
-    if fenced:
-        text = fenced.group(1).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start:end + 1]
-    return text
-
-
-def _load_payload(reply: str) -> dict:
-    raw = _clean_json_text(reply)
-    try:
-        payload = json.loads(raw)
-    except Exception as exc:  # noqa: BLE001 - 模型返回不可控，统一转补丁错误
-        raise PatchError("unparsable", "模型返回不是可解析的 JSON。") from exc
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception as exc:  # noqa: BLE001
-            raise PatchError("unparsable", "补丁 JSON 是字符串，里面也不是对象。") from exc
-    if not isinstance(payload, dict):
-        raise PatchError("unparsable", "补丁 JSON 不是对象。")
-    return payload
 
 
 def _as_index(value, name: str) -> int:
@@ -385,36 +402,6 @@ def _as_index(value, name: str) -> int:
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
     raise PatchError("index_invalid", f"{name} 不是整数。")
-
-
-def _parse_indices(payload: dict, total: int) -> tuple[int, int]:
-    from_value = payload.get("from_index", payload.get("index",
-                   payload.get("start")))
-    to_value = payload.get("to_index", payload.get("index", payload.get("end")))
-    if from_value is None or to_value is None:
-        raise PatchError(
-            "index_missing",
-            "补丁缺少 from_index/to_index（或 index）：模型没有给出要改哪几句。",
-        )
-    from_index = _as_index(from_value, "from_index")
-    to_index = _as_index(to_value, "to_index")
-    if not (1 <= from_index <= total and 1 <= to_index <= total):
-        raise PatchError(
-            "index_out_of_range",
-            f"编号越界：from_index={from_index}, to_index={to_index}，"
-            f"有效范围 1..{total}。",
-        )
-    if from_index > to_index:
-        raise PatchError(
-            "index_reversed",
-            f"from_index={from_index} 大于 to_index={to_index}。",
-        )
-    if from_index == 1 and to_index == total:
-        raise PatchError(
-            "span_whole_segment",
-            f"编号范围 1..{total} 覆盖全文：这不是局部改写。",
-        )
-    return from_index, to_index
 
 
 def _parse_replacement(payload: dict) -> str:
@@ -435,6 +422,18 @@ def _validate_replacement(
 ) -> None:
     if replacement == span_text:
         raise PatchError("no_change", "改写结果与原文该范围完全相同。")
+    # 多句跨度：句数必须一致。落库按字符区间整段替换，机械上不存在还原
+    # 歧义；这条约束的作用是锁住局部边界——不允许 2 句悄悄扩成 3–4 句，
+    # 也不允许合并成 1 句后失去逐句对应关系。连续句末标点由 split_sentences
+    # 视为一句，避免「？！」被误数。
+    if span_sentences >= 2:
+        replacement_sentences = len(split_sentences(replacement))
+        if replacement_sentences != span_sentences:
+            raise PatchError(
+                "replacement_sentence_mismatch",
+                f"待改范围是 {span_sentences} 句，改写后是 "
+                f"{replacement_sentences} 句；多句跨度要求句数一致。",
+            )
     # 整段判据：长度与句数同时逼近全文，才判「replacement 是整段」。
     length_is_whole = len(replacement) >= WHOLE_SEGMENT_LENGTH_RATIO * len(before_text)
     sentences_is_whole = (
@@ -485,11 +484,19 @@ def _check_model_indices(payload: dict, scope: dict) -> None:
         )
 
 
-def _tier_a_replacement(reply: str, scope: dict) -> str:
+def _strip_target_delimiters(text: str) -> str:
+    """模型若把分隔块标记一并回显，先取标记之间的内容。"""
+    if _TARGET_BEGIN in text and _TARGET_END in text:
+        text = text.split(_TARGET_BEGIN, 1)[1].split(_TARGET_END, 1)[0]
+    return text.strip()
+
+
+def _tier_a_replacement(reply: str, scope: dict) -> tuple[str, bool]:
     """Tier A 的返回解析：接受纯替换文本，或带编号的 JSON（编号须一致）。
 
-    取到文本后**先按行剥掉行首编号**，再做空/无正文检查；后续长度与整段
-    校验由调用方统一做（Tier B 第二步也走这里，不复制校验）。
+    返回 ``(替换文本, 是否触发了行首编号剥离)``。编号剥离只是兜底：正常情况
+    下改写提示词里没有任何编号，模型本来就不该写；``numbering_stripped=True``
+    说明模型仍然写了，验收时要如实报告，不能把「剥掉了」当通过。
     """
     raw = (reply or "").strip()
     if not raw:
@@ -498,6 +505,7 @@ def _tier_a_replacement(reply: str, scope: dict) -> str:
     fenced = _FENCE_RE.search(text)
     if fenced:
         text = fenced.group(1).strip()
+    text = _strip_target_delimiters(text)
     if not text:
         raise PatchError("empty_patch", "模型返回为空。")
 
@@ -516,23 +524,156 @@ def _tier_a_replacement(reply: str, scope: dict) -> str:
         _check_model_indices(payload, scope)
         replacement = _parse_replacement(payload)
 
+    had_numbering = any(
+        _NUMBERING_RE.match(line) for line in replacement.splitlines()
+    )
     stripped = _strip_leading_numbering(replacement)
     if not stripped or not _has_body_text(stripped):
         raise PatchError(
             "replacement_numbering_only",
             "替换文本剥掉行首编号后只剩空白/标点，没有正文。",
         )
-    return stripped
+    return stripped, had_numbering
 
 
-def parse_index_reply(reply: str, before_text: str) -> dict:
-    """Tier B 第一步：只解析编号，不接受任何正文，返回 source=model 的范围。"""
+def _clean_any_json_text(reply: str) -> str:
+    """从可能带说明/代码块的返回里抠出 JSON 对象或数组。"""
+    text = (reply or "").strip()
+    fenced = _FENCE_RE.search(text)
+    if fenced:
+        text = fenced.group(1).strip()
+    starts = [i for i in (text.find("["), text.find("{")) if i != -1]
+    if starts:
+        start = min(starts)
+        ends = [i for i in (text.rfind("]"), text.rfind("}")) if i > start]
+        if ends:
+            text = text[start:max(ends) + 1]
+    return text
+
+
+def _load_candidates_payload(reply: str):
+    raw = _clean_any_json_text(reply)
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001 - 模型返回不可控
+        raise PatchError("unparsable", "模型返回不是可解析的 JSON。") from exc
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception as exc:  # noqa: BLE001
+            raise PatchError("unparsable", "候选 JSON 是字符串，里面也不是对象。") from exc
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("candidates", "ranges", "options", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        if any(key in payload for key in ("from_index", "index", "start")):
+            return [payload]
+    raise PatchError("unparsable", "候选 JSON 既不是数组，也没有 candidates 列表。")
+
+
+def _candidate_indices(item: dict, total: int) -> tuple[int, int] | None:
+    """取候选编号；任何一项不合法都返回 None（该候选被丢弃，不整体失败）。"""
+    from_value = item.get("from_index", item.get("index", item.get("start")))
+    to_value = item.get("to_index", item.get("index", item.get("end")))
+    if from_value is None or to_value is None:
+        return None
+    try:
+        from_index = _as_index(from_value, "from_index")
+        to_index = _as_index(to_value, "to_index")
+    except PatchError:
+        return None
+    if not (1 <= from_index <= total and 1 <= to_index <= total):
+        return None
+    if from_index > to_index:
+        return None
+    if from_index == 1 and to_index == total:
+        return None
+    return from_index, to_index
+
+
+def _preview_span(
+    before_text: str, spans: list[dict], from_index: int, to_index: int,
+) -> str:
+    """预览必须由程序从原文按编号截取，不采信模型复述。"""
+    start = spans[from_index - 1]["start"]
+    end = spans[to_index - 1]["end"]
+    text = " ".join(before_text[start:end].split())
+    if len(text) > CLARIFY_MAX_PREVIEW:
+        text = text[:CLARIFY_MAX_PREVIEW - 1].rstrip() + "…"
+    return text
+
+
+def parse_candidates_reply(reply: str, before_text: str) -> list[dict]:
+    """解析含糊指令第一轮的候选区间列表。
+
+    越界、倒序、覆盖全文、超过局部上界、空区间、重复、与已接受候选重叠的
+    候选一律丢弃；全部丢弃时抛 ``no_valid_candidate`` 失败关闭。preview 由
+    程序按编号从原文截取，reason 只做截断，二者都不会进入正文。
+    """
     spans = split_sentences(before_text)
-    if not spans:
-        raise PatchError("index_missing", "正文没有可编号的句子。")
-    payload = _load_payload(reply)
-    from_index, to_index = _parse_indices(payload, len(spans))
-    return _bounded_scope(from_index, to_index, len(spans), None, source="model")
+    total = len(spans)
+    if total == 0:
+        raise PatchError("no_valid_candidate", "正文没有可编号的句子。")
+    items = _load_candidates_payload(reply)
+    limit = clarify_span_limit(total)
+    accepted: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+    discarded = 0
+    for item in items:
+        if not isinstance(item, dict):
+            discarded += 1
+            continue
+        indices = _candidate_indices(item, total)
+        if indices is None:
+            discarded += 1
+            continue
+        from_index, to_index = indices
+        if to_index - from_index + 1 > limit:
+            discarded += 1
+            continue
+        if (from_index, to_index) in seen:
+            discarded += 1
+            continue
+        if any(
+            not (to_index < prev["from_index"] or from_index > prev["to_index"])
+            for prev in accepted
+        ):
+            discarded += 1
+            continue
+        seen.add((from_index, to_index))
+        reason = " ".join(str(item.get("reason") or "").split())
+        accepted.append({
+            "id": f"c{len(accepted) + 1}",
+            "from_index": from_index,
+            "to_index": to_index,
+            "preview": _preview_span(before_text, spans, from_index, to_index),
+            "reason": reason[:CLARIFY_MAX_REASON],
+        })
+        if len(accepted) >= CLARIFY_MAX_CANDIDATES:
+            break
+    if not accepted:
+        raise PatchError(
+            "no_valid_candidate",
+            f"模型给出的 {len(items)} 个候选全部越界/倒序/重叠/超过局部上界"
+            f"（最多 {limit} 句），已失败关闭。",
+        )
+    return accepted
+
+
+def scope_from_selection(
+    candidates: list[dict], from_index: int, to_index: int, total: int,
+) -> dict:
+    """用户选定的区间必须原样来自候选清单，不允许前端自造范围。"""
+    for item in candidates:
+        if (item.get("from_index"), item.get("to_index")) == (from_index, to_index):
+            return _bounded_scope(from_index, to_index, total, None, source="user")
+    raise PatchError(
+        "selection_not_in_candidates",
+        f"选定区间 {from_index}..{to_index} 不在本次候选清单内。",
+    )
 
 
 def parse_patch_reply(
@@ -549,7 +690,7 @@ def parse_patch_reply(
     spans = split_sentences(before_text)
     from_index = scope["from_index"]
     to_index = scope["to_index"]
-    replacement = _tier_a_replacement(reply, scope)
+    replacement, numbering_stripped = _tier_a_replacement(reply, scope)
     scope_source = scope.get("source", "program")
     scope_keyword = scope.get("keyword")
 
@@ -570,6 +711,8 @@ def parse_patch_reply(
         "stages": 2 if scope_source == "model" else 1,
         "scope_source": scope_source,
         "scope_keyword": scope_keyword,
+        # 兜底剥离是否被触发；验收关心的仍是模型原始返回有没有编号。
+        "numbering_stripped": numbering_stripped,
         "applied": [{
             "from_index": from_index,
             "to_index": to_index,

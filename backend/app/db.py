@@ -250,6 +250,9 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # —— 重写的篇幅跌幅（2026-11-12）——
         # 与 scope_mismatch 分列：首尾是否保留、篇幅是否缩水是两类问题。
         ("generation_snapshots", "length_drop", "JSON"),
+        # —— 含糊指令的候选澄清（2026-11-12）——
+        # {round, candidates, fingerprint, note}；只加列、不回填，NULL = 非澄清行。
+        ("generation_snapshots", "clarification", "JSON"),
     ]
     # v3.0 KG 索引定义（ensure_schema 同步建，_migrate_sqlite_columns 老库补建）
     v30_indexes = [

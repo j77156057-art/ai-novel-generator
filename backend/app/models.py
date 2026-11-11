@@ -583,7 +583,7 @@ class GenerationSnapshot(Base):
     batch_id = Column(String(36), nullable=False)
     # rewrite | batch_rewrite | rollback
     operation = Column(String(24), nullable=False)
-    # pending | applied | failed | rolled_back
+    # pending | applied | failed | rolled_back | needs_clarification | clarified
     status = Column(String(16), nullable=False, default="pending")
     before_text = Column(Text, nullable=False)
     after_text = Column(Text, nullable=True)
@@ -602,6 +602,9 @@ class GenerationSnapshot(Base):
     # 与 scope_mismatch **分开记账**：首尾保留 ≠ 篇幅没被压缩。None = 未命中，
     # 或用户明确要求精简/压缩。同样只留痕，不阻断落库。
     length_drop = Column(JSON, nullable=True)
+    # 含糊指令的候选澄清：{round, candidates, fingerprint, note}。None = 非澄清行。
+    # 澄清阶段不写正文、不建 pending，这条 JSON 只作可区分的留痕与幂等键。
+    clarification = Column(JSON, nullable=True)
     agent_run_id = Column(Integer, ForeignKey("agent_runs.id"), nullable=True)
     # 快照时点的 plot_bible 指纹：回滚前比对，防「正文退了、名字没退」。
     bible_hash = Column(String(64), nullable=True)

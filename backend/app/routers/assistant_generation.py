@@ -55,10 +55,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any, Callable, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -129,6 +131,12 @@ class AssistantInvokeGenerationRequest(StrictRequest):
     #: 仅当上一次 409 返回 ``can_takeover=true`` 后由用户显式要求时传 true。
     #: 服务层仍会用条件 UPDATE 做 CAS：原持有者心跳没超时就不会抢走。
     takeover: bool = False
+    #: 含糊指令澄清：上一次 202 返回的 ``clarification_id``。
+    clarification_id: int | None = None
+    #: 从候选清单里选定的区间。必须原样来自候选（服务端会再校验一次）。
+    selected: dict[str, int] | None = None
+    #: 「都不对」的补充说明；最多两轮，超过 → 422 ``clarify_round_limit``。
+    clarify_reply: str | None = None
 
     @model_validator(mode="after")
     def _validate_action_fields(self) -> "AssistantInvokeGenerationRequest":
@@ -144,6 +152,31 @@ class AssistantInvokeGenerationRequest(StrictRequest):
             raise ValueError("generate_next 不接受 segment_no（段号由引擎分配）")
         if not (self.instruction or "").strip():
             raise ValueError("instruction 不能为空：助手生成必须是显式用户指令")
+        clarification_fields = (
+            self.clarification_id, self.selected, self.clarify_reply
+        )
+        if self.action != "regenerate_segment" and any(
+            value is not None for value in clarification_fields
+        ):
+            raise ValueError("澄清字段只适用于 regenerate_segment")
+        if self.selected is not None and self.clarify_reply is not None:
+            raise ValueError("selected 与 clarify_reply 不能同时提交")
+        if self.clarification_id is None and any(
+            value is not None for value in (self.selected, self.clarify_reply)
+        ):
+            raise ValueError("澄清后续请求必须带 clarification_id")
+        if self.clarification_id is not None:
+            if self.selected is None and not (self.clarify_reply or "").strip():
+                raise ValueError(
+                    "clarification_id 必须搭配 selected 或非空 clarify_reply"
+                )
+        if self.selected is not None:
+            from_index = self.selected.get("from_index")
+            to_index = self.selected.get("to_index")
+            if not isinstance(from_index, int) or not isinstance(to_index, int):
+                raise ValueError("selected 必须包含整数 from_index 与 to_index")
+            if from_index < 1 or to_index < 1 or from_index > to_index:
+                raise ValueError("selected 区间不合法")
         return self
 
 
@@ -576,14 +609,190 @@ def _run_ai_flavor_feedback(
 
 
 # ====================================================================
+# 含糊指令：候选澄清（2026-11-12）
+# ====================================================================
+#
+# Tier B（某处/此处/这一句…）不再让模型自己决定改哪里：第一轮只让它列
+# 候选区间（只回编号，不回正文），程序按编号从原文截取预览，以 202 返回给
+# 用户选。选定后按该区间走 Tier A 的同一份改写提示词与全部校验。
+#
+# 澄清阶段**不写正文**：不建 pending 快照、不碰 generations.text，只留一条
+# status='needs_clarification' 的 GenerationSnapshot。它不带 pending，因此
+# 既不占该段的写租约，也不会被 rollback 命中。同一（项目/段/正文哈希/
+# 指令/轮次/补充说明）的重复提交命中 fingerprint 直接复用上次候选，
+# 不会因为重试生成第二批。
+
+#: 最多澄清两轮：首轮候选 + 一次「都不对」补充说明。再问就是无限追问。
+_CLARIFY_MAX_ROUNDS = 2
+
+_CLARIFY_SYSTEM = (
+    "你是中文小说编辑部的定位助手。用户会给出一个不指明具体位置的改写要求，"
+    "你的唯一任务是：阅读已编号的正文，指出最值得改写的 2–4 个连续句子区间。"
+    "你只输出编号与一句理由，不改写正文、不解释、不输出任何其他文字。"
+)
+
+
+def _clarify_fingerprint(
+    *, project_id: int, segment_no: int, before_hash: str,
+    instruction: str, round_no: int, note: str | None,
+) -> str:
+    """澄清幂等键：同一请求（含轮次与补充说明）重复提交必须命中同一个值。"""
+    payload = "\x1f".join([
+        str(project_id), str(segment_no), before_hash,
+        (instruction or "").strip(), str(round_no), (note or "").strip(),
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _clarify_payload(
+    snap, *, instruction: str, round_no: int, limit: int
+) -> dict:
+    """202 响应体：``status='needs_clarification'`` 与 200 成功可一眼区分。"""
+    data = snap.clarification if isinstance(snap.clarification, dict) else {}
+    return {
+        "status": "needs_clarification",
+        "code": "needs_clarification",
+        "clarification_id": snap.id,
+        "segment_no": snap.segment_no,
+        "instruction": instruction,
+        "round": round_no,
+        "max_rounds": _CLARIFY_MAX_ROUNDS,
+        "candidates": data.get("candidates") or [],
+        "limit": limit,
+        "rounds_left": max(0, _CLARIFY_MAX_ROUNDS - round_no),
+        "before_hash": snap.before_hash,
+        "message": (
+            "这句指令没有指明要改哪里：请从下列候选区间里选一个，"
+            "或点「都不对」补充一句说明。"
+        ),
+    }
+
+
+def _run_clarification(
+    db: Session,
+    project: Project,
+    target: Generation,
+    *,
+    instruction: str,
+    round_no: int,
+    note: str | None,
+    request_hash: str,
+) -> JSONResponse:
+    """跑一轮候选澄清并返回 HTTP 202（**不写正文、不建 pending**）。"""
+    from app.agents.dialog.snapshot import (
+        begin_clarification,
+        find_clarification_by_fingerprint,
+        text_hash,
+    )
+    from app.generation.patch import (
+        PatchError,
+        build_candidates_user_prompt,
+        clarify_span_limit,
+        parse_candidates_reply,
+        split_sentences,
+    )
+
+    before_text = target.text or ""
+    before_hash = text_hash(before_text)
+    limit = clarify_span_limit(len(split_sentences(before_text)))
+    fingerprint = _clarify_fingerprint(
+        project_id=project.id, segment_no=target.segment_no,
+        before_hash=before_hash, instruction=instruction,
+        round_no=round_no, note=note,
+    )
+    # 幂等前置：同一请求重复提交（重试/双击）直接复用上次候选，不调模型。
+    existing = find_clarification_by_fingerprint(
+        db, project_id=project.id, segment_no=target.segment_no,
+        fingerprint=fingerprint,
+    )
+    if existing is not None:
+        data = existing.clarification if isinstance(existing.clarification, dict) else {}
+        return JSONResponse(
+            status_code=202,
+            content=_clarify_payload(
+                existing, instruction=instruction,
+                round_no=int(data.get("round") or round_no), limit=limit,
+            ),
+        )
+
+    run = AgentRun(
+        project_id=project.id,
+        role="assistant",
+        status="running",
+        started_at=_now_utc(),
+        finished_at=None,
+        request_hash=request_hash,
+        model="",
+        note=(
+            f"这次是助手发起的澄清（segment_no={target.segment_no}"
+            f", round={round_no}）：{instruction[:120]}"
+        ),
+    )
+    db.add(run)
+    db.flush()
+    run_id = run.id
+    db.commit()  # 先落 run，避免把长调用包在事务里
+
+    from app.llm.provider import get_llm_provider
+
+    try:
+        provider = get_llm_provider()
+        raw = provider.chat(
+            _CLARIFY_SYSTEM,
+            build_candidates_user_prompt(before_text, instruction, note),
+        )
+        candidates = parse_candidates_reply(raw, before_text)
+    except PatchError as exc:
+        run.status = "failed"
+        run.finished_at = _now_utc()
+        run.model = "(unknown)"
+        run.note = f"助手发起的澄清失败（{exc.code}）：{str(exc)[:120]}"
+        db.commit()
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "message": str(exc),
+                    "segment_no": target.segment_no},
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - provider 报错/超时同样要留痕
+        run.status = "failed"
+        run.finished_at = _now_utc()
+        run.model = "(unknown)"
+        run.note = f"助手发起的澄清失败：{str(exc)[:120]}"
+        db.commit()
+        raise HTTPException(
+            status_code=500, detail=f"候选澄清失败：{str(exc)[:200]}"
+        ) from exc
+
+    snap = begin_clarification(
+        db, project, target,
+        instruction=instruction,
+        round_no=round_no,
+        candidates=candidates,
+        fingerprint=fingerprint,
+        note=note,
+        agent_run_id=run_id,
+    )
+    run.status = "success"
+    run.finished_at = _now_utc()
+    run.model = _writer_model_label()
+    db.commit()
+    return JSONResponse(
+        status_code=202,
+        content=_clarify_payload(
+            snap, instruction=instruction, round_no=round_no, limit=limit
+        ),
+    )
+
+
+# ====================================================================
 # POST /api/assistant/invoke-generation
 # ====================================================================
 
 
-@router.post("/invoke-generation")
+@router.post("/invoke-generation", response_model=None)
 def assistant_invoke_generation(
     body: AssistantInvokeGenerationRequest, db: Session = Depends(get_db)
-) -> dict:
+) -> dict | JSONResponse:
     """助手调动生成（**唯一**允许助手触发写业务表的端点；显式用户指令）。
 
     执行顺序：
@@ -607,9 +816,113 @@ def assistant_invoke_generation(
     project = _require_project(db, body.project_id)
     target: Generation | None = None
     snapshot = None
+    # 用户从候选清单选定（或程序解析出）的区间；None = 整段重写。
+    selected_scope: dict | None = None
+    # 实际下发进 Tier A 改写提示词的指令：澄清选定时用澄清行保存的原指令，
+    # 保证「同一份提示词」，与这次的 body.instruction 无关。
+    instruction = body.instruction
     if body.action == "regenerate_segment":
         # 先校验再开 run：目标段不存在时不留一条空跑的审计记录
         target = _require_segment(db, project.id, body.segment_no)
+
+        if body.clarification_id is not None:
+            # —— 澄清后续：选定区间走 Tier A / 「都不对」补一轮 ——
+            from app.agents.dialog.snapshot import find_clarification, text_hash
+
+            clar = find_clarification(db, body.clarification_id)
+            if (
+                clar is None
+                or clar.project_id != project.id
+                or clar.segment_no != body.segment_no
+                or clar.status not in ("needs_clarification", "clarified")
+            ):
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "clarification_not_found",
+                        "message": "澄清记录不存在、不属于该段，或已失效。",
+                        "segment_no": body.segment_no,
+                    },
+                )
+            if text_hash(target.text) != clar.before_hash:
+                # 发起澄清后正文被别人改过：旧候选的编号已不可信。
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "clarification_stale",
+                        "message": "澄清发起后正文已被改过，请重新发起本次改写。",
+                        "segment_no": body.segment_no,
+                    },
+                )
+            data = clar.clarification if isinstance(clar.clarification, dict) else {}
+            instruction = (clar.instruction or body.instruction).strip()
+            if body.selected is not None:
+                from app.generation.patch import (
+                    PatchError,
+                    scope_from_selection,
+                    split_sentences,
+                )
+
+                try:
+                    selected_scope = scope_from_selection(
+                        data.get("candidates") or [],
+                        body.selected["from_index"],
+                        body.selected["to_index"],
+                        len(split_sentences(target.text or "")),
+                    )
+                except PatchError as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": exc.code, "message": str(exc),
+                                "segment_no": body.segment_no},
+                    ) from exc
+            else:
+                round_no = int(data.get("round") or 1) + 1
+                if round_no > _CLARIFY_MAX_ROUNDS:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "code": "clarify_round_limit",
+                            "message": (
+                                f"已经澄清过 {_CLARIFY_MAX_ROUNDS} 轮仍未选定区间；"
+                                "本次失败关闭。请改用更明确的指令"
+                                "（如「最后两句」「第 5 句」）再试。"
+                            ),
+                            "segment_no": body.segment_no,
+                        },
+                    )
+                return _run_clarification(
+                    db, project, target,
+                    instruction=instruction,
+                    round_no=round_no,
+                    note=body.clarify_reply,
+                    request_hash=_request_hash(body),
+                )
+        else:
+            # —— 没有澄清上下文：含糊指令必须**先澄清**，不写正文 ——
+            from app.generation.patch import PatchError, resolve_scope
+            from app.generation.scope_guard import declared_local
+
+            if declared_local(instruction):
+                try:
+                    resolved = resolve_scope(instruction, target.text or "")
+                except PatchError as exc:
+                    # 明确的局部范围但不合法（如「最后五句」超上界）：
+                    # 这是 Tier A 的失败，不该降级成澄清。
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": exc.code, "message": str(exc),
+                                "segment_no": body.segment_no},
+                    ) from exc
+                if resolved is None:
+                    return _run_clarification(
+                        db, project, target,
+                        instruction=instruction,
+                        round_no=1,
+                        note=None,
+                        request_hash=_request_hash(body),
+                    )
+
         # —— 两段式写入第一段：调模型**前**写 pending 快照（独立短事务）——
         # 同段已有在途重写时抛 SnapshotBusy（部分唯一索引兜底）→ 409。
         # 放在开 AgentRun 之前：被并发挡下的请求根本没跑模型，不该留一条
@@ -619,7 +932,7 @@ def assistant_invoke_generation(
         try:
             snapshot = begin_snapshot(
                 db, project, target,
-                instruction=body.instruction,
+                instruction=instruction,
                 takeover=body.takeover,
             )
         except SnapshotBusy as exc:
@@ -712,10 +1025,14 @@ def assistant_invoke_generation(
             max_chars=body.max_chars,
             # 用户的重写要求真正下发进生成提示（引擎侧渲染到
             # 【本次重写要求】指令区）；空串时提示词与改动前逐字节一致。
-            instruction=body.instruction,
+            # 澄清选定时用的是澄清行保存的原指令（同一份提示词）。
+            instruction=instruction,
             # 两段式写入第二段：正文 CAS + 快照 applied 在引擎那次提交里一起落。
             snapshot_id=snapshot.id,
             expected_before=snapshot.before_text,
+            # 澄清选定的区间：引擎直接走 Tier A 改写提示词与全部校验，
+            # 不再让模型定位，也不复用澄清阶段任何模型文本（那阶段只回编号）。
+            selected_scope=selected_scope,
         ):
             if event.get("type") == "chunk":
                 pieces.append(event.get("text") or "")
@@ -737,6 +1054,12 @@ def assistant_invoke_generation(
         run.finished_at = _now_utc()
         run.model = writer_model
         db.commit()
+        # 澄清行一次性收口：正文已按选定区间落库，旧候选不再可用。
+        # best-effort：留痕失败不影响已经成功的正文（与闭环同一纪律）。
+        if body.clarification_id is not None:
+            from app.agents.dialog.snapshot import mark_clarification_clarified
+
+            mark_clarification_clarified(db, body.clarification_id)
         # AI 腔反馈闭环（旁路）：与 generate_next 分支同一函数，不各写一遍
         # （两处各写一遍必漂移是这个项目的历史教训）。
         segment_out = _segment_out(gen)
@@ -750,7 +1073,7 @@ def assistant_invoke_generation(
         )
         # 回答只在指令**确实进了 prompt** 时才声称「已按你的指令」；
         # 空指令保持改动前的原文案（逐字一致），带指令但未注入则如实说明。
-        if (body.instruction or "").strip() and not instruction_injected:
+        if (instruction or "").strip() and not instruction_injected:
             answer = (
                 f"已重写第 {body.segment_no} 段"
                 f"（{len(text)} 字，Writer 模型 {writer_model}），"
@@ -786,6 +1109,8 @@ def assistant_invoke_generation(
             # 撤销入口：这段正文现在可以退回到 snapshot 的 before_text。
             "snapshot_id": snapshot.id if snapshot is not None else None,
             "batch_id": snapshot.batch_id if snapshot is not None else None,
+            # 本次改写来自哪次澄清（None = 非澄清路径）。
+            "clarification_id": body.clarification_id,
         }
     except Exception as exc:  # noqa: BLE001 - 生成失败必须留痕，不静默 200
         logger.warning("invoke-generation 失败（project=%s）：%s", project.id, exc)

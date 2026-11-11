@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import sys
 
 _BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend"))
@@ -15,6 +17,7 @@ if _BACKEND not in sys.path:
     sys.path.insert(0, _BACKEND)
 
 import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 from app.agents.dialog.snapshot import begin_snapshot  # noqa: E402
@@ -22,22 +25,30 @@ from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.generation.engine import regenerate_segment_stream  # noqa: E402
 from app.generation.patch import (  # noqa: E402
     PatchError,
-    build_index_user_prompt,
-    parse_index_reply,
+    build_candidates_user_prompt,
+    build_patch_user_prompt,
+    clarify_span_limit,
+    parse_candidates_reply,
     parse_patch_reply,
     resolve_scope,
+    scope_from_selection,
     split_sentences,
 )
+from app.main import app as fastapi_app  # noqa: E402
 from app.models import Generation, GenerationSnapshot, Project  # noqa: E402
+from app.routers import assistant_generation as ag  # noqa: E402
 
 SEG1 = "林夜推开木门。\n他说：“我回来了。”"
 SEG2 = "第一句。第二句。第三句。"
 
 
-def _tier_b(reply: str, before: str):
-    """Tier B 两段式：第一步只取编号，第二步再取替换文本。"""
-    scope = parse_index_reply(reply, before)
-    return parse_patch_reply(reply, before, scope)
+def _assert_no_numbering_scaffold(prompt: str) -> None:
+    """改写提示词不得含任何编号脚手架（不是禁止正文里本来就有的数字）。"""
+    assert ">>" not in prompt
+    assert "from_index" not in prompt
+    assert "编号" not in prompt
+    for line in prompt.splitlines():
+        assert not re.match(r"^\s*\d+[.．、]\s", line), line
 
 
 # ---------------------------------------------------------------------------
@@ -52,11 +63,10 @@ def test_split_sentences_keeps_quotes_and_tail_fragment():
     assert "她还站着".startswith("她")
 
 
-def test_single_sentence_index_replaces_exactly_one():
+def test_single_sentence_scope_replaces_exactly_one():
     before = "第一句。第二句。第三句。"
-    new_text, meta = _tier_b(
-        '{"index": 2, "replacement": "改过的第二句。"}', before
-    )
+    scope = resolve_scope("第2句", before)
+    new_text, meta = parse_patch_reply("改过的第二句。", before, scope)
     assert new_text == "第一句。改过的第二句。第三句。"
     assert new_text.startswith("第一句。") and new_text.endswith("第三句。")
     applied = meta["applied"][0]
@@ -67,51 +77,23 @@ def test_single_sentence_index_replaces_exactly_one():
 
 def test_multi_sentence_span_replaces_consecutive_sentences():
     before = "第一句。第二句。第三句。第四句。"
-    new_text, meta = _tier_b(
-        '{"from_index": 2, "to_index": 3, '
-        '"replacement": "改过的二。改过的三。"}',
-        before,
-    )
+    scope = resolve_scope("第2句到第3句", before)
+    new_text, meta = parse_patch_reply("改过的二。改过的三。", before, scope)
     assert new_text == "第一句。改过的二。改过的三。第四句。"
     applied = meta["applied"][0]
     assert (applied["from_index"], applied["to_index"]) == (2, 3)
     assert applied["before"] == "第二句。第三句。"
 
 
-def test_index_out_of_range_raises():
-    with pytest.raises(PatchError) as ei:
-        parse_index_reply('{"index": 9}', SEG2)
-    assert ei.value.code == "index_out_of_range"
-    assert "1..3" in str(ei.value)
-
-
-def test_index_reversed_raises():
-    with pytest.raises(PatchError) as ei:
-        parse_index_reply('{"from_index": 3, "to_index": 1}', SEG2)
-    assert ei.value.code == "index_reversed"
-
-
-def test_span_covering_whole_text_is_rejected():
-    with pytest.raises(PatchError) as ei:
-        parse_index_reply('{"from_index": 1, "to_index": 3}', SEG2)
-    assert ei.value.code == "span_whole_segment"
-
-
-def test_missing_index_fields_raises():
-    with pytest.raises(PatchError) as ei:
-        parse_index_reply('{"replacement": "新句子。"}', SEG2)
-    assert ei.value.code == "index_missing"
-
-
 def test_empty_replacement_is_rejected():
-    scope = parse_index_reply('{"index": 2}', SEG2)
+    scope = resolve_scope("第2句", SEG2)
     with pytest.raises(PatchError) as ei:
         parse_patch_reply('{"index": 2, "replacement": "   "}', SEG2, scope)
     assert ei.value.code == "empty_patch"
 
 
 def test_replacement_missing_field_is_rejected():
-    scope = parse_index_reply('{"index": 2}', SEG2)
+    scope = resolve_scope("第2句", SEG2)
     with pytest.raises(PatchError) as ei:
         parse_patch_reply('{"index": 2}', SEG2, scope)
     assert ei.value.code == "replacement_missing"
@@ -119,39 +101,38 @@ def test_replacement_missing_field_is_rejected():
 
 def test_replacement_that_is_whole_segment_is_rejected():
     before = "第一句。第二句。第三句。第四句。第五句。第六句。"
-    scope = parse_index_reply('{"index": 2}', before)
+    scope = resolve_scope("第2句", before)
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply(
-            '{"index": 2, "replacement": "%s"}' % before, before, scope
-        )
+        parse_patch_reply(before, before, scope)
     assert ei.value.code == "replacement_whole_segment"
 
 
 def test_single_sentence_span_rejects_multi_sentence_replacement():
     before = "甲乙丙丁。戊己庚辛。壬癸。"
-    scope = parse_index_reply('{"index": 1}', before)
+    scope = resolve_scope("第1句", before)
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply(
-            '{"index": 1, "replacement": "一二。三四。五六。"}', before, scope
-        )
+        parse_patch_reply("一二。三四。五六。", before, scope)
     assert ei.value.code == "replacement_too_long"
 
 
 def test_dirty_reply_with_fence_and_prose_is_repaired():
     reply = (
         "好的，这是补丁：\n```json\n"
-        '{"index": 2, "replacement": "改过的第二句。"}\n'
+        '{"replacement": "改过的第二句。"}\n'
         "```\n（只改了第二句）"
     )
-    new_text, meta = _tier_b(reply, SEG2)
+    scope = resolve_scope("第2句", SEG2)
+    new_text, meta = parse_patch_reply(reply, SEG2, scope)
     assert new_text == "第一句。改过的第二句。第三句。"
     assert meta["patch_count"] == 1
-    assert meta["stages"] == 2 and meta["scope_source"] == "model"
+    # 位置完全由程序决定（Tier A），模型只提供替换文本。
+    assert meta["stages"] == 1 and meta["scope_source"] == "program"
 
 
-def test_plain_text_reply_is_unparsable():
+def test_broken_json_reply_is_unparsable():
+    scope = resolve_scope("第2句", SEG2)
     with pytest.raises(PatchError) as ei:
-        parse_index_reply("改过的第二句。", SEG2)
+        parse_patch_reply('{"replacement": "改过的第二句。"', SEG2, scope)
     assert ei.value.code == "unparsable"
 
 
@@ -215,11 +196,141 @@ def test_decimal_is_not_mistaken_for_numbering():
     assert new_text == "第一句。3.5 倍的差距。第三句。"
 
 
-def test_index_prompt_has_no_replacement_slot():
-    prompt = build_index_user_prompt(SEG2, "这一句不太顺")
-    assert ">> 2." not in prompt, "未选位置前不应标记目标句"
-    assert '{"from_index": 起始句编号, "to_index": 结束句编号}' in prompt
+# ---------------------------------------------------------------------------
+# 改写提示词去编号：只给目标句分隔块，不给整段编号与 >> 标记（E 组）
+# ---------------------------------------------------------------------------
+
+
+def test_patch_prompt_contains_no_numbering_scaffolding():
+    before = "第一句。\n第二句。\n第三句。"
+    scope = resolve_scope("最后两句", before)
+    prompt = build_patch_user_prompt(before, "把这两句改顺", scope)
+    _assert_no_numbering_scaffold(prompt)
+    assert "第一句。" not in prompt, "非目标句不得出现在改写提示词里"
+
+
+def test_patch_prompt_contains_only_target_sentences():
+    before = "第一句。\n第二句。\n第三句。\n第四句。"
+    scope = resolve_scope("第2句到第3句", before)
+    prompt = build_patch_user_prompt(before, "改顺", scope)
+    assert "第二句。\n第三句。" in prompt
+    assert "第一句。" not in prompt and "第四句。" not in prompt
+
+
+def test_multi_sentence_replacement_keeps_sentence_count():
+    before = "第一句。第二句。第三句。第四句。"
+    scope = resolve_scope("第2句到第3句", before)
+    for reply in ("只改了一句。", "一。二。三。"):
+        with pytest.raises(PatchError) as ei:
+            parse_patch_reply(reply, before, scope)
+        assert ei.value.code == "replacement_sentence_mismatch", reply
+
+
+def test_multi_sentence_replacement_restores_exactly():
+    before = "开头。第二句。第三句。结尾。"
+    scope = resolve_scope("第2句到第3句", before)
+    replacement = "改过的二。改过的三。"
+    new_text, meta = parse_patch_reply(replacement, before, scope)
+    assert new_text == "开头。" + replacement + "结尾。"
+    assert new_text.startswith("开头。") and new_text.endswith("结尾。")
+    assert meta["numbering_stripped"] is False
+
+
+def test_numbering_stripped_flag_reports_fallback_trigger():
+    before = "第一句。第二句。第三句。"
+    scope = resolve_scope("最后两句", before)
+    new_text, meta = parse_patch_reply(
+        "2. 改过的二。\n3. 改过的三。", before, scope
+    )
+    assert new_text == "第一句。改过的二。\n改过的三。"
+    assert meta["numbering_stripped"] is True
+
+
+def test_echoed_target_delimiters_are_stripped():
+    before = "第一句。第二句。第三句。"
+    scope = resolve_scope("第2句", before)
+    reply = "【待改写片段开始】\n改过的第二句。\n【待改写片段结束】"
+    new_text, meta = parse_patch_reply(reply, before, scope)
+    assert new_text == "第一句。改过的第二句。第三句。"
+    assert meta["numbering_stripped"] is False
+
+
+# ---------------------------------------------------------------------------
+# 含糊指令的候选澄清（F 组）：只收编号、程序截预览、越界/倒序/重叠丢弃
+# ---------------------------------------------------------------------------
+
+
+def test_candidates_prompt_has_no_replacement_slot():
+    prompt = build_candidates_user_prompt(SEG2, "这一句不太顺")
+    assert "1. 第一句。" in prompt and "3. 第三句。" in prompt
+    assert '{"candidates": [{"from_index": 起始句编号' in prompt
     assert "不要输出 replacement" in prompt
+    assert '>> ' not in prompt, "未选位置前不应标记目标句"
+
+
+def test_clarify_span_limit_is_min_of_three_and_ten_percent():
+    # 85 句：10% = 8，取更小的 3；20 句：2；不足 10 句时退化为 1。
+    assert clarify_span_limit(85) == 3
+    assert clarify_span_limit(20) == 2
+    assert clarify_span_limit(9) == 1
+    assert clarify_span_limit(0) == 1
+
+
+def test_candidates_discard_out_of_range_reversed_whole_and_overlap():
+    before = "句。" * 20  # limit = min(3, 2) = 2
+    reply = (
+        '{"candidates": ['
+        '{"from_index": 1, "to_index": 99, "reason": "越界"},'
+        '{"from_index": 8, "to_index": 7, "reason": "倒序"},'
+        '{"from_index": 1, "to_index": 20, "reason": "覆盖全文"},'
+        '{"from_index": 5, "to_index": 7, "reason": "超过局部上界"},'
+        '{"from_index": 3, "to_index": 4, "reason": "有效"},'
+        '{"from_index": 4, "to_index": 5, "reason": "与前者重叠"},'
+        '{"from_index": 10, "to_index": 11, "reason": "有效二"}'
+        "]}"
+    )
+    candidates = parse_candidates_reply(reply, before)
+    assert [(c["from_index"], c["to_index"]) for c in candidates] == [(3, 4), (10, 11)]
+    assert [c["id"] for c in candidates] == ["c1", "c2"]
+
+
+def test_candidates_all_discarded_fails_closed():
+    before = "句。" * 20
+    reply = (
+        '{"candidates": ['
+        '{"from_index": 1, "to_index": 99},'
+        '{"from_index": 9, "to_index": 3},'
+        '{"from_index": 1, "to_index": 20}'
+        "]}"
+    )
+    with pytest.raises(PatchError) as ei:
+        parse_candidates_reply(reply, before)
+    assert ei.value.code == "no_valid_candidate"
+
+
+def test_candidate_preview_is_cut_from_source_not_from_model():
+    before = "".join(f"第{i}句。" for i in range(1, 31))  # 30 句 → 上界 3
+    reply = (
+        '{"candidates": [{"from_index": 2, "to_index": 3, '
+        '"preview": "模型瞎编的片段", "reason": "  这里  太平  "}]}'
+    )
+    candidates = parse_candidates_reply(reply, before)
+    assert candidates[0]["preview"] == "第2句。第3句。"
+    assert candidates[0]["reason"] == "这里 太平"
+
+
+def test_scope_from_selection_rejects_range_not_in_candidates():
+    before = "第一句。第二句。第三句。"
+    candidates = parse_candidates_reply(
+        '{"candidates": [{"from_index": 2, "to_index": 2, "reason": "x"}]}',
+        before,
+    )
+    scope = scope_from_selection(candidates, 2, 2, 3)
+    assert (scope["from_index"], scope["to_index"]) == (2, 2)
+    assert scope["source"] == "user"
+    with pytest.raises(PatchError) as ei:
+        scope_from_selection(candidates, 1, 2, 3)
+    assert ei.value.code == "selection_not_in_candidates"
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +547,7 @@ def _seed(db, project, no: int, text: str) -> Generation:
     return gen
 
 
-def _run(db, project, provider, instruction: str):
+def _run(db, project, provider, instruction: str, selected_scope=None):
     gen = db.scalars(
         select(Generation).where(
             Generation.project_id == project.id, Generation.segment_no == 2
@@ -446,6 +557,7 @@ def _run(db, project, provider, instruction: str):
     events = list(regenerate_segment_stream(
         db, project, 2, provider=provider, instruction=instruction,
         snapshot_id=snap.id, expected_before=snap.before_text,
+        selected_scope=selected_scope,
     ))
     done = next(e for e in events if e.get("type") == "done")
     return snap, done
@@ -460,8 +572,9 @@ def test_local_instruction_patches_one_sentence(db):
     snap, done = _run(db, project, provider, "只改最后一句，其余内容保留不要动。")
 
     assert provider.chat_calls == 1 and provider.stream_calls == 0, "局部指令必须走补丁路径"
-    # Tier A：程序把「最后一句」解析成第 3 句，并在编号原文里标出来
-    assert ">> 3." in provider.last_user
+    # Tier A：程序把「最后一句」解析成第 3 句；提示词只给目标句原文，无编号。
+    assert "第三句。" in provider.last_user
+    _assert_no_numbering_scaffold(provider.last_user)
     db.expire_all()
     gen = db.scalars(
         select(Generation).where(
@@ -486,7 +599,8 @@ def test_quantity_scope_patches_last_two_sentences(db):
     _, done = _run(db, project, provider, "把最后两句改顺，其余内容保留不要动。")
 
     assert provider.chat_calls == 1 and provider.stream_calls == 0, "数量词必须走补丁路径"
-    assert ">> 5." in provider.last_user and ">> 6." in provider.last_user
+    assert "第五句。" in provider.last_user and "第六句。" in provider.last_user
+    _assert_no_numbering_scaffold(provider.last_user)
     db.expire_all()
     gen = db.scalars(
         select(Generation).where(
@@ -524,27 +638,56 @@ def test_model_index_mismatch_fails_closed(db):
     assert gen.text == SEG2, "编号不一致不得改写正文"
 
 
-def test_ambiguous_instruction_uses_two_stage_patch(db):
+def test_ambiguous_instruction_without_selection_fails_closed(db):
+    """含糊指令不再让模型定位：没有 selected_scope 就直接失败关闭。"""
     project = _project(db)
     _seed(db, project, 1, SEG1)
     _seed(db, project, 2, SEG2)
-    provider = StubProvider([
-        '{"from_index": 2, "to_index": 2}',
-        "改过的第二句。",
-    ])
+    provider = StubProvider('{"candidates": [{"from_index": 2, "to_index": 2}]}')
 
-    _, done = _run(db, project, provider, "只改某处，其余内容保留不要动。")
+    with pytest.raises(PatchError) as ei:
+        _run(db, project, provider, "只改某处，其余内容保留不要动。")
+    assert ei.value.code == "clarification_required"
+    assert provider.chat_calls == 0, "未经澄清不得调用任何模型写正文"
 
-    assert provider.chat_calls == 2 and provider.stream_calls == 0
-    # 第一步：只给编号清单，不标目标句、没有 replacement 位。
-    assert ">> 2." not in provider.prompts[0]
-    assert "不要输出 replacement" in provider.prompts[0]
-    # 第二步：Tier A 那套提示词，目标句由程序标出来。
-    assert ">> 2." in provider.prompts[1]
-    assert done["patch"]["scope_source"] == "model"
-    assert done["patch"]["stages"] == 2
-    applied = done["patch"]["applied"][0]
-    assert (applied["from_index"], applied["to_index"]) == (2, 2)
+    db.expire_all()
+    snap = db.scalars(
+        select(GenerationSnapshot).order_by(GenerationSnapshot.id.desc())
+    ).first()
+    assert snap.status == "failed"
+    gen = db.scalars(
+        select(Generation).where(
+            Generation.project_id == project.id, Generation.segment_no == 2
+        )
+    ).one()
+    assert gen.text == SEG2, "含糊指令未澄清时正文一行不得改动"
+
+
+def test_selected_scope_uses_tier_a_prompt_and_ignores_old_replacement(db):
+    """选定区间后走 Tier A：同提示词、同校验，不复用澄清阶段的模型文本。"""
+    project = _project(db)
+    _seed(db, project, 1, SEG1)
+    _seed(db, project, 2, SEG2)
+    # 模型只回改写文本；澄清阶段那条「候选 + 旧替换文本」永远不会被使用。
+    provider = StubProvider("改过的第二句。")
+    candidates = parse_candidates_reply(
+        '{"candidates": [{"from_index": 2, "to_index": 2, "reason": "这里平"}]}',
+        SEG2,
+    )
+    scope = scope_from_selection(candidates, 2, 2, len(split_sentences(SEG2)))
+
+    _, done = _run(
+        db, project, provider, "只改某处，其余内容保留不要动。",
+        selected_scope=scope,
+    )
+
+    assert provider.chat_calls == 1 and provider.stream_calls == 0
+    # 改写提示词只含目标句原文，不含编号、也不含候选清单。
+    assert "第二句。" in provider.last_user
+    _assert_no_numbering_scaffold(provider.last_user)
+    assert "candidates" not in provider.last_user
+    assert done["patch"]["scope_source"] == "user"
+    assert done["patch"]["stages"] == 1
     db.expire_all()
     gen = db.scalars(
         select(Generation).where(
@@ -552,54 +695,50 @@ def test_ambiguous_instruction_uses_two_stage_patch(db):
         )
     ).one()
     assert gen.text == "第一句。改过的第二句。第三句。"
-    assert "不太顺" not in gen.text, "指令话术不得进正文"
 
 
-def test_tier_b_second_stage_failure_fails_closed(db):
+def test_selected_scope_still_applies_all_tier_a_validation(db):
+    """选定区间不等于免校验：替换文本为空照样失败关闭。"""
     project = _project(db)
     _seed(db, project, 1, SEG1)
     _seed(db, project, 2, SEG2)
-    provider = StubProvider([
-        '{"from_index": 2, "to_index": 2}',
-        "   ",
-    ])
+    provider = StubProvider("   ")
+    candidates = parse_candidates_reply(
+        '{"candidates": [{"from_index": 2, "to_index": 2}]}', SEG2
+    )
+    scope = scope_from_selection(candidates, 2, 2, len(split_sentences(SEG2)))
 
     with pytest.raises(PatchError) as ei:
-        _run(db, project, provider, "只改某处，其余内容保留不要动。")
+        _run(db, project, provider, "只改某处，其余内容保留不要动。",
+             selected_scope=scope)
     assert ei.value.code == "empty_patch"
-    assert provider.chat_calls == 2
 
     db.expire_all()
-    snap = db.scalars(
-        select(GenerationSnapshot).order_by(GenerationSnapshot.id.desc())
-    ).first()
-    assert snap.status == "failed"
-    assert snap.error_reason == "empty_patch"
     gen = db.scalars(
         select(Generation).where(
             Generation.project_id == project.id, Generation.segment_no == 2
         )
     ).one()
-    assert gen.text == SEG2, "第二步失败不得改动正文"
+    assert gen.text == SEG2, "校验失败不得改动正文"
 
 
 def test_local_patch_failure_marks_snapshot_failed_and_keeps_text(db):
     project = _project(db)
     _seed(db, project, 1, SEG1)
     _seed(db, project, 2, SEG2)
-    provider = StubProvider('{"index": 99, "replacement": "新句子。"}')
+    # 目标句是第 3 句，模型却回了第 2 句的编号 → 失败关闭。
+    provider = StubProvider('{"index": 2, "replacement": "改过的第二句。"}')
 
     with pytest.raises(PatchError) as ei:
-        _run(db, project, provider, "只改某处，其余内容保留不要动。")
-    assert ei.value.code == "index_out_of_range"
-    assert provider.chat_calls == 1, "第一步编号失败后不得再发第二步"
+        _run(db, project, provider, "只改最后一句，其余内容保留不要动。")
+    assert ei.value.code == "index_mismatch"
 
     db.expire_all()
     snap = db.scalars(
         select(GenerationSnapshot).order_by(GenerationSnapshot.id.desc())
     ).first()
     assert snap.status == "failed"
-    assert snap.error_reason == "index_out_of_range"
+    assert snap.error_reason == "index_mismatch"
     gen = db.scalars(
         select(Generation).where(
             Generation.project_id == project.id, Generation.segment_no == 2
@@ -626,3 +765,160 @@ def test_whole_segment_instruction_keeps_legacy_path(db):
     ).one()
     assert gen.text == rewritten
     assert done["patch"] is None
+
+
+# ---------------------------------------------------------------------------
+# 路由级（G 组）：澄清 202 / 不写正文 / 幂等 / 两轮上限 / 选定后走 Tier A
+# ---------------------------------------------------------------------------
+
+
+def _md5(text: str) -> str:
+    return hashlib.md5((text or "").encode("utf-8")).hexdigest()
+
+
+def _post(client, project_id: int, instruction: str, **extra):
+    payload = {
+        "project_id": project_id,
+        "action": "regenerate_segment",
+        "segment_no": 2,
+        "instruction": instruction,
+    }
+    payload.update(extra)
+    return client.post("/api/assistant/invoke-generation", json=payload)
+
+
+def _clarify_rows(db, project, segment_no: int = 2):
+    return db.scalars(
+        select(GenerationSnapshot)
+        .where(
+            GenerationSnapshot.project_id == project.id,
+            GenerationSnapshot.segment_no == segment_no,
+        )
+        .order_by(GenerationSnapshot.id)
+    ).all()
+
+
+def test_clarification_returns_candidates_and_writes_nothing(db, monkeypatch):
+    """含糊指令：202 + 候选清单；正文 md5 不变、不建 pending、重试幂等。"""
+    project = _project(db)
+    _seed(db, project, 1, SEG1)
+    gen = _seed(db, project, 2, SEG2)
+    before_md5 = _md5(gen.text)
+    provider = StubProvider(
+        '{"candidates": ['
+        '{"from_index": 1, "to_index": 1, "reason": "开头太虚", '
+        '"preview": "模型瞎编"},'
+        '{"from_index": 2, "to_index": 2, "reason": "这里平"}'
+        "]}"
+    )
+    monkeypatch.setattr("app.llm.provider.get_llm_provider", lambda: provider)
+    monkeypatch.setattr(ag, "_run_ai_flavor_feedback", lambda *a, **k: None)
+
+    instruction = "只改某处，其余内容保留不要动。"
+    with TestClient(fastapi_app) as client:
+        first = _post(client, project.id, instruction)
+        assert first.status_code == 202, first.text
+        second = _post(client, project.id, instruction)
+        assert second.status_code == 202, second.text
+        body1, body2 = first.json(), second.json()
+
+    assert body1["status"] == "needs_clarification"
+    assert body1["code"] == "needs_clarification"
+    assert body1["clarification_id"] == body2["clarification_id"]
+    assert body1["candidates"] == body2["candidates"]
+    assert provider.chat_calls == 1, "重复提交必须幂等，不得生成第二批候选"
+    # preview 由程序按编号从原文截取，不采信模型复述。
+    assert body1["candidates"][0]["preview"] == "第一句。"
+    assert body1["candidates"][1]["reason"] == "这里平"
+
+    db.expire_all()
+    rows = _clarify_rows(db, project)
+    assert len(rows) == 1
+    assert rows[0].status == "needs_clarification"
+    assert rows[0].clarification["round"] == 1
+    assert all(r.status != "pending" for r in rows), "澄清阶段不得建 pending 快照"
+    gen = db.get(Generation, gen.id)
+    assert gen.text == SEG2
+    assert _md5(gen.text) == before_md5, "澄清阶段正文 md5 必须不变"
+
+
+def test_clarification_round_limit_fails_closed(db, monkeypatch):
+    project = _project(db)
+    _seed(db, project, 1, SEG1)
+    gen = _seed(db, project, 2, SEG2)
+    before_md5 = _md5(gen.text)
+    provider = StubProvider([
+        '{"candidates": [{"from_index": 2, "to_index": 2, "reason": "一"}]}',
+        '{"candidates": [{"from_index": 3, "to_index": 3, "reason": "二"}]}',
+    ])
+    monkeypatch.setattr("app.llm.provider.get_llm_provider", lambda: provider)
+    monkeypatch.setattr(ag, "_run_ai_flavor_feedback", lambda *a, **k: None)
+
+    instruction = "只改某处，其余内容保留不要动。"
+    with TestClient(fastapi_app) as client:
+        r1 = _post(client, project.id, instruction)
+        assert r1.status_code == 202, r1.text
+        r2 = _post(
+            client, project.id, instruction,
+            clarification_id=r1.json()["clarification_id"],
+            clarify_reply="不是这里，是后面",
+        )
+        assert r2.status_code == 202, r2.text
+        assert r2.json()["round"] == 2
+        r3 = _post(
+            client, project.id, instruction,
+            clarification_id=r2.json()["clarification_id"],
+            clarify_reply="还是不对",
+        )
+        assert r3.status_code == 422, r3.text
+        assert r3.json()["detail"]["code"] == "clarify_round_limit"
+
+    db.expire_all()
+    gen = db.get(Generation, gen.id)
+    assert gen.text == SEG2 and _md5(gen.text) == before_md5
+    assert all(r.status != "pending" for r in _clarify_rows(db, project))
+
+
+def test_selection_runs_tier_a_and_does_not_reuse_candidate_text(db, monkeypatch):
+    """选定候选后走 Tier A：不复用澄清阶段模型给的任何替换文本。"""
+    project = _project(db)
+    _seed(db, project, 1, SEG1)
+    gen = _seed(db, project, 2, SEG2)
+    provider = StubProvider([
+        '{"candidates": [{"from_index": 2, "to_index": 2, "reason": "平", '
+        '"replacement": "不该复用的旧文本。"}]}',
+        "改过的第二句。",
+    ])
+    monkeypatch.setattr("app.llm.provider.get_llm_provider", lambda: provider)
+    monkeypatch.setattr(ag, "_run_ai_flavor_feedback", lambda *a, **k: None)
+
+    instruction = "只改某处，其余内容保留不要动。"
+    with TestClient(fastapi_app) as client:
+        r1 = _post(client, project.id, instruction)
+        assert r1.status_code == 202, r1.text
+        clarification_id = r1.json()["clarification_id"]
+        candidate = r1.json()["candidates"][0]
+        r2 = _post(
+            client, project.id, instruction,
+            clarification_id=clarification_id,
+            selected={
+                "from_index": candidate["from_index"],
+                "to_index": candidate["to_index"],
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        body = r2.json()
+
+    assert body["patch"]["scope_source"] == "user"
+    assert body["clarification_id"] == clarification_id
+    text = body["segment"]["text"]
+    assert text == "第一句。改过的第二句。第三句。"
+    assert "不该复用的旧文本" not in text, "不得复用澄清阶段模型给的替换文本"
+    # 改写提示词仍是不含编号的 Tier A 口径。
+    _assert_no_numbering_scaffold(provider.last_user)
+
+    db.expire_all()
+    assert db.get(Generation, gen.id).text == text
+    clar = db.get(GenerationSnapshot, clarification_id)
+    assert clar.status == "clarified"
+

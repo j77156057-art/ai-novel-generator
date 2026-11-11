@@ -1151,10 +1151,51 @@ export interface AssistantInvokeGenerationRequest {
   /** 缺省用 project.generation_length（与 /api/generate 同口径）。 */
   max_chars?: number | null;
   instruction: string;
+  /** 含糊指令澄清：上一次 202 返回的 clarification_id。 */
+  clarification_id?: number | null;
+  /** 从候选清单里选定的区间（原样回传，服务端再校验一次）。 */
+  selected?: { from_index: number; to_index: number } | null;
+  /** 「都不对」的补充说明（最多两轮，超过 → 422 clarify_round_limit）。 */
+  clarify_reply?: string | null;
 }
+
+/** 含糊指令澄清候选（preview 由服务端按编号从原文截取）。 */
+export interface AssistantClarifyCandidate {
+  id: string;
+  from_index: number;
+  to_index: number;
+  preview: string;
+  reason: string;
+}
+
+/**
+ * 澄清响应（HTTP 202）：`status='needs_clarification'`，与 200 成功一眼区分。
+ * 澄清阶段**不写正文**，只是把可选区间摆出来。
+ */
+export interface AssistantClarifyResponse {
+  status: "needs_clarification";
+  code: "needs_clarification";
+  clarification_id: number;
+  segment_no: number;
+  instruction: string;
+  round: number;
+  max_rounds: number;
+  candidates: AssistantClarifyCandidate[];
+  /** 每个候选最多几句（局部上界）。 */
+  limit: number;
+  rounds_left: number;
+  before_hash: string;
+  message: string;
+}
+
+export type AssistantInvokeGenerationResult =
+  | AssistantInvokeGenerationResponse
+  | AssistantClarifyResponse;
 
 /** POST /api/assistant/invoke-generation 响应。 */
 export interface AssistantInvokeGenerationResponse {
+  /** 后端成功响应不返回 status；此字段只用于前端与 202 澄清响应判别。 */
+  status?: undefined;
   answer: string;
   agent_run_id: number;
   action: AssistantGenerationAction;
@@ -1163,6 +1204,21 @@ export interface AssistantInvokeGenerationResponse {
   /** 与 GET /api/generations/{pid} 同形状，可复用渲染。 */
   segment: GenerationOut;
   chars: number;
+  /** 本次改写来自哪次澄清（null = 非澄清路径）。 */
+  clarification_id?: number | null;
+  /** 局部补丁留痕（scope_source='user' 即用户从候选选定）。 */
+  patch?: {
+    patch_count: number;
+    scope_source: string;
+    applied: Array<{
+      from_index: number;
+      to_index: number;
+      before: string;
+      replacement: string;
+    }>;
+  } | null;
+  scope_mismatch?: Record<string, unknown> | null;
+  length_drop?: Record<string, unknown> | null;
   /** generate_next 另带；regenerate 只带 summary / summary_tree。 */
   summary?: string;
   kg_update?: Record<string, unknown>;

@@ -4,6 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import { api } from "@/api/client";
 import type {
   AlertsResponse,
+  AssistantClarifyCandidate,
   DistillJob,
   GeneratePlan,
   Graph,
@@ -1130,6 +1131,150 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
     showActionError("段落重新生成失败", err);
   } finally {
     if (regenState.value[g.id]) regenState.value[g.id].loading = false;
+  }
+}
+
+// ===========================================================================
+// 局部改写：含糊指令先澄清候选（2026-11-12）
+// ---------------------------------------------------------------------------
+// 「某处写得太平了」这类指令**不指明位置**。后端不会再让模型自己挑区间：
+// 第一轮只回 2–4 个候选（202），由用户点选或「都不对」补充说明；选定后
+// 才按该区间走 Tier A 改写。澄清阶段不写正文——这里展示的片段是后端按
+// 编号从原文截的，不是模型复述。
+// ===========================================================================
+type LocalRewriteState = {
+  open: boolean;
+  instruction: string;
+  busy: boolean;
+  error: string | null;
+  notice: string | null;
+  clarificationId: number | null;
+  round: number;
+  maxRounds: number;
+  candidates: AssistantClarifyCandidate[];
+  note: string;
+  showNote: boolean;
+};
+
+const localRewrites = ref<Record<number, LocalRewriteState>>({});
+
+function localState(g: { id: number }): LocalRewriteState {
+  if (!localRewrites.value[g.id]) {
+    localRewrites.value[g.id] = {
+      open: false,
+      instruction: "",
+      busy: false,
+      error: null,
+      notice: null,
+      clarificationId: null,
+      round: 0,
+      maxRounds: 2,
+      candidates: [],
+      note: "",
+      showNote: false,
+    };
+  }
+  return localRewrites.value[g.id];
+}
+
+function toggleLocalRewrite(g: { id: number }) {
+  const s = localState(g);
+  s.open = !s.open;
+}
+
+type SegmentRef = { id: number; segment_no: number };
+
+/** 发一次 invoke-generation；202 时把候选摆出来，200 时刷新正文。 */
+async function callLocalRewrite(
+  g: SegmentRef,
+  s: LocalRewriteState,
+  extra: {
+    clarification_id?: number | null;
+    selected?: { from_index: number; to_index: number } | null;
+    clarify_reply?: string | null;
+  },
+): Promise<void> {
+  const res = await api.assistantInvokeGeneration({
+    project_id: projectId,
+    action: "regenerate_segment",
+    segment_no: g.segment_no,
+    instruction: s.instruction.trim(),
+    ...extra,
+  });
+  if (res.status === "needs_clarification") {
+    s.clarificationId = res.clarification_id;
+    s.round = res.round;
+    s.maxRounds = res.max_rounds;
+    s.candidates = res.candidates;
+    s.showNote = false;
+    s.notice = `${res.message}（第 ${res.round}/${res.max_rounds} 轮，每个候选最多 ${res.limit} 句）`;
+    return;
+  }
+  s.notice = `已改写：${res.chars} 字`;
+  s.candidates = [];
+  s.clarificationId = null;
+  s.showNote = false;
+  s.note = "";
+  await loadGenerations();
+}
+
+async function submitLocalRewrite(g: SegmentRef): Promise<void> {
+  const s = localState(g);
+  if (!s.instruction.trim()) {
+    s.error = "请先写一句改写要求。";
+    return;
+  }
+  s.busy = true;
+  s.error = null;
+  s.notice = null;
+  try {
+    await callLocalRewrite(g, s, {});
+  } catch (err) {
+    s.error = errorText(err);
+  } finally {
+    s.busy = false;
+  }
+}
+
+async function chooseLocalCandidate(
+  g: SegmentRef,
+  c: AssistantClarifyCandidate,
+): Promise<void> {
+  const s = localState(g);
+  if (s.clarificationId == null) return;
+  s.busy = true;
+  s.error = null;
+  try {
+    await callLocalRewrite(g, s, {
+      clarification_id: s.clarificationId,
+      selected: { from_index: c.from_index, to_index: c.to_index },
+    });
+  } catch (err) {
+    s.error = errorText(err);
+  } finally {
+    s.busy = false;
+  }
+}
+
+async function submitLocalNote(g: SegmentRef): Promise<void> {
+  const s = localState(g);
+  if (s.clarificationId == null) return;
+  if (!s.note.trim()) {
+    s.error = "请先补一句说明（例如「后面那句，写小杨推门的」）。";
+    return;
+  }
+  s.busy = true;
+  s.error = null;
+  try {
+    await callLocalRewrite(g, s, {
+      clarification_id: s.clarificationId,
+      clarify_reply: s.note.trim(),
+    });
+    s.note = "";
+  } catch (err) {
+    s.error = errorText(err);
+  } finally {
+    s.busy = false;
   }
 }
 
@@ -2930,6 +3075,13 @@ onUnmounted(stopDistillPolling);
             >
               {{ regenState[g.id]?.loading ? "重生成中…" : "重新生成" }}
             </button>
+            <button
+              class="btn sm"
+              :disabled="localRewrites[g.id]?.busy"
+              @click="toggleLocalRewrite(g)"
+            >
+              {{ localRewrites[g.id]?.open ? "收起局部改写" : "局部改写" }}
+            </button>
             <button class="btn sm" @click="toggleSeg(g.id)">
               {{ expandedSegs[g.id] ? "收起" : "展开" }}
             </button>
@@ -2944,6 +3096,93 @@ onUnmounted(stopDistillPolling);
             class="prose seg-text"
             :class="{ expanded: expandedSegs[g.id] }"
           >{{ g.text }}</div>
+
+          <!-- 局部改写：含糊指令 → 202 候选 → 用户点选 / 都不对 -->
+          <div
+            v-if="localRewrites[g.id]?.open"
+            class="local-rewrite"
+          >
+            <div class="row tight" style="width: 100%; gap: 6px">
+              <input
+                class="input sm"
+                style="flex: 1"
+                v-model="localRewrites[g.id].instruction"
+                placeholder="例如：某处写得太平了，收拾一下"
+                :disabled="localRewrites[g.id].busy"
+                @keydown.enter.prevent="submitLocalRewrite(g)"
+              />
+              <button
+                class="btn sm primary"
+                :disabled="localRewrites[g.id].busy"
+                @click="submitLocalRewrite(g)"
+              >
+                {{ localRewrites[g.id].busy ? "处理中…" : "发起改写" }}
+              </button>
+            </div>
+
+            <div
+              v-if="localRewrites[g.id].notice"
+              class="local-rewrite-notice"
+            >{{ localRewrites[g.id].notice }}</div>
+            <div
+              v-if="localRewrites[g.id].error"
+              class="notice err"
+              style="margin-top: 6px"
+            >{{ localRewrites[g.id].error }}</div>
+
+            <div
+              v-if="localRewrites[g.id].candidates.length"
+              class="local-candidates"
+            >
+              <button
+                v-for="c in localRewrites[g.id].candidates"
+                :key="c.id"
+                class="local-candidate"
+                :disabled="localRewrites[g.id].busy"
+                @click="chooseLocalCandidate(g, c)"
+              >
+                <span class="local-candidate-range">
+                  第 {{ c.from_index }}<template v-if="c.to_index !== c.from_index">–{{ c.to_index }}</template> 句
+                </span>
+                <span class="local-candidate-reason">{{ c.reason || "（模型未给理由）" }}</span>
+                <span class="local-candidate-preview">{{ c.preview }}</span>
+              </button>
+
+              <div class="row tight" style="gap: 6px; margin-top: 6px">
+                <button
+                  class="btn sm"
+                  :disabled="localRewrites[g.id].busy"
+                  @click="localRewrites[g.id].showNote = !localRewrites[g.id].showNote"
+                >
+                  都不对
+                </button>
+                <span class="faint" style="font-size: var(--fs-xs)">
+                  澄清共 {{ localRewrites[g.id].maxRounds }} 轮，当前第 {{ localRewrites[g.id].round }} 轮
+                </span>
+              </div>
+              <div
+                v-if="localRewrites[g.id].showNote"
+                class="row tight"
+                style="gap: 6px; margin-top: 6px; width: 100%"
+              >
+                <input
+                  class="input sm"
+                  style="flex: 1"
+                  v-model="localRewrites[g.id].note"
+                  placeholder="补一句说明：到底想改哪里？"
+                  :disabled="localRewrites[g.id].busy"
+                  @keydown.enter.prevent="submitLocalNote(g)"
+                />
+                <button
+                  class="btn sm"
+                  :disabled="localRewrites[g.id].busy"
+                  @click="submitLocalNote(g)"
+                >
+                  再问一次
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -3474,6 +3713,53 @@ onUnmounted(stopDistillPolling);
   padding: 16px 18px;
   line-height: 2;
   font-size: var(--fs-md);
+}
+.local-rewrite {
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.local-rewrite-notice {
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
+.local-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.local-candidate {
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  cursor: pointer;
+}
+.local-candidate:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.local-candidate-range {
+  font-weight: 600;
+  font-size: var(--fs-xs);
+}
+.local-candidate-reason {
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
+.local-candidate-preview {
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--fg);
 }
 .btn.sm,
 .input.sm {
