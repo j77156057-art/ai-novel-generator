@@ -129,6 +129,25 @@ def _restore_one(
             segment_no=snap.segment_no,
         )
 
+    # 复读闸门 · P4：回滚恢复的是**本来就存在**的文本，不是新产出——
+    # 只记日志（便于事后查「这段回滚回去也是退化的」），**不判定、不写标记、
+    # 不跳过任何东西**，也不让回滚失败。`quality_json` 保持原值不动。
+    try:
+        from app.generation.repetition import analyze_repetition
+
+        report = analyze_repetition(snap.before_text or "")
+        if report.is_degenerate or not report.metrics.ends_complete:
+            log.warning(
+                "回滚恢复的正文疑似退化（只记日志，不判定）：project=%s "
+                "segment=%s verdict=%s top_sentence_repeat=%s dup20=%s "
+                "truncated=%s",
+                snap.project_id, snap.segment_no, report.verdict,
+                report.metrics.top_sentence_repeat, report.metrics.dup20,
+                not report.metrics.ends_complete,
+            )
+    except Exception:  # noqa: BLE001 —— 日志失败绝不能影响回滚
+        log.warning("回滚正文复读检查失败（忽略）", exc_info=True)
+
     new_snap = GenerationSnapshot(
         project_id=snap.project_id,
         generation_id=snap.generation_id,
