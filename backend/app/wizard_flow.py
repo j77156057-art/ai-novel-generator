@@ -62,6 +62,10 @@ STYLE_HINTS = {
 #: 「不投喂」在多选里的哨兵值。0 不是合法的 novel_id（自增从 1 开始）。
 CORPUS_NONE = 0
 
+#: 书级事实「不指定」的哨兵值。0 不是合法的 novel_id。
+#: 语义：不按书过滤 —— 多本语料的物品组/实体/持有事实合并读。
+BOOK_SCOPE_NONE = 0
+
 #: 沿用已有文风档案（不重跑蒸馏）的哨兵值。
 DISTILL_REUSE = "reuse"
 
@@ -106,12 +110,20 @@ def step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
 def _base_step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> list[str]:
     if kind == KIND_ORIGINAL:
         steps = [FIRST_STEP, "corpus"]
-        if _has_corpus(answers, ctx):
+        corpus_ids = _corpus_ids(answers, ctx)
+        if corpus_ids:
             steps.append("distill")
+        if len(corpus_ids) > 1:
+            # 多本参考语料才问：书级事实（物品/实体）按哪本读。
+            # 单本不存在跨书歧义，问它只是多一步。
+            steps.insert(2, "book_scope")
         steps += ["genre", "style", "length", "chapters", "outline", "confirm"]
         return steps
     if kind == KIND_CONTINUATION:
         steps = [FIRST_STEP, "continue_from"]
+        if len(_corpus_ids(answers, ctx)) > 1:
+            # 续写分支的「书级事实」问的是续写书：决定往后写时按哪本读持有。
+            steps.append("book_scope")
         if ctx.get("needs_distill"):
             steps.append("distill")
         steps += ["length", "chapters", "confirm"]
@@ -165,6 +177,30 @@ def _has_corpus(answers: dict[str, Any], ctx: dict[str, Any]) -> bool:
     return bool(ctx.get("project_has_corpus"))
 
 
+def _corpus_ids(answers: dict[str, Any], ctx: dict[str, Any]) -> list[int]:
+    """本轮引导**实际在场**的语料 id（书级事实步骤的选项来源）。
+
+    原创分支看这轮选了什么（提交时会整体覆盖 `reference_novel_ids`）；
+    续写分支看项目已有语料（续写不再选书）。两类都只取合法正整数。
+    """
+    raw: Any
+    if "corpus" in answers:
+        raw = answers.get("corpus") or []
+    elif answers.get("branch") == KIND_CONTINUATION:
+        raw = ctx.get("project_corpus_ids") or []
+    else:
+        raw = []
+    ids: list[int] = []
+    for item in raw:
+        try:
+            nid = int(item)
+        except (TypeError, ValueError):
+            continue
+        if nid > 0 and nid not in ids:
+            ids.append(nid)
+    return ids
+
+
 def next_step(
     kind: str | None,
     current: str,
@@ -205,6 +241,7 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
     builders = {
         "branch": _q_branch,
         "corpus": _q_corpus,
+        "book_scope": _q_book_scope,
         "distill": _q_distill,
         "genre": _q_genre,
         "style": _q_style,
@@ -245,7 +282,8 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
 
 
 #: 允许「跳过 = 用默认值」的步骤。必答项（方向、语料、确认）不在其中。
-SKIPPABLE = {"genre", "style", "length", "chapters", "outline", "scene"}
+#: 书级事实默认「不指定（合并读）」，跳过等于保持合并读，因此可跳。
+SKIPPABLE = {"genre", "style", "length", "chapters", "outline", "scene", "book_scope"}
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +339,26 @@ def _msg_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) 
         + "\n\n"
         "不投喂的好处是快、可控：生成时不用等蒸馏，风格靠题材和平台调性兜。"
         "如果你想「像某本书那样写」，就选那本书；只是想要个能读的故事，可以不投喂。"
+    )
+
+
+def _msg_book_scope(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    ids = _corpus_ids(answers, ctx)
+    titles = {int(n["id"]): _display_title(n) for n in (ctx.get("novels") or [])}
+    names = "、".join(f"《{titles.get(i) or f'#{i}'}》" for i in ids)
+    if kind == KIND_CONTINUATION:
+        return (
+            f"你手上有 {len(ids)} 本可以接着写的语料：{names}。续写书决定我按哪本读"
+            "物品「现在在谁手上」、实体和写法；不指定就是把两本的同名物品合并读，"
+            "相同时会标成「名字有歧义」——写正文时那条持有约束等于没有。\n\n"
+            "如果你要接着其中一本的剧情写，选那本；只是想把两本当参考一起用，可以不指定。"
+        )
+    return (
+        f"这次参考了 {len(ids)} 本语料：{names}。生成时物品「现在在谁手上」按「事实来源书」读，"
+        "两本里出现同名物品时，不指定会同时命中两边、读通道按「名字有歧义」处理（不猜、"
+        "也不给持有约束）。\n\n"
+        "挑一本主参考书，物品持有的约束才落得下去；只想借文风、不关心物品事实，可以不指定。"
+        "这一项之后也可以在项目工作台「参考语料」里改。"
     )
 
 
@@ -470,7 +528,8 @@ def _msg_character(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any
         return (
             "项目里还没有角色卡，所以这一项得你直接打名字。我会用最基础的设定陪你聊，"
             "细节靠常识补，可能不够贴原著。\n\n"
-            "想让角色更准，先去 KG 工作台把人物和关系建起来，再回来这里选。"
+            "想让角色更准，先去「项目工作台 → 剧情圣经 → 角色」加角色，"
+            "再回来这里选。"
         )
     legacy = ctx.get("character_source") == "legacy"
     source = (
@@ -527,6 +586,7 @@ def _msg_custom(step: str, ctx: dict[str, Any]) -> str:
 _MESSAGE_BUILDERS = {
     "branch": _msg_branch,
     "corpus": _msg_corpus,
+    "book_scope": _msg_book_scope,
     "distill": _msg_distill,
     "genre": _msg_genre,
     "style": _msg_style,
@@ -561,6 +621,14 @@ def ack_for(step: str, value: Any, answers: dict[str, Any], ctx: dict[str, Any])
         titles = {int(n["id"]): _display_title(n) for n in (ctx.get("novels") or [])}
         names = [titles.get(int(v)) or f"#{v}" for v in value]
         return "好，参考" + "、".join("《" + n + "》" for n in names) + "。"
+    if step == "book_scope":
+        if not value:
+            return "好，不指定——按所有在场语料合并读，同名物品会标成「无法确定」。"
+        titles = {int(n["id"]): _display_title(n) for n in (ctx.get("novels") or [])}
+        name = titles.get(int(value)) or f"#{value}"
+        if answers.get("branch") == KIND_CONTINUATION:
+            return f"好，续写书定为《{name}》，物品和实体事实按它读。"
+        return f"好，事实来源书定为《{name}》，物品持有按它读。"
     if step == "distill":
         if value == DISTILL_REUSE:
             return "好，沿用现有档案，不用重跑蒸馏，秒级完成。"
@@ -670,6 +738,58 @@ def _q_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) ->
             "empty_hint": None
             if novels
             else "还没上传语料？先去「语料库」上传 txt，再回来选。",
+            "options": options,
+        },
+    }
+
+
+def _q_book_scope(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    ids = _corpus_ids(answers, ctx)
+    titles = {int(n["id"]): _display_title(n) for n in (ctx.get("novels") or [])}
+    # 默认值优先取「已经设好的那本书」（且仍在本次语料里）——否则用户跳过这一步
+    # 会把工作台里手工设过的书清成「不指定」。
+    if "book_scope" in answers:
+        default = answers.get("book_scope")
+    else:
+        existing = (ctx.get("continuation_novel_id")
+                    if kind == KIND_CONTINUATION else ctx.get("active_novel_id"))
+        default = int(existing) if existing in ids else BOOK_SCOPE_NONE
+    options = [
+        {
+            "value": nid,
+            "label": f"《{titles.get(nid) or f'#{nid}'}》",
+            "desc": "物品组 / 持有 / 实体事实只按这本读，不和另一本混",
+        }
+        for nid in ids
+    ]
+    options.append(
+        {
+            "value": BOOK_SCOPE_NONE,
+            "label": "不指定（合并读）",
+            "desc": "两本书合并读：同名物品命中多个组时会标成「名字有歧义」，不猜",
+        }
+    )
+    if kind == KIND_CONTINUATION:
+        return {
+            "title": "接着哪本书往下写？",
+            "why": "你手上有多本参考语料。续写书决定物品「现在在谁手上」、实体和写法按哪本读；"
+            "选错会把另一本的同名物品当成这本书的事实。",
+            "card": {
+                "type": "single",
+                "field": "continuation_novel_id",
+                "default": default,
+                "options": options,
+            },
+        }
+    return {
+        "title": "物品和事实按哪本书读？",
+        "why": "你选了多本参考语料。两本里可能有同名物品/同名角色，不指定就会把它们合并读，"
+        "命中多个组时读通道按「名字有歧义」处理（不猜、也不给持有约束）；"
+        "挑一本作为事实来源书，物品持有的约束才落得下去。",
+        "card": {
+            "type": "single",
+            "field": "active_novel_id",
+            "default": default,
             "options": options,
         },
     }
@@ -851,7 +971,7 @@ def _q_character(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
     if not chars:
         return {
             "title": "想和哪个角色对话？",
-            "why": "项目里还没有角色卡。直接输入角色名，我会用最基础的设定陪你聊；想更准，先去 KG 工作台建图。",
+            "why": "项目里还没有角色卡。直接输入角色名，我会用最基础的设定陪你聊；想更准，先去「项目工作台 → 剧情圣经 → 角色」加角色。",
             "card": {
                 "type": "text",
                 "field": "character",
@@ -988,6 +1108,16 @@ def validate(
             raise AnswerError(f"语料不存在：{unknown}")
         return values
 
+    if step == "book_scope":
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise AnswerError("书级事实只能选一本书，或选「不指定」") from exc
+        ids = _corpus_ids(answers, ctx)
+        if value != BOOK_SCOPE_NONE and value not in ids:
+            raise AnswerError("只能从本次在场的参考语料里挑一本")
+        return value
+
     if step == "distill":
         value = str(raw or "").strip()
         valid = {t["key"] for t in (ctx.get("tiers") or [])}
@@ -1089,6 +1219,12 @@ def echo_label(step: str, value: Any, kind: str | None, ctx: dict[str, Any]) -> 
             return "不投喂语料（自由生成）"
         titles = {int(n["id"]): n.get("title") or f"#{n['id']}" for n in (ctx.get("novels") or [])}
         return "参考语料：" + "、".join(titles.get(int(v), f"#{v}") for v in value)
+    if step == "book_scope":
+        if not value:
+            return "书级事实：不指定（合并读）"
+        titles = {int(n["id"]): n.get("title") or f"#{n['id']}" for n in (ctx.get("novels") or [])}
+        label = "续写书" if kind == KIND_CONTINUATION else "事实来源书"
+        return f"{label}：{titles.get(int(value), f'#{value}')}"
     if step == "distill":
         if value == DISTILL_REUSE:
             return "蒸馏：沿用现有档案"
@@ -1122,6 +1258,8 @@ def summary_rows(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
     add("branch", "方向", kind or KIND_LABELS.get(kind or "", "未选"))
     if kind == KIND_ORIGINAL:
         add("corpus", "参考语料", answers.get("corpus") or [])
+        if len(_corpus_ids(answers, ctx)) > 1:
+            add("book_scope", "事实来源书", answers.get("book_scope", BOOK_SCOPE_NONE))
         if _has_corpus(answers, ctx):
             add("distill", "蒸馏档位", answers.get("distill"))
         add("genre", "题材", answers.get("genre") or "未选")
@@ -1131,6 +1269,8 @@ def summary_rows(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
         add("outline", "先出大纲", answers.get("outline", True))
     elif kind == KIND_CONTINUATION:
         add("continue_from", "续写起点", answers.get("continue_from", 0))
+        if len(_corpus_ids(answers, ctx)) > 1:
+            add("book_scope", "续写书", answers.get("book_scope", BOOK_SCOPE_NONE))
         if ctx.get("needs_distill"):
             add("distill", "蒸馏档位", answers.get("distill"))
         add("length", "单段字数", answers.get("length", ctx.get("generation_length") or 3000))

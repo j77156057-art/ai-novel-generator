@@ -76,10 +76,135 @@ _Q_MARKS = (
     "推荐哪",
 )
 
-_BACK_WORDS = ("上一步", "返回上一步", "退回上一步", "退回去", "回去改", "改上一步")
-
 _NUM = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 _UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+
+#: 去掉空白后超过这个字数就算「长文本」：不再当成一个选项吞掉。
+LONG_TEXT_CHARS = 40
+
+#: 每一步自己的兜底话术。原则：只举这一步真正能说的例子；
+#: 多选步骤绝不出现「3000 字」这种别的步骤的答案。
+FALLBACKS: dict[str, str] = {
+    "branch": (
+        "方向还没定：想写原创、接着已有正文续写，还是和角色对话？"
+        "说「原创」「续写」「角色对话」，或者直接点上面的卡片。"
+    ),
+    "corpus": "可以说书名（如「参考某某书」），或者「不投喂语料」；也可以直接点卡片选。",
+    "distill": "可以说「完整档」「平衡档」「快速档」；已有档案时也可以说「沿用现有档案」。",
+    "book_scope": "说按哪本书读，比如「按某某书读」，或者说「不指定」；也可以直接点卡片。",
+    "genre": "说一个题材，比如「悬疑」「科幻」「历史」；也可以直接点卡片。",
+    "style": "说一个平台调性，比如「番茄」「起点」「晋江」「豆瓣阅读」「知乎盐选」。",
+    "length": "说单段字数，比如「3000 字」（范围 500–8000）；这是每段字数，不是全书长度。",
+    "chapters": "说这次写几段，比如「1 段」「3 段」；也可以直接点卡片。",
+    "outline": "说「先出大纲」或「直接开写」；也可以直接点卡片。",
+    "continue_from": "说「接在最后一段之后」，或者给一个段号；也可以直接点卡片。",
+    "character": "直接打一个角色名（用上面的角色卡），或者点卡片选。",
+    "scene": "描述一下情境，比如「初次见面」「一场对峙之后」；也可以点卡片选。",
+    "confirm": "确认无误就说「开始」；想改就说「上一步」，或点要改的那一行。",
+}
+
+#: 越界要求：明确拒绝，并给出替代路径。顺序在动作/作答之前。
+_REFUSALS = (
+    (
+        re.compile(
+            r"(抄|照抄|复制|粘贴|搬运|贴).{0,12}(原文|全文|整段|正文|章节)"
+            r"|(原文|全文|整段).{0,10}(抄|复制|粘贴|搬)"
+        ),
+        "这件事我不做：不会把参考语料整段抄进你的正文。要参考原文，可以把它作为参考语料做蒸馏/检索，"
+        "只取检索到的片段或摘要来学写法。",
+    ),
+    (
+        re.compile(r"(删掉|删除|删了|清空|毁掉|干掉).{0,8}(项目|这本|当前|小说|书)"),
+        "这件事我不做：引导流程里不能删项目。要删除项目，请到项目工作台的项目设置里操作（那里有二次确认）。",
+    ),
+    (
+        re.compile(
+            r"(帮我|替我|给我|代我).{0,8}(写|代写|做).{0,8}(论文|作业|毕设|毕业设计|开题报告)"
+            r"|(别人的|他人的|别人).{0,6}(论文|作业|毕设)"
+            r"|(代写|枪手).{0,6}(论文|作业)"
+        ),
+        "这件事我不做：不代写他人的论文、作业或毕设。这个助手只用于小说创作；"
+        "如果你在写自己的论文，请用专门的写作工具。",
+    ),
+)
+
+#: 「第 N 段」= 指代某一已有/指定段落，不是「这次写几段」的数量。
+_SEG_REF = re.compile(r"第\s*(\d+|[零〇一二两三四五六七八九十百]+)\s*段")
+
+#: 带这些词时，「第 N 段」是改写/调整意图，而不是选段号（continue_from 要放行纯段号）。
+_EDIT_WORDS = re.compile(
+    r"改写|重写|重新写|修改|改一下|改得|改紧|改成|改为|写紧|写松|写短|写长"
+    r"|润色|扩写|缩写|压缩|删掉|删除|替换|换成|调整"
+)
+
+_SEG_DIGITS = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+#: 控制意图的封闭清单：只在 character / scene 这类自由文本步骤前置识别，
+#: 识别到就不再当角色名/情境。清单外的新说法见 control_intent 末尾的兜底。
+_CONTROL_PATTERNS = (
+    (
+        "skip",
+        re.compile(r"^(跳过|略过|不要问|别问|不用问)(掉)?(这|这一|当前|本)?(一)?(步|题|项|步骤)?$"),
+    ),
+    ("skip", re.compile(r"^(跳过|略过)(蒸馏|语料|风格|题材|字数|段数|大纲|情境|角色)$")),
+    (
+        "process",
+        re.compile(
+            r"^(直接|马上|立刻)?(生成|开写|开始写|写正文|出正文)$"
+            r"|^(先)?(别|不要|不用|暂停|停掉)(再)?蒸馏$"
+        ),
+    ),
+    ("set_length", re.compile(r"字数|篇幅")),
+    ("set_genre", re.compile(r"题材|类型")),
+    ("set_style", re.compile(r"风格|平台调性")),
+    (
+        "edit_character",
+        re.compile(r"(主角|人物|角色|设定|背景|朝代|世界观).{0,8}(改成|改为|换成|变成|设为|调整)"),
+    ),
+    ("edit_character", re.compile(r"^(换|改)(个|一个|一下)?(朝代|背景|设定|人物|主角)")),
+)
+
+_BRANCH_EXACT = {
+    "原创": flow.KIND_ORIGINAL,
+    "原创小说": flow.KIND_ORIGINAL,
+    "原创故事": flow.KIND_ORIGINAL,
+    "写原创": flow.KIND_ORIGINAL,
+    "自己写": flow.KIND_ORIGINAL,
+    "从零开始": flow.KIND_ORIGINAL,
+    "从头写": flow.KIND_ORIGINAL,
+    "新书": flow.KIND_ORIGINAL,
+    "续写": flow.KIND_CONTINUATION,
+    "接着写": flow.KIND_CONTINUATION,
+    "往下写": flow.KIND_CONTINUATION,
+    "继续写": flow.KIND_CONTINUATION,
+    "接着写下去": flow.KIND_CONTINUATION,
+    "角色对话": flow.KIND_ROLE,
+    "角色扮演": flow.KIND_ROLE,
+    "和角色聊天": flow.KIND_ROLE,
+    "跟角色聊天": flow.KIND_ROLE,
+    "聊天": flow.KIND_ROLE,
+    "对话": flow.KIND_ROLE,
+    "角色": flow.KIND_ROLE,
+}
+
+_BRANCH_PATTERNS = (
+    (
+        flow.KIND_ORIGINAL,
+        r"(我)?(想|要|准备|打算)?(写|做|开)?(一本|一个|一部)?"
+        r"(原创|新书|全新的书|从零|从头写)(小说|故事|书)?",
+    ),
+    (
+        flow.KIND_CONTINUATION,
+        r"(我)?(想|要|准备|打算)?(续写|接着写|往下写|继续写|接着写下去)(下去)?",
+    ),
+    (
+        flow.KIND_ROLE,
+        r"(我)?(想|要|准备|打算)?(和|跟)?(角色|AI|角色卡)?(聊天|对话|扮演|角色扮演)(一下|一会儿)?",
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +232,179 @@ def looks_like_question(text: str) -> bool:
     if t.endswith("？") or t.endswith("?"):
         return True
     return any(m in t for m in _Q_MARKS)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def is_long_text(text: str) -> bool:
+    """去空白后 ≥40 字算长文本：不能再被当成一个选项吞掉。"""
+    return len(_norm(text)) >= LONG_TEXT_CHARS
+
+
+def _first_clause(text: str) -> str:
+    """取第一句/第一个分句：方向意图只在开头这一小段里认。"""
+    return re.split(r"[，,。；;：:\n]", (text or "").strip(), maxsplit=1)[0].strip()
+
+
+def _branch_intent(text: str) -> str | None:
+    """方向判定：明确选项、或第一分句是成句意图才算；整段梗概不算。
+
+    这样「原创」「我想写一本原创小说」照常接住，而「……对话里的潜台词」
+    这种长文本不会再被子串命中。
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    has_punct = bool(re.search(r"[，,。；;：:\n]", t))
+    # 没有标点又是一整段：多半是梗概/设定，不在这里替用户定方向。
+    if not has_punct and len(_norm(t)) > 24:
+        return None
+    clause = _first_clause(t)
+    key = _norm(clause).strip("。！？!?～~")
+    if key in _BRANCH_EXACT:
+        return _BRANCH_EXACT[key]
+    if not key or len(key) > 24:
+        return None
+    for value, pattern in _BRANCH_PATTERNS:
+        if re.fullmatch(pattern, key):
+            return value
+    return None
+
+
+def is_back(text: str) -> bool:
+    """回退意图：整句匹配，避免「回到上一步」比「上一步」多两个字就不认。"""
+    t = _norm(text).strip("。！？!?～~")
+    if t in {"退回去", "回去改", "改上一步", "重来一次", "重新来"}:
+        return True
+    return bool(re.fullmatch(r"(回到|返回|退回|退到)?到?(上一步|前面|上一题|上题|上一步骤)", t))
+
+
+def control_intent(step: str, text: str) -> str | None:
+    """character/scene 的前置控制意图识别（封闭清单）。
+
+    清单外但看起来像指令的短句，返回 `unknown_control`，交给上层问一句，
+    而不是当成角色名/情境。真正的自由文本（角色名、情境描述）才放行。
+    """
+    if step not in {"character", "scene"}:
+        return None
+    t = _norm(text).strip("。！？!?～~")
+    for key, pattern in _CONTROL_PATTERNS:
+        if pattern.search(t):
+            return key
+    if len(t) <= 20 and re.search(
+        r"(跳过|略过|上一步|返回|回退|改成|改为|换成|设为|调整|生成|蒸馏)", t
+    ):
+        return "unknown_control"
+    return None
+
+
+def control_message(step: str, intent: str) -> str:
+    where = "角色" if step == "character" else "情境"
+    if intent == "skip":
+        if step == "scene":
+            return "这一步是情境；不想写可以点卡片上的跳过按钮，或者说「跳过情境」。"
+        return "这一步要先选一个角色，不能跳过。想换方向可以说「上一步」。"
+    if intent == "process":
+        return (
+            f"这是流程操作，不是{where}。要直接开写，请先答完引导；"
+            "蒸馏相关操作请到项目工作台处理。"
+        )
+    if intent == "set_length":
+        return (
+            f"这一步在选{where}。要改单段字数，直接说「把字数改成 3000」；"
+            "全书长度不在引导里设置。"
+        )
+    if intent == "set_genre":
+        return f"这一步在选{where}。要改题材，直接说「把题材改成悬疑」这类带字段名的说法。"
+    if intent == "set_style":
+        return f"这一步在选{where}。要改风格，直接说「把风格改成番茄」这类带字段名的说法。"
+    if intent == "edit_character":
+        return (
+            f"人物/世界观设定不在这条引导里改：引导只选{where}。"
+            "要改角色设定，请到「项目工作台 → 剧情圣经 → 角色」："
+            "那里可以加角色、改境界、改名、删除（改名只允许影响不大的情况）。"
+        )
+    return f"这句像操作指令，但我不确定指哪一步。可以说「跳过风格」「上一步」，或直接点卡片。"
+
+
+def _segment_no(raw: str) -> int | None:
+    """「3」「三」「十二」→ 段号；认不出返回 None。"""
+    raw = (raw or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    n = _cn_to_int(raw)
+    if n is not None:
+        return n
+    if len(raw) == 1:
+        return _SEG_DIGITS.get(raw)
+    return None
+
+
+def segment_edit_hint(step: str, text: str, ctx: dict[str, Any]) -> str | None:
+    """「第 N 段」指代已有段落时给出诚实回应，绝不当成数量/字数答案。
+
+    只在两种情况下拦截（其余步骤保持原行为）：
+    - 当前步就是在问数量/字数（chapters / length）——「第 N 段」不可能是答案；
+    - 这句话带改写动词（重写/写紧/改成…）——即使在 continue_from 也不能当段号。
+
+    返回 `None` 表示放行；返回字符串表示直接以 clarify 回给用户，不推进流程。
+    """
+    t = text or ""
+    m = _SEG_REF.search(t)
+    if not m:
+        return None
+    if step not in {"chapters", "length"} and not _EDIT_WORDS.search(t):
+        return None
+
+    prefix = {
+        "chapters": "这一步是「这次写几段」，不是改第几段。",
+        "length": "这一步是「每段多少字」，不是改某一段。",
+    }.get(step, "")
+
+    n = _segment_no(m.group(1))
+    segments: list[int] = []
+    for x in ctx.get("segments") or []:
+        try:
+            segments.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    segments = sorted(set(segments))
+
+    if not segments:
+        return (
+            f"{prefix}现在还没有可改写的正文——等正文生成后，"
+            "在工作台助手说「把第 N 段重写，<你的要求>」，那里会先弹确认卡再覆盖。"
+        )
+    if n is not None and n in segments:
+        return (
+            f"{prefix}第 {n} 段已经有正文了。要重写它，请到工作台助手说"
+            f"「把第 {n} 段重写，<你的要求>」，确认后会覆盖该段；"
+            "这条引导不会直接改已写正文。"
+        )
+    have = "、".join(f"第 {x} 段" for x in segments[:5])
+    target = f"第 {n} 段" if n is not None else "这一段"
+    return (
+        f"{prefix}目前已有正文的是 {have}；{target}还没有正文，没法改写。"
+        "要重写已有段，请到工作台助手说「把第 N 段重写」。"
+    )
+
+
+def refusal(text: str) -> str | None:
+    """越界要求：命中就返回一句明确拒绝；不命中返回 None。"""
+    t = text or ""
+    for pattern, message in _REFUSALS:
+        if pattern.search(t):
+            return message
+    return None
+
+
+def fallback_for(step: str) -> str:
+    return FALLBACKS.get(
+        step,
+        "这一步需要你从上面的卡片里选一个；也可以说「上一步」或「重新开始」。",
+    )
 
 
 def _cn_to_int(text: str) -> int | None:
@@ -183,14 +481,9 @@ def _match(step: str, text: str, answers: dict[str, Any], ctx: dict[str, Any],
     low = t.lower()
 
     if step == "branch":
-        rules = (
-            (("原创", "新书", "自己写", "从零", "从头写"), flow.KIND_ORIGINAL),
-            (("续写", "接着写", "往下写", "继续写", "接着"), flow.KIND_CONTINUATION),
-            (("角色对话", "角色", "扮演", "聊天", "对话"), flow.KIND_ROLE),
-        )
-        for keys, value in rules:
-            if any(k in t for k in keys):
-                return value, flow.KIND_LABELS[value]
+        value = _branch_intent(t)
+        if value:
+            return value, flow.KIND_LABELS[value]
         return None
 
     if step == "corpus":
@@ -353,12 +646,17 @@ def parse(
     """
     t = (text or "").strip()
     if not t:
-        return {"kind": "clarify", "message": "没看到内容，你直接说选哪个就行。"}
+        return {"kind": "clarify", "message": "没看到内容。" + fallback_for(step)}
 
-    if t in _BACK_WORDS or any(t == w for w in _BACK_WORDS):
+    refused = refusal(t)
+    if refused:
+        return {"kind": "clarify", "message": refused}
+
+    if is_back(t):
         return {"kind": "back"}
 
-    if _is_default_word(t):
+    # 长文本不套默认值：避免整段话里出现「不知道」就被当成「你定」。
+    if not is_long_text(t) and _is_default_word(t):
         value = flow.default_for(step, answers, ctx)
         label = flow.echo_label(step, value, answers.get("branch"), ctx)
         return {
@@ -371,6 +669,16 @@ def parse(
     if looks_like_question(t) and not _has_commit_verb(t) and not _has_number_with_unit(t):
         return {"kind": "question"}
 
+    # 「第 N 段」指代已有正文：不能把它当成「写几段 / 每段多少字」的数字。
+    seg_hint = segment_edit_hint(step, t, ctx)
+    if seg_hint:
+        return {"kind": "clarify", "message": seg_hint}
+
+    # character/scene 是自由文本：先认控制指令和改设定，剩下的才当角色名/情境。
+    ctrl = control_intent(step, t)
+    if ctrl:
+        return {"kind": "clarify", "message": control_message(step, ctrl)}
+
     match = _match(step, t, answers, ctx, question)
     if match is not None:
         value, label = match
@@ -379,13 +687,17 @@ def parse(
     if looks_like_question(t):
         return {"kind": "question"}
 
-    return {
-        "kind": "clarify",
-        "message": (
-            "我没听懂这句算选哪个。可以直接点上面的卡片，或者换个说法——"
-            "比如「完整档」「3000 字」「先出大纲」。"
-        ),
-    }
+    # 方向步骤收到整段梗概：不替用户定方向，先问一句。
+    if step == "branch" and is_long_text(t):
+        return {
+            "kind": "clarify",
+            "message": (
+                "这段像完整的想法，但方向还没定：你想写原创、续写，还是和角色对话？"
+                "先定方向，再往下走。"
+            ),
+        }
+
+    return {"kind": "clarify", "message": fallback_for(step)}
 
 
 # ---------------------------------------------------------------------------

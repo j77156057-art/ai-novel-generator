@@ -50,6 +50,11 @@ from app.style.narrative import DEFAULT_TIER, list_tiers
 
 router = APIRouter(prefix="/api/assistant/wizard", tags=["assistant-wizard"])
 
+#: 长文本至少落进 project.premise 的步骤（方向/角色名/情境有自己的语义，
+#: 不在这里兜底）。premise 是既有字段，已被生成链路读取，不需要改表。
+_PREMISE_STEPS = {"corpus", "genre", "style", "length", "chapters", "outline", "book_scope"}
+_LONG_TEXT_NOTE = "（这段我先记进项目简介了，之后生成会带上。）"
+
 
 # ---------------------------------------------------------------------------
 # 请求体
@@ -102,6 +107,21 @@ def _require_project(db: Session, project_id: int) -> Project:
     if proj is None:
         raise HTTPException(status_code=404, detail="project 不存在")
     return proj
+
+
+def _capture_premise(db: Session, project: Project, text: str) -> bool:
+    """把长文本追加进项目简介（既有字段），返回是否真的写了。
+
+    只追加、不覆盖：用户之前写过的简介保留；同一段重复发送不重复落库。
+    这里不新建字段、不改表结构。
+    """
+    t = (text or "").strip()
+    old = (project.premise or "").strip()
+    if not t or t in old:
+        return False
+    project.premise = f"{old}\n\n{t}".strip() if old else t
+    db.commit()
+    return True
 
 
 def _active_session(db: Session, project_id: int) -> AssistantWizardSession | None:
@@ -232,6 +252,11 @@ def _context(
         "default_tier": project.narrative_tier or DEFAULT_TIER,
         "archive_exists": archive_exists,
         "project_has_corpus": bool(corpus),
+        # 续写分支不重选语料，书级事实步骤（book_scope）的选项要按项目已有语料出。
+        "project_corpus_ids": corpus,
+        # 现有书级事实：作为 book_scope 的默认值，避免用户「跳过」把已设好的书清掉。
+        "active_novel_id": project.active_novel_id,
+        "continuation_novel_id": project.continuation_novel_id,
         "project_has_style": archive_exists,
         "needs_distill": bool(corpus) and not archive_exists,
         "segments": segments,
@@ -337,6 +362,20 @@ def _state(
     answers = session.answers or {}
     question = None
     if session.status == "active":
+        # 步骤序列是动态的（例如本轮新增的 book_scope 会因为「在场语料 ≥2 本」
+        # 插在 corpus 之后）。部署前就停在后面的旧会话，step_key 会「越过」
+        # 一个从未答过的步骤——进度写着 10 步、实际只走 9 步，新步骤对它永不
+        # 可见。这里退回到序列里第一个未答的步骤，自愈一次即可。
+        order = flow.step_order(answers.get("branch"), answers, ctx)
+        pending = next((s for s in order if s not in answers), None)
+        if (
+            pending
+            and session.step_key in order
+            and order.index(pending) < order.index(session.step_key)
+        ):
+            session.step_key = pending
+            db.commit()
+            db.refresh(session)
         question = flow.build_question(session.step_key, answers, ctx)
         if ack:
             question["message"] = ack + "\n\n" + str(question.get("message") or "")
@@ -691,6 +730,28 @@ def say(
     ctx = _context(db, project, session.history or [], session.overrides or {})
     question = flow.build_question(step, answers, ctx)
 
+    # 越界要求先明确拒绝：不执行、不推进，也不写进 premise。
+    refused = chat.refusal(body.text)
+    if refused:
+        _record_user(db, project.id, session, body.text)
+        _record_reply(db, project.id, session, refused)
+        return {
+            "mode": "clarify",
+            "message": refused,
+            "question": question,
+            "session": _session_view(session),
+        }
+
+    # 长文本至少有落点：语料/题材/风格/字数/段数/大纲这些步骤，追加进
+    # project.premise（既有字段，生成链路会读）；追问不写。
+    premise_saved = (
+        step in _PREMISE_STEPS
+        and chat.is_long_text(body.text)
+        and not chat.looks_like_question(body.text)
+        and _capture_premise(db, project, body.text)
+    )
+    long_note = _LONG_TEXT_NOTE if premise_saved else ""
+
     # 先看是不是「帮我改 X」：档位、采样章数、字数、题材、风格、大纲、流程。
     # 动作不推进引导步骤，只改项目/会话配置，并返回可撤销的审计 id。
     act = actions.plan(body.text, ctx, step)
@@ -699,10 +760,10 @@ def say(
             res = actions.apply(db, project, session, act, ctx, background_tasks)
         except (ValueError, flow.AnswerError) as exc:
             _record_user(db, project.id, session, body.text)
-            _record_reply(db, project.id, session, str(exc))
+            _record_reply(db, project.id, session, str(exc) + long_note)
             return {
                 "mode": "clarify",
-                "message": str(exc),
+                "message": str(exc) + long_note,
                 "question": question,
                 "session": _session_view(session),
             }
@@ -712,7 +773,7 @@ def say(
             db,
             project.id,
             session,
-            res["message"],
+            res["message"] + long_note,
             kind="wizard_action",
             payload={
                 "action": res.get("action"),
@@ -723,7 +784,7 @@ def say(
         _record_question(db, project.id, session, out.get("question"))
         return {
             "mode": "action",
-            "message": res["message"],
+            "message": res["message"] + long_note,
             "action": res.get("action"),
             "undo_id": res.get("undo_id"),
             "undoable": res.get("undoable", False),
@@ -746,10 +807,10 @@ def say(
 
     if parsed["kind"] == "clarify":
         _record_user(db, project.id, session, body.text)
-        _record_reply(db, project.id, session, parsed["message"])
+        _record_reply(db, project.id, session, parsed["message"] + long_note)
         return {
             "mode": "clarify",
-            "message": parsed["message"],
+            "message": parsed["message"] + long_note,
             "question": question,
             "session": _session_view(session),
         }
@@ -781,7 +842,7 @@ def say(
     try:
         value = flow.validate(step, value, answers.get("branch"), answers, ctx)
     except flow.AnswerError as exc:
-        message = f"{exc}。换个说法，或者直接点上面的卡片。"
+        message = f"{exc}。换个说法，或者直接点上面的卡片。" + long_note
         _record_user(db, project.id, session, body.text)
         _record_reply(db, project.id, session, message)
         return {
@@ -794,6 +855,7 @@ def say(
     ack = flow.ack_for(step, value, answers, ctx)
     if parsed.get("note"):
         ack = ack + str(parsed["note"])
+    ack = ack + long_note
     # 用户原话先落库（自由输入保留原话，比只记选项文案更有信息量）；
     # 传 echo=None 告诉 `_advance`「用户消息已经记过，别重复记」。
     _record_user(db, project.id, session, body.text)
@@ -897,6 +959,14 @@ def _commit(
         project.genre = answers.get("genre") or project.genre
         project.style = answers.get("style") or project.style
         project.generation_length = int(answers.get("length") or project.generation_length or 3000)
+        # 书级事实：只有真的问了这一步（≥2 本在场）才写，避免单本书时改动用户
+        # 在工作台手工设过的值。原创分支声明「事实来源书」时顺手清掉续写书：
+        # book_for_project 的优先级是 continuation → active，留着旧续写书会把
+        # 刚选的事实来源书整个盖掉。
+        if "book_scope" in answers:
+            scope = int(answers.get("book_scope") or flow.BOOK_SCOPE_NONE)
+            project.active_novel_id = scope or None
+            project.continuation_novel_id = None
         tier = answers.get("distill")
         if tier and tier != flow.DISTILL_REUSE:
             project.narrative_tier = tier
@@ -905,6 +975,8 @@ def _commit(
         if tier and tier != flow.DISTILL_REUSE:
             distill = _start_distill(db, project, tier, background_tasks)
         result["applied"] = ["reference_novel_ids", "genre", "style", "generation_length"]
+        if "book_scope" in answers:
+            result["applied"] += ["active_novel_id", "continuation_novel_id"]
         if tier and tier != flow.DISTILL_REUSE:
             result["applied"].append("narrative_tier")
 
@@ -916,6 +988,9 @@ def _commit(
 
     elif kind == flow.KIND_CONTINUATION:
         project.generation_length = int(answers.get("length") or project.generation_length or 3000)
+        if "book_scope" in answers:
+            scope = int(answers.get("book_scope") or flow.BOOK_SCOPE_NONE)
+            project.continuation_novel_id = scope or None
         tier = answers.get("distill")
         if tier and tier != flow.DISTILL_REUSE and not project.style_narrative:
             project.narrative_tier = tier
@@ -924,6 +999,8 @@ def _commit(
         else:
             db.commit()
         result["applied"] = ["generation_length"]
+        if "book_scope" in answers:
+            result["applied"].append("continuation_novel_id")
         result["distill"] = distill
         result["message"] = _commit_message(kind, distill, "ready")
 
