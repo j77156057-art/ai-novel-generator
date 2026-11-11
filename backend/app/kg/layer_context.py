@@ -250,9 +250,12 @@ def build_context(seeds: list[str], canon_db: str | pathlib.Path,
                 f"（{node['kind']}，出现 {node['mentions']} 次）"
             )
         for edge in generated_edges:
+            stale = ""
+            if edge.get("status") in ("ended", "historical"):
+                stale = "（第 %s 章已失效，仅可作「曾…」表述）" % edge.get("valid_to")
             gen_lines.append(
                 f"- 第 {edge['source_chapter']} 章写过：{edge['from_name']}"
-                f" —{edge['rel_type']}→ {edge['to_name']}"
+                f" —{edge['rel_type']}→ {edge['to_name']}{stale}"
             )
         for event in generated_events:
             gen_lines.append(

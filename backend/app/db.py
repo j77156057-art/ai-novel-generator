@@ -214,6 +214,9 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # —— v3.0 KG：secret/event 类情报的事实文本（known_kind 消费路径）——
         # 漏这一项的后果与 style_narrative 相同：老库 INSERT 含 known_text 直接炸。
         ("kg_entity_knowledge", "known_text", "VARCHAR(200)"),
+        # —— v3.0 KG：关系边的正式/候选状态（集合端点门降级用）——
+        # 老行补列即有 'active'，迁移只加列、不改列，读路径按 active 过滤。
+        ("kg_relations", "status", "VARCHAR(16) NOT NULL DEFAULT 'active'"),
         # —— Version 补齐快照指纹与归属——
         ("versions", "project_id", "INTEGER"),
         ("versions", "kind", "VARCHAR(16)"),

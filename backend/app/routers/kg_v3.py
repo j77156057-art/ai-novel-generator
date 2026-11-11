@@ -287,7 +287,8 @@ def list_relations(
 
     rows = db.scalars(
         select(KgRelation)
-        .where(KgRelation.project_id == project_id)
+        .where(KgRelation.project_id == project_id,
+               KgRelation.status == "active")  # 候选边（集合端点门降级）不进关系图
         .order_by(KgRelation.strength.desc())
         .limit(limit)
     ).all()

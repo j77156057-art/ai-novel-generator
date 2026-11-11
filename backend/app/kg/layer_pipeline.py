@@ -48,7 +48,18 @@ def ingest_chapter(con, canon_db: str | pathlib.Path | None, text: str, chapter:
             direction_basis=edge.get("direction_basis") or "",
             trigger=edge.get("trigger") or "",
             confidence=float(edge.get("confidence") or 0.5),
+            confirm_method=edge.get("confirm_method") or "",
         )
+    # 失效与死亡只做减法：关旧边、追加失效记录，不改建边原句。
+    for inv in ext["invalidations"]:
+        store.invalidate_edge(con, inv["from"], inv["to"], inv["rel"], chapter,
+                              reason=inv["reason"], trigger=inv["trigger"],
+                              evidence=inv["evidence"])
+    for death in ext["deaths"]:
+        store.close_edges_by_endpoint(con, death["name"], chapter,
+                                      reason=death["reason"],
+                                      trigger=death["trigger"],
+                                      evidence=death["evidence"])
     for event in ext["events"]:
         store.add_event(
             con, chapter, event["event_type"], event["summary"],
@@ -86,6 +97,8 @@ def ingest_chapter(con, canon_db: str | pathlib.Path | None, text: str, chapter:
         "events": len(ext["events"]),
         "candidates": len(ext["candidates"]),
         "rejected_subjects": len(ext["rejected_subjects"]),
+        "invalidations": len(ext["invalidations"]),
+        "deaths": len(ext["deaths"]),
         "conflicts": found,
         "by_decision": by_decision,
     }

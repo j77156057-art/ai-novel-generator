@@ -277,6 +277,9 @@ class KgRelation(Base):
     since_chapter = Column(Integer, nullable=True)
     description = Column(String(200), nullable=True)
     confidence = Column(Float, nullable=False, default=1.0)
+    #: active = 正式边；candidate = 集合端点门降级（成员边挂在集合/上位节点、窗口内
+    #: 无任何具体人名）。降级不删边：读路径过滤 candidate，复核后可转正。
+    status = Column(String(16), nullable=False, default="active")
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -320,6 +323,8 @@ class KgEvent(Base):
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    #: 事件所属书；NULL = 项目级通用事件（原创项目自己写出来的段落）。
+    novel_id = Column(Integer, nullable=True)
     sequence = Column(Integer, nullable=False)  # 项目内连续序号（全局事件顺序）
     chapter = Column(Integer, nullable=True)
     segment_no = Column(Integer, nullable=True)  # 生成段号（generations.segment_no）

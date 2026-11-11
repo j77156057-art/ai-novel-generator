@@ -44,6 +44,8 @@ _RELATION_ALIASES = {
 # event 字段别名
 _EVENT_ALIASES = {
     "sequence": ("sequence", "seq", "序号"),
+    # segment = 事件所属段号（批抽一次吃多段，落库按它归属；旧行为一律记批首段）
+    "segment": ("segment", "seg", "segment_no", "段号"),
     "chapter": ("chapter", "chapter_no", "章"),
     "event_type": ("event_type", "type", "类型"),
     "summary": ("summary", "desc", "描述", "svo", "svo_triplet"),
@@ -292,6 +294,7 @@ def normalize_extraction(raw: dict, *, error: str | None = None) -> dict:
         summary = _as_str(_pick(ev, _EVENT_ALIASES["summary"]))
         item = {
             "sequence": _as_int(_pick(ev, _EVENT_ALIASES["sequence"])),  # 批内序号，供 links/knowledge 引用
+            "segment": _as_int(_pick(ev, _EVENT_ALIASES["segment"])),
             "chapter": _as_int(_pick(ev, _EVENT_ALIASES["chapter"])),
             "event_type": et,
             "summary": summary[:500],
@@ -473,7 +476,7 @@ _EXTRACT_SYSTEM = (
     '"canonical_name": "规范名", "aliases": ["别名"], "attrs": {"该 kind 对应的字段": "值"}}],\n'
     '  "relations": [{"from": "主体名", "to": "客体名", "rel_type": '
     '"从下方 rel_type 取值表中选一个", "strength": 0.5}],\n'
-    '  "events": [{"sequence": 1, "chapter": 1, "event_type": "incident|revelation|foreshadow_plant|'
+    '  "events": [{"sequence": 1, "segment": 1, "chapter": 1, "event_type": "incident|revelation|foreshadow_plant|'
     'foreshadow_payoff|death|romance_milestone|battle|decision|time_marker", '
     '"summary": "SVO 事件描述", "subject": "主体名", "verb": "动作", "object": "客体名", '
     '"location": "地点名", "in_story_date": "故事内时间（如贞观三年秋）"}],\n'
@@ -594,6 +597,8 @@ _EXTRACT_SYSTEM = (
     "- incident：以上都不符合的普通情节推进（兜底，占比应最低）\n"
     "- in_story_date 只在文本有明确时间线索时填，否则留空字符串\n"
     "- events 的 sequence 从 1 开始连续编号（本批内），供 event_links/entity_knowledge 引用\n"
+    "- events 每条必须带 segment：写该事件主要发生在哪一段（输入里【第 N 段】的 N，"
+    "只能是本批出现过的段号）；跨段事件写主体动作所在的那一段。不要把所有事件都写第 1 段\n"
     "- event_links 用 sequence 引用事件（不要用事件描述），描述本批事件间因果/时序关系；\n"
     "  伏笔回收用 link_type=resolves\n"
     "- entity_knowledge：当文本明确表现某角色**得知**了另一角色/事实（被告知/看到/发现）时抽取，\n"
@@ -625,6 +630,82 @@ _BATCH_TEMPLATE = (
 # 原则：遇到截断先抬上限取全结果，不要靠缩短输入或反复重试去将就。
 
 
+def _best_segment(ev: dict, seg_text: dict[int, str]) -> int | None:
+    """按事件主体/客体/地点在本批各段正文里的出现次数选段。
+
+    只在**分得清**时返回段号：最高分并列、或最高分没比次高分高出 1.5 倍
+    （连续几段里主角名反复出现，分数天然接近）都返回 ``None``——这种情况
+    交给调用方按事件顺序均摊，不拿一个「看起来最高」的段去猜。
+    """
+    names = [_as_str(ev.get(k)) for k in ("subject", "object", "location")]
+    names = [n for n in names if len(n) >= 2]
+    if not names:
+        return None
+    scores: list[tuple[int, int]] = []
+    for seg, text in seg_text.items():
+        if not text:
+            continue
+        scores.append((sum(text.count(n) for n in names), seg))
+    if not scores:
+        return None
+    scores.sort(reverse=True)
+    best_score, best_seg = scores[0]
+    if best_score <= 0:
+        return None
+    if len(scores) > 1:
+        second = scores[1][0]
+        if second == best_score or best_score * 2 < second * 3:
+            return None
+    return best_seg
+
+
+def attribute_event_segments(out: dict, texts: list[tuple[int, str, int | None]]) -> dict:
+    """给每条事件标注它所属的段号（批抽一次吃多段时用）。
+
+    判定顺序：
+
+    1. **模型标注可信**（本批事件给出了两个以上的不同段号，且不是整批都写
+       批首段）→ 用模型的段号；只有当一个事件在它声称的段里连主体/客体/地点
+       都没出现、而另一段命中明显更多时，才以正文为准纠正。
+    2. 模型没标 / 越界 / **整批都写第 1 段**（LLM 的典型退化输出，等同于没标）
+       → 先看正文命中能否唯一确定（见 ``_best_segment``）；分不清就按事件
+       在批内的顺序在段间均摊。
+
+    旧行为是一律记批首段，后几段的事件按段过滤（judge / retrieval）就错位。
+    """
+    events = out.get("events") or []
+    if not events or not texts:
+        return out
+    segs = [int(s) for s, _t, _c in texts]
+    valid = set(segs)
+    seg_text = {int(s): (t or "") for s, t, _c in texts}
+
+    def _valid_label(v) -> bool:
+        return not isinstance(v, bool) and isinstance(v, int) and v in valid
+
+    labels = [ev.get("segment") if isinstance(ev, dict) else None for ev in events]
+    good = [lb for lb in labels if _valid_label(lb)]
+    all_first = bool(good) and all(lb == segs[0] for lb in good)
+    trust = len(set(good)) > 1 and not all_first
+
+    for i, ev in enumerate(events):
+        if not isinstance(ev, dict):
+            continue
+        seg = labels[i] if _valid_label(labels[i]) else None
+        best = _best_segment(ev, seg_text)
+        if seg is not None and trust:
+            names = [n for n in (_as_str(ev.get(k)) for k in
+                                 ("subject", "object", "location")) if len(n) >= 2]
+            if (best is not None and best != seg and names
+                    and not any(n in seg_text.get(seg, "") for n in names)):
+                seg = best
+        else:
+            seg = best if best is not None else \
+                segs[min(i * len(segs) // len(events), len(segs) - 1)]
+        ev["segment"] = seg
+    return out
+
+
 def extract_segment(provider, text: str, segment_no: int, chapter: int | None = None) -> dict:
     """单段抽取（LLM）。失败返回**带 `_error` 的空骨架**（不抛异常，不阻塞主链）。
 
@@ -639,15 +720,16 @@ def extract_segment(provider, text: str, segment_no: int, chapter: int | None = 
     out = _parse_and_normalize(raw)
     if out.get(ERROR_FIELD):
         return out
-    return validate_kinship_terms(reconcile_owns(out, text), text)
+    out = validate_kinship_terms(reconcile_owns(out, text), text)
+    return attribute_event_segments(out, [(segment_no, text, chapter)])
 
 
 def extract_batch(provider, texts: list[tuple[int, str, int | None]]) -> dict:
     """批量抽取（一次抽 N 段合并——省 LLM 调用 + 跨段一致性）。
 
     texts: [(segment_no, text, chapter), ...]
-    返回的 entities/events 不带 segment_no（落库时由调用方补：events.segment_no
-    在批内无法精确归属，统一记批首段号）。
+    返回的 events 每条都带 ``segment``（``attribute_event_segments`` 按模型标注 +
+    段内命中归属；落库直接用，不再统一记批首段）。
     失败返回带 `ERROR_FIELD` 的空骨架，调用方据此判 failed。
     """
     if not texts:
@@ -667,7 +749,8 @@ def extract_batch(provider, texts: list[tuple[int, str, int | None]]) -> dict:
     if out.get(ERROR_FIELD):
         return out
     full_text = "\n".join(t for _s, t, _c in texts)
-    return validate_kinship_terms(reconcile_owns(out, full_text), full_text)
+    out = validate_kinship_terms(reconcile_owns(out, full_text), full_text)
+    return attribute_event_segments(out, texts)
 
 
 # 定向二遍抽取：主抽里 faction / power_system 为空时的补齐通道。
@@ -790,8 +873,20 @@ class ExtractionStats:
     entities_new: int = 0
     relations_upserted: int = 0
     events_added: int = 0
+    #: 重抽（requeue / 回放）时命中去重键、没有重复追加的事件数
+    events_skipped: int = 0
     event_links_added: int = 0
     entity_knowledge_added: int = 0
     state_changes: int = 0
     foreshadows: int = 0
+    #: 成功路径里用「库里已有实体」补出来的提及（p5 item 提及为 0 的修复）。
+    #: LLM 本批抽到的实体提及不计入这里（那是主路径产物）。
+    mentions_alias_added: int = 0
+    #: 持有投影统计（组/写法/持有段/错误）；空 dict = 本批没投影（测试直调）。
+    projection: dict = field(default_factory=dict)
+    #: 归一时丢弃的派生 item 实体（名字 → 条数，见 canon_source.DERIVED_ITEM_NAMES）。
+    #: 空 = 本批没抽到；有值说明「为什么没建这个实体」，落在 note.batch_stats 可查。
+    derived_items_dropped: dict = field(default_factory=dict)
+    #: 随派生实体一并清理的引用行数（关系/状态/情报整条、事件字段清空）。
+    derived_refs_dropped: int = 0
     errors: list = field(default_factory=list)

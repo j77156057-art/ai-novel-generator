@@ -16,10 +16,15 @@ from __future__ import annotations
 
 from sqlalchemy import select, func
 
+from app.kg.book_scope import book_for_project
 from app.kg.entity_lookup import resolve_entity_by_name
 from app.models import (
     KgCharacterState, KgEntity, KgEntityKnowledge, KgEvent, KgForeshadow, KgMention,
+    KgRelation, Project,
 )
+
+#: 双向关系类型；其余按 from→to 单向渲染（亲属类方向靠 rel_type 本身表达）。
+_SYMMETRIC_REL_TYPES = frozenset({"ally", "enemy", "sibling", "romantic", "friend", "rival"})
 
 
 def slice_for_prompt(
@@ -29,12 +34,14 @@ def slice_for_prompt(
     *,
     window: int = 5,
     max_entities: int = 20,
+    max_relations: int = 10,
     active_characters: list[str] | None = None,
 ) -> dict:
     """按当前剧情点取 KG 切片喂 prompt。
 
     window: 回溯最近 N 段的 mention
     max_entities: 实体清单上限（prompt 预算）
+    max_relations: 关系清单上限（关系只列当前段实体之间的边，不写人物小传）
     active_characters: 当前段涉及的角色名（用于取状态和情报）；None 则用本段全部
 
     返回：
@@ -44,9 +51,13 @@ def slice_for_prompt(
       "active_foreshadows": [{"name","status","planted_chapter","planned_payoff_chapter"}],
       "known_facts": [{"character","knows"}],   # 当前角色知道什么
       "recent_events": [{"summary","event_type","in_story_date"}],
+      "relationships": [{"from","to","rel_type"}],  # 当前段实体内已发生的关系
     }
     """
     lo = max(1, current_segment_no - window + 1)
+    # 事件按书收窄：续写书 → 来源书 → None（不按书过滤），与写侧同一个取值点。
+    project = db.get(Project, project_id)
+    book = book_for_project(project) if project is not None else None
 
     # —— 1. 最近 N 段涉及的实体（mention 反向索引）——
     recent_mentions = db.scalars(
@@ -66,10 +77,16 @@ def slice_for_prompt(
     # 按 mention 频次取 top，补 entity 信息
     top_ent_ids = sorted(ent_agg, key=lambda e: ent_agg[e]["count"], reverse=True)[:max_entities]
     recent_entities = []
+    #: 关系取边的锚点：只认本段实体，顺带记名字/书，供书维度过滤用。
+    anchor_ids: set[int] = set(top_ent_ids)
+    ent_names: dict[int, str] = {}
+    ent_books: dict[int, int | None] = {}
     for eid in top_ent_ids:
         ent = db.get(KgEntity, eid)
         if ent is None:
             continue
+        ent_names[eid] = ent.canonical_name
+        ent_books[eid] = ent.novel_id
         recent_entities.append({
             "name": ent.canonical_name,
             "kind": ent.kind,
@@ -88,6 +105,9 @@ def slice_for_prompt(
             ent = resolve_entity_by_name(db, project_id, name, kind="character")
             if ent is None:
                 continue
+            anchor_ids.add(ent.id)
+            ent_names[ent.id] = ent.canonical_name
+            ent_books[ent.id] = ent.novel_id
             latest: dict[str, KgCharacterState] = {}
             for st in db.scalars(
                 select(KgCharacterState).where(
@@ -144,19 +164,60 @@ def slice_for_prompt(
                 known_facts.append({"character": ent.canonical_name, "knows": knows})
 
     # —— 5. 最近 N 段的事件（in_story_date 喂物理时间校验 prompt）——
+    # 书维度（2026-11-18）：本书显式事件优先、项目级 NULL 事件作通配、别书事件绝不参与。
+    # SQLite 里 NULL 互不相等，折成 -1 再比（与既有 COALESCE(novel_id,-1) 同口径）；
+    # book 为 None（项目没指定书）时保持加列前的行为：不按书过滤。
+    event_q = select(KgEvent).where(
+        KgEvent.project_id == project_id,
+        KgEvent.segment_no >= lo,
+        KgEvent.segment_no <= current_segment_no,
+    )
+    event_order = [KgEvent.segment_no.desc()]
+    if book is not None:
+        event_q = event_q.where(
+            func.coalesce(KgEvent.novel_id, -1).in_((book, -1)))
+        event_order.append(func.coalesce(KgEvent.novel_id, -1).desc())
     recent_events = []
-    for ev in db.scalars(
-        select(KgEvent).where(
-            KgEvent.project_id == project_id,
-            KgEvent.segment_no >= lo,
-            KgEvent.segment_no <= current_segment_no,
-        ).order_by(KgEvent.segment_no.desc())
-    ):
+    for ev in db.scalars(event_q.order_by(*event_order)):
         recent_events.append({
             "summary": ev.summary,
             "event_type": ev.event_type,
             "in_story_date": ev.in_story_date,
         })
+
+    # —— 6. 当前段实体之间已发生的关系（kg_relations）——
+    # kg_relations 表本身没有 novel_id，书维度用「两端实体的 novel_id」替代：
+    # 只有两端都在本段实体集合里、且都在当前书可见范围内（NULL=通配）才取。
+    # 这样既不会把别书的边（如「镇国剑归镇北王」）注进无关故事，也不会把整张
+    # 关系图铺成人物小传。
+    relationships: list[dict] = []
+    visible = {
+        eid for eid in anchor_ids
+        if eid in ent_names and (book is None or ent_books.get(eid) in (None, book))
+    }
+    if visible:
+        seen: set[tuple[frozenset[int], str]] = set()
+        for rel in db.scalars(
+            select(KgRelation).where(
+                KgRelation.project_id == project_id,
+                KgRelation.status == "active",  # 候选边（集合端点门降级）不注入
+                KgRelation.from_id.in_(visible),
+                KgRelation.to_id.in_(visible),
+            ).order_by(KgRelation.strength.desc(), KgRelation.id)
+        ):
+            if rel.from_id == rel.to_id:
+                continue
+            key = (frozenset((rel.from_id, rel.to_id)), rel.rel_type)
+            if key in seen:  # 反向重复边（A ally B / B ally A）只留一条
+                continue
+            seen.add(key)
+            relationships.append({
+                "from": ent_names[rel.from_id],
+                "to": ent_names[rel.to_id],
+                "rel_type": rel.rel_type,
+            })
+            if len(relationships) >= max_relations:
+                break
 
     return {
         "recent_entities": recent_entities,
@@ -164,6 +225,7 @@ def slice_for_prompt(
         "active_foreshadows": active_foreshadows,
         "known_facts": known_facts,
         "recent_events": recent_events,
+        "relationships": relationships,
     }
 
 
@@ -216,6 +278,12 @@ def format_slice_for_prompt(sl: dict) -> str:
         lines.append("【角色已知情报】")
         for k in sl["known_facts"]:
             lines.append(f"- {k['character']}知道: {', '.join(k['knows'])}")
+    if sl.get("relationships"):
+        # 只列当前段实体之间的边；明确标成「已发生的事实」，避免模型当成可改写设定。
+        lines.append("【既有人物关系（已发生的事实，不得改写）】")
+        for r in sl["relationships"]:
+            mark = "↔" if r.get("rel_type") in _SYMMETRIC_REL_TYPES else "→"
+            lines.append(f"- {r['from']}{mark}{r['to']}：{r['rel_type']}")
     if sl.get("recent_events"):
         lines.append("【近期事件】")
         for ev in sl["recent_events"][:10]:

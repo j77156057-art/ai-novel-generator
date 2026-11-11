@@ -85,7 +85,14 @@ def _explicit_scale(card: dict) -> tuple[str, int | None]:
 
 
 def _character_scale_rows(bible: dict, *, limit: int = 12) -> list[str]:
-    """每个角色一行；只写显式证据，境界名单独出现时记为 unknown。"""
+    """每个角色一行；只写显式证据，境界名单独出现时记为 unknown。
+
+    境界与量级是**同一维度（战力）的两种刻度**，不是两个维度：
+    境界是体系内名义阶位，量级是跨体系可比的物理尺度，realm_map 里
+    `tiers[].stage_seq` 就是两者的默认映射。所以两者同时存在时合并成
+    「境界「A」（量级 B，seq n/15）」，境界名在前（读者看到的是这个名字），
+    量级放在括号里当可比刻度——既不丢境界名，也不让量级消失。
+    """
     rows: list[str] = []
     characters = bible.get("characters") or []
     if not isinstance(characters, list):
@@ -107,9 +114,15 @@ def _character_scale_rows(bible: dict, *, limit: int = 12) -> list[str]:
         if detail:
             hint = _as_text(card.get("出手规模"))
             hint = hint or SCALE_HINTS_15.get(detail) or SCALE_HINTS.get(detail, "")
-            head = f"  · {name}＝{detail}"
-            if seq is not None:
-                head += f"（seq {seq}/15）"
+            if realm:
+                head = f"  · {name}＝境界「{realm}」（量级 {detail}"
+                if seq is not None:
+                    head += f"，seq {seq}/15"
+                head += "）"
+            else:
+                head = f"  · {name}＝{detail}"
+                if seq is not None:
+                    head += f"（seq {seq}/15）"
             rows.append(head + (f"：{hint}" if hint else ""))
         elif realm:
             # 有境界名但没有量级证据：只登记称谓，明确标 unknown，不折算。
