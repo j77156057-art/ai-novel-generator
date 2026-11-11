@@ -32,14 +32,24 @@ import re
 #: 必须**同时**满足「前后缀都很短」才提示；在那种情况下，一句「指令像限定
 #: 局部、结果却像整段重写」的提示本身是合理的，不会阻断任何操作。
 #: 位置锚点：段尾 / 段首。**与补丁范围解析共用同一份词表**——
-#: `app.generation.patch.resolve_scope` 直接引用这两个元组把词映射成编号，
-#: 不另抄一份（两套口径必漂）。
+#: `app.generation.patch.resolve_scope` 直接引用下面这组模式（含带数量的
+#: `TAIL_COUNT_PATTERN` 等）把词映射成编号，不另抄一份（两套口径必漂）。
 TAIL_SCOPE_PATTERNS = (r"结尾", r"段尾", r"最后一句")
 HEAD_SCOPE_PATTERNS = (r"开头", r"段首", r"第一句")
 
 #: 句号编号里的数字字符集；`NTH_SENTENCE_PATTERN` 的捕获组 1 就是它。
-SENTENCE_NUM = r"[0-9一二三四五六七八九十百]+"
+#: 「两」也收进来：口语里「最后两句」「前两句」比「二句」自然得多。
+SENTENCE_NUM = r"[0-9一二三四五六七八九十百两]+"
 NTH_SENTENCE_PATTERN = rf"第\s*({SENTENCE_NUM})\s*句"
+
+#: 带数量的位置词，仍然只在这份词表里定义（``patch.py`` 直接 import，不另抄）：
+#: - ``最后两句 / 末三句``：段尾往前数 N 句；
+#: - ``前两句 / 头三句``：段首往后数 N 句；
+#: - ``倒数第二句``：从段尾往前数的第 N 句（单句）。
+#: 三条的捕获组 1 都是数量（:data:`SENTENCE_NUM`）。
+TAIL_COUNT_PATTERN = rf"(?:最后|末)\s*({SENTENCE_NUM})\s*句"
+HEAD_COUNT_PATTERN = rf"(?:前|头)\s*({SENTENCE_NUM})\s*句"
+COUNTDOWN_PATTERN = rf"倒数第\s*({SENTENCE_NUM})\s*句"
 
 LOCAL_SCOPE_PATTERNS = (
     r"只",
@@ -50,6 +60,9 @@ LOCAL_SCOPE_PATTERNS = (
     r"不改",
     *TAIL_SCOPE_PATTERNS,
     *HEAD_SCOPE_PATTERNS,
+    TAIL_COUNT_PATTERN,
+    HEAD_COUNT_PATTERN,
+    COUNTDOWN_PATTERN,
     NTH_SENTENCE_PATTERN,
     r"某处",
     r"局部",

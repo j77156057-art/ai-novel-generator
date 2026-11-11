@@ -4,22 +4,31 @@
 ## 两级分工
 
 **Tier A（范围词由程序解析）**：指令里出现位置锚点（段尾 / 结尾 / 最后一句 /
-段首 / 开头 / 第一句 / 第 N 句）时，``resolve_scope`` 直接把词映射成编号区间，
-把目标句逐句标出来交给模型。模型只回替换文本；即使它回了编号，编号也必须与
-程序算的一致，否则 ``index_mismatch`` 失败关闭。**改哪一句不再由模型决定。**
+段首 / 开头 / 第一句 / 第 N 句，以及带数量的 最后两句 / 前两句 / 倒数第二句
+等）时，``resolve_scope`` 直接把词映射成编号区间，把目标句逐句标出来交给模型。
+模型只回替换文本；即使它回了编号，编号也必须与程序算的一致，否则
+``index_mismatch`` 失败关闭。**改哪一句不再由模型决定。**
 
 **Tier B（含糊指令）**：``某处`` / ``此处`` / ``这一句`` 这类无法从指令本身
 定位的说法，``resolve_scope`` 返回 None，仍按上一版行为由模型给编号。
 
-## 多句范围的规则（刻意取最小解释）
+## 多句范围的规则
 
-- ``段尾 / 结尾 / 最后一句`` → **只取最后一句**；``段首 / 开头 / 第一句`` →
-  只取第一句；``第 N 句`` → 只取第 N 句。
-- 理由：这些词本身不带 N。「段尾」如果默认取「最后若干句」，N 无界，很容易
-  滑向整段——这正是要修的缺陷。最小、可验证、可回滚的解释就是 1 句；用户要
-  多句时写明确区间（``第 82 句到第 84 句``），由 ``resolve_scope`` 解析成多句
-  跨度并继续校验 ``from <= to``、范围内、不覆盖全文。
-- 因此 Tier A 只有「显式区间」这一条多句路径，不存在「默认取 N 句」。
+- 不带数量的位置词（``段尾 / 结尾 / 最后一句 / 段首 / 开头 / 第一句``）→
+  **1 句**。理由：这些词本身不带 N，若默认取「最后若干句」，N 无界，很容易
+  滑向整段——这正是要修的缺陷。
+- 带数量的位置词（``最后两句 / 最后三句 / 末两句 / 前两句 / 头三句``）→ 程序
+  解析出 **N 句**；``倒数第 N 句`` → 从段尾往前数第 N 句（单句）。中文数字与
+  阿拉伯数字都认。
+- 显式区间（``第 N 句到第 M 句``）**优先于所有位置词**：用户把编号写死时，
+  不要再猜。
+- **数量上界**：``N <= max(SCOPE_COUNT_MIN, total // SCOPE_COUNT_DIVISOR)``
+  且 ``N < total``，超界抛 ``scope_count_too_large`` 失败关闭。判据：超过全文
+  四分之一的句子被同时改写，就很难再说「其余保留」——这是「局部」与「整段」
+  之间一条可验证的分界；至少允许 2 句，是因为 8 句以下的短段 ``total // 4``
+  只有 0–1，不兜底的话「最后两句」在最需要它的短段上反而不可用。**超界直接
+  失败，不静默截断**：按上界截断会让用户以为改了 N 句、实际只改了几分之一，
+  比报错更糟。
 
 ## 拒绝路径：直接失败，不回退整段重写
 
@@ -34,6 +43,7 @@
 ``index_out_of_range``       编号越界
 ``index_reversed``           from_index > to_index
 ``index_mismatch``           Tier A：模型回的编号 ≠ 程序解析出的编号
+``scope_count_too_large``    数量词超过上界（防止「最后一百句」滑回整段）
 ``span_whole_segment``       编号范围覆盖全文
 ``replacement_missing``      缺 replacement 字段
 ``empty_patch``              replacement 为空
@@ -48,14 +58,22 @@ import json
 import re
 
 from app.generation.scope_guard import (
+    COUNTDOWN_PATTERN,
+    HEAD_COUNT_PATTERN,
     HEAD_SCOPE_PATTERNS,
     NTH_SENTENCE_PATTERN,
     SENTENCE_NUM,
+    TAIL_COUNT_PATTERN,
     TAIL_SCOPE_PATTERNS,
 )
 
 REPLACEMENT_SLACK = 60
 REPLACEMENT_RATIO = 3
+#: 数量词上界：``N <= max(SCOPE_COUNT_MIN, total // SCOPE_COUNT_DIVISOR)`` 且
+#: ``N < total``。依据见模块头「数量上界」——四分之一是「局部/整段」之间
+#: 可验证的分界，至少 2 句是短段兜底；**超界失败关闭，不截断**。
+SCOPE_COUNT_MIN = 2
+SCOPE_COUNT_DIVISOR = 4
 #: 「replacement 是整段」的长度判据：达到全文长度的 80%。
 WHOLE_SEGMENT_LENGTH_RATIO = 0.8
 #: 「replacement 是整段」的句数判据：达到全句数的 80%。
@@ -71,6 +89,9 @@ _SENTENCE_RE = re.compile(
 # —— Tier A：范围词 → 编号 ——
 _TAIL_RE = re.compile("|".join(TAIL_SCOPE_PATTERNS))
 _HEAD_RE = re.compile("|".join(HEAD_SCOPE_PATTERNS))
+_TAIL_COUNT_RE = re.compile(TAIL_COUNT_PATTERN)
+_HEAD_COUNT_RE = re.compile(HEAD_COUNT_PATTERN)
+_COUNTDOWN_RE = re.compile(COUNTDOWN_PATTERN)
 _SINGLE_NTH_RE = re.compile(NTH_SENTENCE_PATTERN)
 #: 显式多句区间：第 N 句到第 M 句（到/至/破折号/波浪号均可）。
 _RANGE_RE = re.compile(
@@ -173,12 +194,34 @@ def _bounded_scope(
     }
 
 
+def _count_scope(
+    total: int, count: int, keyword: str, *, from_tail: bool
+) -> dict:
+    """数量词 → 编号区间；超上界失败关闭（**不截断**）。"""
+    if count < 1:
+        raise PatchError(
+            "index_out_of_range", f"指令解析出的句数不是正数：{count}。"
+        )
+    limit = max(SCOPE_COUNT_MIN, total // SCOPE_COUNT_DIVISOR)
+    if count > limit or count >= total:
+        raise PatchError(
+            "scope_count_too_large",
+            f"指令要求改 {count} 句，超过上界 {limit} 句（全文 {total} 句；"
+            f"上界 = max({SCOPE_COUNT_MIN}, total // {SCOPE_COUNT_DIVISOR})，"
+            "且必须少于全文）。已失败关闭，不会截断成上界。",
+        )
+    from_index = total - count + 1 if from_tail else 1
+    to_index = total if from_tail else count
+    return _bounded_scope(from_index, to_index, total, keyword)
+
+
 def resolve_scope(instruction: str, before_text: str) -> dict | None:
     """Tier A：把范围词解析成编号区间；无法定位返回 None（交给 Tier B）。
 
-    解析顺序：显式区间 → 段尾 → 段首 → 第 N 句。词表来自
-    ``scope_guard``（``TAIL_SCOPE_PATTERNS`` / ``HEAD_SCOPE_PATTERNS`` /
-    ``NTH_SENTENCE_PATTERN``），不另造一套。
+    解析顺序（先具体后笼统）：显式区间 → 倒数第 N 句 → 段尾数量词 →
+    段首数量词 → 段尾 → 段首 → 第 N 句。词表来自 ``scope_guard``
+    （``TAIL_SCOPE_PATTERNS`` / ``HEAD_SCOPE_PATTERNS`` / ``NTH_SENTENCE_PATTERN``
+    以及数量词三条），不另造一套。
     """
     text = (instruction or "").strip()
     if not text:
@@ -195,6 +238,20 @@ def resolve_scope(instruction: str, before_text: str) -> dict | None:
             _cn_to_int(match.group(2)),
             total,
             match.group(0),
+        )
+    match = _COUNTDOWN_RE.search(text)
+    if match:
+        index = total - _cn_to_int(match.group(1)) + 1
+        return _bounded_scope(index, index, total, match.group(0))
+    match = _TAIL_COUNT_RE.search(text)
+    if match:
+        return _count_scope(
+            total, _cn_to_int(match.group(1)), match.group(0), from_tail=True
+        )
+    match = _HEAD_COUNT_RE.search(text)
+    if match:
+        return _count_scope(
+            total, _cn_to_int(match.group(1)), match.group(0), from_tail=False
         )
     match = _TAIL_RE.search(text)
     if match:
