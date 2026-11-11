@@ -301,6 +301,7 @@ def build_user_prompt(
     rag_has_forbidden: bool = False,
     *,
     directive_suffix: str | None = None,
+    instruction_suffix: str | None = None,
     node_prompt: str | None = None,
     kg_slice: str | None = None,
     item_holding_block: str | None = None,
@@ -460,6 +461,14 @@ def build_user_prompt(
         # 标题/说明/明细统一走 render_item_holding_section——重写路径复用同一份。
         blocks += ["", render_item_holding_section(item_holding_block)]
     blocks += ["", "【续写指令】", directive]
+    # 用户在对话里明确给出的重写要求。放在【续写指令】之后的指令区，
+    # 不追加到待改正文/物品块/constraints 里；空文本时逐字节不变。
+    instruction_block = _override_section(
+        "本次重写要求（用户指定；与已发生事实、物品归属冲突时以事实为准）",
+        instruction_suffix,
+    )
+    if instruction_block:
+        blocks += ["", instruction_block.rstrip("\n")]
     directive_extra = _override_section(_OVERRIDE_DIRECTIVE_HEADER, directive_suffix)
     if directive_extra:
         blocks += ["", directive_extra.rstrip("\n")]

@@ -144,6 +144,15 @@ def test_strip_thinking_marker():
     s = " <think>reasoning </think>林悠然升职了。【本节完】"
     check("思维链 + marker 都剥", _strip_thinking(s), "林悠然升职了。")
 
+    # 模型把 constraints 回显到正文末尾（实测 p1：marker + 锁定角色 + 未填伏笔）
+    s = (
+        "林悠然升职了。\n\n【本节完】\n\n"
+        "【本段已锁定角色】李浩、项目\n"
+        "【尚未兑现的伏笔】汇报怎么样？"
+    )
+    check("回显的锁定名单与伏笔整行剥离",
+          _strip_thinking(s), "林悠然升职了。")
+
 
 # ── 组 4：build_user_prompt 节末信号 ──
 

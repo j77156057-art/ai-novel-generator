@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 
 from app.db import Base, IS_SQLITE
@@ -522,6 +523,112 @@ class Generation(Base):
     chapter_range = Column(String(32), nullable=True)
     text = Column(Text, nullable=True)
     summary = Column(JSON, nullable=True)
+
+
+class GenerationSnapshot(Base):
+    """重写前的段级快照（撤销「助手重写」的唯一数据源）。
+
+    为什么不复用 `versions`：该表的 `proposal_id` 是 `NOT NULL` 外键，而重写
+    没有提案；且 `versions` 被定义为「永不 UPDATE」的提案产物，而本表必须经历
+    `pending → applied | failed` 的状态流转。结论见
+    `.trae/documents/rewrite-snapshot-design.md` §1。
+
+    ## 两段式写入（崩溃安全的关键）
+
+    1. 调模型**前**插一条 `status='pending'`，只含 `before_*`（独立短事务）；
+    2. 模型返回后，在引擎既有那次提交里 CAS 写正文 + 把本行置 `applied`；
+    3. 失败/超时/中断置 `failed`（留痕 24 小时），由清理任务删除。
+
+    任何崩溃点都不会出现「正文已变但快照没写」——正文与 `applied` 同事务。
+
+    ## 并发
+
+    `uq_gs_pending` 是 `(project_id, segment_no) WHERE status='pending'` 的
+    **部分唯一索引**：同段同时只允许一个在途重写。它是把双刃剑——进程崩溃后
+    残留的 `pending` 会挡住同段重写，故在途行带**租约**（见下）。
+
+    ## 租约（2026-11-12）
+
+    `pending` 行同时是一条租约：`owner_pid` + `owner_started_at` 证明「哪个
+    进程、哪一次启动」在写，`heartbeat_at` 是它最后一次确认存活。三层判据：
+
+    - 所有者 pid 不存在 / 启动时刻对不上（pid 被复用）→ 启动收割/进入前直接清；
+    - 所有者活着但 `heartbeat_at` 超过 `max(3×心跳间隔, 60s)` → **不自动清**，
+      返回 409 并提供显式「强制接管」（条件 UPDATE 做 CAS）；
+    - 接管成功后原行置 `failed`，`error_reason` 记录原持有者与停跳时长。
+
+    不再用固定的 30 分钟超时：回滚链路会重放全书 KG，一次可能远超 5 分钟，
+    「活得久」不等于「死了」。`owner_started_at` 不能省——只比 pid 会把
+    「pid 被别的进程复用」误判成原持有者还活着。
+
+    `before_hash` / `after_hash` 是正文 sha256，提交与回滚都用它做 CAS：
+    不引入 `generations.edit_seq`——`/regenerate-stream` 与提案 apply 不维护
+    计数器，那种「版本号」会给出一致性的假象。
+
+    ## 摘要为什么也要存
+
+    设计文档只写了正文，但 `rebuild_summary_tree` 是从 `generations.summary`
+    重建 L1 的（engine.py:538）。只退正文不退摘要，重建出来的摘要树仍然是
+    重写后的内容——「摘要说 A、正文是 B」。故 `before_summary` / `after_summary`
+    与正文同事务落库，回滚时一起恢复。
+    """
+
+    __tablename__ = "generation_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    generation_id = Column(Integer, ForeignKey("generations.id"), nullable=False)
+    segment_no = Column(Integer, nullable=False)
+    # 一次用户操作（「最近 3 段一起调语气」）共享一个 UUID；单段重写也生成一个。
+    batch_id = Column(String(36), nullable=False)
+    # rewrite | batch_rewrite | rollback
+    operation = Column(String(24), nullable=False)
+    # pending | applied | failed | rolled_back
+    status = Column(String(16), nullable=False, default="pending")
+    before_text = Column(Text, nullable=False)
+    after_text = Column(Text, nullable=True)
+    # 段摘要（generations.summary 的 JSON 整体）：回滚必须连摘要一起退，
+    # 否则摘要树重建出来仍是重写后的内容。
+    before_summary = Column(JSON, nullable=True)
+    after_summary = Column(JSON, nullable=True)
+    before_hash = Column(String(64), nullable=False)  # sha256(before_text)
+    after_hash = Column(String(64), nullable=True)
+    instruction = Column(Text, nullable=True)  # 本次重写要求，解释「为什么变成这样」
+    agent_run_id = Column(Integer, ForeignKey("agent_runs.id"), nullable=True)
+    # 快照时点的 plot_bible 指纹：回滚前比对，防「正文退了、名字没退」。
+    bible_hash = Column(String(64), nullable=True)
+    # model_error | timeout | client_disconnect | concurrent_edit | process_restart
+    # 强制接管时写 taken_over:owner_pid=…;stale=…s;by_pid=…
+    error_reason = Column(String(255), nullable=True)
+    # —— 在途租约（仅 pending 有意义）——
+    # 写入者 pid 与其**进程启动时刻**指纹（防 pid 复用）。两者必须同时比对：
+    # 只比 pid 时，崩溃后 pid 被别的进程复用会被误判成「原持有者还活着」。
+    owner_pid = Column(Integer, nullable=True)
+    owner_started_at = Column(String(64), nullable=True)
+    # 最后一次心跳（流式输出期间节流更新）。NULL = 升级前的存量 pending，
+    # 没有租约证据，按「已过期」处理，但绝不按 created_at 补一个假心跳。
+    heartbeat_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    rolled_back_at = Column(DateTime, nullable=True)
+    rolled_back_by_snapshot_id = Column(
+        Integer, ForeignKey("generation_snapshots.id"), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_gs_project_segment", "project_id", "segment_no", "id"),
+        Index("ix_gs_batch", "batch_id", "segment_no"),
+        Index("ix_gs_status_created", "status", "created_at"),
+        # 同段只允许一个在途重写。SQLite / PG 都支持部分索引。
+        Index(
+            "uq_gs_pending",
+            "project_id",
+            "segment_no",
+            unique=True,
+            sqlite_where=text("status = 'pending'"),
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
 
 
 class AppSetting(Base):

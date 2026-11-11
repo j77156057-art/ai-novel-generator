@@ -20,6 +20,7 @@ from app.routers import assistant_audit as assistant_audit_router
 from app.routers import assistant_generation as assistant_generation_router
 from app.routers import assistant_clean as assistant_clean_router
 from app.routers import assistant_wizard as assistant_wizard_router
+from app.routers import assistant_snapshot as assistant_snapshot_router
 from app.routers import kg_v3 as kg_v3_router
 
 
@@ -78,6 +79,28 @@ async def lifespan(app: FastAPI):
         )
     except Exception as exc:  # noqa: BLE001 —— 记账失败不该拖垮启动
         logging.getLogger(__name__).warning("canon 来源记账失败（已忽略）：%s", exc)
+
+    # —— 重写快照：收割「所有者已死」的在途行 ——
+    # 多 worker 同时启动时，别的 worker 的 pending 还活着：只清 pid 不存在 /
+    # 启动时刻对不上（pid 被复用）的行，绝不按「我刚启动」整批清。活着但
+    # 心跳超时的行留给 409 + 显式接管（见 snapshot.py 模块 docstring）。
+    # 顺手做一次保留策略清理（failed 超 24h）。
+    try:
+        from app.agents.dialog.snapshot import (
+            purge_snapshots,
+            reap_orphan_pending,
+        )
+
+        with SessionLocal() as db:
+            reaped = reap_orphan_pending(db)
+            purged = purge_snapshots(db)
+        if reaped or purged["failed_deleted"] or purged["applied_deleted"]:
+            logging.getLogger(__name__).info(
+                "启动收割重写快照：无主 pending→failed %s 条，清理 failed %s / applied %s 条",
+                reaped, purged["failed_deleted"], purged["applied_deleted"],
+            )
+    except Exception as exc:  # noqa: BLE001 —— 收割是增强，不是启动的前提
+        logging.getLogger(__name__).warning("重写快照启动收割失败（已忽略）：%s", exc)
     yield
 
 
@@ -103,6 +126,8 @@ app.include_router(assistant_generation_router.router)
 app.include_router(assistant_clean_router.router)
 # 对话式创作引导：/api/assistant/wizard/*（会话落库，复用既有蒸馏/大纲/生成链路）。
 app.include_router(assistant_wizard_router.router)
+# 重写快照的撤销入口：/api/assistant/snapshots/*（列表 / 单段回滚 / 整批回滚）。
+app.include_router(assistant_snapshot_router.router)
 
 
 @app.get("/health")

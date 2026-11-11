@@ -16,6 +16,7 @@ from app.generation.prompts import (
     build_system_prompt,
     build_user_prompt,
     merged_constraint_items,
+    render_item_holding_section,
 )
 from app.generation.timeline import (
     TimelineState,
@@ -41,6 +42,7 @@ from app.generation.summary_tree import (
 )
 from app.kg.book_scope import book_for_project as _book_for_project
 from app.kg.queries import get_reminders
+from app.llm.provider import render_constraints
 from app.models import Generation, Project
 from app.retrieval.search import hybrid_search
 from app.style.exemplar import sample_style_exemplars
@@ -62,6 +64,21 @@ def _strip_thinking(text: str) -> str:
         # 只有开标签没有闭标签：从开标签后全部丢弃不可靠，退化为原样返回
     # v2.6：剥离【本节完】marker 行（如果存在）。通常 stop token 已停在此之前，
     # 但模型偶尔可能已输出 marker 才被 stop——保险剥离避免污染落库。
+    # 2026-11-10：有的模型还会把 constraints 回显到正文末尾（【本段已锁定角色】/
+    # 【尚未兑现的伏笔】两行）。它们排在 marker 之后，先把这段回显整行剥掉，
+    # 再交给 marker 正则，否则 marker 不在末尾、正则匹配不到（实测 p1 落库段落
+    # 末三行就是 marker + 两行锁定名单）。
+    lines = text.rstrip().splitlines()
+    while lines:
+        last = lines[-1].strip()
+        if not last:
+            lines.pop()
+            continue
+        if last.startswith(("【本段已锁定角色", "【尚未兑现的伏笔")):
+            lines.pop()
+            continue
+        break
+    text = "\n".join(lines)
     # 模式：行首可有 0+ 空白（包含换行/空格/制表），然后是 marker，
     # marker 后到行尾可能有空白——$ 用 \Z 而不是 $（不受多行模式影响）
     import re
@@ -1094,12 +1111,23 @@ def _gather_rewrite_evidence(db, project, text: str, reasons: list[str],
 
 
 def _rewrite_prompt(text: str, reasons: list[str], forbidden: dict | None,
-                    evidence: list[dict] | None = None) -> tuple[str, str]:
+                    evidence: list[dict] | None = None,
+                    item_holding_block: str | None = None,
+                    constraints: dict | None = None) -> tuple[str, str]:
     """构造针对性重写的 system/user prompt。
 
     evidence：`_gather_rewrite_evidence` 产出的「原文对照」证据。
     **为 None/空列表时 user 回退到旧形状**（问题清单 + 待改正文），
     保证快档与无证据场景逐字节不变。
+
+    item_holding_block：与初稿同一份物品持有块（`build_context` 的产物）。
+    重写是"会替换正文"的路径，必须携带同一份已发生事实与 constraints——
+    否则注入只作用于被丢弃的初稿（2026-11-10 实测：p1 落库正文来自重写，
+    重写 prompt 里没有物品持有块）。
+
+    constraints：与初稿同一份锁定名单。**必须放 system、不能追加在 user 末尾**：
+    重写的 user 末尾是「待改正文」，把锁定名单排在正文之后，模型会把它当成
+    正文内容原样吐出来（实测落库段落末三行 = 【本节完】+ 锁定角色 + 未填伏笔）。
     """
     system = (
         "你是一位资深中文网文编辑。你的任务是将一段 AI 生成的文本改写得更像真人写的网文。\n\n"
@@ -1112,15 +1140,22 @@ def _rewrite_prompt(text: str, reasons: list[str], forbidden: dict | None,
         "6. 允许留白，段落可以以一个动作或物件收住\n"
         "7. 具体优于形容，少堆形容词\n"
     )
+    if item_holding_block:
+        # 只在有块时追加：无块项目的重写 prompt 逐字节不变。
+        system += "8. 不得改动物品归属；与【物品持有事实】冲突时以事实为准\n"
     if forbidden:
         for dim, items in forbidden.items():
             if items:
                 system += f"\n【{dim}】禁止使用：{'、'.join(items[:8])}"
+    constraint_text = render_constraints(constraints)
+    if constraint_text:
+        system += (
+            "\n\n【本段锁定信息（只用于约束，禁止把这些条目原样写进正文）】\n"
+            + constraint_text
+        )
     system += "\n\n只输出改写后的正文，不要输出任何解释或标记。"
-    user = (
-        f"以下文本存在以下 AI 腔问题：\n{'；'.join(reasons)}\n\n"
-        f"请改写：\n\n{text}"
-    )
+    head = f"以下文本存在以下 AI 腔问题：\n{'；'.join(reasons)}"
+    parts = [head]
     if evidence:
         # 【原文对照】块：每条证据都带**来源标注**（前文第 N 段 / 参考语料《X》第 M 章），
         # 让模型分清哪段是「你自己更早写下的事实」、哪段是「别人写的同类场景」。
@@ -1130,25 +1165,33 @@ def _rewrite_prompt(text: str, reasons: list[str], forbidden: dict | None,
             f"- 来源：{e.get('source') or '未知'}（{e.get('kind') or '未知'}）\n{e.get('text') or ''}"
             for e in evidence
         ]
-        user = (
-            f"以下文本存在以下 AI 腔问题：\n{'；'.join(reasons)}\n\n"
+        parts.append(
             "【原文对照】以下片段仅供你对照调性与前文事实：参考语料是同类场景的写法参考，"
             "前文片段是你自己更早写下的事实。**只学表达方式、只保证与前文不矛盾，"
             "不要照抄内容，也不要把参考语料的情节搬进本段。**\n"
             + "\n\n".join(blocks)
-            + "\n\n"
-            f"请改写：\n\n{text}"
         )
-    return system, user
+    section = render_item_holding_section(item_holding_block)
+    if section:
+        parts.append(section)
+    parts.append(f"请改写：\n\n{text}")
+    return system, "\n\n".join(parts)
 
 
 def _rewrite_with_evidence(db, project, provider, text: str, reasons: list[str],
-                           forbidden: dict | None) -> tuple[str | None, dict | None]:
+                           forbidden: dict | None, *,
+                           item_holding_block: str | None = None,
+                           constraints: dict | None = None) -> tuple[str | None, dict | None]:
     """执行一次针对性重写，返回 (rewritten_text_or_None, rewrite_info)。
 
     抽出成公共函数是为了让 `generate_next_segment` 与 `generate_next_segment_stream`
     **两个入口的重写语义完全一致**——原先两处各写一遍，任何一边漏改都会造成
     「流式与非流式重写结果不同」这种极难排查的不一致。
+
+    **必须携带与初稿同一份注入**（2026-11-10 修）：
+    `item_holding_block` 原样进入重写 user prompt，`constraints` 进入重写 system
+    （**不能**交给 provider 追加到 user 末尾——重写 user 末尾是待改正文，追加会
+    被模型当正文回显）。重写会替换正文，如果这里不带，注入就只作用于被丢弃的初稿。
 
     完整档（_selfcheck_enabled）才收集原文对照证据；其余档位 evidence 为空，
     prompt 回退旧形状，零新增调用。
@@ -1160,7 +1203,13 @@ def _rewrite_with_evidence(db, project, provider, text: str, reasons: list[str],
     if _selfcheck_enabled(project):
         evidence, selfcheck = _gather_rewrite_evidence(db, project, text, reasons, forbidden)
     try:
-        rw_system, rw_user = _rewrite_prompt(text, reasons, forbidden, evidence)
+        rw_system, rw_user = _rewrite_prompt(
+            text, reasons, forbidden, evidence,
+            item_holding_block=item_holding_block,
+            constraints=constraints,
+        )
+        # constraints 已进 system；不能再走 provider 的"追加到 user 末尾"通道——
+        # 重写的 user 末尾是待改正文，追加会把锁定名单挤进正文被模型回显。
         rewritten = provider.chat(rw_system, rw_user)
         rewritten = _strip_thinking(rewritten)
         if rewritten and len(rewritten) > len(text) * 0.5:
@@ -1168,6 +1217,9 @@ def _rewrite_with_evidence(db, project, provider, text: str, reasons: list[str],
                 "reasons": reasons,
                 "original_chars": len(text),
                 "rewritten_chars": len(rewritten),
+                # 观测位：重写是否真的携带了注入块 / 锁定名单（而不是又走回老路）
+                "item_holding_injected": bool(item_holding_block),
+                "constraints_injected": bool(render_constraints(constraints)),
             }
             # selfcheck 是纯新增键 —— 既有字段语义一个字都不改
             if selfcheck:
@@ -1541,7 +1593,11 @@ def generate_next_segment(
     need_rewrite, reasons = _should_rewrite(text, forbidden)
     if need_rewrite:
         # 重写（完整档会带原文对照证据）——流式与非流式共用同一实现，语义一致
-        rewritten, info = _rewrite_with_evidence(db, project, provider, text, reasons, forbidden)
+        rewritten, info = _rewrite_with_evidence(
+            db, project, provider, text, reasons, forbidden,
+            item_holding_block=ctx.get("item_holding_block") or None,
+            constraints=ctx.get("constraints"),
+        )
         if rewritten:
             text = rewritten
             summary = provider.summarize(text)
@@ -1726,7 +1782,11 @@ def generate_next_segment_stream(
     need_rewrite, reasons = _should_rewrite(text, forbidden)
     if need_rewrite:
         # 与 generate_next_segment 共用同一实现：流式路径的重写语义必须完全一致
-        rewritten, info = _rewrite_with_evidence(db, project, provider, text, reasons, forbidden)
+        rewritten, info = _rewrite_with_evidence(
+            db, project, provider, text, reasons, forbidden,
+            item_holding_block=ctx.get("item_holding_block") or None,
+            constraints=ctx.get("constraints"),
+        )
         if rewritten:
             text = rewritten
             summary = provider.summarize(text)
@@ -1826,6 +1886,7 @@ def _build_generation_prompts(
     provider=None,
     reminders: dict | None = None,
     node_prompt: str | None = None,
+    instruction: str | None = None,
 ):
     """组装提示词；`before_segment` 给定时的前情**只取该段之前**（重生成用）。
 
@@ -1888,6 +1949,7 @@ def _build_generation_prompts(
             before_segment if before_segment is not None
             else (_next_segment_no(db, project.id) - 1),
         ) or None,
+        instruction_suffix=instruction,
     )
     return system, user, max_chars
 
@@ -1899,6 +1961,9 @@ def regenerate_segment_stream(
     novel_ids: list[int] | None = None,
     provider=None,
     max_chars: int | None = None,
+    instruction: str | None = None,
+    snapshot_id: int | None = None,
+    expected_before: str | None = None,
 ):
     """重生成单段（流式）：删除目标段旧内容、依前文摘要链重生成插回、重建摘要链。
 
@@ -1908,6 +1973,14 @@ def regenerate_segment_stream(
 
     `novel_ids` 目前**未被使用**——重生成有意不带 RAG 素材（见
     `_build_generation_prompts` 的 `[]` 实参），保留参数以维持调用方契约。
+    `instruction`（2026-11-11）：对话助手重写卡带的用户要求。只注入
+    user prompt 的【本次重写要求】指令区（不进待改正文/物品块/constraints）；
+    为空时提示词与旧版逐字节相同。done 事件用 `instruction_injected` 回报
+    是否真的出现在发出的 prompt 里，供 API/测试核对。
+    `snapshot_id` / `expected_before`（2026-11-11 快照）：助手重写走两段式写入——
+    调用方在调模型前已写好 `pending` 快照，这里用 CAS（`WHERE text = expected_before`）
+    写正文并与快照 `applied` 同事务提交。两者都为 None 时走原有赋值路径，
+    `/regenerate-stream` 的行为逐字节不变。
     v2.3：传 `node_prompt` 给 `_build_generation_prompts`——重生成用时间线模式
     剔除全故事信息。**不**调 `_judge_and_advance`——重生成替换第 N 段语义
     上不改 `_next_segment_no`（已存在），不应触发 state advance。
@@ -1942,17 +2015,45 @@ def regenerate_segment_stream(
     system, user, max_chars = _build_generation_prompts(
         db, project, before_segment=segment_no, novel_ids=novel_ids,
         max_chars=max_chars, provider=provider, reminders=reminders,
-        node_prompt=node_prompt,
+        node_prompt=node_prompt, instruction=instruction,
     )
+    # 指令是否**真的**出现在发出的 user prompt 里（只看渲染后的文本，不看入参）。
+    # 空/纯空白指令一律 False，与改动前「不注入」行为一致。
+    _instruction = (instruction or "").strip()
+    instruction_injected = bool(_instruction) and _instruction in user
     # constraints 与正常续写同源（角色/伏笔的锁定名单不能因重生成而变）。
     # 只组装这一个 dict，**不跑 build_context**：那条路会为 RAG 与风格样例各加载
     # 一遍全部 NovelChunk，而重生成的 user prompt 不带 RAG 素材，结果全部丢弃。
     constraints = _constraints_from(reminders, project)
 
     pieces: list[str] = []
-    for piece in provider.stream_chat(system, user, constraints=constraints):
-        pieces.append(piece)
-        yield {"type": "chunk", "text": piece}
+    # —— 在途租约心跳（仅助手重写路径）——
+    # 每 20 秒最多写一次 ``heartbeat_at``（snapshot.SnapshotLease 在内存里
+    # 节流）；``snapshot_id is None`` 的 /regenerate-stream 完全不产生额外写。
+    # 心跳与生成/抽取抢写锁是真实成本，所以不做「每 chunk 一次无条件 UPDATE」。
+    lease = None
+    if snapshot_id is not None:
+        from app.agents.dialog.snapshot import SnapshotLease
+
+        lease = SnapshotLease(snapshot_id)
+        lease.touch(db)  # 开流前刷新一次（begin 之后可能已过一段时间）
+    try:
+        for piece in provider.stream_chat(system, user, constraints=constraints):
+            if lease is not None:
+                lease.touch(db)
+            pieces.append(piece)
+            yield {"type": "chunk", "text": piece}
+    except BaseException as exc:  # noqa: BLE001 —— 含客户端断开（GeneratorExit）
+        # 快照留痕：模型报错/超时/客户端中断都置 failed，正文一行没动。
+        # 不做这两行的话，残留的 pending 会变成一条没有心跳的租约，该段要等
+        # 心跳判据超时后由用户显式接管才能重写。
+        if snapshot_id is not None:
+            from app.agents.dialog.snapshot import fail_snapshot
+
+            reason = ("client_disconnect" if isinstance(exc, GeneratorExit)
+                      else type(exc).__name__)
+            fail_snapshot(db, snapshot_id, reason)
+        raise
 
     text = _strip_thinking("".join(pieces))
     summary = provider.summarize(text)
@@ -1982,18 +2083,52 @@ def regenerate_segment_stream(
     if text != era_before:
         summary = provider.summarize(text)
 
-    target.text = text
-    target.summary = {
+    new_summary = {
         "text": summary,
         "era": {**era_prompt_meta, **era_meta},
         "power": power_meta,
     }
-    target.chapter_range = f"段{segment_no}"
 
-    # —— 重生成的 KG 簿记（清空 + 全量 replay）——
-    # ⚠️ 顺序陷阱：rebuild_generated_kg 从 Generation 表读各段正文，新文本必须先
-    # 落库，否则 replay 读到的是**旧**文本 —— 等于没修。故此 commit 必须在 replay 前。
-    db.commit()
+    if snapshot_id is None:
+        # —— 旧路径（/regenerate-stream、测试）：逐字节不变 ——
+        target.text = text
+        target.summary = new_summary
+        target.chapter_range = f"段{segment_no}"
+
+        # —— 重生成的 KG 簿记（清空 + 全量 replay）——
+        # ⚠️ 顺序陷阱：rebuild_generated_kg 从 Generation 表读各段正文，新文本必须先
+        # 落库，否则 replay 读到的是**旧**文本 —— 等于没修。故此 commit 必须在 replay 前。
+        db.commit()
+    else:
+        # —— 两段式写入（助手重写）：正文 CAS + 快照 applied 同一事务 ——
+        from app.agents.dialog.snapshot import (
+            ConcurrentEdit,
+            fail_snapshot,
+            finalize_snapshot,
+        )
+
+        try:
+            finalize_snapshot(
+                db,
+                snapshot_id=snapshot_id,
+                generation_id=target.id,
+                segment_no=segment_no,
+                expected_before=expected_before,
+                new_text=text,
+                new_summary=new_summary,
+            )
+            # 与上面旧路径同一个提交点：正文与快照一起落，中间崩了都不会出现
+            # 「正文变了但快照还是 pending」。
+            db.commit()
+        except ConcurrentEdit:
+            db.rollback()
+            fail_snapshot(db, snapshot_id, "concurrent_edit")
+            raise
+        except BaseException as exc:  # noqa: BLE001 —— 含中断
+            db.rollback()
+            fail_snapshot(db, snapshot_id, type(exc).__name__)
+            raise
+
     kg_stats = None
     try:
         from app.kg.build import rebuild_generated_kg
@@ -2015,9 +2150,14 @@ def regenerate_segment_stream(
         "summary": summary,
         "summary_tree": tree_stats,
         "rewrite_info": rewrite_info,
+        # 本次重写要求是否真的进了发出的 prompt（供 API/测试事后核对；
+        # 空指令恒为 False）。正文已落库，此标记只描述提示词，不改文本。
+        "instruction_injected": instruction_injected,
         "era": {**era_prompt_meta, **era_meta},
         "power": power_meta,
         "id": target.id,
+        # 快照 id（助手重写才有）：撤销入口据此定位「上一次」。
+        "snapshot_id": snapshot_id,
         # 与流式续写路径（generate_next_segment_stream）的 done 键对齐，
         # 让重生成也带上簿记统计，可被前端/API 观测。
         "kg": kg_stats,

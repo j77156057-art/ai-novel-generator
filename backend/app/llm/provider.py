@@ -153,15 +153,17 @@ class LLMProvider:
         return joined[:limit] + ("…" if len(joined) > limit else "")
 
 
-def _apply_constraints(user: str, constraints: dict | None) -> str:
-    """把 constraints（已锁定角色 / 未兑现伏笔）真正序列化进 prompt。
+def render_constraints(constraints: dict | None) -> str:
+    """把 constraints（已锁定角色 / 未兑现伏笔）渲染成 prompt 片段。
 
-    旧实现只把 constraints 传给 LocalFallbackLLMProvider，真实 OpenAI 兼容 provider
-    签名收下却从不使用——于是「约束进入生成环」只在离线兜底路径成立，生产模型完全
-    拿不到角色约束。现统一在 user 末尾追加（不动 system，避免击穿静态提示词缓存）。
+    生成与重写共用同一份措辞：
+    - 生成走 `_apply_constraints`，追加在 user 末尾；
+    - 重写不能追加在末尾——那会把锁定名单排在"待改正文"之后，模型会把它当成
+      正文的一部分原样吐出来（2026-11-10 实测：落库段落末尾出现
+      【本节完】+【本段已锁定角色】+【尚未兑现的伏笔】）。重写改为放进 system。
     """
     if not constraints:
-        return user
+        return ""
     parts: list[str] = []
     chars = [str(c) for c in (constraints.get("characters") or []) if c]
     holes = [str(h) for h in (constraints.get("plotholes") or []) if h]
@@ -173,9 +175,20 @@ def _apply_constraints(user: str, constraints: dict | None) -> str:
         parts.append(
             "【尚未兑现的伏笔（可推进或隐晦呼应，不要集中回收）】" + "；".join(holes)
         )
-    if not parts:
+    return "\n".join(parts)
+
+
+def _apply_constraints(user: str, constraints: dict | None) -> str:
+    """把 constraints（已锁定角色 / 未兑现伏笔）真正序列化进 prompt。
+
+    旧实现只把 constraints 传给 LocalFallbackLLMProvider，真实 OpenAI 兼容 provider
+    签名收下却从不使用——于是「约束进入生成环」只在离线兜底路径成立，生产模型完全
+    拿不到角色约束。现统一在 user 末尾追加（不动 system，避免击穿静态提示词缓存）。
+    """
+    section = render_constraints(constraints)
+    if not section:
         return user
-    return user + "\n\n" + "\n".join(parts)
+    return user + "\n\n" + section
 
 
 class OpenAICompatibleChatProvider(LLMProvider):

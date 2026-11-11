@@ -235,6 +235,14 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("ai_flavor_memories", "last_reused_at", "DATETIME"),
         ("ai_flavor_memories", "recurrences", "INTEGER NOT NULL DEFAULT 0"),
         ("ai_flavor_memories", "flagged_ineffective", "BOOLEAN NOT NULL DEFAULT 0"),
+        # —— 重写快照的在途租约（2026-11-12）——
+        # 只加列、**不回填**：存量 pending 行三列保持 NULL。按 created_at 补
+        # 心跳等于给僵尸行发一张新租约（会让崩溃残留多活一个判据周期）；
+        # 补 pid 更糟，可能撞上被复用的 pid。NULL 的语义是「升级前写入、
+        # 无租约证据」，启动收割按「pid 不存在」清掉。
+        ("generation_snapshots", "owner_pid", "INTEGER"),
+        ("generation_snapshots", "owner_started_at", "VARCHAR(64)"),
+        ("generation_snapshots", "heartbeat_at", "DATETIME"),
     ]
     # v3.0 KG 索引定义（ensure_schema 同步建，_migrate_sqlite_columns 老库补建）
     v30_indexes = [

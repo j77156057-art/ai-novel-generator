@@ -126,6 +126,9 @@ class AssistantInvokeGenerationRequest(StrictRequest):
     max_chars: int | None = None
     #: 用户显式指令（非空）。空串/纯空白 → 422。
     instruction: str
+    #: 仅当上一次 409 返回 ``can_takeover=true`` 后由用户显式要求时传 true。
+    #: 服务层仍会用条件 UPDATE 做 CAS：原持有者心跳没超时就不会抢走。
+    takeover: bool = False
 
     @model_validator(mode="after")
     def _validate_action_fields(self) -> "AssistantInvokeGenerationRequest":
@@ -597,13 +600,32 @@ def assistant_invoke_generation(
        下次生成的输入；自带事务与异常兜底，失败绝不影响本次已成功的
        生成（见 `_run_ai_flavor_feedback`）。
 
-    `instruction` 原样进 AgentRun.request_hash 与响应 `answer`，让
-    「助手为什么写了这一段」在审计链里可回答。
+    `instruction` 原样进 AgentRun.request_hash 与响应 `answer`；`regenerate_segment`
+    分支还会把它下发给引擎，渲染成提示词里的【本次重写要求】指令区（2026-11-11），
+    响应里的 `instruction_injected` 回报它是否真的出现在发出的 prompt 中。
     """
     project = _require_project(db, body.project_id)
+    target: Generation | None = None
+    snapshot = None
     if body.action == "regenerate_segment":
         # 先校验再开 run：目标段不存在时不留一条空跑的审计记录
-        _require_segment(db, project.id, body.segment_no)
+        target = _require_segment(db, project.id, body.segment_no)
+        # —— 两段式写入第一段：调模型**前**写 pending 快照（独立短事务）——
+        # 同段已有在途重写时抛 SnapshotBusy（部分唯一索引兜底）→ 409。
+        # 放在开 AgentRun 之前：被并发挡下的请求根本没跑模型，不该留一条
+        # 「running → failed」的空审计（与上面 404 先校验同一纪律）。
+        from app.agents.dialog.snapshot import SnapshotBusy, begin_snapshot
+
+        try:
+            snapshot = begin_snapshot(
+                db, project, target,
+                instruction=body.instruction,
+                takeover=body.takeover,
+            )
+        except SnapshotBusy as exc:
+            # detail 已在服务层算好（含 can_takeover / 原持有者 / 停跳秒数 /
+            # 可选动作）；这里不再拼字段，避免把 SQL/约束错误原文漏给用户。
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
 
     run = AgentRun(
         project_id=project.id,
@@ -622,6 +644,10 @@ def assistant_invoke_generation(
     db.add(run)
     db.flush()
     run_id = run.id
+    if snapshot is not None:
+        # 把 AgentRun 挂到快照上（失败排查时能顺着快照找到这次 run）。
+        snapshot.agent_run_id = run_id
+        db.commit()
 
     writer_model = ""
     try:
@@ -680,7 +706,16 @@ def assistant_invoke_generation(
         pieces: list[str] = []
         done: dict[str, Any] = {}
         for event in regenerate_segment_stream(
-            db, project, body.segment_no, max_chars=body.max_chars
+            db,
+            project,
+            body.segment_no,
+            max_chars=body.max_chars,
+            # 用户的重写要求真正下发进生成提示（引擎侧渲染到
+            # 【本次重写要求】指令区）；空串时提示词与改动前逐字节一致。
+            instruction=body.instruction,
+            # 两段式写入第二段：正文 CAS + 快照 applied 在引擎那次提交里一起落。
+            snapshot_id=snapshot.id,
+            expected_before=snapshot.before_text,
         ):
             if event.get("type") == "chunk":
                 pieces.append(event.get("text") or "")
@@ -689,6 +724,7 @@ def assistant_invoke_generation(
         if not done:
             raise RuntimeError("重生成流式结束但没有产出 done 事件")
         text = "".join(pieces)
+        instruction_injected = bool(done.get("instruction_injected"))
         gen_id = done.get("id")
         gen = db.get(Generation, gen_id) if gen_id else None
         if gen is None:
@@ -712,11 +748,21 @@ def assistant_invoke_generation(
         flavor_feedback = _run_ai_flavor_feedback(
             db, project, gen.text, body.segment_no, body.instruction
         )
-        return {
-            "answer": (
+        # 回答只在指令**确实进了 prompt** 时才声称「已按你的指令」；
+        # 空指令保持改动前的原文案（逐字一致），带指令但未注入则如实说明。
+        if (body.instruction or "").strip() and not instruction_injected:
+            answer = (
+                f"已重写第 {body.segment_no} 段"
+                f"（{len(text)} 字，Writer 模型 {writer_model}），"
+                "但你的重写要求没能进入这次生成，建议重试这一段。"
+            )
+        else:
+            answer = (
                 f"已按你的指令重写第 {body.segment_no} 段"
                 f"（{len(text)} 字，Writer 模型 {writer_model}）。"
-            ),
+            )
+        return {
+            "answer": answer,
             "agent_run_id": run_id,
             "action": body.action,
             "writer_model": writer_model,
@@ -724,17 +770,37 @@ def assistant_invoke_generation(
             "chars": len(text),
             "summary": done.get("summary") or "",
             "summary_tree": done.get("summary_tree") or {},
+            # 指令是否真的进了发出的 prompt（空指令恒为 False，与改前一致）。
+            "instruction_injected": instruction_injected,
             # 闭环摘要（旁路观测）：与 generate_next 分支同键同形状，
             # 异常/未达记忆线时为 None。前端据此提示「本次已沉淀 AI 腔教训」。
             "ai_flavor_feedback": flavor_feedback,
+            # 撤销入口：这段正文现在可以退回到 snapshot 的 before_text。
+            "snapshot_id": snapshot.id if snapshot is not None else None,
+            "batch_id": snapshot.batch_id if snapshot is not None else None,
         }
     except Exception as exc:  # noqa: BLE001 - 生成失败必须留痕，不静默 200
         logger.warning("invoke-generation 失败（project=%s）：%s", project.id, exc)
+        # 快照留痕（正文未变）：模型报错/超时/中断时把 pending 置 failed。
+        # 引擎在流式中断时已标过一次，这里是兜底（只对 pending 生效，幂等）。
+        if snapshot is not None:
+            from app.agents.dialog.snapshot import fail_snapshot
+
+            fail_snapshot(db, snapshot.id, type(exc).__name__)
         run.status = "failed"
         run.finished_at = _now_utc()
         run.model = writer_model or "(unknown)"
         run.note = f"这次生成是助手调用的（失败）：{str(exc)[:120]}"
         db.commit()
+        # 并发改正文（另一个入口在生成期间写过该段）→ 409，不是 500。
+        from app.agents.dialog.snapshot import ConcurrentEdit
+
+        if isinstance(exc, ConcurrentEdit):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": str(exc),
+                        "segment_no": getattr(exc, "segment_no", body.segment_no)},
+            ) from exc
         raise HTTPException(
             status_code=500, detail=f"助手调动生成失败：{str(exc)[:200]}"
         )

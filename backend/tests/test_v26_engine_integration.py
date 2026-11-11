@@ -108,10 +108,71 @@ def test_engine_return_field_in_unit():
     )
 
 
+# ── 组 4：重写路径必须携带物品持有块与 constraints（2026-11-10 修）──
+
+def test_rewrite_carries_item_block_and_constraints():
+    print("\n=== 组 4: 重写携带注入块 ===")
+    import inspect
+
+    from app.generation import engine
+
+    block = "- 镇国剑：权属（own）归镇北王（九十六至一百零六章）"
+    system, user = engine._rewrite_prompt(
+        "正文" * 80, ["机械转折"], None, None, item_holding_block=block,
+    )
+    check("重写 system 声明不得改动物品归属",
+          "不得改动物品归属" in system, True)
+    check("重写 user 含块标题",
+          "【物品持有事实（已写内容最新一段；续写须与此一致）】" in user, True)
+    check("重写 user 含块明细", block in user, True)
+    check("块在「请改写」之前", user.index(block) < user.index("请改写："), True)
+    check("优先级说明随块一起下发", "不要静默改写物品归属" in user, True)
+
+    # 无块时保持旧形状：不加第 8 条、不出现块标题
+    s2, u2 = engine._rewrite_prompt("正文" * 80, ["机械转折"], None, None)
+    check("无块 system 不加第 8 条", "不得改动物品归属" in s2, False)
+    check("无块 user 不含块标题", "【物品持有事实" in u2, False)
+
+    class _Provider:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, system, user, constraints=None, stop_sequences=None):
+            self.calls.append(
+                {"system": system, "user": user, "constraints": constraints}
+            )
+            return "改写后的正文，" * 40
+
+    p = _Provider()
+    cons = {"characters": ["李浩"], "plotholes": ["策划书去哪了"]}
+    out, info = engine._rewrite_with_evidence(
+        None, None, p, "正文" * 80, ["机械转折"], None,
+        item_holding_block=block, constraints=cons,
+    )
+    check("重写成功返回", out is not None, True)
+    check("constraints 进 system（不追加到待改正文之后）",
+          "【本段已锁定角色（必须保持一致，不得凭空新增主要人物）】李浩"
+          in p.calls[0]["system"], True)
+    check("伏笔也进 system",
+          "策划书去哪了" in p.calls[0]["system"], True)
+    check("provider 不再收到 constraints= 追加",
+          p.calls[0]["constraints"] is None, True)
+    check("重写 prompt 含块", block in p.calls[0]["user"], True)
+    check("rewrite_info 记录已注入",
+          (info or {}).get("item_holding_injected"), True)
+    check("rewrite_info 记录 constraints 已注入",
+          (info or {}).get("constraints_injected"), True)
+
+    src = inspect.getsource(engine)
+    check("同步/流式两个入口都传块",
+          src.count('item_holding_block=ctx.get("item_holding_block")') >= 2, True)
+
+
 # ── 跑全部 ──
 
 if __name__ == "__main__":
     test_detect_via_guard()
     test_engine_return_field_in_unit()
+    test_rewrite_carries_item_block_and_constraints()
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败 / {PASS + FAIL} 总数")
     sys.exit(0 if FAIL == 0 else 1)
