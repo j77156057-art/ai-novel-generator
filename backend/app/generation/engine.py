@@ -6,6 +6,7 @@
 """
 
 import copy
+import json
 import logging
 
 from sqlalchemy import or_, select
@@ -18,6 +19,7 @@ from app.generation.prompts import (
     merged_constraint_items,
     render_item_holding_section,
 )
+from app.generation.repetition import analyze_repetition, quality_payload
 from app.generation.scope_guard import (
     declared_local,
     detect_length_drop,
@@ -470,8 +472,47 @@ def _require_distill_ready(db, project) -> None:
     )
 
 
+def _quality_check(text: str) -> tuple[dict | None, dict | None, list[str]]:
+    """算复读报告：返回 (落库 payload, 响应 repetition, warnings)。
+
+    检测异常一律吞掉并返回 `(None, None, [])`——闸门绝不能拖垮生成；
+    `None` 在列里就是 `NULL`（读取侧显示「未检测」），不是「正常」。
+
+    `truncated` 与 verdict 独立：短文本（`skipped_short`）同样会因
+    `ends_complete=False` 被标记为截断。
+    """
+    try:
+        report = analyze_repetition(text or "")
+        payload = quality_payload(report)
+    except Exception:  # noqa: BLE001 —— 判据层故障不影响正文落库
+        logging.getLogger(__name__).warning(
+            "复读检测失败，本段按未检测落库", exc_info=True)
+        return None, None, []
+
+    rep = payload["repetition"]
+    warnings: list[str] = []
+    if rep["verdict"] == "degenerate":
+        warnings.append("疑似复读，建议重生成：" + rep["reason_text"])
+    if payload["truncated"]:
+        warnings.append("结尾停在半句，可能是截断")
+    return payload, rep, warnings
+
+
+def _quality_json(payload: dict | None) -> str | None:
+    """payload → `generations.quality_json` 的 TEXT；None 保持 NULL。"""
+    return json.dumps(payload, ensure_ascii=False) if payload else None
+
+
+def _is_degenerate(payload: dict | None) -> bool:
+    return bool(
+        payload
+        and (payload.get("repetition") or {}).get("verdict") == "degenerate"
+    )
+
+
 def _commit_segment(db, project: Project, text: str, summary: str,
-                    meta: dict | None = None) -> tuple[Generation, int]:
+                    meta: dict | None = None,
+                    quality: dict | None = None) -> tuple[Generation, int]:
     """落库一段：写 Generation + 追加 L1 到摘要树 + 同步扁平归档。
 
     `project.summary` **继续维护**，但它已从「注入源」退为「L1 无损归档」：
@@ -488,6 +529,7 @@ def _commit_segment(db, project: Project, text: str, summary: str,
         chapter_range=f"段{segment_no}",
         text=text,
         summary={"text": summary, **(meta or {})},
+        quality_json=_quality_json(quality),
     )
     db.add(gen)
 
@@ -1625,9 +1667,13 @@ def generate_next_segment(
     if text != era_before:
         summary = provider.summarize(text)
 
+    # 复读闸门（P1 · I2）：落库前算好，与正文同一次 INSERT 落 quality_json。
+    quality, repetition, warnings = _quality_check(text)
+
     gen, segment_no = _commit_segment(
         db, project, text, summary,
         meta={"era": {**era_prompt_meta, **era_meta}, "power": power_meta},
+        quality=quality,
     )
 
     # —— v2.1：exit_condition LLM 判定 → 必要时提前切节点（§13 待定项落地）——
@@ -1639,7 +1685,16 @@ def generate_next_segment(
     # —— 图谱进入生成闭环 ——
     # 每段生成后增量合并事实到 generated 图（不清空、upsert），
     # 使下一次生成的 reminders 能拿到本段新出现的角色 / 新埋的伏笔。
-    kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+    # 复读退化段**跳过**（标记而非拒绝）：循环对白一旦并入 facts 会污染后续
+    # reminders，且重写路径本来就不合并 KG，无法靠重写修回来。
+    if _is_degenerate(quality):
+        kg_stats = {
+            "merged": False,
+            "skipped": "repetition_degenerate",
+            "reason": "本段疑似复读，已跳过 KG 抽取",
+        }
+    else:
+        kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
     power_meta = _attach_power_meta(db, gen, power_meta, kg_stats)
 
     # v3.0 异步批抽：入队 extractor_v3 落 9 张表（Judge/检索切片/读侧 API 的数据源）。
@@ -1715,6 +1770,8 @@ def generate_next_segment(
         "style_warning": style_warning,
         "unlisted_characters": unlisted,
         "rewrite_info": rewrite_info,
+        "repetition": repetition,
+        "warnings": warnings,
     }
 
 
@@ -1814,9 +1871,13 @@ def generate_next_segment_stream(
     if text != era_before:
         summary = provider.summarize(text)
 
+    # 复读闸门（P2 · I2）：与同步版同口径，落库前算好、随正文同一次 INSERT 落。
+    quality, repetition, warnings = _quality_check(text)
+
     gen, segment_no = _commit_segment(
         db, project, text, summary,
         meta={"era": {**era_prompt_meta, **era_meta}, "power": power_meta},
+        quality=quality,
     )
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
     node_judge = _judge_and_advance(db, project, provider, text, written)
@@ -1829,12 +1890,20 @@ def generate_next_segment_stream(
     # 收归唯一入口，重写的结果就是又出现"只更一半"的路径。
     # 保留 try/except：簿记异常绝不打断 SSE（正文已落库，done 必须照样发）。
     kg_stats = None
-    try:
-        kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
-    except Exception as exc:  # noqa: BLE001 —— 簿记异常绝不打断 SSE：正文已落库，
-        # done 事件必须照样发出，否则前端表现为"生成卡住且无结果"。
-        logging.getLogger(__name__).warning("流式 KG 簿记失败，段落已落库: %s", exc)
-        kg_stats = {"merged": False, "reason": f"KG 簿记失败：{str(exc)[:100]}"}
+    if _is_degenerate(quality):
+        # 复读退化段跳过 KG（标记而非拒绝）：循环对白不并入 facts。
+        kg_stats = {
+            "merged": False,
+            "skipped": "repetition_degenerate",
+            "reason": "本段疑似复读，已跳过 KG 抽取",
+        }
+    else:
+        try:
+            kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+        except Exception as exc:  # noqa: BLE001 —— 簿记异常绝不打断 SSE：正文已落库，
+            # done 事件必须照样发出，否则前端表现为"生成卡住且无结果"。
+            logging.getLogger(__name__).warning("流式 KG 簿记失败，段落已落库: %s", exc)
+            kg_stats = {"merged": False, "reason": f"KG 簿记失败：{str(exc)[:100]}"}
     power_meta = _attach_power_meta(db, gen, power_meta, kg_stats)
 
     # v3.0 异步批抽：与同步版同口径入队
@@ -1888,6 +1957,9 @@ def generate_next_segment_stream(
         "node_judge": node_judge,
         "v3_extraction": v3_extraction,
         "branch_roll": branch_info,
+        # 复读闸门（D7）：与 200 响应同形的 verdict / 触发线 / 原因 + 提示。
+        "repetition": repetition,
+        "warnings": warnings,
     }
 
 
@@ -2207,6 +2279,10 @@ def regenerate_segment_stream(
     if text != era_before:
         summary = provider.summarize(text)
 
+    # 复读闸门（P3 · I3）：落库前算好，两条子路径都必须带同一份报告。
+    # 重写路径不合并 KG，所以这里没有「跳过 KG」的动作（详见方案稿 §3.2）。
+    quality, repetition, warnings = _quality_check(text)
+
     new_summary = {
         "text": summary,
         "era": {**era_prompt_meta, **era_meta},
@@ -2225,6 +2301,8 @@ def regenerate_segment_stream(
         target.text = text
         target.summary = new_summary
         target.chapter_range = f"段{segment_no}"
+        # 与正文同一次 commit：正文与标记不可能分叉。
+        target.quality_json = _quality_json(quality)
 
         # —— 重生成的 KG 簿记（清空 + 全量 replay）——
         # ⚠️ 顺序陷阱：rebuild_generated_kg 从 Generation 表读各段正文，新文本必须先
@@ -2250,6 +2328,8 @@ def regenerate_segment_stream(
                 # 与 applied 同一事务落快照行（只留痕，不参与任何拦截）。
                 scope_mismatch=scope_mismatch,
                 length_drop=length_drop,
+                # 复读标记进同一条 SQL UPDATE（防「正文换了、标记没跟上」）。
+                quality_json=_quality_json(quality),
             )
             # 与上面旧路径同一个提交点：正文与快照一起落，中间崩了都不会出现
             # 「正文变了但快照还是 pending」。
@@ -2322,6 +2402,9 @@ def regenerate_segment_stream(
         # 与流式续写路径（generate_next_segment_stream）的 done 键对齐，
         # 让重生成也带上簿记统计，可被前端/API 观测。
         "kg": kg_stats,
+        # 复读闸门（D7）：verdict / triggers / reason_text + 提示。
+        "repetition": repetition,
+        "warnings": warnings,
     }
 
 

@@ -679,6 +679,7 @@ def finalize_snapshot(
     new_summary: Any,
     scope_mismatch: dict | None = None,
     length_drop: dict | None = None,
+    quality_json: str | None = None,
 ) -> None:
     """CAS 写正文 + 置 applied。**不 commit**，由调用方那次事务一起落。
 
@@ -688,6 +689,8 @@ def finalize_snapshot(
             重试；与 applied 同一事务写入快照行，便于统计模型服从度。
         length_drop: 「篇幅跌幅超过 20%」的提示结构，**单独一列**——与
             scope_mismatch 分开记账，避免两类模型不服从混在一起。
+        quality_json: 复读闸门的检测结论（JSON 文本，NULL = 未检测）。
+            与正文写进**同一条 UPDATE**，不可能出现「正文换了、标记没跟上」。
 
     Raises:
         ConcurrentEdit: 正文已被别的入口改过（rowcount != 1）。
@@ -704,6 +707,7 @@ def finalize_snapshot(
             text=new_text,
             summary=new_summary,
             chapter_range=f"段{segment_no}",
+            quality_json=quality_json,
         )
         .execution_options(synchronize_session=False)
     )

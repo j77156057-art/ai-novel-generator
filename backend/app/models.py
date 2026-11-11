@@ -523,6 +523,10 @@ class Generation(Base):
     chapter_range = Column(String(32), nullable=True)
     text = Column(Text, nullable=True)
     summary = Column(JSON, nullable=True)
+    # 复读闸门的检测结论（JSON 文本）。NULL = 未检测（历史行 / 回滚恢复行 /
+    # 接线前写入），**不是**「正常」；读取侧由 parse_quality 映射成
+    # verdict="undetected"。契约见 docs/repetition-gate-insertion.md §3.1 / §3.4。
+    quality_json = Column(Text, nullable=True)
 
 
 class GenerationSnapshot(Base):

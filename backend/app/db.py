@@ -184,6 +184,9 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("raw_novels", "style_profile", "JSON"),
         # —— 第 8 步：语料清洗报告（导入时剔除水印的留痕）——
         ("raw_novels", "clean_report", "JSON"),
+        # —— 复读闸门标记：NULL = 未检测（历史行 / 回滚恢复行），不是「正常」——
+        # 漏这一项的后果：老库 INSERT 含 quality_json 直接炸，生成整条链失败。
+        ("generations", "quality_json", "TEXT"),
         ("kg_nodes", "source", "VARCHAR(64)"),
         # —— v3.0 KG 书维度：实体/提及归属哪本书 ——
         # NULL = 项目级通配（归不出书的行 / 老数据），读侧与加列前完全一致。
