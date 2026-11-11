@@ -9,8 +9,21 @@
 模型只回替换文本；即使它回了编号，编号也必须与程序算的一致，否则
 ``index_mismatch`` 失败关闭。**改哪一句不再由模型决定。**
 
-**Tier B（含糊指令）**：``某处`` / ``此处`` / ``这一句`` 这类无法从指令本身
-定位的说法，``resolve_scope`` 返回 None，仍按上一版行为由模型给编号。
+**Tier B（含糊指令，两段式）**：``某处`` / ``此处`` / ``这一句`` 这类无法从
+指令本身定位的说法，``resolve_scope`` 返回 None，然后分两次调用模型：
+第一步 ``build_index_user_prompt`` 只让它回编号（同一份编号清单），第二步把
+第一步的编号交给 Tier A 的 ``build_patch_user_prompt``，只让它写替换文本。
+**两步都必须成功**；第一步的编号校验与第二步的替换校验都失败关闭，各自给
+独立错误码。这样模型没有「一边选位置一边写正文」的机会，也就不会把指令话术
+抄进正文（实测过「这一句确实不太顺，……」）。
+
+## 剥除行首编号
+
+模型经常无视「不要编号」，把 ``83.`` / ``84.``（或 ``83、`` / ``83)`` /
+``（83）``，中文数字同样认）写进替换文本。程序在 Tier A 第二步统一按行剥除
+行首编号，**剥完再做所有校验**；剥完没有正文（只剩空白/标点）按
+``replacement_numbering_only`` 失败关闭。提示词仍然保留「只写替换文本」，
+但兜底靠程序，不靠模型自觉。
 
 ## 多句范围的规则
 
@@ -46,7 +59,8 @@
 ``scope_count_too_large``    数量词超过上界（防止「最后一百句」滑回整段）
 ``span_whole_segment``       编号范围覆盖全文
 ``replacement_missing``      缺 replacement 字段
-``empty_patch``              replacement 为空
+``empty_patch``              replacement 为空（或剥编号后没有正文）
+``replacement_numbering_only`` 剥掉行首编号后只剩空白/标点，没有正文
 ``replacement_whole_segment`` 长度与句数双判据都指向「整段」
 ``replacement_too_long``     相对所选范围明显过长
 ``no_change``                改写结果与原文该范围完全相同
@@ -97,6 +111,14 @@ _SINGLE_NTH_RE = re.compile(NTH_SENTENCE_PATTERN)
 _RANGE_RE = re.compile(
     rf"第\s*({SENTENCE_NUM})\s*句\s*(?:到|至|—|–|-|~|～)\s*第?\s*({SENTENCE_NUM})\s*句"
 )
+#: 行首编号：``83.`` / ``83．`` / ``83、`` / ``83)`` / ``83）`` / ``(83)`` /
+#: ``（83）``。数字字符集与句子编号共用（中文 + 阿拉伯）。
+#: 点号后紧跟数字的不剥（``3.14`` 是正文里的数，不是编号）。
+_NUMBERING_RE = re.compile(
+    rf"^\s*(?:[（(]\s*{SENTENCE_NUM}\s*[)）]"
+    rf"|{SENTENCE_NUM}\s*[.．](?!\d)"
+    rf"|{SENTENCE_NUM}\s*[、)）])\s*"
+)
 
 
 class PatchError(ValueError):
@@ -143,6 +165,17 @@ def _render_numbered(spans: list[dict], scope: dict | None = None) -> str:
     return "\n".join(lines)
 
 
+def _strip_leading_numbering(text: str) -> str:
+    """按行剥掉行首编号（``83.`` / ``83、`` / ``（83）`` …），其余原样保留。"""
+    lines = [_NUMBERING_RE.sub("", line, count=1) for line in text.splitlines()]
+    return "\n".join(lines).strip()
+
+
+def _has_body_text(text: str) -> bool:
+    """是否还有「正文」：中文/字母至少一个（纯数字、纯标点都不算）。"""
+    return any(ch.isalpha() for ch in text)
+
+
 def _cn_to_int(token: str) -> int:
     """把 ``第 N 句`` 里的 N 转成整数；支持阿拉伯数字与「八十四」这类中文数字。"""
     token = (token or "").strip()
@@ -168,7 +201,8 @@ def _cn_to_int(token: str) -> int:
 
 
 def _bounded_scope(
-    from_index: int, to_index: int, total: int, keyword: str
+    from_index: int, to_index: int, total: int, keyword: str | None,
+    *, source: str = "program",
 ) -> dict:
     if not (1 <= from_index <= total and 1 <= to_index <= total):
         raise PatchError(
@@ -189,7 +223,7 @@ def _bounded_scope(
         "from_index": from_index,
         "to_index": to_index,
         "keyword": keyword,
-        "source": "program",
+        "source": source,
         "total_sentences": total,
     }
 
@@ -271,28 +305,29 @@ def _range_label(scope: dict) -> str:
     return f"第 {fi} 句" if fi == ti else f"第 {fi} 句到第 {ti} 句"
 
 
+def build_index_user_prompt(before_text: str, instruction: str) -> str:
+    """Tier B 第一步：只让模型选位置，不给它写正文的机会。"""
+    spans = split_sentences(before_text)
+    numbered = _render_numbered(spans)
+    return (
+        "下面是一段已定稿的正文，已按句末标点切成编号句子。"
+        "本次只做一件事：**选出要改写的连续若干句**，不要写任何改写内容。\n\n"
+        f"【本次要求】\n{(instruction or '').strip()}\n\n"
+        f"【编号原文】（共 {len(spans)} 句）\n{numbered}\n\n"
+        "【输出格式（必须严格遵守）】\n"
+        "只输出一个 JSON 对象，不要代码块、不要解释、不要任何前后缀文字：\n"
+        '{"from_index": 起始句编号, "to_index": 结束句编号}\n'
+        f"- from_index <= to_index，且都在 1 到 {len(spans)} 之间；"
+        "范围不能覆盖全文；\n"
+        "- 不要输出 replacement，不要输出任何正文或改写结果；"
+        "改写文本由下一次请求单独生成。"
+    )
+
+
 def build_patch_user_prompt(
-    before_text: str, instruction: str, scope: dict | None = None
+    before_text: str, instruction: str, scope: dict
 ) -> str:
     spans = split_sentences(before_text)
-    if scope is None:
-        numbered = _render_numbered(spans)
-        return (
-            "下面是一段已定稿的正文，已按句末标点切成编号句子。请做**局部改写**："
-            "只改写【本次要求】指定的连续若干句，其余句子一个字都不要改。\n\n"
-            f"【本次要求】\n{(instruction or '').strip()}\n\n"
-            f"【编号原文】（共 {len(spans)} 句）\n{numbered}\n\n"
-            "【输出格式（必须严格遵守）】\n"
-            "只输出一个 JSON 对象，不要代码块、不要解释、不要任何前后缀文字：\n"
-            '{"from_index": 起始句编号, "to_index": 结束句编号, '
-            '"replacement": "改写后的这几句"}\n'
-            f"- from_index <= to_index，且都在 1 到 {len(spans)} 之间；"
-            "范围不能覆盖全文；\n"
-            "- replacement 只写该编号范围内的句子改写结果，不要带编号，"
-            "不含范围外的内容；\n"
-            "- 长度与原文那几句接近，不得输出整段正文，不得顺便压缩或扩写其他句子。"
-        )
-
     numbered = _render_numbered(spans, scope)
     label = _range_label(scope)
     start, end = scope["from_index"], scope["to_index"]
@@ -451,7 +486,11 @@ def _check_model_indices(payload: dict, scope: dict) -> None:
 
 
 def _tier_a_replacement(reply: str, scope: dict) -> str:
-    """Tier A 的返回解析：接受纯替换文本，或带编号的 JSON（编号须一致）。"""
+    """Tier A 的返回解析：接受纯替换文本，或带编号的 JSON（编号须一致）。
+
+    取到文本后**先按行剥掉行首编号**，再做空/无正文检查；后续长度与整段
+    校验由调用方统一做（Tier B 第二步也走这里，不复制校验）。
+    """
     raw = (reply or "").strip()
     if not raw:
         raise PatchError("empty_patch", "模型返回为空。")
@@ -463,44 +502,56 @@ def _tier_a_replacement(reply: str, scope: dict) -> str:
         raise PatchError("empty_patch", "模型返回为空。")
 
     if not text.startswith("{"):
-        return text
-    # 看起来是 JSON 就必须解析成功；解析失败不能把半截 JSON 当正文拼进去。
-    try:
-        payload = json.loads(text)
-    except Exception as exc:  # noqa: BLE001
-        raise PatchError("unparsable", "模型返回的 JSON 无法解析。") from exc
-    if isinstance(payload, str):
-        payload = {"replacement": payload}
-    if not isinstance(payload, dict):
-        raise PatchError("unparsable", "补丁 JSON 不是对象。")
-    _check_model_indices(payload, scope)
-    return _parse_replacement(payload)
+        replacement = text
+    else:
+        # 看起来是 JSON 就必须解析成功；解析失败不能把半截 JSON 当正文拼进去。
+        try:
+            payload = json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            raise PatchError("unparsable", "模型返回的 JSON 无法解析。") from exc
+        if isinstance(payload, str):
+            payload = {"replacement": payload}
+        if not isinstance(payload, dict):
+            raise PatchError("unparsable", "补丁 JSON 不是对象。")
+        _check_model_indices(payload, scope)
+        replacement = _parse_replacement(payload)
+
+    stripped = _strip_leading_numbering(replacement)
+    if not stripped or not _has_body_text(stripped):
+        raise PatchError(
+            "replacement_numbering_only",
+            "替换文本剥掉行首编号后只剩空白/标点，没有正文。",
+        )
+    return stripped
+
+
+def parse_index_reply(reply: str, before_text: str) -> dict:
+    """Tier B 第一步：只解析编号，不接受任何正文，返回 source=model 的范围。"""
+    spans = split_sentences(before_text)
+    if not spans:
+        raise PatchError("index_missing", "正文没有可编号的句子。")
+    payload = _load_payload(reply)
+    from_index, to_index = _parse_indices(payload, len(spans))
+    return _bounded_scope(from_index, to_index, len(spans), None, source="model")
 
 
 def parse_patch_reply(
-    reply: str, before_text: str, scope: dict | None = None
+    reply: str, before_text: str, scope: dict
 ) -> tuple[str, dict]:
     """解析模型返回并替换，返回 ``(new_text, meta)``。
 
-    ``scope`` 非 None 时为 Tier A：编号由程序给定，只从返回里取替换文本；
-    为 None 时沿用 Tier B（模型给编号）。
+    ``scope`` 必须由程序给定（Tier A 直接解析，Tier B 由第一步选定）：
+    只从返回里取替换文本，编号不一致即失败关闭。
 
     所有无法安全落地的情况都抛 :class:`PatchError`；调用方应失败并留痕，
     不得回退整段重写。
     """
     spans = split_sentences(before_text)
-    if scope is None:
-        payload = _load_payload(reply)
-        from_index, to_index = _parse_indices(payload, len(spans))
-        replacement = _parse_replacement(payload)
-        scope_source = "model"
-        scope_keyword = None
-    else:
-        from_index = scope["from_index"]
-        to_index = scope["to_index"]
-        replacement = _tier_a_replacement(reply, scope)
-        scope_source = "program"
-        scope_keyword = scope.get("keyword")
+    from_index = scope["from_index"]
+    to_index = scope["to_index"]
+    replacement = _tier_a_replacement(reply, scope)
+    scope_source = scope.get("source", "program")
+    scope_keyword = scope.get("keyword")
 
     start = spans[from_index - 1]["start"]
     end = spans[to_index - 1]["end"]
@@ -515,6 +566,8 @@ def parse_patch_reply(
     new_text = before_text[:start] + replacement + before_text[end:]
     meta = {
         "patch_count": 1,
+        # Tier B 两段式：1 = 程序解析范围，2 = 模型先选位置、再单独写替换。
+        "stages": 2 if scope_source == "model" else 1,
         "scope_source": scope_source,
         "scope_keyword": scope_keyword,
         "applied": [{

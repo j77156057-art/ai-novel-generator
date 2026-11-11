@@ -2066,26 +2066,52 @@ def regenerate_segment_stream(
     # —— 意图分流：局部指令走句子索引补丁（2026-11-12）——
     # 判定复用 scope_guard.declared_local，不另造关键词表（两套口径必漂）。
     # Tier A：位置词（段尾/最后一句/段首/第 N 句…）由程序解析成编号，
-    # 模型只写替换文本；Tier B（某处/此处/这一句）仍由模型给编号。
+    # 模型只写替换文本；Tier B（某处/此处/这一句）分两段：先只让模型选编号，
+    # 再把编号交给 Tier A 的提示词单独写替换——模型没有「边选边写」的机会，
+    # 指令话术也就抄不进正文。
     # 两条路都只把替换文本拼回原文，其余文字逐字不动，压缩没有发生的空间。
     local_patch = bool(_instruction) and declared_local(_instruction)
     patch_meta = None
     if local_patch:
         from app.generation.patch import (
             PatchError,
+            build_index_user_prompt,
             build_patch_user_prompt,
+            parse_index_reply,
             parse_patch_reply,
             resolve_scope,
         )
 
-        # Tier A：范围词（段尾/最后一句/段首/第 N 句…）先由程序解析成编号，
-        # 模型只写替换文本；Tier B（某处/此处/这一句）仍由模型给编号。
+        def _chat(user_prompt: str) -> str:
+            try:
+                if lease is not None:
+                    lease.touch(db)
+                return provider.chat(system, user_prompt, constraints=constraints)
+            except BaseException as exc:  # noqa: BLE001 —— 含客户端断开
+                if snapshot_id is not None:
+                    from app.agents.dialog.snapshot import fail_snapshot
+
+                    reason = ("client_disconnect" if isinstance(exc, GeneratorExit)
+                              else type(exc).__name__)
+                    fail_snapshot(db, snapshot_id, reason)
+                raise
+
+        def _fail_patch(exc: PatchError, reply_text: str, stage: str) -> None:
+            # 留痕：快照 error_reason 只存 code；模型原始返回截一段进日志，
+            # 否则事后无法解释「为什么这句补丁失败了」。
+            logging.getLogger("generation.engine").warning(
+                "局部补丁失败（%s）code=%s；模型返回前 400 字：%r",
+                stage, exc.code, (reply_text or "")[:400],
+            )
+            if snapshot_id is not None:
+                from app.agents.dialog.snapshot import fail_snapshot
+
+                fail_snapshot(db, snapshot_id, exc.code)
+
+        # Tier A：范围词（段尾/最后一句/段首/第 N 句…）先由程序解析成编号。
         # 范围解析失败同样失败关闭，不把「改哪一句」退回去让模型猜。
         try:
             scope = resolve_scope(_instruction, before_text)
-            patch_user = build_patch_user_prompt(
-                before_text, _instruction, scope=scope
-            )
         except PatchError as exc:
             logging.getLogger("generation.engine").warning(
                 "局部补丁范围解析失败 code=%s；指令：%r", exc.code, _instruction
@@ -2095,36 +2121,31 @@ def regenerate_segment_stream(
 
                 fail_snapshot(db, snapshot_id, exc.code)
             raise
+
+        if scope is None:
+            # Tier B 第一步：只选位置，不给写正文的机会。
+            index_reply = ""
+            try:
+                index_reply = _chat(
+                    build_index_user_prompt(before_text, _instruction)
+                )
+                scope = parse_index_reply(index_reply, before_text)
+            except PatchError as exc:
+                _fail_patch(exc, index_reply, "选位置")
+                raise
+
+        # 第二步（Tier A 与 Tier B 共用）：目标句由程序标出，模型只写替换文本。
+        patch_user = build_patch_user_prompt(before_text, _instruction, scope)
         # 指令确实进了本次发出的 prompt（补丁 prompt 里也有【本次要求】区）。
         instruction_injected = _instruction in patch_user
+        reply = _chat(patch_user)
         try:
-            if lease is not None:
-                lease.touch(db)
-            reply = provider.chat(system, patch_user, constraints=constraints)
-        except BaseException as exc:  # noqa: BLE001 —— 含客户端断开
-            if snapshot_id is not None:
-                from app.agents.dialog.snapshot import fail_snapshot
-
-                reason = ("client_disconnect" if isinstance(exc, GeneratorExit)
-                          else type(exc).__name__)
-                fail_snapshot(db, snapshot_id, reason)
-            raise
-        try:
-            text, patch_meta = parse_patch_reply(reply, before_text, scope=scope)
+            text, patch_meta = parse_patch_reply(reply, before_text, scope)
         except PatchError as exc:
             # 直接失败，**不回退整段重写**：回退会重新打开压缩的口子，而且
             # 「成功的整段重写」与「局部改写」在正文上不可区分。失败保证
             # 「局部指令要么精确补丁，要么正文一行不动」。
-            # 留痕：快照 error_reason 只存 code；模型原始返回截一段进日志，
-            # 否则事后无法解释「为什么这句补丁失败了」。
-            logging.getLogger("generation.engine").warning(
-                "局部补丁失败 code=%s；模型返回前 400 字：%r",
-                exc.code, (reply or "")[:400],
-            )
-            if snapshot_id is not None:
-                from app.agents.dialog.snapshot import fail_snapshot
-
-                fail_snapshot(db, snapshot_id, exc.code)
+            _fail_patch(exc, reply, "写替换")
             raise
         # 补丁完成后一次性把完整正文发给客户端：UI 拿到的仍是「整段新正文」，
         # 但模型从未收到「重写整段」的请求。
