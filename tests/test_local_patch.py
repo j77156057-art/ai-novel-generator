@@ -22,6 +22,8 @@ from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.generation.engine import regenerate_segment_stream  # noqa: E402
 from app.generation.patch import (  # noqa: E402
     PatchError,
+    build_index_user_prompt,
+    parse_index_reply,
     parse_patch_reply,
     resolve_scope,
     split_sentences,
@@ -30,6 +32,12 @@ from app.models import Generation, GenerationSnapshot, Project  # noqa: E402
 
 SEG1 = "林夜推开木门。\n他说：“我回来了。”"
 SEG2 = "第一句。第二句。第三句。"
+
+
+def _tier_b(reply: str, before: str):
+    """Tier B 两段式：第一步只取编号，第二步再取替换文本。"""
+    scope = parse_index_reply(reply, before)
+    return parse_patch_reply(reply, before, scope)
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +54,7 @@ def test_split_sentences_keeps_quotes_and_tail_fragment():
 
 def test_single_sentence_index_replaces_exactly_one():
     before = "第一句。第二句。第三句。"
-    new_text, meta = parse_patch_reply(
+    new_text, meta = _tier_b(
         '{"index": 2, "replacement": "改过的第二句。"}', before
     )
     assert new_text == "第一句。改过的第二句。第三句。"
@@ -59,7 +67,7 @@ def test_single_sentence_index_replaces_exactly_one():
 
 def test_multi_sentence_span_replaces_consecutive_sentences():
     before = "第一句。第二句。第三句。第四句。"
-    new_text, meta = parse_patch_reply(
+    new_text, meta = _tier_b(
         '{"from_index": 2, "to_index": 3, '
         '"replacement": "改过的二。改过的三。"}',
         before,
@@ -72,59 +80,59 @@ def test_multi_sentence_span_replaces_consecutive_sentences():
 
 def test_index_out_of_range_raises():
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply('{"index": 9, "replacement": "新句子。"}', SEG2)
+        parse_index_reply('{"index": 9}', SEG2)
     assert ei.value.code == "index_out_of_range"
     assert "1..3" in str(ei.value)
 
 
 def test_index_reversed_raises():
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply(
-            '{"from_index": 3, "to_index": 1, "replacement": "新句子。"}', SEG2
-        )
+        parse_index_reply('{"from_index": 3, "to_index": 1}', SEG2)
     assert ei.value.code == "index_reversed"
 
 
 def test_span_covering_whole_text_is_rejected():
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply(
-            '{"from_index": 1, "to_index": 3, "replacement": "整段新文字。"}', SEG2
-        )
+        parse_index_reply('{"from_index": 1, "to_index": 3}', SEG2)
     assert ei.value.code == "span_whole_segment"
 
 
 def test_missing_index_fields_raises():
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply('{"replacement": "新句子。"}', SEG2)
+        parse_index_reply('{"replacement": "新句子。"}', SEG2)
     assert ei.value.code == "index_missing"
 
 
 def test_empty_replacement_is_rejected():
+    scope = parse_index_reply('{"index": 2}', SEG2)
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply('{"index": 2, "replacement": "   "}', SEG2)
+        parse_patch_reply('{"index": 2, "replacement": "   "}', SEG2, scope)
     assert ei.value.code == "empty_patch"
 
 
 def test_replacement_missing_field_is_rejected():
+    scope = parse_index_reply('{"index": 2}', SEG2)
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply('{"index": 2}', SEG2)
+        parse_patch_reply('{"index": 2}', SEG2, scope)
     assert ei.value.code == "replacement_missing"
 
 
 def test_replacement_that_is_whole_segment_is_rejected():
     before = "第一句。第二句。第三句。第四句。第五句。第六句。"
+    scope = parse_index_reply('{"index": 2}', before)
     with pytest.raises(PatchError) as ei:
         parse_patch_reply(
-            '{"index": 2, "replacement": "%s"}' % before, before
+            '{"index": 2, "replacement": "%s"}' % before, before, scope
         )
     assert ei.value.code == "replacement_whole_segment"
 
 
 def test_single_sentence_span_rejects_multi_sentence_replacement():
     before = "甲乙丙丁。戊己庚辛。壬癸。"
+    scope = parse_index_reply('{"index": 1}', before)
     with pytest.raises(PatchError) as ei:
         parse_patch_reply(
-            '{"index": 1, "replacement": "一二。三四。五六。"}', before
+            '{"index": 1, "replacement": "一二。三四。五六。"}', before, scope
         )
     assert ei.value.code == "replacement_too_long"
 
@@ -135,15 +143,83 @@ def test_dirty_reply_with_fence_and_prose_is_repaired():
         '{"index": 2, "replacement": "改过的第二句。"}\n'
         "```\n（只改了第二句）"
     )
-    new_text, meta = parse_patch_reply(reply, SEG2)
+    new_text, meta = _tier_b(reply, SEG2)
     assert new_text == "第一句。改过的第二句。第三句。"
     assert meta["patch_count"] == 1
+    assert meta["stages"] == 2 and meta["scope_source"] == "model"
 
 
 def test_plain_text_reply_is_unparsable():
     with pytest.raises(PatchError) as ei:
-        parse_patch_reply("改过的第二句。", SEG2)
+        parse_index_reply("改过的第二句。", SEG2)
     assert ei.value.code == "unparsable"
+
+
+# ---------------------------------------------------------------------------
+# 剥除行首编号（83. / 83、/ 83)/83）/ (83)）（D 组）
+# ---------------------------------------------------------------------------
+
+
+def test_leading_sentence_numbers_are_stripped():
+    before = "第一句。第二句。第三句。"
+    scope = resolve_scope("最后两句", before)  # 2..3
+    new_text, meta = parse_patch_reply(
+        "2. 改过的二。\n3. 改过的三。", before, scope
+    )
+    assert new_text == "第一句。改过的二。\n改过的三。"
+    assert meta["applied"][0]["replacement"] == "改过的二。\n改过的三。"
+
+
+def test_chinese_and_parenthesized_numbers_are_stripped():
+    before = "第一句。第二句。第三句。"
+    scope = resolve_scope("最后两句", before)
+    replies = (
+        "二、改过的二。\n三）改过的三。",
+        "（二）改过的二。\n（三）改过的三。",
+        "(2) 改过的二。\n3) 改过的三。",
+    )
+    for reply in replies:
+        new_text, _ = parse_patch_reply(reply, before, scope)
+        assert new_text.startswith("第一句。改过的二。"), reply
+        assert "改过的三。" in new_text, reply
+
+
+def test_numbering_only_replacement_fails_closed():
+    before = "第一句。第二句。第三句。"
+    scope = resolve_scope("最后两句", before)
+    for reply in ("2. 3.", "2、3）", "（2）（3）", "2.\n3."):
+        with pytest.raises(PatchError) as ei:
+            parse_patch_reply(reply, before, scope)
+        assert ei.value.code == "replacement_numbering_only", reply
+
+
+def test_punctuation_only_replacement_fails_closed():
+    before = "第一句。第二句。第三句。"
+    scope = resolve_scope("最后两句", before)
+    with pytest.raises(PatchError) as ei:
+        parse_patch_reply("2. 。", before, scope)
+    assert ei.value.code == "replacement_numbering_only"
+
+
+def test_plain_replacement_is_not_stripped():
+    before = "第一句。第二句。第三句。"
+    scope = resolve_scope("第2句", before)
+    new_text, _ = parse_patch_reply("他数到三。然后离开。", before, scope)
+    assert new_text == "第一句。他数到三。然后离开。第三句。"
+
+
+def test_decimal_is_not_mistaken_for_numbering():
+    before = "第一句。第二句。第三句。"
+    scope = resolve_scope("第2句", before)
+    new_text, _ = parse_patch_reply("3.5 倍的差距。", before, scope)
+    assert new_text == "第一句。3.5 倍的差距。第三句。"
+
+
+def test_index_prompt_has_no_replacement_slot():
+    prompt = build_index_user_prompt(SEG2, "这一句不太顺")
+    assert ">> 2." not in prompt, "未选位置前不应标记目标句"
+    assert '{"from_index": 起始句编号, "to_index": 结束句编号}' in prompt
+    assert "不要输出 replacement" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -296,18 +372,25 @@ def test_explicit_range_beats_quantity_words():
 
 
 class StubProvider:
-    """chat 返回补丁 JSON，stream_chat 返回整段文本；两条路径都用这个替身。"""
+    """chat 按顺序返回给定回复（两段式需要两条），stream_chat 返回整段文本。"""
 
-    def __init__(self, reply: str, stream_reply: str | None = None) -> None:
-        self.reply = reply
-        self.stream_reply = stream_reply if stream_reply is not None else reply
+    def __init__(self, reply: str | list[str], stream_reply: str | None = None) -> None:
+        self.replies = reply if isinstance(reply, list) else [reply]
+        self.stream_reply = (
+            stream_reply if stream_reply is not None
+            else (self.replies[-1] if self.replies else "")
+        )
         self.chat_calls = 0
         self.stream_calls = 0
+        self.prompts: list[str] = []
+        self.last_user = ""
 
     def chat(self, system, user, constraints=None, **kw):
-        self.chat_calls += 1
+        self.prompts.append(user)
         self.last_user = user
-        return self.reply
+        index = min(self.chat_calls, len(self.replies) - 1)
+        self.chat_calls += 1
+        return self.replies[index]
 
     def stream_chat(self, system, user, constraints=None, **kw):
         self.stream_calls += 1
@@ -441,18 +524,63 @@ def test_model_index_mismatch_fails_closed(db):
     assert gen.text == SEG2, "编号不一致不得改写正文"
 
 
-def test_ambiguous_instruction_still_lets_model_pick_index(db):
+def test_ambiguous_instruction_uses_two_stage_patch(db):
     project = _project(db)
     _seed(db, project, 1, SEG1)
     _seed(db, project, 2, SEG2)
-    provider = StubProvider('{"index": 2, "replacement": "改过的第二句。"}')
+    provider = StubProvider([
+        '{"from_index": 2, "to_index": 2}',
+        "改过的第二句。",
+    ])
 
     _, done = _run(db, project, provider, "只改某处，其余内容保留不要动。")
 
-    assert provider.chat_calls == 1 and provider.stream_calls == 0
+    assert provider.chat_calls == 2 and provider.stream_calls == 0
+    # 第一步：只给编号清单，不标目标句、没有 replacement 位。
+    assert ">> 2." not in provider.prompts[0]
+    assert "不要输出 replacement" in provider.prompts[0]
+    # 第二步：Tier A 那套提示词，目标句由程序标出来。
+    assert ">> 2." in provider.prompts[1]
     assert done["patch"]["scope_source"] == "model"
+    assert done["patch"]["stages"] == 2
     applied = done["patch"]["applied"][0]
     assert (applied["from_index"], applied["to_index"]) == (2, 2)
+    db.expire_all()
+    gen = db.scalars(
+        select(Generation).where(
+            Generation.project_id == project.id, Generation.segment_no == 2
+        )
+    ).one()
+    assert gen.text == "第一句。改过的第二句。第三句。"
+    assert "不太顺" not in gen.text, "指令话术不得进正文"
+
+
+def test_tier_b_second_stage_failure_fails_closed(db):
+    project = _project(db)
+    _seed(db, project, 1, SEG1)
+    _seed(db, project, 2, SEG2)
+    provider = StubProvider([
+        '{"from_index": 2, "to_index": 2}',
+        "   ",
+    ])
+
+    with pytest.raises(PatchError) as ei:
+        _run(db, project, provider, "只改某处，其余内容保留不要动。")
+    assert ei.value.code == "empty_patch"
+    assert provider.chat_calls == 2
+
+    db.expire_all()
+    snap = db.scalars(
+        select(GenerationSnapshot).order_by(GenerationSnapshot.id.desc())
+    ).first()
+    assert snap.status == "failed"
+    assert snap.error_reason == "empty_patch"
+    gen = db.scalars(
+        select(Generation).where(
+            Generation.project_id == project.id, Generation.segment_no == 2
+        )
+    ).one()
+    assert gen.text == SEG2, "第二步失败不得改动正文"
 
 
 def test_local_patch_failure_marks_snapshot_failed_and_keeps_text(db):
@@ -464,6 +592,7 @@ def test_local_patch_failure_marks_snapshot_failed_and_keeps_text(db):
     with pytest.raises(PatchError) as ei:
         _run(db, project, provider, "只改某处，其余内容保留不要动。")
     assert ei.value.code == "index_out_of_range"
+    assert provider.chat_calls == 1, "第一步编号失败后不得再发第二步"
 
     db.expire_all()
     snap = db.scalars(
