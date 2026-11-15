@@ -17,7 +17,7 @@
 
     python .../apply_group_backfill.py --dry-run
     python .../apply_group_backfill.py
-    python .../apply_group_backfill.py --db D:\\Temp\\copy.db
+    python .../apply_group_backfill.py --db <副本.db>
 """
 from __future__ import annotations
 

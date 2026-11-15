@@ -11,6 +11,7 @@ from __future__ import annotations
 import pathlib
 import sqlite3
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -27,7 +28,7 @@ from app.generation.prompts import build_user_prompt  # noqa: E402
 from app.models import Generation, KgEntity, KgMention, Project  # noqa: E402
 
 REAL = ROOT / "backend" / "novel_dev.db"
-COPY = pathlib.Path("D:/Temp/novel_dev_e2e.db")
+COPY = pathlib.Path(tempfile.gettempdir()) / "novel_dev_e2e.db"
 PROJECT_ID = 5
 SEGMENT = 2  # build_context 用 _next_segment_no - 1 = 2
 

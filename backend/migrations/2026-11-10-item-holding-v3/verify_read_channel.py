@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""验证物品持有读通道（只读真实库 + D:\\Temp 副本）。
+"""验证物品持有读通道（只读真实库 + 临时目录副本）。
 
 真实库：backend/data/generated.db（63 行）、backend/novel_dev.db（kg_entities 为空，
 所以实体解析按原名继续）。副本只用来放真实库没有的演示行：
@@ -17,6 +17,7 @@ import json
 import pathlib
 import sqlite3
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -32,7 +33,7 @@ from app.kg import item_holding_read as read  # noqa: E402
 
 REAL_DB = BACKEND / "data" / "generated.db"
 APP_DB = BACKEND / "novel_dev.db"
-COPY_DB = pathlib.Path("D:/Temp/kg_read_copy.db")
+COPY_DB = pathlib.Path(tempfile.gettempdir()) / "kg_read_copy.db"
 
 
 def _app_session():

@@ -12,7 +12,7 @@
   用法：
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-backend-task.ps1
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-backend-task.ps1 -Port 8000
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-backend-task.ps1 -Port 8011 -TaskName AiNovelBackendTest -DatabaseUrl "sqlite:///D:/Temp/probe.db"
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-backend-task.ps1 -Port 8011 -TaskName AiNovelBackendTest -DatabaseUrl "sqlite:///backend/backups/probe.db"
 
   任务名：默认 AiNovelBackend-<端口>（-TaskName 可改），如 AiNovelBackend-8000。
 

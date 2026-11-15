@@ -262,23 +262,26 @@ KgMention.segment_no == current_seg        # current_seg = _next_segment_no() - 
 
 ## 9. 复现命令
 
+> 以下 7 个脚本是当时的本机临时脚本，**原脚本未入库**；路径用 `<原脚本目录>` 占位，
+> 复跑需自行重建等价脚本。
+
 ```powershell
 # 只读：注入链逐环实测
-python D:\Temp\verify_chain.py
+python <原脚本目录>\verify_chain.py
 
 # 只读：项目叙事档案 / 指纹
-python D:\Temp\verify_narrative.py
-python D:\Temp\verify_fingerprint.py
+python <原脚本目录>\verify_narrative.py
+python <原脚本目录>\verify_fingerprint.py
 
 # 只读：时间线旁证
-python D:\Temp\verify_timeline.py
+python <原脚本目录>\verify_timeline.py
 
 # 纯计算：RRF 复杂度
-python D:\Temp\bench_rrf.py
+python <原脚本目录>\bench_rrf.py
 
 # 真实语料上的混合检索耗时
-python D:\Temp\bench_hybrid.py
+python <原脚本目录>\bench_hybrid.py
 
 # 机制验证（写副本，不写真实库）
-python D:\Temp\diag_inject_copy.py
+python <原脚本目录>\diag_inject_copy.py
 ```

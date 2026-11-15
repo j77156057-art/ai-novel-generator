@@ -18,7 +18,7 @@ segment_no=1、2），不改任何其他表。
 
     python backend/migrations/2026-11-14-item-mention-backfill-v1/backfill_mentions.py --dry-run
     python backend/migrations/2026-11-14-item-mention-backfill-v1/backfill_mentions.py \
-        --db D:/Temp/novel_dev_copy.db --no-backup          # 先在副本上跑
+        --db <副本.db> --no-backup          # 先在副本上跑
 
 边界：只 INSERT ``kg_mentions``；不动 ``kg_entities`` / ``generations`` / 持有表。
 """

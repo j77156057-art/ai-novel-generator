@@ -23,7 +23,7 @@ sys.path.insert(0, str(PROJ / "backend"))
 from app.kg import generated_store as store  # noqa: E402
 
 REAL = PROJ / "backend" / "data" / "generated.db"
-BACKUP_DIR = pathlib.Path("D:/Temp")
+BACKUP_DIR = PROJ / "backend" / "backups"
 
 #: 落库前那 58 行的原始列（不含本轮新增的 instance_id）
 ORIG_COLS = ("id", "item_id", "item_name", "hold_type", "owner_id", "owner_name",
