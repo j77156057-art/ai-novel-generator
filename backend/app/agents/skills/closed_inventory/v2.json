@@ -1,0 +1,10 @@
+{
+  "id": "closed_inventory", "version": 2, "status": "experimental",
+  "applicable_tasks": ["body_consistency", "repair_verification"], "agent_roles": ["diagnostic"],
+  "required_capabilities": [{"id": "read_closed_inventory", "min_version": 1}],
+  "steps": [{"id": "inventory", "capability": "read_closed_inventory", "requires": [], "observe": ["independent person/place/object constraints", "character-budgeted short-quote ledger", "validated batch checkpoints", "independent verdicts"]}],
+  "acceptance": [{"id": "explicit_closure", "requires_evidence": true}, {"id": "full_scope_coverage", "requires_evidence": true}],
+  "source_evidence": [],
+  "failure_boundaries": ["Experimental protocol v2; v1 preserved.", "Missing dimension is unknown, never implicit open; open requires saved-authority quote.", "Unselected dimensions remain unknown; no global quality claim.", "Successful checkpoints bind complete saved body/contract, protocol, dimension and batch; failed batches are never accepted.", "One truncation subdivision at most; bounded requests; first real probe failure stops validation.", "Located quotes and source coverage do not prove complete recall or cross-genre semantic correctness.", "No Writer, distillation, body modification or apply."],
+  "allowed_actions": [], "supersedes": null
+}

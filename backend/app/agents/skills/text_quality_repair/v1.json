@@ -1,0 +1,72 @@
+{
+  "id": "text_quality_repair",
+  "version": 1,
+  "status": "experimental",
+  "applicable_tasks": [
+    "text_quality_repair"
+  ],
+  "agent_roles": [
+    "editor"
+  ],
+  "required_capabilities": [
+    {
+      "id": "inspect_text_quality",
+      "min_version": 1
+    },
+    {
+      "id": "prepare_text_repair",
+      "min_version": 1
+    }
+  ],
+  "steps": [
+    {
+      "id": "scan",
+      "capability": "inspect_text_quality",
+      "requires": [],
+      "observe": [
+        "只认规则算得出来的机械修法：半角标点换全角、连续重复标点收成一个",
+        "改法由规则算出，模型不重新措辞、不改语序、不动风格"
+      ]
+    },
+    {
+      "id": "repair",
+      "capability": "prepare_text_repair",
+      "requires": [
+        "scan"
+      ],
+      "observe": [
+        "按段构造待确认卡；此刻什么也不写进正文",
+        "用户在卡上确认或再改后，才存成待批提案；批准并应用后才生效"
+      ]
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "every_error_has_a_mechanical_fix",
+      "requires_evidence": true
+    },
+    {
+      "id": "no_write_without_confirmation",
+      "requires_evidence": true
+    }
+  ],
+  "source_evidence": [
+    {
+      "run_ref": "agent_runs:96",
+      "code_version": "02f5c81",
+      "input_fingerprint": "62270c6539f4cb648f94241cdd45ccc6ee178e13861f5b1b78e5db61f5519b48",
+      "scope": "project:9/generation:20",
+      "provider_role": "assistant",
+      "independent_verification": "提案 #4 应用后用同一套规则复算：punctuation_hits=0、剩余可机械修 0 处、正文前后差异与规则改法逐字一致"
+    }
+  ],
+  "failure_boundaries": [
+    "machine_rule_only",
+    "no_artistic_quality_guarantee",
+    "no_business_write",
+    "foreign_terms_need_human",
+    "one_case_evidence_only"
+  ],
+  "allowed_actions": [],
+  "supersedes": null
+}

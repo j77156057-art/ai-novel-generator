@@ -1,0 +1,23 @@
+{
+  "id": "body_repair",
+  "version": 3,
+  "status": "experimental",
+  "applicable_tasks": ["body_consistency", "repair_verification"],
+  "agent_roles": ["diagnostic"],
+  "required_capabilities": [{"id":"read_body_consistency","min_version":1},{"id":"prepare_body_repair","min_version":1}],
+  "steps": [{"id":"bounded_repair","capability":"read_body_consistency","requires":[],"observe":[
+    "限定segment_nos读取正文及真实保存契约；矛盾须有两端source IDs，权威不清先澄清",
+    "用户指定objective、冲突端与保留事实；prepare_body_repair只读，确认后独立写入口生成pending候选",
+    "replacement仅选定范围；服务端核对原诊断关联、候选哈希、范围外不变和保留事实逐字不变",
+    "独立Assistant复验；同维度supported必须引用改动端与保留端，无新增contradicted或unknown",
+    "服务端生成verification_acceptance；局部accepted与segment_plan_consistency unknown分别展示，covered/uncovered不可由客户端降格",
+    "缺历史契约时保留局部结论但维持应用阻塞；只能用真实历史契约重新显式复核，不造快照、不迁旧提案",
+    "某件物品的使用含义歧义，以及本次局部矛盾之外的正文语义，不在局部证明范围内，保留unknown；不由四维supported宣布全段合格",
+    "完整清单约束必须随新段保存原设定权威，不从当前设定倒填历史。full-contract-real-v2已真实消费完整权威但漏检正文新增的未授权物件；四维supported不得替代人工完整清单验收，方法保持experimental"
+  ]}],
+  "acceptance": [{"id":"local_repair_verification","requires_evidence":true},{"id":"preserved_facts","requires_evidence":true},{"id":"scope_binding","requires_evidence":true}],
+  "source_evidence": [{"run_ref":"historical Assistant run79; offline replay tests/fixtures/body_repair_run79.json","scope":"generation10 [5517,5535), registration-book contradiction only; 20 citations and six preserved quotes","input_fingerprint":"e73b337eca9c8898a732d6a35506b567f227cc8249ecb595797be8affff663ba","provider_role":"assistant","independent_verification":"historical MiniMax-M3 response; no new calls; bounded local evidence only","code_version":"see git commit containing docs/body-repair-scope-design.md"}],
+  "failure_boundaries": ["authority_adapter_single_project_failed_semantic_acceptance", "derived_rebuild_kg_fact_pending_no_unlock", "experimental_single_project", "missing_saved_contract_blocks_apply", "overall_unknown", "other_body_semantics_unknown", "no_automatic_old_proposal_upgrade", "no_historical_contract_fabrication", "no_new_model_calls_in_offline_replay", "quote_location_is_not_semantic_proof"],
+  "allowed_actions": [],
+  "supersedes": null
+}

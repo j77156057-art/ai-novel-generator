@@ -1,0 +1,10 @@
+{
+  "id": "closed_inventory", "version": 5, "status": "experimental",
+  "applicable_tasks": ["body_consistency", "repair_verification"], "agent_roles": ["diagnostic"],
+  "required_capabilities": [{"id": "read_closed_inventory", "min_version": 1}],
+  "steps": [{"id": "inventory", "capability": "read_closed_inventory", "requires": [], "observe": ["full frozen authority", "source canonical state groups with original provenance", "bounded incremental independent verdict", "structured independence verdict (entity_kind) with server-derived status"]}],
+  "acceptance": [{"id": "explicit_closure", "requires_evidence": true}, {"id": "full_scope_coverage", "requires_evidence": true}],
+  "source_evidence": [],
+  "failure_boundaries": ["Experimental v5; previous versions and verdicts preserved as history.", "The model answers only whether a candidate is an independent entity; the server derives the verdict from the closed-list policy, so the same input cannot yield opposite verdicts across audits.", "A part, packaging, material, wear, internal state or attachment of an authorized item is not a new entity.", "Something already stated in the frozen authority (fixed scene fittings, places, named items) is not a new entity.", "Insufficient evidence stays unknown and never blocks the whole-body acceptance.", "Unknown sources, unreviewed candidates and unselected dimensions remain explicit; completed pipeline is not semantic success.", "No Writer, distillation, apply or ReAct core changes."],
+  "allowed_actions": [], "supersedes": null
+}

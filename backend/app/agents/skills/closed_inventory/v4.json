@@ -1,0 +1,10 @@
+{
+  "id": "closed_inventory", "version": 4, "status": "experimental",
+  "applicable_tasks": ["body_consistency", "repair_verification"], "agent_roles": ["diagnostic"],
+  "required_capabilities": [{"id": "read_closed_inventory", "min_version": 1}],
+  "steps": [{"id": "inventory", "capability": "read_closed_inventory", "requires": [], "observe": ["full frozen authority", "source canonical state groups with original provenance", "bounded incremental independent verdict"]}],
+  "acceptance": [{"id": "explicit_closure", "requires_evidence": true}, {"id": "full_scope_coverage", "requires_evidence": true}],
+  "source_evidence": [],
+  "failure_boundaries": ["Experimental v4; previous versions and verdicts preserved as history.", "Reuse located mentions only for identical observation fingerprint; invalidate old verdicts for authority/protocol/candidate version changes.", "Exact canonical or explicit aliases only; never merge different objects using ungrounded synonym guesses.", "Full authority controls category, location and time scope; scene-authorized furniture and ordinary background are not automatically violations.", "Unknown sources, unreviewed candidates and unselected dimensions remain explicit; completed pipeline is not semantic success.", "No Writer, distillation, apply or ReAct core changes."],
+  "allowed_actions": [], "supersedes": null
+}

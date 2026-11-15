@@ -1,0 +1,10 @@
+{
+  "id": "closed_inventory", "version": 1, "status": "experimental",
+  "applicable_tasks": ["body_consistency", "repair_verification"], "agent_roles": ["diagnostic"],
+  "required_capabilities": [{"id": "read_closed_inventory", "min_version": 1}],
+  "steps": [{"id": "inventory", "capability": "read_closed_inventory", "requires": [], "observe": ["saved authority", "full body mention ledger", "independent verdicts"]}],
+  "acceptance": [{"id": "explicit_closure", "requires_evidence": true}, {"id": "full_scope_coverage", "requires_evidence": true}],
+  "source_evidence": [],
+  "failure_boundaries": ["Ordinary fiction defaults to open inventories.", "Missing authority or coverage stays unknown.", "Located quotes do not prove entity recall or semantic correctness.", "This task does not validate time, plot completion, or literary quality."],
+  "allowed_actions": [], "supersedes": null
+}
