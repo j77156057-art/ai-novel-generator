@@ -155,10 +155,14 @@ def KgSignal_factory(new_characters: int = 0, open_plotholes: int = 0):
 # ── 组 4：attach_branch_to_state ──
 
 def test_attach_branch_to_state():
-    print("\n=== 组 4: attach_branch_to_state 纯函数 ===")
+    print("\n=== 组 4: attach_branch_to_state 纯函数（段/章两种模式） ===")
     from app.generation.branch import attach_branch_to_state
     from app.generation.timeline import PlotNode
 
+    # ── 段模式（chapter_based=False，默认）：current_node 切到支线 + 嵌套挂载 ──
+    # 契约（2026-11-15 定稿）：段模式没有章边界，支线挂到「它从哪一段长出来的」
+    # 节点下；上一条支线若仍是 current_node，第二条支线就嵌套在它下面，
+    # 保留溯源信息。归一化（取父主干）只在章模式生效。
     st = plan_timeline(total_segments=10)
     # 节点 n1 已有
     branch = PlotNode(
@@ -167,25 +171,58 @@ def test_attach_branch_to_state():
         parent="n1", children=[],
     )
     new_st = attach_branch_to_state(st, branch)
-    check("current_node 切到支线", new_st.current_node, "b-n1-1")
-    check("branch_used +1", new_st.branch_used, 1)
-    check("n1.children 含 b-n1-1", "b-n1-1" in new_st.nodes["n1"].children, True)
-    check("branch 已加到 nodes", "b-n1-1" in new_st.nodes, True)
-    check("原 state 不变（纯函数）", st.current_node, "n1")
-    check("原 branch_used 不变", st.branch_used, 0)
+    check("[段] current_node 切到支线", new_st.current_node, "b-n1-1")
+    check("[段] branch_used +1", new_st.branch_used, 1)
+    check("[段] n1.children 含 b-n1-1", "b-n1-1" in new_st.nodes["n1"].children, True)
+    check("[段] branch 已加到 nodes", "b-n1-1" in new_st.nodes, True)
+    check("[段] 原 state 不变（纯函数）", st.current_node, "n1")
+    check("[段] 原 branch_used 不变", st.branch_used, 0)
 
-    # 再次 attach 不同支线
+    # 再次 attach 不同支线：current_node 现在是 b-n1-1，段模式**不归一化**，
+    # 于是 branch2 嵌套挂在 b-n1-1 之下（而不是同级挂回 n1）。
     branch2 = PlotNode(
         id="b-n1-2", kind="branch", title="支线2", emotion="爽",
         entry_condition="e", exit_condition="x", segment_budget=1,
         parent="n1", children=[],
     )
-    # 但 current_node 现在是 b-n1-1（不是 n1）—— branch2.parent 是 b-n1-1
     branch2.parent = "b-n1-1"
     new_st2 = attach_branch_to_state(new_st, branch2)
-    check("第二次切到 b-n1-2", new_st2.current_node, "b-n1-2")
-    check("branch_used=2", new_st2.branch_used, 2)
-    check("b-n1-1.children 含 b-n1-2", "b-n1-2" in new_st2.nodes["b-n1-1"].children, True)
+    check("[段] 第二次切到 b-n1-2", new_st2.current_node, "b-n1-2")
+    check("[段] branch_used=2", new_st2.branch_used, 2)
+    check("[段] 嵌套挂载：b-n1-1.children 含 b-n1-2",
+          "b-n1-2" in new_st2.nodes["b-n1-1"].children, True)
+    check("[段] 不回归同级挂载：b-n1-2 不在 n1.children",
+          "b-n1-2" in new_st2.nodes["n1"].children, False)
+
+    # ── 章模式（chapter_based=True）：current_node 不切走 + 挂在主干层 ──
+    # 章模式的「当前剧情点」必须与章号对齐，支线只登记到 branch_current；
+    # 即使 current_node 被外部写成支线（这里用段模式结果模拟），挂载锚点也会
+    # 归一化回父主干，保证第二条支线仍是主干同级（不嵌套）。
+    st_c = plan_timeline(total_segments=10)
+    branch_c1 = PlotNode(
+        id="b-n1-1", kind="branch", title="章模式支线1", emotion="爽",
+        entry_condition="e", exit_condition="x", segment_budget=1,
+        parent="n1", children=[],
+    )
+    new_c1 = attach_branch_to_state(st_c, branch_c1, chapter_based=True)
+    check("[章] current_node 保持 n1", new_c1.current_node, "n1")
+    check("[章] branch_current 记到支线", new_c1.branch_current, "b-n1-1")
+    check("[章] n1.children 含 b-n1-1", "b-n1-1" in new_c1.nodes["n1"].children, True)
+
+    # 把 current_node 人为指到支线（模拟历史存档/外部写入），再切第二条：
+    # 章模式必须归一化**挂载锚点**到父主干 n1 → 同级挂载。注意本函数只归一化
+    # 锚点，不改写 current_node 指针（章模式下由引擎保证它与章号对齐）。
+    new_c1.current_node = "b-n1-1"
+    branch_c2 = PlotNode(
+        id="b-n1-2", kind="branch", title="章模式支线2", emotion="爽",
+        entry_condition="e", exit_condition="x", segment_budget=1,
+        parent="n1", children=[],
+    )
+    new_c2 = attach_branch_to_state(new_c1, branch_c2, chapter_based=True)
+    check("[章] 归一化：b-n1-2 挂在 n1.children",
+          "b-n1-2" in new_c2.nodes["n1"].children, True)
+    check("[章] 不嵌套：b-n1-1.children 不含 b-n1-2",
+          "b-n1-2" in new_c2.nodes["b-n1-1"].children, False)
 
 
 # ── 组 5：detect_kg_signal SQL 查询 ──

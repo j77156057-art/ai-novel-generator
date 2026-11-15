@@ -131,6 +131,32 @@ def test_projection_writes_group_surface_holding_and_story_segment(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 1b. transfer_event_id：持有变化要能指回「哪件事」
+# ---------------------------------------------------------------------------
+def test_projection_links_transfer_event(tmp_path):
+    path = _gen_db(tmp_path)
+    seen = {}
+
+    def _lookup(item, owner, segment_no):
+        seen["args"] = (item, owner)
+        return 77
+
+    stats = project_holdings(
+        project_id=_PROJECT, book=_BOOK, result=_result(), batch=_batch(),
+        kind_of=_kind_of, owner_lookup=_owner, event_lookup=_lookup,
+        generated_db=str(path))
+    assert stats["errors"] == []
+    assert seen["args"] == ("镇北王刀", "许七安")
+
+    con = store.connect(path, readonly=True)
+    try:
+        holding = con.execute("SELECT * FROM kg_item_holding").fetchone()
+        assert holding["transfer_event_id"] == 77
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
 # 2. 重跑幂等：零新增
 # ---------------------------------------------------------------------------
 def test_projection_is_idempotent_on_rerun(tmp_path):

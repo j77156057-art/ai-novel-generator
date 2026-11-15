@@ -382,10 +382,10 @@ check("aliases 合并去重", set(ly.aliases), {"悠然", "林经理"})
 check("attrs 深合并 arc 被覆盖", ly.attrs["arc"], "成长")
 check("attrs 深合并 secrets 新增", ly.attrs.get("secrets"), ["母亲之死"])
 
-# strength 变化 → evolution 追加
+# 关系演化：新建时落一条基线，strength 变化再追加一条（表不再是死表）
 evols = db.scalars(select(KgRelationEvolution).where(KgRelationEvolution.project_id == 1)).all()
-check("strength 变化追加 evolution", len(evols), 1)
-check("evolution 新 strength", evols[0].strength, 0.9)
+check("新建基线 + strength 变化共 2 条 evolution", len(evols), 2)
+check("evolution 新 strength", max(e.strength for e in evols), 0.9)
 db.refresh(rels[0])
 check("relation strength 更新", rels[0].strength, 0.9)
 

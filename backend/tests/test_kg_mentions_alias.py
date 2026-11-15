@@ -20,12 +20,13 @@ from sqlalchemy.orm import Session  # noqa: E402
 
 from app.kg import batch_worker as bw  # noqa: E402
 from app.models import (  # noqa: E402
-    Generation, KgEntity, KgEvent, KgIngestQuarantine, KgMention,
+    Generation, KgEntity, KgEvent, KgIngestQuarantine, KgMention, Project,
 )
 
 #: 只建用到的表：不碰 raw_novels 等带向量列的表，也不连真实库
-#: （隔离表也要建：门拦截的段会往 kg_ingest_quarantine 写整行）
-_TABLES = (KgEntity, KgEvent, Generation, KgIngestQuarantine, KgMention)
+#: （隔离表也要建：门拦截的段会往 kg_ingest_quarantine 写整行；Project 是
+#: _persist_extraction 里 db.get(Project, ...) 的依赖）
+_TABLES = (Project, KgEntity, KgEvent, Generation, KgIngestQuarantine, KgMention)
 
 
 def _session(tmp_path) -> Session:

@@ -143,6 +143,10 @@ def test_rewrite_carries_item_block_and_constraints():
             )
             return "改写后的正文，" * 40
 
+        def stream_chat(self, system, user, **kwargs):
+            # 重写轮已改走流式：受测对象是 prompt 组装，这里按 chunk 一次性吐出
+            yield self.chat(system, user)
+
     p = _Provider()
     cons = {"characters": ["李浩"], "plotholes": ["策划书去哪了"]}
     out, info = engine._rewrite_with_evidence(

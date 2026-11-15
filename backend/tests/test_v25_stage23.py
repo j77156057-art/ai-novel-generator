@@ -222,7 +222,12 @@ def test_regenerate_does_not_call_v25():
         def summarize(self, text): return "new sum"
         def summarize_rollup(self, texts, level): return "roll"
 
-    with patch("app.generation.engine._style_narrative", return_value=None):
+    # v3 批抽入队走全局单例队列 + 后台线程，而本用例用的是临时内存库：
+    # 真入队会让 worker 去读一个不存在的库，并污染后续用例的队列。这里只验证
+    # v2.5 接线，把 v3 入队替换成空实现。
+    with patch("app.generation.engine._style_narrative", return_value=None), \
+         patch("app.generation.engine._enqueue_v3_extraction",
+               return_value={"enqueued": False}):
         chunks = list(regenerate_segment_stream(s, p, segment_no=1, novel_ids=None, provider=FP()))
     done = chunks[-1]
     # regenerate 不应 yield "kg_update" 或 "branch_roll" 字段（v2.5 不接 regenerate）

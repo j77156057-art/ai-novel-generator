@@ -673,7 +673,11 @@ def test_normalize_extraction_keeps_original_form(monkeypatch):
 
 
 def test_normalize_extraction_drops_derived_item_entities(caplog):
-    """派生 item 实体（地书碎片/地书聊天群）在入口丢弃，且有计数与日志。"""
+    """派生 item 实体（地书碎片/地书聊天群）在入口丢弃，且有计数与日志。
+
+    名单现由项目配置传入（`plot_bible.derived_item_names`），代码里不再内置，
+    所以这里显式给名单 —— 与生产侧 `batch_worker._persist_extraction` 同路径。
+    """
     result = {
         "entities": [
             {"canonical_name": "地书", "kind": "item", "aliases": []},
@@ -694,7 +698,8 @@ def test_normalize_extraction_drops_derived_item_entities(caplog):
         ],
     }
     with caplog.at_level(logging.WARNING):
-        canon_source.normalize_extraction(result)
+        canon_source.normalize_extraction(
+            result, derived_item_names={"地书碎片", "地书聊天群"})
 
     assert [e["canonical_name"] for e in result["entities"]] == ["地书", "许七安"]
     # 计数可查（batch_worker 会转进 ExtractionStats → agent_runs.note）
@@ -717,9 +722,39 @@ def test_derived_item_names_do_not_touch_other_items():
         "relations": [],
         "events": [],
     }
-    canon_source.normalize_extraction(result)
+    canon_source.normalize_extraction(
+        result, derived_item_names={"地书碎片", "地书聊天群"})
     assert [e["canonical_name"] for e in result["entities"]] == ["镇国剑", "太平刀"]
     assert "derived_items_dropped" not in result
+
+
+def test_derived_item_names_default_off():
+    """没配名单 = 不启用：同名实体原样保留（不误伤同名独立物品的书）。"""
+    result = {
+        "entities": [
+            {"canonical_name": "地书碎片", "kind": "item", "aliases": []},
+            {"canonical_name": "地书聊天群", "kind": "item", "aliases": []},
+        ],
+        "relations": [],
+        "events": [],
+    }
+    canon_source.normalize_extraction(result)
+    assert [e["canonical_name"] for e in result["entities"]] == ["地书碎片", "地书聊天群"]
+    assert "derived_items_dropped" not in result
+
+
+def test_derived_item_names_from_project():
+    """只认 plot_bible.derived_item_names 的列表写法；缺失/非法一律空集。"""
+    class _Proj:
+        def __init__(self, bible):
+            self.plot_bible = bible
+
+    assert canon_source.derived_item_names_from_project(
+        _Proj({"derived_item_names": [" 地书碎片 ", "地书聊天群", ""]}),
+    ) == frozenset({"地书碎片", "地书聊天群"})
+    for bad in ({}, {"derived_item_names": None}, {"derived_item_names": "地书碎片"},
+                None):
+        assert canon_source.derived_item_names_from_project(_Proj(bad)) == frozenset()
 
 
 def test_legacy_mode_does_not_normalize(monkeypatch):

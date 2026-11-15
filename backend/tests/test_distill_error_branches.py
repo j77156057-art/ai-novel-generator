@@ -97,6 +97,37 @@ def test_format_never_leaks_api_key():
     assert "glm-4-flash" in msg
 
 
+def test_clear_stale_scope_chunks_drops_old_tier():
+    """换档/换语料后，旧 scope 的断点必须清掉，不能留给下一次蒸馏。"""
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import app.models  # noqa: F401
+    from app.db import Base
+    from app.models import DistillChunk, Project
+    from app.style.narrative import _clear_stale_scope_chunks
+
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    db = sessionmaker(bind=eng, future=True)()
+    proj = Project(title="换档残留测试")
+    db.add(proj)
+    db.commit()
+    db.add_all([
+        DistillChunk(project_id=proj.id, novel_id=1, scope="fast",
+                     chunk_key="c1", payload={}),
+        DistillChunk(project_id=proj.id, novel_id=1, scope="balanced",
+                     chunk_key="c1", payload={}),
+    ])
+    db.commit()
+
+    removed = _clear_stale_scope_chunks(db, proj.id, "balanced")
+    assert removed == 1
+    assert {c.scope for c in db.scalars(select(DistillChunk)).all()} == {"balanced"}
+
+
 if __name__ == "__main__":
     import pytest
 

@@ -155,6 +155,9 @@ def test_identical_text_passes_without_quarantine():
     assert _count(db, KgEvent) == 1
     assert _count(db, KgRelation) == 1
     assert _count(db, KgMention) >= 1
+    # 定位字段：每条 mention 都必须绑定到真实 generation，否则点名字跳不到原文
+    mentions = db.query(KgMention).all()
+    assert all(m.generation_id is not None for m in mentions)
     assert _q(db) == []
     assert stats.text_gate["blocked_segments"] == {}
 

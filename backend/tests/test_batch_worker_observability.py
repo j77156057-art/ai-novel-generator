@@ -17,6 +17,16 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# 本文件是可直接运行的脚本（脚本文末会 sys.exit），不是 pytest 用例。
+# 不加这道闸，pytest 收集阶段会执行全文件并以 SystemExit 中断整个测试会话。
+if __name__ != "__main__":
+    import pytest
+
+    pytest.skip(
+        "standalone script: python tests/test_batch_worker_observability.py",
+        allow_module_level=True,
+    )
+
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
@@ -92,14 +102,14 @@ db.commit()
 bw._queue._queues.clear()
 
 # ====================================================================
-# 1. enqueue_segment 落一行 running
+# 1. enqueue_segment 落一行 pending（认领权归常驻 worker）
 # ====================================================================
 rid1 = bw.enqueue_segment(db, 1, 1, "林悠然推开门。", chapter=1)
 db.commit()
 check_true("enqueue 返回 AgentRun id", rid1 is not None)
 row = db.get(AgentRun, rid1)
 check("role 是 kg_batch_extract", row.role, bw.ROLE_KG_EXTRACT)
-check("status 是 running", row.status, "running")
+check("status 是 pending", row.status, "pending")
 import json as _json  # noqa: E402
 
 note = _json.loads(row.note)

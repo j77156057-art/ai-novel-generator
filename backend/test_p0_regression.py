@@ -74,6 +74,12 @@ class FakeProvider:
         self.idx += 1
         return t
 
+    def complete_message(self, messages, tools=None, tool_choice=None):
+        """素材轮要结构化返回；真 provider 有这个入口，桩子缺了会抛
+        AttributeError 并被素材轮的兜底 except 吞掉——留在这里会让「桩不完整」
+        伪装成「链路正常」。返回空 tool_calls 即「本章不需要外部素材」。"""
+        return {"content": "", "tool_calls": []}
+
     def summarize(self, text):
         return f"摘要{self.idx}"
 
@@ -192,11 +198,23 @@ def main() -> int:
     import app.llm.provider as pm  # noqa: E402
 
     class _Resp:
+        """假响应：接口对齐 `http.client.HTTPResponse`。
+
+        provider 按 64KiB 窗口分块读（`read1(n)` 优先、`read(n)` 兜底），
+        只实现无参 `read()` 会在真实调用路径上直接 TypeError。
+        """
+
         def __init__(self, body):
             self.b = body
+            self.pos = 0
 
-        def read(self):
-            return self.b
+        def read(self, n=-1):
+            chunk = self.b[self.pos:] if n is None or n < 0 else self.b[self.pos:self.pos + n]
+            self.pos += len(chunk)
+            return chunk
+
+        def read1(self, n=-1):
+            return self.read(n)
 
         def __iter__(self):
             return iter(self.b.splitlines(keepends=True))
@@ -352,12 +370,18 @@ def main() -> int:
     # 只断言 build_context 的返回值不够——真正决定模型看到什么的是 provider 的入参。
     fake.seen_constraints.clear()
     generate_next_segment(db, project, provider=fake)
-    recv = fake.seen_constraints[-1] if fake.seen_constraints else {}
+    calls = list(fake.seen_constraints)
+    print(f"  本章 provider 正文调用 {len(calls)} 次，逐次 constraints = {calls}")
+    # 断言范围是**每一次正文调用**，不是 `[-1]`：初稿之后还有补写轮
+    # （`_complete_short_draft`）等多条正文路径，只看最后一次时，只要最后一条
+    # 恰好是裸奔的补写轮，整条 bible 注入链就被掩盖了（2026-11-14 补写轮上线
+    # 后 p0 一直红在这里的表现即此）。
+    recv = calls[0] if calls else None
     recv_chars = (recv or {}).get("characters") or []
-    print(f"  provider 实收 constraints.characters = {recv_chars}")
-    check("provider 实收 constraints 含 bible 角色（沈砚）", "沈砚" in recv_chars, str(recv))
+    print(f"  provider 初稿实收 constraints.characters = {recv_chars}")
+    check("provider 初稿调用实收 constraints 含 bible 角色（沈砚）", "沈砚" in recv_chars, str(recv))
     check(
-        "provider 实收 constraints 含 bible 伏笔（铜镜背面的裂纹）",
+        "provider 初稿调用实收 constraints 含 bible 伏笔（铜镜背面的裂纹）",
         any("铜镜背面的裂纹" in (h or "") for h in ((recv or {}).get("plotholes") or [])),
         str(recv),
     )
@@ -365,6 +389,19 @@ def main() -> int:
         "bible 角色在 provider 实收名单里也排最前（权威在前，未被图谱淹没）",
         bool(recv_chars) and recv_chars[0] == "沈砚",
         str(recv_chars),
+    )
+    check(
+        "初稿之后的每次正文调用（补写轮等）都带同一份锁定名单，不得裸奔",
+        bool(calls) and all(
+            (c or {}).get("characters") == recv_chars for c in calls),
+        str([(c or {}).get("characters") for c in calls]),
+    )
+    check(
+        "初稿之后的每次正文调用都带 bible 伏笔，不得裸奔",
+        bool(calls) and all(
+            any("铜镜背面的裂纹" in (h or "") for h in ((c or {}).get("plotholes") or []))
+            for c in calls),
+        str([(c or {}).get("plotholes") for c in calls]),
     )
 
     # -----------------------------------------------------------------------

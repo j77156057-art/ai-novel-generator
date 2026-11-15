@@ -223,6 +223,78 @@ def test_retry_exhausted_is_visible_then_requeue_resets(db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 4b. parse_failed（输出被截断）→ 带输出预算约束定向重抽一次
+# ---------------------------------------------------------------------------
+class _TruncateThenOk:
+    def __init__(self):
+        self.notes: list[bool] = []
+
+    def chat(self, system, user):
+        if "连通性探针" in system:
+            return "ok"
+        self.notes.append("【输出预算】" in user)
+        if "【输出预算】" not in user:
+            # 模拟被 4096 token 上限截断的半截 JSON
+            return '{"entities": [{"kind": "character", "canonical_name": "某'
+        return json.dumps({"entities": [], "relations": [], "events": [],
+                           "state_changes": []}, ensure_ascii=False)
+
+
+def test_parse_failed_retries_with_output_budget(db, monkeypatch):
+    prov = _TruncateThenOk()
+    monkeypatch.setattr(bw, "_get_provider", lambda: prov)
+    monkeypatch.setattr(bw, "_provider_unavailable", lambda p: False)
+    s = db()
+    s.add(Generation(project_id=1, segment_no=1, text="第 1 段正文。"))
+    s.commit()
+    s.close()
+    rid = bw.enqueue_segment(db(), 1, 1, "第 1 段正文。")
+
+    bw.flush_project(1)
+
+    note = _note(db, rid)
+    assert "error_kind" not in note, note
+    assert prov.notes == [False, True]  # 第一次裸抽、第二次带输出预算
+
+
+# ---------------------------------------------------------------------------
+# 4c. 版本化之前的老 mentions（generation_id 为空）按章段号一起置非当前
+# ---------------------------------------------------------------------------
+class _OkEmpty:
+    def chat(self, system, user):
+        if "连通性探针" in system:
+            return "ok"
+        return json.dumps({"entities": [], "relations": [], "events": [],
+                           "state_changes": []}, ensure_ascii=False)
+
+
+def test_null_generation_mentions_superseded_on_rebuild(db, monkeypatch):
+    from app.models import KgMention
+
+    monkeypatch.setattr(bw, "_get_provider", lambda: _OkEmpty())
+    monkeypatch.setattr(bw, "_provider_unavailable", lambda p: False)
+    s = db()
+    for seg in (14, 15, 16, 17, 18):
+        s.add(Generation(project_id=1, segment_no=seg,
+                         chapter_range=f"第1章《测试章》（v{seg}）",
+                         text=f"第 {seg} 段正文。"))
+    s.flush()
+    old = KgMention(project_id=1, entity_id=1, generation_id=None,
+                    segment_no=16, is_current=True, version=1)
+    s.add(old)
+    s.commit()
+    old_id = old.id
+    s.close()
+
+    bw.enqueue_segment(db(), 1, 18, "第 18 段正文。", chapter=1, rebuild=True)
+    bw.flush_project(1)
+
+    s = db()
+    assert s.get(KgMention, old_id).is_current is False
+    s.close()
+
+
+# ---------------------------------------------------------------------------
 # 5. provider 不可用：单独分类，attempts=0
 # ---------------------------------------------------------------------------
 def test_provider_unavailable_is_visible(db, monkeypatch):

@@ -63,19 +63,26 @@ def main():
     small = [(i, f"第{i}章") for i in range(1, 11)]
     check("少量章节全部返回", _sample_chapters(small, max_chapters=30) == small)
 
-    # ── 2. _validate_evidence：证据验证 ──
-    chunk = "他抬起头，看着远处的山口，风从那里吹过来，带着一点凉意。她把斗篷裹紧了些，没有说话。"
+    # ── 2. _validate_evidence：证据验证（2026-11-12 起证据下限 20 字）──
+    chunk = (
+        "他抬起头，看着远处的山口，风从那里吹过来，带着一点凉意。"
+        "她把斗篷裹紧了些，低声说了一句什么，然后转身往山下走去。"
+    )
+    long_ev = "她把斗篷裹紧了些，低声说了一句什么，然后转身往山下走去"
     # 证据在原文中
-    check("证据在原文中通过", _validate_evidence("对白简短（证据：她没有回答，只是握紧了手中的匕首）", chunk) or
-          _validate_evidence("外貌描写从动作入手（证据：她把斗篷裹紧了些，没有说话）", chunk))
+    check("证据在原文中通过",
+          _validate_evidence(f"外貌描写从动作入手（证据：{long_ev}）", chunk))
     # 证据不在原文中
     check("证据不在原文中被拒", not _validate_evidence("角色总是微笑（证据：他露出了灿烂的笑容）", chunk))
     # 无证据标记但规则本身是原文句子——通过
-    check("原文引用直接验证通过", _validate_evidence("她把斗篷裹紧了些，没有说话", chunk))
+    check("原文引用直接验证通过", _validate_evidence(long_ev, chunk))
     # 无证据标记且规则不是原文句子——被拒
     check("编造规则被拒", not _validate_evidence("这是一个完全编造的规则，原文中不存在", chunk))
     # 证据太短被拒
     check("证据太短被拒", not _validate_evidence("规则（证据：他）", chunk))
+    # 20 字是硬门槛：19 字拒、20 字收
+    check("19 字证据被拒", not _validate_evidence(f"规则（证据：{long_ev[:19]}）", chunk))
+    check("20 字证据通过", _validate_evidence(f"规则（证据：{long_ev}）", chunk))
 
     # ── 3. _parse_extract_result：JSON 解析容错 ──
     # 直接 JSON
@@ -101,16 +108,18 @@ def main():
     check("指纹含 narrative_version", fp1.get("narrative_version") == NARRATIVE_VERSION)
 
     # ── 5. describe_narrative ──
+    # 选条会过「证据 ≥8 字」硬过滤；这里给足长度，避免测的是过滤而不是渲染。
+    ev = "他把窗户推开，冷风灌进屋里，桌上的纸页被吹得哗哗作响"
     profile = {
         "rules": {
             "人物描写手法": [
-                {"rule": "规则A（证据：原文A）"},
-                {"rule": "规则B（证据：原文B）"},
-                {"rule": "规则C（证据：原文C）"},
-                {"rule": "规则D（证据：原文D）"},
+                {"rule": f"规则A（证据：{ev}）", "chapter_no": 1},
+                {"rule": f"规则B（证据：{ev}）", "chapter_no": 2},
+                {"rule": f"规则C（证据：{ev}）", "chapter_no": 3},
+                {"rule": f"规则D（证据：{ev}）", "chapter_no": 4},
             ],
             "对白风格": [
-                {"rule": "规则E（证据：原文E）"},
+                {"rule": f"规则E（证据：{ev}）", "chapter_no": 5},
             ],
             "节奏控制": [],  # 空维度应跳过
         },
@@ -148,7 +157,10 @@ def main():
     check("有缓存直接返回", result == cached)
 
     # ── 7. 维度清单 ──
-    check("维度清单非空", len(NARRATIVE_DIMENSIONS) == 14)
+    check("维度清单非空", len(NARRATIVE_DIMENSIONS) == 13)
+    from app.style.narrative import DEPRECATED_DIMENSIONS
+    check("停用维度不在提炼清单", "高频场景模板" in DEPRECATED_DIMENSIONS
+          and "高频场景模板" not in NARRATIVE_DIMENSIONS)
     check("维度含人物描写手法", "人物描写手法" in NARRATIVE_DIMENSIONS)
     check("维度含对白风格", "对白风格" in NARRATIVE_DIMENSIONS)
 

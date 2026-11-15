@@ -123,7 +123,9 @@ db.commit()
 # 1. engine 挂载（静态检查）
 # ====================================================================
 engine_py = (BACKEND / "app" / "generation" / "engine.py").read_text(encoding="utf-8")
-check("engine 调 _enqueue_v3_extraction 次数", engine_py.count("_enqueue_v3_extraction(db, project, segment_no, text)"), 2)
+# 调用点 = 全部出现次数 − 1 处 def（2026-11-14：新增 regenerate 路径，且各调用带 chapter=）
+_enqueue_calls = engine_py.count("_enqueue_v3_extraction(") - engine_py.count("def _enqueue_v3_extraction(")
+check("engine 调 _enqueue_v3_extraction 次数", _enqueue_calls, 3)
 check("同步版 return 带 v3_extraction", engine_py.count('"v3_extraction": v3_extraction'), 2)
 
 # ====================================================================

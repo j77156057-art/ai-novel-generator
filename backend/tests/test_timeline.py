@@ -168,13 +168,15 @@ check("时间线模式不含 premise", "相知相守" in up_tl, False)
 check("时间线模式不含 premise 字段", "小说大概内容" in up_tl, False)
 check("时间线模式注入当前剧情点", "当前剧情进度" in up_tl, True)
 
-# 原逻辑模式：不传 node_prompt（向后兼容）—— 仍注所有 plot_bible + premise
+# 原逻辑模式：不传 node_prompt（向后兼容）——续写段仍注 plot_bible + premise。
+# 首段（无前情）自 2026-11-12 起只给 conflicts，synopsis/走向延后到第 2 节，
+# 所以这里用带前情的续写段来验证「非时间线模式仍注入 synopsis」。
 up_orig = build_user_prompt(
-    prior_summaries=[], rag_context=[], outline=outline, max_chars=3000,
+    prior_summaries=["前情提要"], rag_context=[], outline=outline, max_chars=3000,
     plot_bible=plot_bible, premise=premise, node_prompt=None,
 )
 check("原逻辑模式含整条大纲", "宣布改革" in up_orig, True)
-check("原逻辑模式含 synopsis", "迎娶白富美" in up_orig, True)
+check("原逻辑模式含 synopsis（续写段）", "迎娶白富美" in up_orig, True)
 check("原逻辑模式不含剧情点块", "当前剧情进度" in up_orig, False)
 
 # ── 9. plan_nodes_with_llm：LLM 把占位节点填实（§7.3）──

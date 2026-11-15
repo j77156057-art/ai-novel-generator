@@ -239,11 +239,16 @@ def main() -> int:
         print("  项目2 constraints ->", plan2["constraints"])
         print("  项目2 rag_context 条数 ->", len(plan2["rag_context"]))
         _check(failures, "沈砚" in sys2, "bible 角色进入 system_prompt")
-        _check(failures, "铜镜背面的裂纹" in sys2, "bible 伏笔进入 system_prompt")
+        # 首段裁剪（v2.3 分级投喂 + 2026-11-12 首段裁剪）：新项目还没有正文，
+        # system 与尾部 constraints 都**刻意不摊开**伏笔清单——首段给全等于把
+        # 全书后手一次说完。这不是注入链断裂：角色仍进 system/constraints，
+        # 伏笔延后到第 2 节；本节末尾用「已写 3 段的项目 1」反向验证它确实会进入。
+        _check(failures, "铜镜背面的裂纹" not in sys2,
+               "首段 system_prompt 不摊开 bible 伏笔清单（分级投喂）")
         # v2.3 起：bible 的 synopsis/direction **只进 system 提示，不再进 user prompt**
         # ——时间线分级投喂把它拦在 user 侧（一次给全结局走向会让第一章就讲完）。
-        # 上面已断言沈砚与铜镜进入 system_prompt；这里反过来守住「user 侧不得再出现」，
-        # 防的是有人把整段 bible 又塞回 user 把分级投喂废掉。
+        # 上面已断言沈砚进入 system_prompt、伏笔按首段规则延后；这里反过来守住
+        # 「user 侧不得出现梗概与伏笔」，防的是有人把整段 bible 又塞回 user。
         _check(failures,
                "一桩尘封十年的旧案" not in plan2["user_prompt"]
                and "铜镜背面的裂纹" not in plan2["user_prompt"],
@@ -252,14 +257,36 @@ def main() -> int:
         _check(failures, plan2["rag_context"] == [], "未选参考语料时 RAG 为空", plan2["rag_context"])
         # bible 层必须同时进 system_prompt **和** constraints（后者会被 provider 追加到
         # user 末尾做近因提醒）。两处口径必须一致，否则尾部那份自称完整的锁定名单会漏掉
-        # 最高权威层——这正是本项修复要防的。
+        # 最高权威层——这正是本项修复要防的。首段例外：伏笔按上面的规则延后，两处都空。
         _check(failures, "沈砚" in (plan2["constraints"]["characters"] or []),
                "bible 角色进入 constraints（与 system 同口径）",
                plan2["constraints"]["characters"])
-        _check(failures, any("铜镜背面的裂纹" in (h or "")
-                             for h in plan2["constraints"]["plotholes"]),
-               "bible 伏笔进入 constraints（与 system 同口径）",
+        _check(failures, plan2["constraints"]["plotholes"] == [],
+               "首段 constraints.plotholes 为空（与 system 同口径，均不摊开）",
                plan2["constraints"]["plotholes"])
+
+        # —— 反向验证：非首段必须真的注入 bible 伏笔 ——
+        # 用「已写 3 段」的项目 1 再预览一次。首段裁剪只对没有正文的项目生效，
+        # 这一条把「首段刻意见不到」和「注入链断了」区分开：前者正文一开写就恢复，
+        # 后者无论写多少段都进不来。
+        r = client.patch(f"/api/projects/{project_id}", json={"plot_bible": bible})
+        _check(failures, r.status_code == 200, "项目1 PATCH plot_bible 返回 200", r.status_code)
+        r = client.post("/api/generate-plan", json={"project_id": project_id, "novel_ids": [novel_id]})
+        if r.status_code != 200:
+            failures.append(f"generate-plan#1b 失败 {r.status_code}: {r.text}")
+        else:
+            plan_ns = r.json()
+            _check(failures, "铜镜背面的裂纹" in plan_ns["system_prompt"],
+                   "第 2 节起 bible 伏笔进入 system_prompt",
+                   plan_ns["system_prompt"][:80])
+            _check(failures, "沈砚" in (plan_ns["constraints"]["characters"] or []),
+                   "第 2 节起 bible 角色进入 constraints",
+                   plan_ns["constraints"]["characters"])
+            _check(failures,
+                   any("铜镜背面的裂纹" in (h or "")
+                       for h in plan_ns["constraints"]["plotholes"]),
+                   "第 2 节起 bible 伏笔进入 constraints（与 system 同口径）",
+                   plan_ns["constraints"]["plotholes"])
 
         # ============ 四、请求体严格模式（拼错字段 fail loud）============
         print("\n=== 四、请求体严格模式 ===")

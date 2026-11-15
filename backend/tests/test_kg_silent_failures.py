@@ -192,7 +192,8 @@ def test_enqueue_commits_row_itself(tmp_path):
     s2 = Session()
     row = s2.get(AgentRun, rid)
     assert row is not None, "入队行未持久化：还在依赖调用方后续的 commit"
-    assert row.status == "running"
+    # 入队只落 pending，认领权归常驻 worker（写章进程可能是短命的 CLI）。
+    assert row.status == "pending"
 
     s2.close()
     s1.close()

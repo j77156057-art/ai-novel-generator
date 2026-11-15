@@ -24,7 +24,8 @@ NODES = [
         ("临安", ["临安公主"]), ("魏渊", []), ("神殊", []),
         ("宋廷风", []), ("朱广孝", []), ("李玉春", []), ("杨砚", []),
         ("褚采薇", []), ("浮香", []), ("元景帝", []), ("李妙真", []),
-        ("金莲", []), ("张巡抚", []),
+        ("金莲", []), ("张巡抚", []), ("吕青", []), ("南宫倩柔", []),
+        ("梁有平", []), ("杨川南", []),
     ]
 ]
 
@@ -100,15 +101,47 @@ def test_gate_only_subtracts_edges(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4. 306 章那批的实际绑定行为
+# 4. 名词分支：R10–R13 收紧（306 样本的 4 条残余错）
 # ---------------------------------------------------------------------------
-def test_colleague_noun_binds_holder_to_referent():
-    """「同僚」是第三人：宋、朱是持有者，许七安才是被指代的人。"""
+def test_colleague_noun_with_two_holders_is_not_bound():
+    """R12：holders 已有两人时，句外第三人只是旁证，唯一指代不启用。
+
+    这是 306 章那批的旧行为（曾把「宋廷风-许七安」开出来）；收紧后宁漏不错，
+    真正的密度靠生成层信号补，不靠名词分支。
+    """
     text = ("宋廷风和朱广孝察觉到了同僚的异常，"
             "被许七安毫无血色的脸庞吓了一跳。")
     out = _run(text, [_edge("宋廷风", "朱广孝", "ally"),
                       _edge("宋廷风", "许七安", "ally")], 97)
-    assert {(e["from"], e["to"]) for e in out["edges"]} == {("宋廷风", "许七安")}
+    assert out["edges"] == []
+
+
+def test_r10_quantity_noun_does_not_bind_outer_person():
+    """R10：『两位同僚』是群体，李玉春只是办公室的主人（ch66）。"""
+    out = _run("许七安随两位同僚走向李玉春的办公室。",
+               [_edge("李玉春", "许七安", "ally")], 66)
+    assert out["edges"] == []
+
+
+def test_r11_recipient_is_not_the_colleague_referent():
+    """R11：『分发给许七安三人』里许七安是受事，不是同僚（ch68）。"""
+    out = _run("吕青和两位同僚卸下包裹，分发给许七安三人。",
+               [_edge("吕青", "许七安", "ally")], 68)
+    assert out["edges"] == []
+
+
+def test_r12_possessive_noun_does_not_bind_outer_person():
+    """R12：『X 是 Y 的好友』关系双方都在小句里，杨川南是句外的人（ch495）。"""
+    out = _run("而梁有平笑着点头，是李妙真的好友。",
+               [_edge("李妙真", "杨川南", "ally")], 495)
+    assert out["edges"] == []
+
+
+def test_r13_coordinated_copula_only_binds_the_pair():
+    """R13：『A 与 B 为同僚』只认并列这一对，宋廷风在别的分句（ch806）。"""
+    out = _run("许七安与南宫倩柔为同僚，宋廷风出现在后句。",
+               [_edge("宋廷风", "许七安", "ally")], 806)
+    assert out["edges"] == []
 
 
 def test_copular_colleague_statement_is_kept():

@@ -95,12 +95,30 @@ def test_f_too_few_names_skipped():
 
 
 def test_g_max_names_truncation():
-    """G: 名字超过 max_names 时截断并标记 skipped。"""
+    """G: 调用方显式传 max_names 时截断并标记 skipped（明确限额，非静默截断）。"""
     many = [f"角色{i}" for i in range(100)]
     p = FakeProvider('{"not_person": []}')
     res = _audit_character_names(p, voices_of(many), max_names=80)
     assert res["checked"] == 80
     assert res["skipped"] is True
+
+
+def test_l_default_keeps_full_coverage():
+    """L: 不传 max_names（生产调用）时全量覆盖；上限大于候选数也不截断。
+
+    这条钉住 2026-11-12「全量覆盖」与 2026-11-15「显式限额」两套口径的边界：
+    默认必须是全量，只有调用方主动给正整数上限才截断。
+    """
+    many = [f"角色{i}" for i in range(100)]
+    p = FakeProvider('{"not_person": []}')
+    res = _audit_character_names(p, voices_of(many))
+    assert res["checked"] == 100, res
+    assert res["candidates"] == 100, res
+    assert res["skipped"] is False, res
+
+    res2 = _audit_character_names(p, voices_of(many), max_names=200)
+    assert res2["checked"] == 100, res2
+    assert res2["skipped"] is False, res2
 
 
 def test_i_surname_names_skip_audit():
@@ -156,6 +174,7 @@ if __name__ == "__main__":
         ("E 坏 JSON 不崩", test_e_bad_json_not_blocking),
         ("F 名字太少跳过", test_f_too_few_names_skipped),
         ("G 超量截断", test_g_max_names_truncation),
+        ("L 默认全量覆盖", test_l_default_keeps_full_coverage),
         ("H 只标记不删除", test_h_only_marks_never_deletes),
         ("I 姓+名跳过审计", test_i_surname_names_skip_audit),
         ("J 复姓跳过审计", test_j_compound_surname_skip_audit),

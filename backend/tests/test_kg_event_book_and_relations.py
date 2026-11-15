@@ -89,7 +89,8 @@ def test_slice_events_filtered_by_book_and_null_is_wildcard():
     assert summaries[0] == "书5事件"
 
 
-def test_slice_events_without_book_keeps_old_behavior():
+def test_slice_events_without_book_only_project_level():
+    """项目没绑书（原创）→ 只认项目级 NULL 事件；带 novel_id 的都是参考书语料。"""
     db = _db()
     proj = _project(db)  # continuation/active 都空
     _event(db, proj.id, 1, "本项目原创事件")
@@ -98,7 +99,8 @@ def test_slice_events_without_book_keeps_old_behavior():
     db.commit()
 
     summaries = {e["summary"] for e in slice_for_prompt(db, proj.id, 1)["recent_events"]}
-    assert summaries == {"本项目原创事件", "书5事件", "书6事件"}
+    # 参考书事件不得混入本书上下文（同号段撞号时正是串书入口）
+    assert summaries == {"本项目原创事件"}
 
 
 # ---------------------------------------------------------------------------
