@@ -239,7 +239,7 @@ def test_real_v2_bad_quote_is_rejected_with_replayable_details():
             "sources": sources}}, report, kinds=["object"])
     assert report["inventory"]["calls"][-1]["rejected_citation"] == {
         "source_id": "G1P025",
-        "quote": "她手里的核对表",
+        "quote": "她手里的记录板",
         "source_quote": data["request"]["sources"]["G1P025"],
     }
     assert report["inventory"]["dimensions"]["object"]["validated_source_ids"] == []

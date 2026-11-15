@@ -1,26 +1,26 @@
 {
-  "origin": "single real v2 run, request4/response4; no repaired source or quote",
+  "origin": "synthetic, derived from structure only (request/response shape preserved)",
   "request": {
     "stage": "mentions",
     "dimension": "object",
     "sources": {
-      "G1P025": "林夏看了看页脚：“第十页。”她在手里的核对表上做了个小记号，铅笔没有落到纸上。",
-      "G1P026": "后面的页码顺下来。",
-      "G1P027": "“第十一。”",
-      "G1P028": "“第十二。”",
-      "G1P029": "“十三。”",
-      "G1P030": "“十四。”",
-      "G1P031": "翻页进行到第二十几页时，陈舟的速度慢了些。第十九页靠近书脊的位置有一条短的旧折痕，页码却没有被遮住，他抬眼看林夏。",
-      "G1P032": "“第十九页，折痕在左边，页码能看清。”",
-      "G1P033": "林夏靠近一点：“折痕有没有压到图像？”",
-      "G1P034": "“没压到图，只挨着边。”",
-      "G1P035": "“好，继续。”",
-      "G1P036": "第二十七页比前面的纸更软，陈舟捏住页角时，纸面发出很轻的摩擦声。他停住，手指没有加力。",
-      "G1P037": "“这一页有点软。”他说，“页码还能看见，二十七。”",
-      "G1P038": "“别捏中间。”林夏提醒，“托住页边。”",
-      "G1P039": "陈舟换了个姿势，把纸页从下方托起，翻到第二十八页。",
-      "G1P040": "“二十八。”",
-      "G1P041": "核对继续往后走，桌上的手机计时器已经过了三十多分钟，陈舟翻到第三十六页时，林夏让他暂停，先把目前看到的页面整理了一遍。她按顺序报出页码，陈舟跟着复述一遍，碰到第十九页的折痕和第九页的叶片时，两人都没有把它们算作缺页。"
+      "G1P025": "薛棠看了一眼托盘边沿：“第七只。”她在手边的记录板上划了个小记号，笔尖没有碰到纸面。",
+      "G1P026": "后面的编号顺着往下走。",
+      "G1P027": "“第十一只。”",
+      "G1P028": "“第十二只。”",
+      "G1P029": "“十三只。”",
+      "G1P030": "“十四只。”",
+      "G1P031": "清点到二十几只时，阿翊的手慢了下来。在下数第十七只的表壳边缘有一道旧划痕，编号没有被挡住，他抬眼看薛棠。",
+      "G1P032": "“第十七只，划痕在左边，编号能看清。”",
+      "G1P033": "薛棠凑近一点：“划痕有没有压到刻度？”",
+      "G1P034": "“没压到刻度，只贴着边。”",
+      "G1P035": "“行，往下走。”",
+      "G1P036": "第二十四只的外壳比前面的薄，阿翊捏住表耳时，金属发出很轻的碰响。他停住，没有加力。",
+      "G1P037": "“这一只有点薄。”他说，“编号还能看见，二十四。”",
+      "G1P038": "“别掐当中。”薛棠提醒，“托住表耳。”",
+      "G1P039": "阿翊改了手势，从底下托住表壳，数到第二十五只。",
+      "G1P040": "“二十五只。”",
+      "G1P041": "清点继续往后走，台面的小钟已经走过了四十多分钟，阿翊数到第三十二只时，薛棠让他暂停，先把刚看过的几只归了归。她照着顺序念出编号，阿翊挨个重复，念到第十七只的划痕和第六只的缺件时，两个人都没把这当成损坏。"
     }
   },
   "response": {
@@ -46,266 +46,260 @@
     "mentions": [
       {
         "source_id": "G1P025",
-        "canonical": "核对表",
-        "quote": "她手里的核对表",
+        "canonical": "记录板",
+        "quote": "她手里的记录板",
         "state": "actual"
       },
       {
         "source_id": "G1P025",
-        "canonical": "铅笔",
-        "quote": "铅笔没有落到纸上",
+        "canonical": "笔尖",
+        "quote": "笔尖没有碰到纸面",
         "state": "actual"
       },
       {
         "source_id": "G1P025",
-        "canonical": "纸",
-        "quote": "铅笔没有落到纸上",
+        "canonical": "纸面",
+        "quote": "笔尖没有碰到纸面",
         "state": "actual"
       },
       {
         "source_id": "G1P026",
-        "canonical": "页码",
-        "quote": "后面的页码顺下来",
+        "canonical": "编号",
+        "quote": "后面的编号顺着往下走",
         "state": "actual"
       },
       {
         "source_id": "G1P027",
-        "canonical": "页码",
-        "quote": "第十一",
+        "canonical": "编号",
+        "quote": "第十一只",
         "state": "quoted"
       },
       {
         "source_id": "G1P028",
-        "canonical": "页码",
-        "quote": "第十二",
+        "canonical": "编号",
+        "quote": "第十二只",
         "state": "quoted"
       },
       {
         "source_id": "G1P029",
-        "canonical": "页码",
-        "quote": "十三",
+        "canonical": "编号",
+        "quote": "十三只",
         "state": "quoted"
       },
       {
         "source_id": "G1P030",
-        "canonical": "页码",
-        "quote": "十四",
+        "canonical": "编号",
+        "quote": "十四只",
         "state": "quoted"
       },
       {
         "source_id": "G1P031",
-        "canonical": "纸页",
-        "quote": "翻页进行到第二十几页时",
+        "canonical": "表壳",
+        "quote": "清点到二十几只时",
         "state": "actual"
       },
       {
         "source_id": "G1P031",
-        "canonical": "书脊",
-        "quote": "第十九页靠近书脊的位置",
+        "canonical": "表壳",
+        "quote": "第十七只的表壳边缘",
         "state": "actual"
       },
       {
         "source_id": "G1P031",
-        "canonical": "旧折痕",
-        "quote": "有一条短的旧折痕",
+        "canonical": "旧划痕",
+        "quote": "有一道旧划痕",
         "state": "actual"
       },
       {
         "source_id": "G1P031",
-        "canonical": "页码",
-        "quote": "页码却没有被遮住",
+        "canonical": "编号",
+        "quote": "编号没有被挡住",
         "state": "actual"
       },
       {
         "source_id": "G1P032",
-        "canonical": "纸页",
-        "quote": "第十九页，折痕在左边",
+        "canonical": "表壳",
+        "quote": "第十七只，划痕在左边",
         "state": "quoted"
       },
       {
         "source_id": "G1P032",
-        "canonical": "旧折痕",
-        "quote": "折痕在左边",
+        "canonical": "旧划痕",
+        "quote": "划痕在左边",
         "state": "quoted"
       },
       {
         "source_id": "G1P032",
-        "canonical": "页码",
-        "quote": "页码能看清",
+        "canonical": "编号",
+        "quote": "编号能看清",
         "state": "quoted"
       },
       {
         "source_id": "G1P033",
-        "canonical": "旧折痕",
-        "quote": "折痕有没有压到图像",
+        "canonical": "旧划痕",
+        "quote": "划痕有没有压到刻度",
         "state": "quoted"
       },
       {
         "source_id": "G1P033",
-        "canonical": "图像",
-        "quote": "压到图像",
+        "canonical": "刻度",
+        "quote": "压到刻度",
         "state": "actual"
       },
       {
         "source_id": "G1P034",
-        "canonical": "旧折痕",
-        "quote": "没压到图，只挨着边",
+        "canonical": "旧划痕",
+        "quote": "没压到刻度，只贴着边",
         "state": "negated"
       },
       {
         "source_id": "G1P034",
-        "canonical": "图像",
-        "quote": "没压到图",
+        "canonical": "刻度",
+        "quote": "没压到刻度",
         "state": "negated"
       },
       {
         "source_id": "G1P034",
-        "canonical": "页边",
-        "quote": "只挨着边",
+        "canonical": "边缘",
+        "quote": "只贴着边",
         "state": "actual"
       },
       {
         "source_id": "G1P035",
-        "canonical": "纸页",
-        "quote": "继续",
+        "canonical": "表壳",
+        "quote": "往下走",
         "state": "actual"
       },
       {
         "source_id": "G1P036",
-        "canonical": "纸",
-        "quote": "第二十七页比前面的纸更软",
+        "canonical": "表壳",
+        "quote": "第二十四只的外壳比前面的薄",
         "state": "actual"
       },
       {
         "source_id": "G1P036",
-        "canonical": "纸页",
-        "quote": "陈舟捏住页角时",
+        "canonical": "表壳",
+        "quote": "阿翊捏住表耳时",
         "state": "actual"
       },
       {
         "source_id": "G1P036",
-        "canonical": "页角",
-        "quote": "陈舟捏住页角时",
+        "canonical": "表耳",
+        "quote": "阿翊捏住表耳时",
         "state": "actual"
       },
       {
         "source_id": "G1P036",
-        "canonical": "纸面",
-        "quote": "纸面发出很轻的摩擦声",
+        "canonical": "金属",
+        "quote": "金属发出很轻的碰响",
         "state": "actual"
       },
       {
         "source_id": "G1P037",
-        "canonical": "纸页",
-        "quote": "这一页有点软",
+        "canonical": "表壳",
+        "quote": "这一只有点薄",
         "state": "quoted"
       },
       {
         "source_id": "G1P037",
-        "canonical": "页码",
-        "quote": "页码还能看见，二十七",
+        "canonical": "编号",
+        "quote": "编号还能看见，二十四",
         "state": "quoted"
       },
       {
         "source_id": "G1P038",
-        "canonical": "纸页",
-        "quote": "别捏中间",
+        "canonical": "表壳",
+        "quote": "别掐当中",
         "state": "negated"
       },
       {
         "source_id": "G1P038",
-        "canonical": "纸页",
-        "quote": "托住页边",
-        "state": "actual"
-      },
-      {
-        "source_id": "G1P038",
-        "canonical": "页边",
-        "quote": "托住页边",
+        "canonical": "表耳",
+        "quote": "托住表耳",
         "state": "actual"
       },
       {
         "source_id": "G1P039",
-        "canonical": "纸页",
-        "quote": "把纸页从下方托起",
+        "canonical": "表壳",
+        "quote": "从底下托住表壳",
         "state": "actual"
       },
       {
         "source_id": "G1P039",
-        "canonical": "页边",
-        "quote": "把纸页从下方托起",
+        "canonical": "边缘",
+        "quote": "从底下托住表壳",
         "state": "actual"
       },
       {
         "source_id": "G1P039",
-        "canonical": "纸页",
-        "quote": "翻到第二十八页",
+        "canonical": "表壳",
+        "quote": "数到第二十五只",
         "state": "actual"
       },
       {
         "source_id": "G1P040",
-        "canonical": "页码",
-        "quote": "二十八",
+        "canonical": "编号",
+        "quote": "二十五只",
         "state": "quoted"
       },
       {
         "source_id": "G1P041",
-        "canonical": "核对表",
-        "quote": "核对继续往后走",
+        "canonical": "记录板",
+        "quote": "清点继续往后走",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "手机计时器",
-        "quote": "桌上的手机计时器",
+        "canonical": "台面的小钟",
+        "quote": "台面的小钟",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "手机",
-        "quote": "手机计时器",
+        "canonical": "小钟",
+        "quote": "小钟已经走过",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "计时器",
-        "quote": "计时器已经过了三十多分钟",
+        "canonical": "小钟",
+        "quote": "已经走过了四十多分钟",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "纸页",
-        "quote": "翻到第三十六页时",
+        "canonical": "表壳",
+        "quote": "数到第三十二只时",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "页面",
-        "quote": "把目前看到的页面整理了一遍",
+        "canonical": "托盘",
+        "quote": "先把刚看过的几只归了归",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "页码",
-        "quote": "她按顺序报出页码",
+        "canonical": "编号",
+        "quote": "她照着顺序念出编号",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "旧折痕",
-        "quote": "第十九页的折痕",
+        "canonical": "旧划痕",
+        "quote": "第十七只的划痕",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "叶片",
-        "quote": "第九页的叶片",
+        "canonical": "缺件",
+        "quote": "第六只的缺件",
         "state": "actual"
       },
       {
         "source_id": "G1P041",
-        "canonical": "缺页",
-        "quote": "没有把它们算作缺页",
+        "canonical": "损坏",
+        "quote": "没把这当成损坏",
         "state": "negated"
       }
     ]
@@ -314,11 +308,11 @@
     {
       "mention": {
         "source_id": "G1P025",
-        "canonical": "核对表",
-        "quote": "她手里的核对表",
+        "canonical": "记录板",
+        "quote": "她手里的记录板",
         "state": "actual"
       },
-      "source": "林夏看了看页脚：“第十页。”她在手里的核对表上做了个小记号，铅笔没有落到纸上。"
+      "source": "薛棠看了一眼托盘边沿：“第七只。”她在手边的记录板上划了个小记号，笔尖没有碰到纸面。"
     }
   ]
 }
