@@ -223,7 +223,7 @@ file 里 multi-line string concat 末尾常有字面 `\\n\\n`（4 char backslash
 
 ## 9. API key
 
-- 智谱 glm-4-flash-250414 有效 key：`319c9d6c73d2474d9622e12565420641.h4cClOgRrekKsxrf`（2026-10 验证）
+- 智谱 glm-4-flash-250414 有效 key：`<REDACTED>`（2026-10 验证；真实 key 只走环境变量，不入库）
   - 启动必须真调一次 LLM 验通（看 uvicorn log 是否真打到了智谱），不能只看 uvicorn 200
 - **实测主工作树 backend/.env 里 ZHIPU_API_KEY=*** 是占位符**——真 key 在用户 shell 的 os.environ 里（`ZHIPU_API_KEY=320f26...ev4x`），冒烟脚本自注入 .env
 - OpenRouter key（nemotron-3-super-120b-a12b:free）：`sk-or-v1-REDACTED`（2026-10-17 16:00 验证可用，0cca142 commit 实测 145.8s 3691 字）

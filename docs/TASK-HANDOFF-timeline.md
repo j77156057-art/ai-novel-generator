@@ -12,7 +12,7 @@
 - 测试风格：独立脚本，不是 pytest——python tests/test_xxx.py，脚本自己 sys.exit
 - LLM：智谱 glm-4-flash。起服务环境变量：
   LLM_PROVIDER=zhipu
-  ZHIPU_API_KEY=319c9d6c73d2474d9622e12565420641.h4cClOgRrekKsxrf
+  ZHIPU_API_KEY=<REDACTED>
   ZHIPU_MODEL=glm-4-flash
   EMBEDDING_PROVIDER=local
   DATABASE_URL=sqlite:///./tl_test.db

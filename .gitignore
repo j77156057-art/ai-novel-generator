@@ -2,11 +2,17 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
 
 # 本地/测试数据库（开发态 sqlite，勿入库）
 *.db
 *.sqlite
 *.sqlite3
+# 数据库备份（*.db 的通配匹配不到 *.db.bak-*，单文件可达 400MB+）
+*.db.bak-*
+*.db.backup*
+*.bak
 
 # 工具产物
 _m2_test.db
@@ -27,6 +33,9 @@ backend/live_result.txt
 # data/seed/ 下 UTF-8 解码后文件名笔误的旧版种子（保留本地不再入库）
 data/seed/【示例·网文】组建-王德财.txt
 data/seed/【示例·网文】黑市病案-无证证词.txt
+# 语料原文（含第三方作品全文）绝不入库，只保留投放说明
+data/seed/*.txt
+!data/seed/README*.md
 
 # 根目录散落的语料/草稿（真实作品原文、下载的 txt）——绝不进版本库
 /*.txt
@@ -55,3 +64,39 @@ qa9_audit_*
 # 含第三方作品文本的分析产物与内部派单文档（只留本地，不入库）
 docs/v2*.json
 docs/handoff/
+# 第三方作品衍生的世界观/时间线分析（2026-11-15 工作区整理，只留本地）
+reports/kg-修真聊天群/
+
+# ---- 运行数据与大文件（2026-11-15 工作区整理）----
+# 五级目录检索大 JSON（单文件 13–52MB）与检索简报缓存
+backend/data/catalog/
+backend/data/brief_cache/
+# 素材库（检索结果落库，跨章复用；运行时数据，不入库）
+backend/data/brief_library/
+# sqlite 旁支（主库 *.db 已被上面的规则忽略）
+*.db-shm
+*.db-wal
+
+# 备份目录（约 6GB）与迁移前数据快照
+backend/backups/
+backend/migrations/*/snapshots/
+backend/migrations/*/snapshot_*.json
+
+# 运行/测试日志与临时报告
+*.log
+.tmp_junit_*.xml
+.tmp_verify/
+.screenshots/
+
+# 工具产物与 AI 工作区元数据（成果文档已迁到 docs/）
+artifacts/
+reports/assets/
+.trae/
+.trae-html-share-packages/
+
+# 一次性脚本与根目录散件（保留本地，不入库）
+/x
+/prepare_judge_tasks.py
+/prepare_summary_tasks.py
+/rollback_novel7_ch1656.sql
+/rule_selection_report.html
