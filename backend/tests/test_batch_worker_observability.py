@@ -152,6 +152,9 @@ check("note no_generation 段清单",
 check("note no_generation 累计",
       note2["batch_stats"]["text_gate"]["no_generation"]["cumulative_count"], 0)
 check_true("note 有 text_gate_alert 槽", "text_gate_alert" in note2)
+# 耗时留痕槽：真实 provider 会写 {provider, model, first_byte_ms, total_ms, bytes}；
+# FakeProvider 没有 last_call_stats，槽位存在且为 None（不因缺字段而崩）。
+check_true("note.llm 有 timing 槽", "timing" in (note2.get("llm") or {}))
 
 # ====================================================================
 # 3. LLM 失败 → 重试 ≤ RETRY_LIMIT 次 → failed

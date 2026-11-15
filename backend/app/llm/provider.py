@@ -413,6 +413,14 @@ class OpenAICompatibleChatProvider(LLMProvider):
         # 花在思考还是供应商排队」无从判断；这里在读取 SSE 时自行累计。
         # None = 这次调用没有任何可测信号（**不是**「0 个字符」）。
         self.last_stream_stats: dict | None = None
+        # 最近一次**成功**非流式调用的耗时留痕：
+        # `{provider, model, first_byte_ms, total_ms, bytes}`。
+        # 成功调用此前只有一条总耗时日志，取不到「首字节 vs 总时间」的分布，
+        # KG 抽取的 `first_byte_timeout` 定多少一直没有实测依据。这里按
+        # 「请求发出 → 首个正文字节」「请求发出 → body 读完」记录，由调用方
+        # （批抽）落进 `agent_runs.note`。每次 complete_message 开始时清空，
+        # 失败调用不会残留上一次成功调用的数字。
+        self.last_call_stats: dict | None = None
         # chat 路径默认 180s（2026-11-14 由 120s 提到与流式同档）：4000 字级单章
         # 实测一次生成需 180s 上下，120s 的同步入口必然读超时、零产出。
         # Assistant 仍显式传 timeout=60（诊断必须快速失败），不受此默认值影响。
@@ -530,6 +538,8 @@ class OpenAICompatibleChatProvider(LLMProvider):
             if tool_choice:
                 payload_base["tool_choice"] = tool_choice
         last_exc: Exception | None = None
+        # 本次调用从头留痕：失败时不能留着上一次成功调用的耗时。
+        self.last_call_stats = None
         # 整条链（换模型 + 每模型重试）共享同一个硬截止：总时长上限。
         deadline = time.monotonic() + self.total_timeout
         # 带 tools 的请求**不能**落到实测不可用的模型上：那会返回
@@ -568,6 +578,9 @@ class OpenAICompatibleChatProvider(LLMProvider):
                 for hk, hv in self.extra_headers.items():
                     req.add_header(hk, hv)
                 try:
+                    # 本次尝试的计时起点放在**请求发出前**：含建连与供应商排队，
+                    # 「首字节耗时」才是调用方真正等的那段。
+                    attempt_started = time.monotonic()
                     remaining = deadline - time.monotonic()
                     if remaining <= 1:
                         last_exc = TimeoutError(
@@ -592,7 +605,7 @@ class OpenAICompatibleChatProvider(LLMProvider):
                     with urllib.request.urlopen(
                         req, timeout=max(1, first_wait)
                     ) as resp:
-                        raw = self._read_body(resp, deadline)
+                        raw, first_byte_at = self._read_body(resp, deadline)
                     data = json.loads(raw.decode("utf-8"))
                     self._note_usage(data.get("usage"))
                     choice = data["choices"][0]
@@ -603,12 +616,30 @@ class OpenAICompatibleChatProvider(LLMProvider):
                     # 单次非流式调用耗时留痕：历史上没有这项统计，只能拿整章耗时
                     # 反推上界（p50/p90/max 见 settings.writer_total_timeout 注释）。
                     cost = time.monotonic() - (deadline - self.total_timeout)
+                    # 首字节 vs 总耗时：`kg_extract_first_byte_timeout` 该定多少
+                    # 此前没有实测依据（成功调用只记总耗时）。这里按「请求发出 →
+                    # 首个正文字节」「请求发出 → body 读完」记录，由批抽落进
+                    # `agent_runs.note.llm.timing`，不依赖日志轮转即可按批统计分布。
+                    total_ms = int((time.monotonic() - attempt_started) * 1000)
+                    first_byte_ms = (
+                        int((first_byte_at - attempt_started) * 1000)
+                        if first_byte_at is not None else None
+                    )
+                    self.last_call_stats = {
+                        "provider": getattr(self, "label", type(self).__name__),
+                        "model": model,
+                        "first_byte_ms": first_byte_ms,
+                        "total_ms": total_ms,
+                        "bytes": len(raw),
+                    }
                     # 字节数 + 平均速率一并留痕：这是「速率判据下限」的观测来源
                     # （此前只有整章耗时，取不到真实字节速率分布）。
                     logger.info(
-                        "%s 非流式调用完成 %.1fs（model=%s，响应 %d 字节，"
+                        "%s 非流式调用完成 %.1fs（model=%s，首字节 %s，响应 %d 字节，"
                         "平均 %.1fB/s）",
-                        self.label, cost, model, len(raw),
+                        self.label, cost, model,
+                        f"{first_byte_ms}ms" if first_byte_ms is not None else "未测到",
+                        len(raw),
                         len(raw) / cost if cost > 0 else 0.0,
                     )
                     if cost > self.timeout * 2:
@@ -668,8 +699,11 @@ class OpenAICompatibleChatProvider(LLMProvider):
         )
         raise RuntimeError(f"{self.label} chat 调用失败: {last_exc}") from last_exc
 
-    def _read_body(self, resp, deadline: float) -> bytes:
+    def _read_body(self, resp, deadline: float) -> tuple[bytes, float | None]:
         """分块读响应体：**吞吐判据为主、总时长硬顶为备**。
+
+        返回 ``(body, first_byte_at)``：``first_byte_at`` 是**首个正文字节**到达
+        时的 ``time.monotonic()``（空响应为 None），供调用方计算首字节耗时。
 
         为什么不能直接 `resp.read()`：那是一次阻塞调用，`urlopen(timeout=)` 只约束
         **每次 recv 的空闲时间**；服务端慢速滴包（或分块传输里持续有心跳）时，
@@ -723,7 +757,7 @@ class OpenAICompatibleChatProvider(LLMProvider):
             guard.check(time.monotonic())
             piece = reader(65536)
             if not piece:
-                return b"".join(buf)
+                return b"".join(buf), guard.started
             buf.append(piece)
             guard.feed(len(piece), time.monotonic())
 

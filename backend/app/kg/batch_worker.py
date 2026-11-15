@@ -799,15 +799,21 @@ def _merge_note(row: AgentRun, extra: dict) -> None:
 
 
 def _llm_budget_note(provider) -> dict:  # noqa: ANN001
-    """本次抽取的 LLM 留痕：渠道、候选链、预算、实际应答模型。
+    """本次抽取的 LLM 留痕：渠道、候选链、预算、实际应答模型、耗时。
 
     只写进 ``agent_runs.note``（JSON），不动表结构。用途：事后能回答
     「这条抽取行跑的是哪条链、什么预算」——此前 note 只有 stats/error，
     排查 `#205` 时无法确认，只能回头翻代码与配置快照。
+
+    ``timing`` 是最近一次**成功**非流式调用的 ``{provider, model, first_byte_ms,
+    total_ms, bytes}``（见 `provider.last_call_stats`）。落库而不是只打日志，
+    是为了让「首字节 vs 总时间」的分布能按批直接查——`kg_extract_first_byte_timeout`
+    的取值要据此校准。失败调用为 None，不会残留上一次成功的数字。
     """
     if provider is None:
         return {"provider": None, "models": [], "model": None,
-                "total_timeout": None, "first_byte_timeout": None}
+                "total_timeout": None, "first_byte_timeout": None,
+                "timing": None}
     chain = getattr(provider, "_model_chain", None)
     return {
         "provider": type(provider).__name__,
@@ -816,6 +822,7 @@ def _llm_budget_note(provider) -> dict:  # noqa: ANN001
         "model": getattr(provider, "last_model", None) or getattr(provider, "model", None),
         "total_timeout": getattr(provider, "total_timeout", None),
         "first_byte_timeout": getattr(provider, "first_byte_timeout", None),
+        "timing": getattr(provider, "last_call_stats", None),
     }
 
 

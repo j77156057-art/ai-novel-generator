@@ -361,6 +361,50 @@ def test_load_persisted_zhipu_models():
         reset_provider_cache()
 
 
+def test_call_timing():
+    print("\n=== 10. 成功调用留下首字节/总耗时（供校准 first_byte_timeout） ===")
+    sys.stdout.flush()
+    from app.kg.batch_worker import _llm_budget_note
+    from app.llm.provider import get_kg_extract_provider
+
+    _setup_minimax()
+    k = get_kg_extract_provider()
+    msgs = [{"role": "user", "content": "hi"}]
+
+    orig = urllib.request.urlopen
+    try:
+        urllib.request.urlopen = _install_fake_urlopen([], [])
+        k.complete_message(msgs)
+        stats = k.last_call_stats
+        check_true("last_call_stats 已记录", isinstance(stats, dict),
+                   detail=repr(stats))
+        check("timing 渠道", (stats or {}).get("provider"), "MiniMax")
+        check("timing 实际模型", (stats or {}).get("model"), "MiniMax-M3.1-Flash")
+        check_true("timing first_byte_ms 是整数",
+                   isinstance((stats or {}).get("first_byte_ms"), int)
+                   and stats["first_byte_ms"] >= 0)
+        check_true("timing total_ms 是整数",
+                   isinstance((stats or {}).get("total_ms"), int)
+                   and stats["total_ms"] >= 0)
+        check_true("timing bytes > 0", (stats or {}).get("bytes", 0) > 0)
+        check("note.llm.timing 与 last_call_stats 一致",
+              _llm_budget_note(k).get("timing"), stats)
+
+        # 失败调用必须清空：否则失败行会带着上一次成功的漂亮数字，误导排查
+        def _boom(req, timeout=None):
+            raise ValueError("boom")
+
+        urllib.request.urlopen = _boom
+        try:
+            k.complete_message(msgs)
+        except Exception:  # noqa: BLE001 —— 只为验证留痕被清空
+            pass
+        check("失败调用不残留 timing", k.last_call_stats, None)
+        check("失败行 note.llm.timing 为 None", _llm_budget_note(k).get("timing"), None)
+    finally:
+        urllib.request.urlopen = orig
+
+
 if __name__ == "__main__":
     test_defaults()
     test_writer_unchanged()
@@ -371,6 +415,7 @@ if __name__ == "__main__":
     test_kg_channel_zhipu()
     test_kg_channel_unknown()
     test_load_persisted_zhipu_models()
+    test_call_timing()
     print(f"\n===== 通过 {PASS} 条，失败 {FAIL} 条 =====")
     if FAILED:
         print("失败项：")
