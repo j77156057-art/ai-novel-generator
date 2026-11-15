@@ -1010,6 +1010,8 @@ def assistant_invoke_generation(
                 "ai_flavor_feedback": flavor_feedback,
                 # 复读闸门（D7）：落库仍是 200，只把结论带回来。
                 "repetition": result.get("repetition"),
+                "length": result.get("length"),
+                "summary_style": result.get("summary_style"),
                 "warnings": result.get("warnings") or [],
                 "debug": {
                     "system_prompt": result.get("system_prompt") or "",
@@ -1112,6 +1114,8 @@ def assistant_invoke_generation(
             "ai_flavor_feedback": flavor_feedback,
             # 复读闸门（D7）：与 generate_next 分支同键同形。
             "repetition": done.get("repetition"),
+            "length": done.get("length"),
+            "summary_style": done.get("summary_style"),
             "warnings": done.get("warnings") or [],
             # 撤销入口：这段正文现在可以退回到 snapshot 的 before_text。
             "snapshot_id": snapshot.id if snapshot is not None else None,

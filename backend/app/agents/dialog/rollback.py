@@ -498,6 +498,11 @@ def list_batches(db, *, project_id: int, limit: int = 20) -> list[dict]:
         )
         .order_by(GenerationSnapshot.id.desc())
     ).all()
+    # 同上：批里任一段指向已删除的正文行，整组就退不了（同成同败），
+    # 这里提前标出来，别让界面仍显示「整组回滚」。
+    live_ids = set(
+        db.scalars(select(Generation.id).where(Generation.project_id == project_id)).all()
+    )
     grouped: dict[str, dict] = {}
     for snap in rows:
         item = grouped.setdefault(snap.batch_id, {
@@ -511,6 +516,8 @@ def list_batches(db, *, project_id: int, limit: int = 20) -> list[dict]:
         })
         item["segments"].append(snap.segment_no)
         item[snap.status] = item.get(snap.status, 0) + 1
+        if snap.status == "applied" and snap.generation_id not in live_ids:
+            item["missing_generations"] = item.get("missing_generations", 0) + 1
         ts = aware(snap.created_at)
         if ts is not None and (
             item["created_at"] is None or ts.isoformat() > item["created_at"]
@@ -519,7 +526,8 @@ def list_batches(db, *, project_id: int, limit: int = 20) -> list[dict]:
     out = []
     for item in grouped.values():
         item["segments"] = sorted(set(item["segments"]))
-        item["undoable"] = item["applied"] > 0
+        item["generation_exists"] = item.get("missing_generations", 0) == 0
+        item["undoable"] = item["applied"] > 0 and item["generation_exists"]
         out.append(item)
     out.sort(key=lambda x: x["created_at"] or "", reverse=True)
     return out[: max(1, min(limit, 100))]

@@ -18,6 +18,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app import wizard_market as market
+from app import wizard_story as story
+
 # ---------------------------------------------------------------------------
 # 分支
 # ---------------------------------------------------------------------------
@@ -109,15 +112,20 @@ def step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
 
 def _base_step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> list[str]:
     if kind == KIND_ORIGINAL:
-        steps = [FIRST_STEP, "corpus"]
+        # 先问题材与写法，再问参考语料：用户说「我要写小说」时，先问清要写
+        # 什么，而不是先照着生产路径问「投喂哪本」。语料/蒸馏仍保留，只是
+        # 排到故事塑造之后，按题材族动态决定中间问哪几件。
+        steps = [FIRST_STEP, "genre"]
+        steps += story.plan_steps(answers, tuple(GENRE_HINTS))
+        steps.append("corpus")
         corpus_ids = _corpus_ids(answers, ctx)
         if corpus_ids:
             steps.append("distill")
         if len(corpus_ids) > 1:
             # 多本参考语料才问：书级事实（物品/实体）按哪本读。
             # 单本不存在跨书歧义，问它只是多一步。
-            steps.insert(2, "book_scope")
-        steps += ["genre", "style", "length", "chapters", "outline", "confirm"]
+            steps.insert(steps.index("corpus") + 1, "book_scope")
+        steps += ["style", "length", "chapters", "outline", "confirm"]
         return steps
     if kind == KIND_CONTINUATION:
         steps = [FIRST_STEP, "continue_from"]
@@ -207,17 +215,25 @@ def next_step(
     answers: dict[str, Any],
     ctx: dict[str, Any],
 ) -> str | None:
-    """当前题的下一题；已到末尾返回 None。"""
+    """当前题的下一题；已到末尾返回 None。
+
+    `answers["_auto"]` 里的步骤是「用户在一句话里已经给过信息、由 agent
+    预填」的项，往前推进时直接跳过，避免把已经说过的话再问一遍。
+    """
     order = step_order(kind, answers, ctx)
+    auto = set(answers.get("_auto") or [])
     if current not in order:
         # 当前题因上游改动不再适用（例如把语料改成「不投喂」后蒸馏题消失）：
         # 从新序列里找第一个尚未回答的题，找不到就回到最后一题。
         for key in order:
-            if key not in answers:
+            if key not in answers and key not in auto:
                 return key
         return order[-1] if order else None
     idx = order.index(current)
-    return order[idx + 1] if idx + 1 < len(order) else None
+    for key in order[idx + 1:]:
+        if key not in auto:
+            return key
+    return None
 
 
 def prev_step(history: list[str], current: str) -> str | None:
@@ -254,7 +270,9 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
         "confirm": _q_confirm,
     }
     builder = builders.get(step)
-    if builder is None:
+    if step in story.STORY_STEPS and step != "genre":
+        body = _q_story(step, answers, ctx)
+    elif builder is None:
         if not step.startswith(CUSTOM_PREFIX):
             raise ValueError(f"未知引导步骤：{step}")
         body = _q_custom(step, answers, ctx)
@@ -283,7 +301,21 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
 
 #: 允许「跳过 = 用默认值」的步骤。必答项（方向、语料、确认）不在其中。
 #: 书级事实默认「不指定（合并读）」，跳过等于保持合并读，因此可跳。
-SKIPPABLE = {"genre", "style", "length", "chapters", "outline", "scene", "book_scope"}
+SKIPPABLE = {
+    "genre",
+    "pov",
+    "premise",
+    "protagonist",
+    "world",
+    "power",
+    "scale",
+    "style",
+    "length",
+    "chapters",
+    "outline",
+    "scene",
+    "book_scope",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -299,10 +331,23 @@ def _message(step: str, kind: str | None, answers: dict[str, Any], ctx: dict[str
     """把步骤渲染成两段对话文字（不含卡片）。"""
     if step.startswith(CUSTOM_PREFIX):
         return _msg_custom(step, ctx)
+    if step in story.STORY_STEPS and step != "genre":
+        return _msg_story(step, kind, answers, ctx)
     builder = _MESSAGE_BUILDERS.get(step)
     if builder is None:
         raise ValueError(f"未知引导步骤：{step}")
     return builder(kind, answers, ctx)
+
+
+def _msg_story(step: str, kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """故事问题只给「为什么问」，选项/输入框由卡片承接。"""
+    body = _q_story(step, answers, ctx)
+    why = str(body.get("why") or "")
+    if step == "protagonist":
+        note = market.protagonist_note(answers.get("genre"), today=ctx.get("today"))
+        if note:
+            why = f"{why}\n\n{note}"
+    return why
 
 
 def _msg_branch(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
@@ -408,7 +453,7 @@ def _msg_distill(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
         ),
         line(
             fast,
-            "砍掉节拍序列、高频场景模板、潜台词模式三个维度（14→11），角色名完全不清洗；"
+            "砍掉节拍序列、潜台词模式两个维度（13→11），角色名完全不清洗；"
             "只适合先验证管线通不通，不建议拿它出成品。",
         ),
         "选哪一档，接下来都是同一条链：起后台蒸馏任务 → 项目工作台显示逐块进度 → "
@@ -453,13 +498,15 @@ def _msg_distill(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
 
 
 def _msg_genre(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
-    return (
+    base = (
         "题材决定模型对世界观、冲突类型和节奏的默认假设：科幻会先铺设定，悬疑先埋谜团，"
         "言情把重心放在关系推进，仙侠则默认从凡到仙的成长线。它不影响耗时，只影响"
         "「写出来的东西像不像你要的那类」。\n\n"
         "这一项我没有给默认值，因为选错会让后面的风格和字数一起偏。"
         "拿不准就选你最近读得最多的那类——你对那个题材的「不对劲」最敏感，改起来也最快。"
     )
+    block = market.genre_block(today=ctx.get("today"))
+    return f"{base}\n\n{block}" if block else base
 
 
 def _msg_style(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
@@ -606,9 +653,14 @@ _MESSAGE_BUILDERS = {
 
 
 def _display_title(novel: dict[str, Any]) -> str:
-    """语料标题去掉 .txt 后缀：对话里说「《大奉打更人》」比「.txt」自然。"""
+    """语料标题去掉 .txt 后缀：对话里说书名比说后缀自然。"""
     title = str(novel.get("title") or novel.get("id") or "")
     return re.sub(r"\.(txt|md|epub)$", "", title, flags=re.I)
+
+
+def _short(value: Any, limit: int = 40) -> str:
+    text = str(value).replace("\n", " ").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def ack_for(step: str, value: Any, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
@@ -651,6 +703,18 @@ def ack_for(step: str, value: Any, answers: dict[str, Any], ctx: dict[str, Any])
         return "好，记下了，会写进项目简介。" if value else "好，这条先空着。"
     if step == "genre":
         return f"好，{value}。"
+    if step == "pov":
+        return f"好，写法按「{value}」。"
+    if step == "premise":
+        return f"好，核心冲突记下了：{_short(value, 60)}"
+    if step == "protagonist":
+        return f"好，主角按「{_short(value, 60)}」来。"
+    if step == "world":
+        return f"好，世界观约束记下了：{_short(value, 60)}"
+    if step == "power":
+        return f"好，力量/金手指边界记下了：{_short(value, 60)}"
+    if step == "scale":
+        return f"好，篇幅与更新按「{value}」。"
     if step == "style":
         return f"好，{value}调性。"
     if step == "length":
@@ -1024,6 +1088,27 @@ def _q_scene(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> 
     }
 
 
+def _q_story(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """故事塑造步骤的问题卡：由 wizard_story 按题材族渲染。"""
+    body = story.question(
+        step,
+        answers,
+        tuple(GENRE_HINTS),
+        {**ctx, "genre_hints": GENRE_HINTS},
+    )
+    if step == "protagonist":
+        # 有有效行情卡时，用「带来源的人设方向」替换静态示例；
+        # 卡过期/题材不匹配时 playbook 保持原样，不硬凑。
+        directions = market.protagonist_directions(
+            answers.get("genre"), today=ctx.get("today")
+        )
+        if directions:
+            card = dict(body.get("card") or {})
+            card["suggestions"] = [d["text"] for d in directions] + ["按自己的设定来"]
+            body["card"] = card
+    return body
+
+
 def _q_custom(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     """渲染用户自己插入的问题（字段已登记，答案落到 premise）。"""
     item = _custom_item(step, ctx)
@@ -1133,6 +1218,22 @@ def validate(
         value = str(raw or "").strip()
         if value not in GENRE_HINTS:
             raise AnswerError("未知题材")
+        return value
+
+    if step in {"pov", "premise", "protagonist", "world", "power", "scale"}:
+        value = str(raw or "").strip()
+        limits = {
+            "pov": 200,
+            "premise": 1000,
+            "protagonist": 300,
+            "world": 500,
+            "power": 500,
+            "scale": 200,
+        }
+        if not value:
+            raise AnswerError("这一项不能为空；不想现在定可以说「按默认来」")
+        if len(value) > limits[step]:
+            raise AnswerError(f"这一项最多 {limits[step]} 字")
         return value
 
     if step == "style":
@@ -1263,6 +1364,12 @@ def summary_rows(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
         if _has_corpus(answers, ctx):
             add("distill", "蒸馏档位", answers.get("distill"))
         add("genre", "题材", answers.get("genre") or "未选")
+        # 故事塑造项：只展示真正答过/预填过的，顺序跟本轮题材计划一致。
+        for step in story.plan_steps(answers, tuple(GENRE_HINTS)):
+            value = answers.get(step)
+            if value in (None, ""):
+                continue
+            add(step, story.STORY_LABELS.get(step, step), value)
         add("style", "风格", answers.get("style") or "未选")
         add("length", "单段字数", answers.get("length", ctx.get("generation_length") or 3000))
         add("chapters", "本次段数", answers.get("chapters", 1))

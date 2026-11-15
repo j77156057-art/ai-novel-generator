@@ -111,19 +111,35 @@ def get_events(
     project_id: int,
     limit: int = Query(50, ge=1, le=500),
     event_type: str | None = Query(None),
+    novel_id: int | None = Query(None),
     db: Session = Depends(get_db),
 ) -> dict:
-    """事件列表（含因果链），按 sequence 降序。"""
-    _require_project(db, project_id)
+    """事件列表（含因果链），按 sequence 降序。
+
+    ``novel_id`` 缺省取项目当前书。事件表按书隔离，项目挂两本书时不能把
+    别书的事件混进前端列表；未指定书（None）时才返回项目全部事件。
+    """
+    proj = _require_project(db, project_id)
     from app.models import KgEventLink
 
-    q = select(KgEvent).where(KgEvent.project_id == project_id)
+    book = novel_id if novel_id is not None else proj.active_novel_id
+    q = select(KgEvent).where(
+        KgEvent.project_id == project_id,
+        KgEvent.is_current.is_(True),  # 同章旧稿事件只留档，不进渲染
+    )
+    if book is not None:
+        q = q.where(KgEvent.novel_id.in_((book, None)))
     if event_type:
         q = q.where(KgEvent.event_type == event_type)
     events = db.scalars(q.order_by(KgEvent.sequence.desc()).limit(limit)).all()
+    event_ids = {e.id for e in events}
     links = db.scalars(
-        select(KgEventLink).where(KgEventLink.project_id == project_id)
-    ).all() if events else []
+        select(KgEventLink).where(
+            KgEventLink.project_id == project_id,
+            KgEventLink.from_event_id.in_(event_ids),
+            KgEventLink.to_event_id.in_(event_ids),
+        )
+    ).all() if event_ids else []
     seq_to_id = {e.sequence: e.id for e in events}
     return {
         "events": [
@@ -141,9 +157,59 @@ def get_events(
     }
 
 
+@router.get("/worldview")
+def get_worldview(
+    project_id: int,
+    novel_id: int = Query(..., description="要出的书（raw_novels.id）"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """世界观清单：势力/组织、地点、体系与境界、资源与规则，各带证据章号。"""
+    _require_project(db, project_id)
+    from app.kg.story_context import worldview
+
+    return worldview(db, project_id, novel_id)
+
+
+@router.get("/timeline")
+def get_timeline(
+    project_id: int,
+    novel_id: int = Query(..., description="要出的书（raw_novels.id）"),
+    from_chapter: int = Query(1, ge=1),
+    to_chapter: int | None = Query(None, ge=1),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=2000),
+    include_gaps: bool = Query(False, description="是否返回没有事件覆盖的章节空段"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """剧情时间线：按章排序的事件序列（可分页），每条给 who/where/what/result。"""
+    _require_project(db, project_id)
+    from app.kg.story_context import timeline
+
+    return timeline(db, project_id, novel_id, from_chapter=from_chapter,
+                    to_chapter=to_chapter, offset=offset, limit=limit,
+                    include_gaps=include_gaps)
+
+
+@router.get("/story-context")
+def get_story_context(
+    project_id: int,
+    novel_id: int = Query(..., description="要续写的书（raw_novels.id）"),
+    up_to_chapter: int = Query(..., ge=1, description="当前已写到第 N 章"),
+    recent_events: int = Query(30, ge=1, le=200),
+    top_characters: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> dict:
+    """按章截取：此前发生了什么 / 哪些伏笔未回收 / 关键人物当前状态。"""
+    _require_project(db, project_id)
+    from app.kg.story_context import story_context
+
+    return story_context(db, project_id, novel_id, up_to_chapter,
+                         recent_events=recent_events,
+                         top_characters=top_characters)
+
+
 class ExemptRequest(BaseModel):
     """作者豁免请求体。"""
-
     finding_id: int | None = None
     rule: str
     entity: str = ""
@@ -288,7 +354,8 @@ def list_relations(
     rows = db.scalars(
         select(KgRelation)
         .where(KgRelation.project_id == project_id,
-               KgRelation.status == "active")  # 候选边（集合端点门降级）不进关系图
+               KgRelation.status == "active",  # 候选边（集合端点门降级）不进关系图
+               KgRelation.is_current.is_(True))  # 同章旧稿关系只留档，不进图
         .order_by(KgRelation.strength.desc())
         .limit(limit)
     ).all()

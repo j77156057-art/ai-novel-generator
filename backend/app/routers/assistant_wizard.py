@@ -17,13 +17,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app import wizard_actions as actions
 from app import wizard_chat as chat
 from app import wizard_facts as facts
 from app import wizard_flow as flow
+from app import wizard_story as story
 from app.assistant_store import list_messages, record_message
 from app.db import get_db
 from app.models import (
@@ -34,6 +35,7 @@ from app.models import (
     KgEntity,
     KgNode,
     KgRelation,
+    NovelChunk,
     Project,
     RawNovel,
     WizardNotice,
@@ -122,6 +124,103 @@ def _capture_premise(db: Session, project: Project, text: str) -> bool:
     project.premise = f"{old}\n\n{t}".strip() if old else t
     db.commit()
     return True
+
+
+def _story_prefill(
+    step: str,
+    text: str,
+    answers: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """从用户一句话里抽出**其他步骤**的信息（当前步骤交给 parse 判）。
+
+    这是「只说一句就尽量别重复问」的入口：在 branch 说「写个科幻悬疑，主角叫
+    林深，第一人称，30 万字日更」，题材/写法/主角/篇幅会一次性预填，后面
+    对应的卡片直接跳过，回执里告诉用户「已记下什么、还差什么」。
+    """
+    if step not in story.STORY_STEPS and step != "branch":
+        return {}, []
+    sig = story.read_signals(text, tuple(flow.GENRE_HINTS), tuple(flow.STYLE_HINTS))
+    if not sig:
+        return {}, []
+    prefilled = story.prefill(answers, sig)
+    tags = list(prefilled.pop("genre_tags", None) or [])
+    prefilled.pop(step, None)
+    return prefilled, tags
+
+
+def _apply_prefill(
+    answers: dict[str, Any],
+    prefill: dict[str, Any],
+    tags: list[str],
+    current_step: str,
+) -> dict[str, Any]:
+    """把预填写进 answers，并记进 `_auto`（next_step 会跳过这些已说过的项）。"""
+    auto = [s for s in (answers.get("_auto") or []) if s != current_step]
+    for key, value in prefill.items():
+        if key == current_step or key in answers:
+            continue
+        answers[key] = value
+        auto.append(key)
+    if tags:
+        answers["genre_tags"] = list(tags)
+        if not answers.get("genre"):
+            answers["genre"] = tags[0]
+            auto.append("genre")
+    if auto:
+        answers["_auto"] = sorted(set(auto))
+    return answers
+
+
+def _fill_defaults(
+    answers: dict[str, Any],
+    ctx: dict[str, Any],
+    project: Project,
+    start_step: str,
+) -> list[str]:
+    """「按默认来 / 别问了」：把当前及后续步骤全部按默认补齐，直达确认页。"""
+    order = flow.step_order(answers.get("branch"), answers, ctx)
+    start = order.index(start_step) if start_step in order else 0
+    auto = list(answers.get("_auto") or [])
+    filled: list[str] = []
+    keys = tuple(flow.GENRE_HINTS)
+    for key in order[start:]:
+        if key == "confirm" or key in answers:
+            continue
+        value = flow.default_for(key, answers, ctx)
+        if value is None or value == "":
+            value = story.default_for(key, answers, keys, project.genre)
+        if value is None or value == "":
+            # 风格卡没有默认值，但「别问了」要求不再追问：取第一个平台调性。
+            if key == "style":
+                value = next(iter(flow.STYLE_HINTS), "")
+        if value is None or value == "":
+            continue
+        answers[key] = value
+        auto.append(key)
+        filled.append(key)
+    if filled and not answers.get("genre_tags") and answers.get("genre"):
+        answers["genre_tags"] = [answers["genre"]]
+    if auto:
+        answers["_auto"] = sorted(set(auto))
+    return filled
+
+
+def _story_brief(answers: dict[str, Any]) -> dict[str, str]:
+    """把故事问答压成「问题 → 答案」，既写进 premise 也传给大纲生成。"""
+    labels = story.STORY_LABELS
+    out: dict[str, str] = {}
+    tags = answers.get("genre_tags") or []
+    if answers.get("genre"):
+        extra = ""
+        if len(tags) > 1:
+            extra = "（副标签：" + "、".join(str(t) for t in tags if t != answers["genre"]) + "）"
+        out["题材"] = f"{answers['genre']}{extra}"
+    for key in ("pov", "premise", "protagonist", "world", "power", "scale"):
+        value = answers.get(key)
+        if value in (None, ""):
+            continue
+        out[labels.get(key, key)] = str(value)
+    return out
 
 
 def _active_session(db: Session, project_id: int) -> AssistantWizardSession | None:
@@ -263,6 +362,7 @@ def _context(
         "characters": characters,
         "character_source": character_source,
         "generation_length": project.generation_length or 3000,
+        "project_genre": project.genre,
     }
     # 语料真实章数/字数、已有档案、各档预计耗时、维度清单、模型可用事实清单。
     ctx.update(facts.distill_context(db, project))
@@ -659,11 +759,14 @@ def _advance(
     background_tasks: BackgroundTasks,
     ack: str,
     echo: str | None = None,
+    prefill: dict[str, Any] | None = None,
+    prefill_tags: list[str] | None = None,
 ) -> dict:
     """把一次作答写进会话并推进到下一题（卡片点击与自由输入共用）。
 
     `echo` 是用户气泡要显示的话：点卡片时是选项文案，自由输入时由调用方
     先单独记录原话（传 None 表示「用户消息已记过，这里不再重复」）。
+    `prefill` 是同一句话里带出的**其他步骤**答案，写入 `_auto`，后续跳过。
     """
     if echo is not None:
         _record_user(db, project.id, session, echo, kind="choice")
@@ -684,11 +787,27 @@ def _advance(
         return out
 
     answers = dict(session.answers or {})
+    old_genre = answers.get("genre")
     answers[step] = value
     if step == "branch":
         session.kind = value
         # 换方向等于换一套问题：清掉另一条分支的答案，避免汇总串味。
         answers = {"branch": value}
+    # 用户显式答过这一步，就不再算「一句话预填」，避免回退后又被跳过。
+    auto = {s for s in (answers.get("_auto") or []) if s != step}
+    # 题材变了：之前由一句话预填的题材条件项（世界观/金手指等）已经过期，
+    # 清掉让新题材的追问重新问一遍；用户显式答过的项不在此列。
+    if step == "genre" and old_genre and old_genre != value:
+        for key in story.STORY_STEPS:
+            if key != "genre" and key in auto:
+                answers.pop(key, None)
+                auto.discard(key)
+    if auto:
+        answers["_auto"] = sorted(auto)
+    else:
+        answers.pop("_auto", None)
+    if prefill:
+        _apply_prefill(answers, prefill, prefill_tags or [], step)
 
     history = list(session.history or [])
     history.append(step)
@@ -794,6 +913,27 @@ def say(
 
     parsed = chat.parse(step, body.text, answers, ctx, question)
 
+    if parsed["kind"] == "bypass":
+        # 用户明确说「按默认来 / 别问了」：当前及后续步骤按默认补齐，直达确认页。
+        # 同句里已经给出的信息仍然优先落库，不因为「别问了」被默认值覆盖。
+        prefill, tags = _story_prefill(step, body.text, answers)
+        _apply_prefill(answers, prefill, tags, step)
+        filled = _fill_defaults(answers, ctx, project, step)
+        history = list(session.history or [])
+        history.append(step)
+        session.answers = answers
+        session.history = history
+        session.step_key = "confirm"
+        db.commit()
+        db.refresh(session)
+        labels = "、".join(story.STORY_LABELS.get(k, k) for k in filled) or "后续参数"
+        ack = f"好，不逐题问了：{labels}按默认补齐，之后在确认页还能逐项改。"
+        out = _state(db, project, session, ack=ack)
+        _record_user(db, project.id, session, body.text)
+        _record_reply(db, project.id, session, ack)
+        _record_question(db, project.id, session, out.get("question"))
+        return {"mode": "answered", **out}
+
     if parsed["kind"] == "question":
         message = chat.explain(step, body.text, answers, ctx, question)
         _record_user(db, project.id, session, body.text)
@@ -855,11 +995,37 @@ def say(
     ack = flow.ack_for(step, value, answers, ctx)
     if parsed.get("note"):
         ack = ack + str(parsed["note"])
+    # 同一句话里带出的其他步骤信息：一次性记下，并告诉用户还差什么。
+    prefill, tags = _story_prefill(step, body.text, answers)
+    if prefill or tags:
+        preview = dict(answers)
+        preview[step] = value
+        _apply_prefill(preview, prefill, tags, step)
+        cap = dict(prefill)
+        if tags:
+            cap["genre_tags"] = tags
+        if step == "genre":
+            cap["genre"] = value
+        captured = story.captured_summary(cap)
+        if captured:
+            ack = ack + " " + captured
+        ack = ack + " " + story.remaining_summary(preview, tuple(flow.GENRE_HINTS))
     ack = ack + long_note
     # 用户原话先落库（自由输入保留原话，比只记选项文案更有信息量）；
     # 传 echo=None 告诉 `_advance`「用户消息已经记过，别重复记」。
     _record_user(db, project.id, session, body.text)
-    out = _advance(db, project, session, step, value, background_tasks, ack, echo=None)
+    out = _advance(
+        db,
+        project,
+        session,
+        step,
+        value,
+        background_tasks,
+        ack,
+        echo=None,
+        prefill=prefill,
+        prefill_tags=tags,
+    )
     out["echo"] = parsed.get("label") or ack
     return {"mode": "answered", **out}
 
@@ -942,6 +1108,29 @@ def _project_hint(project: Project) -> dict:
     }
 
 
+def _require_continuation_corpus(db: Session, novel_id: int) -> None:
+    """续写书必须先有正文语料，否则文风档案与续写上下文都无从谈起。
+
+    `novel_chunks` 是蒸馏与 RAG 的唯一语料源；为空时蒸馏会整批失败，
+    用户只会看到「蒸馏完成但 0 条规则」。所以在写字段前拦下，并把
+    「先去导入语料」这一步说清楚。
+    """
+    novel = db.get(RawNovel, novel_id)
+    chunks = db.scalar(
+        select(func.count()).select_from(NovelChunk).where(NovelChunk.novel_id == novel_id)
+    ) or 0
+    if chunks:
+        return
+    title = (novel.title if novel is not None else "") or f"#{novel_id}"
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"《{title}》还没有导入正文（novel_chunks 为空），无法生成文风档案，"
+            "续写也拿不到原文上下文。请先在语料库导入这本书的章节，再回来选续写。"
+        ),
+    )
+
+
 def _commit(
     db: Session,
     project: Project,
@@ -959,6 +1148,19 @@ def _commit(
         project.genre = answers.get("genre") or project.genre
         project.style = answers.get("style") or project.style
         project.generation_length = int(answers.get("length") or project.generation_length or 3000)
+        # 故事问答落到既有字段：premise 追加结构化简报（生成链路会读），
+        # target_length 记全书规模。不新建表字段。
+        brief = _story_brief(answers)
+        block = ""
+        if brief:
+            block = "【创作问答】\n" + "\n".join(f"{k}：{v}" for k, v in brief.items())
+            old = (project.premise or "").strip()
+            if block not in old:
+                project.premise = f"{old}\n\n{block}".strip() if old else block
+        scale_sig = story.read_signals(
+            str(answers.get("scale") or ""), tuple(flow.GENRE_HINTS)
+        )
+        book_length = scale_sig.get("book_length")
         # 书级事实：只有真的问了这一步（≥2 本在场）才写，避免单本书时改动用户
         # 在工作台手工设过的值。原创分支声明「事实来源书」时顺手清掉续写书：
         # book_for_project 的优先级是 continuation → active，留着旧续写书会把
@@ -970,11 +1172,17 @@ def _commit(
         tier = answers.get("distill")
         if tier and tier != flow.DISTILL_REUSE:
             project.narrative_tier = tier
+        if book_length:
+            project.target_length = int(book_length)
         db.commit()
 
         if tier and tier != flow.DISTILL_REUSE:
             distill = _start_distill(db, project, tier, background_tasks)
         result["applied"] = ["reference_novel_ids", "genre", "style", "generation_length"]
+        if block:
+            result["applied"].append("premise")
+        if book_length:
+            result["applied"].append("target_length")
         if "book_scope" in answers:
             result["applied"] += ["active_novel_id", "continuation_novel_id"]
         if tier and tier != flow.DISTILL_REUSE:
@@ -982,7 +1190,7 @@ def _commit(
 
         if answers.get("outline", True):
             result["stage"] = "outline"
-            result["bible"] = _build_bible(db, project)
+            result["bible"] = _build_bible(db, project, answers)
         result["distill"] = distill
         result["message"] = _commit_message(kind, distill, result["stage"])
 
@@ -990,6 +1198,16 @@ def _commit(
         project.generation_length = int(answers.get("length") or project.generation_length or 3000)
         if "book_scope" in answers:
             scope = int(answers.get("book_scope") or flow.BOOK_SCOPE_NONE)
+            if scope:
+                # 续写书必须先有语料：否则蒸馏必然 0 产出、档案也读不到数据源。
+                _require_continuation_corpus(db, scope)
+                # 文风档案的数据源是 reference_novel_ids（见 style/pipeline.py 与
+                # style/narrative.py）。续写书不并进去，续写项目就永远没有档案。
+                # 只追加、不覆盖：用户在工作台手工设的其他参考书原样保留。
+                refs = [int(x) for x in (project.reference_novel_ids or [])]
+                if scope not in refs:
+                    refs.append(scope)
+                project.reference_novel_ids = refs
             project.continuation_novel_id = scope or None
         tier = answers.get("distill")
         if tier and tier != flow.DISTILL_REUSE and not project.style_narrative:
@@ -1001,6 +1219,8 @@ def _commit(
         result["applied"] = ["generation_length"]
         if "book_scope" in answers:
             result["applied"].append("continuation_novel_id")
+            if project.continuation_novel_id:
+                result["applied"].append("reference_novel_ids")
         result["distill"] = distill
         result["message"] = _commit_message(kind, distill, "ready")
 
@@ -1104,11 +1324,21 @@ def undo_action(
     }
 
 
-def _build_bible(db: Session, project: Project) -> dict:
-    """复用现有 build-bible（含无 LLM 时的离线兜底）。"""
-    from app.routers.wizard import build_bible
+def _build_bible(
+    db: Session,
+    project: Project,
+    answers: dict[str, Any] | None = None,
+) -> dict:
+    """复用现有 build-bible（含无 LLM 时的离线兜底）。
 
-    bible = build_bible(project.id, None, db)
+    把引导里的故事问答作为「创作者问答」传进去：大纲要按用户刚说的题材、
+    写法、核心冲突、主角、世界约束、篇幅来构思，而不是只按 genre/style 猜。
+    """
+    from app.routers.wizard import ExpertAnswersIn, build_bible
+
+    qa = _story_brief(answers or {})
+    body = ExpertAnswersIn(answers=qa) if qa else None
+    bible = build_bible(project.id, body, db)
     return bible if isinstance(bible, dict) else dict(bible)
 
 
@@ -1181,7 +1411,22 @@ def role_chat(project_id: int, body: RoleChatIn, db: Session = Depends(get_db)) 
         raise HTTPException(status_code=400, detail="单条消息最多 2000 字")
 
     card = _character_card(db, project.id, name)
-    system = _role_system_prompt(name, scene, card)
+    # 角色对话 = dialogue 用途：声音词典给足配额，文风/时间线退为辅助；
+    # KG 侧只取人物近况与关系（不要整条事件序列）。
+    from app.generation.engine import (
+        _narrative_timeline,
+        _style_narrative,
+        _style_source_ids,
+    )
+    from app.generation.prompts import _narrative_block
+
+    narrative_block = _narrative_block(
+        _style_narrative(db, project),
+        _style_source_ids(project),
+        mode="dialogue",
+        timeline=_narrative_timeline(db, project),
+    )
+    system = _role_system_prompt(name, scene, card, narrative_block=narrative_block)
     history_lines = []
     for turn in body.history[-8:]:
         role = "用户" if turn.get("role") == "user" else name
@@ -1277,6 +1522,7 @@ def _character_card(db: Session, project_id: int, name: str) -> str:
         .filter(
             KgCharacterState.project_id == project_id,
             KgCharacterState.character_id == entity.id,
+            KgCharacterState.is_current.is_(True),  # 同章旧稿状态只留档
         )
         .order_by(desc(KgCharacterState.chapter), desc(KgCharacterState.id))
         .limit(8)
@@ -1291,6 +1537,7 @@ def _character_card(db: Session, project_id: int, name: str) -> str:
         .filter(
             KgRelation.project_id == project_id,
             (KgRelation.from_id == entity.id) | (KgRelation.to_id == entity.id),
+            KgRelation.is_current.is_(True),  # 同章旧稿关系只留档
         )
         .order_by(desc(KgRelation.strength))
         .limit(10)
@@ -1309,7 +1556,8 @@ def _character_card(db: Session, project_id: int, name: str) -> str:
     return "\n".join(lines)
 
 
-def _role_system_prompt(name: str, scene: str, card: str) -> str:
+def _role_system_prompt(name: str, scene: str, card: str,
+                        narrative_block: str = "") -> str:
     if card:
         setting = f"以下是你的人物卡，只能依据它说话：\n{card}"
     else:
@@ -1318,6 +1566,7 @@ def _role_system_prompt(name: str, scene: str, card: str) -> str:
         f"你在扮演小说角色「{name}」。\n"
         f"当前情境：{scene}\n"
         f"{setting}\n\n"
+        f"{narrative_block}"
         "规则：\n"
         "1. 始终用第一人称、符合角色身份与时代背景的口吻说话，不要自称 AI、不要跳出角色。\n"
         "2. 只使用人物卡里的事实；卡里没有的，宁可含糊带过或反问，也不要编造。\n"

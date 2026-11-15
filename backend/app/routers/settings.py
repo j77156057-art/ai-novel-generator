@@ -107,7 +107,10 @@ PROVIDER_META: dict[str, dict] = {
         "label": "MiniMax",
         "key_hint": "platform.minimaxi.com → 账号管理 → 接口 Keys（形如 sk-cp-...，仅国内站可用）",
         "free_note": "实测唯一干净可用：M3.1-Flash-Preview（推理独立字段，正文不混思维链）；M3/M2.x 会把思维链混进正文",
-        "default_models": ["MiniMax-M3.1-Flash-Preview", "MiniMax-Text-01"],
+        # 2026-11-13：MiniMax-Text-01 已下线（调用直接 404），从默认链移除；
+        # 这里必须与 `config.settings.minimax_models` 保持同源，否则设置页会
+        # 引导用户切到一个必然失败的模型（test_settings_roles 三源一致性守这条）。
+        "default_models": ["MiniMax-M3.1-Flash-Preview"],
     },
     "openrouter": {
         "label": "OpenRouter",

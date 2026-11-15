@@ -57,12 +57,12 @@ MEASURED = {
 #: 实测点的分钟/字，用于按字数外推（明确标注为估算）。
 _MINUTES_PER_CHAR = MEASURED["minutes"] / MEASURED["sampled_chars"]
 
-#: 运行时在 14 个提炼维度之外附加的一维。
+#: 运行时在提炼维度之外附加的一维（当前 13 个提炼维度 + 这 1 个）。
 EXTRA_DIMENSION = "文风漂移分析"
 
 
 def dimension_inventory() -> dict[str, Any]:
-    """返回维度清单（含「为什么有人记成不止 14 维」的解释）。"""
+    """返回维度清单（含「为什么有人记成不止 13 维」的解释）。"""
     return {
         "extract": list(NARRATIVE_DIMENSIONS),
         "extract_count": len(NARRATIVE_DIMENSIONS),

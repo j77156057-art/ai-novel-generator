@@ -19,6 +19,8 @@ import re
 from typing import Any
 
 from app import wizard_flow as flow
+from app import wizard_market as market
+from app import wizard_story as story
 
 #: 「你定就行」：直接取该题默认值，并在回执里说明取了什么、为什么。
 DEFAULT_WORDS = (
@@ -93,6 +95,12 @@ FALLBACKS: dict[str, str] = {
     "distill": "可以说「完整档」「平衡档」「快速档」；已有档案时也可以说「沿用现有档案」。",
     "book_scope": "说按哪本书读，比如「按某某书读」，或者说「不指定」；也可以直接点卡片。",
     "genre": "说一个题材，比如「悬疑」「科幻」「历史」；也可以直接点卡片。",
+    "pov": "说写法，比如「第一人称」「第三人称快节奏」「多视角」；也可以点卡片。",
+    "premise": "用一句话说「主角想要什么、最大的阻力是什么」；也可以从卡片里的方向挑一个。",
+    "protagonist": "说主角的名字和一句设定，比如「名字 + 身份/处境」；也可以让大纲先起一个。",
+    "world": "说这个世界必须守住的约束，比如科技上限、时代落点、力量来源与禁忌。",
+    "power": "说金手指/力量体系能做什么、代价是什么、什么不能做；没有就说「不设金手指」。",
+    "scale": "说全书篇幅和更新节奏，比如「30 万字，日更，每段 4000 字」。",
     "style": "说一个平台调性，比如「番茄」「起点」「晋江」「豆瓣阅读」「知乎盐选」。",
     "length": "说单段字数，比如「3000 字」（范围 500–8000）；这是每段字数，不是全书长度。",
     "chapters": "说这次写几段，比如「1 段」「3 段」；也可以直接点卡片。",
@@ -176,6 +184,12 @@ _BRANCH_EXACT = {
     "从零开始": flow.KIND_ORIGINAL,
     "从头写": flow.KIND_ORIGINAL,
     "新书": flow.KIND_ORIGINAL,
+    "写小说": flow.KIND_ORIGINAL,
+    "我要写小说": flow.KIND_ORIGINAL,
+    "我想写小说": flow.KIND_ORIGINAL,
+    "写一本书": flow.KIND_ORIGINAL,
+    "写个故事": flow.KIND_ORIGINAL,
+    "我要写一篇小说": flow.KIND_ORIGINAL,
     "续写": flow.KIND_CONTINUATION,
     "接着写": flow.KIND_CONTINUATION,
     "往下写": flow.KIND_CONTINUATION,
@@ -193,7 +207,8 @@ _BRANCH_EXACT = {
 _BRANCH_PATTERNS = (
     (
         flow.KIND_ORIGINAL,
-        r"(我)?(想|要|准备|打算)?(写|做|开)?(一本|一个|一部)?"
+        r"(我)?(想|要|准备|打算)?(写|做|开)(一本|一个|一部|个)?(小说|故事|书)"
+        r"|(我)?(想|要|准备|打算)?(写|做|开)(一本|一个|一部|个)?"
         r"(原创|新书|全新的书|从零|从头写)(小说|故事|书)?",
     ),
     (
@@ -214,6 +229,41 @@ _BRANCH_PATTERNS = (
 
 def _is_default_word(text: str) -> bool:
     return any(w in text for w in DEFAULT_WORDS)
+
+
+#: 「别问了 / 按默认来」：明确要求停止追问。只在非方向、非确认步骤生效。
+_BYPASS_ALL = (
+    "按默认来",
+    "按默认",
+    "用默认",
+    "都按默认",
+    "全都默认",
+    "别问了",
+    "不要问了",
+    "不用问了",
+    "别再问",
+    "你全定了",
+    "剩下的你定",
+)
+
+
+def is_bypass(text: str, include_process: bool = False) -> bool:
+    words = story.BYPASS_WORDS if include_process else _BYPASS_ALL
+    return any(w in (text or "") for w in words)
+
+
+def _is_vague(text: str) -> bool:
+    """短句里只有「随便/都行/不知道」这类词，才算模糊回答。
+
+    带具体信息的句子（「随便写个科幻」）不算——那种应该直接抽出题材。
+    """
+    t = _norm(text).strip("。！？!?～~")
+    if not any(w in t for w in story.VAGUE_WORDS):
+        return False
+    residual = t
+    for word in story.VAGUE_WORDS:
+        residual = residual.replace(word, "")
+    return len(residual) <= 4
 
 
 def _has_commit_verb(text: str) -> bool:
@@ -484,6 +534,14 @@ def _match(step: str, text: str, answers: dict[str, Any], ctx: dict[str, Any],
         value = _branch_intent(t)
         if value:
             return value, flow.KIND_LABELS[value]
+        if any(k in t for k in ("续写", "接着写", "往下写", "继续写")):
+            return flow.KIND_CONTINUATION, flow.KIND_LABELS[flow.KIND_CONTINUATION]
+        if re.search(r"(角色|人物).{0,4}(对话|聊天|扮演)", t):
+            return flow.KIND_ROLE, flow.KIND_LABELS[flow.KIND_ROLE]
+        # 「写个科幻悬疑」这种只给题材、没说「小说」的，也按原创接住。
+        sig = story.read_signals(t, tuple(flow.GENRE_HINTS))
+        if sig.get("genres"):
+            return flow.KIND_ORIGINAL, flow.KIND_LABELS[flow.KIND_ORIGINAL]
         return None
 
     if step == "corpus":
@@ -546,6 +604,10 @@ def _match(step: str, text: str, answers: dict[str, Any], ctx: dict[str, Any],
             if word in t:
                 return value, value
         return None
+
+    if step in {"pov", "premise", "protagonist", "world", "power", "scale"}:
+        # 这几步收自由文本：写法、冲突、主角、约束、篇幅都可以直接用一句话说。
+        return t, t
 
     if step == "style":
         for value in flow.STYLE_HINTS:
@@ -655,9 +717,57 @@ def parse(
     if is_back(t):
         return {"kind": "back"}
 
+    # 明确要求「别问了 / 按默认来」：不再逐题追问，按默认值补齐后直达确认页。
+    if step not in {"branch", "confirm"} and is_bypass(t):
+        return {"kind": "bypass"}
+
+    signals = (
+        story.read_signals(t, tuple(flow.GENRE_HINTS), tuple(flow.STYLE_HINTS))
+        if step in story.STORY_STEPS
+        else {}
+    )
+
+    # 故事类问题收到模糊回答（「随便」「都行」）：给 2–3 个具体方向，
+    # 而不是直接套默认配置开写。参数类问题（字数/段数/风格）保持原默认行为。
+    if step in story.STORY_STEPS and _is_vague(t) and not signals:
+        return {
+            "kind": "clarify",
+            "message": story.vague_message(
+                step,
+                answers,
+                tuple(flow.GENRE_HINTS),
+                {**ctx, "genre_hints": flow.GENRE_HINTS},
+            ),
+        }
+
+    # 这句话里已经带了这一项的明确信息（「随便写个科幻」「第一人称吧」）：
+    # 直接当成答案，不让「随便」把它拖回默认。
+    if signals:
+        value = signals.get(step)
+        if step == "genre" and signals.get("genres"):
+            value = signals["genres"][0]
+        if value not in (None, "", []):
+            return {
+                "kind": "answer",
+                "value": value,
+                "label": flow.echo_label(step, value, answers.get("branch"), ctx),
+                "note": None,
+            }
+
     # 长文本不套默认值：避免整段话里出现「不知道」就被当成「你定」。
-    if not is_long_text(t) and _is_default_word(t):
+    if not is_long_text(t) and _is_default_word(t) and not signals:
         value = flow.default_for(step, answers, ctx)
+        if value in (None, "", []):
+            # 故事类问题没有默认值（如题材）：仍然给方向，不静默失败。
+            return {
+                "kind": "clarify",
+                "message": story.vague_message(
+                    step,
+                    answers,
+                    tuple(flow.GENRE_HINTS),
+                    {**ctx, "genre_hints": flow.GENRE_HINTS},
+                ),
+            }
         label = flow.echo_label(step, value, answers.get("branch"), ctx)
         return {
             "kind": "answer",
@@ -735,10 +845,10 @@ def _faq_distill(ctx: dict[str, Any]) -> str:
     return (
         f"{_corpus_phrase(ctx)}。三个档位不是「准/中/快」三个形容词，差别落在四个"
         "可实现的轴上：采样多少章、跑哪些维度、要不要做角色名归一化、伪角色清洗多狠。\n\n"
-        f"完整档：{full}。14 个提炼维度全开，角色名会做归一化（小落→安小落），"
+        f"完整档：{full}。{dim.get('extract_count', 13)} 个提炼维度全开，角色名会做归一化（小落→安小落），"
         "伪角色也按词频自证全量清洗。\n"
         f"平衡档：{balanced}。维度一样，但不归一化角色名——简称会各算一个角色。\n"
-        f"快速档：{fast}。砍掉节拍序列、高频场景模板、潜台词模式三维（14→11），"
+        f"快速档：{fast}。砍掉节拍序列、潜台词模式两维（13→11），"
         "角色名完全不清洗，只适合试跑。\n\n"
         f"耗时口径要说明白：仓库里唯一一次带计时的实测是《{measured.get('novel', '').strip('《》')}》"
         f"语料 {measured.get('corpus_chapters')} 章、n_ch={measured.get('sampled_chapters')}、"
@@ -752,13 +862,13 @@ def _faq_dimensions(ctx: dict[str, Any]) -> str:
     extract = "、".join(dim.get("extract") or [])
     forbidden = "、".join(dim.get("forbidden") or [])
     return (
-        f"维度不是一个孤零零的「14」。代码里的口径是：\n"
-        f"- {dim.get('extract_count', 14)} 个提炼维度（NARRATIVE_DIMENSIONS）：{extract}\n"
+        f"维度不是一个孤零零的「{dim.get('extract_count', 13)}」。代码里的口径是：\n"
+        f"- {dim.get('extract_count', 13)} 个提炼维度（NARRATIVE_DIMENSIONS）：{extract}\n"
         f"- 运行时额外算 1 个「文风漂移分析」（开头与结尾的文风差多少），"
-        f"落库合计 {dim.get('stored_count', 15)} 个维度——docs 表格里的「维度数 15」就是它\n"
+        f"落库合计 {dim.get('stored_count', 14)} 个维度\n"
         f"- 另有 {dim.get('forbidden_count', 4)} 个反向禁忌维度：{forbidden}\n\n"
-        f"所以全部维度键是 {dim.get('total_keys', 19)} 个。快速档砍的是节拍序列、"
-        "高频场景模板、潜台词模式这三个提炼维度，落库维度随之从 15 降到 12。"
+        f"所以全部维度键是 {dim.get('total_keys', 18)} 个。快速档砍的是节拍序列、"
+        "潜台词模式这两个提炼维度，落库维度随之从 14 降到 12。"
     )
 
 
@@ -771,7 +881,7 @@ def _faq_normalize(ctx: dict[str, Any]) -> str:
         "各自学一套口头禅和句长。生成时你写「安小落」，档案里可能只匹配到「小落」那一份，"
         "或者两份打架——同一个人一会儿冷嘲一会儿软语。\n\n"
         "完整档的做法是拿语料词频做包含关系自证：短名如果高频出现在长名里，就并进长名。"
-        f"实测里真截断的占比 ≤1.1%、真名 ≥67%，分得很开；《大奉打更人》那种 "
+        f"实测里真截断的占比 ≤1.1%、真名 ≥67%，分得很开；像那种 "
         f"{measured.get('corpus_chapters', 833)} 章的语料，513 个角色节点最后收敛成 19 个规范名"
         "+12 条别名映射，还把「相信/冷声」这种伪角色清掉了。平衡档不做这一步，所以快，"
         "但简称噪声会留在档案里。"
@@ -878,6 +988,49 @@ def _faq(text: str, ctx: dict[str, Any]) -> str | None:
     return None
 
 
+#: 「最近什么题材好卖」：这类问题必须用带来源的行情卡回答，不能让模型凭记忆编。
+_MARKET_Q = re.compile(
+    r"(题材|类型).{0,8}(好卖|火|热门|趋势|行情|吃香|市场)"
+    r"|(什么|哪个|哪种|哪类).{0,6}(题材|类型).{0,6}(好|火|热|流行)"
+    r"|最近的?风向|市场行情|什么好卖|网文趋势"
+)
+
+#: 「什么主角讨喜」：同样必须带来源与样本口径，不能当事实下判断。
+_POPULAR_Q = re.compile(
+    r"(人设|主角|性格).{0,8}(讨喜|受欢迎|吃香|好卖)"
+    r"|什么.{0,6}(人设|性格|主角).{0,6}(好|讨喜|受欢迎)"
+)
+
+
+def _market_answer(
+    step: str,
+    text: str,
+    answers: dict[str, Any],
+    ctx: dict[str, Any],
+) -> str | None:
+    """用独立行情卡回答「最近什么题材好卖 / 什么主角讨喜」。
+
+    卡过期或没有匹配题材时返回 None，继续走原来的解释路径；
+    绝不用模型记忆补一条「行情」。
+    """
+    today = ctx.get("today")
+    if _MARKET_Q.search(text):
+        block = market.genre_block(today=today)
+        if block:
+            return block
+    if step == "protagonist" and _POPULAR_Q.search(text):
+        directions = market.protagonist_directions(answers.get("genre"), today=today)
+        if directions:
+            lines = "\n".join(f"{i}. {d['text']}" for i, d in enumerate(directions, 1))
+            return (
+                "近期平台编辑口径里，这类人设出现得多：\n"
+                + lines
+                + "\n\n注意：这是编辑解读与投放视角，样本口径未公开，也存在幸存者偏差；"
+                "「讨喜」不能当事实，只能当参考方向。"
+            )
+    return None
+
+
 def explain(
     step: str,
     text: str,
@@ -889,6 +1042,10 @@ def explain(
     fixed = _faq(text, ctx)
     if fixed:
         return fixed
+
+    market_reply = _market_answer(step, text, answers, ctx)
+    if market_reply:
+        return market_reply
 
     chars = ctx.get("characters") or []
     if re.search(r"(角色|人物).*(哪些|谁|列表|几个|有什么)", text) and chars:

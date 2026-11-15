@@ -950,7 +950,23 @@ def list_snapshots(
     if status is not None:
         stmt = stmt.where(GenerationSnapshot.status == status)
     stmt = stmt.order_by(GenerationSnapshot.id.desc()).limit(max(1, min(limit, 200)))
-    return [snapshot_to_dict(s) for s in db.scalars(stmt).all()]
+    snaps = db.scalars(stmt).all()
+    # 正文行可能已被删（项目重建 / 手工清理）。这种快照点「确认」只会 409，
+    # 所以在列表上就标 generation_exists=False 并把 undoable 置 False，
+    # 让界面直接禁用按钮，而不是等用户点完确认才发现退不了。
+    live_ids = set(
+        db.scalars(
+            select(Generation.id).where(Generation.project_id == project_id)
+        ).all()
+    )
+    out: list[dict] = []
+    for snap in snaps:
+        item = snapshot_to_dict(snap)
+        exists = snap.generation_id in live_ids
+        item["generation_exists"] = exists
+        item["undoable"] = bool(item.get("undoable")) and exists
+        out.append(item)
+    return out
 
 
 def latest_applied(

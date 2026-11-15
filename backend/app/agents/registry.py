@@ -32,8 +32,10 @@ callable 内部——所以工具在业务数据上是纯只读，进白名单�
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
 logger = logging.getLogger("agent.registry")
@@ -56,9 +58,10 @@ FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "apply_proposal",
 )
 
-# 默认白名单：search_novel_chunks / read_generation_segments /
-# get_character_profile / get_plot_timeline / get_fact_ledger / get_reminders /
-# summarize_bible —— 与 task spec 一致。
+# 默认白名单见下方 `ALLOWED_READ_ONLY_TOOLS`（单一来源）。除基础查询与
+# audit 四件套外，还包含五级目录工具（browse / search / rule / anchor /
+# similar）与作者轨迹监察（inspect_retrieval_trace）。注册表 `_DEFAULT_SPECS`
+# 里每个工具都有面向模型的 description，新增只读工具时两处一起加。
 #
 # 助手页瘦身后新增 4 个（audit_corpus / audit_kg / audit_generation /
 # analyze_logs）：诊断、日志分析、三类审核从「前端页签」改为「agent 自主
@@ -85,6 +88,19 @@ ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
     # 生成闭环（assistant_generation → ai_flavor_memory.resolve_tuning）这条
     # 既有的自动写入路径上，工具表只提供读入口（项目红线：不注册写工具）。
     "query_ai_flavor_memory",
+    # 五级目录（只读）：浏览 / 检索 / 读原文 / 扩上下文 / 同类规则。
+    # 作者 agent 与助理 agent 共用 `app.retrieval.tools` 同一份实现。
+    "browse",
+    "search",
+    "rule",
+    "anchor",
+    "similar",
+    # 作者 agent 轨迹监察（只读）：助理据此判断检索是否跑偏，不写任何结果。
+    "inspect_retrieval_trace",
+    # 操作发现（只读）：从前端接线盘点的动作目录里筛出「本次问题相关的可执行
+    # 操作」，让助手自己判断能不能做、该在哪做。目录本体在
+    # `app.agents.action_catalog`，本工具只读它、不执行任何操作。
+    "list_actions",
 )
 
 
@@ -92,9 +108,14 @@ ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
 # ToolSpec
 # ====================================================================
 
+def _empty_parameter_schema() -> dict:
+    """无参工具的 JSON Schema（OpenAI `tools[].function.parameters` 格式）。"""
+    return {"type": "object", "properties": {}, "required": []}
+
+
 @dataclass(frozen=True)
 class ToolSpec:
-    """Assistant 工具声明：name / read_only / callable。
+    """Assistant 工具声明：name / read_only / callable / 参数 schema。
 
     callable 签名固定为 `(db, project_id: int, **kwargs) -> dict`：
     - db：路由层注入的 SQLAlchemy Session（router 已校验 project 存在）；
@@ -102,12 +123,23 @@ class ToolSpec:
     - **kwargs：工具自身需要的额外参数（query / segment_no / top_k…）。
 
     不持有 db session / 不持有 LLM 句柄：测试可独立构造 ToolSpec。
+
+    `parameters` 与 `expose_to_model` 是 function calling 接入后新增的：
+    - `parameters` 必须是 `{"type": "object", ...}` 的 JSON Schema，直接进
+      `tools[].function.parameters`；无参工具用 `_empty_parameter_schema()`。
+    - `expose_to_model=False` 的工具**不出现在** `describe_tools()` 输出里，
+      模型看不到、也叫不动——留给「只给确定性路径用」的工具。
+    非只读工具即使 `expose_to_model=True` 也不会被 `describe_tools()` 导出
+    （那里还会再判一次 `read_only`），构造期不做拒绝：`register()` 才是
+    拒绝写工具的边界（抛 PermissionError），既有回归依赖这个顺序。
     """
 
     name: str
     description: str
     read_only: bool
     callable: Callable[..., dict]
+    parameters: dict = field(default_factory=_empty_parameter_schema)
+    expose_to_model: bool = True
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -116,6 +148,10 @@ class ToolSpec:
             raise ValueError("ToolSpec.read_only 必须为 bool")
         if not callable(self.callable):
             raise ValueError("ToolSpec.callable 必须是可调用对象")
+        if not isinstance(self.parameters, dict) or self.parameters.get("type") != "object":
+            raise ValueError("ToolSpec.parameters 必须是 type=object 的 JSON Schema")
+        if not isinstance(self.expose_to_model, bool):
+            raise ValueError("ToolSpec.expose_to_model 必须为 bool")
 
 
 # ====================================================================
@@ -187,8 +223,40 @@ class AssistantToolRegistry:
     def __contains__(self, name: str) -> bool:
         return name in self._tools
 
+    def describe_tools(self, only: Iterable[str] | None = None) -> list[dict]:
+        """导出可直接塞进请求体的 OpenAI `tools` 数组。
+
+        三重过滤，缺一不可：
+          1. 只取已注册工具（`only` 里没注册的名字直接跳过，不报错）；
+          2. `read_only=True` 且 `expose_to_model=True`；
+          3. name ⊆ `ALLOWED_READ_ONLY_TOOLS`（与 register / invoke 同源的白名单）。
+
+        因此档 2 / 档 3 的写操作**不可能**出现在这里：它们根本没有注册成工具，
+        只在 `action_catalog` 的文本里出现。模型能看见的函数名 = 只读白名单交集。
+        """
+        candidates = list(only) if only is not None else self.names()
+        described: list[dict] = []
+        for name in candidates:
+            spec = self._tools.get(name)
+            if spec is None or not spec.read_only or not spec.expose_to_model:
+                continue
+            if spec.name not in ALLOWED_READ_ONLY_TOOLS:
+                continue
+            described.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": spec.parameters,
+                    },
+                }
+            )
+        return described
+
     # ----- 调用 -----
-    def invoke(self, name: str, /, db: Any, project_id: int, **kwargs: Any) -> dict:
+    def invoke(self, name: str, /, db: Any, project_id: int, *,
+               trace: Mapping[str, Any] | None = None, **kwargs: Any) -> dict:
         """按 name 调用工具：先校验角色，再透传 db / project_id / kwargs。
 
         校验：
@@ -201,6 +269,11 @@ class AssistantToolRegistry:
             塞进 _tools，invoke 仍会用白名单拦下，不给「注册即信任」留口子）。
 
         异常**不**写入任何状态：invoke_tool 抛错时本注册表的状态保持不变。
+
+        `trace`：可选的调用轨迹上下文（R24）。给了且带 `session_id` 时，**每次**
+        调用落一行 `retrieval_logs`（含 `error` / `empty`），字段口径见
+        `app.retrieval.trace.record_trace`；不给就不写，行为与接入前一致。
+        轨迹写入自身失败只 warn，**绝不**影响工具返回。
         """
         for prefix in FORBIDDEN_PREFIXES:
             if name.startswith(prefix):
@@ -221,7 +294,26 @@ class AssistantToolRegistry:
             )
         # 把 db / project_id 显式注入；kwargs 是工具自身的额外参数（如 query / k）。
         # 工具 callable 不会拿到 db / project_id 之外的"特权"——返回 dict，不持引用。
-        return spec.callable(db=db, project_id=project_id, **kwargs)
+        started = time.perf_counter()
+        call_kwargs = dict(kwargs)
+        # 目录工具内部不写轨迹（避免与 _record_invoke_trace 双行），但预算池
+        # 需要 session_id 才能按会话计数；只传计数用的键，不改变工具契约。
+        if name in ("browse", "search", "rule", "anchor", "similar") and trace:
+            call_kwargs["_trace_session_id"] = trace.get("session_id")
+        try:
+            result = spec.callable(db=db, project_id=project_id, **call_kwargs)
+        except Exception:
+            _record_invoke_trace(
+                db, name, trace, kwargs, result=None, status="error",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+            raise
+        _record_invoke_trace(
+            db, name, trace, kwargs, result=result,
+            status=_trace_status(result),
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return result
 
     # ----- 测试 / 复位 -----
     def clear(self) -> None:
@@ -254,9 +346,149 @@ def reset_tool_registry() -> None:
     _registry = None
 
 
-def invoke_tool(name: str, /, db: Any, project_id: int, **kwargs: Any) -> dict:
-    """便捷入口：get_tool_registry().invoke(name, db, project_id, **kwargs)。"""
-    return get_tool_registry().invoke(name, db, project_id=project_id, **kwargs)
+def invoke_tool(name: str, /, db: Any, project_id: int,
+                trace: Mapping[str, Any] | None = None, **kwargs: Any) -> dict:
+    """便捷入口：get_tool_registry().invoke(name, db, project_id, trace=..., **kwargs)。"""
+    return get_tool_registry().invoke(
+        name, db, project_id=project_id, trace=trace, **kwargs
+    )
+
+
+def describe_tools(only: Iterable[str] | None = None) -> list[dict]:
+    """便捷入口：get_tool_registry().describe_tools(only=...)。"""
+    return get_tool_registry().describe_tools(only=only)
+
+
+# ====================================================================
+# 调用轨迹（R24）：工具调用 → retrieval_logs
+# ====================================================================
+
+#: 工具里可能装「命中项」的键。命中 id 从这里取，**不从结果文本里正则抠**。
+_HIT_KEYS = ("hits", "segments", "rules", "facts", "timeline", "cards")
+
+#: 命中项里可能作为 id 的字段，按顺序取第一个非空。
+_ID_FIELDS = ("id", "rule_id", "card_id", "ref_id", "chunk_id")
+
+#: 结果里表示「条数」的键；为 0 且无命中 → status=empty。
+_COUNT_KEYS = ("count", "total", "n")
+
+
+def _trace_status(result: Any) -> str:
+    """`ok` / `empty`。工具已正常返回，`error` 只在 callable 抛错时出现。"""
+    if not isinstance(result, dict):
+        return "ok"
+    # 目录工具显式带 `status`：invalid 参数会返回 status=error 而不是抛错，
+    # 按工具自己的口径记，别让轨迹把「参数错了」读成「查到东西了」。
+    explicit = result.get("status")
+    if explicit in ("ok", "empty", "error", "budget_exhausted", "denied"):
+        return str(explicit)
+    if _hit_ids_from(result):
+        return "ok"
+    for key in _COUNT_KEYS:
+        if key in result and result.get(key) == 0:
+            return "empty"
+    for key in _HIT_KEYS:
+        if key in result and isinstance(result.get(key), list) and not result[key]:
+            return "empty"
+    return "ok"
+
+
+def _hit_ids_from(result: Any) -> list[str]:
+    """从工具返回的命中列表里取 id。取不到就是空列表，不猜。"""
+    if not isinstance(result, dict):
+        return []
+    out: list[str] = []
+    for key in _HIT_KEYS:
+        items = result.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            for field in _ID_FIELDS:
+                value = item.get(field)
+                if value is not None and value != "":
+                    out.append(str(value))
+                    break
+    return out
+
+
+def _record_invoke_trace(db: Any, tool_name: str,
+                         trace: Mapping[str, Any] | None,
+                         kwargs: Mapping[str, Any], *,
+                         result: Any, status: str, latency_ms: int) -> None:
+    """写一行调用轨迹。没有 `session_id` 就不写——不编造会话。
+
+    写入失败只 warn：轨迹是观测面，不能让观测面把检索打挂。
+    """
+    if not trace or not trace.get("session_id"):
+        return
+    try:
+        from app.retrieval.trace import record_trace
+
+        result_dict = result if isinstance(result, dict) else {}
+        hit_ids = _hit_ids_from(result)
+        if not hit_ids and result_dict.get("rule_id"):
+            # rule / anchor 不返回命中列表，但这次调用读的就是这一条。
+            hit_ids = [str(result_dict["rule_id"])]
+        returned_chars = (
+            int(result_dict["returned_chars"])
+            if result_dict.get("returned_chars") is not None
+            else (len(json.dumps(result, ensure_ascii=False, default=str))
+                  if result is not None else 0)
+        )
+        path = trace.get("path")
+        query = trace.get("query") or kwargs.get("query")
+        path = path or result_dict.get("path")
+        query = query or result_dict.get("query")
+        # 目录工具把宽 / 是否增量放在返回值里（工具内已关闭自身轨迹），
+        # trace 没给时从 result 兜底，否则 anchor 的 context_expansion_count
+        # 会永远按 is_delta=False 记成 0。
+        rule_id = trace.get("rule_id") or result_dict.get("rule_id")
+        card_id = trace.get("card_id") or result_dict.get("card_id")
+        distill_id = trace.get("distill_id") or result_dict.get("distill_id")
+        width = trace.get("width")
+        if width is None:
+            width = result_dict.get("width")
+        if "is_delta" in trace:
+            is_delta = bool(trace.get("is_delta"))
+        else:
+            is_delta = bool(result_dict.get("is_delta"))
+        # 工具内部按工具名给默认预算池；走 registry 时工具自身不写轨迹，
+        # 这里补上同一份口径（catalog / rule / anchor）。
+        budget_pool = trace.get("budget_pool")
+        if not budget_pool:
+            from app.retrieval.tools import _DEFAULT_POOL
+
+            budget_pool = _DEFAULT_POOL.get(tool_name)
+        record_trace(
+            db,
+            session_id=str(trace["session_id"]),
+            tool_name=tool_name,
+            agent_kind=str(trace.get("agent_kind") or "author"),
+            turn_no=int(trace.get("turn_no") or 1),
+            seq=int(trace.get("seq") or 1),
+            segment_no=trace.get("segment_no"),
+            project_id=trace.get("project_id"),
+            novel_id=trace.get("novel_id") or (
+                result.get("novel_id") if isinstance(result, dict) else None
+            ),
+            distill_id=distill_id,
+            path=path,
+            rule_id=rule_id,
+            card_id=card_id,
+            query=query,
+            hit_ids=hit_ids,
+            returned_chars=returned_chars,
+            budget_remaining=trace.get("budget_remaining"),
+            latency_ms=latency_ms,
+            status=status,
+            width=width,
+            is_delta=is_delta,
+            budget_pool=budget_pool,
+        )
+    except Exception as exc:  # noqa: BLE001 - 轨迹失败不影响检索
+        logger.warning("写 retrieval_logs 失败（工具 %s）：%s", tool_name, exc)
 
 
 # ====================================================================
@@ -285,7 +517,17 @@ def _impl_search_novel_chunks(*, db: Any, project_id: int,
         target_novel_id = int(refs[0])
 
     hits = hybrid_search(db, target_novel_id, query, k=k)
-    return {"novel_id": target_novel_id, "query": query, "k": k, "hits": hits}
+    # 分片也是正文：补精确字数（按 text 原样 len），并给出条目数。
+    for hit in hits:
+        if isinstance(hit, dict) and "chars" not in hit:
+            hit["chars"] = len(str(hit.get("text") or hit.get("chunk_text") or ""))
+    return {
+        "novel_id": target_novel_id,
+        "query": query,
+        "k": k,
+        "hits": hits,
+        "count": len(hits),
+    }
 
 
 def _impl_read_generation_segments(*, db: Any, project_id: int,
@@ -300,18 +542,23 @@ def _impl_read_generation_segments(*, db: Any, project_id: int,
         q = q.where(Generation.segment_no == segment_no)
     q = q.order_by(Generation.segment_no.desc()).limit(limit)
     gens = list(db.scalars(q).all())
+    segments = [
+        {
+            "id": g.id,
+            "segment_no": g.segment_no,
+            "chapter_range": g.chapter_range,
+            "text": g.text,
+            # 精确字数（Python len，与快照回执的 chars 同口径）。
+            # 模型数汉字数错过，所以这个字段就是唯一口径。
+            "chars": len(g.text or ""),
+            "summary": g.summary,
+        }
+        for g in gens
+    ]
     return {
-        "segments": [
-            {
-                "id": g.id,
-                "segment_no": g.segment_no,
-                "chapter_range": g.chapter_range,
-                "text": g.text,
-                "summary": g.summary,
-            }
-            for g in gens
-        ],
-        "count": len(gens),
+        "segments": segments,
+        "count": len(segments),
+        "total_chars": sum(s["chars"] for s in segments),
     }
 
 
@@ -636,34 +883,194 @@ def _impl_query_ai_flavor_memory(*, db: Any, project_id: int,
         return {"matched": [], "unmatched": [], "error": str(exc)}
 
 
+# ====================================================================
+# 五级目录：五个只读工具（与作者 agent 共用 app.retrieval.tools）
+# ====================================================================
+#
+# 不复制检索 / 锚点 / 相似度逻辑：callable 直接是 `app.retrieval.tools`
+# 的适配层，作者 agent 走同一份函数，只是自己带 ToolContext。轨迹由本注册表
+# 的 `_record_invoke_trace` 统一写一行（工具内部 trace_enabled=False），避免
+# 一次调用落两行。
+
+
+def _impl_browse(*, db: Any, project_id: int, **kwargs: Any) -> dict:
+    from app.retrieval.tools import tool_browse
+
+    return tool_browse(db=db, project_id=project_id, **kwargs)
+
+
+def _impl_search(*, db: Any, project_id: int, **kwargs: Any) -> dict:
+    from app.retrieval.tools import tool_search
+
+    return tool_search(db=db, project_id=project_id, **kwargs)
+
+
+def _impl_rule(*, db: Any, project_id: int, **kwargs: Any) -> dict:
+    from app.retrieval.tools import tool_rule
+
+    return tool_rule(db=db, project_id=project_id, **kwargs)
+
+
+def _impl_anchor(*, db: Any, project_id: int, **kwargs: Any) -> dict:
+    from app.retrieval.tools import tool_anchor
+
+    return tool_anchor(db=db, project_id=project_id, **kwargs)
+
+
+def _impl_similar(*, db: Any, project_id: int, **kwargs: Any) -> dict:
+    from app.retrieval.tools import tool_similar
+
+    return tool_similar(db=db, project_id=project_id, **kwargs)
+
+
+def _impl_inspect_retrieval_trace(*, db: Any, project_id: int,
+                                  session_id: str | None = None,
+                                  segment_no: int | None = None) -> dict:
+    """作者 agent 轨迹监察：只读 retrieval_logs，给 verdict / findings / summary。"""
+    from app.agents.inspection import inspect_session
+
+    return inspect_session(
+        db, session_id=session_id, project_id=project_id,
+        segment_no=segment_no,
+    )
+
+
+def _impl_list_actions(*, db: Any, project_id: int,
+                       query: str | None = None,
+                       category: str | None = None,
+                       policy: str | None = None) -> dict:
+    """发现可执行操作（只读）：从动作目录按 query / 类别 / 策略过滤。
+
+    只返回声明，不执行任何操作。档 3（破坏性/批量/配置）也在目录里，但
+    policy=frontend_only —— 助手看到的是「必须由用户在前端确认」，不是「可以代劳」。
+    """
+    from app.agents.action_catalog import list_actions as _list_actions
+
+    actions = _list_actions(query=query, category=category, policy=policy)
+    return {"count": len(actions), "actions": actions}
+
+
+# ====================================================================
+# 模型可见工具的参数 schema
+# ====================================================================
+#
+# 只给 **action_catalog 里 policy=auto_read** 的工具写 schema（另外
+# `unwired_read` 若将来绑定了已注册工具，也会自动纳入——见
+# `action_catalog.model_tool_names()`）。档 2 / 档 3 的写操作根本没有
+# 注册成 ToolSpec，因此**不会**出现在这里，也不在 `describe_tools()` 输出里。
+#
+# schema 与 `_impl_*` 的签名一一对应：模型给错的参数会在 invoke 处变成
+# TypeError（已被 /qa 的工具循环捕获成一条 tool 错误消息，不会 500）。
+
+def _obj(properties: dict | None = None, required: list[str] | None = None) -> dict:
+    """拼一个 `type=object` 的 JSON Schema（省掉重复样板）。"""
+    return {"type": "object", "properties": properties or {}, "required": required or []}
+
+
+_MODEL_TOOL_PARAMETERS: dict[str, dict] = {
+    "search_novel_chunks": _obj(
+        {
+            "query": {"type": "string", "description": "检索关键词或问题"},
+            "k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+            "novel_id": {"type": "integer", "description": "不传则取项目首本参考语料"},
+        },
+        ["query"],
+    ),
+    "read_generation_segments": _obj(
+        {
+            "segment_no": {"type": "integer", "minimum": 1, "description": "精确取某一段"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+        }
+    ),
+    "get_character_profile": _obj(
+        {"name": {"type": "string", "description": "角色名"}}, ["name"]
+    ),
+    "get_reminders": _obj(
+        {
+            "source": {"type": "string", "enum": ["generated"], "default": "generated"},
+            "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 50},
+        }
+    ),
+    "summarize_bible": _obj(),
+    "audit_corpus": _obj(
+        {
+            "novel_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "不传=全库语料；给列表=只审这些（空列表会被拒）",
+            }
+        }
+    ),
+    "audit_kg": _obj(),
+    "audit_generation": _obj(),
+    "analyze_logs": _obj(
+        {
+            "status": {"type": "string", "enum": ["running", "success", "failed"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+        }
+    ),
+    "query_ai_flavor_memory": _obj(
+        {
+            "patterns": {"type": "array", "items": {"type": "string"}},
+            "include_global": {"type": "boolean", "default": True},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 12},
+        }
+    ),
+    "browse": _obj(
+        {
+            "level": {"type": "integer", "minimum": 1, "maximum": 4, "default": 1},
+            "path": {"type": "string", "description": "父路径，空=从 L1 开始"},
+            "depth": {"type": "integer", "minimum": 1, "maximum": 2, "default": 1},
+        }
+    ),
+    "inspect_retrieval_trace": _obj(
+        {
+            "session_id": {"type": "string", "description": "不传取本项目最近一段会话"},
+            "segment_no": {"type": "integer", "minimum": 1},
+        }
+    ),
+}
+
+
 _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="search_novel_chunks",
-        description="对项目首本参考语料（或显式 novel_id）做混合检索，返回前 k 个分片。",
+        description=(
+            "对项目首本参考语料（或显式 novel_id）做混合检索，返回前 k 个分片。"
+            "每个分片带 chars（精确字数），条目数以 count 为准——"
+            "回答字数/条数时直接用这些字段，不要自行统计。"
+        ),
         read_only=True,
         callable=_impl_search_novel_chunks,
+        parameters=_MODEL_TOOL_PARAMETERS["search_novel_chunks"],
     ),
     ToolSpec(
         name="read_generation_segments",
-        description="读取项目已生成的段（默认最新 limit 段；或按 segment_no 精确取）。",
+        description=(
+            "读取项目已生成的段（默认最新 limit 段；或按 segment_no 精确取）。"
+            "每段带 chars（精确字数），count 是段数、total_chars 是这些段的总字数——"
+            "字数/段数以这些字段为准，不要自行统计。"
+        ),
         read_only=True,
         callable=_impl_read_generation_segments,
+        parameters=_MODEL_TOOL_PARAMETERS["read_generation_segments"],
     ),
     ToolSpec(
         name="get_character_profile",
         description="按角色名取人设 + 关系出边（复用 kg.queries.get_character）。",
         read_only=True,
         callable=_impl_get_character_profile,
+        parameters=_MODEL_TOOL_PARAMETERS["get_character_profile"],
     ),
     ToolSpec(
         name="get_plot_timeline",
-        description="按 segment_no 升序拉取 Generation 的时间线与短摘要。",
+        description="按 segment_no 升序拉取 Generation 的时间线与短摘要。count 是条目数，以该字段为准。",
         read_only=True,
         callable=_impl_get_plot_timeline,
     ),
     ToolSpec(
         name="get_fact_ledger",
-        description="读 Fact 表（可按 type 过滤），返回已裁决事实 + 别名。",
+        description="读 Fact 表（可按 type 过滤），返回已裁决事实 + 别名。count 是条目数，以该字段为准。",
         read_only=True,
         callable=_impl_get_fact_ledger,
     ),
@@ -672,12 +1079,14 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         description="生成前提醒：未填坑 + 角色约束清单（复用 kg.queries.get_reminders）。",
         read_only=True,
         callable=_impl_get_reminders,
+        parameters=_MODEL_TOOL_PARAMETERS["get_reminders"],
     ),
     ToolSpec(
         name="summarize_bible",
         description="读取 project.plot_bible / premise / outline，不做总结（命名沿用 task spec）。",
         read_only=True,
         callable=_impl_summarize_bible,
+        parameters=_MODEL_TOOL_PARAMETERS["summarize_bible"],
     ),
     ToolSpec(
         name="audit_corpus",
@@ -689,6 +1098,7 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         ),
         read_only=True,
         callable=_impl_audit_corpus,
+        parameters=_MODEL_TOOL_PARAMETERS["audit_corpus"],
     ),
     ToolSpec(
         name="audit_kg",
@@ -699,6 +1109,7 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         ),
         read_only=True,
         callable=_impl_audit_kg,
+        parameters=_MODEL_TOOL_PARAMETERS["audit_kg"],
     ),
     ToolSpec(
         name="audit_generation",
@@ -709,6 +1120,7 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         ),
         read_only=True,
         callable=_impl_audit_generation,
+        parameters=_MODEL_TOOL_PARAMETERS["audit_generation"],
     ),
     ToolSpec(
         name="analyze_logs",
@@ -720,6 +1132,7 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         ),
         read_only=True,
         callable=_impl_analyze_logs,
+        parameters=_MODEL_TOOL_PARAMETERS["analyze_logs"],
     ),
     ToolSpec(
         name="query_ai_flavor_memory",
@@ -731,6 +1144,80 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         ),
         read_only=True,
         callable=_impl_query_ai_flavor_memory,
+        parameters=_MODEL_TOOL_PARAMETERS["query_ai_flavor_memory"],
+    ),
+    ToolSpec(
+        name="browse",
+        description=(
+            "浏览五级目录：level=1 看资源族，level>1 给父 path 逐级下钻"
+            "（场景域→节拍→技法）；depth=2 可一次看两层。返回子节点条数与路径，"
+            "空路径不列、<5 条已并入上级。"
+        ),
+        read_only=True,
+        callable=_impl_browse,
+        parameters=_MODEL_TOOL_PARAMETERS["browse"],
+    ),
+    ToolSpec(
+        name="search",
+        description=(
+            "在目录里检索规则：query 必填，可用 path 限定子树、l1 限定资源族，"
+            "k 默认 5（上限 10）。返回卡 id / 摘要 / 路径 / 分数；命中不足会回落"
+            "到通用（global）卡并标记 fallback。"
+        ),
+        read_only=True,
+        callable=_impl_search,
+    ),
+    ToolSpec(
+        name="rule",
+        description=(
+            "读一条规则的完整卡片：原文、证据句、四维分数、硬过滤标记、章号与时间线。"
+            "card_id / rule_id 二选一；被硬过滤的旧 id 也能回查原文（card_missing=true）。"
+        ),
+        read_only=True,
+        callable=_impl_rule,
+    ),
+    ToolSpec(
+        name="anchor",
+        description=(
+            "把规则定位到原章并取上下文：首次给 card_id，width 默认 300；"
+            "要扩大范围就把上次返回的 cursor 原样带回来，只返回新增区间。"
+            "单次最多 4,000 字，没有轮次上限，可自行决定继续扩。"
+        ),
+        read_only=True,
+        callable=_impl_anchor,
+    ),
+    ToolSpec(
+        name="similar",
+        description=(
+            "找同类规则：同 L4 技法优先、其次同 L3 节拍、同 L2 场景，不跨 L1 资源族。"
+            "用户说「有没有别的写法 / 再给几条同类型规则」时调用。"
+        ),
+        read_only=True,
+        callable=_impl_similar,
+    ),
+    ToolSpec(
+        name="inspect_retrieval_trace",
+        description=(
+            "监察作者 agent 的检索轨迹（只读）：默认取本项目最近一段作者会话，"
+            "也可给 session_id / segment_no。返回 verdict（healthy/watch/drifting）、"
+            "可读 summary、逐条 findings 与指标——空转率、重复路径/query、是否只在 "
+            "L1 打转、seq 缺口（调用数与日志是否对齐）、预算压力、扩窗次数、采纳回填。"
+            "用户问「这段检索是不是跑偏了 / 为什么查了半天没用」时调用。"
+        ),
+        read_only=True,
+        callable=_impl_inspect_retrieval_trace,
+        parameters=_MODEL_TOOL_PARAMETERS["inspect_retrieval_trace"],
+    ),
+    ToolSpec(
+        name="list_actions",
+        description=(
+            "发现可执行操作（只读）：按用户意图从后端动作目录筛出相关操作，返回"
+            "类别（read/write/destructive）、策略（可直接执行/需用户确认/仅前端可做/"
+            "尚未接入）、是否需要确认、前端入口。用户问「你能做什么 / 这个能不能做 / "
+            "在哪改」或不确定某能力是否可用时调用；目录外的一律视为不支持。"
+        ),
+        read_only=True,
+        callable=_impl_list_actions,
     ),
 )
 

@@ -22,7 +22,7 @@ from app.generation import (
     generate_loop,
     generate_next_segment,
 )
-from app.generation.engine import _style_info, _style_narrative, _style_profile, _next_segment_no, current_node_prompt
+from app.generation.engine import _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt
 from app.generation.prompts import build_system_prompt, build_user_prompt
 from app.generation.repetition import parse_quality
 from app.models import Generation, Project
@@ -102,6 +102,8 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
         **_to_generation_out(_last_generation(db, proj.id)),
         # 落库仍是 200：复读只标记不拒绝（D7）。
         "repetition": result.get("repetition"),
+        "length": result.get("length"),
+        "summary_style": result.get("summary_style"),
         "warnings": result.get("warnings") or [],
         "debug": {
             "system_prompt": result["system_prompt"],
@@ -198,6 +200,8 @@ def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)
             {**_to_generation_out(_generation_by_no(db, proj.id, r["segment_no"])),
              "summary": r["summary"],
              "repetition": r.get("repetition"),
+             "length": r.get("length"),
+             "summary_style": r.get("summary_style"),
              "warnings": r.get("warnings") or []}
             for r in results
         ],
@@ -216,15 +220,21 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
     system = build_system_prompt(
         proj.title, ctx["reminders"], _style_info(proj), proj.plot_bible,
         profile, _style_narrative(db, proj),
+        style_source_ids=_style_source_ids(proj),
+        # 预检必须与真实生成同口径：首段裁剪/角色卡遮蔽/压缩趋势降权都在这里生效。
+        is_opening=not ctx["prior_blocks"] and not ctx["prior_summaries"],
+        catalog_skeleton=_catalog_skeleton(db, proj),
+        max_chars=proj.generation_length or 4000,
     )
     from app.llm.provider import get_llm_provider
     user = build_user_prompt(
         ctx["prior_summaries"], ctx["rag_context"], proj.outline,
-        proj.generation_length or 3000, proj.plot_bible, proj.premise,
+        proj.generation_length or 4000, proj.plot_bible, proj.premise,
         prior_blocks=ctx["prior_blocks"],
         style_exemplars=ctx.get("style_exemplars"),
         rag_has_forbidden=ctx.get("rag_has_forbidden", False),
         # 预检页必须与真实生成同源：漏了这块，人工审阅看到的 prompt 就不是实际下发的那份
+        kg_slice=ctx.get("kg_slice") or None,
         item_holding_block=ctx.get("item_holding_block") or None,
         node_prompt=current_node_prompt(
             proj, _next_segment_no(db, body.project_id) - 1, get_llm_provider(), db=db
@@ -258,22 +268,21 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
 
 def _sentinel_digest(project: Project) -> dict:
     """哨兵的预检摘要：规则清单 + 本书的境界阶梯来源。"""
-    from app.kg.sentinel import REALM_SYSTEMS, REALM_ORDER, _active_rules, realm_order_from_project
+    from app.kg.sentinel import _active_rules, realm_order_from_project
 
     ladder = realm_order_from_project(project)
-    # 项目自己配了就明说是自配的；用默认表则说明只覆盖常见档位
-    from_bible = ladder is not REALM_SYSTEMS
+    # 未配置 = 不注入、不判定（与 power_prompt._realm_order_line 同口径）
+    from_bible = bool(ladder)
     return {
         "rules": _active_rules(),
         "realm_systems": len(ladder),
         "realm_words": sum(len(g) for g in ladder),
         "realm_from_project": from_bible,
-        "realm_default_words": len(REALM_ORDER),
         "note": (
             "境界阶梯取自 plot_bible.realm_order"
             if from_bible else
-            "未配 plot_bible.realm_order，用默认阶梯（只覆盖常见玄幻档位；"
-            "本书自造档位不参与判定）"
+            "未配 plot_bible.realm_order，不做境界判定（不注入、不抽境界事件）；"
+            "要启用请在项目设定里给 realm_order"
         ),
     }
 
