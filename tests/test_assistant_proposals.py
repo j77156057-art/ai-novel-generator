@@ -699,6 +699,51 @@ def test_restore_creates_new_version_and_keeps_history(client, db_session, proje
     assert _proposal_row(db_session, pid).status == "rolled_back"
 
 
+def test_restore_expected_hash_guards_drift(client, db_session, project_id):
+    """恢复携带预览基线时：漂移 409 且不写，匹配则正常恢复。"""
+    gen_id = _seed_segment(db_session, project_id)
+    v0_text = db_session.get(Generation, gen_id).text
+    pid = _create_text_proposal(client, project_id, gen_id)["proposal"]["id"]
+    _approve(client, pid)
+    code, applied = _apply(client, pid)
+    assert code == 200
+    current_text = db_session.get(Generation, gen_id).text
+
+    baseline = proposal_lib.insert_version_row(
+        db_session,
+        proposal_id=pid,
+        project_id=project_id,
+        kind="text",
+        snapshot={
+            "target_kind": "generation_text", "target_id": str(gen_id),
+            "proposal_type": "text_edit", "before": v0_text, "after": v0_text,
+            "before_hash": proposal_lib.content_hash(v0_text),
+            "after_hash": proposal_lib.content_hash(v0_text),
+        },
+        content_hash_value=proposal_lib.content_hash(v0_text),
+        created_by="tester",
+    )
+    db_session.commit()
+
+    drifted = client.post(
+        f"/api/assistant/versions/{baseline.id}/restore",
+        json={"action": "restore", "expected_hash": "0" * 64},
+    )
+    assert drifted.status_code == 409
+    assert drifted.json()["detail"]["error"] == "stale"
+    db_session.expire_all()
+    assert db_session.get(Generation, gen_id).text == current_text
+    assert db_session.scalar(select(func.count(Version.id))) == 2
+
+    accepted = client.post(
+        f"/api/assistant/versions/{baseline.id}/restore",
+        json={"action": "restore", "expected_hash": proposal_lib.content_hash(current_text)},
+    )
+    assert accepted.status_code == 200, accepted.text
+    db_session.expire_all()
+    assert db_session.get(Generation, gen_id).text == v0_text
+
+
 def test_full_lifecycle_v0_v1_v2_rollback_v3(client, db_session, project_id):
     """验收标准 6：v0 → v1 → v2 → 回滚为新版本，差异正确、历史可读。"""
     gen_id = _seed_segment(db_session, project_id)
