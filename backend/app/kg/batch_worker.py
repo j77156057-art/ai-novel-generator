@@ -809,12 +809,21 @@ def _llm_budget_note(provider) -> dict:  # noqa: ANN001
     total_ms, bytes}``（见 `provider.last_call_stats`）。落库而不是只打日志，
     是为了让「首字节 vs 总时间」的分布能按批直接查——`kg_extract_first_byte_timeout`
     的取值要据此校准。失败调用为 None，不会残留上一次成功的数字。
+
+    **跨渠道兜底记账**（`FallbackChannelProvider`）：`channel_used` 是实际应答的
+    渠道（全败为 None），`fallback_used` = 是否由非主渠道应答，`channels[]` 按
+    尝试顺序记录每个渠道的 `{provider, model, outcome, elapsed_ms, error}`——
+    包括构建期就被跳过的 `channel_skipped_no_key`。未开兜底时这三个字段分别是
+    当前渠道名 / False / 空列表，与改造前只多出字段、不改旧字段含义。
     """
     if provider is None:
         return {"provider": None, "models": [], "model": None,
                 "total_timeout": None, "first_byte_timeout": None,
-                "timing": None}
+                "timing": None,
+                "channel_used": None, "fallback_used": False, "channels": []}
     chain = getattr(provider, "_model_chain", None)
+    # 只有兜底包装器会在每次调用后留下 last_channel_stats；单渠道没有这个属性。
+    channel_stats = getattr(provider, "last_channel_stats", None) or {}
     return {
         "provider": type(provider).__name__,
         "models": list(chain()) if callable(chain) else [],
@@ -823,6 +832,10 @@ def _llm_budget_note(provider) -> dict:  # noqa: ANN001
         "total_timeout": getattr(provider, "total_timeout", None),
         "first_byte_timeout": getattr(provider, "first_byte_timeout", None),
         "timing": getattr(provider, "last_call_stats", None),
+        "channel_used": channel_stats.get(
+            "channel_used", getattr(provider, "channel_name", None)),
+        "fallback_used": bool(channel_stats.get("fallback_used", False)),
+        "channels": list(channel_stats.get("channels") or []),
     }
 
 
@@ -1198,7 +1211,10 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
     summary = {"success": 0, "failed": 0, "running": 0, "pending": 0,
                "stuck": 0, "empty": 0,
                # 失败可见性 / 溢出留痕的汇总（recent_runs 里可看逐行明细）
-               "abandoned": 0, "overflow": 0, "claimed": 0}
+               "abandoned": 0, "overflow": 0, "claimed": 0,
+               # 跨渠道兜底：由非主渠道应答的行数（note.llm.fallback_used）。
+               # 开通兜底后这个数持续上涨 = 主渠道一直在挂，别只看 success。
+               "fallback": 0}
     items = []
     for r in runs:
         started = r.started_at
@@ -1236,6 +1252,11 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
             summary["overflow"] += 1
         if note.get("abandoned"):
             summary["abandoned"] += 1
+        # 兜底留痕在 note.llm 里（`_llm_budget_note`）：只有包装器实际切到后备
+        # 渠道才是 True；全败为 False（走了哪些渠道看 channels[]）。
+        note_llm = note.get("llm")
+        if isinstance(note_llm, dict) and note_llm.get("fallback_used"):
+            summary["fallback"] += 1
         # 认领标记与 status 正交：pending 也会带 claim_owner（认领不改 status）。
         # 按「有认领标记」计数，才不会再恒为 0；过期与否由逐行 claim_expired 表达。
         if note.get("claim_owner"):

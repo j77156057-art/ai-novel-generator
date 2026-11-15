@@ -129,3 +129,14 @@ kg_extract:
   models: ""
   total_timeout: 300
   first_byte_timeout: 120
+  # 跨渠道兜底（默认关闭）：主渠道超时 / 连接错误 / 429 / 5xx 后，按序切换
+  # 到这里的渠道（各自用本渠道的 key / base_url / 模型链）。400/401/403/404
+  # 不切换，当场暴露。
+  #   ""（默认）  关闭，路径与改造前完全一致。
+  #   "zhipu"     主渠道失败后切智谱；未知渠道名或未配 key 的条目记
+  #               channel_skipped_no_key 并跳过。
+  # 也可用同名 env 覆盖：KG_EXTRACT_FALLBACK_PROVIDERS。
+  fallback_providers: ""
+  # 主渠道 + 后备渠道共享的链级预算（秒）。每次尝试最坏一个本值，
+  # 整批仍是 (RETRY_LIMIT + 1) × 300s ≈ 15 分钟。
+  fallback_chain_timeout: 300

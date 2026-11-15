@@ -356,6 +356,25 @@ class Settings(BaseSettings):
     #: 这里单独一槽，`get_kg_extract_provider()` 才会套用；Writer 完全不读。
     #: 由 `PUT /api/settings/llm` 的 `kg_extract.models` 写入并热生效。
     kg_extract_models: str = str(_KG_EXTRACT_DEFAULTS.get("models", "") or "")
+    #: KG 抽取的**跨渠道兜底列表**（逗号分隔渠道名，按序尝试；默认空 = 关闭）。
+    #:
+    #: 为什么需要：渠道内的 `models` 链共用同一份 base_url / api_key，只能换
+    #: model id；MiniMax 对抽取类请求整条挂死时，换 id 救不回来。这里让主渠道
+    #: 在超时 / 连接错误 / 429 / 5xx 后切到另一渠道（自己的 key 与模型链）。
+    #: 只有可用后备渠道时才包一层 `FallbackChannelProvider`；空列表 = 原路径。
+    #: 未知渠道名或未配 key 的条目会写 `channel_skipped_no_key` 并跳过。
+    #: env：`KG_EXTRACT_FALLBACK_PROVIDERS`。
+    kg_extract_fallback_providers: str = str(
+        _KG_EXTRACT_DEFAULTS.get("fallback_providers", "") or ""
+    )
+    #: 跨渠道兜底的**链级预算**（秒），主渠道 + 后备渠道共享，默认 300。
+    #:
+    #: 每个渠道拿到「链剩余额度」与自身 `kg_extract_total_timeout` 的较小值，
+    #: 所以整批最坏仍是 `(RETRY_LIMIT + 1) × 300s ≈ 15 分钟`，不会叠加成 3×600。
+    #: env：`KG_EXTRACT_FALLBACK_CHAIN_TIMEOUT`。
+    kg_extract_fallback_chain_timeout: int = int(
+        _KG_EXTRACT_DEFAULTS.get("fallback_chain_timeout", 300)
+    )
     #: 重写允许的字数上浮比例，默认 8%。**手写值，不是档案推导**：来源是第 4 章
     #: 实测（2,987→2,868 汉字，段均 23.2→24.8）——修碎段要给短对白补神态/动作，
     #: 必然增字。它只防借补写无限膨胀，不是篇幅预算；篇幅上限由 `length_limits`

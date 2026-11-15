@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -197,6 +198,65 @@ def _backoff(attempt: int) -> float:
     """指数退避 + 抖动，封顶 16s：2→4→8→（封顶）。"""
     base = min(2 ** (attempt + 1), 16)
     return base + (time.time() % 1)
+
+
+#: 触发跨渠道兜底的 HTTP 状态。其余 4xx **一律不切换**：400 参数错 / 401 鉴权 /
+#: 403 无权限 / 404 模型不存在都是配置问题，换渠道只会把真实错误藏起来。
+_FALLBACK_HTTP = {429, 500, 502, 503, 529}
+
+#: 触发跨渠道兜底的传输层错误关键字（含 urllib 包装后的文案）。
+_FALLBACK_MSG_HINTS = (
+    "timed out", "timeout", "connection reset", "connection refused",
+    "broken pipe", "remote end closed connection",
+    "name or service not known", "temporary failure in name resolution",
+    "network is unreachable",
+)
+
+
+def _root_cause(exc: Exception) -> Exception:
+    """沿 `__cause__` 找到最里层原因。
+
+    provider 会把自己的异常再包一层 `RuntimeError(f"{label} chat 调用失败: …")`，
+    直接看外层只能得到「调用失败」，判不出到底是超时还是 400。
+    """
+    cur, seen = exc, set()
+    while cur.__cause__ is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return cur
+
+
+def _fallback_eligible(exc: Exception) -> bool:
+    """这个异常值不值得换渠道再试。
+
+    只认**传输层 / 服务端**故障：超时、连接类错误、429、5xx。
+    配置类错误（400/401/403/404）与内容不可解析不换渠道——换过去只会
+    让「key 写错」「模型名写错」看起来像「跑在备用渠道上，一切正常」。
+    """
+    root = _root_cause(exc)
+    if isinstance(root, TimeoutError):
+        return True
+    code = _http_code(root)
+    if code is not None:
+        return code in _FALLBACK_HTTP
+    if isinstance(root, urllib.error.URLError):
+        return True  # HTTPError 已由上面的 code 分支处理，这里只剩纯传输层
+    return any(k in str(root).lower() for k in _FALLBACK_MSG_HINTS)
+
+
+def _channel_outcome(exc: Exception) -> str:
+    """给一次失败分类，写进 `agent_runs.note.llm.channels[].outcome`。"""
+    root = _root_cause(exc)
+    if isinstance(root, TimeoutError):
+        return "timeout"
+    code = _http_code(root)
+    if code is not None:
+        return f"http_{code}"
+    if isinstance(root, urllib.error.URLError):
+        return "transport"
+    if any(k in str(root).lower() for k in ("timed out", "timeout")):
+        return "timeout"
+    return "error"
 
 
 class ToolsUnsupportedError(RuntimeError):
@@ -493,15 +553,24 @@ class OpenAICompatibleChatProvider(LLMProvider):
         self.model = chain[0]
         self._models = [chain[0]] + [m for m in chain[1:] if m != chain[0]]
 
-    def _complete(self, messages: list[dict], stop_sequences: list[str] | None = None) -> str:
+    def _complete(self, messages: list[dict], stop_sequences: list[str] | None = None,
+                  budget_seconds: float | None = None) -> str:
         """纯文本补全 = `complete_message` 的薄包装。
 
         Writer 只依赖这个字符串接口。**行为必须与改造前逐字节一致**：
         同样的 payload、同样的模型链、同样的重试 / 429 换模型、同样的
         `strip_reasoning` 后 `.strip()`。所有结构化能力都放在
         `complete_message` 里，本方法不再持有任何逻辑。
+
+        budget_seconds：仅跨渠道兜底用（见 `FallbackChannelProvider`），
+        None = 用本实例的 `total_timeout`，与改造前一致。**None 时不传这个
+        kwarg**：调用方可能替换了 `complete_message`（测试替身/子类），
+        不能让新增参数变成对方签名上的硬依赖。
         """
-        message = self.complete_message(messages, stop_sequences=stop_sequences)
+        kwargs: dict = {"stop_sequences": stop_sequences}
+        if budget_seconds is not None:
+            kwargs["budget_seconds"] = budget_seconds
+        message = self.complete_message(messages, **kwargs)
         return str(message.get("content") or "")
 
     def complete_message(
@@ -511,6 +580,7 @@ class OpenAICompatibleChatProvider(LLMProvider):
         tools: list[dict] | None = None,
         tool_choice: str | None = None,
         stop_sequences: list[str] | None = None,
+        budget_seconds: float | None = None,
     ) -> dict:
         """结构化补全：透传 `tools` / `tool_choice`，返回完整 message。
 
@@ -540,8 +610,13 @@ class OpenAICompatibleChatProvider(LLMProvider):
         last_exc: Exception | None = None
         # 本次调用从头留痕：失败时不能留着上一次成功调用的耗时。
         self.last_call_stats = None
+        started = time.monotonic()
+        # 跨渠道兜底会把「链剩余额度」传进来；不传 = 本实例的 total_timeout，
+        # writer / assistant / 默认路径行为完全不变。
+        budget = (float(self.total_timeout) if budget_seconds is None
+                  else max(1.0, min(float(budget_seconds), float(self.total_timeout))))
         # 整条链（换模型 + 每模型重试）共享同一个硬截止：总时长上限。
-        deadline = time.monotonic() + self.total_timeout
+        deadline = started + budget
         # 带 tools 的请求**不能**落到实测不可用的模型上：那会返回
         # `finish_reason=tool_calls` + 空数组的假信号。整条链都不可用时
         # 明确抛 ToolsUnsupportedError，由调用方回落确定性路径。
@@ -615,7 +690,7 @@ class OpenAICompatibleChatProvider(LLMProvider):
                     message = choice.get("message") or {}
                     # 单次非流式调用耗时留痕：历史上没有这项统计，只能拿整章耗时
                     # 反推上界（p50/p90/max 见 settings.writer_total_timeout 注释）。
-                    cost = time.monotonic() - (deadline - self.total_timeout)
+                    cost = time.monotonic() - started
                     # 首字节 vs 总耗时：`kg_extract_first_byte_timeout` 该定多少
                     # 此前没有实测依据（成功调用只记总耗时）。这里按「请求发出 →
                     # 首个正文字节」「请求发出 → body 读完」记录，由批抽落进
@@ -817,18 +892,26 @@ class OpenAICompatibleChatProvider(LLMProvider):
             )
 
     def chat(self, system: str, user: str, constraints: dict | None = None,
-             stop_sequences: list[str] | None = None) -> str:
+             stop_sequences: list[str] | None = None,
+             budget_seconds: float | None = None) -> str:
         """chat 调用。
 
         stop_sequences：v2.6 —— 本次调用独立的 stop token 列表（推荐用这个，
         避免和 provider 单例共享的 set_stop_sequences 互相覆盖）。
+        budget_seconds：仅跨渠道兜底传「链剩余额度」，None = 本实例预算。
         """
         user = _apply_constraints(user, constraints)
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        return self._complete(messages, stop_sequences=stop_sequences)
+        # budget_seconds 只在兜底链显式下发时才传给 `_complete`：子类/测试替身
+        # 可能仍按旧签名重写 `_complete(messages, stop_sequences=...)`，
+        # 不能让新增参数变成它们签名上的硬依赖（None 时行为与改造前一致）。
+        kwargs: dict = {"stop_sequences": stop_sequences}
+        if budget_seconds is not None:
+            kwargs["budget_seconds"] = budget_seconds
+        return self._complete(messages, **kwargs)
 
     def stream_chat(self, system: str, user: str, constraints: dict | None = None,
                     stop_sequences: list[str] | None = None):
@@ -1268,6 +1351,148 @@ class LocalFallbackLLMProvider(LLMProvider):
 
 
 # ====================================================================
+# 跨渠道兜底（仅 KG 抽取）
+# ====================================================================
+
+
+def _invoke_chat(prov, system: str, user: str,
+                 constraints: dict | None, budget: float) -> str:
+    """把「链剩余额度」传给渠道。
+
+    只有 OpenAI 兼容层认识 `budget_seconds`；其余实现（本地模板等）走原签名，
+    避免为了兜底改一圈无关 provider 的接口。
+    """
+    if isinstance(prov, OpenAICompatibleChatProvider):
+        return prov.chat(system, user, constraints, budget_seconds=budget)
+    return prov.chat(system, user, constraints)
+
+
+class FallbackChannelProvider(LLMProvider):
+    """KG 抽取专用：主渠道失败后按序切后备渠道（跨 provider，不只是换 model id）。
+
+    为什么需要：现有 `models` 链只在**同一渠道实例内**换 model id，共用同一份
+    `base_url` / `api_key`。MiniMax 对抽取类请求整条挂死时，链上换 id 救不回来，
+    只能手动改 `KG_EXTRACT_PROVIDER` 绕开。这里在渠道层再包一层：主渠道抛
+    「可切换」错误后，换另一个渠道（自己的 key / base_url / 模型链）重试。
+
+    **触发面**：超时、连接类错误、429、5xx；400/401/403/404 与内容不可解析
+    不切换，原样抛出（见 `_fallback_eligible`）。
+    **预算**：整条链共享 `chain_timeout`，每个渠道拿到「剩余额度」与自身
+    `total_timeout` 的较小值——最坏时长仍是一次尝试一个链级预算，不叠加。
+    **记账**：每次调用的结果留在 `last_channel_stats`，由批抽写进
+    `agent_runs.note.llm`（channel_used / fallback_used / channels）。
+
+    `fallback_providers` 为空时**不会**构造本类，`get_kg_extract_provider()`
+    直接返回原 provider，行为与改造前逐字节一致。
+    """
+
+    def __init__(self, channels, *, chain_timeout: float,
+                 skipped: list[dict] | None = None) -> None:
+        if not channels:
+            raise ValueError("FallbackChannelProvider 至少需要一个渠道")
+        self.channels = list(channels)  # [(channel_id, provider)]
+        self.chain_timeout = float(chain_timeout)
+        # 构建期就被跳过的渠道（未知渠道名 / 未配 key）：写进 channels[]，
+        # 让「为什么没走 zhipu」在 note 里可见，而不是静默消失。
+        self.skipped = [dict(item) for item in (skipped or [])]
+        self.last_channel_stats: dict | None = None
+        self._last_provider = self.channels[0][1]
+        self.channel_name = self.channels[0][0]
+        self.model = getattr(self._last_provider, "model", "") or ""
+        # 对上层（note / 日志）看起来仍像「一个带预算的 provider」
+        self.total_timeout = int(chain_timeout)
+        self.first_byte_timeout = getattr(
+            self._last_provider, "first_byte_timeout", None)
+
+    # -- 诊断字段：委托给「最后应答 / 最后尝试」的渠道 ----------------
+    @property
+    def last_model(self):  # noqa: ANN201
+        return (getattr(self._last_provider, "last_model", None)
+                or getattr(self._last_provider, "model", None))
+
+    @property
+    def last_call_stats(self):  # noqa: ANN201
+        return getattr(self._last_provider, "last_call_stats", None)
+
+    def _model_chain(self) -> list[str]:
+        chain = getattr(self._last_provider, "_model_chain", None)
+        return list(chain()) if callable(chain) else []
+
+    def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
+        return self._dispatch(
+            lambda prov, budget: _invoke_chat(prov, system, user, constraints, budget)
+        )
+
+    def _dispatch(self, invoke):  # noqa: ANN001, ANN202
+        started = time.monotonic()
+        records = [dict(item) for item in self.skipped]
+        last_exc: Exception | None = None
+        for index, (name, prov) in enumerate(self.channels):
+            remaining = self.chain_timeout - (time.monotonic() - started)
+            if remaining <= 1:
+                records.append({
+                    "provider": name, "outcome": "chain_timeout", "elapsed_ms": 0,
+                    "error": "链级预算已用尽，未发起调用",
+                })
+                break
+            attempt_started = time.monotonic()
+            try:
+                result = invoke(prov, remaining)
+            except Exception as exc:  # noqa: BLE001 —— 分类后决定切不切
+                elapsed = int((time.monotonic() - attempt_started) * 1000)
+                records.append({
+                    "provider": name,
+                    "model": (getattr(prov, "last_model", None)
+                              or getattr(prov, "model", None)),
+                    "outcome": _channel_outcome(exc),
+                    "elapsed_ms": elapsed,
+                    "error": str(exc)[:500],
+                })
+                last_exc = exc
+                if not _fallback_eligible(exc):
+                    # 配置类错误（400/401/403/404）当场暴露：切渠道只会掩盖它
+                    self.last_channel_stats = self._stats(None, records)
+                    raise
+                if index + 1 < len(self.channels):
+                    # 每次**真实切换**一条 warning；最后一个渠道失败由下面的
+                    # error 记完整链，不再多打一条「→ 无后备渠道」的假降级。
+                    logger.warning(
+                        "kg 抽取渠道降级：%s → %s（%s，%dms）：%s",
+                        name, self.channels[index + 1][0], records[-1]["outcome"],
+                        elapsed, str(exc)[:200],
+                    )
+                continue
+            elapsed = int((time.monotonic() - attempt_started) * 1000)
+            self._last_provider = prov
+            records.append({
+                "provider": name,
+                "model": (getattr(prov, "last_model", None)
+                          or getattr(prov, "model", None)),
+                "outcome": "success",
+                "elapsed_ms": elapsed,
+            })
+            self.last_channel_stats = self._stats(name, records)
+            return result
+
+        # 全渠道失败：错误信息带完整链，原错误原文保留在 records 里
+        summary = "; ".join(f"{r['provider']}={r['outcome']}" for r in records)
+        self.last_channel_stats = self._stats(None, records)
+        logger.error("kg 抽取全部渠道失败：%s", summary)
+        raise RuntimeError(
+            f"KG 抽取全部渠道失败（{summary}）；最后一个错误：{last_exc}"
+        ) from last_exc
+
+    def _stats(self, used, records: list[dict]) -> dict:  # noqa: ANN001
+        return {
+            "channel_used": used,
+            # 「降级」定义为**实际由非主渠道应答**；全败时没有应答渠道，算 False，
+            # 走了哪些渠道仍可从 channels[] 看出来。
+            "fallback_used": used is not None and used != self.channels[0][0],
+            "channels": records,
+        }
+
+
+# ====================================================================
 # Writer 单例（b58c763 行为完全保留）
 # ====================================================================
 
@@ -1419,6 +1644,11 @@ def get_kg_extract_provider() -> LLMProvider:
     改造前 KG 抽取沿用 Writer 的 960s：`agent_runs #205` 三次各烧满 ≈ 48 分钟。
 
     单独持有单例（不复用 `_PROVIDER`），避免任一角色的预算/渠道改动污染 Writer。
+
+    **跨渠道兜底**：`settings.kg_extract_fallback_providers` 非空时，在上面这个
+    单例外面再包一层 `FallbackChannelProvider`（整链共享
+    `kg_extract_fallback_chain_timeout`，默认 300s）。为空（默认）时**不包**，
+    返回的就是原 provider，路径与改造前逐字节一致。
     """
     global _KG_EXTRACT_PROVIDER
     if _KG_EXTRACT_PROVIDER is not None:
@@ -1442,7 +1672,96 @@ def get_kg_extract_provider() -> LLMProvider:
     ]
     if custom_chain and hasattr(_KG_EXTRACT_PROVIDER, "set_model_chain"):
         _KG_EXTRACT_PROVIDER.set_model_chain(custom_chain)
+
+    primary_channel = override or (settings.llm_provider or "").strip().lower() or "primary"
+    # 给 note 用：单渠道时也要能回答「这条抽取跑在哪个渠道」。
+    _KG_EXTRACT_PROVIDER.channel_name = primary_channel
+    _KG_EXTRACT_PROVIDER = _wrap_kg_fallbacks(
+        _KG_EXTRACT_PROVIDER, primary_channel,
+        chain_timeout=settings.kg_extract_fallback_chain_timeout,
+    )
     return _KG_EXTRACT_PROVIDER
+
+
+def _kg_fallback_channel_names() -> list[str]:
+    """解析 `kg_extract.fallback_providers`（逗号或分号分隔，去重保序）。"""
+    raw = str(settings.kg_extract_fallback_providers or "")
+    names = [n.strip().lower() for n in raw.replace(";", ",").split(",") if n.strip()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _wrap_kg_fallbacks(primary: LLMProvider, primary_channel: str,
+                       *, chain_timeout: int) -> LLMProvider:
+    """按配置给 KG 抽取 provider 包一层跨渠道兜底。
+
+    列表为空时原样返回 `primary`，保证「关掉兜底 = 与改造前逐字节一致」。
+    有后备渠道被跳过（未知名 / 缺 key）时仍包一层，只为把
+    `channel_skipped_no_key` 留在 `note.llm.channels[]` 里（单渠道行为不变）。
+    """
+    names = _kg_fallback_channel_names()
+    if not names:
+        return primary
+    channels: list[tuple[str, LLMProvider]] = [(primary_channel, primary)]
+    skipped: list[dict] = []
+    seen = {primary_channel}
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        if name not in KG_EXTRACT_CHANNELS:
+            skipped.append({
+                "provider": name, "outcome": "channel_skipped_no_key",
+                "detail": "unknown_channel", "elapsed_ms": 0,
+                "error": f"未知渠道 {name!r}，已跳过",
+            })
+            logger.warning("KG 抽取兜底渠道 %r 不是已知渠道，已跳过（不会静默改用其它渠道）",
+                           name)
+            continue
+        prov = _build_channel_provider(
+            provider=name,
+            total_timeout=settings.kg_extract_total_timeout,
+            first_byte_timeout=settings.kg_extract_first_byte_timeout,
+        )
+        if isinstance(prov, LocalFallbackLLMProvider):
+            # 没配 key 时 builder 会回落本地模板。作为**后备**用它等于静默产出
+            # 空抽取，必须跳过并留痕，而不是假装渠道可用。
+            skipped.append({
+                "provider": name, "outcome": "channel_skipped_no_key",
+                "detail": "no_api_key", "elapsed_ms": 0,
+                "error": f"渠道 {name!r} 未配置 API key，已跳过",
+            })
+            logger.warning("KG 抽取兜底渠道 %r 未配置 API key，已跳过", name)
+            continue
+        custom = [
+            m.strip() for m in (settings.kg_extract_models or "").split(",") if m.strip()
+        ]
+        if custom and hasattr(prov, "set_model_chain"):
+            prov.set_model_chain(custom)
+        prov.channel_name = name
+        channels.append((name, prov))
+
+    if len(channels) <= 1 and not skipped:
+        # 配了兜底但一个都用不上（或全被去重掉）：保持原路径
+        return primary
+    if skipped and len(channels) <= 1:
+        # 有后备渠道被跳过（未知渠道名 / 未配 key）：仍包一层**只为留痕**——
+        # `note.llm.channels[]` 要看得见 channel_skipped_no_key，而不是静默消失。
+        # 只有一个可用渠道，行为与不包时一致。
+        logger.warning(
+            "KG 抽取配置了兜底渠道但全部被跳过（%s），本次仍走主渠道 %s",
+            "、".join(str(item.get("provider")) for item in skipped), primary_channel)
+    logger.info(
+        "KG 抽取启用跨渠道兜底：%s（链级预算 %ss）",
+        " → ".join(name for name, _ in channels), chain_timeout,
+    )
+    return FallbackChannelProvider(
+        channels, chain_timeout=chain_timeout, skipped=skipped)
 
 
 def reset_kg_extract_provider_cache() -> None:

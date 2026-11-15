@@ -134,6 +134,10 @@ def _setup_minimax(kg_provider: str = ""):
     settings.minimax_api_key = "test-key"
     settings.minimax_model = "MiniMax-M3.1-Flash"
     settings.kg_extract_provider = kg_provider
+    # 本机 .env 可能已开跨渠道兜底（KG_EXTRACT_FALLBACK_PROVIDERS=zhipu）。
+    # 这些用例只验证「单渠道路径」的字面量，必须显式关掉兜底才是可比基线。
+    # 兜底本身的行为由 tests/test_kg_provider_fallback.py 覆盖。
+    settings.kg_extract_fallback_providers = ""
     reset_provider_cache()
 
 
