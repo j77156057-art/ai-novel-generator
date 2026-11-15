@@ -1,0 +1,1553 @@
+{
+ "version": "progress-ledger-v1",
+ "status": "ok",
+ "window": [
+  23,
+  32
+ ],
+ "chapter_count": 10,
+ "config": {
+  "cast_overlap_high": 0.8,
+  "cast_core_max": 6,
+  "cast_stagnant_chapters": 20,
+  "attr_stale_chapters": 10,
+  "head_paragraphs": 1,
+  "tail_paragraphs": 1,
+  "question_tail_paragraphs": 3,
+  "question_top": 3,
+  "question_overlap": 0.34,
+  "time_jump_min_days": 2
+ },
+ "cast": {
+  "protagonist": "陈小满",
+  "protagonist_rule": "角色卡 role 含「主角」",
+  "debuts": {
+   "王大勇": 23,
+   "苏九斤": 23,
+   "陈小满": 23,
+   "顾青梧": 23,
+   "周德贵": 24
+  },
+  "debut_scope": "window",
+  "declared_debuts": {
+   "陈小满": 1,
+   "周德贵": 1,
+   "顾青梧": 2,
+   "王大勇": 1,
+   "苏九斤": 4
+  },
+  "debut_checks": [
+   {
+    "character": "陈小满",
+    "declared": 1,
+    "observed_in_window": 23,
+    "status": "早于窗口（窗口内出现不代表新登场）"
+   },
+   {
+    "character": "周德贵",
+    "declared": 1,
+    "observed_in_window": 24,
+    "status": "早于窗口（窗口内出现不代表新登场）"
+   },
+   {
+    "character": "顾青梧",
+    "declared": 2,
+    "observed_in_window": 23,
+    "status": "早于窗口（窗口内出现不代表新登场）"
+   },
+   {
+    "character": "王大勇",
+    "declared": 1,
+    "observed_in_window": 23,
+    "status": "早于窗口（窗口内出现不代表新登场）"
+   },
+   {
+    "character": "苏九斤",
+    "declared": 4,
+    "observed_in_window": 23,
+    "status": "早于窗口（窗口内出现不代表新登场）"
+   }
+  ],
+  "new_debuts_by_chapter": {
+   "23": [
+    "王大勇",
+    "苏九斤",
+    "陈小满",
+    "顾青梧"
+   ],
+   "24": [
+    "周德贵"
+   ]
+  },
+  "rows": [
+   {
+    "chapter": 23,
+    "cast": [
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "顾青梧": 27,
+     "陈小满": 48,
+     "王大勇": 25,
+     "苏九斤": 2
+    },
+    "new_debuts": [
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "overlap_prev": null,
+    "cast_size": 4,
+    "protagonist_present": true,
+    "minor_present": [
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 24,
+    "cast": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "陈小满": 89,
+     "王大勇": 54,
+     "顾青梧": 49,
+     "周德贵": 56,
+     "苏九斤": 12
+    },
+    "new_debuts": [
+     "周德贵"
+    ],
+    "overlap_prev": 0.8,
+    "cast_size": 5,
+    "protagonist_present": true,
+    "minor_present": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 25,
+    "cast": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "王大勇": 25,
+     "顾青梧": 23,
+     "陈小满": 67,
+     "苏九斤": 9,
+     "周德贵": 30
+    },
+    "new_debuts": [],
+    "overlap_prev": 1.0,
+    "cast_size": 5,
+    "protagonist_present": true,
+    "minor_present": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 26,
+    "cast": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "王大勇": 27,
+     "陈小满": 65,
+     "顾青梧": 18,
+     "周德贵": 8,
+     "苏九斤": 8
+    },
+    "new_debuts": [],
+    "overlap_prev": 1.0,
+    "cast_size": 5,
+    "protagonist_present": true,
+    "minor_present": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 27,
+    "cast": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "陈小满": 69,
+     "顾青梧": 26,
+     "王大勇": 26,
+     "苏九斤": 8,
+     "周德贵": 7
+    },
+    "new_debuts": [],
+    "overlap_prev": 1.0,
+    "cast_size": 5,
+    "protagonist_present": true,
+    "minor_present": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 28,
+    "cast": [
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "苏九斤": 19,
+     "陈小满": 48,
+     "王大勇": 15,
+     "顾青梧": 20
+    },
+    "new_debuts": [],
+    "overlap_prev": 0.8,
+    "cast_size": 4,
+    "protagonist_present": true,
+    "minor_present": [
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 29,
+    "cast": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "陈小满": 47,
+     "顾青梧": 44,
+     "苏九斤": 2,
+     "王大勇": 1,
+     "周德贵": 7
+    },
+    "new_debuts": [],
+    "overlap_prev": 0.8,
+    "cast_size": 5,
+    "protagonist_present": true,
+    "minor_present": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 30,
+    "cast": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "陈小满": 50,
+     "顾青梧": 21,
+     "王大勇": 34,
+     "苏九斤": 4,
+     "周德贵": 13
+    },
+    "new_debuts": [],
+    "overlap_prev": 1.0,
+    "cast_size": 5,
+    "protagonist_present": true,
+    "minor_present": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 31,
+    "cast": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "陈小满": 58,
+     "王大勇": 30,
+     "顾青梧": 33,
+     "周德贵": 23,
+     "苏九斤": 2
+    },
+    "new_debuts": [],
+    "overlap_prev": 1.0,
+    "cast_size": 5,
+    "protagonist_present": true,
+    "minor_present": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   },
+   {
+    "chapter": 32,
+    "cast": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "mentions": {
+     "顾青梧": 23,
+     "王大勇": 10,
+     "陈小满": 40,
+     "周德贵": 18,
+     "苏九斤": 3
+    },
+    "new_debuts": [],
+    "overlap_prev": 1.0,
+    "cast_size": 5,
+    "protagonist_present": true,
+    "minor_present": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "顾青梧"
+    ]
+   }
+  ],
+  "roster_size": 5,
+  "minor_coverage": {
+   "周德贵": {
+    "chapters": 8,
+    "coverage": 0.8,
+    "first": 24,
+    "last": 32
+   },
+   "顾青梧": {
+    "chapters": 10,
+    "coverage": 1.0,
+    "first": 23,
+    "last": 32
+   },
+   "王大勇": {
+    "chapters": 10,
+    "coverage": 1.0,
+    "first": 23,
+    "last": 32
+   },
+   "苏九斤": {
+    "chapters": 10,
+    "coverage": 1.0,
+    "first": 23,
+    "last": 32
+   }
+  },
+  "minor_never_appeared": [],
+  "overlap_runs": [
+   {
+    "start": 23,
+    "end": 32,
+    "chapters": 10,
+    "members": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "member_count": 5,
+    "max_cast_size": 5,
+    "new_debuts": [
+     "周德贵",
+     "王大勇",
+     "苏九斤",
+     "陈小满",
+     "顾青梧"
+    ],
+    "avg_overlap": 0.933
+   }
+  ],
+  "longest_overlap_run": {
+   "start": 23,
+   "end": 32,
+   "chapters": 10,
+   "members": [
+    "周德贵",
+    "王大勇",
+    "苏九斤",
+    "陈小满",
+    "顾青梧"
+   ],
+   "member_count": 5,
+   "max_cast_size": 5,
+   "new_debuts": [
+    "周德贵",
+    "王大勇",
+    "苏九斤",
+    "陈小满",
+    "顾青梧"
+   ],
+   "avg_overlap": 0.933
+  },
+  "stagnant": false,
+  "thresholds": {
+   "overlap_high": 0.8,
+   "core_max": 6,
+   "stagnant_chapters": 20
+  }
+ },
+ "attributes": {
+  "rows": [
+   {
+    "character": "陈小满",
+    "kind": "realm",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "周德贵",
+    "kind": "realm",
+    "first_seen": 24,
+    "first_seen_basis": "cast_debut",
+    "appearances": 8,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 8,
+    "longest_zero_run": 9,
+    "longest_zero_span": [
+     24,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "顾青梧",
+    "kind": "realm",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "王大勇",
+    "kind": "realm",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "苏九斤",
+    "kind": "realm",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "陈小满",
+    "kind": "skill",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "周德贵",
+    "kind": "skill",
+    "first_seen": 24,
+    "first_seen_basis": "cast_debut",
+    "appearances": 8,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 8,
+    "longest_zero_run": 9,
+    "longest_zero_span": [
+     24,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "顾青梧",
+    "kind": "skill",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "王大勇",
+    "kind": "skill",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "苏九斤",
+    "kind": "skill",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "陈小满",
+    "kind": "item",
+    "first_seen": 24,
+    "first_seen_basis": "first_attribute_evidence",
+    "appearances": 10,
+    "changes": [
+     {
+      "chapter": 24,
+      "values": [
+       "封条"
+      ],
+      "count": 1,
+      "evidence": "王大勇捏着封条凑到标签前，发现编号少了一位，便把封条递还给陈小满，由他塞进证物袋"
+     },
+     {
+      "chapter": 25,
+      "values": [
+       "铜牌"
+      ],
+      "count": 1,
+      "evidence": "陈小满弯腰捡起铜牌：“谁让你送的"
+     },
+     {
+      "chapter": 30,
+      "values": [
+       "后台通知",
+       "内部消息"
+      ],
+      "count": 2,
+      "evidence": "“满哥，我刚收到一条后台通知"
+     }
+    ],
+    "change_count": 3,
+    "last_change": 30,
+    "chapters_since_last_change": 2,
+    "longest_zero_run": 4,
+    "longest_zero_span": [
+     26,
+     29
+    ],
+    "status": "changed"
+   },
+   {
+    "character": "周德贵",
+    "kind": "item",
+    "first_seen": 24,
+    "first_seen_basis": "cast_debut",
+    "appearances": 8,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 8,
+    "longest_zero_run": 9,
+    "longest_zero_span": [
+     24,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   },
+   {
+    "character": "顾青梧",
+    "kind": "item",
+    "first_seen": 23,
+    "first_seen_basis": "first_attribute_evidence",
+    "appearances": 10,
+    "changes": [
+     {
+      "chapter": 23,
+      "values": [
+       "旧手机"
+      ],
+      "count": 1,
+      "evidence": "顾青梧接过旧手机：“指定接任人不能直接生效"
+     },
+     {
+      "chapter": 32,
+      "values": [
+       "旧账"
+      ],
+      "count": 1,
+      "evidence": "顾青梧看完消息，先下结论：“对方知道我们拿到了旧账，也知道陈阿姨住哪间"
+     }
+    ],
+    "change_count": 2,
+    "last_change": 32,
+    "chapters_since_last_change": 0,
+    "longest_zero_run": 8,
+    "longest_zero_span": [
+     24,
+     31
+    ],
+    "status": "changed"
+   },
+   {
+    "character": "王大勇",
+    "kind": "item",
+    "first_seen": 28,
+    "first_seen_basis": "first_attribute_evidence",
+    "appearances": 10,
+    "changes": [
+     {
+      "chapter": 28,
+      "values": [
+       "手机"
+      ],
+      "count": 1,
+      "evidence": "王大勇接过手机：“我在想啊，我要是每个都念对，今天这工单能不能算我独立负责一单"
+     }
+    ],
+    "change_count": 1,
+    "last_change": 28,
+    "chapters_since_last_change": 4,
+    "longest_zero_run": 4,
+    "longest_zero_span": [
+     29,
+     32
+    ],
+    "status": "changed"
+   },
+   {
+    "character": "苏九斤",
+    "kind": "item",
+    "first_seen": 23,
+    "first_seen_basis": "cast_debut",
+    "appearances": 10,
+    "changes": [],
+    "change_count": 0,
+    "last_change": null,
+    "chapters_since_last_change": 9,
+    "longest_zero_run": 10,
+    "longest_zero_span": [
+     23,
+     32
+    ],
+    "status": "no_attribute_evidence"
+   }
+  ],
+  "realm_systems": [
+   [
+    "凡人",
+    "炼气",
+    "筑基",
+    "金丹",
+    "元婴",
+    "化神",
+    "炼虚",
+    "合体",
+    "大乘",
+    "渡劫",
+    "真仙",
+    "金仙",
+    "太乙",
+    "大罗"
+   ],
+   [
+    "黄阶",
+    "玄阶",
+    "地阶",
+    "天阶",
+    "圣阶",
+    "神阶"
+   ],
+   [
+    "一星",
+    "二星",
+    "三星",
+    "四星",
+    "五星",
+    "六星",
+    "七星",
+    "八星",
+    "九星"
+   ]
+  ],
+  "item_states": {
+   "旧手机": {
+    "first_seen": 23,
+    "owner": "顾青梧",
+    "changes": [
+     {
+      "chapter": 23,
+      "change": "gain",
+      "owner": "顾青梧",
+      "sentence": "顾青梧接过旧手机：“指定接任人不能直接生效"
+     }
+    ]
+   },
+   "封条": {
+    "first_seen": 24,
+    "owner": "陈小满",
+    "changes": [
+     {
+      "chapter": 24,
+      "change": "transfer",
+      "owner": "陈小满",
+      "sentence": "王大勇捏着封条凑到标签前，发现编号少了一位，便把封条递还给陈小满，由他塞进证物袋"
+     }
+    ]
+   },
+   "铜牌": {
+    "first_seen": 25,
+    "owner": "陈小满",
+    "changes": [
+     {
+      "chapter": 25,
+      "change": "gain",
+      "owner": "陈小满",
+      "sentence": "陈小满弯腰捡起铜牌：“谁让你送的"
+     }
+    ]
+   },
+   "手机": {
+    "first_seen": 28,
+    "owner": "王大勇",
+    "changes": [
+     {
+      "chapter": 28,
+      "change": "gain",
+      "owner": "王大勇",
+      "sentence": "王大勇接过手机：“我在想啊，我要是每个都念对，今天这工单能不能算我独立负责一单"
+     }
+    ]
+   },
+   "后台通知": {
+    "first_seen": 30,
+    "owner": "陈小满",
+    "changes": [
+     {
+      "chapter": 30,
+      "change": "gain",
+      "owner": "陈小满",
+      "sentence": "“满哥，我刚收到一条后台通知"
+     }
+    ]
+   },
+   "内部消息": {
+    "first_seen": 30,
+    "owner": "陈小满",
+    "changes": [
+     {
+      "chapter": 30,
+      "change": "gain",
+      "owner": "陈小满",
+      "sentence": "我寻思它以前不是只用来接单吗，怎么还能收到内部消息"
+     }
+    ]
+   },
+   "旧账": {
+    "first_seen": 32,
+    "owner": "顾青梧",
+    "changes": [
+     {
+      "chapter": 32,
+      "change": "gain",
+      "owner": "顾青梧",
+      "sentence": "顾青梧看完消息，先下结论：“对方知道我们拿到了旧账，也知道陈阿姨住哪间"
+     }
+    ]
+   }
+  },
+  "items_known": [
+   "地书碎片",
+   "地书聊天群"
+  ],
+  "item_first_seen": {
+   "旧手机": 23,
+   "封条": 24,
+   "铜牌": 25,
+   "手机": 28,
+   "后台通知": 30,
+   "内部消息": 30,
+   "旧账": 32
+  },
+  "skill_uses": {},
+  "unattributed": {
+   "realm": [],
+   "skill": [],
+   "item": [
+    {
+     "chapter": 24,
+     "item": "新群消息",
+     "change": "gain",
+     "basis": "unattributed",
+     "sentence": "电话没立刻挂断，旧手机却收到新群消息"
+    },
+    {
+     "chapter": 28,
+     "item": "名单",
+     "change": "gain",
+     "basis": "nonperson_subject",
+     "sentence": "苏九斤靠在货架边：“我说一句啊，平台拿到名单以后，收件地址都没改，直接把十二箱算到旧改片区"
+    },
+    {
+     "chapter": 32,
+     "item": "模糊照片",
+     "change": "gain",
+     "basis": "unattributed",
+     "sentence": "几秒后，新手机收到一张模糊照片"
+    }
+   ]
+  },
+  "thresholds": {
+   "stale_chapters": 10
+  }
+ },
+ "linkage": {
+  "rows": [
+   {
+    "prev_chapter": 23,
+    "chapter": 24,
+    "head": "第十二箱里的动静停了半拍，胶带从内侧又顶出一道白痕，陈小满伸向箱扣的手随即收回，指腹在裤缝上蹭了两下。",
+    "shared_entities": [
+     "陈小满"
+    ],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": true,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": false,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   },
+   {
+    "prev_chapter": 24,
+    "chapter": 25,
+    "head": "药盒里的三份纸还摊在货架上。病历压着同意书，换手书放在最下面，红章盖歪在签名栏旁，章色反倒比纸新。",
+    "shared_entities": [],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": false,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": true,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   },
+   {
+    "prev_chapter": 25,
+    "chapter": 26,
+    "head": "敲门声第三次落下，不轻不重，像指节碰在铁皮门上。",
+    "shared_entities": [],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [
+     {
+      "text": "一会儿",
+      "days": 0,
+      "span": [
+       8,
+       11
+      ]
+     }
+    ],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": false,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": true,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   },
+   {
+    "prev_chapter": 26,
+    "chapter": 27,
+    "head": "长乐街旧院区的楼道白得发灰，顶灯每隔两秒灭一次，黑暗只够人挪半步。戴半脸面具的人站在转角，右半张脸露在灯下，左边只剩一块发黑铜边。",
+    "shared_entities": [],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": false,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": true,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   },
+   {
+    "prev_chapter": 27,
+    "chapter": 28,
+    "head": "门外第四声没有落下，感应灯却灭了一次。陈小满伸手拦住王大勇的镜头，示意他继续录门缝。",
+    "shared_entities": [
+     "陈小满"
+    ],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": true,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": false,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   },
+   {
+    "prev_chapter": 28,
+    "chapter": 29,
+    "head": "感应灯在陈小满身后灭了一盏。",
+    "shared_entities": [],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": false,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": true,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   },
+   {
+    "prev_chapter": 29,
+    "chapter": 30,
+    "head": "资料室外的旧铁门半掩着，顶灯每隔几秒暗一下，墙上的线路图仍停在门卫室东墙那一栏；陈小满把打印件压在窗台上，纸角被穿堂风掀起，手背上立刻多了一道红印。",
+    "shared_entities": [],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": false,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": true,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   },
+   {
+    "prev_chapter": 30,
+    "chapter": 31,
+    "head": "门卫室三号机没有再响，话筒却歪在底座上。陈小满把铜牌压在打印件旁，边缘盖住设备号最后一位。",
+    "shared_entities": [],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": false,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": true,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   },
+   {
+    "prev_chapter": 31,
+    "chapter": 32,
+    "head": "顾青梧把牛皮档案袋搁到三号机上，纸袋底部撞上铜牌，响了一声。王大勇把新手机立在机器旁，镜头压住桌面，没急着碰那叠回执。",
+    "shared_entities": [],
+    "shared_locations": [],
+    "shared_time_cues": [],
+    "head_time_cues": [],
+    "tail_time_cues": [],
+    "time_jump_days": 0,
+    "time_jump": false,
+    "bridge_words": [],
+    "shared_anchor": false,
+    "time_explained": null,
+    "time_jump_unexplained": false,
+    "no_shared_anchor": true,
+    "prev_questions": [],
+    "questions": [],
+    "questions_rementioned": [],
+    "questions_dropped": []
+   }
+  ],
+  "breaks": [],
+  "anchorless": [
+   {
+    "prev_chapter": 24,
+    "chapter": 25
+   },
+   {
+    "prev_chapter": 25,
+    "chapter": 26
+   },
+   {
+    "prev_chapter": 26,
+    "chapter": 27
+   },
+   {
+    "prev_chapter": 28,
+    "chapter": 29
+   },
+   {
+    "prev_chapter": 29,
+    "chapter": 30
+   },
+   {
+    "prev_chapter": 30,
+    "chapter": 31
+   },
+   {
+    "prev_chapter": 31,
+    "chapter": 32
+   }
+  ],
+  "no_time_cue": [
+   {
+    "prev_chapter": 23,
+    "chapter": 24
+   },
+   {
+    "prev_chapter": 24,
+    "chapter": 25
+   },
+   {
+    "prev_chapter": 25,
+    "chapter": 26
+   },
+   {
+    "prev_chapter": 26,
+    "chapter": 27
+   },
+   {
+    "prev_chapter": 27,
+    "chapter": 28
+   },
+   {
+    "prev_chapter": 28,
+    "chapter": 29
+   },
+   {
+    "prev_chapter": 29,
+    "chapter": 30
+   },
+   {
+    "prev_chapter": 30,
+    "chapter": 31
+   },
+   {
+    "prev_chapter": 31,
+    "chapter": 32
+   }
+  ],
+  "dropped_questions": [],
+  "thresholds": {
+   "question_overlap": 0.34,
+   "time_jump_min_days": 2
+  }
+ },
+ "structure": {
+  "rows": [
+   {
+    "chapter": 23,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 2,
+    "premature_hits": [
+     {
+      "chapter": 24,
+      "terms": [
+       "名字"
+      ]
+     },
+     {
+      "chapter": 25,
+      "terms": [
+       "留下的"
+      ]
+     }
+    ],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 24,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 1,
+    "premature_hits": [
+     {
+      "chapter": 25,
+      "terms": [
+       "留下的"
+      ]
+     }
+    ],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 25,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 3,
+    "premature_hits": [
+     {
+      "chapter": 26,
+      "terms": [
+       "出片区"
+      ]
+     },
+     {
+      "chapter": 27,
+      "terms": [
+       "由平台"
+      ]
+     },
+     {
+      "chapter": 28,
+      "terms": [
+       "的换手"
+      ]
+     }
+    ],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 26,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 2,
+    "premature_hits": [
+     {
+      "chapter": 27,
+      "terms": [
+       "名单"
+      ]
+     },
+     {
+      "chapter": 29,
+      "terms": [
+       "留痕"
+      ]
+     }
+    ],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 27,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 0,
+    "premature_hits": [],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 28,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 2,
+    "premature_hits": [
+     {
+      "chapter": 29,
+      "terms": [
+       "留痕"
+      ]
+     },
+     {
+      "chapter": 31,
+      "terms": [
+       "出平台"
+      ]
+     }
+    ],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 29,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 0,
+    "premature_hits": [],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 30,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 2,
+    "premature_hits": [
+     {
+      "chapter": 32,
+      "terms": [
+       "病房"
+      ]
+     },
+     {
+      "chapter": 33,
+      "terms": [
+       "满自己"
+      ]
+     }
+    ],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 31,
+    "source": "computed",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 1,
+    "premature_hits": [
+     {
+      "chapter": 32,
+      "terms": [
+       "病房"
+      ]
+     }
+    ],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   },
+   {
+    "chapter": 32,
+    "source": "stored",
+    "status": null,
+    "mode": "report",
+    "beat_coverage": 1.0,
+    "beat_total": 1,
+    "beat_covered": 1,
+    "beat_missing": [],
+    "premature_chapters_hit": 1,
+    "premature_hits": [
+     {
+      "chapter": 35,
+      "terms": [
+       "授权"
+      ]
+     }
+    ],
+    "gender_count": 0,
+    "gender_mismatches": [],
+    "blocking": false,
+    "enforced": false
+   }
+  ],
+  "issues": [
+   {
+    "chapter": 23,
+    "source": "computed",
+    "beat_missing": [],
+    "premature_chapters_hit": 2,
+    "gender_count": 0
+   },
+   {
+    "chapter": 24,
+    "source": "computed",
+    "beat_missing": [],
+    "premature_chapters_hit": 1,
+    "gender_count": 0
+   },
+   {
+    "chapter": 25,
+    "source": "computed",
+    "beat_missing": [],
+    "premature_chapters_hit": 3,
+    "gender_count": 0
+   },
+   {
+    "chapter": 26,
+    "source": "computed",
+    "beat_missing": [],
+    "premature_chapters_hit": 2,
+    "gender_count": 0
+   },
+   {
+    "chapter": 28,
+    "source": "computed",
+    "beat_missing": [],
+    "premature_chapters_hit": 2,
+    "gender_count": 0
+   },
+   {
+    "chapter": 30,
+    "source": "computed",
+    "beat_missing": [],
+    "premature_chapters_hit": 2,
+    "gender_count": 0
+   },
+   {
+    "chapter": 31,
+    "source": "computed",
+    "beat_missing": [],
+    "premature_chapters_hit": 1,
+    "gender_count": 0
+   },
+   {
+    "chapter": 32,
+    "source": "stored",
+    "beat_missing": [],
+    "premature_chapters_hit": 1,
+    "gender_count": 0
+   }
+  ],
+  "sources": {
+   "23": "computed",
+   "24": "computed",
+   "25": "computed",
+   "26": "computed",
+   "27": "computed",
+   "28": "computed",
+   "29": "computed",
+   "30": "computed",
+   "31": "computed",
+   "32": "stored"
+  }
+ },
+ "flags": [
+  {
+   "code": "attr_stagnant",
+   "message": "12 条「角色×属性」在本窗口内没有推进（其中 0 条超过 10 章未变）"
+  },
+  {
+   "code": "structure_issue",
+   "message": "8 章 structure_check 有告警（引用，不重算）"
+  }
+ ],
+ "pending_verification": [
+  "cast_overlap_high",
+  "cast_core_max",
+  "cast_stagnant_chapters",
+  "attr_stale_chapters",
+  "head_paragraphs",
+  "tail_paragraphs",
+  "question_tail_paragraphs",
+  "question_overlap",
+  "time_jump_min_days"
+ ],
+ "chapter_labels": {
+  "23": "第23章《十二箱》",
+  "24": "第24章《药盒上有名字》",
+  "25": "第25章《公告原文》",
+  "26": "第26章《整片区回收》",
+  "27": "第27章《名单》",
+  "28": "第28章《苏九斤的价》",
+  "29": "第29章《编外留痕》",
+  "30": "第30章《内应》",
+  "31": "第31章《抽脉》",
+  "32": "第32章《病房谈判》"
+ }
+}

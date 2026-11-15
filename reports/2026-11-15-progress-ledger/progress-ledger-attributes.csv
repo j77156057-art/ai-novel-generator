@@ -1,0 +1,16 @@
+﻿角色,属性,首次证据章,首次依据,出场章数,变化次数,变化点,最后一次变化,距今章数,最长零变化章数,区间起,区间止,状态
+陈小满,realm,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
+周德贵,realm,24,cast_debut,8,0,,,8,9,24,32,no_attribute_evidence
+顾青梧,realm,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
+王大勇,realm,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
+苏九斤,realm,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
+陈小满,skill,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
+周德贵,skill,24,cast_debut,8,0,,,8,9,24,32,no_attribute_evidence
+顾青梧,skill,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
+王大勇,skill,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
+苏九斤,skill,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
+陈小满,item,24,first_attribute_evidence,10,3,第24章:封条；第25章:铜牌；第30章:后台通知/内部消息,30,2,4,26,29,changed
+周德贵,item,24,cast_debut,8,0,,,8,9,24,32,no_attribute_evidence
+顾青梧,item,23,first_attribute_evidence,10,2,第23章:旧手机；第32章:旧账,32,0,8,24,31,changed
+王大勇,item,28,first_attribute_evidence,10,1,第28章:手机,28,4,4,29,32,changed
+苏九斤,item,23,cast_debut,10,0,,,9,10,23,32,no_attribute_evidence
