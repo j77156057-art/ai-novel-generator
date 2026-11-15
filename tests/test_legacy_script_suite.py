@@ -45,6 +45,11 @@ _TMP_DIR = Path(tempfile.gettempdir()) / "legacy_gate"
 #: 脚本可能打开的真实库（相对 backend/）。跑前跑后必须原样。
 _REAL_DBS = ("novel_demo.db", "novel_dev.db")
 
+#: 已由根 pytest 真正收集的 backend/tests 文件。它们是 pytest 风格，被当子进程
+#: 直跑只会 import 后 exit 0（假绿），所以这里排除、由 pytest.ini 的 testpaths
+#: 负责执行断言。新增同类文件时两边同步。
+_PYTEST_COLLECTED = {"test_kg_entity_book_scope.py"}
+
 #: 已知有缺陷的老脚本：**仍然跑**（让真实库守卫覆盖到它），但不作为通过条件。
 #: `concurrent_assistant_qa.py` 用 20 个线程对**同一个 sqlite 文件**并发写，必然撞
 #: `database is locked`——这与库隔离无关（换任何文件库都一样），是脚本自身的设计问题。
@@ -65,14 +70,16 @@ def _discover() -> list[Path]:
     """收集待跑脚本（绝对路径）。
 
     三组：
-      1. `backend/tests/test_*.py` —— 老式 sys.exit 脚本（v3.0 KG 等）
+      1. `backend/tests/test_*.py` —— 老式 sys.exit 脚本（v3.0 KG 等）；
+         pytest 风格、已进根收集的文件（`_PYTEST_COLLECTED`）不在此列
       2. `backend/test_*.py`       —— 更早的一批
       3. `tests/concurrent_*.py`   —— 并发压测脚本。**必须纳入**：它们曾因
          `from app.db import engine` + `drop_all` 且无 DATABASE_URL 覆盖，
          在 backend/ 下直接跑就能清掉真实库（与 2026-10-17 事故同类暴露面）。
     """
     found: list[Path] = []
-    found += sorted((_BACKEND / "tests").glob("test_*.py"))
+    found += [p for p in sorted((_BACKEND / "tests").glob("test_*.py"))
+              if p.name not in _PYTEST_COLLECTED]
     found += sorted(_BACKEND.glob("test_*.py"))
     found += sorted((_REPO / "tests").glob("concurrent_*.py"))
     return found

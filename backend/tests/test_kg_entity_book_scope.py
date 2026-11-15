@@ -7,8 +7,9 @@
    COALESCE(novel_id, -1))``——同名不同书是两行，同书重复仍是 upsert 到一行；
 2. **NULL 语义**：``novel_id IS NULL`` 是项目级通配；写侧带书写入时优先命中
    真书行、其次 NULL 行，**绝不新建重复**（单书场景行为不变的前提）；
-3. **提及按书**：``_active_item_entries`` 传书时只返回「本书 + NULL」的提及，
-   不传书时不过滤（与加列前逐字一致）；
+3. **提及按书**：``_active_item_entries`` / ``_lookup_entity_id`` 传书时只看
+   「本书 + NULL」；**不传书时只看项目级 NULL**，绝不回落到别的书（原创项目
+   的书维度全是 NULL，参考书的行不参与）；
 4. **写侧落书**：``_persist_extraction`` / ``_index_mentions_only`` 接收调用方
    算好的 ``book``（``_run_batches_locked`` 用 ``book_for_project`` 取，唯一
    书来源）；``_index_mentions_only`` 的候选实体按书收窄，新 mention 落
@@ -135,8 +136,11 @@ def test_lookup_entity_id_does_not_cross_books():
     db.commit()
     assert _lookup_entity_id(db, proj.id, "镇国剑", novel_id=5) == a.id
     assert _lookup_entity_id(db, proj.id, "镇国剑", novel_id=6) == b.id
-    # 不传书 = 旧行为（解析到确定性的一行）
-    assert _lookup_entity_id(db, proj.id, "镇国剑") in (a.id, b.id)
+    # 不传书 = 项目级作用域，只认 novel_id IS NULL 的行（batch_worker.py
+    # L3272-3276：own_only 只查 NULL；绝不跨书抽一行）
+    n = _entity(db, proj.id, "镇国剑")
+    db.commit()
+    assert _lookup_entity_id(db, proj.id, "镇国剑") == n.id
 
 
 def test_alias_mentions_take_project_book():
@@ -184,19 +188,23 @@ def test_active_item_entries_filters_by_book():
     assert names == {"乙剑", "丙剑"}
 
 
-def test_active_item_entries_without_book_sees_everything():
+def test_active_item_entries_without_book_sees_only_project_scope():
     db = _db()
     proj = _project(db)
     e5 = _upsert_entity(db, proj.id, {"kind": "item", "canonical_name": "甲剑"},
                         novel_id=5)
     e6 = _upsert_entity(db, proj.id, {"kind": "item", "canonical_name": "乙剑"},
                         novel_id=6)
+    en = _upsert_entity(db, proj.id, {"kind": "item", "canonical_name": "丙剑"})
     _mention(db, proj.id, e5.id, 1, 5)
     _mention(db, proj.id, e6.id, 1, 6)
+    _mention(db, proj.id, en.id, 1, None)
     db.commit()
 
     names = {x["name"] for x in gen_engine._active_item_entries(db, proj, 1)}
-    assert names == {"甲剑", "乙剑"}
+    # 无 active/continuation = 原创项目，prompt 作用域只有 NULL
+    # （book_scope.prompt_scope_book_ids 的约定）；书 5/6 的提及不可见
+    assert names == {"丙剑"}
 
 
 # ---------------------------------------------------------------------------
