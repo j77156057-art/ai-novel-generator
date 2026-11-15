@@ -1,5 +1,7 @@
 # 项目 6/7 清理与 `kg_item_group.novel_id` 只读评估
 
+> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+
 日期：2026-11-11  
 范围：`backend/novel_dev.db`（应用库，已改）、`backend/data/generated.db`（生成库，未改）  
 相关：`reports/item-residual-surface-audit-2026-11-10.md` §14（`许七安的佩刀` 维持摘除）

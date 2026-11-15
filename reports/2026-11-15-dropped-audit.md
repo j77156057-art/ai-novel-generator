@@ -1,5 +1,7 @@
 # 弃项审计与大纲端点仲裁（2026-11-15）
 
+> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+
 - 基准：feat = `feat/resume-push-2026-10`（当前工作区）；main = `freeze/main-cb05a45`（`cb05a45`，只读 worktree `D:\Temp\mwt-main3`）
 - 方法：`git grep` 全仓检索 + `ast` 符号级 diff（main-only 符号 / 同名实现差异）+ 逐个查 feat 等价物；不按文件名推断。
 - 关联：`reports/2026-11-15-main-coverage-ledger.md` / `.csv`

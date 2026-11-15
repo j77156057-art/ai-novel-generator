@@ -1,5 +1,7 @@
 # Surface 层「写法比组名更泛」审计
 
+> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+
 日期：2026-11-10  
 范围：`backend/data/generated.db` 的 `kg_item_surface`（只统计 `status='approved'`），覆盖度按 `novel_chunks(novel_id=5)` 的**独立章数**算。  
 性质：**只读清单，未改任何数据**。
