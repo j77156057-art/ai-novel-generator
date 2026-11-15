@@ -69,6 +69,12 @@ docs/v2*.json
 docs/handoff/
 # 第三方作品衍生的世界观/时间线分析（2026-11-15 工作区整理，只留本地）
 reports/kg-修真聊天群/
+# 待出版书稿草稿：商业原因不外发，只留本地（2026-11-15 用户裁决）
+reports/2026-11-13-p6-*
+reports/2026-11-12-p6-trial-ch1-3.md
+docs/2026-11-12-p6-modern-xianxia-setting-draft.md
+# 第三方原文大段摘录对照：版权原因不外发，只留本地
+reports/2026-11-12-p6-style-pairwise-vs-novel7.md
 
 # ---- 运行数据与大文件（2026-11-15 工作区整理）----
 # 五级目录检索大 JSON（单文件 13–52MB）与检索简报缓存
