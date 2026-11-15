@@ -25,7 +25,7 @@ import time
 import urllib.request
 import uuid
 
-from app.config import settings
+from app.config import KG_EXTRACT_CHANNELS, settings
 from app.llm.reasoning import ReasoningFilter, strip_reasoning
 
 logger = logging.getLogger("llm.provider")
@@ -385,6 +385,7 @@ class OpenAICompatibleChatProvider(LLMProvider):
                  max_tokens: int | None = None, timeout: int | None = None,
                  stream_timeout: int | None = None,
                  total_timeout: int | None = None,
+                 first_byte_timeout: int | None = None,
                  extra_headers: dict | None = None) -> None:
         if not api_key:
             raise ValueError(f"{self.label} 需要 API key")
@@ -400,6 +401,9 @@ class OpenAICompatibleChatProvider(LLMProvider):
         # 最近一次调用的 finish_reason（'length' = 被 max_tokens 截断）。
         # 仅供诊断/测试；provider 是单例，多线程下可能互相覆盖，但用途就是打日志。
         self.last_finish_reason: str | None = None
+        # 最近一次**成功**调用实际使用的模型 id（可能来自模型链上切换后的位置）。
+        # 与 last_finish_reason 同口径：仅供诊断留痕，不参与任何控制流。
+        self.last_model: str | None = None
         # 最近一次调用的 usage（prompt / completion / total / reasoning）。
         # 2026-11-07：此前兼容层完全丢弃 usage，导致成本报表里 token 全为 null；
         # 这里只做解析留痕，不改返回内容，也不改请求体。
@@ -435,6 +439,18 @@ class OpenAICompatibleChatProvider(LLMProvider):
             int(total_timeout) if isinstance(total_timeout, int) and total_timeout > 0
             else settings.writer_total_timeout
         )
+        # **首字节阶段**上限（秒）：只对「已经连上、但一个正文字节都还没来」的
+        # 等待生效，取 `min(剩余总预算, 本值)`。None / 0 = 不做额外限制（沿用
+        # 旧行为：首字节前由剩余总预算兜底）。
+        #
+        # 为什么必须由调用方按需传入、不能给默认值：正文生成的首字节等待实测
+        # 100–305s 属正常区间，任何全局下限都会误杀章节生成。KG 抽取是秒级小
+        # 任务，长时间无字节就是挂起，才需要这个早暴露的闸门。
+        self.first_byte_timeout = (
+            int(first_byte_timeout)
+            if isinstance(first_byte_timeout, int) and first_byte_timeout > 0
+            else None
+        )
         # 候选模型链：去重保序，默认模型置首；仅首个之后的模型用于限流时切换
         chain = [model] + [m for m in (models or []) if m and m != model]
         self._models = chain
@@ -456,6 +472,18 @@ class OpenAICompatibleChatProvider(LLMProvider):
 
     def _model_chain(self) -> list[str]:
         return self._models
+
+    def set_model_chain(self, models: list[str]) -> None:
+        """覆盖候选模型链（**仅 KG 抽取独立配置使用**）：首位即首选模型。
+
+        只为 `kg_extract.models` 这个独立槽服务——不写 settings、不碰 Writer
+        单例。空列表 = 不改（调用方应在那之前就别调本方法）。
+        """
+        chain = [m.strip() for m in models if m and m.strip()]
+        if not chain:
+            return
+        self.model = chain[0]
+        self._models = [chain[0]] + [m for m in chain[1:] if m != chain[0]]
 
     def _complete(self, messages: list[dict], stop_sequences: list[str] | None = None) -> str:
         """纯文本补全 = `complete_message` 的薄包装。
@@ -552,8 +580,17 @@ class OpenAICompatibleChatProvider(LLMProvider):
                     # 仍无产出——而重写轮生成期本来就可能是几分钟，180s 会误杀
                     # 「慢但正常」的调用。首字节之后由 _read_body 的速率判据接管，
                     # 那里不需要也不该有长等待。
+                    #
+                    # 例外：调用方显式传了 `first_byte_timeout`（目前只有 KG 抽取）
+                    # 时，首字节等待取 `min(剩余预算, 该值)`——否则「服务端握着连接
+                    # 一个字节都不给」只能等整份总预算耗尽才报错。
+                    first_wait = (
+                        min(remaining, float(self.first_byte_timeout))
+                        if self.first_byte_timeout
+                        else remaining
+                    )
                     with urllib.request.urlopen(
-                        req, timeout=max(1, remaining)
+                        req, timeout=max(1, first_wait)
                     ) as resp:
                         raw = self._read_body(resp, deadline)
                     data = json.loads(raw.decode("utf-8"))
@@ -580,6 +617,8 @@ class OpenAICompatibleChatProvider(LLMProvider):
                             self.label, cost, model, self.total_timeout,
                             cost / self.total_timeout * 100,
                         )
+                    # 留痕：本次实际应答的模型（可能是模型链上切换后的位置）。
+                    self.last_model = model
                     return {
                         # 只对正文剥推理：tool_calls 是结构化字段，不能过 strip_reasoning
                         "content": strip_reasoning(
@@ -661,10 +700,17 @@ class OpenAICompatibleChatProvider(LLMProvider):
                     f"{self.label} 读取响应超过总时长上限 {self.total_timeout}s"
                 )
             # 首个正文字节到达前：只受硬顶约束（同 urlopen 的理由——生成期可能
-            # 长达数分钟，180s 的 socket 空闲超时会误杀慢调用）；首字节之后：
-            # 空闲上限压到速率窗口内，服务端假活在一个窗口内就会被判死。
+            # 长达数分钟，180s 的 socket 空闲超时会误杀慢调用）；调用方显式传了
+            # `first_byte_timeout` 时改用 min(剩余预算, 该值)，让「一个字节都不来」
+            # 在分钟级暴露。首字节之后：空闲上限压到速率窗口内，服务端假活在
+            # 一个窗口内就会被判死。
             if not guard.open:
-                sock_timeout = max(0.5, remaining)
+                wait = (
+                    min(remaining, float(self.first_byte_timeout))
+                    if self.first_byte_timeout
+                    else remaining
+                )
+                sock_timeout = max(0.5, wait)
             else:
                 sock_timeout = max(
                     0.5,
@@ -1194,21 +1240,36 @@ class LocalFallbackLLMProvider(LLMProvider):
 _PROVIDER: LLMProvider | None = None
 
 
-def get_llm_provider() -> LLMProvider:
-    """Writer provider 单例：b58c763 时已有的唯一获取入口，签名/行为完全保留。
+def _build_channel_provider(
+    *,
+    provider: str | None = None,
+    total_timeout: int | None = None,
+    first_byte_timeout: int | None = None,
+) -> LLMProvider:
+    """按 settings 构造渠道 provider（不缓存、不读写单例）。
 
-    新代码请走 ProviderRegistry.get('writer') 而不是直接调本函数。
+    `provider` 为 None 时渠道取 `settings.llm_provider`——**默认路径逐字节等价**
+    （Writer 与改造前完全一致）。显式传值只给 `kg_extract.provider` 用：让 KG 抽取
+    走一条与写正文不同的渠道（当前只支持配置成与主渠道同名的已知渠道）。
+
+    渠道选择与模型链和历史实现逐字节一致。`total_timeout` / `first_byte_timeout`
+    为 None 时**不覆盖**：总预算仍由 `settings.writer_total_timeout` 兜底、首字节
+    仍只受总预算约束——即默认路径行为完全不变（writer/正文生成不受影响）。
+
+    只有需要独立预算的调用方（当前是 KG 批抽）才显式传入这两个值。
     """
-    global _PROVIDER
-    if _PROVIDER is not None:
-        return _PROVIDER
+    channel = provider or settings.llm_provider
     # 超时从 settings 取（默认 180 / 180 = 现网值），不再依赖类默认参数。
     _timeouts = {
         "timeout": settings.writer_timeout,
         "stream_timeout": settings.writer_stream_timeout,
     }
-    if settings.llm_provider == "openrouter" and settings.openrouter_api_key:
-        _PROVIDER = OpenRouterChatProvider(
+    if total_timeout is not None:
+        _timeouts["total_timeout"] = int(total_timeout)
+    if first_byte_timeout is not None:
+        _timeouts["first_byte_timeout"] = int(first_byte_timeout)
+    if channel == "openrouter" and settings.openrouter_api_key:
+        return OpenRouterChatProvider(
             settings.openrouter_api_key,
             settings.openrouter_base_url,
             settings.openrouter_model,
@@ -1216,17 +1277,22 @@ def get_llm_provider() -> LLMProvider:
             max_tokens=settings.writer_max_tokens,
             **_timeouts,
         )
-    elif settings.llm_provider == "zhipu" and settings.zhipu_api_key:
-        _PROVIDER = ZhipuChatProvider(
+    elif channel == "zhipu" and settings.zhipu_api_key:
+        zhipu_models = settings.zhipu_model_list
+        # 显式指定渠道（KG 抽取解耦）时，候选链首项即首选模型：此时链必须与库里
+        # `llm.zhipu_models` 完全一致，不能再把主渠道默认的 `zhipu_model`
+        # （glm-4-flash-250414）插到链首。未指定渠道时行为完全不变。
+        zhipu_primary = zhipu_models[0] if provider and zhipu_models else settings.zhipu_model
+        return ZhipuChatProvider(
             settings.zhipu_api_key,
             settings.zhipu_base_url,
-            settings.zhipu_model,
-            models=settings.zhipu_model_list,
+            zhipu_primary,
+            models=zhipu_models,
             max_tokens=settings.writer_max_tokens,
             **_timeouts,
         )
-    elif settings.llm_provider == "siliconflow" and settings.siliconflow_api_key:
-        _PROVIDER = SiliconFlowChatProvider(
+    elif channel == "siliconflow" and settings.siliconflow_api_key:
+        return SiliconFlowChatProvider(
             settings.siliconflow_api_key,
             settings.siliconflow_base_url,
             settings.siliconflow_model,
@@ -1234,8 +1300,8 @@ def get_llm_provider() -> LLMProvider:
             max_tokens=settings.writer_max_tokens,
             **_timeouts,
         )
-    elif settings.llm_provider == "minimax" and settings.minimax_api_key:
-        _PROVIDER = MiniMaxChatProvider(
+    elif channel == "minimax" and settings.minimax_api_key:
+        return MiniMaxChatProvider(
             settings.minimax_api_key,
             settings.minimax_base_url,
             settings.minimax_model,
@@ -1246,7 +1312,8 @@ def get_llm_provider() -> LLMProvider:
     # ------------------------------------------------------------------
     # 通用 OpenAI 兼容渠道（第 8 步新增，判据与上面 5 个分支同形）。
     #
-    # **仅当 llm_provider == "openai" 时命中**；其余渠道（zhipu / siliconflow /
+    # **仅当生效渠道 == "openai" 时命中**（默认路径下即 llm_provider；
+    # KG 抽取可通过 kg_extract.provider 覆盖）；其余渠道（zhipu / siliconflow /
     # minimax / openrouter / dashscope / 其它任意值）这个判据为假，继续走各自
     # 的原有分支，**行为逐字节不变**——上面 5 个分支一行未改。
     #
@@ -1260,8 +1327,8 @@ def get_llm_provider() -> LLMProvider:
     # （settings.openai_base_url，默认官方 https://api.openai.com/v1）。
     # 模型链：读该渠道的 CSV（settings.openai_models），与 zhipu 等分支同口径。
     # ------------------------------------------------------------------
-    elif settings.llm_provider == "openai" and settings.openai_api_key:
-        _PROVIDER = GenericOpenAIChatProvider(
+    elif channel == "openai" and settings.openai_api_key:
+        return GenericOpenAIChatProvider(
             settings.openai_api_key,
             settings.llm_base_url or settings.openai_base_url,
             settings.openai_model,
@@ -1269,26 +1336,103 @@ def get_llm_provider() -> LLMProvider:
             max_tokens=settings.writer_max_tokens,
             **_timeouts,
         )
-    elif settings.llm_provider == "dashscope" and settings.dashscope_api_key:
+    elif channel == "dashscope" and settings.dashscope_api_key:
         base = settings.llm_base_url or settings.dashscope_base_url
-        _PROVIDER = DashScopeChatProvider(
+        return DashScopeChatProvider(
             settings.dashscope_api_key, base, settings.llm_model,
             max_tokens=settings.writer_max_tokens,
             **_timeouts,
         )
     else:
         # 未配置 key 或显式 local：降级本地兜底，保证离线可跑
-        _PROVIDER = LocalFallbackLLMProvider()
+        return LocalFallbackLLMProvider()
+
+
+def get_llm_provider() -> LLMProvider:
+    """Writer provider 单例：b58c763 时已有的唯一获取入口，签名/行为完全保留。
+
+    新代码请走 ProviderRegistry.get('writer') 而不是直接调本函数。
+
+    **默认路径不传任何预算**：总时长走 `settings.writer_total_timeout`（960s），
+    首字节不设额外上限——与改造前逐字节一致（正文生成首字实测 100–305s 属正常）。
+    """
+    global _PROVIDER
+    if _PROVIDER is not None:
+        return _PROVIDER
+    _PROVIDER = _build_channel_provider()
     return _PROVIDER
+
+
+_KG_EXTRACT_PROVIDER: LLMProvider | None = None
+
+
+def get_kg_extract_provider() -> LLMProvider:
+    """KG 批抽**专用** provider 单例：渠道可独立配置，预算独立。
+
+    渠道由 `settings.kg_extract_provider`（env `KG_EXTRACT_PROVIDER`）决定：
+
+    - 空（默认）→ 跟随主渠道 `llm_provider`，与改造前完全一致；
+    - `zhipu`  → 抽取走智谱（key / base_url 取 `zhipu_*`，模型链取库里
+      `llm.zhipu_models`），写正文的渠道不受影响；
+    - 其它非空值 → **配置错误**，抛 `ValueError`。绝不静默回退主渠道——
+      回退会把 `KG_EXTRACT_PROVIDER=zhiphu` 这类笔误藏成「配置已生效」。
+
+    预算与渠道无关：`total_timeout = kg_extract_total_timeout`（默认 300s）、
+    `first_byte_timeout = kg_extract_first_byte_timeout`（默认 120s）。
+
+    最坏总时长 = 外层 `RETRY_LIMIT + 1`（默认 3 次尝试）× 300s ≈ 15 分钟；
+    首字节挂起时每次尝试在 120s 内先暴露，不再烧穿整份预算。
+    改造前 KG 抽取沿用 Writer 的 960s：`agent_runs #205` 三次各烧满 ≈ 48 分钟。
+
+    单独持有单例（不复用 `_PROVIDER`），避免任一角色的预算/渠道改动污染 Writer。
+    """
+    global _KG_EXTRACT_PROVIDER
+    if _KG_EXTRACT_PROVIDER is not None:
+        return _KG_EXTRACT_PROVIDER
+    override = (settings.kg_extract_provider or "").strip().lower()
+    if override and override not in KG_EXTRACT_CHANNELS:
+        allowed = "、".join(sorted(KG_EXTRACT_CHANNELS))
+        raise ValueError(
+            f"kg_extract.provider={settings.kg_extract_provider!r} 不是已知渠道"
+            f"（可选：空 = 跟随主渠道，或 {allowed}）。不会回退到主渠道。"
+        )
+    _KG_EXTRACT_PROVIDER = _build_channel_provider(
+        provider=override or None,
+        total_timeout=settings.kg_extract_total_timeout,
+        first_byte_timeout=settings.kg_extract_first_byte_timeout,
+    )
+    # 自定义模型链（`kg_extract.models`，默认空 = 用渠道自己的链）。
+    # 只改这个单例；Writer 单例与 settings 上的渠道链一个字都不动。
+    custom_chain = [
+        m.strip() for m in (settings.kg_extract_models or "").split(",") if m.strip()
+    ]
+    if custom_chain and hasattr(_KG_EXTRACT_PROVIDER, "set_model_chain"):
+        _KG_EXTRACT_PROVIDER.set_model_chain(custom_chain)
+    return _KG_EXTRACT_PROVIDER
+
+
+def reset_kg_extract_provider_cache() -> None:
+    """只清 KG 抽取单例：改抽取渠道/模型链时调用。
+
+    与 `reset_provider_cache()` 的区别：后者会连同 Writer 单例一起清掉。
+    「模型设置」页改 KG 抽取配置时不该顺带重建写正文的 provider——虽然重建
+    本身不改配置，但多一次无谓的单例重建会让「改抽取」看上去动了生成链路。
+    """
+    global _KG_EXTRACT_PROVIDER
+    _KG_EXTRACT_PROVIDER = None
 
 
 def reset_provider_cache() -> None:
     """清掉 Writer provider 单例缓存：下次 get_llm_provider() 按最新 settings 重建。
 
     仅影响 Writer；Assistant 单例由 reset_assistant_provider_cache() 管理，互不干扰。
+    KG 抽取单例（`_KG_EXTRACT_PROVIDER`）也在这里一并清掉——它和 Writer 读同一份
+    渠道配置（llm_provider / key / 模型链），配置热切换时必须同步重建，否则抽取会
+    继续用旧渠道。
     """
-    global _PROVIDER
+    global _PROVIDER, _KG_EXTRACT_PROVIDER
     _PROVIDER = None
+    _KG_EXTRACT_PROVIDER = None
 
 
 def apply_runtime_config(overrides: dict[str, str | None]) -> None:

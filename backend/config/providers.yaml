@@ -98,3 +98,34 @@ distiller:
 # 代码侧默认值见 app/llm/provider.py 的 OpenCodeGoChatProvider（UA 与 session
 # 已在类里内置，直接构造即可，不必手动加 header）。
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# KG 批抽专用预算（与 writer 完全独立，不在三角色配置里）
+#
+# 为什么独立：抽取是「1 段正文 -> 一坨结构化 JSON」的秒级小任务，却复用了
+# writer 的 provider 单例，于是继承 960s 总预算。agent_runs #205 连续 3 次
+# 各烧满 960s 才报 The read operation timed out，整段失败耗时 48 分钟。
+#
+# total_timeout       单次 complete_message 总预算（含换模型/重试退避）。
+#                     最坏总时长 = 3 次外层尝试 x 300s = 15 分钟。
+# first_byte_timeout  首字节阶段上限：连上了但一个字节都不给时，2 分钟内
+#                     判死，而不是等整份总预算耗尽。writer 不读这两个值。
+#
+# provider            抽取**独立渠道**（env KG_EXTRACT_PROVIDER 优先级更高）。
+#   ""（默认）        跟随主渠道 llm_provider，现有行为零变化。
+#   zhipu             抽取走智谱：key/base_url 取 zhipu_*，模型链取库里
+#                     `llm.zhipu_models`（启动时加载），预算仍是 300/120。
+#   其它任何非空值     **配置错误**，启动即报错——不静默回退主渠道，
+#                     否则 zhiphu 这类笔误会被藏成「配置已生效」。
+#   writer/正文生成不读本字段。
+# ---------------------------------------------------------------------------
+kg_extract:
+  provider: ""
+  # 自定义模型链（逗号分隔，**首选模型在首位**）。
+  #   ""（默认）       用所选渠道自己的链（zhipu → settings.zhipu_models；
+  #                    跟随主渠道 → 主渠道的 *_models）。
+  #   非空             只覆盖 KG 抽取用的链，写正文的候选链（writer）不受影响。
+  # 由「模型设置」页的 KG 抽取配置区写入库键 `kg_extract.models`，保存即热生效。
+  models: ""
+  total_timeout: 300
+  first_byte_timeout: 120

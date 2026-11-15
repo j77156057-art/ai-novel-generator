@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import yaml
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: 仓库根目录（backend/app/config.py → backend → 仓库根）。
@@ -34,6 +35,16 @@ _PROVIDERS_YAML = _load_yaml_defaults(
 _WRITER_DEFAULTS = _PROVIDERS_YAML.get("writer") if isinstance(_PROVIDERS_YAML.get("writer"), dict) else {}
 _ASSISTANT_DEFAULTS = _PROVIDERS_YAML.get("assistant") if isinstance(_PROVIDERS_YAML.get("assistant"), dict) else {}
 _DISTILLER_DEFAULTS = _PROVIDERS_YAML.get("distiller") if isinstance(_PROVIDERS_YAML.get("distiller"), dict) else {}
+#: KG 批抽专用预算块（与 writer 完全独立，不在 6 字段角色配置里）。
+_KG_EXTRACT_DEFAULTS = _PROVIDERS_YAML.get("kg_extract") if isinstance(_PROVIDERS_YAML.get("kg_extract"), dict) else {}
+
+#: `kg_extract.provider` 允许的显式渠道值（空 = 跟随主渠道 `llm_provider`）。
+#: 与 `_build_channel_provider` 支持的分支同源；**未知值不是配置**，在 Settings
+#: 构造时就抛错（启动即失败），绝不静默回退主渠道——回退会把
+#: `KG_EXTRACT_PROVIDER=zhiphu` 这类笔误藏成「配置已生效」。
+KG_EXTRACT_CHANNELS: frozenset[str] = frozenset(
+    {"openrouter", "zhipu", "siliconflow", "minimax", "openai", "dashscope", "local"}
+)
 
 # Assistant / Distiller **显式留空**时的渠道回退表（backend/config/providers.yaml 的注释承诺）：
 #   <role>.api_key 为空 → 按 <role>.provider 的渠道名去 legacy 字段取对应 *_api_key
@@ -293,6 +304,47 @@ class Settings(BaseSettings):
     #: 「慢但正常」的重写，终稿回落初稿、段均 19.4 违规——max 已经漂了，
     #: 不能再按 max×1.5 贴着取。960s 只用于兜住真正无响应的调用。
     writer_total_timeout: int = int(_WRITER_DEFAULTS.get("total_timeout", 960))
+    #: KG 批抽**专用**的单次 `complete_message` 总时长硬顶（秒）。默认 300。
+    #:
+    #: 为什么必须独立：KG 抽取复用了 writer 的 provider 单例，于是继承它的
+    #: 960s 预算——而抽取是「1 段正文 → 一坨结构化 JSON」的小任务，实测
+    #: `agent_runs #205` 连续 3 次各烧满 960s 才报 `The read operation timed out`，
+    #: 整段失败耗时 48 分钟。抽取不该沿用长文生成的预算。
+    #:
+    #: 最坏总时长 = 外层 `RETRY_LIMIT + 1`（默认 3）× 本值 = 3 × 300s = 15 分钟；
+    #: 首字节挂起则每次在 `kg_extract_first_byte_timeout` 内先暴露。
+    #: 只影响 KG 批抽（`get_kg_extract_provider()`），**writer/正文生成不读它**。
+    kg_extract_total_timeout: int = int(
+        _KG_EXTRACT_DEFAULTS.get("total_timeout", 300)
+    )
+    #: KG 批抽**首字节阶段**上限（秒）。默认 120。
+    #:
+    #: 改造前首字节前直接用剩余总预算当 socket 超时（`provider.py` 的
+    #: `urlopen(timeout=remaining)`），180s 的 `writer_timeout` 被完全绕过，
+    #: 服务端一个字节都不给时要等整份预算耗尽才报错。抽取路径传本值后，
+    #: 挂起在 2 分钟内就被判死，而不是拖到 5 分钟（总预算）或 16 分钟（旧 writer 预算）。
+    #: None/0 = 沿用原行为（只受总预算约束）——writer 路径不传，行为不变。
+    kg_extract_first_byte_timeout: int = int(
+        _KG_EXTRACT_DEFAULTS.get("first_byte_timeout", 120)
+    )
+    #: KG 批抽**独立渠道**（可覆盖项，env `KG_EXTRACT_PROVIDER`）。
+    #:
+    #: - 空（默认）= 跟随主渠道 `llm_provider`，现有行为零变化；
+    #: - `zhipu` = 抽取改走智谱：key / base_url 取 `zhipu_*`，模型链取库里
+    #:   `llm.zhipu_models`（启动时由 `load_persisted_llm_config` 落进
+    #:   `settings.zhipu_models`），预算仍用上面 300s / 120s；
+    #: - 其它非空且不在 `KG_EXTRACT_CHANNELS` 内的值 = **配置错误**，Settings
+    #:   构造时直接抛错（启动失败），不静默回退主渠道。
+    #:
+    #: 只影响 `get_kg_extract_provider()`；writer/正文生成不读本字段。
+    kg_extract_provider: str = str(_KG_EXTRACT_DEFAULTS.get("provider", "") or "")
+    #: KG 抽取的**自定义模型链**（逗号分隔，空 = 用所选渠道自己的链）。
+    #:
+    #: 为什么不直接写库里的 `llm.<channel>_models`：那条链是**主渠道共用**的，
+    #: 抽取侧改它等于顺手改了写正文的候选链（违反「不改 writer 渠道与预算」）。
+    #: 这里单独一槽，`get_kg_extract_provider()` 才会套用；Writer 完全不读。
+    #: 由 `PUT /api/settings/llm` 的 `kg_extract.models` 写入并热生效。
+    kg_extract_models: str = str(_KG_EXTRACT_DEFAULTS.get("models", "") or "")
     #: 重写允许的字数上浮比例，默认 8%。**手写值，不是档案推导**：来源是第 4 章
     #: 实测（2,987→2,868 汉字，段均 23.2→24.8）——修碎段要给短对白补神态/动作，
     #: 必然增字。它只防借补写无限膨胀，不是篇幅预算；篇幅上限由 `length_limits`
@@ -473,6 +525,23 @@ class Settings(BaseSettings):
             return ""
         value = getattr(self, name, "")
         return str(value or "").strip()
+
+    @field_validator("kg_extract_provider")
+    @classmethod
+    def _validate_kg_extract_provider(cls, value: str) -> str:
+        """未知渠道值 = 配置错误，启动即失败（绝不静默回退主渠道）。
+
+        空串是默认值（跟随主渠道），必须放行；大小写不敏感，但保留原值
+        不做小写化——工厂侧统一 `.strip().lower()` 后再比对。
+        """
+        raw = (value or "").strip()
+        if raw.lower() not in KG_EXTRACT_CHANNELS | {""}:
+            allowed = "、".join(sorted(KG_EXTRACT_CHANNELS))
+            raise ValueError(
+                f"kg_extract.provider={value!r} 不是已知渠道（可选：空 = 跟随主渠道，"
+                f"或 {allowed}）。不会静默回退到主渠道。"
+            )
+        return raw
 
     @property
     def openrouter_model_list(self) -> list[str]:

@@ -51,6 +51,11 @@ MAX_QUEUE = 200
 WORKER_THREADS = 1
 #: 同批失败后的立即重试上限。只覆盖网络抖动；持续挂是 key/配额问题，
 #: 重试解决不了——暴露成 failed 行给人看（requeue API 手动重捞）才是对的。
+#:
+#: 最坏总时长 = (RETRY_LIMIT + 1) × 单次调用总预算
+#:            = 3 × settings.kg_extract_total_timeout（默认 300s）≈ 15 分钟；
+#: 每次尝试内若首字节迟迟不到，会先被 `kg_extract_first_byte_timeout`
+#: （默认 120s）判死，而不是像改造前那样每次烧满 Writer 的 960s（合计 ≈48 分钟）。
 RETRY_LIMIT = 2
 #: parse_failed 的定向重抽约束：模型输出被 4096 token 上限截断时，只压「条数」
 #: 让 JSON 收得进一个回复；抽取口径（kind/枚举/证据要求）不变。
@@ -616,6 +621,7 @@ def _run_batches_locked(project_id: int) -> None:
                         "text_gate": gate,
                         "text_gate_alert": gate_alert,
                         "canon": canon_meta,
+                        "llm": _llm_budget_note(provider),
                     })
                 db.commit()
                 _log.warning(
@@ -683,7 +689,8 @@ def _run_batches_locked(project_id: int) -> None:
                                     # 失败可见性：试了几次 / 上限几次 / 是否已放弃
                                     "attempts": attempts_made,
                                     "max_attempts": RETRY_LIMIT + 1,
-                                    "abandoned": False}
+                                    "abandoned": False,
+                                    "llm": _llm_budget_note(provider)}
                 if empty:
                     note_extra["empty"] = True
                 # 零事件静默通过：实体抽到了、批也 success，但一条事件都没落。
@@ -708,7 +715,8 @@ def _run_batches_locked(project_id: int) -> None:
                 for row in rows.values():
                     row.status = status
                     row.finished_at = now
-                    row.model = None
+                    # 留痕实际应答模型（此前恒为 None，事后无从确认跑的是哪条链）
+                    row.model = _llm_budget_note(provider)["model"]
                     _merge_note(row, note_extra)
                 db.commit()
             else:
@@ -724,6 +732,7 @@ def _run_batches_locked(project_id: int) -> None:
                 for row in rows.values():
                     row.status = "failed"
                     row.finished_at = now
+                    row.model = _llm_budget_note(provider)["model"]
                     _merge_note(row, {
                         "error": err,
                         # 失败可见性：原因分类 / 实际尝试次数 / 上限 / 已放弃
@@ -738,6 +747,7 @@ def _run_batches_locked(project_id: int) -> None:
                         "text_gate": gate,
                         "text_gate_alert": gate_alert,
                         "canon": canon_meta,
+                        "llm": _llm_budget_note(provider),
                     })
                 db.commit()
                 _log.warning(
@@ -767,6 +777,27 @@ def _merge_note(row: AgentRun, extra: dict) -> None:
         base = {}
     base.update(extra)
     row.note = json.dumps(base, ensure_ascii=False)
+
+
+def _llm_budget_note(provider) -> dict:  # noqa: ANN001
+    """本次抽取的 LLM 留痕：渠道、候选链、预算、实际应答模型。
+
+    只写进 ``agent_runs.note``（JSON），不动表结构。用途：事后能回答
+    「这条抽取行跑的是哪条链、什么预算」——此前 note 只有 stats/error，
+    排查 `#205` 时无法确认，只能回头翻代码与配置快照。
+    """
+    if provider is None:
+        return {"provider": None, "models": [], "model": None,
+                "total_timeout": None, "first_byte_timeout": None}
+    chain = getattr(provider, "_model_chain", None)
+    return {
+        "provider": type(provider).__name__,
+        "models": list(chain()) if callable(chain) else [],
+        # 最近一次成功应答的模型；全程失败时回落到配置的首选模型
+        "model": getattr(provider, "last_model", None) or getattr(provider, "model", None),
+        "total_timeout": getattr(provider, "total_timeout", None),
+        "first_byte_timeout": getattr(provider, "first_byte_timeout", None),
+    }
 
 
 #: note 里取 JSON 的公共表达式：脏 note（非 JSON）当空对象，绝不让 UPDATE 抛错
@@ -1601,12 +1632,40 @@ def rebuild_chapter(db: Session, project_id: int, chapter: int) -> dict:
 
 
 def _get_provider():
-    try:
-        from app.llm.provider import get_llm_provider
+    """KG 批抽专用 provider（预算独立于 Writer）。
 
-        return get_llm_provider()
+    **不要**改回 `get_llm_provider()`：那条单例的总预算来自
+    `settings.writer_total_timeout`（960s，为长文重写设定）。抽取是秒级小任务，
+    沿用它会让人一次挂起烧掉 16 分钟/次 × 3 次 ≈ 48 分钟（`agent_runs #205`）。
+    这里的单例渠道/模型链与 Writer 完全相同，只有两个预算不同：
+    总预算 `kg_extract_total_timeout`（默认 300s）、首字节
+    `kg_extract_first_byte_timeout`（默认 120s）。
+    """
+    try:
+        from app.llm.provider import get_kg_extract_provider
+
+        return get_kg_extract_provider()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _active_foreshadow_names(db: Session, project_id: int) -> list[str]:
+    """账上**未回收**的伏笔名（给抽取器做同名复用，见 `extractor_v3.known_foreshadow_block`）。
+
+    只取 planted/developing —— 已回收/已丢弃的线索不该再要求模型沿用它的名字。
+    取不到就返回空名单：那等于回到「抽取器看不到已有名字」的旧行为，
+    提示词与从前逐字节相同（宁可不省，不能因此挡住落库）。
+    """
+    try:
+        rows = db.scalars(
+            select(KgForeshadow.name).where(
+                KgForeshadow.project_id == project_id,
+                KgForeshadow.status.in_(["planted", "developing"]),
+            ).order_by(KgForeshadow.planted_chapter, KgForeshadow.id)
+        ).all()
+        return [str(n) for n in rows if n]
+    except Exception:  # noqa: BLE001 —— 名单是优化项，取不到不该挡住抽取
+        return []
 
 
 def _provider_unavailable(provider) -> bool:  # noqa: ANN001

@@ -60,9 +60,15 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.config import KG_EXTRACT_CHANNELS, settings
 from app.db import get_db
-from app.llm.provider import apply_runtime_config, build_provider, get_llm_provider
+from app.llm.provider import (
+    apply_runtime_config,
+    build_provider,
+    get_kg_extract_provider,
+    get_llm_provider,
+    reset_kg_extract_provider_cache,
+)
 from app.llm.registry import (
     ASSISTANT_ROLE,
     DISTILLER_ROLE,
@@ -182,6 +188,9 @@ _CUSTOM_URL_PROVIDERS: frozenset[str] = frozenset({"openai"})
 _DB_KEY_PROVIDER = "llm.provider"
 _DB_KEY_MODEL = "llm.model"
 _DB_KEY_MODELS = "llm.models"
+#: KG 抽取独立渠道 + 自定义模型链的持久化键（与角色键同一套 AppSetting 机制）。
+_DB_KEY_KG_EXTRACT_PROVIDER = "kg_extract.provider"
+_DB_KEY_KG_EXTRACT_MODELS = "kg_extract.models"
 
 # ------------------------------------------------------------------
 # 角色（role）配置：settings 字段名与 AppSetting 键的映射
@@ -325,6 +334,99 @@ def _role_block(role: str) -> dict[str, Any]:
     }
 
 
+def _split_model_csv(raw: str) -> list[str]:
+    """逗号分隔的模型链 → 去空保序列表（不去重，去重由 provider 侧负责）。"""
+    return [m.strip() for m in (raw or "").split(",") if m.strip()]
+
+
+def _channel_chain(provider: str) -> list[str]:
+    """某渠道在 settings 里配置的候选链（`*_models`）；local 无链 → []。
+
+    与 `_build_channel_provider` 的口径一致：它是「渠道默认链」的唯一来源。
+    """
+    field = _MODELS_FIELD.get(provider)
+    if not field:
+        return []
+    return _split_model_csv(str(getattr(settings, field, "") or ""))
+
+
+def _kg_extract_block() -> dict[str, Any]:
+    """KG 抽取渠道 + 模型链的当前视图（GET 出参的 `kg_extract` 对象）。
+
+    与三个角色块同口径：**优先读生效单例**（它才是抽取真正在用的），
+    配置字段只用于回答「用户选了哪个渠道 / 是否跟随主渠道 / 链从哪来」。
+
+    字段约定：
+    - `provider`        ：已保存的显式渠道；"" = 跟随主渠道；
+    - `follow_main`     ：是否跟随主渠道（前端据此显示语义说明）；
+    - `effective_provider` / `effective_label` / `is_fallback`：实际生效值；
+    - `models`          ：**当前实际生效**的模型链（首选在首位）；
+    - `models_source`   ：`follow_main`（随主渠道）/ `channel`（所选渠道的链）
+                          / `custom`（`kg_extract.models` 自定义链）；
+    - `models_override` ：已保存的自定义链（空 = 没自定义）；
+    - `channel_models`  ：各渠道的默认链（前端换渠道时用它回填输入框）；
+    - `valid` / `error` ：配置非法时明确报出来，不静默回退主渠道。
+    """
+    configured = (settings.kg_extract_provider or "").strip()
+    follow_main = not configured
+    main_provider = (settings.llm_provider or "local").strip() or "local"
+    effective_provider = main_provider if follow_main else configured.lower()
+    override = _split_model_csv(settings.kg_extract_models)
+    models_source = "custom" if override else ("follow_main" if follow_main else "channel")
+
+    valid = follow_main or configured.lower() in KG_EXTRACT_CHANNELS
+    error: str | None = None
+    active = None
+    if valid:
+        try:
+            active = get_kg_extract_provider()
+        except ValueError as exc:
+            # 未知渠道值：工厂只会在这里抛错（不静默回落），如实展示给前端。
+            valid = False
+            error = str(exc)
+    else:
+        allowed = "、".join(sorted(KG_EXTRACT_CHANNELS))
+        error = (
+            f"kg_extract.provider={configured!r} 不是已知渠道"
+            f"（可选：空 = 跟随主渠道，或 {allowed}）。不会回退到主渠道。"
+        )
+
+    models: list[str] = []
+    if active is not None and hasattr(active, "_model_chain"):
+        models = list(active._model_chain())
+    if not models:
+        models = override or _channel_chain(effective_provider)
+
+    # 展示标签优先用 PROVIDER_META（与渠道按钮同一套文案），避免出现
+    # 「按钮写 智谱 GLM、生效行写 Zhipu」这种同名不同写的困惑。
+    label = (
+        PROVIDER_META.get(effective_provider, {}).get("label")
+        or getattr(active, "label", None)
+        or effective_provider
+    )
+    is_fallback = active is not None and type(active).__name__ == "LocalFallbackLLMProvider"
+
+    return {
+        "provider": configured,
+        "follow_main": follow_main,
+        "main_provider": main_provider,
+        "effective_provider": effective_provider,
+        "effective_label": label,
+        "models": models,
+        "models_source": models_source,
+        "models_override": override,
+        "channel_models": {
+            p: _channel_chain(p) for p in sorted(KG_EXTRACT_CHANNELS)
+        },
+        "allowed_providers": sorted(KG_EXTRACT_CHANNELS),
+        "total_timeout": settings.kg_extract_total_timeout,
+        "first_byte_timeout": settings.kg_extract_first_byte_timeout,
+        "is_fallback": is_fallback,
+        "valid": valid,
+        "error": error,
+    }
+
+
 def _current(db: Session) -> dict:
     """当前生效配置 + 各渠道 key 脱敏状态（GET 用）。
 
@@ -363,7 +465,26 @@ def _current(db: Session) -> dict:
         "writer": _role_block(WRITER_ROLE),
         "assistant": _role_block(ASSISTANT_ROLE),
         "distiller": _role_block(DISTILLER_ROLE),
+        # KG 抽取独立渠道 + 模型链（只影响抽取，不影响写正文）。
+        "kg_extract": _kg_extract_block(),
     }
+
+
+class KgExtractIn(StrictRequest):
+    """KG 抽取渠道 + 模型链（`PUT /api/settings/llm` 的 `kg_extract` 字段）。
+
+    `provider` 空串 = **跟随主渠道**（默认；抽取与写正文同渠道同链）；
+    其它值必须属于 `KG_EXTRACT_CHANNELS`，否则 400——绝不静默回退主渠道。
+
+    `models`：
+    - 缺省（None）= 不改动已存的自定义链；若同时换了渠道，则清空自定义链，
+      让链跟着新渠道走（避免拿着 A 渠道的链去打 B 渠道）；
+    - `[]`（空数组）= 显式清空自定义链，回到所选渠道的默认链；
+    - 非空 = 该链只供 KG 抽取使用，**不影响**写正文的候选链。
+    """
+
+    provider: str = ""
+    models: list[str] | None = None
 
 
 class LlmConfigIn(StrictRequest):
@@ -373,13 +494,15 @@ class LlmConfigIn(StrictRequest):
     只写传入的字段，`api_key` 空则保留原值）。
     `role` 给定 → 角色模式：写该角色的六个字段（持久化到
     `writer.*` / `assistant.*` 键），只重置该角色的 provider 缓存。
+    `kg_extract` 给定 → KG 抽取模式：写 `kg_extract.*` 键，只重置抽取单例。
 
     `base_url` / `max_tokens` / `timeout` 是角色模式的新字段；legacy
     模式下携带它们 → 400（legacy 路径从不接受这三个字段，静默忽略
     会造成「以为生效了」的假象，故 fail loud）。
     """
 
-    provider: str
+    #: legacy / 角色模式必填；`kg_extract` 模式下不需要（由 kg_extract 决定渠道）。
+    provider: str | None = None
     api_key: str | None = None  # 空 = 不改该角色 key
     model: str | None = None
     models: list[str] | None = None  # 候选链（限流切换用；非 writer 角色不接受）
@@ -387,6 +510,8 @@ class LlmConfigIn(StrictRequest):
     max_tokens: int | None = None
     timeout: int | None = None
     role: Literal["writer", "assistant", "distiller"] | None = None
+    #: KG 抽取独立渠道 + 模型链（只影响抽取；不碰 writer 的渠道与预算）。
+    kg_extract: KgExtractIn | None = None
 
 
 @router.get("/llm")
@@ -581,8 +706,78 @@ def _put_role(body: LlmConfigIn, provider: str, role: str, db: Session) -> dict:
     return _current(db)
 
 
+def _put_kg_extract(body: KgExtractIn, db: Session) -> dict:
+    """KG 抽取模式：写 `kg_extract.*` 键 + 只重置抽取单例。
+
+    与角色模式的隔离底线一致——**不写任何 `llm.*` 键、不动 settings 上的
+    渠道 key / 模型链、不重建 Writer 单例**。抽取渠道与写正文渠道互不影响。
+
+    校验（fail-loud）：
+    - `provider` 必须是 `KG_EXTRACT_CHANNELS` 之一或空串（空 = 跟随主渠道）；
+      非法值 400，绝不静默回退主渠道（回退会把 `zhiphu` 这类笔误藏成
+      「配置已生效」）。
+    - `models` 里的空项被丢弃；全部为空 = 清空自定义链（回到渠道默认链）。
+    """
+    provider = (body.provider or "").strip().lower()
+    if provider and provider not in KG_EXTRACT_CHANNELS:
+        allowed = "、".join(sorted(KG_EXTRACT_CHANNELS))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"未知抽取渠道：{body.provider!r}"
+                f"（可选：空 = 跟随主渠道，或 {allowed}）。不会回退到主渠道。"
+            ),
+        )
+
+    previous = (settings.kg_extract_provider or "").strip().lower()
+    _set(db, _DB_KEY_KG_EXTRACT_PROVIDER, provider)
+    overrides: dict[str, Any] = {"kg_extract_provider": provider}
+
+    if body.models is not None:
+        chain = [m.strip() for m in body.models if m.strip()]
+        _set(db, _DB_KEY_KG_EXTRACT_MODELS, ",".join(chain))
+        overrides["kg_extract_models"] = ",".join(chain)
+    elif provider != previous:
+        # 换了渠道但没显式给链：旧渠道的自定义链必须清掉，否则等于拿着
+        # A 渠道的模型名去打 B 渠道（表现为莫名其妙的 404/400）。
+        _set(db, _DB_KEY_KG_EXTRACT_MODELS, "")
+        overrides["kg_extract_models"] = ""
+
+    db.commit()
+
+    for field, value in overrides.items():
+        if hasattr(settings, field):
+            setattr(settings, field, value)
+    # 只清抽取单例；Writer 单例原样不动（写正文的渠道与预算不受影响）。
+    reset_kg_extract_provider_cache()
+    return _current(db)
+
+
 @router.put("/llm")
 def put_llm_config(body: LlmConfigIn, db: Session = Depends(get_db)) -> dict:
+    if body.kg_extract is not None:
+        # 三种模式互斥：混用会让「这次到底改了谁」变得不可判定，直接 400。
+        mixed = (
+            body.role is not None
+            or bool(body.provider)
+            or bool(body.api_key)
+            or bool(body.model)
+            or body.models is not None
+            or body.base_url is not None
+            or body.max_tokens is not None
+            or body.timeout is not None
+        )
+        if mixed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "kg_extract 模式只接受 kg_extract 字段；不得与 "
+                    "provider / role / api_key / model / models / base_url / "
+                    "max_tokens / timeout 混用"
+                ),
+            )
+        return _put_kg_extract(body.kg_extract, db)
+
     provider = (body.provider or "").strip()
     if provider not in PROVIDER_META:
         raise HTTPException(status_code=400, detail=f"未知渠道：{provider}")
@@ -732,6 +927,16 @@ def load_persisted_llm_config(db: Session) -> None:
             else:
                 overrides[f"{role}_{field}"] = raw
 
+    # ---- 1.5) KG 抽取独立渠道 + 模型链（kg_extract.* 键）----
+    # 用「键存在」而非「值非空」判断：显式保存的 ""（跟随主渠道）也要盖过
+    # yaml/env 里的旧值，否则界面上改回「跟随主渠道」重启后又变回独立渠道。
+    if _DB_KEY_KG_EXTRACT_PROVIDER in stored:
+        overrides["kg_extract_provider"] = (
+            stored[_DB_KEY_KG_EXTRACT_PROVIDER] or ""
+        ).strip()
+    if _DB_KEY_KG_EXTRACT_MODELS in stored:
+        overrides["kg_extract_models"] = stored[_DB_KEY_KG_EXTRACT_MODELS] or ""
+
     # ---- 2) legacy 键（既有行为）----
     if stored.get(_DB_KEY_PROVIDER):
         overrides["llm_provider"] = stored[_DB_KEY_PROVIDER]
@@ -742,6 +947,17 @@ def load_persisted_llm_config(db: Session) -> None:
         provider = stored.get(_DB_KEY_PROVIDER, settings.llm_provider)
         if provider in _MODELS_FIELD:
             overrides[_MODELS_FIELD[provider]] = stored[_DB_KEY_MODELS]
+    # 渠道级候选链（`llm.<channel>_models`）：上面的 `llm.models` 只按**当前**
+    # 主渠道映射，其它渠道自己的链不会被应用。
+    #
+    # KG 抽取解耦（`kg_extract.provider=zhipu`）要求抽取的模型链取库里
+    # `llm.zhipu_models`，而主渠道是 minimax——这里只补 zhipu：
+    #   - assistant / distiller 用 `models=[model]` 构造，不受本链影响；
+    #   - writer 当前走 minimax，不走 zhipu 分支，正文生成链不受影响。
+    # 不补其它渠道：补 minimax 会把正文的候选链从 yaml 默认改成库值，
+    # 那属于「顺手改正文路径」，不在本次范围。
+    if stored.get("llm.zhipu_models"):
+        overrides["zhipu_models"] = stored["llm.zhipu_models"]
     for field in _KEY_FIELD.values():
         v = stored.get(f"llm.{field}")
         if v:
