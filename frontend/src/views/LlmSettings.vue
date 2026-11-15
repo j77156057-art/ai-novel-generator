@@ -10,11 +10,13 @@
  * 三个角色的表单状态**各自独立**（RoleModelPanel 每实例一份 reactive），
  * 保存 A 绝不改动 B / C，也不清掉它们未保存的编辑。
  */
-import { onMounted, reactive } from "vue";
+import { onMounted, reactive, ref } from "vue";
 import { ApiError, api } from "@/api/client";
+import KgExtractPanel from "@/components/KgExtractPanel.vue";
 import RoleModelPanel from "@/components/RoleModelPanel.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
 import type {
+  LlmKgExtractSavePayload,
   LlmRole,
   LlmRoleSavePayload,
   LlmRoleTestPayload,
@@ -46,6 +48,15 @@ const notices = reactive<Record<LlmRole, RoleNotice | null>>(
 const testResults = reactive<Record<LlmRole, LlmTestResult | null>>(
   emptyRoleMap<LlmTestResult | null>(() => null),
 );
+
+/**
+ * KG 抽取配置（渠道 + 模型链）的忙态与提示。
+ *
+ * 单独一份：它不属于 writer / assistant / distiller 任何一个角色——
+ * 保存它不改写正文的渠道与预算，也不该串到那三个面板的提示里。
+ */
+const kgBusy = ref(false);
+const kgNotice = ref<RoleNotice | null>(null);
 
 /** 旧后端（StrictRequest extra=forbid）遇到 role / max_tokens / timeout 会 422。 */
 function roleUnsupported(err: unknown): boolean {
@@ -106,6 +117,34 @@ async function onTest(payload: LlmRoleTestPayload): Promise<void> {
 }
 
 onMounted(load);
+
+/**
+ * 保存 KG 抽取配置：只提交 `kg_extract` 字段。
+ *
+ * 不夹带 provider / role——后端三种模式互斥（混用 400），而且带 provider
+ * 会让人误以为这次顺带改了主渠道。
+ */
+async function onSaveKgExtract(payload: LlmKgExtractSavePayload): Promise<void> {
+  kgBusy.value = true;
+  kgNotice.value = null;
+  try {
+    config.value = await api.saveLlmConfig({ kg_extract: payload });
+    kgNotice.value = {
+      kind: "ok",
+      text: "KG 抽取配置已保存并热生效；生成 / 助手 / 蒸馏与写正文的渠道、预算均未改动。",
+    };
+  } catch (err) {
+    const text = err instanceof Error ? err.message : String(err);
+    kgNotice.value = {
+      kind: "err",
+      text: roleUnsupported(err)
+        ? `保存失败：当前后端不支持 KG 抽取独立配置（HTTP 422：${text}）。`
+        : `保存失败：${text}`,
+    };
+  } finally {
+    kgBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -116,6 +155,7 @@ onMounted(load);
       三个角色分开配：生成模型写正文、助手模型做问答与诊断、蒸馏模型抽文风档案。
       各自的渠道 / key / 模型互不影响，分别保存、分别测试。key 只存在本机数据库
       （.gitignore 保护），页面不显示明文。
+      知识图谱抽取可以单独指定渠道与模型链（默认跟随生成渠道），不影响写正文。
     </p>
   </header>
 
@@ -156,6 +196,19 @@ onMounted(load);
       @test="onTest"
     />
   </div>
+
+  <!--
+    KG 抽取渠道 + 模型链：放在同一页、三个角色面板之后（不新开第二个设置入口）。
+    旧后端不返回 kg_extract（undefined）→ 整块不渲染，不伪造。
+  -->
+  <KgExtractPanel
+    v-if="config?.kg_extract"
+    :config="config.kg_extract"
+    :providers="config.providers ?? {}"
+    :busy="kgBusy"
+    :notice="kgNotice"
+    @save="onSaveKgExtract"
+  />
 </template>
 
 <style scoped>

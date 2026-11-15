@@ -354,10 +354,57 @@ export interface LlmConfig {
   writer?: LlmRoleConfig | null;
   assistant?: LlmRoleConfig | null;
   distiller?: LlmRoleConfig | null;
+  /**
+   * KG 抽取独立渠道 + 模型链（后端 `kg_extract` 块）。
+   *
+   * 旧后端不返回该字段（undefined）：界面不渲染这一块，不伪造。
+   * 这里**只影响知识图谱抽取**，与写正文的 writer 渠道 / 预算完全隔离。
+   */
+  kg_extract?: LlmKgExtractConfig | null;
+}
+
+/**
+ * KG 抽取配置（GET /api/settings/llm 的 `kg_extract`）。
+ *
+ * 关键区分：
+ *   - `provider` 是**已保存**的选择，空串 = 跟随主渠道；
+ *   - `effective_provider` / `effective_label` / `models` 是**实际生效值**
+ *     （来自抽取单例，抽取真正在用的就是它）；
+ *   - `valid=false` 时 `error` 给出原因——非法值不会静默回退主渠道。
+ */
+export interface LlmKgExtractConfig {
+  provider: string;
+  follow_main: boolean;
+  main_provider: string;
+  effective_provider: string;
+  effective_label: string;
+  /** 当前实际生效的模型链（首选在首位）。 */
+  models: string[];
+  /** 链的来源：随主渠道 / 所选渠道默认链 / 自定义链。 */
+  models_source: "follow_main" | "channel" | "custom";
+  /** 已保存的自定义链（空 = 没有自定义，用渠道默认链）。 */
+  models_override: string[];
+  /** 各渠道的默认链（换渠道时前端据此回填输入框）。 */
+  channel_models: Record<string, string[]>;
+  allowed_providers: string[];
+  total_timeout: number;
+  first_byte_timeout: number;
+  is_fallback: boolean;
+  valid: boolean;
+  error: string | null;
+}
+
+/** KG 抽取配置的保存载荷（PUT /api/settings/llm 的 `kg_extract` 字段）。 */
+export interface LlmKgExtractSavePayload {
+  /** 空串 = 跟随主渠道；必须是 allowed_providers 之一或空串。 */
+  provider: string;
+  /** 空数组 = 清空自定义链，回到所选渠道的默认链。 */
+  models: string[];
 }
 
 export interface LlmConfigIn {
-  provider: string;
+  /** legacy / 角色模式必填；`kg_extract` 模式不需要（由 kg_extract 决定渠道）。 */
+  provider?: string;
   api_key?: string | null;
   model?: string | null;
   models?: string[] | null;
@@ -369,6 +416,8 @@ export interface LlmConfigIn {
   base_url?: string | null;
   max_tokens?: number | null;
   timeout?: number | null;
+  /** KG 抽取模式：只写抽取渠道 / 模型链，不得与上面的字段混用（后端 400）。 */
+  kg_extract?: LlmKgExtractSavePayload | null;
 }
 
 /** POST /api/settings/llm/test 请求体（role 可选，只测该角色）。 */
