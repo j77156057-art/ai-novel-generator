@@ -24,8 +24,8 @@ export function severityMeta(s: string): { label: string; tag: string } {
  *
  * 两档（都带文字，不靠颜色单独承载信息）：
  *   - 高（err）：会**顶掉**已有内容 —— regenerate_segment 重写某段
- *   - 中（warn）：只**新增**，已有段落不受影响 —— generate_next 续写、
- *     以及各类提案（提案本身不改正文，真正写入还要再过审批与生效）
+ *   - 中（warn）：确认本身不顶掉正文 —— generate_next 只新增一段；
+ *     proposal 只创建一条待批提案（真正写入要再过批准 → 应用）
  *
  * 判据优先级：`detail.destructive`（服务端显式标注，权威）→ 退回从
  * `body.action` 推断（覆盖式生成）。之所以两条都留：detail 是给界面看的
@@ -49,6 +49,20 @@ export function pendingActionRiskMeta(
         typeof detail.risk_hint === "string" && detail.risk_hint
           ? detail.risk_hint
           : "确认后已有正文会被顶掉（旧内容进版本历史，可用版本回滚兜底）。",
+    };
+  }
+  if (action.kind === "proposal") {
+    // 提案卡片：确认只 POST /api/assistant/proposals 建一条 **pending** 提案，
+    // 正文一个字都不改；真正生效还要再过「批准 → 应用」，改写类到应用时才覆盖
+    // 目标段落。此前落到默认分支说成「追加新段落、Writer 会新写一段入库」，
+    // 与实际动作完全不符。
+    return {
+      label: "待确认的改写",
+      tag: "warn",
+      hint:
+        typeof detail.risk_hint === "string" && detail.risk_hint
+          ? detail.risk_hint
+          : "确认后只创建一条待批提案，不改任何正文；要到项目页批准并应用后才会写入（改写类会覆盖目标段落）。",
     };
   }
   return {

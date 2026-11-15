@@ -18,6 +18,8 @@ const uploadState = ref<{ loading: boolean; result: UploadResult | null; error: 
   error: null,
 });
 const fileInput = ref<HTMLInputElement | null>(null);
+/** 混书剔除开关：默认关（只检测不删），与后端 `drop_foreign_blocks=Form(False)` 一致。 */
+const dropForeignBlocks = ref(false);
 
 const selected = ref<NovelOut | null>(null);
 const chunks = ref<ChunkOut[]>([]);
@@ -72,7 +74,7 @@ async function onFile(e: Event) {
   if (!file || uploadState.value.loading) return;
   uploadState.value = { loading: true, result: null, error: null };
   try {
-    const r = await api.uploadNovel(file);
+    const r = await api.uploadNovel(file, dropForeignBlocks.value);
     uploadState.value = { loading: false, result: r, error: null };
     await reloadNovels();
   } catch (err) {
@@ -80,6 +82,13 @@ async function onFile(e: Event) {
   } finally {
     input.value = "";
   }
+}
+
+/** 入库状态的人话说法；原始值并列显示，便于与后端 status 对账。 */
+function uploadStatusLabel(status: string | null | undefined): string {
+  if (status === "imported_review") return "待人工复核 imported_review";
+  if (status === "imported") return "已导入 imported";
+  return status || "—";
 }
 
 async function loadChunks(n: NovelOut) {
@@ -182,6 +191,10 @@ const cleanRuleCounts = computed(() => {
         :disabled="uploadState.loading"
         @change="onFile"
       />
+      <label class="upload-drop">
+        <input type="checkbox" v-model="dropForeignBlocks" :disabled="uploadState.loading" />
+        剔除检出的异书块（drop_foreign_blocks）
+      </label>
       <button
         type="button"
         class="btn primary"
@@ -194,8 +207,26 @@ const cleanRuleCounts = computed(() => {
         <span class="spinner" /> 正在上传并解析…
       </span>
     </div>
+    <p class="faint upload-hint">
+      默认只检测、不删除；不勾选时若检出混入的其他书块，语料仍入库并标记为
+      <span class="mono">imported_review</span> 待人工复核。
+    </p>
     <div v-if="uploadState.result" class="notice ok upload-notice" role="status">
       已入库：{{ uploadState.result.title }} · {{ uploadState.result.chapters }} 章 / {{ uploadState.result.chunks }} 分片（novel_id={{ uploadState.result.novel_id }}）
+      <span
+        class="tag"
+        :class="uploadState.result.status === 'imported_review' ? 'warn' : 'ok'"
+      >
+        {{ uploadStatusLabel(uploadState.result.status) }}
+      </span>
+    </div>
+    <div
+      v-if="uploadState.result?.status === 'imported_review'"
+      class="notice warn upload-notice"
+      role="alert"
+    >
+      检出疑似混入的其他书块，本次未剔除（开关未勾选），已按待复核状态入库。
+      如需剔除，请重新上传并勾选「剔除检出的异书块」。
     </div>
     <div v-if="uploadState.error" class="notice err upload-notice" role="alert">
       {{ uploadState.error }}
@@ -235,6 +266,7 @@ const cleanRuleCounts = computed(() => {
         </div>
         <div class="row tight novel-meta">
           <span class="tag">{{ n.platform || "—" }}</span>
+          <span v-if="n.status === 'imported_review'" class="tag warn">待复核 imported_review</span>
           <span class="faint novel-action">查看分片</span>
         </div>
       </button>
@@ -503,6 +535,16 @@ const cleanRuleCounts = computed(() => {
 <style scoped>
 .upload-row {
   align-items: center;
+}
+.upload-drop {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-sm);
+}
+.upload-hint {
+  margin-top: 8px;
+  font-size: var(--fs-xs);
 }
 .upload-notice {
   margin-top: 16px;

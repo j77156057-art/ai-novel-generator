@@ -20,6 +20,8 @@ export interface ChunkOut {
 export interface UploadResult {
   novel_id: number;
   title: string | null;
+  /** imported / imported_review（后者 = 检出混书但未剔除，待人工确认）。 */
+  status: string | null;
   chapters: number;
   chunks: number;
 }

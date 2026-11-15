@@ -199,9 +199,11 @@ function assistantEndpointPath(endpoint: string): string {
 export const api = {
   listNovels: () => request<NovelOut[]>("/novels"),
 
-  uploadNovel: (file: File) => {
+  uploadNovel: (file: File, dropForeignBlocks = false) => {
     const form = new FormData();
     form.append("file", file);
+    // 与后端 `Form(False)` 同名同义：默认只检测不删，显式 true 才剔除检出的异书块。
+    form.append("drop_foreign_blocks", String(dropForeignBlocks));
     return request<UploadResult>("/novels/upload", { method: "POST", body: form });
   },
 
