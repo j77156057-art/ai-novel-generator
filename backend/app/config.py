@@ -73,14 +73,45 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # 时代越界护栏（era_guard，独立区块）
     #
-    # **默认关闭**，按项目显式打开；打开后默认 report（只扫描、落 meta，
-    # 不改正文）。实验已证明句级独立重写会把语义拼散（铜镜→导航、
-    # 电脑→砚台），所以改写还要再把 ERA_GUARD_MODE 设成 "rewrite"。
-    # 项目没有显式 genre / 世界设定时不注入约束（meta 记 baseline_unknown）。
+    # v17（2026-11-15）**默认打开，且维持 report（只判不拦）**：此前默认关，
+    # 已落库章节没有任何时代错误率数据。打开后正文不改、`passed` 不受影响、
+    # 不进 `violations`；扫描结果并进 `quality_json.era_check`。
+    # 约束注入与扫描留痕是**两个独立子开关**（都默认开）：报告里必须能区分
+    # 「本章注没注入那 209 字约束」，否则命中率变化分不清是正文变好还是被压住。
+    # 项目没有显式 genre / 世界设定时不注入、不扫描（meta 记 baseline_unknown）。
+    # 改写仍必须显式把 ERA_GUARD_MODE 设成 "rewrite"：实验已证明句级独立重写
+    # 会把语义拼散（铜镜→导航、电脑→砚台）。
     # ------------------------------------------------------------------
-    era_guard_enabled: bool = False
+    era_guard_enabled: bool = True
+    #: 约束注入开关（默认开）：只决定 system 里加不加那 209 字时代约束。
+    #: 与 `era_guard_scan_enabled` **互不牵连**——要纯观测命中率就关它、留着扫描。
+    era_guard_prompt_enabled: bool = True
+    #: 扫描留痕开关（默认开）：只决定生成后扫不扫、写不写 `quality_json.era_check`。
+    #: 关掉后 `era_check.status` 记 `scan_disabled`，不再产命中数。
+    era_guard_scan_enabled: bool = True
     era_guard_mode: str = "report"  # report | rewrite
     era_guard_max_rounds: int = 2
+
+    # 通道滥用聚合（v18，只判不拦）：例外通道命中但同句缺引出人（留痕键
+    # `channel_hit_no_introducer`）本来逐条只记录；某章扎堆或连续多章出现，
+    # 说明通道被当成放行通道用，需要看到。阈值走配置，<=0 关闭对应判定。
+    era_channel_abuse_threshold: int = 3  # 单章条数阈值
+    era_channel_abuse_streak: int = 2  # 连续章数阈值
+    era_channel_abuse_lookback: int = 8  # 回看最近多少条已落库留痕
+
+    # ------------------------------------------------------------------
+    # 一致性层（coherence，与文风闸门并排、互不干涉）
+    #
+    # 查四类硬伤：说话人归属 / 时间线 / 指代 / 伏笔提前点破。判定所需数据全部来自
+    # 项目本身（plot_bible / outline / 前文正文 / 已有实体），代码里不写任何书名、
+    # 人名、年份、章号。
+    #
+    # **默认只报不拦**：结果写进 `generations.quality_json["coherence"]`，
+    # 不改变文风闸门的 `passed`。要让 definite 级问题触发重写，需显式设
+    # COHERENCE_GUARD_MODE=rewrite；设为 off 则连计算都跳过。
+    # ------------------------------------------------------------------
+    coherence_guard_enabled: bool = True
+    coherence_guard_mode: str = "report"  # report | rewrite | off
 
     # ------------------------------------------------------------------
     # canon 词表来源（KG_CANON_SOURCE，纯增量开关，默认行为不变）
@@ -119,6 +150,24 @@ class Settings(BaseSettings):
     # 关闭时门函数直接返回 None，边一律 status='active'；集合/上位节点照样保留
     # （mixed 边 710→724 的收益与门无关）。保留开关与 status 列，将来能开。
     kg_collection_gate: bool = False
+
+    # ------------------------------------------------------------------
+    # v3 批抽的超时重捞周期（秒）。
+    #
+    # 背景：写章节的进程可能是短命进程，内存队列随进程退出丢失，库里只剩
+    # status=running 的行；旧实现只能等后端重启或人工 requeue 才捞得回来
+    # （实测有两章卡在 running 18–30 小时）。worker 线程按本周期扫库，
+    # 把超过 STUCK_MINUTES 的 running 行重新入队——不依赖重启。
+    # <=0 关闭周期扫描（保留人工 /worker/recover 入口）。
+    # ------------------------------------------------------------------
+    kg_stuck_sweep_seconds: int = 120
+
+    # 作者 agent 的「写后定向自查」（app.generation.author_research）。
+    # 默认关闭（2026-11-13）：段 11 实测用段 9 的 1/58 自查 token 只换来与段 9
+    # 持平的闸门表现（差 3），且段落类缺口在参考语料里方向相反，检索会帮倒忙。
+    # 保留代码与开关，需要做对照实验时显式打开；关闭时 quality_json 记
+    # `author_research.status = "disabled"`。
+    author_research_enabled: bool = False
 
     # Embedding（M2 混合检索）
     embedding_provider: str = "dashscope"  # dashscope | local
@@ -176,11 +225,12 @@ class Settings(BaseSettings):
     # 2026-10-12 实测 9 款模型：只有 M3.1-Flash-Preview 把推理放在独立字段 reasoning_content，
     # content 干净（JSON 可直接解析、中文质量好）；M3/M2.7/M2.5 等把 <think> 混进 content，
     # 且传 thinking:{"type":"disabled"} 无效。故默认与切换链均只用 M3.1-Flash-Preview；
-    # MiniMax-Text-01 仅作链尾兜底（content 可能混思维链，实际很少走到）。
+    # 2026-11-13：MiniMax-Text-01 已下线（404 "is no longer available"），移出默认链，
+    # 否则链尾每次回退都是一次注定失败的 404，把真错误伪装成「网络 404」。
     minimax_api_key: str = ""
     minimax_base_url: str = "https://api.minimaxi.com/v1"
     minimax_model: str = "MiniMax-M3.1-Flash-Preview"
-    minimax_models: str = "MiniMax-M3.1-Flash-Preview,MiniMax-Text-01"
+    minimax_models: str = "MiniMax-M3.1-Flash-Preview"
 
     # 阿里百炼 DashScope（兼容 OpenAI 协议）
     dashscope_models: str = "qwen-plus,qwen-max,qwen-turbo,qwen-flash"
@@ -221,7 +271,140 @@ class Settings(BaseSettings):
     #: 保持一致（2026-11-07 由 8192 提到 65536）：MiniMax M3.1-Flash-Preview 的
     #: reasoning_content 会先吃 max_tokens，32768 档实测出现整章 0 字正文。
     writer_max_tokens: int = int(_WRITER_DEFAULTS.get("max_tokens", 65536))
-    writer_timeout: int = int(_WRITER_DEFAULTS.get("timeout", 120))
+    #: 2026-11-14 由 120 提到 180，与流式 stream_timeout 同档：4000 字级单章
+    #: 实测一次生成需 180s 上下，120s 的同步入口在长篇幅下必然读超时。
+    writer_timeout: int = int(_WRITER_DEFAULTS.get("timeout", 180))
+    #: 流式续写的读超时。此前写死在 provider 函数的默认参数里，换机器/换模型
+    #: 只能改代码；现与 `writer_timeout` 成对配置（默认 180 = 现网值）。
+    writer_stream_timeout: int = int(_WRITER_DEFAULTS.get("stream_timeout", 180))
+    #: 非流式补全（重写轮走的 `complete_message`）的**总时长硬顶**，默认 960s。
+    #:
+    #: 2026-11-14 新增：`writer_timeout` 只是 socket 每次 recv 的空闲超时，不是
+    #: 总时长——服务端慢速滴包会不断重置它，模型链 × 每模型 4 次重试还会把它乘
+    #: 起来。第 16 章实测一次重写静默挂 19 分钟才被人工终止。这里给整条调用
+    #: （含换模型、429 退避）一个硬截止。
+    #:
+    #: **本条只是极端兜底，挂起的主判据是吞吐速率**（provider 的
+    #: `_RATE_FLOOR_BPS` / `_RATE_WINDOW_SECONDS`）：「每 1s 滴 1 字节」那种
+    #: 假活响应在速率窗口内就会被判死，走不到这里。
+    #:
+    #: 为什么从 720 提到 960（= max×2）：11 章样本单次重写耗时 p50=294s、
+    #: p90=464s、max=481s；但 720s（原「max×1.5」）在第 17 章掐断了一次
+    #: 「慢但正常」的重写，终稿回落初稿、段均 19.4 违规——max 已经漂了，
+    #: 不能再按 max×1.5 贴着取。960s 只用于兜住真正无响应的调用。
+    writer_total_timeout: int = int(_WRITER_DEFAULTS.get("total_timeout", 960))
+    #: 重写允许的字数上浮比例，默认 8%。**手写值，不是档案推导**：来源是第 4 章
+    #: 实测（2,987→2,868 汉字，段均 23.2→24.8）——修碎段要给短对白补神态/动作，
+    #: 必然增字。它只防借补写无限膨胀，不是篇幅预算；篇幅上限由 `length_limits`
+    #: （generation_length × 1.2）决定。
+    rewrite_growth_allowance: float = 0.08
+    #: 重写「跑飞」回退阈值，默认 16%（= 上浮比例的 2 倍）。同样是**手写值，
+    #: 不是档案推导**，来源与上一条相同；只用于整轮回退，不写进提示词。
+    rewrite_growth_reject_ratio: float = 0.16
+    #: 重写轮数上限（**调度项**，不改任何闸门判据/阈值/违规项定义）。
+    #: 默认 2 = 旧行为；设 1 只允许一轮；设 0 关闭重写轮（超长仍走压缩兜底）。
+    rewrite_max_rounds: int = 2
+    #: 一轮重写没有带来可测改善时，是否停止后续重写轮（默认 True）。
+    #: 「可测改善」只读既有闸门输出：从不过变为通过，或剩余问题条数严格减少。
+    #: 设为 False 可回退到旧的「跑满 rewrite_max_rounds」调度。
+    rewrite_stop_without_gain: bool = True
+    #: 初稿已超字数硬上限时，是否跳过整章重写、直接走压缩（默认 True）。
+    #: 依据：2026-11-15 第 23–32 章报告——超长章的重写轮净收益为负
+    #: （第 24 章两轮净 −4 字仍超限，第 23 章两轮全丢），压缩才是有效手段。
+    #: 设为 False 可回退「先重写、仍超再压缩」的旧调度。
+    rewrite_skip_oversize: bool = True
+    #: 初稿补完轮数上限（**调度项**）。默认 2 = 旧行为；设 0 关闭补写。
+    draft_completion_max_rounds: int = 2
+    #: 初稿提示里的字数下限占目标字数的比例（**只影响提示措辞**，不改任何闸门）。
+    #: None（默认）= 取 `_archive_rhythm()` 推出的 `completion_min_ratio`，
+    #: 即与补完触发线**同一条线**（本项目第 32 章为 0.826 → 4000×0.826=3304 字）；
+    #: 旧行为是写死 `max_chars × 0.8`（3200 字，比触发线低 104 字，模型按提示
+    #: 写 3200 仍会被判偏短），所以**默认值不等于旧行为**。设 0.8 可退回旧口径。
+    draft_prompt_min_ratio: float | None = None
+    #: 卷长（章）的**退回值**：优先从项目大纲的卷结构解析，解析不到才用这里。
+    #: 默认 14 是本书卷 1 的章数；换项目且大纲无卷标记时必须改。
+    volume_chapters: int = 14
+    #: `极短纯对白段占比` 上限的**退回值**（v10）：正常路径由参考档案的
+    #: 「非零章 p90」现推，换参考书自动重推；只有参考书里该指标全为 0
+    #: （推不出非零章分位）时才用这里。留空表示不设配置覆盖，退回常量表
+    #: （0.0，即旧口径），并由 `gate_limits.fallback_used/fallback_reason` 留痕。
+    ultra_short_dialogue_max_ratio: float | None = None
+    #: `对白字占比` 参考线（p25/p50/p75）的**退回值**（v12，非判罚）：正常路径由
+    #: 参考档案的章级分位现推，换参考书自动重推；只有无参考书/有效章不足时
+    #: 才用这里。留空表示不设配置覆盖，退回常量表
+    #: `ARCHIVE_CHAPTER_PERCENTILES["对白字占比"]`，并由
+    #: `gate_limits.fallback_used/fallback_reason` 留痕。
+    dialogue_ratio_reference: list[float] | None = None
+    #: `句长均值` 参考线（p10/p50/p90）的**退回值**（v13，非判罚）：正常路径由
+    #: 参考档案的卷级分位现推，换参考书自动重推；只有无参考书/有效卷不足时
+    #: 才用这里。留空表示不设配置覆盖，退回常量表
+    #: `ARCHIVE_CHAPTER_PERCENTILES["句长均值"]`，并沿用 `fallback_used` 留痕。
+    sentence_length_reference: list[float] | None = None
+    #: `短句占比` / `长句占比` 参考（p10/p50/p90）的**退回值**（v14，非判罚）：
+    #: 正常路径由参考档案的卷口径分位现推，换参考书自动重推；只有无参考书/
+    #: 有效卷不足时才用这里，留空退回块级常量表并沿用 `fallback_used` 留痕。
+    short_sentence_ratio_reference: list[float] | None = None
+    long_sentence_ratio_reference: list[float] | None = None
+    #: 对白句类配比的**退回值**（v14，非判罚），依序为
+    #: [陈述句 p50, 问句 p25, 问句 p90, 感叹句首个非零分位, 叹词起头首个非零分位]。
+    #: 正常路径由参考书**章级**分位现推。
+    dialogue_mix_reference: list[float] | None = None
+    #: 角色名提取里「泛称/无名」词表的**退回值**（v14）。此前是代码常量
+    #: `_VOICE_GENERIC_MARKERS`；这组词无法由参考书频次分位生成（频次分不出
+    #: 「泛称」与「高频主角」），故降级为配置项。留空用原常量表。
+    voice_generic_markers: list[str] | None = None
+    #: 初稿被 `finish_reason=length` 截断后，**优先重生成**的次数（v15）。
+    #: 默认 1：一次足以区分「偶发截断」与「稳定撞 max_tokens 硬顶」；设 0 即
+    #: 直接降级为「压缩断头稿」并在 `quality_json.truncation` 留痕。
+    #: 与档案无关（供给侧行为），所以是配置项而不是分位推导。
+    truncation_regen_attempts: int = 1
+    #: 结构约束检测（v15）：`report` 只告警落库 / `block` 阻断落库。
+    #: 检测口径全部来自 `project.outline` 与角色卡，不含任何写死的词表。
+    structure_guard_mode: str = "report"
+    #: 本章情节点「覆盖」判据：该事件的中文二元组有这么多比例出现在正文里。
+    #: 条数不足 `structure_beat_min_units` 时，同一阈值改判「本章大纲独有词
+    #: 三元组覆盖率」（`basis=fallback_term_coverage`），并与其他项同权进入
+    #: `blocking_reasons`；`report` 模式仍只判不拦。
+    #: **待验证**：0.34 是退回值（无档案可推，取「同义改写容忍度约三分之一」的
+    #: 起点），没有经过样本校准，不是推导值。
+    structure_beat_min_coverage: float = 0.34
+    #: 情节点切分后至少要有这么多条，覆盖率才有区分度（不足时 1/1 恒 1.00）。
+    #: 不足时**不跳过**，改用 `fallback_term_coverage` 作正式判据。
+    #: **待验证**：3 是退回值——少于 3 条时覆盖率只剩 0/0.5/1 这种量级，
+    #: 不具区分度；条数阈值本身未按样本校准，改了要重跑回放报告。
+    structure_beat_min_units: int = 3
+    #: 越章材料只查当前章之后的这么多章；超出的章不参与差集（太远易误报）。
+    #: **待验证**：3 是退回值，只用来压住远端章的同词噪声，未经样本校准。
+    structure_premature_lookahead: int = 3
+    #: 越章材料命中的章节数超过它才判阻断（默认 3 = 四章全越才拦）。
+    #: **待验证**：3 是退回值，目的是先只抓「大面积搬运后续材料」，未校准。
+    structure_premature_max_hits: int = 3
+    #: 性别不一致的条数超过它才判阻断（默认 0 = 一条都不许）。
+    #: 该值不待验证：检测口径只认「同小句内明确性别断言词」，一条即硬冲突。
+    structure_gender_max_mismatches: int = 0
+    #: 名字前后多少字符内找「明确性别断言词」作为该角色的一致性证据。
+    #: **待验证**：12 字是退回值（约一个小句），未按真实误报率校准。
+    structure_gender_window: int = 12
+    #: 逐章推进台账（v1）：角色阵容停滞 / 属性零变化 / 章间断档。
+    #: **只判不拦**：台账只出报告，不改 `passed`、不进 `violations`。
+    #: 各字段为 `None` 时用 `app.generation.progress_ledger.DEFAULTS` 的兜底值，
+    #: 避免同一阈值在两处各写一遍。所有数值均「待验证」，口径见该模块文档。
+    progress_ledger_enabled: bool = True
+    progress_ledger_cast_overlap_high: float | None = None
+    progress_ledger_cast_core_max: int | None = None
+    progress_ledger_cast_stagnant_chapters: int | None = None
+    progress_ledger_attr_stale_chapters: int | None = None
+    progress_ledger_head_paragraphs: int | None = None
+    progress_ledger_tail_paragraphs: int | None = None
+    progress_ledger_question_tail_paragraphs: int | None = None
+    progress_ledger_question_top: int | None = None
+    progress_ledger_question_overlap: float | None = None
+    progress_ledger_time_jump_min_days: int | None = None
+    progress_ledger_window_chapters: int | None = None
+    #: 连通性探测（设置页「测试连接」）用的超时：同步 120 / 流式 180，
+    #: 与旧 `build_provider` 默认值逐秒一致，env 可覆盖（LLM_PROBE_TIMEOUT）。
+    llm_probe_timeout: int = 120
+    llm_stream_timeout: int = 180
 
     assistant_provider: str = _ASSISTANT_DEFAULTS.get("provider", "zhipu")
     assistant_api_key: str = _ASSISTANT_DEFAULTS.get("api_key", "")
@@ -229,6 +412,19 @@ class Settings(BaseSettings):
     assistant_model: str = _ASSISTANT_DEFAULTS.get("model", "glm-4-flash")
     assistant_max_tokens: int = int(_ASSISTANT_DEFAULTS.get("max_tokens", 1024))
     assistant_timeout: int = int(_ASSISTANT_DEFAULTS.get("timeout", 60))
+    #: 实测**不可用**于 function calling 的模型名单（逗号分隔，env 可覆盖）。
+    #:
+    #: 来源：2026-11-14 最小探针（`%TEMP%\tool_probe\probe*.py`，同一套线上渠道
+    #: 配置，四段请求：控制组 / tool_choice=auto / required / 工具结果回传）。
+    #: `glm-z1-flash`：auto 下 `finish_reason=length`（预算全被 `<think>` 吃掉）；
+    #: `max_tokens=4096 + tool_choice=required` 时 `finish_reason=tool_calls` 但
+    #: `tool_calls=[]`、content 673 字——**finish_reason 会撒谎**，所以按模型名
+    #: 直接排除，而不是运行时探测。
+    #: 注意：`glm-4.6` / `glm-4.5-air` 当时因账号欠额（HTTP 429 / code 1113）
+    #: 无法验证，**不**列入本名单（它们不是「实测不支持」）。
+    assistant_tools_unsupported_models: str = str(
+        _ASSISTANT_DEFAULTS.get("tools_unsupported_models", "glm-z1-flash")
+    )
 
     # ---- 蒸馏模型（Distiller，第 3 个角色）----
     # 用途：**文风档案抽取**（把参考语料压成可注入的文风特征），与

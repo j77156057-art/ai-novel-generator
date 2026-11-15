@@ -256,6 +256,36 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # —— 含糊指令的候选澄清（2026-11-12）——
         # {round, candidates, fingerprint, note}；只加列、不回填，NULL = 非澄清行。
         ("generation_snapshots", "clarification", "JSON"),
+        # —— 目录检索轨迹表（设计稿 §5.8）：轨迹与检索流水是同一张表 ——
+        # 这张表可能在本次升级之前就被 create_all 建过（只有 id/session_id/tool 等旧列），
+        # 而 create_all 只补缺失表、不补列，所以新字段必须逐项进清单。
+        # 全部带 DEFAULT 或可空：老行（目前为空表，但口径要一致）补列即有值。
+        ("retrieval_logs", "project_id", "INTEGER"),
+        ("retrieval_logs", "agent_kind", "VARCHAR(16) NOT NULL DEFAULT 'author'"),
+        ("retrieval_logs", "turn_no", "INTEGER NOT NULL DEFAULT 1"),
+        ("retrieval_logs", "seq", "INTEGER NOT NULL DEFAULT 1"),
+        ("retrieval_logs", "segment_no", "INTEGER"),
+        ("retrieval_logs", "hit_ids", "JSON"),
+        ("retrieval_logs", "budget_remaining", "JSON"),
+        ("retrieval_logs", "budget_pool", "VARCHAR(16)"),
+        ("retrieval_logs", "adopted_rule_ids", "JSON"),
+        ("retrieval_logs", "soft_flags", "JSON"),
+        # —— KG 按章版本化（2026-11-14）——
+        # 同章重写不物理删行：旧版本 is_current=0 保留可回溯，读侧（切片/检索/
+        # 状态渲染）只认 is_current=1；version 记「同章第几次入库」。
+        # 老行补列即有 1/1 = 当前第 1 版，行为与加列前一致（不隐藏任何存量数据）。
+        # 漏这一项的后果：老库 SELECT 这些表直接 no such column: is_current。
+        ("kg_events", "is_current", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("kg_events", "version", "INTEGER NOT NULL DEFAULT 1"),
+        ("kg_mentions", "is_current", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("kg_mentions", "version", "INTEGER NOT NULL DEFAULT 1"),
+        ("kg_relations", "is_current", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("kg_relations", "version", "INTEGER NOT NULL DEFAULT 1"),
+        ("kg_character_state", "is_current", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("kg_character_state", "version", "INTEGER NOT NULL DEFAULT 1"),
+        # 错位行重标的留痕（见 app/kg/relabel_misplaced.py）：NULL = 未经修复
+        ("kg_events", "note", "TEXT"),
+        ("kg_character_state", "note", "TEXT"),
     ]
     # v3.0 KG 索引定义（ensure_schema 同步建，_migrate_sqlite_columns 老库补建）
     v30_indexes = [
@@ -332,5 +362,20 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_gs_pending"
                 " ON generation_snapshots (project_id, segment_no)"
                 " WHERE status = 'pending'",
+            ):
+                conn.execute(text(stmt))
+
+        # —— 轨迹表索引兜底 ——
+        # 老库若在这张表定型前就建过它，create_all 不会补索引；段级聚合
+        # （按 session+segment 回填 adopted_rule_ids）没有索引会全表扫。
+        exists = conn.execute(text(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type='table' AND name='retrieval_logs'")).fetchone()
+        if exists:
+            for stmt in (
+                "CREATE INDEX IF NOT EXISTS idx_retrieval_logs_session_segment"
+                " ON retrieval_logs (session_id, segment_no)",
+                "CREATE INDEX IF NOT EXISTS idx_retrieval_logs_agent_created"
+                " ON retrieval_logs (agent_kind, created_at)",
             ):
                 conn.execute(text(stmt))

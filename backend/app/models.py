@@ -65,7 +65,10 @@ class Project(Base):
     # 加不了），取值由写入方保证 ∈ raw_novels.id。
     continuation_novel_id = Column(Integer, nullable=True)
     plot_bible = Column(JSON, nullable=True)  # 动态剧情圣经：角色关系/后续走向/剧情冲突/伏笔
-    generation_length = Column(Integer, nullable=False, default=3000)  # 单次生成字数（长文，避免多段压缩）
+    # 单次生成字数（长文，避免多段压缩）。默认 4,000 与
+    # `style.consistency.DEFAULT_TARGET_LENGTH` 同步：3,000 压不下 id=23 的
+    # 5,224 字而不伤情节（详见该常量注释），故两者一起放宽到 4,000/4,800。
+    generation_length = Column(Integer, nullable=False, default=4000)
     # 层级摘要树（L1 段 / L2 卷 / L3 主线骨架）。
     # summary 仍是**无损的 L1 归档**，但注入提示词的已是本字段拼出的有界前情
     # （summary_tree.compose_prior）——summary 从「注入源」退为「存档」。
@@ -281,6 +284,12 @@ class KgRelation(Base):
     #: active = 正式边；candidate = 集合端点门降级（成员边挂在集合/上位节点、窗口内
     #: 无任何具体人名）。降级不删边：读路径过滤 candidate，复核后可转正。
     status = Column(String(16), nullable=False, default="active")
+    #: 章节版本化（2026-11-14）：同章重写后旧版本不删行，只置 is_current=0；
+    #: 读路径（切片/检索/状态渲染）只认 is_current=1。关系边受
+    #: uq_kg_relation（实体对+类型）约束只能原地升版：非当前后再次被同章断言
+    #: 则翻回 current 并 version+1，历史见 kg_relation_evolution。
+    is_current = Column(Boolean, nullable=False, default=True, server_default="1")
+    version = Column(Integer, nullable=False, default=1, server_default="1")
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -340,6 +349,13 @@ class KgEvent(Base):
     extra_actors = Column(JSON, nullable=True, default=list)  # 参与角色超过 2 个时存名字列表
     confidence = Column(Float, nullable=False, default=1.0)
     evidence_segment_ids = Column(JSON, nullable=True, default=list)
+    #: 章节版本化（2026-11-14）：同章重写后旧版本保留但置 is_current=0，
+    #: 切片/检索只认 is_current=1；version 为同章第几次入库（从 1 递增）。
+    is_current = Column(Boolean, nullable=False, default=True, server_default="1")
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+    #: 数据修复留痕（``app/kg/relabel_misplaced.py``）：错位行重标时写来源与
+    #: 原章号（JSON）。NULL = 未经修复。只记证据，不参与任何读路径。
+    note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
 
     __table_args__ = (
@@ -386,6 +402,13 @@ class KgCharacterState(Base):
     state_type = Column(String(16), nullable=False)  # location|injury|mood|goal|inventory|alive
     new_value = Column(String(500), nullable=True)  # 变化后的值
     cause_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
+    #: 章节版本化（2026-11-14）：同章重写后旧状态保留但置 is_current=0，
+    #: 状态渲染/judge 只认当前版本。
+    is_current = Column(Boolean, nullable=False, default=True, server_default="1")
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+    #: 数据修复留痕（``app/kg/relabel_misplaced.py``）：错位行重标时写来源与
+    #: 原章号（JSON）。NULL = 未经修复。只记证据，不参与任何读路径。
+    note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
 
     __table_args__ = (
@@ -470,6 +493,10 @@ class KgMention(Base):
     segment_no = Column(Integer, nullable=True)
     context_window = Column(String(500), nullable=True)  # 提及处原文片段
     mention_kind = Column(String(16), nullable=True)  # llm|alias|reference
+    #: 章节版本化（2026-11-14）：同章重写产生的新段会把旧段的提及置 is_current=0，
+    #: 切片/active 角色只认当前版本；旧行保留可回溯。
+    is_current = Column(Boolean, nullable=False, default=True, server_default="1")
+    version = Column(Integer, nullable=False, default=1, server_default="1")
 
     __table_args__ = (
         UniqueConstraint("project_id", "entity_id", "generation_id", name="uq_kg_mention"),
@@ -509,6 +536,42 @@ class KgIngestQuarantine(Base):
     __table_args__ = (
         Index("ix_kg_quarantine_project_kind", "project_id", "kind", "reason"),
         Index("ix_kg_quarantine_run", "run_id"),
+    )
+
+
+class KgCorpusWindow(Base):
+    """参考语料 → KG v3 的窗口进度表（corpus_ingest 的断点续跑账本）。
+
+    KG v3 的常规入口只认 ``generations``（生成段正文），参考语料没有进图路径，
+    所以 3173 章的《修真聊天群》在 v3 表里一行都没有。补建时按「章窗口」调
+    v3 抽取器，每窗口先登记一行，成功才置 done；中断后重跑只补 pending/failed，
+    已 done 的窗口不重复花 LLM 调用。
+
+    与 ``kg_ingest_quarantine`` 的分工：那张表存**被拒的行快照**，这张表存
+    **窗口级进度**（粒度不同，不合并）。
+    """
+
+    __tablename__ = "kg_corpus_windows"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    novel_id = Column(Integer, nullable=False)
+    #: f"{novel_id}:{chapter_start}-{chapter_end}"，跨次运行去重靠它
+    window_key = Column(String(64), nullable=False)
+    chapter_start = Column(Integer, nullable=False)
+    chapter_end = Column(Integer, nullable=False)
+    #: pending | running | done | failed
+    status = Column(String(16), nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    n_events = Column(Integer, nullable=False, default=0)
+    n_entities = Column(Integer, nullable=False, default=0)
+    error = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("novel_id", "window_key", name="uq_kg_corpus_window"),
+        Index("ix_kg_corpus_window_novel_status", "novel_id", "status"),
     )
 
 
@@ -982,6 +1045,12 @@ class DistillChunk(Base):
     chapter_start = Column(Integer, nullable=True)
     chapter_end = Column(Integer, nullable=True)
     payload = Column(JSON, nullable=False, default=dict)
+    #: 产出该块的 provider（`OpenCodeGo` / `CommandCode`…）。**老行为 NULL = 未知来源**，
+    #: 不按时间回填猜测值——那会把「不知道」伪装成「确定」。
+    provider = Column(String(32), nullable=True)
+    #: 产出该块的 endpoint（`base_url`）。同一 provider 换网关（如 go → provider/v1）时
+    #: 只有这一列能区分，模型 id 可能一字不差。
+    endpoint = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
@@ -1403,6 +1472,40 @@ class StyleBaseline(Base):
     )
 
 
+class NarrativeRuleWeight(Base):
+    """叙事规则的**生成后反馈权重**（按项目隔离，不是内存系数）。
+
+    第四层：`style_checks` 已经量出每段生成正文的核心指标，这里把「档案里的
+    规则」和「模型实际有没有做到」对上账：
+
+      - 规则声称「短句占 44%」，生成实测 18% → `misses +1`、权重 ×0.9；
+      - 规则声称的数字对得上，且与参考档案差异明显 → `hits +1`、权重 ×1.05。
+
+    权重在渲染选条时乘进总分（`select_rules_with_audit`），所以模型持续不遵守
+    的规则会自然沉底，而不是每次渲染都重新犯同一个错。
+
+    `rule_hash` 是规则原文（含证据）的 sha1 前 20 位，与档案顶层 `rule_scores`
+    的 key 只差维度前缀——权重跟着「文本本身」走，同一句话在多个维度里共享。
+    """
+
+    __tablename__ = "narrative_rule_weights"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    rule_hash = Column(String(32), nullable=False)
+    weight = Column(Float, nullable=False, default=1.0)
+    hits = Column(Integer, nullable=False, default=0)
+    misses = Column(Integer, nullable=False, default=0)
+    # 最近一次调整原因（人话，可直接展示给用户排查）
+    last_reason = Column(Text, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "rule_hash", name="uq_narrative_rule_weight"),
+        Index("ix_narrative_rule_weight_project", "project_id"),
+    )
+
+
 class StyleCheck(Base):
     """单次文风校验的**影子记录**（第一阶段：只记录，不判定、不阻断）。
 
@@ -1453,4 +1556,121 @@ class StyleCheck(Base):
     __table_args__ = (
         Index("idx_style_checks_proj_created", "project_id", "created_at"),
         Index("idx_style_checks_gen", "generation_id"),
+    )
+
+
+class RetrievalLog(Base):
+    """五级目录的**统一调用轨迹**（作者 agent / 助理 agent / 系统共用一张表）。
+
+    设计稿 §5.8–§5.11。一次工具调用一行，靠 `agent_kind` 区分是谁调的。
+    不按角色分表：分表会让「谁在越界」这类跨角色统计变成两条 SQL，字段一改还要改两处。
+
+    ## 为什么单独建表
+
+    `context_expansion_count` 的口径是「同一 rule 在同一检索会话里成功拿到 delta
+    的次数」。它是**检索行为**，不是规则本身，不能塞进 `style_distills` 的 JSON
+    （那会让每次写流水都改档案、触发档案失效）。而规则质量又要能按 rule 聚合，
+    所以拆成「轨迹 + 聚合」两张表。
+
+    ## 现在没有数据也要建
+
+    表结构先落库（novel 7 也建），P3 工具层上线前一直是空表。先建的理由：
+    - 字段口径要在设计阶段钉死，等有数据再改列会牵扯回填；
+    - `ensure_schema()` 的 create_all 只补缺失表，先把表建好，后续加列走迁移清单。
+
+    ## 字段口径
+
+    - `context_expansion_count`：本行所属会话内，该 `rule_id` 已成功返回 delta 的次数
+      （首次默认窗口、重复范围、`anchor_missing` 都不计）。首次调用写 0。
+    - `width`：本次 anchor 请求的外侧宽度；`is_delta=False` 表示默认窗口。
+    - `returned_chars`：本次实际返回的字数（预算与截断后）。
+    - `hit_ids`：本次命中的卡片 id（按返回顺序），用于「命中未采用」统计。
+    - `adopted_rule_ids`：**本段实际采用**的规则 id，段末回填到该段所有行；
+      未回填 = 未统计，不能当成「查了不用」。
+    - `budget_remaining`：调用后剩余额度 `{"turns": n, "anchor_chars": n}`。
+    - `status`：`ok` / `empty` / `budget_exhausted` / `denied` / `error`。
+      **被护栏拒绝也要落行**，否则事后分不清「没查」和「查了被拒」。
+    """
+
+    __tablename__ = "retrieval_logs"
+
+    id = Column(Integer, primary_key=True)
+    # 写作项目（哪本书的生成过程）。NULL = 纯检索评测，不经项目。
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    # 卡片/规则归属哪本书。NULL = 跨书通用约束（兜底池）。
+    novel_id = Column(Integer, nullable=True)
+    distill_id = Column(Integer, nullable=True)
+    # author / assistant / system
+    agent_kind = Column(String(16), nullable=False, default="author")
+    # 一次 agent 会话内保持不变；`context_expansion_count` 按它分组计数。
+    session_id = Column(String(64), nullable=False)
+    turn_no = Column(Integer, nullable=False, default=1)
+    # 轮内调用序号，从 1 递增；用于还原调用顺序。
+    seq = Column(Integer, nullable=False, default=1)
+    # 当前写第几段；`adopted_rule_ids` 按段回填。
+    segment_no = Column(Integer, nullable=True)
+    # browse / search / rule / anchor / similar
+    tool_name = Column(String(16), nullable=False)
+    path = Column(String(128), nullable=True)
+    rule_id = Column(String(32), nullable=True)
+    card_id = Column(String(32), nullable=True)
+    query = Column(Text, nullable=True)
+    hit_ids = Column(JSON, nullable=True)
+    width = Column(Integer, nullable=True)
+    is_delta = Column(Boolean, nullable=False, default=False)
+    returned_chars = Column(Integer, nullable=False, default=0)
+    budget_remaining = Column(JSON, nullable=True)
+    # explore / writing：探索池与回查池分开计（设计稿 §5.12）；空段（纯评测）为 NULL。
+    budget_pool = Column(String(16), nullable=True)
+    context_expansion_count = Column(Integer, nullable=False, default=0)
+    adopted_rule_ids = Column(JSON, nullable=True)
+    # 监察官软档标记（只记录、不改生成结果），见设计稿 §5.10。
+    soft_flags = Column(JSON, nullable=True)
+    status = Column(String(24), nullable=False, default="ok")
+    latency_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_retrieval_logs_session_rule", "session_id", "rule_id"),
+        Index("idx_retrieval_logs_session_segment", "session_id", "segment_no"),
+        Index("idx_retrieval_logs_novel_created", "novel_id", "created_at"),
+        Index("idx_retrieval_logs_tool_created", "tool_name", "created_at"),
+        Index("idx_retrieval_logs_agent_created", "agent_kind", "created_at"),
+    )
+
+
+class RuleQualityStat(Base):
+    """按 `rule_id` 聚合的检索质量（`retrieval_logs` 的唯一汇总表）。
+
+    口径见设计稿 §5.7：
+
+    - `context_expansion_count >= 3` → `needs_rewrite`：规则原文表达不清，
+      读者（agent）反复扩窗才读懂，不是模型不会读。
+    - `max_width_used`：最后读懂时用的最大宽度。≤600 判「词法/句式问题」，
+      1,200+ 判「规则结构问题」，用于决定重写还是拆分。
+    - `hits`：被 search/rule 选中的次数，用于区分「没人查」和「查了读不懂」。
+
+    这张表**允许滞后**：写入方是离线汇总任务，不是生成路径。
+    """
+
+    __tablename__ = "rule_quality_stats"
+
+    id = Column(Integer, primary_key=True)
+    # 汇总只按「具体书」聚合：卡片 id 本身就是 novel_id + text_hash，
+    # 不存在无主规则。这里不给 NULL，唯一键才挡得住重复行
+    # （sqlite 的唯一索引把 NULL 当互不相同，NULL 会让唯一约束形同虚设）。
+    novel_id = Column(Integer, nullable=False)
+    rule_id = Column(String(32), nullable=False)
+    hits = Column(Integer, nullable=False, default=0)
+    anchor_calls = Column(Integer, nullable=False, default=0)
+    context_expansion_count = Column(Integer, nullable=False, default=0)
+    max_width_used = Column(Integer, nullable=True)
+    needs_rewrite = Column(Boolean, nullable=False, default=False)
+    last_expanded_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        # 同一本书内一条规则只有一行汇总。
+        Index("uq_rule_quality_novel_rule", "novel_id", "rule_id", unique=True),
+        Index("idx_rule_quality_needs_rewrite", "needs_rewrite"),
     )
