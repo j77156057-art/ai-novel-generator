@@ -1,6 +1,6 @@
 # KG 抽取 / LLM 渠道 待办台账（2026-11-16）
 
-> 状态：条目 1 已实施（2026-11-16，待重启后端生效）；条目 2 仅记录，**未实现、未排期**。
+> 状态：条目 1 已实施（2026-11-16，待重启后端生效）；条目 2、条目 3 仅记录，**未实现、未排期**。
 > 触发背景：项目 7 第 5 段（`Generation id=72`，1458 字）入队后，`agent_runs #205` 连续 3 次
 > `MiniMax-M3.1-Flash` 读超时，于 2026-11-15T17:06:17Z 落 `failed`（`retry_exhausted`，48m09s）。
 
@@ -86,7 +86,111 @@
 
 ---
 
-## 附：本轮已确认但**不属于**上述两项的事实
+## 条目 3｜skills 诊断体系接线（18 份 playbook + `diagnostic_skills` 加载链）
+
+- **状态**：只记账，**未接线、未排期**（2026-11-16 只读复核；决定 A）。
+- **决策**：现在不接。成本是 3 个缺失模块 + registry 三处 + 14 份测试 + 4 个 fixture；
+  且技能体系依赖「生成 → 落库 → KG」主线先稳定。18 份 JSON 已在仓库里作为数据资产与
+  测试夹具，不接线不会丢能力。
+
+### 3.1 现状结论
+
+- 18 份 JSON 全部 `status=experimental`：
+  `body_consistency` v1-v2、`body_repair` v3-v4、`closed_inventory` v1-v8、
+  `foundation_input_health` v1、`planning_review` v1-v2、`prompt_health_audit` v1、
+  `text_quality_audit` v1、`text_quality_repair` v1（role=`editor`，其余 `diagnostic`）。
+- **生产零消费点**：`load_skill()` 的唯一生产调用点是
+  `backend/app/agents/diagnostic.py:265`，它属于 `diagnostic_tool()`
+  （`diagnostic.py:530-553`）；`diagnostic_tool` 全仓无调用方。`discover_skills()` 只被测试调用。
+  `body_repair.create_body_repair()`（`body_repair.py:532`）会用 `previous['skill']` 做复验，
+  但它自己也没有上游调用方（`prepare_body_repair` / `create_body_repair` 在 `backend/app` 内零调用）。
+- 实际身份：**数据资产 + 测试夹具**（`tests/test_diagnostic_skills_manifest.py`、
+  `tests/test_skill_packaging.py`），不服务任何请求。
+- 加载器本身可用且会真报错。`load_skill()`（`diagnostic_skills.py:110-140`）按
+  `ROOT/<skill_id>/v<version>.json` 路径读取；`validate_manifest()`（L61-107）会拦住：
+  `invalid_manifest_fields`（含额外字段）、`invalid_manifest_id`、`invalid_manifest_version`、
+  `invalid_manifest_status`、`invalid_manifest_list:*`、`invalid_manifest_contract`、
+  `unsupported_action`、`validated_requires_evidence`；`load_skill` 另拦
+  `invalid_skill_identifier`、`untrusted_skill`、`unknown_skill`、`skill_version_not_found`、
+  `manifest_identity_mismatch`、`skill_status_not_allowed`；只有 `OSError`/`JSONDecodeError`
+  被包装成 `invalid_manifest`。唯一静默点是 `discover_skills()` 的
+  `except ValueError: continue`（L151-152），坏清单被跳过。
+
+### 3.2 接线要动的确切位置（`backend/app/agents/registry.py`）
+
+1. `_MODEL_TOOL_PARAMETERS`（L970 起的 dict）：补 `run_diagnosis` 与
+   `list_diagnostic_skills` 的参数定义。main 侧对应 `_DIAGNOSTIC_PARAMETERS`
+   （`origin/main:backend/app/agents/registry.py:1887-1945`），含 `skill_id` / `skill_version` /
+   `allow_experimental`。
+2. `_DEFAULT_SPECS`（L1035 起的 tuple）：补两个 `ToolSpec`——`run_diagnosis` 指向
+   `diagnostic_tool`，`list_diagnostic_skills` 指向 `discover_skills`；main 的注册在
+   `registry.py:1842-1852` 与 `1930-1945`。
+3. `_register_default_tools`（L1225）：确保两个 spec 进入默认注册表，从而被
+   `backend/app/agents/diagnosis.py:251-254` 的白名单调用链执行。
+
+**为什么不动它就「没有任何请求能触达」**：模型工具层是唯一能把 `skill_id` + `skill_version`
+传进 `run_diagnostic_task()` 的地方。没有这两个工具，模型既看不到 `discover_skills()`
+的目录，也无法发起 `diagnostic_tool()`，18 份 JSON 不会被任何用户请求读到。
+
+### 3.3 必须先补的三个模块
+
+| 缺失模块 | 不补的后果 |
+|---|---|
+| `backend/app/agents/consent.py` | `diagnostic_tool` 在 `diagnostic.py:543-544` 导入 `experimental_consent_granted`；**第一次调用就 ImportError**。且 18 份 skill 全为 `experimental`，没有授权闸门只能一直 `skill_status_not_allowed` |
+| `backend/app/agents/prompt_audit.py` | `read_capability` 的 `prompt_health` 分支在 `diagnostic.py:159-161` 导入 `run_prompt_audit`；`prompt_health_audit v1` 一调用就 ImportError |
+| `backend/app/style/scope.py` | `read_capability` 的 `binding` 分支在 `diagnostic.py:120-121` 导入 `resolve_project_scope`；`inspect_narrative_binding` 失败，`foundation_input_health v1`（默认技能）跑不完 |
+
+### 3.4 版本固定为什么只是名义上的
+
+- `report['skill']` 只保留 `id/version/status`（`diagnostic.py:267`），随 `run.note` 落库
+  （`diagnostic.py:453-459`）；复验只比这三个键（`diagnostic.py:282-283`）。
+- `validate_manifest` 用 `set(value) != required` 做严格字段集校验
+  （`diagnostic_skills.py:62-64`），**新增 `sha256` 字段会被直接判 `invalid_manifest_fields`**。
+- 因此同版本号替换文件内容是静默的：给定版本号只能证明「当前磁盘这一份」，不能证明
+  「当时那次运行用的那一份」。`origin/main` 也只有三键（main 的 `diagnostic.py:267`），
+  这一步 main 也没做。
+- 让哈希链路成立要改三处：
+  1. 放开 `diagnostic_skills.py:62-64` 的字段集（或把哈希放进 sidecar 并在 L61-107 校验）；
+  2. `load_skill()`（L110-140）计算并返回 `sha256(文件字节)`；
+  3. `report['skill']`（`diagnostic.py:267`）写入该哈希，复验（L282-283）比对哈希而非仅版本号。
+
+### 3.5 缺失的 14 个测试与 4 个 fixture
+
+- 入口/发现：`test_diagnostic_discovery.py`、`test_diagnostic_subagent.py`、
+  `test_diagnostic_tool_observation.py`。
+- 闭集盘点：`test_closed_inventory_v3.py`、`test_closed_inventory_v4.py`、
+  `test_closed_inventory_v4_tool.py`。
+- 正文修复：`test_body_repair_decoupling.py`、`test_body_repair_delivery.py`、
+  `test_body_repair_multirange.py`、`test_body_repair_scope.py`、
+  `test_authority_repair_protocol.py`。
+- 规划/合流/纯对话：`test_planning_diagnostic.py`、`test_merge_diagnosis.py`、
+  `test_diagnosis_plain_dialogue.py`。
+- fixture/helper：`tests/fixtures/closed_inventory_v4_real_verdict.json`、
+  `tests/fixtures/planning_accepted_real_shape.json`、`tests/fixtures/body_repair_run79.json`、
+  `tests/helpers/probe_closed_inventory.py`。
+- **后果**：接线之后没有回归保护——「发现层静默跳过坏清单」「复验只比版本号」
+  「多区间范围越界」这三类问题都不会红。本地已有的
+  `test_diagnostic_skills_manifest.py`（18 文件、closed_inventory 8 版、body_consistency 2 版、
+  body_repair 2 版）与 `test_skill_packaging.py`（3 条 strict xfail）只覆盖加载与身份，
+  不覆盖接线行为。
+
+### 3.6 触发条件
+
+- 「生成 → 落库 → KG」主线稳定之后；或
+- 出现具体诊断需求：正文一致性核对、闭集盘点、提示词体检、文字质量修复；或
+- 需要「按版本复现当时提示词」的审计/合规要求。
+
+### 3.7 捡起来的第一步
+
+1. 先确认三个依赖模块（`consent.py`、`prompt_audit.py`、`style/scope.py`）能从 main 连带搬入
+   且不牵出新依赖（`style/scope.py` 对应 `projects.narrative_scope` 列，属第 3 批）。
+2. 在 `registry.py` 三处只加 `list_diagnostic_skills`，用 `discover_skills()` 验证目录可达。
+3. 跑 `tests/test_diagnostic_skills_manifest.py`，确认加载链未被改动破坏。
+4. 再搬 14 个测试与 4 个 fixture，最后才开 `run_diagnosis`。
+
+---
+
+## 附：本轮已确认但**不属于**上述条目的事实
 
 - `#205` 失败期间心跳每 15s 照写、`failures` 累计为 0、写锁可获取（窗口内 2 次 + 独立 3 次
   `BEGIN IMMEDIATE` 均成功）。
