@@ -6,9 +6,12 @@ import type {
   AssistantActionRequest,
   AssistantAnalyzeLogsRequest,
   AssistantApplyResult,
+  AssistantApplySelectedResponse,
   AssistantAuditCorpusRequest,
   AssistantAuditRequest,
   AssistantAuditResponse,
+  AssistantCleanCorpusRequest,
+  AssistantCleanCorpusResponse,
   AssistantDiagnoseRequest,
   AssistantDiagnoseResponse,
   AssistantInvokeGenerationRequest,
@@ -25,8 +28,14 @@ import type {
   AssistantQaResponse,
   AssistantRestoreRequest,
   AssistantRestoreResult,
+  AssistantRollbackBatchRequest,
+  AssistantRollbackBatchResult,
+  AssistantRollbackRequest,
+  AssistantRollbackResult,
   AssistantRunDetailResponse,
   AssistantRunListResponse,
+  AssistantSnapshotGroupListResponse,
+  AssistantSnapshotListResponse,
   AssistantVersionDiffResponse,
   AssistantVersionListResponse,
   CharacterDetail,
@@ -343,10 +352,6 @@ export const api = {
       `/projects/style-distills?status=${encodeURIComponent(status)}&limit=${encodeURIComponent(String(limit))}`,
     ),
 
-  /** 单条蒸馏库条目详情（含 style_narrative 全文）。 */
-  getStyleDistill: (distillId: number) =>
-    request<StyleDistillDetail>(`/projects/style-distills/${distillId}`),
-
   /** 归档一条蒸馏库条目（不再被复用，但保留供查阅）。 */
   archiveStyleDistill: (distillId: number) =>
     request<StyleDistillListResponse["items"][number]>(
@@ -361,12 +366,6 @@ export const api = {
       body: JSON.stringify({ distill_id: distillId } satisfies StyleDistillApplyRequest),
     }),
 
-  buildKg: (projectId: number, novelId?: number | null) =>
-    request<{ characters: number; plotholes: number; relationships: number }>(
-      `/projects/${projectId}/build-kg${novelId ? `?novel_id=${novelId}` : ""}`,
-      jsonInit("POST"),
-    ),
-
   getKg: (
     projectId: number,
     type: "all" | "character" | "plothole" = "all",
@@ -374,18 +373,6 @@ export const api = {
   ) =>
     request<Graph>(
       `/projects/${projectId}/kg?type=${type}${source ? `&source=${encodeURIComponent(source)}` : ""}`,
-    ),
-
-  getCharacter: (projectId: number, name: string) =>
-    request<CharacterDetail>(
-      `/projects/${projectId}/kg/character/${encodeURIComponent(name)}`,
-    ),
-
-  // source 与 getKg 保持对称：不传＝本次创作自己的图谱（生成默认），
-  // 传 novel:{id} 才能看参考语料那一侧的提醒
-  getReminders: (projectId: number, source?: string | null) =>
-    request<Reminders>(
-      `/projects/${projectId}/reminders${source ? `?source=${encodeURIComponent(source)}` : ""}`,
     ),
 
   // ---------- 向导（选语料 → 类型/风格 → 内容 → 构思 → 生成） ----------
@@ -418,15 +405,6 @@ export const api = {
     request<GeneratePlan>(
       "/generate-plan",
       jsonInit("POST", { project_id: projectId }),
-    ),
-
-  generate: (projectId: number, maxChars?: number | null) =>
-    request<GenerateResult>(
-      "/generate",
-      jsonInit("POST", {
-        project_id: projectId,
-        max_chars: maxChars ?? null,
-      }),
     ),
 
   // 流式续写：SSE 逐块回调 onChunk，结束回调 onDone。流结束时 Promise resolve。
@@ -533,16 +511,6 @@ export const api = {
       }).catch((e) => reject(e));
     }),
 
-  generateLoop: (projectId: number, segments: number, maxChars?: number) =>
-    request<GenerateLoopResult>(
-      "/generate-loop",
-      jsonInit("POST", {
-        project_id: projectId,
-        segments,
-        max_chars: maxChars ?? null,
-      }),
-    ),
-
   listGenerations: (projectId: number) =>
     request<GenerationOut[]>(`/generations/${projectId}`),
 
@@ -584,117 +552,92 @@ export const api = {
   assistantQa: (body: AssistantQaRequest) =>
     request<AssistantQaResponse>("/assistant/qa", jsonInit("POST", body)),
 
-  /** 2. 诊断：确定性规则先行、模型后置，返回结构化 issues。 */
-  assistantDiagnose: (body: AssistantDiagnoseRequest) =>
-    request<AssistantDiagnoseResponse>("/assistant/diagnose", jsonInit("POST", body)),
+  // 诊断 / 提案 / 版本 / 提示词 / 运行日志 / 三类审核的封装已从前端收起：
+  // 能力改由助手按后端动作目录（app/agents/action_catalog.py）发现，读走工具、
+  // 写走待确认卡片、破坏性操作只在页面做。后端端点保持不变，契约见 routers。
 
-  /** 3. 创建提案（停在 pending，业务表零写入）。after_text 必须由用户填写。 */
-  createProposal: (body: AssistantProposalCreate) =>
-    request<AssistantProposalCreateResponse>(
-      "/assistant/proposals",
+  // ---------- 档 3：前端显式入口专用（助手不得代执行）----------
+  //
+  // 语料清洗 / 快照回滚 / 批量应用提案在动作目录里登记为 frontend_only：
+  // 助手只能告诉用户「去哪个页面」，真正触发只发生在这里。页面负责
+  // 「影响范围说明 → 二次确认 → 可核对回执」三步，actor 固定串标记来源。
+
+  /** 语料清洗：规则先行 + 模型复核，只产 pending 提案，不写 novel_chunks。 */
+  cleanCorpus: (body: AssistantCleanCorpusRequest) =>
+    request<AssistantCleanCorpusResponse>(
+      "/assistant/clean-corpus",
       jsonInit("POST", body),
     ),
 
-  /** 4. 提案列表（可按 status 过滤）。 */
-  listProposals: (projectId: number, status?: AssistantProposalStatus | null, limit = 100) =>
-    request<AssistantProposalListResponse>(
-      `/assistant/proposals?project_id=${projectId}` +
-        (status ? `&status=${encodeURIComponent(status)}` : "") +
-        `&limit=${limit}`,
+  /** 重写快照列表；只有 status="applied" 的旧快照还能回滚。 */
+  listSnapshots: (projectId: number, status?: string | null, limit = 50) => {
+    const p = new URLSearchParams({
+      project_id: String(projectId),
+      limit: String(limit),
+    });
+    if (status) p.set("status", status);
+    return request<AssistantSnapshotListResponse>(`/assistant/snapshots?${p}`);
+  },
+
+  /** 按一次操作（batch_id）聚合的撤销入口（整组回滚用）。 */
+  listSnapshotGroups: (projectId: number, limit = 20) =>
+    request<AssistantSnapshotGroupListResponse>(
+      `/assistant/snapshots/groups?project_id=${projectId}&limit=${limit}`,
     ),
 
-  /** 5. 提案详情（含 diff 与目标基线指纹）。 */
-  getProposal: (proposalId: number) =>
-    request<AssistantProposalDetailResponse>(`/assistant/proposals/${proposalId}`),
+  /** 单段回滚；不给 snapshot_id 时可只给 segment_no（撤销该段上一次）。 */
+  rollbackSnapshot: (body: AssistantRollbackRequest) =>
+    request<AssistantRollbackResult>(
+      "/assistant/snapshots/rollback",
+      jsonInit("POST", body),
+    ),
 
-  /** 6. 批准：pending → approved。只改状态，不写业务表。 */
-  approveProposal: (proposalId: number, body: AssistantActionRequest) =>
+  /** 整组回滚：一个事务恢复所有正文，任一段不自洽则零写入。 */
+  rollbackSnapshotGroup: (body: AssistantRollbackBatchRequest) =>
+    request<AssistantRollbackBatchResult>(
+      "/assistant/snapshots/rollback-group",
+      jsonInit("POST", body),
+    ),
+
+  /** 提案列表（status 可选：pending / approved / applied / rejected / stale…）。 */
+  listProposals: (projectId: number, status?: string | null, limit = 100) => {
+    const p = new URLSearchParams({
+      project_id: String(projectId),
+      limit: String(limit),
+    });
+    if (status) p.set("status", status);
+    return request<AssistantProposalListResponse>(`/assistant/proposals?${p}`);
+  },
+
+  /** 批准一条 pending 提案：只改状态，不写任何业务表。 */
+  approveProposal: (proposalId: number) =>
     request<AssistantProposalActionResponse>(
       `/assistant/proposals/${proposalId}/approve`,
-      jsonInit("POST", body),
-    ),
-
-  /** 7. 拒绝：pending → rejected（终态）。 */
-  rejectProposal: (proposalId: number, body: AssistantActionRequest) =>
-    request<AssistantProposalActionResponse>(
-      `/assistant/proposals/${proposalId}/reject`,
-      jsonInit("POST", body),
-    ),
-
-  /** 8. 应用：approved → applied，唯一写业务表的入口。漂移时返回 409(stale)。 */
-  applyProposal: (proposalId: number, body: AssistantActionRequest) =>
-    request<AssistantApplyResult>(
-      `/assistant/proposals/${proposalId}/apply`,
-      jsonInit("POST", body),
-    ),
-
-  /** 9. 版本历史（含回滚产生的版本）。 */
-  listVersions: (projectId: number, kind?: string | null, limit = 100) =>
-    request<AssistantVersionListResponse>(
-      `/assistant/versions?project_id=${projectId}` +
-        (kind ? `&kind=${encodeURIComponent(kind)}` : "") +
-        `&limit=${limit}`,
-    ),
-
-  /** 10. 两个版本的内容 diff（from_id → to_id）。 */
-  diffVersions: (fromId: number, toId: number) =>
-    request<AssistantVersionDiffResponse>(
-      `/assistant/versions/diff?from_id=${fromId}&to_id=${toId}`,
-    ),
-
-  /** 11. 回滚到某个版本；回滚本身也生成一条新 Version（历史不丢）。 */
-  restoreVersion: (versionId: number, body: AssistantRestoreRequest) =>
-    request<AssistantRestoreResult>(
-      `/assistant/versions/${versionId}/restore`,
-      jsonInit("POST", body),
-    ),
-
-  /** 12. 当前生效提示词来源（runtime_override / code_default）。 */
-  promptsActive: (projectId: number) =>
-    request<AssistantPromptsActiveResponse>(
-      `/assistant/prompts/active?project_id=${projectId}`,
-    ),
-
-  /** 13. 提示词覆写操作历史。 */
-  promptVersions: (projectId: number) =>
-    request<AssistantPromptVersionsResponse>(
-      `/assistant/prompts/versions?project_id=${projectId}`,
-    ),
-
-  // ---------- Assistant 运行日志 / 审核 / 调动生成（后端已合入） ----------
-
-  /** GET /api/assistant/runs?project_id=&status=&limit=（助手自己的运行日志，只读）。 */
-  assistantRuns: (projectId: number, status?: string | null, limit = 50) =>
-    request<AssistantRunListResponse>(
-      `/assistant/runs?project_id=${projectId}` +
-        (status ? `&status=${encodeURIComponent(status)}` : "") +
-        `&limit=${limit}`,
+      jsonInit("POST", { action: "approve" }),
     ),
 
   /**
-   * GET /api/assistant/runs/{run_id}（单条日志详情，含该 run 的全部 Evidence）。
-   * projectId 可选：带了后端会做跨项目校验（不匹配 → 404）。
+   * 应用单条 approved 提案：走单条专用端点（写业务表 + 写 Version）。
+   * 409 分两种：目标漂移 detail 是 `{error:"stale", message, hint, ...}`；
+   * 状态机拒绝 detail 是字符串（如 pending 直接 apply、重复 apply）。
    */
-  assistantRunDetail: (runId: number, projectId?: number | null) =>
-    request<AssistantRunDetailResponse>(
-      `/assistant/runs/${runId}${projectId ? `?project_id=${projectId}` : ""}`,
+  applyProposal: (proposalId: number, actor = "ui:workspace") =>
+    request<AssistantApplyResult>(
+      `/assistant/proposals/${proposalId}/apply`,
+      jsonInit("POST", { action: "apply", actor }),
     ),
 
-  /** POST /api/assistant/analyze-logs（日志分析，只读，统一 issues 结构）。 */
-  assistantAnalyzeLogs: (body: AssistantAnalyzeLogsRequest) =>
-    request<AssistantAuditResponse>("/assistant/analyze-logs", jsonInit("POST", body)),
+  /**
+   * 受控批量应用：必须显式枚举 id，整批同一事务、同成同败。
+   * 任一 stale / blocked → 409，detail 是 `{ok:false, stale[], blocked[], reason}`。
+   */
+  applySelectedProposals: (proposalIds: number[], actor = "ui:workspace") =>
+    request<AssistantApplySelectedResponse>(
+      "/assistant/proposals/apply-selected",
+      jsonInit("POST", { action: "apply", proposal_ids: proposalIds, actor }),
+    ),
 
-  /** POST /api/assistant/audit-corpus（参考语料审核，只读，统一 issues）。 */
-  assistantAuditCorpus: (body: AssistantAuditCorpusRequest) =>
-    request<AssistantAuditResponse>("/assistant/audit-corpus", jsonInit("POST", body)),
-
-  /** POST /api/assistant/audit-kg（知识图谱审核，只读，统一 issues）。 */
-  assistantAuditKg: (body: AssistantAuditRequest) =>
-    request<AssistantAuditResponse>("/assistant/audit-kg", jsonInit("POST", body)),
-
-  /** POST /api/assistant/audit-generation（生成质量审核，只读，统一 issues）。 */
-  assistantAuditGeneration: (body: AssistantAuditRequest) =>
-    request<AssistantAuditResponse>("/assistant/audit-generation", jsonInit("POST", body)),
+  // ---------- 调动生成（后端已合入） ----------
 
   /**
    * POST /api/assistant/invoke-generation（助手按用户显式指令调动 Writer 生成）。

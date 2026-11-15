@@ -734,12 +734,19 @@ export interface RegenerateStreamDoneMeta {
 //      一律不要带这四个键。
 // ==================================================================
 
-export type AssistantProposalType = "text_edit" | "prompt_edit" | "fact_resolution";
+export type AssistantProposalType =
+  | "text_edit"
+  | "prompt_edit"
+  | "fact_resolution"
+  /** 语料清洗产出（clean-corpus 只产 pending，不写 novel_chunks）。 */
+  | "corpus_text_edit";
 
 export type AssistantTargetKind =
   | "generation_text"
   | "project_plot_bible"
-  | "prompt_override";
+  | "prompt_override"
+  /** 语料分片正文（target_id 是 novel_chunks.id 的十进制字符串）。 */
+  | "novel_chunk_text";
 
 export type AssistantProposalStatus =
   | "pending"
@@ -875,6 +882,53 @@ export interface AssistantPendingAction {
   body: Record<string, unknown>;
 }
 
+// ---------- 工具调用轨迹（function calling 接入） ----------
+
+/**
+ * 一次工具调用（后端 `/qa` 的 `tool_trace[]`）。
+ *
+ * 只含只读工具名 / 参数原文（截断）/ 状态 / 耗时，**没有** endpoint、body
+ * 等写语义字段 —— 前端只用来展示「模型调了什么、拿到没有」，不据此发请求。
+ */
+export interface AssistantToolTraceItem {
+  /** 第几轮请求里发起的（模型可在一轮里发多个调用）。 */
+  step: number;
+  /** 本次问答内的调用序号（从 1 开始）。 */
+  seq: number;
+  /** 工具名（必然在只读白名单内；旧后端不会出现这个字段）。 */
+  name: string;
+  /** 模型给的参数原文（服务端已按 300 字符截断并打标记）。 */
+  arguments: string;
+  /** ok=已执行；denied=不在白名单，未执行；error=参数非法或执行失败。 */
+  status: "ok" | "denied" | "error" | string;
+  /** 工具执行耗时（毫秒）。 */
+  latency_ms: number;
+}
+
+/**
+ * 动作目录项（后端 `available_actions[]`）。
+ *
+ * 档 2 / 档 3 只会出现在这里（文本发现），永远不会变成可调用的工具；
+ * 前端当前只按需展示，不据此直接发写请求（写操作仍走待确认卡片）。
+ */
+export interface AssistantAvailableAction {
+  key: string;
+  title: string;
+  summary: string;
+  category: "read" | "write" | "destructive" | string;
+  policy: "auto_read" | "propose_write" | "frontend_only" | "unwired_read" | string;
+  /** 面向用户的一句话策略解释（服务端下发，前端不自己编）。 */
+  policy_hint: string;
+  endpoint: string | null;
+  method: string | null;
+  read_tool: string | null;
+  frontend_entry: string;
+  triggers: string[];
+  requires_confirmation: boolean;
+  batch: boolean;
+  touches_config: boolean;
+}
+
 // ---------- 响应体 ----------
 
 export interface AssistantQaResponse {
@@ -895,6 +949,17 @@ export interface AssistantQaResponse {
   rules_evaluated?: string[];
   /** 待用户确认的写操作卡片；旧后端不返回 → [] → 整段不渲染。 */
   pending_actions?: AssistantPendingAction[];
+  /**
+   * 本次取证的执行方式：`model`=模型自主选了工具；`deterministic`=回落确定性检索。
+   * 旧后端不返回 → undefined → 不显示该标签。
+   */
+  tool_mode?: "model" | "deterministic";
+  /** 模型自主调用轨迹；确定性路径为空数组，旧后端不返回 → undefined。 */
+  tool_trace?: AssistantToolTraceItem[];
+  /** 回落原因（仅 deterministic 时非空；供诊断，不展示为正文）。 */
+  tool_fallback_reason?: string;
+  /** 本次问题命中的动作目录项（档 2/3 只会出现在这里）。 */
+  available_actions?: AssistantAvailableAction[];
 }
 
 export interface AssistantDiagnoseResponse extends AssistantQaResponse {
@@ -1742,4 +1807,210 @@ export interface WizardRoleChatResponse {
   answer: string;
   character: string;
   scene: string;
+}
+
+// ==================================================================
+// 档 3 前端显式入口：语料清洗 / 快照回滚 / 批量应用提案
+// ------------------------------------------------------------------
+// 三者在 backend/app/agents/action_catalog.py 里登记为 frontend_only：
+// 助手只能引导用户来页面操作，页面自己完成「影响范围确认 → 二次确认 →
+// 可核对回执」。前端不得从对话框直接触发这三条链路。
+// ==================================================================
+
+/** POST /api/assistant/clean-corpus 请求体（project_id / novel_id 至少给一个）。 */
+export interface AssistantCleanCorpusRequest {
+  project_id?: number | null;
+  novel_id?: number | null;
+  chunk_ids?: number[] | null;
+  /** 后端合法区间 [1, MAX_CLEAN_CHUNK_LIMIT=200]，默认 20。 */
+  limit?: number;
+  /** true = 只检测与复核，不创建提案。 */
+  dry_run?: boolean;
+}
+
+/** 一条建议修正（suggested_edits[]）；proposed=true 表示已落成提案。 */
+export interface AssistantCleanEdit {
+  chunk_id: number;
+  novel_id: number;
+  rules: string[];
+  /** rule = 确定性修正；model = 模型复核。 */
+  source: string;
+  before: string;
+  after: string;
+  reason: string;
+  confidence: number;
+  proposed: boolean;
+  skip_reason?: string;
+}
+
+/** 被护栏丢弃的模型输出（model_rejected[]）。 */
+export interface AssistantCleanReject {
+  chunk_id: number;
+  reason: string;
+}
+
+/** POST /api/assistant/clean-corpus 响应。 */
+export interface AssistantCleanCorpusResponse {
+  answer: string;
+  issues: AssistantIssue[];
+  findings: AssistantIssue[];
+  suggested_edits: AssistantCleanEdit[];
+  model_rejected: AssistantCleanReject[];
+  proposals: AssistantProposal[];
+  proposal_count: number;
+  dry_run: boolean;
+  model_participated: boolean;
+  model_note: string;
+  evidence: AssistantEvidence[];
+  confidence: number;
+  agent_run_id: number;
+  tool_results: {
+    chunks_scanned: number;
+    limit: number;
+    novel_id: number | null;
+    chunk_ids: number[] | null;
+    findings_by_rule: Record<string, number>;
+    findings_by_severity: Record<string, number>;
+    model_note: string;
+    model_rejected: AssistantCleanReject[];
+    hint_only_rules: string[];
+  };
+  rules_evaluated: string[];
+  scope: {
+    project_id: number;
+    novel_id: number | null;
+    chunk_ids: number[] | null;
+    limit: number;
+    chunks_scanned: number;
+  };
+}
+
+/** GenerationSnapshot 的一行（GET /api/assistant/snapshots）。 */
+export interface AssistantSnapshot {
+  id: number;
+  project_id: number;
+  generation_id: number;
+  segment_no: number;
+  batch_id: string | null;
+  operation: string;
+  /** pending | applied | failed | rolled_back */
+  status: string;
+  before_hash: string | null;
+  after_hash: string | null;
+  instruction: string | null;
+  scope_mismatch: Record<string, unknown> | null;
+  length_drop: Record<string, unknown> | null;
+  agent_run_id: number | null;
+  bible_hash: string | null;
+  error_reason: string | null;
+  clarification: Record<string, unknown> | null;
+  created_at: string | null;
+  finished_at: string | null;
+  rolled_back_at: string | null;
+  rolled_back_by_snapshot_id: number | null;
+  before_chars: number;
+  after_chars: number;
+  /** 快照指向的正文行是否还在。false 时点确认只会 409，界面应直接禁用。 */
+  generation_exists: boolean;
+  /** 只有 applied 且正文行还在的旧快照还能回滚。 */
+  undoable: boolean;
+}
+
+export interface AssistantSnapshotListResponse {
+  items: AssistantSnapshot[];
+  count: number;
+}
+
+/** 一次操作的聚合（GET /api/assistant/snapshots/groups），整组回滚用。 */
+export interface AssistantSnapshotGroup {
+  batch_id: string;
+  operation: string;
+  created_at: string | null;
+  segments: number[];
+  applied: number;
+  failed: number;
+  rolled_back: number;
+  /** 组内 applied 快照指向的正文行是否都还在。false 时整组回滚必被拒。 */
+  generation_exists: boolean;
+  undoable: boolean;
+}
+
+export interface AssistantSnapshotGroupListResponse {
+  items: AssistantSnapshotGroup[];
+  count: number;
+}
+
+/** auto：设定变过就 409 让用户选；text_only：只退正文；with_bible：先退设定再退正文。 */
+export type AssistantRollbackMode = "auto" | "text_only" | "with_bible";
+
+export interface AssistantRollbackRequest {
+  project_id: number;
+  snapshot_id?: number | null;
+  segment_no?: number | null;
+  mode?: AssistantRollbackMode;
+  actor?: string | null;
+}
+
+export interface AssistantRollbackBatchRequest {
+  project_id: number;
+  batch_id: string;
+  mode?: AssistantRollbackMode;
+  actor?: string | null;
+}
+
+/** 单段回滚成功回执。 */
+export interface AssistantRollbackResult {
+  ok: true;
+  restored_snapshot_id: number;
+  rollback_snapshot_id: number;
+  rollback_batch_id: string;
+  segment_no: number;
+  chars: number;
+  text_hash: string;
+  operation: string;
+  actor: string | null;
+  warnings: string[];
+  derived: Record<string, unknown>;
+}
+
+/** 整组回滚成功回执。 */
+export interface AssistantRollbackBatchResult {
+  ok: true;
+  batch_id: string;
+  rollback_batch_id: string;
+  segments: {
+    segment_no: number;
+    restored_snapshot_id: number;
+    rollback_snapshot_id: number;
+    chars: number;
+  }[];
+  count: number;
+  operation: string;
+  actor: string | null;
+  warnings: string[];
+  derived: Record<string, unknown>;
+}
+
+/** 批量应用的逐条失败原因。 */
+export interface AssistantApplyConflictItem {
+  proposal_id: number | null;
+  status?: string;
+  reason: string;
+}
+
+/** POST /api/assistant/proposals/apply-selected 请求体（必须显式枚举 id）。 */
+export interface AssistantApplySelectedRequest {
+  action: "apply";
+  proposal_ids: number[];
+  actor?: string | null;
+}
+
+/** apply-selected 成功回执；409 时 detail 是同一形状且 ok=false。 */
+export interface AssistantApplySelectedResponse {
+  ok: boolean;
+  applied: AssistantApplyResult[];
+  stale: AssistantApplyConflictItem[];
+  blocked: AssistantApplyConflictItem[];
+  reason: string;
+  proposal_ids?: number[];
 }

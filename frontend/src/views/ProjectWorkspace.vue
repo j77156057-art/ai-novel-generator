@@ -1,10 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { api } from "@/api/client";
+import { api, ApiError } from "@/api/client";
 import type {
   AlertsResponse,
+  AssistantApplyResult,
+  AssistantApplySelectedResponse,
   AssistantClarifyCandidate,
+  AssistantProposal,
+  AssistantRollbackBatchResult,
+  AssistantRollbackMode,
+  AssistantRollbackResult,
+  AssistantSnapshot,
+  AssistantSnapshotGroup,
   DistillJob,
   GeneratePlan,
   Graph,
@@ -500,6 +508,429 @@ async function loadGenerations() {
     generationsError.value = errorText(err);
   } finally {
     generationsLoading.value = false;
+  }
+}
+
+// ==================================================================
+// 重写快照与回滚（档 3：前端显式入口，助手不代执行）
+// ------------------------------------------------------------------
+// 快照由 invoke-generation 每次重写时自动记录；这里只负责「退回去」。
+// 三条硬规则：
+//   1. 只有 status="applied" 的旧快照能回滚（列表按该状态取）；
+//   2. 二次确认必须写清「第几段、当前正文会被换成什么、退到哪个快照 id」；
+//   3. 回滚本身也会生成新快照，回执里给出 id，可再核对/再撤销。
+// ==================================================================
+const ROLLBACK_ACTOR = "ui:workspace";
+
+const snapshotList = ref<AssistantSnapshot[]>([]);
+const snapshotGroups = ref<AssistantSnapshotGroup[]>([]);
+const snapshotsLoading = ref(false);
+const snapshotsError = ref<string | null>(null);
+
+const rollbackTarget = ref<
+  | { kind: "segment"; snapshot: AssistantSnapshot }
+  | { kind: "group"; group: AssistantSnapshotGroup }
+  | null
+>(null);
+const rollbackBusy = ref(false);
+const rollbackError = ref<string | null>(null);
+/** 整组回滚被拒时后端给的逐段原因（detail.blockers）。 */
+const rollbackBlockers = ref<
+  { snapshot_id: number; segment_no: number; reason: string }[]
+>([]);
+/** 设定漂移 409：后端给三个选项，用户在模态里二次选择后才继续。 */
+const rollbackDrift = ref<{
+  message: string;
+  canRestoreBible: boolean;
+  options: { id: string; label: string }[];
+} | null>(null);
+const rollbackResult = ref<
+  | { kind: "segment"; data: AssistantRollbackResult }
+  | { kind: "group"; data: AssistantRollbackBatchResult }
+  | null
+>(null);
+
+async function loadSnapshots() {
+  snapshotsLoading.value = true;
+  snapshotsError.value = null;
+  try {
+    const [list, groups] = await Promise.all([
+      api.listSnapshots(projectId, "applied", 50),
+      api.listSnapshotGroups(projectId, 20),
+    ]);
+    snapshotList.value = list.items;
+    snapshotGroups.value = groups.items;
+  } catch (err) {
+    snapshotList.value = [];
+    snapshotGroups.value = [];
+    snapshotsError.value = errorText(err);
+  } finally {
+    snapshotsLoading.value = false;
+  }
+}
+
+/** 打开确认模态；不发任何写请求（真正的请求只在 submitRollback 里）。 */
+function openRollbackSnapshot(s: AssistantSnapshot) {
+  rollbackError.value = null;
+  rollbackDrift.value = null;
+  rollbackBlockers.value = [];
+  rollbackResult.value = null;
+  rollbackTarget.value = { kind: "segment", snapshot: s };
+}
+
+function openRollbackGroup(g: AssistantSnapshotGroup) {
+  rollbackError.value = null;
+  rollbackDrift.value = null;
+  rollbackBlockers.value = [];
+  rollbackResult.value = null;
+  rollbackTarget.value = { kind: "group", group: g };
+}
+
+function closeRollback() {
+  if (rollbackBusy.value) return;
+  rollbackTarget.value = null;
+  rollbackError.value = null;
+  rollbackDrift.value = null;
+  rollbackBlockers.value = [];
+}
+
+/** 确认文案：影响范围必须在点击之前就看得见。 */
+const rollbackConfirm = computed(() => {
+  const t = rollbackTarget.value;
+  if (!t) return null;
+  if (t.kind === "segment") {
+    const s = t.snapshot;
+    const cur = generations.value.find((g) => g.id === s.generation_id);
+    const curChars = cur?.text ? cur.text.length : null;
+    return {
+      title: `确认回滚到快照 #${s.id}`,
+      lead: `第 ${s.segment_no} 段（正文 #${s.generation_id}）`,
+      lines: [
+        `覆盖：该段当前正文${curChars != null ? `（约 ${curChars} 字）` : ""}会被替换为快照 #${s.id} 记录的 before_text（${s.before_chars} 字）。`,
+        `定位：before_hash ${(s.before_hash || "—").slice(0, 12)} · 来源操作 ${s.operation} · 快照时间 ${s.created_at || "—"}。`,
+        "不动：其它段与剧情圣经都不受影响；若设定自该快照后被改过，会先让你选「只退正文 / 先退设定再退正文 / 取消」。",
+        "可再撤销：本次回滚会生成一条新快照（回执里给出 id），核对不满意还可以再退。",
+        "拒绝条件：该段正文在快照之后又被改过时，后端会拒绝覆盖，整段保持不动。",
+      ],
+      button: "确认回滚本段",
+    };
+  }
+  const g = t.group;
+  return {
+    title: `确认整组回滚 ${g.batch_id.slice(0, 8)}`,
+    lead: `一次「${g.operation}」操作，共 ${g.segments.length} 段：第 ${g.segments.join("、")} 段`,
+    lines: [
+      `覆盖：上述每一段的当前正文都会被回退到各自快照记录的 before_text（共 ${g.segments.length} 段）。`,
+      `组内状态：applied ${g.applied} · failed ${g.failed} · 已回滚过 ${g.rolled_back}。`,
+      "同成同败：任一段不自洽（在那批之后又被改过），整组零写入并列出是哪几段。",
+      "可再撤销：每段都会生成一条新快照，回执逐段列出 id。",
+    ],
+    button: "确认整组回滚",
+  };
+});
+
+/**
+ * 设定漂移时后端返回的三个 option id（BibleDrift.detail.options）→ 回滚 mode。
+ * id 是后端契约，不在这里另起名字；cancel 不发请求。
+ */
+const ROLLBACK_MODE_BY_OPTION: Record<string, AssistantRollbackMode | "cancel"> = {
+  restore_bible_then_text: "with_bible",
+  text_only: "text_only",
+  cancel: "cancel",
+};
+
+async function chooseDrift(optionId: string) {
+  const mode = ROLLBACK_MODE_BY_OPTION[optionId];
+  if (!mode) return;
+  if (mode === "cancel") {
+    closeRollback();
+    return;
+  }
+  await submitRollback(mode);
+}
+
+async function submitRollback(mode: AssistantRollbackMode = "auto") {
+  // 防绕过：没有打开确认模态、没有目标，一律不发请求。
+  const t = rollbackTarget.value;
+  if (!t || rollbackBusy.value) return;
+  rollbackBusy.value = true;
+  rollbackError.value = null;
+  rollbackBlockers.value = [];
+  try {
+    if (t.kind === "segment") {
+      const data = await api.rollbackSnapshot({
+        project_id: projectId,
+        snapshot_id: t.snapshot.id,
+        mode,
+        actor: ROLLBACK_ACTOR,
+      });
+      rollbackResult.value = { kind: "segment", data };
+    } else {
+      const data = await api.rollbackSnapshotGroup({
+        project_id: projectId,
+        batch_id: t.group.batch_id,
+        mode,
+        actor: ROLLBACK_ACTOR,
+      });
+      rollbackResult.value = { kind: "group", data };
+    }
+    rollbackTarget.value = null;
+    rollbackDrift.value = null;
+    await Promise.all([loadGenerations(), loadSnapshots()]);
+  } catch (err) {
+    const detail =
+      err instanceof ApiError && err.detail && typeof err.detail === "object"
+        ? (err.detail as Record<string, unknown>)
+        : null;
+    if (detail?.code === "bible_changed_since_snapshot") {
+      const rawOptions = Array.isArray(detail.options) ? detail.options : [];
+      rollbackDrift.value = {
+        message: String(detail.message ?? "设定在快照之后被改过"),
+        canRestoreBible: detail.can_restore_bible !== false,
+        options: rawOptions
+          .filter((o): o is { id: string; label: string } =>
+            !!o && typeof o === "object" && "id" in o && "label" in o)
+          .map((o) => ({ id: String(o.id), label: String(o.label) })),
+      };
+    } else if (
+      detail?.code === "batch_not_rollbackable" &&
+      Array.isArray(detail.blockers)
+    ) {
+      // 后端逐段给了 snapshot_id / segment_no / reason。只渲染总述等于把
+      // 「哪几段被拦」吞掉，用户只能靠猜，所以这里原样列出来。
+      rollbackBlockers.value = (detail.blockers as unknown[])
+        .filter((b): b is Record<string, unknown> => !!b && typeof b === "object")
+        .map((b) => ({
+          snapshot_id: Number(b.snapshot_id ?? 0),
+          segment_no: Number(b.segment_no ?? 0),
+          reason: String(b.reason ?? ""),
+        }));
+      rollbackError.value = String(detail.message ?? errorText(err));
+    } else {
+      rollbackError.value = errorText(err);
+    }
+  } finally {
+    rollbackBusy.value = false;
+  }
+}
+
+// ==================================================================
+// 待应用提案：批准 → 勾选 → 受控批量应用（档 3：前端显式入口）
+// ------------------------------------------------------------------
+// 批量应用只接受**已批准**的提案，且必须显式枚举 id、整批同一事务。
+// 医院式的三步都在这里：批准（只改状态）→ 勾选 → 确认（写清覆盖哪些目标）→ 应用。
+// ==================================================================
+/** 与后端 MAX_BULK_APPLY 对齐（app/agents/proposals.py）。 */
+const MAX_BULK_APPLY = 50;
+
+const pendingProposals = ref<AssistantProposal[]>([]);
+const approvedProposals = ref<AssistantProposal[]>([]);
+const proposalsLoading = ref(false);
+const proposalsError = ref<string | null>(null);
+const selectedProposalIds = ref<number[]>([]);
+const approveBusyId = ref<number | null>(null);
+
+const applyConfirmOpen = ref(false);
+const applyBusy = ref(false);
+const applyError = ref<string | null>(null);
+const applyConflict = ref<AssistantApplySelectedResponse | null>(null);
+const applyResult = ref<AssistantApplyResult[] | null>(null);
+
+// 单条应用：走 /proposals/{id}/apply 专用端点，与批量（apply-selected）分开。
+const singleApplyTarget = ref<AssistantProposal | null>(null);
+const singleApplyBusy = ref(false);
+const singleApplyError = ref<string | null>(null);
+const singleApplyResult = ref<AssistantApplyResult | null>(null);
+
+async function loadProposals() {
+  proposalsLoading.value = true;
+  proposalsError.value = null;
+  try {
+    const [pending, approved] = await Promise.all([
+      api.listProposals(projectId, "pending", MAX_BULK_APPLY),
+      api.listProposals(projectId, "approved", MAX_BULK_APPLY),
+    ]);
+    pendingProposals.value = pending.proposals;
+    approvedProposals.value = approved.proposals;
+    // 已选 id 必须仍然处于 approved，否则会让用户以为还选着一条已经被别处改状态的提案。
+    const alive = new Set(approved.proposals.map((p) => p.id));
+    selectedProposalIds.value = selectedProposalIds.value.filter((id) => alive.has(id));
+  } catch (err) {
+    pendingProposals.value = [];
+    approvedProposals.value = [];
+    proposalsError.value = errorText(err);
+  } finally {
+    proposalsLoading.value = false;
+  }
+}
+
+/** 提案目标的人话描述：正文提案尽量反查出段号，避免用户只看 id。 */
+function proposalTargetLabel(p: AssistantProposal): string {
+  const raw = p.target_id;
+  if (p.target_kind === "generation_text") {
+    const gen = generations.value.find((g) => g.id === Number(raw));
+    return gen ? `第 ${gen.segment_no} 段（正文 #${raw}）` : `正文 #${raw}`;
+  }
+  if (p.target_kind === "novel_chunk_text") return `语料分片 #${raw}`;
+  if (p.target_kind === "project_plot_bible") return "剧情圣经";
+  if (p.target_kind === "prompt_override") return `提示词覆写 ${raw}`;
+  return `${p.target_kind} ${raw}`;
+}
+
+function toggleProposal(p: AssistantProposal) {
+  const i = selectedProposalIds.value.indexOf(p.id);
+  if (i >= 0) {
+    selectedProposalIds.value.splice(i, 1);
+    return;
+  }
+  if (selectedProposalIds.value.length >= MAX_BULK_APPLY) {
+    actionNotice.value = {
+      kind: "err",
+      text: `单次最多应用 ${MAX_BULK_APPLY} 条，请分批勾选。`,
+    };
+    return;
+  }
+  selectedProposalIds.value.push(p.id);
+}
+
+/** 批准一条：只改状态，不写任何业务表，所以不需要二次确认。 */
+async function approveOne(p: AssistantProposal) {
+  if (approveBusyId.value != null) return;
+  approveBusyId.value = p.id;
+  actionNotice.value = null;
+  try {
+    await api.approveProposal(p.id);
+    actionNotice.value = { kind: "ok", text: `提案 #${p.id} 已批准；应用前不会改任何正文。` };
+    await loadProposals();
+  } catch (err) {
+    showActionError(`批准提案 #${p.id} 失败`, err);
+  } finally {
+    approveBusyId.value = null;
+  }
+}
+
+const selectedProposals = computed(() =>
+  approvedProposals.value.filter((p) => selectedProposalIds.value.includes(p.id)),
+);
+
+const applyConfirm = computed(() => {
+  const items = selectedProposals.value;
+  if (!items.length) return null;
+  return {
+    title: `确认应用 ${items.length} 条已批准提案`,
+    lines: [
+      `覆盖范围：下列 ${items.length} 个目标会被写入（正文/圣经/提示词/语料分片按 target_kind 区分）。`,
+      "同成同败：整批同一事务；任一条 stale（目标已变）或 blocked，则整批零写入。",
+      "可回退点：每条都会写一条 Version，应用后可按 version 逐条回滚。",
+      `上限：单批最多 ${MAX_BULK_APPLY} 条。`,
+    ],
+    items,
+    button: `确认应用 ${items.length} 条`,
+  };
+});
+
+/** 打开确认模态；不发请求。 */
+function openApplyConfirm() {
+  if (!selectedProposalIds.value.length || applyBusy.value) return;
+  applyError.value = null;
+  applyConflict.value = null;
+  applyConfirmOpen.value = true;
+}
+
+function closeApplyConfirm() {
+  if (applyBusy.value) return;
+  applyConfirmOpen.value = false;
+}
+
+async function submitApply() {
+  // 防绕过：必须从确认模态发起，且至少选了一条。
+  if (!applyConfirmOpen.value || !selectedProposalIds.value.length || applyBusy.value) return;
+  applyBusy.value = true;
+  applyError.value = null;
+  applyConflict.value = null;
+  try {
+    const data = await api.applySelectedProposals(
+      [...selectedProposalIds.value],
+      ROLLBACK_ACTOR,
+    );
+    applyResult.value = data.applied;
+    singleApplyResult.value = null;
+    applyConfirmOpen.value = false;
+    selectedProposalIds.value = [];
+    actionNotice.value = {
+      kind: "ok",
+      text: `已应用 ${data.applied.length} 条提案，回执见「待应用提案」卡片。`,
+    };
+    await Promise.all([loadProposals(), loadGenerations()]);
+  } catch (err) {
+    const detail =
+      err instanceof ApiError && err.detail && typeof err.detail === "object"
+        ? (err.detail as Partial<AssistantApplySelectedResponse>)
+        : null;
+    if (detail && (Array.isArray(detail.stale) || Array.isArray(detail.blocked))) {
+      applyConflict.value = {
+        ok: false,
+        applied: [],
+        stale: Array.isArray(detail.stale) ? detail.stale : [],
+        blocked: Array.isArray(detail.blocked) ? detail.blocked : [],
+        reason: typeof detail.reason === "string" ? detail.reason : errorText(err),
+      };
+    } else {
+      applyError.value = errorText(err);
+    }
+  } finally {
+    applyBusy.value = false;
+  }
+}
+
+/** 打开单条应用确认；不发请求。 */
+function openSingleApply(p: AssistantProposal) {
+  if (applyBusy.value || singleApplyBusy.value) return;
+  singleApplyError.value = null;
+  singleApplyTarget.value = p;
+}
+
+function closeSingleApply() {
+  if (singleApplyBusy.value) return;
+  singleApplyTarget.value = null;
+}
+
+/**
+ * 单条应用：直连 `POST /assistant/proposals/{id}/apply`。
+ * 与批量端点不同，这里没有 stale[]/blocked[] 报告，失败语义按状态码区分：
+ * 409 = 状态机拒绝或目标漂移（detail 可能是结构化 stale），404 = 提案不存在。
+ */
+async function submitSingleApply() {
+  const p = singleApplyTarget.value;
+  if (!p || singleApplyBusy.value) return;
+  singleApplyBusy.value = true;
+  singleApplyError.value = null;
+  singleApplyResult.value = null;
+  try {
+    const data = await api.applyProposal(p.id, ROLLBACK_ACTOR);
+    singleApplyResult.value = data;
+    applyResult.value = null;
+    singleApplyTarget.value = null;
+    actionNotice.value = {
+      kind: "ok",
+      text: `提案 #${p.id} 已应用（version #${data.version_id}），回执见「待应用提案」卡片。`,
+    };
+    await Promise.all([loadProposals(), loadGenerations()]);
+  } catch (err) {
+    if (err instanceof ApiError && err.detail && typeof err.detail === "object") {
+      const detail = err.detail as { message?: unknown; hint?: unknown };
+      const message = typeof detail.message === "string" ? detail.message : errorText(err);
+      const hint = typeof detail.hint === "string" ? ` ${detail.hint}` : "";
+      singleApplyError.value = `${message}${hint}`;
+    } else {
+      singleApplyError.value = errorText(err);
+    }
+    // 409/404 可能已把提案置 stale 或目标已不存在：刷新列表，避免继续显示为可应用。
+    if (err instanceof ApiError && (err.status === 409 || err.status === 404)) {
+      await loadProposals();
+    }
+  } finally {
+    singleApplyBusy.value = false;
   }
 }
 
@@ -1867,6 +2298,9 @@ async function initialize() {
     if (!project.value) return;
     kgSourceOptions.value = buildSourceOptions();
     await loadGenerations();
+    // 档 3 两个入口的数据（只读列表），与正文一起加载；失败各自降级，不阻塞工作台。
+    void loadSnapshots();
+    void loadProposals();
     restoreStep();
     if (generations.value.length) void loadPlan();
     void loadAlerts();
@@ -3187,6 +3621,311 @@ onUnmounted(stopDistillPolling);
       </div>
     </div>
 
+    <!-- ===== 重写快照与回滚（档 3：前端显式入口，助手不代执行） ===== -->
+    <div class="card" style="margin-top: var(--gap); box-shadow: none">
+      <div class="card-title" style="font-size: var(--fs-md)">
+        重写快照与回滚 <span class="hint">只有 applied 的旧快照能退回去</span>
+      </div>
+      <p class="faint" style="font-size: var(--fs-xs); margin-bottom: 10px; line-height: 1.7">
+        每次重写都会留一条快照。回滚会把该段正文换回快照记录的 before_text；
+        回滚本身也会生成新快照（可再核对、再撤销）。助手只能引导你到这里，不能代执行。
+      </p>
+
+      <div v-if="snapshotsLoading" class="empty"><span class="spinner" /> 正在读取快照</div>
+      <div v-else-if="snapshotsError" class="notice err inline-retry" role="alert">
+        <span>快照读取失败：{{ snapshotsError }}</span>
+        <button class="link-btn" @click="loadSnapshots">重试</button>
+      </div>
+      <template v-else>
+        <div class="row tight" style="margin-bottom: 6px">
+          <strong style="font-size: var(--fs-sm)">按段回滚</strong>
+          <span class="hint">
+            {{ snapshotList.filter((s) => s.undoable).length }} 条可回滚快照
+            <template v-if="snapshotList.filter((s) => !s.undoable).length">
+              （另有 {{ snapshotList.filter((s) => !s.undoable).length }} 条因正文行已删不可回滚）
+            </template>
+          </span>
+        </div>
+        <div v-if="!snapshotList.length" class="empty">还没有可回滚的快照（重写一段后才会产生）。</div>
+        <div v-else class="list">
+          <div
+            v-for="s in snapshotList"
+            :key="s.id"
+            class="list-item"
+            style="align-items: center; gap: 8px; flex-wrap: wrap"
+          >
+            <span class="tag accent mono" style="flex: none">第 {{ s.segment_no }} 段</span>
+            <span class="faint mono" style="font-size: var(--fs-xs)">
+              快照 #{{ s.id }} · {{ s.operation }} · {{ s.created_at || "—" }}
+            </span>
+            <span class="faint mono" style="font-size: var(--fs-xs)">
+              → 回到 {{ s.before_chars }} 字
+            </span>
+            <span
+              v-if="!s.generation_exists"
+              class="tag warn"
+              :title="`快照指向的正文行 #${s.generation_id} 已被删除`"
+            >
+              正文行 #{{ s.generation_id }} 已不存在，不能回滚
+            </span>
+            <span style="flex: 1"></span>
+            <button
+              class="btn sm"
+              :disabled="rollbackBusy || !s.undoable"
+              @click="openRollbackSnapshot(s)"
+            >
+              回滚到这条
+            </button>
+          </div>
+        </div>
+
+        <div class="row tight" style="margin: 14px 0 6px">
+          <strong style="font-size: var(--fs-sm)">按整组操作回滚</strong>
+          <span class="hint">
+            {{ snapshotGroups.filter((g) => g.undoable).length }} 组可回滚
+          </span>
+        </div>
+        <div v-if="!snapshotGroups.length" class="empty">还没有成组的重写记录。</div>
+        <div v-else class="list">
+          <div
+            v-for="g in snapshotGroups"
+            :key="g.batch_id"
+            class="list-item"
+            style="align-items: center; gap: 8px; flex-wrap: wrap"
+          >
+            <span class="tag mono">{{ g.operation }}</span>
+            <span class="faint mono" style="font-size: var(--fs-xs)">
+              {{ g.batch_id.slice(0, 8) }} · 第 {{ g.segments.join("、") }} 段 ·
+              applied {{ g.applied }} / failed {{ g.failed }} / 已回滚 {{ g.rolled_back }}
+            </span>
+            <span class="faint mono" style="font-size: var(--fs-xs)">{{ g.created_at || "—" }}</span>
+            <span style="flex: 1"></span>
+            <span v-if="!g.undoable" class="tag warn">
+              {{
+                g.generation_exists
+                  ? "该组已不可整组回滚"
+                  : "该组指向的正文行已不存在，不能整组回滚"
+              }}
+            </span>
+            <button
+              v-else
+              class="btn sm"
+              :disabled="rollbackBusy"
+              @click="openRollbackGroup(g)"
+            >
+              整组回滚
+            </button>
+          </div>
+        </div>
+      </template>
+
+      <!-- 回执：每一项都能与后端响应逐一核对 -->
+      <div v-if="rollbackResult" class="notice ok" style="margin-top: 12px">
+        <template v-if="rollbackResult.kind === 'segment'">
+          <div>
+            已回滚第 {{ rollbackResult.data.segment_no }} 段：恢复快照
+            <span class="mono">#{{ rollbackResult.data.restored_snapshot_id }}</span>，
+            新快照 <span class="mono">#{{ rollbackResult.data.rollback_snapshot_id }}</span>
+            （batch <span class="mono">{{ rollbackResult.data.rollback_batch_id.slice(0, 8) }}</span>），
+            当前 {{ rollbackResult.data.chars }} 字 · text_hash
+            <span class="mono">{{ rollbackResult.data.text_hash.slice(0, 12) }}</span>
+          </div>
+          <div v-if="rollbackResult.data.warnings.length" class="faint" style="margin-top: 6px">
+            提示：{{ rollbackResult.data.warnings.join("；") }}
+          </div>
+          <div
+            v-if="Object.keys(rollbackResult.data.derived || {}).length"
+            class="faint mono"
+            style="margin-top: 6px; font-size: var(--fs-xs)"
+          >
+            派生数据：{{ JSON.stringify(rollbackResult.data.derived) }}
+          </div>
+        </template>
+        <template v-else>
+          <div>
+            已整组回滚 {{ rollbackResult.data.count }} 段（batch
+            <span class="mono">{{ rollbackResult.data.batch_id.slice(0, 8) }}</span> → 新 batch
+            <span class="mono">{{ rollbackResult.data.rollback_batch_id.slice(0, 8) }}</span>）：
+          </div>
+          <ul style="margin: 6px 0 0; padding-left: 18px">
+            <li
+              v-for="seg in rollbackResult.data.segments"
+              :key="seg.segment_no"
+              class="mono"
+              style="font-size: var(--fs-xs)"
+            >
+              第 {{ seg.segment_no }} 段：恢复快照 #{{ seg.restored_snapshot_id }} → 新快照
+              #{{ seg.rollback_snapshot_id }}（{{ seg.chars }} 字）
+            </li>
+          </ul>
+          <div v-if="rollbackResult.data.warnings.length" class="faint" style="margin-top: 6px">
+            提示：{{ rollbackResult.data.warnings.join("；") }}
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- ===== 待应用提案（档 3：前端显式入口，助手不代执行） ===== -->
+    <div class="card" style="margin-top: var(--gap); box-shadow: none">
+      <div class="card-title" style="font-size: var(--fs-md)">
+        待应用提案 <span class="hint">单条直接应用 / 勾选后整批应用</span>
+      </div>
+      <p class="faint" style="font-size: var(--fs-xs); margin-bottom: 10px; line-height: 1.7">
+        批准只改提案状态、不写任何正文；单条「应用」走单条端点，勾选后「应用选中」走批量端点。
+        两者都会覆盖目标内容，并给每条写一条 Version（可逐条回滚）；批量整批同一事务、同成同败，
+        单批最多 {{ MAX_BULK_APPLY }} 条。助手只能引导你到这里，不能代执行。
+      </p>
+
+      <div v-if="proposalsLoading" class="empty"><span class="spinner" /> 正在读取提案</div>
+      <div v-else-if="proposalsError" class="notice err inline-retry" role="alert">
+        <span>提案读取失败：{{ proposalsError }}</span>
+        <button class="link-btn" @click="loadProposals">重试</button>
+      </div>
+      <template v-else>
+        <div class="row tight" style="margin-bottom: 6px">
+          <strong style="font-size: var(--fs-sm)">待批准</strong>
+          <span class="hint">{{ pendingProposals.length }} 条</span>
+        </div>
+        <div v-if="!pendingProposals.length" class="empty">没有待批准的提案。</div>
+        <div v-else class="list">
+          <div
+            v-for="p in pendingProposals"
+            :key="p.id"
+            class="list-item"
+            style="align-items: flex-start; gap: 6px; flex-direction: column"
+          >
+            <div class="row tight" style="width: 100%; flex-wrap: wrap">
+              <span class="tag mono">#{{ p.id }}</span>
+              <span class="tag info">{{ p.type }}</span>
+              <span class="tag accent">{{ proposalTargetLabel(p) }}</span>
+              <span class="tag" :class="p.risk_level === 'high' ? 'err' : 'warn'">
+                risk {{ p.risk_level }}
+              </span>
+              <span style="flex: 1"></span>
+              <button
+                class="btn sm"
+                :disabled="approveBusyId !== null"
+                @click="approveOne(p)"
+              >
+                {{ approveBusyId === p.id ? "批准中…" : "批准" }}
+              </button>
+            </div>
+            <div v-if="p.reason" class="faint" style="font-size: var(--fs-xs)">{{ p.reason }}</div>
+            <details v-if="p.diff" class="faint" style="font-size: var(--fs-xs); width: 100%">
+              <summary>查看改动</summary>
+              <pre class="mono" style="white-space: pre-wrap; margin: 6px 0 0">{{ p.diff }}</pre>
+            </details>
+          </div>
+        </div>
+
+        <div class="row tight" style="margin: 14px 0 6px">
+          <strong style="font-size: var(--fs-sm)">已批准（可单条应用 / 批量应用）</strong>
+          <span class="hint">{{ approvedProposals.length }} 条</span>
+        </div>
+        <div v-if="!approvedProposals.length" class="empty">没有已批准的提案。</div>
+        <div v-else class="list">
+          <div
+            v-for="p in approvedProposals"
+            :key="p.id"
+            class="list-item"
+            style="align-items: flex-start; gap: 8px"
+          >
+            <input
+              type="checkbox"
+              style="margin-top: 3px"
+              :checked="selectedProposalIds.includes(p.id)"
+              @change="toggleProposal(p)"
+            />
+            <div style="flex: 1; min-width: 0">
+              <div class="row tight" style="flex-wrap: wrap">
+                <span class="tag mono">#{{ p.id }}</span>
+                <span class="tag info">{{ p.type }}</span>
+                <span class="tag accent">{{ proposalTargetLabel(p) }}</span>
+                <span class="tag" :class="p.risk_level === 'high' ? 'err' : 'warn'">
+                  risk {{ p.risk_level }}
+                </span>
+              </div>
+              <div v-if="p.reason" class="faint" style="font-size: var(--fs-xs)">{{ p.reason }}</div>
+              <div v-if="p.impact" class="faint" style="font-size: var(--fs-xs)">
+                影响：{{ p.impact }}
+              </div>
+              <details v-if="p.diff" class="faint" style="font-size: var(--fs-xs)">
+                <summary>查看改动</summary>
+                <pre class="mono" style="white-space: pre-wrap; margin: 6px 0 0">{{ p.diff }}</pre>
+              </details>
+            </div>
+            <button
+              class="btn sm"
+              :disabled="applyBusy || singleApplyBusy"
+              @click="openSingleApply(p)"
+            >
+              {{ singleApplyBusy && singleApplyTarget?.id === p.id ? "应用中…" : "应用" }}
+            </button>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 10px; align-items: center">
+          <span class="faint" style="font-size: var(--fs-xs)">
+            已选 {{ selectedProposalIds.length }} 条（上限 {{ MAX_BULK_APPLY }}）
+          </span>
+          <span style="flex: 1"></span>
+          <button
+            class="btn primary"
+            :disabled="!selectedProposalIds.length || applyBusy"
+            @click="openApplyConfirm"
+          >
+            应用选中
+          </button>
+        </div>
+      </template>
+
+      <!-- 回执 / 冲突 -->
+      <div v-if="singleApplyResult" class="notice ok" style="margin-top: 12px">
+        <div>
+          已应用提案 #{{ singleApplyResult.proposal_id }} → version #{{ singleApplyResult.version_id }}
+          （{{ singleApplyResult.kind }} · {{ singleApplyResult.target_kind }}
+          {{ singleApplyResult.target_id }}）
+        </div>
+        <div class="faint mono" style="font-size: var(--fs-xs); margin-top: 4px">
+          hash {{ (singleApplyResult.content_hash || "").slice(0, 12) }} ·
+          {{ singleApplyResult.applied_at || "—" }}
+        </div>
+      </div>
+      <div v-if="applyResult" class="notice ok" style="margin-top: 12px">
+        <div>已应用 {{ applyResult.length }} 条，每条都写了一条 Version：</div>
+        <div class="list" style="margin-top: 6px">
+          <div
+            v-for="a in applyResult"
+            :key="a.proposal_id"
+            class="list-item mono"
+            style="font-size: var(--fs-xs); flex-wrap: wrap; gap: 8px"
+          >
+            <span>提案 #{{ a.proposal_id }}</span>
+            <span>→ version #{{ a.version_id }}</span>
+            <span>{{ a.kind }} · {{ a.target_kind }} {{ a.target_id }}</span>
+            <span>hash {{ (a.content_hash || "").slice(0, 12) }}</span>
+            <span>{{ a.applied_at || "—" }}</span>
+          </div>
+        </div>
+      </div>
+      <div v-if="applyConflict" class="notice err" style="margin-top: 12px">
+        <div><b>整批已拒绝（零写入）</b>：{{ applyConflict.reason }}</div>
+        <div v-if="applyConflict.stale.length" style="margin-top: 6px">
+          目标已变（stale）：
+          <span v-for="s in applyConflict.stale" :key="'s' + s.proposal_id" class="mono" style="margin-right: 10px">
+            #{{ s.proposal_id }}（{{ s.reason }}）
+          </span>
+        </div>
+        <div v-if="applyConflict.blocked.length" style="margin-top: 6px">
+          被阻断（blocked）：
+          <span v-for="b in applyConflict.blocked" :key="'b' + b.proposal_id" class="mono" style="margin-right: 10px">
+            #{{ b.proposal_id }}（{{ b.reason }}）
+          </span>
+        </div>
+      </div>
+      <div v-if="applyError" class="notice err" style="margin-top: 12px">{{ applyError }}</div>
+    </div>
+
     <div class="row" style="margin-top: var(--gap)">
       <button class="btn" @click="goStep(7)">下一步：看知识图谱 →</button>
     </div>
@@ -3213,37 +3952,162 @@ onUnmounted(stopDistillPolling);
     </div>
 
     <div v-if="!graph" class="empty">先点上方「建/重建『我的小说』图谱」。</div>
-    <div v-else class="grid-2">
-      <div>
-        <div class="card-title" style="font-size: var(--fs-md)">角色 <span class="hint">{{ characters.length }}</span></div>
-        <div class="list">
-          <div v-for="c in characters" :key="c.id" class="list-item">
-            <strong>{{ c.props?.name }}</strong>
-            <span class="faint mono" style="font-size: var(--fs-xs)">提及 {{ c.props?.mentions }} · 第 {{ c.props?.first_chapter }}–{{ c.props?.last_chapter }} 章</span>
-          </div>
-          <div v-if="!characters.length" class="empty">无角色节点</div>
-        </div>
+    <template v-else>
+      <div class="notice info" style="margin-bottom: 12px">
+        角色清单与关系已收进
+        <router-link :to="`/projects/${projectId}/kg`">KG v3 工作台</router-link>
+        （当前图谱 {{ characters.length }} 个角色节点）；本页只保留生成后要盯的未填坑。
       </div>
-      <div>
-        <div class="card-title" style="font-size: var(--fs-md)">未填坑 <span class="hint">{{ plotholes.length }}</span></div>
-        <div class="list">
-          <div v-for="p in plotholes" :key="p.id" class="list-item" style="align-items: flex-start">
-            <div style="flex: 1">
-              <div class="prose" style="font-size: var(--fs-sm)">{{ p.props?.question }}</div>
-              <span class="faint mono" style="font-size: var(--fs-xs)">首现第 {{ p.props?.first_chapter }} 章</span>
-            </div>
-            <span class="tag" :class="p.props?.status === 'open' ? 'warn' : 'ok'">{{ p.props?.status }}</span>
+      <div class="card-title" style="font-size: var(--fs-md)">未填坑 <span class="hint">{{ plotholes.length }}</span></div>
+      <div class="list">
+        <div v-for="p in plotholes" :key="p.id" class="list-item" style="align-items: flex-start">
+          <div style="flex: 1">
+            <div class="prose" style="font-size: var(--fs-sm)">{{ p.props?.question }}</div>
+            <span class="faint mono" style="font-size: var(--fs-xs)">首现第 {{ p.props?.first_chapter }} 章</span>
           </div>
-          <div v-if="!plotholes.length" class="empty">无坑节点</div>
+          <span class="tag" :class="p.props?.status === 'open' ? 'warn' : 'ok'">{{ p.props?.status }}</span>
         </div>
+        <div v-if="!plotholes.length" class="empty">无坑节点</div>
       </div>
-    </div>
+    </template>
 
     <div class="row" style="margin-top: var(--gap)">
       <button class="btn ghost" @click="goStep(6)">← 返回生成</button>
     </div>
   </section>
   </template>
+
+  <!-- ===== 回滚二次确认（唯一的请求发起点；关掉就没有别的路径能回滚） ===== -->
+  <div v-if="rollbackTarget" class="bible-modal-mask" @click.self="closeRollback">
+    <div class="bible-modal" role="dialog" aria-modal="true" aria-labelledby="rollback-confirm-title">
+      <div id="rollback-confirm-title" class="card-title">{{ rollbackConfirm?.title }}</div>
+      <p style="margin: 8px 0 12px">{{ rollbackConfirm?.lead }}</p>
+      <ul class="rollback-scope">
+        <li v-for="(line, i) in rollbackConfirm?.lines" :key="i">{{ line }}</li>
+      </ul>
+
+      <!-- 设定漂移：后端要求用户在三个选项里再选一次，选完才真正回滚 -->
+      <div v-if="rollbackDrift" class="notice warn" style="margin-top: 12px">
+        <div>{{ rollbackDrift.message }}</div>
+        <div class="row tight" style="margin-top: 8px; flex-wrap: wrap">
+          <button
+            v-for="o in rollbackDrift.options"
+            :key="o.id"
+            class="btn sm"
+            :disabled="
+              rollbackBusy ||
+              (o.id === 'restore_bible_then_text' && !rollbackDrift.canRestoreBible)
+            "
+            @click="chooseDrift(o.id)"
+          >
+            {{ o.label }}
+          </button>
+        </div>
+        <div v-if="!rollbackDrift.canRestoreBible" class="faint" style="margin-top: 6px">
+          后端查不到快照时点的设定版本，只能「只回滚正文」或取消。
+        </div>
+      </div>
+
+      <div v-if="rollbackError" class="notice err" style="margin-top: 12px">{{ rollbackError }}</div>
+      <ul v-if="rollbackBlockers.length" class="rollback-scope" style="margin-top: 8px">
+        <li v-for="b in rollbackBlockers" :key="b.snapshot_id">
+          快照 #{{ b.snapshot_id }} · 第 {{ b.segment_no }} 段：{{ b.reason }}
+        </li>
+      </ul>
+
+      <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+        <button class="btn ghost" :disabled="rollbackBusy" @click="closeRollback">取消</button>
+        <button
+          class="btn primary"
+          :disabled="rollbackBusy || !!rollbackDrift"
+          @click="submitRollback('auto')"
+        >
+          {{ rollbackBusy ? "回滚中…" : rollbackConfirm?.button }}
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 批量应用二次确认（唯一发起点） ===== -->
+  <div v-if="applyConfirmOpen" class="bible-modal-mask" @click.self="closeApplyConfirm">
+    <div class="bible-modal" role="dialog" aria-modal="true" aria-labelledby="apply-confirm-title">
+      <div id="apply-confirm-title" class="card-title">{{ applyConfirm?.title }}</div>
+      <ul class="rollback-scope" style="margin-top: 10px">
+        <li v-for="(line, i) in applyConfirm?.lines" :key="i">{{ line }}</li>
+      </ul>
+
+      <div class="faint" style="font-size: var(--fs-xs); margin-top: 12px">将被写入的目标：</div>
+      <div class="list" style="margin-top: 6px; max-height: 240px; overflow: auto">
+        <div
+          v-for="p in applyConfirm?.items"
+          :key="p.id"
+          class="list-item"
+          style="font-size: var(--fs-xs); flex-wrap: wrap; gap: 8px"
+        >
+          <span class="tag mono">#{{ p.id }}</span>
+          <span class="tag info">{{ p.type }}</span>
+          <span class="tag accent">{{ proposalTargetLabel(p) }}</span>
+          <span class="tag" :class="p.risk_level === 'high' ? 'err' : 'warn'">
+            risk {{ p.risk_level }}
+          </span>
+        </div>
+      </div>
+
+      <div v-if="applyError" class="notice err" style="margin-top: 12px">{{ applyError }}</div>
+
+      <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+        <button class="btn ghost" :disabled="applyBusy" @click="closeApplyConfirm">取消</button>
+        <button class="btn primary" :disabled="applyBusy" @click="submitApply">
+          {{ applyBusy ? "应用中…" : applyConfirm?.button }}
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 单条应用二次确认（单条专用端点，唯一发起点） ===== -->
+  <div v-if="singleApplyTarget" class="bible-modal-mask" @click.self="closeSingleApply">
+    <div class="bible-modal" role="dialog" aria-modal="true" aria-labelledby="single-apply-title">
+      <div id="single-apply-title" class="card-title">确认应用提案 #{{ singleApplyTarget.id }}</div>
+      <ul class="rollback-scope" style="margin-top: 10px">
+        <li>
+          覆盖目标：{{ proposalTargetLabel(singleApplyTarget) }}（{{ singleApplyTarget.target_kind }}
+          {{ singleApplyTarget.target_id }}）。
+        </li>
+        <li>写入内容：该提案的 after；目标当前内容会被替换。</li>
+        <li>可回退点：本次会写一条 Version，应用后可按 version 回滚。</li>
+        <li>拒绝条件：目标已被改动（stale）或提案不再处于 approved 时，整条零写入。</li>
+      </ul>
+
+      <div class="list" style="margin-top: 8px">
+        <div
+          class="list-item"
+          style="font-size: var(--fs-xs); flex-wrap: wrap; gap: 8px"
+        >
+          <span class="tag mono">#{{ singleApplyTarget.id }}</span>
+          <span class="tag info">{{ singleApplyTarget.type }}</span>
+          <span class="tag accent">{{ proposalTargetLabel(singleApplyTarget) }}</span>
+          <span class="tag" :class="singleApplyTarget.risk_level === 'high' ? 'err' : 'warn'">
+            risk {{ singleApplyTarget.risk_level }}
+          </span>
+        </div>
+      </div>
+      <details v-if="singleApplyTarget.diff" class="faint" style="font-size: var(--fs-xs)">
+        <summary>查看改动</summary>
+        <pre class="mono" style="white-space: pre-wrap; margin: 6px 0 0">{{ singleApplyTarget.diff }}</pre>
+      </details>
+
+      <div v-if="singleApplyError" class="notice err" style="margin-top: 12px">
+        {{ singleApplyError }}
+      </div>
+
+      <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+        <button class="btn ghost" :disabled="singleApplyBusy" @click="closeSingleApply">取消</button>
+        <button class="btn primary" :disabled="singleApplyBusy" @click="submitSingleApply">
+          {{ singleApplyBusy ? "应用中…" : `确认应用 #${singleApplyTarget.id}` }}
+        </button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
@@ -3616,6 +4480,17 @@ onUnmounted(stopDistillPolling);
   max-height: 80vh;
   overflow: auto;
   box-shadow: var(--shadow-md);
+}
+
+/* 档 3 确认弹层的「影响范围」清单：行距放宽，保证逐条能读清 */
+.rollback-scope {
+  margin: 0;
+  padding-left: 20px;
+  line-height: 1.75;
+  font-size: var(--fs-sm);
+}
+.rollback-scope li + li {
+  margin-top: 6px;
 }
 .bible-textarea {
   resize: vertical;

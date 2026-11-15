@@ -39,6 +39,7 @@ import type {
   AssistantEvidence,
   AssistantIssue,
   AssistantPendingAction,
+  AssistantToolTraceItem,
   DistillJob,
   ProjectOut,
   WizardActionEcho,
@@ -102,6 +103,14 @@ interface Turn {
   confidence: number;
   agentRunId: number;
   cards: ActionCard[];
+  /** 本次取证的执行方式（旧后端不返回 → 空串，不显示相关提示）。 */
+  toolMode: "model" | "deterministic" | "";
+  /** 模型自主调用的工具轨迹（确定性路径为空数组）。 */
+  toolTrace: AssistantToolTraceItem[];
+  /** 工具名 → 结果体（只用来给人看「拿到了什么」，不参与任何请求构造）。 */
+  toolResults: Record<string, unknown>;
+  /** 回落原因（仅确定性路径非空）。 */
+  toolFallbackReason: string;
   error: string | null;
   loading: boolean;
   /** 创作引导的一步（卡片）；与普通问答互斥。 */
@@ -164,6 +173,10 @@ function makeUserTurn(text: string): Turn {
     confidence: 0,
     agentRunId: 0,
     cards: [],
+    toolMode: "",
+    toolTrace: [],
+    toolResults: {},
+    toolFallbackReason: "",
     error: null,
     loading: false,
   };
@@ -181,6 +194,10 @@ function makeAssistantTurn(): Turn {
     confidence: 0,
     agentRunId: 0,
     cards: [],
+    toolMode: "",
+    toolTrace: [],
+    toolResults: {},
+    toolFallbackReason: "",
     error: null,
     loading: true,
   };
@@ -823,6 +840,11 @@ async function send(): Promise<void> {
     // 旧后端不给 → 空数组 → 整段不渲染（不留空态）。
     turn.issues = res.issues ?? res.findings ?? [];
     turn.rulesEvaluated = res.rules_evaluated ?? [];
+    // 工具调用轨迹：旧后端不返回 tool_mode / tool_trace → 空值 → 整块不渲染。
+    turn.toolMode = res.tool_mode ?? "";
+    turn.toolTrace = res.tool_trace ?? [];
+    turn.toolResults = res.tool_results ?? {};
+    turn.toolFallbackReason = res.tool_fallback_reason ?? "";
     turn.cards = (res.pending_actions ?? []).map((action) => ({
       key: nextKey("card"),
       action,
@@ -1074,6 +1096,30 @@ function confidenceLabel(c: number): string {
   if (c >= 0.7) return "高置信 high";
   if (c >= 0.4) return "中置信 medium";
   return "低置信 low";
+}
+
+/** 工具调用状态 → 面向用户的文字 + 色标（文字为主，颜色只做辅助）。 */
+function toolStatusMeta(status: string): { label: string; tag: string } {
+  if (status === "ok") return { label: "已执行", tag: "ok" };
+  if (status === "denied") return { label: "已拒绝（未执行）", tag: "err" };
+  return { label: "执行失败", tag: "warn" };
+}
+
+/**
+ * 工具结果预览：按工具名从 `tool_results` 取结果体，序列化后截断。
+ *
+ * 只用于「展开轨迹后看一眼拿到了什么」，不参与任何请求构造；
+ * 结果体可能很大，这里截到 600 字符并打标记，避免一次渲染几百 KB JSON。
+ */
+function toolResultText(turn: Turn, name: string): string {
+  if (!(name in turn.toolResults)) return "";
+  const value = turn.toolResults[name];
+  try {
+    const text = JSON.stringify(value) ?? "";
+    return text.length > 600 ? `${text.slice(0, 600)}…（以下截断）` : text;
+  } catch {
+    return String(value);
+  }
 }
 
 const hasHistory = computed(() => turns.value.length > 0);
@@ -1399,6 +1445,56 @@ onMounted(async () => {
               :agent-run-id="turn.agentRunId"
             />
 
+            <!-- 工具调用轨迹：默认折叠；确定性回落时只给一行说明。
+                 tool_trace 为空且不是回落 → 整块不渲染（旧后端行为一致）。 -->
+            <div
+              v-if="turn.toolTrace.length || turn.toolMode === 'deterministic'"
+              class="blk"
+            >
+              <div class="blk-head">
+                工具调用{{ turn.toolTrace.length ? `（${turn.toolTrace.length} 次）` : "" }}
+              </div>
+              <div v-if="turn.toolMode === 'deterministic'" class="tool-mode-hint">
+                本次由确定性检索取证（模型未自主调用工具）。
+                <span v-if="turn.toolFallbackReason" class="mono">
+                  原因：{{ turn.toolFallbackReason }}
+                </span>
+              </div>
+              <button
+                v-if="turn.toolTrace.length"
+                class="link-btn"
+                @click="toggle(`tools-${turn.key}`)"
+              >
+                {{ isOpen(`tools-${turn.key}`) ? "收起调用轨迹" : "展开调用轨迹" }}
+              </button>
+              <div
+                v-if="turn.toolTrace.length && isOpen(`tools-${turn.key}`)"
+                class="ev-list"
+              >
+                <div
+                  v-for="t in turn.toolTrace"
+                  :key="`tool-${turn.key}-${t.seq}`"
+                  class="ev"
+                >
+                  <div class="row tight" style="align-items: center">
+                    <span class="tag mono">#{{ t.seq }} · 第 {{ t.step }} 轮</span>
+                    <span class="tag accent mono">{{ t.name }}</span>
+                    <span class="tag" :class="toolStatusMeta(t.status).tag">
+                      {{ toolStatusMeta(t.status).label }}
+                    </span>
+                    <span class="tag mono">{{ t.latency_ms }}ms</span>
+                  </div>
+                  <div class="tool-args mono">参数：{{ t.arguments }}</div>
+                  <div
+                    v-if="t.status === 'ok' && toolResultText(turn, t.name)"
+                    class="prose snippet mono"
+                  >
+                    结果：{{ toolResultText(turn, t.name) }}
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <!-- 证据 -->
             <div v-if="turn.evidence.length" class="blk">
               <div class="blk-head">证据（{{ turn.evidence.length }} 条）</div>
@@ -1707,6 +1803,17 @@ onMounted(async () => {
 .snippet {
   max-height: 7.5em;
   overflow: hidden;
+}
+
+/* 工具调用轨迹：参数原文与回落说明都走弱化色，避免抢正文的视觉层级。 */
+.tool-args {
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  word-break: break-all;
+}
+.tool-mode-hint {
+  color: var(--fg-faint);
+  font-size: var(--fs-xs);
 }
 .snippet.expanded {
   max-height: none;
