@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from pathlib import Path
 
 # 复用 conftest 的常量与函数（pytest 会把 conftest 所在目录放进导入路径）。
 from conftest import (  # noqa: E402
@@ -41,6 +42,46 @@ def test_test_db_is_isolated_to_temp_file(test_database_url):
     # 真实库文件名不应出现在测试库路径里（额外的一道粗筛）
     assert "novel_dev.db" not in test_database_url
     assert "novel_demo.db" not in test_database_url
+
+
+def test_child_process_does_not_reuse_this_sessions_db(test_database_url):
+    """子进程（spawn 出来的 pytest）**不得**复用本会话的库。
+
+    ## 为什么要有这条护栏
+
+    Linux CI 上曾抓到一批神秘失败：
+    `sqlite3.OperationalError: attempt to write a readonly database`
+    —— 报错从本会话第一个用到共享 engine 的用例开始，后面全红，
+    而**本机 Windows 全绿**。
+
+    根因：子进程**继承**了父进程的 `DATABASE_URL` → 子进程的 conftest 沿用了
+    父进程的库 → 子进程退出时 atexit **把父进程的库文件删了**。
+    Linux 上 POSIX 允许 unlink 打开中的文件（父进程后续写它就报 readonly）；
+    Windows 上删不掉被打开的文件（PermissionError 被吞）⇒ 本机看不出来。
+
+    ⇒ 现在 conftest 给**每个进程**一个专属临时目录，子进程必须自己开一份。
+    这条测试直接模拟「继承环境变量」的子进程，断言它**没有**选中本会话的库。
+    """
+    import subprocess
+    import sys
+
+    child = (
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+        "import conftest  # noqa: F401  （触发它算库路径）\n"
+        "print(os.environ.get('DATABASE_URL', ''))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", child],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert out.returncode == 0, out.stderr[-800:]
+    child_url = (out.stdout or "").strip().splitlines()[-1] if out.stdout.strip() else ""
+    assert child_url, f"子进程没打出它选的库：{out.stdout!r} / {out.stderr[-400:]!r}"
+    assert child_url != test_database_url, (
+        "子进程复用了本会话的库！它退出时会把那个文件删掉 —— "
+        "本进程后续用例会炸（Linux 上报 'attempt to write a readonly database'）。"
+    )
 
 
 def test_real_dev_db_untouched_by_test_session(real_db_snapshot):

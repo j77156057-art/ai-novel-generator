@@ -315,15 +315,13 @@ def test_put_writer_role_still_reports_singleton_values_on_get(db_session):
     reset_provider_registry()
 
     block = _get(db_session)["writer"]
-    # 2026-11-14：Writer chat 超时 120 → 180（与 stream 同档）。GET 必须如实
-    # 展示单例的真实值，不是展示某个历史常量。
-    assert block["timeout"] == 180
-    # 不硬编码具体数字：这条断言的是「GET 如实展示单例配置的
-    # 真实值」，不是「Writer 的 max_tokens 恰好是 2048」。原先写死 2048，结果
-    # 2026-10-14 调到 4096（给 3000 字目标留余量）后就超结果炸了。
-    # 数字口径的守卫另有一道：tests/test_finish_reason_truncation.py::
-    # test_writer_max_tokens_leaves_headroom 保证不会被调得低于 3000。
+    # 不硬编码具体数字：这条断言的是「GET 如实展示单例配置的真实值」，
+    # 不是「Writer 的 timeout 恰好是某个历史数字」。写死数字后每次调参都要改测试，
+    # 而且会把「接口如实回显」降级成「常量没被改」。
+    # Writer 的 chat/stream timeout 都在 providers.yaml 的 writer 段。
     from app.config import _PROVIDERS_YAML
+    # max_tokens 口径的守卫另有一道：tests/test_finish_reason_truncation.py::
+    # test_writer_max_tokens_leaves_headroom 保证不会被调得低于 3000。
     assert block["max_tokens"] == _PROVIDERS_YAML["writer"]["max_tokens"]
     assert block["timeout"] == _PROVIDERS_YAML["writer"]["timeout"]
 
