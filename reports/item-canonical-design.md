@@ -21,11 +21,11 @@
 
 | # | 环节 | 位置 | 负责什么 | 现在的判据 | 为什么挡不住一物多名 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 抽取 | `extractor_v3.extract_segment`（[extractor_v3.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/kg/extractor_v3.py#L628-L640)）；提示词见 [L560](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/kg/extractor_v3.py#L558-L560) | 产出 item 实体与 `canonical_name`/`aliases` | 提示词要求「canonical_name 用**全书**最常用的规范称呼」，但模型每次只看一章一段 | **模型看不到全书**，每章各取各的「最常用」：ch94 叫「黑金刀」、ch102 叫「黑金长刀」、ch227 叫「监正出品的长刀」。不判定、只命名 |
-| 2 | 折叠 | `canon_source.fold_item_aliases`（[canon_source.py L753-L803](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/kg/canon_source.py#L752-L803)） | **唯一真正判定「这两个名字是同一物」的地方**（`normalize_extraction` L806 第一步就调它） | `ITEM_ALIASES`（[L720-L741](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/kg/canon_source.py#L720-L741)）**精确字符串匹配**，16 条；另有 `ITEM_ALIAS_BLOCKLIST`（[L746-L750](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/kg/canon_source.py#L746-L750)）手工剔通名 | 判据是**人写死的常量**：dict 里没有的名字原样通过。加一个物品＝人工读原文、确认、加一行 |
+| 1 | 抽取 | `extractor_v3.extract_segment`（[extractor_v3.py](backend/app/kg/extractor_v3.py#L628-L640)）；提示词见 [L560](backend/app/kg/extractor_v3.py#L558-L560) | 产出 item 实体与 `canonical_name`/`aliases` | 提示词要求「canonical_name 用**全书**最常用的规范称呼」，但模型每次只看一章一段 | **模型看不到全书**，每章各取各的「最常用」：ch94 叫「黑金刀」、ch102 叫「黑金长刀」、ch227 叫「监正出品的长刀」。不判定、只命名 |
+| 2 | 折叠 | `canon_source.fold_item_aliases`（[canon_source.py L753-L803](backend/app/kg/canon_source.py#L752-L803)） | **唯一真正判定「这两个名字是同一物」的地方**（`normalize_extraction` L806 第一步就调它） | `ITEM_ALIASES`（[L720-L741](backend/app/kg/canon_source.py#L720-L741)）**精确字符串匹配**，16 条；另有 `ITEM_ALIAS_BLOCKLIST`（[L746-L750](backend/app/kg/canon_source.py#L746-L750)）手工剔通名 | 判据是**人写死的常量**：dict 里没有的名字原样通过。加一个物品＝人工读原文、确认、加一行 |
 | 3 | canon 词表 | `canon_source` 两层词表（`layers` 的 entities/aliases） | 人物/势力/地点的跨章归一 | 与 item 无关：`kg_nodes` 3315 行里 item 为 **0**，item 层根本没有词表 | item 在这一环被跳过 |
-| 4 | 实体存储 | [kg_entities DDL](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/models.py) `UNIQUE(project_id, kind, canonical_name)`；`aliases` 是 JSON 数组 | 存规范名与别名 | 只保证「同一个规范名不重复」；别名没有唯一约束、没有反向索引 | **只能防一名多物，防不住一物多名**。实测已有 3 处别名撞规范名（`铜锣↔法器铜锣`、`银枪→长枪`） |
-| 5 | 读通道 | `item_holding_read._resolve_entities`（[item_holding_read.py L78-L140](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/kg/item_holding_read.py#L78-L140)） | 把调用方给的名字/ id 解析到实体 | `canonical_name IN (...)` **或** `aliases LIKE '%"名"%'`，再 `setdefault` 先到先得 | 不判定同物；两行别名重合时**静默取先到的一行**，不报冲突 |
+| 4 | 实体存储 | [kg_entities DDL](backend/app/models.py) `UNIQUE(project_id, kind, canonical_name)`；`aliases` 是 JSON 数组 | 存规范名与别名 | 只保证「同一个规范名不重复」；别名没有唯一约束、没有反向索引 | **只能防一名多物，防不住一物多名**。实测已有 3 处别名撞规范名（`铜锣↔法器铜锣`、`银枪→长枪`） |
+| 5 | 读通道 | `item_holding_read._resolve_entities`（[item_holding_read.py L78-L140](backend/app/kg/item_holding_read.py#L78-L140)） | 把调用方给的名字/ id 解析到实体 | `canonical_name IN (...)` **或** `aliases LIKE '%"名"%'`，再 `setdefault` 先到先得 | 不判定同物；两行别名重合时**静默取先到的一行**，不报冲突 |
 | 6 | 同步脚本 | `sync_item_entities.load_cache_entities` / `build_plan` | 把 229 章缓存灌进 `kg_entities` | 折叠后按 `(project, kind, canonical_name)` 幂等 upsert | 新名字**直接 insert 成新规范名**；没有任何「这个名字是否已是别物的写法」检查 |
 
 ### 1.1 为什么每加一个物品就要人肉补一条
@@ -199,11 +199,11 @@
 
 两个写入口，缺一不可：
 
-1. **持有段写入**：`generated_store.record_holding`（[generated_store.py L552](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/kg/generated_store.py#L552-L600)）
+1. **持有段写入**：`generated_store.record_holding`（[generated_store.py L552](backend/app/kg/generated_store.py#L552-L600)）
    ——它是全库唯一持有写入口（`_insert_holding` L505 只被它调用）。加：
    `surface → group` 查不到 → **不新建组、不写段**，写一条 `pending` 候选并返回
    `action='pending_surface'`。
-2. **实体同步**：`sync_item_entities.build_plan`（[sync_item_entities.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/migrations/2026-11-10-item-holding-v3/sync_item_entities.py)）
+2. **实体同步**：`sync_item_entities.build_plan`（[sync_item_entities.py](backend/migrations/2026-11-10-item-holding-v3/sync_item_entities.py)）
    ——当前会把未知名字直接 insert。加：
    未在 surface 表登记的规范名 → 进 `pending` 候选，`--allow-new-surface` 才插；
    默认 dry-run 列出「本次会新增的规范名」。
