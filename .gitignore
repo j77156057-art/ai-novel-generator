@@ -1,9 +1,12 @@
 # Python
 __pycache__/
 *.pyc
+
+# 密钥文件：只提交模板（.env.example），真实 key 一律留在本机
 .env
 .env.*
 !.env.example
+!.env.example.*
 
 # 本地/测试数据库（开发态 sqlite，勿入库）
 *.db
