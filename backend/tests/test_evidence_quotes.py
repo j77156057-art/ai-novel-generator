@@ -60,10 +60,14 @@ def chunk() -> str:
 
 
 def test_a_curly_single_quotes():
-    """A: 弯单引号包裹的证据能匹配（旧版漏了这个，259 条被误拒）。"""
+    """A: 弯单引号包裹的证据能匹配（旧版漏了这个，259 条被误拒）。
+
+    证据引文必须 >= ``EVIDENCE_MIN_CHARS``（20 字，narrative.py L101/L1344），
+    所以这里用原文里的完整长句；13 字的短截断会先被长度闸门拒掉，测不到引号。
+    """
     cases = [
-        "用环境铺陈（证据：\u2018北凉王府龙盘虎踞于清凉山\u2019）",
-        "环境描写细致（证据：\u2018北凉王府龙盘虎踞于清凉山\u2019\u2019）",
+        "用环境铺陈（证据：\u2018北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛\u2019）",
+        "环境描写细致（证据：\u2018北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛\u2019\u2019）",
     ]
     for c in cases:
         assert _validate_evidence(c, chunk()), f"弯单引号没归一化: {c[:40]}"
@@ -71,23 +75,23 @@ def test_a_curly_single_quotes():
 
 def test_b_curly_double_quotes():
     """B: 弯双引号包裹的证据能匹配。"""
-    case = "用环境铺陈（证据：\u201c北凉王府龙盘虎踞于清凉山\u201d）"
+    case = "用环境铺陈（证据：\u201c北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛\u201d）"
     assert _validate_evidence(case, chunk()), "弯双引号没归一化"
 
 
 def test_c_ascii_quotes():
     """C: ASCII 引号也能匹配。"""
     for c in [
-        "用环境铺陈（证据：'北凉王府龙盘虎踞于清凉山'）",
-        '用环境铺陈（证据："北凉王府龙盘虎踞于清凉山"）',
+        "用环境铺陈（证据：'北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛'）",
+        '用环境铺陈（证据："北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛"）',
     ]:
         assert _validate_evidence(c, chunk()), f"ASCII 引号没归一化: {c[:40]}"
 
 
 def test_d_mixed_quotes():
     """D: 混合引号（外层弯单、内层 ASCII）也能匹配。"""
-    # 外层弯单、内层 ASCII：归一化后应拼成 "北凉王府龙盘虎踞于清凉山"
-    case = "环境铺陈（证据：\u2018北凉王府龙盘\u2019'虎踞于清凉山')"
+    # 外层弯单、内层 ASCII：归一化后应拼成完整引文（>=20 字，过长度闸门）
+    case = "环境铺陈（证据：\u2018北凉王府龙盘\u2019'虎踞于清凉山，千门万户，极土木之盛')"
     assert _validate_evidence(case, chunk()), "混合引号没正确归一化"
 
 
@@ -104,7 +108,7 @@ def test_e_quotes_still_reject_fabricated():
 
 def test_f_no_quotes_still_works():
     """F: 不带引号的证据照常匹配（不因归一化改动而破坏）。"""
-    case = "用环境铺陈（证据：北凉王府龙盘虎踞于清凉山）"
+    case = "用环境铺陈（证据：北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛）"
     assert _validate_evidence(case, chunk())
 
 

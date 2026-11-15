@@ -137,12 +137,19 @@ def test_e_character_prompt_shorter():
 
 
 def test_f_narrative_prompt_about_same():
-    """F: 叙事组 prompt 与原版差不多（7 维本来就在原版里）。"""
+    """F: 叙事组 prompt 比原版长，但增量只来自块级输出契约。
+
+    原版 ``_build_extract_prompt`` 只有 10 维规则；叙事组（narrative.py
+    L1011-1075）在 7 维之外还要模型输出 primary_scene / secondary_scenes /
+    章节摘要 / 人物别名。因此「与原版相当（±30%）」的旧基线已不成立，
+    改为「比原版长但不超过 1.8 倍」，并逐字锁住这四个块级字段仍在。
+    """
     new_sys, _ = _build_extract_narrative_prompt(CHUNK, LABEL)
     old_sys, _ = _build_extract_prompt(CHUNK, LABEL)
-    # 叙事组应该接近原版（±30%）
     ratio = len(new_sys) / len(old_sys)
-    assert 0.7 < ratio < 1.3, f"叙事组/原版 = {ratio:.2f}，超出 ±30%"
+    assert 1.0 < ratio < 1.8, f"叙事组/原版 = {ratio:.2f}，超出 1.0–1.8"
+    for key in ("primary_scene", "secondary_scenes", "章节摘要", "人物别名"):
+        assert key in new_sys, f"块级字段 {key} 不在叙事组 prompt 里"
 
 
 def test_g_character_prompt_mentions_focus():

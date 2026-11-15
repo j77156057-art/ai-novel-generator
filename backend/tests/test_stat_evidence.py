@@ -96,8 +96,10 @@ def test_b_fabricated_rejected():
 def test_c_real_quotes_pass():
     """C: 原文真实引用照常放行。"""
     cases = [
-        "用环境铺陈（证据：北凉王府龙盘虎踞于清凉山）",
-        "以对话推进（证据：连堂堂大柱国北凉王都得蹲在那里好言相劝）",
+        # 证据引文必须 >= EVIDENCE_MIN_CHARS（20 字，narrative.py L101/L1344）——
+        # 13 字的短截断会先被长度闸门拒掉，测不到「原文引用放行」这条。
+        "用环境铺陈（证据：北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛）",
+        "以对话推进（证据：连堂堂大柱国北凉王都得蹲在那里好言相劝，循循善诱里透着股诱拐）",
     ]
     for c in cases:
         assert _validate_evidence(c, chunk()), f"应放行：{c[:40]}"
