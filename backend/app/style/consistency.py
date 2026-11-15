@@ -356,7 +356,23 @@ def measure(text: str) -> dict[str, Any]:
 #: 4. `quality_json.gate_limits.short_sentence_max_len` 记录字长阈值，便于事后判读。
 #: 历史章不回改；**第 23–33 章的 `短句占比` 因此是「含碎片 + ≤5 字」双重旧口径**，
 #: 与 v20 之后既不可比、也不可换算（换算需要逐句重算）。
-GEN_GATE_VERSION = "gen-gate-v20"
+#:
+#: 2026-11-15 升 v21（**判罚项、判罚阈值、`passed` 口径一字未改**）：
+#: `sentence_shape_check` 增加 `verdict`，把「拥挤度」与「上尾」联判：
+#: 上尾（≥40 字占比）低于章级 p10 时，「不拥挤」不再单独成立，记
+#: `crowd_conclusion="voided"`（`voided_by="long_ratio_below_floor"`）；
+#: `crowded` 仍然照旧成立（中段堆压与上尾是否够长是两件事）。
+#: 仍是只判不拦：不进 violations、不触发重写、不改 passed。
+#: 理由：第 40 章拥挤度 0.5196 达标、≥40 字占比 0.011（下限 0.0659），
+#: 台账却把「拥挤度达标」记成变好——句子被整体压短时，中段占比低是机械结果。
+#: 2026-11-15 升 v22（**判罚项未变，只改段数下限的口径**）：
+#: `段数` 下限从「参考书章级 p10 的绝对段数」改为「每千字段数 × 目标字数 / 1000」。
+#: 档案带写入 `per_1k = p10 ÷ 4,000 × 1000`（`source="reference_p10_per_1k"`），
+#: 无参考书时用常量 `17.5 段/千字`（`source="constant_per_1k"`）。
+#: 理由：4,000 字目标下 17.5×4 = 70，与项目 6 现行值一致；而此前 1,200 字目标也
+#: 要求 70 段，空项目（无参考书）必判不合格，且没有参考带可判时重写块会格式化
+#: 一个不存在的下限。历史章不回改：第 23–43 章只读回放后段数判定逐章一致。
+GEN_GATE_VERSION = "gen-gate-v22"
 
 #: 句长口径 v2 的生效起点章号（第 33 章及以前按 v1 统计，不回改、不重算）。
 #: 这个数字会写进每章的 `quality_json.gate_limits.sentence_scope_from_chapter`，
@@ -376,6 +392,18 @@ LENGTH_LIMIT_RATIO = 1.2
 #: （极短纯对白段 16.0%、消息段字数中位 15）。保留对白之间叙述的压缩下限约
 #: 4,000，故目标放宽到 4,000、硬上限 4,800。
 DEFAULT_TARGET_LENGTH = 4000
+
+#: 段数下限的折算基准（汉字数）。参考书档案里的「段数 p10」是在整章上量的
+#: **绝对段数**（项目 6 的参考书 = 70），而平台生成单元的目标字数是 4,000；
+#: 把 p10 折成「每千字段数」时用它作基准（p10 ÷ 4）。这样 4,000 字目标下折算值
+#: 恒等于档案 p10（项目 6 仍是 70），更短的目标按同一比例下降（1,200 字 → 21），
+#: 不会出现「1,200 字目标也要求 70 段」这种永远凑不到的绝对下限。
+PARAGRAPH_FLOOR_BASIS_CHARS = 4000
+
+#: 无参考书（或档案里没有段数分位）时的**退回系数**：段/千字。
+#: 17.5 = 项目 6 现行下限 70 段 ÷ 4,000 字 × 1,000，与参考书推导值同源；
+#: 手写的只有「无档案时用这个数」这一件事，不是新增判据。
+PARAGRAPH_FLOOR_FALLBACK_PER_1K = 17.5
 
 
 def hanzi_count(text: str) -> int:
@@ -799,6 +827,9 @@ _ACTIVE_MIX_REF = contextvars.ContextVar("gen_gate_dialogue_mix_reference", defa
 #: `_archive_gate_limits` 里 `percentile_row(段数)["p10"]` 的口径；此前写死 100
 #: 与推导值不一致。只在 `_ACTIVE_JUDGE` 未写入（无参考书/有效章不足/推导异常）
 #: 时生效，并由 engine 在 `quality_json.gate_limits.fallback_used` 显式留痕。
+#: v22 起 70 是 **4,000 字基准**下的常量：`generation_gate` 会按项目目标字数
+#: 折算（`paragraph_floor_limits`，17.5 段/千字 → 1,200 字目标为 21 段），
+#: 不再让短目标套用 4,000 字的绝对下限。
 CHAPTER_GATE_LIMITS: dict[str, dict[str, float]] = {
     k: GEN_GATE_LIMITS[k] for k in CHAPTER_GATE_METRICS if k in GEN_GATE_LIMITS
 }
@@ -897,6 +928,52 @@ def _row_or_default(pct, key: str, field: str, fallback) -> float:
     return round(float(v), 4) if v is not None else float(fallback or 0.0)
 
 
+def paragraph_floor_limits(
+    limits: dict[str, dict[str, float]] | None,
+    target_chars: int | None,
+) -> dict[str, dict[str, float]] | None:
+    """把 `段数` 下限按目标字数线性折算；其余指标原样。
+
+    规则：`min = per_1k × 目标字数 / 1000`。
+
+    - 档案推导的带里已带 `per_1k`（`source="reference_p10_per_1k"`）→ 直接折算；
+    - 只有绝对下限（如无参考书时的常量带 70）→ 按
+      `min ÷ PARAGRAPH_FLOOR_BASIS_CHARS × 1000` 反推系数并标
+      `source="constant_per_1k"`，保证同一份常量在短目标下也按比例下降；
+    - 没有 `段数`、没有下限、或下限为 0 → **原样返回，不臆造阈值**。
+      这类情况闸门不判它（`generation_gate` 跳过 None 分位），重写块也走
+      `_gate_hard_block` 的降级分支，绝不会把 None 送进 `format()`。
+
+    幂等：每次都按 `per_1k` 重算 `min`，重复调用不会二次缩放。
+    """
+    if not limits:
+        return limits
+    row = limits.get("段数")
+    if not row:
+        return limits
+    per_1k = row.get("per_1k")
+    source = str(row.get("source") or "")
+    if per_1k is None:
+        lo = row.get("min")
+        if not lo:
+            return limits
+        per_1k = float(lo) * 1000.0 / float(PARAGRAPH_FLOOR_BASIS_CHARS)
+        source = "constant_per_1k"
+    target = int(target_chars or PARAGRAPH_FLOOR_BASIS_CHARS)
+    lo = round(float(per_1k) * target / 1000.0, 4)
+    out = dict(limits)
+    out["段数"] = {
+        **row,
+        "min": lo,
+        "lo": lo,
+        "source": source,
+        "per_1k": round(float(per_1k), 4),
+        "target": target,
+        "basis_chars": PARAGRAPH_FLOOR_BASIS_CHARS,
+    }
+    return out
+
+
 def limits_from_chapter_percentiles(
     pct: dict[str, dict[str, float]],
     ultra_short_max: float | None = None,
@@ -913,6 +990,25 @@ def limits_from_chapter_percentiles(
     """
     def d(key: str, field: str):
         return (GEN_GATE_LIMITS.get(key) or {}).get(field)
+
+    # v22：段数下限＝「每千字段数 × 目标字数 / 1000」。档案分位只给出绝对段数，
+    # 这里把 p10 折成每千字系数（÷4，基准 4,000 字），由
+    # `paragraph_floor_limits()` 按项目目标字数现算；4,000 字目标下仍等于 p10。
+    para_p10 = (pct.get("段数") or {}).get("p10")
+    if para_p10 is None:
+        # 分位里没有段数（无参考书 / 样本不含该指标）：不臆造阈值，沿用旧退回。
+        para_limit: dict[str, float] = {
+            "min": _row_or_default(pct, "段数", "p10", d("段数", "min")),
+        }
+    else:
+        para_p10 = round(float(para_p10), 4)
+        para_limit = {
+            "min": para_p10,
+            "lo": para_p10,
+            "per_1k": round(para_p10 * 1000.0 / PARAGRAPH_FLOOR_BASIS_CHARS, 4),
+            "source": "reference_p10_per_1k",
+            "basis_chars": PARAGRAPH_FLOOR_BASIS_CHARS,
+        }
 
     return {
         "句长均值": {
@@ -965,9 +1061,9 @@ def limits_from_chapter_percentiles(
         },
         # 结构项（2026-11-14）：最少段数＝参考语料章级 p10。段数少说明章节被写成了
         # 大段块状排版，与题材无关，越界就是排版坏了，故进单章硬判。
-        "段数": {
-            "min": _row_or_default(pct, "段数", "p10", d("段数", "min")),
-        },
+        # v22：这里给的是 4,000 字基准下的绝对下限 + `per_1k`，实际判定值由
+        # `paragraph_floor_limits()` 按项目目标字数折算（见上方注释）。
+        "段数": para_limit,
         "消息段字数中位": {
             "min": _row_or_default(pct, "消息段字数中位", "p10",
                                    d("消息段字数中位", "min")),
@@ -1202,13 +1298,18 @@ def generation_gate(
     并列进 `violations`、同样触发重写。`max_chars` 为 None 时回退项目默认 3,000。
 
     `gate_limits` 缺省取 `active_gate_limits()`（由 engine 按参考语料章级分位设置）。
+    v22 起 `段数` 下限在这里按 `max_chars` 目标字数现折算（`paragraph_floor_limits`），
+    4,000 字目标仍等于档案 p10；无参考书时从常量带 70 反推 17.5 段/千字。
 
     **永不抛异常**：任何故障都返回 passed=True（放行）——生成不能因为闸门本身
     失败而中断。`skipped=True` 表示字数不足/算不出，调用方不要把它当成“通过”
     去写正常日志。
     """
     limit_len = length_limits(max_chars)
-    judge_limits = gate_limits if gate_limits is not None else active_gate_limits()
+    judge_limits = paragraph_floor_limits(
+        gate_limits if gate_limits is not None else active_gate_limits(),
+        limit_len["target"],
+    )
     out: dict[str, Any] = {
         "version": GEN_GATE_VERSION,
         "passed": True,

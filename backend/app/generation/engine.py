@@ -94,11 +94,13 @@ from app.style.consistency import (
     ULTRA_SHORT_DIALOGUE_MAX_HANZI,
     VOLUME_CHAPTERS,
     active_full_limits,
+    active_gate_limits,
     gate_limits_from_percentiles,
     generation_gate,
     hanzi_count,
     length_limits,
     merge_ultra_short_dialogue,
+    paragraph_floor_limits,
     percentile_row,
     set_dialogue_mix_reference,
     set_dialogue_reference,
@@ -547,6 +549,7 @@ def _gate_fallback(project: Project, fallback: dict, reason: str) -> dict:
     # 不判、不拦；宁可缺一条观测，也不拿别本书的数字当门槛。
     fallback.setdefault("sentence_shape", {})
     fallback["sentence_scope"] = stylometry.SENTENCE_METRIC_SCOPE
+    # 仅记录、无判罚效力：不参与任何闸门分支，换章号来源也不会误判。
     fallback["sentence_scope_from_chapter"] = SENTENCE_SCOPE_FROM_CHAPTER
     fallback["short_sentence_max_len"] = SHORT_SENTENCE_MAX_LEN
     logging.getLogger(__name__).warning(
@@ -847,6 +850,8 @@ def _archive_gate_limits(db, project: Project) -> dict:
             "chapter_percentiles": chapter_pct,
             "sentence_shape": sentence_shape,
             "sentence_scope": stylometry.SENTENCE_METRIC_SCOPE,
+            # `sentence_scope_from_chapter` 仅记录、无判罚效力：全仓没有任何分支
+            # 读取它，换章号来源也不会误判——它不是闸门开关，别当闸用。
             "sentence_scope_from_chapter": SENTENCE_SCOPE_FROM_CHAPTER,
             "short_sentence_max_len": SHORT_SENTENCE_MAX_LEN,
             "volume_reference": volume_pct,
@@ -899,11 +904,25 @@ def _apply_gate_limits(db, project: Project, seg_no: int | None = None) -> dict:
     不传时只写参考书分位，不写本书实测。
     """
     meta = dict(_archive_gate_limits(db, project))
-    if meta.get("chapter_limits"):
+    # v22：段数下限随目标字数线性折算（`paragraph_floor_limits`）。参考书 p10 是
+    # 4,000 字基准下的绝对段数，4,000 字目标折算后仍等于 p10（项目 6 = 70）；
+    # 短目标按 17.5 段/千字下降（1,200 → 21），无参考书时从常量带 70 反推同系数。
+    # 折算结果与来源一并写进 meta，随章落库（quality.gate_limits["段数"]）可复核。
+    target_chars = int(
+        length_limits(getattr(project, "generation_length", None))["target"]
+    )
+    judge = paragraph_floor_limits(meta.get("chapter_limits"), target_chars)
+    full = paragraph_floor_limits(meta.get("full_limits"), target_chars)
+    meta["chapter_limits"] = judge
+    meta["full_limits"] = full
+    if judge:
         set_gate_limits(
-            judge=meta["chapter_limits"],
-            full=meta.get("full_limits"),
+            judge=judge,
+            full=full,
         )
+    # 实际生效的段数下限：有档案用折算后的判罚带，无档案用常量带回退折算。
+    effective = judge or paragraph_floor_limits(active_gate_limits(), target_chars)
+    meta["段数"] = (effective or {}).get("段数")
     window = int(meta.get("volume_chapters") or VOLUME_CHAPTERS)
     rows = _recent_gate_metrics(db, project, seg_no, window) if seg_no is not None else []
 
@@ -1968,6 +1987,10 @@ def _sentence_shape_check(text: str, metrics: dict, gate_limits_meta: dict) -> d
     `CV` 下限本次不上（用户 2026-11-15 指定）。两项都只记录：不改 `passed`、
     不进 `violations`、不触发重写。参考带推不出来时 `source="no_reference"`，
     不判也不臆造。
+
+    v21（2026-11-15）：新增 `verdict`——把两项**联判**。上尾没进带时
+    `crowd_conclusion` 记 `voided`（`voided_by="long_ratio_below_floor"`），
+    不再单独给「不拥挤」；`crowded` 仍照旧成立（中段堆压与上尾长度是两件事）。
     """
     shape = gate_limits_meta.get("sentence_shape") or {}
     band = shape.get("band") or {}
@@ -1980,6 +2003,21 @@ def _sentence_shape_check(text: str, metrics: dict, gate_limits_meta: dict) -> d
     long_ratio = metrics.get("长句占比")
     long_floor = shape.get("long_ratio_floor")
     source = shape.get("source") or "no_reference"
+    # v21：拥挤度与上尾**联判**。上尾（≥40 字占比）没进带时，「不拥挤」不能单独成立
+    # ——句子整体被压短会让中段占比机械地降下来，那不是分布均衡。
+    # 只加结论字段：`crowded` / `not_crowded` / `voided`；仍是只判不拦。
+    if crowd is None:
+        crowd_conclusion = None
+    elif isinstance(crowd_max, (int, float)) and crowd > float(crowd_max):
+        crowd_conclusion = "crowded"
+    elif (
+        isinstance(long_floor, (int, float))
+        and isinstance(long_ratio, (int, float))
+        and float(long_ratio) < float(long_floor)
+    ):
+        crowd_conclusion = "voided"
+    else:
+        crowd_conclusion = "not_crowded"
     return {
         "mode": "report",
         "level": "chapter",
@@ -2009,6 +2047,13 @@ def _sentence_shape_check(text: str, metrics: dict, gate_limits_meta: dict) -> d
         },
         "source": source,
         "chapters": shape.get("chapters"),
+        "verdict": {
+            "crowd_conclusion": crowd_conclusion,
+            "voided_by": (
+                "long_ratio_below_floor" if crowd_conclusion == "voided" else None
+            ),
+            "rule": "上尾低于下限时，crowd_conclusion 不记 not_crowded",
+        },
         "note": "只判不拦：不影响 passed，不进 violations，不触发重写",
     }
 
@@ -3024,7 +3069,11 @@ def _gate_hard_block(gate_info: dict | None) -> str:
     if not gate_info or gate_info.get("passed") or gate_info.get("skipped"):
         return ""
     metrics = gate_info.get("metrics") or {}
-    bad = {v.get("metric") for v in (gate_info.get("violations") or [])}
+    viol_limits = {
+        v.get("metric"): (v.get("limit") or {})
+        for v in (gate_info.get("violations") or [])
+    }
+    bad = set(viol_limits)
     lines = []
     for key, (label, unit, fmt) in _GATE_FMT.items():
         if key not in bad:
@@ -3035,8 +3084,15 @@ def _gate_hard_block(gate_info: dict | None) -> str:
             cur = int(metrics.get(key) or 0)
             lines.append(f"- {label} ≤{cap} 字（当前 {cur} 字）")
             continue
-        limit = active_full_limits().get(key) or {}
+        # 阈值取「判这条违规的那份带」优先（违规项自带 limit，判罚带随项目目标字数
+        # 折算过），再退全量参考带。两处都没有上下限时只留 violations、不渲染：
+        # 没有阈值就没有可执行的修复目标，绝不能把 None 送进 format()
+        # （无参考书时 `段数` 在 full 带里根本不存在，旧代码在此抛 TypeError，
+        # 导致重写轮整轮崩掉、正文仍旧稿）。
+        limit = viol_limits.get(key) or active_full_limits().get(key) or {}
         lo, hi = limit.get("min"), limit.get("max")
+        if lo is None and hi is None:
+            continue
         if lo is not None and hi is not None:
             target = f"{fmt.format(lo)}–{fmt.format(hi)}{unit}"
         elif lo is not None:
@@ -4936,8 +4992,12 @@ def generate_next_segment(
                   "sentence_reference", "rhythm_reference",
                   "dialogue_mix_reference",
                   # v20：句子口径与形状带随章落库（同步版与流式版同款）。
+                  # `sentence_scope_from_chapter` 仅记录、无判罚效力（无任何分支读取）。
                   "sentence_scope", "sentence_scope_from_chapter",
                   "short_sentence_max_len", "sentence_shape",
+                  # v22：段数下限的折算结果与来源（reference_p10_per_1k /
+                  # constant_per_1k），用于复核「这个数是怎么来的」。
+                  "段数",
                   "fallback_used", "fallback_reason")
     }
     _attach_volume_gate(db, project, quality, written + 1, chapter or written + 1,
@@ -5373,8 +5433,11 @@ def generate_next_segment_stream(
                   "dialogue_mix_reference",
                   # v20：句子口径与形状带随章落库，否则跨章无法按 scope 分组比较
                   # （第 35 章之前这四项在库里全是 null，只有内存里有值）。
+                  # `sentence_scope_from_chapter` 仅记录、无判罚效力（无任何分支读取）。
                   "sentence_scope", "sentence_scope_from_chapter",
                   "short_sentence_max_len", "sentence_shape",
+                  # v22：段数下限的折算结果与来源（同步版同款）。
+                  "段数",
                   "fallback_used", "fallback_reason")
     }
     _attach_volume_gate(db, project, quality, written + 1, chapter or written + 1,
