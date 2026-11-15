@@ -136,7 +136,49 @@ def test_build_clean_report_shapes():
         "version", "cleaned", "chars_in", "chars_out",
         "removed_chars", "removed_ratio", "detected_count", "marks",
         "rejected_count", "rejected_candidates", "thresholds",
+        "site_residue", "site_marker_lines",
     }
+
+
+# ====================================================================
+# (c'') 站点噪声：整行标记 + 精确区间
+# ====================================================================
+
+
+def test_site_marker_lines_are_dropped_and_counted():
+    """含站点标记的**整行**不进入库语料，删掉的条数写进报告。"""
+    text = "\n".join([
+        "第一章 开端",
+        "他推门而入，屋里没有人。",
+        "请记住本站地址，最快更新无弹窗。",
+        "他坐下，倒了一杯茶。",
+        "求收藏求推荐票，谢谢支持。",
+        "夜色渐深，他终于开口说话。",
+        "本章完",
+        "第二章 转折",
+        "第二天清晨，雨停了。",
+    ])
+    cleaned, report = clean_novel_text(text)
+
+    assert report["site_marker_lines"] == 3
+    assert report["cleaned"] is True
+    for marker in ("最快更新", "求推荐票", "本章完"):
+        assert marker not in cleaned
+    # 正文行一个字都不动
+    for keep in ("他推门而入，屋里没有人。", "他坐下，倒了一杯茶。", "第二天清晨，雨停了。"):
+        assert keep in cleaned
+
+
+def test_site_residue_spans_are_removed_at_ingest():
+    """有边界的域名 token 只删区间，同一行的正文保留（不整行丢）。"""
+    text = "他说完这句话便转身离去。wap..info\n第二天他回来了。"
+    cleaned, report = clean_novel_text(text)
+
+    assert "..info" not in cleaned
+    assert report["site_residue"]["removed_count"] == 1
+    # 整行没被 site marker 连带删掉：删区间后行内正文仍在
+    assert "他说完这句话便转身离去。" in cleaned
+    assert "第二天他回来了。" in cleaned
 
 
 # ====================================================================

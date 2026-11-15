@@ -10,8 +10,9 @@ import json
 
 from sqlalchemy.orm import Session
 
+from app.agents.ingest_clean import detect_foreign_blocks_report, fingerprint
 from app.config import settings
-from app.corpus_health import strip_repeated_ads
+from app.corpus_health import find_foreign_blocks, strip_foreign_blocks, strip_repeated_ads
 from app.db import IS_SQLITE
 from app.embeddings.provider import get_embedding_provider
 from app.ingestion.chunk import chunk_text
@@ -47,6 +48,7 @@ def ingest_text(
     source_url: str | None = None,
     chapter_meta: list[dict] | None = None,
     commit_batch: int = 200,
+    drop_foreign_blocks: bool = False,
 ) -> dict:
     """解析 → 切分 → 填 embedding → 写 raw_novels + novel_chunks。
 
@@ -58,9 +60,33 @@ def ingest_text(
     清洗（第 8 步）：在解析之前先剔除水印，保证**入库的分片就是干净的**；
     清洗报告（含检出串、次数、删字数、原文样本）写入 `novel.clean_report`，
     可通过 API 读到。清洗是确定性的，同一输入两次结果逐字节相同。
+
+    drop_foreign_blocks（默认 False）：盗版站「单本下载」经常把好几本书拼进
+    一个 txt，检测结果**只报不删**；只有调用方显式置 True 才剔除检出的异书块。
+    检出但未剔除 ⇒ `status="imported_review"`（待人工确认），不假装这份语料干净。
     """
+    # —— 混书体检：在清洗/解析之前，对**原文**检测（清洗会删字，区间对不上）——
+    foreign_blocks = find_foreign_blocks(text)
+    foreign_report = detect_foreign_blocks_report(text, foreign_blocks)
+    if drop_foreign_blocks and foreign_report.get("detected"):
+        text, strip_report = strip_foreign_blocks(text, foreign_blocks)
+        foreign_report = {
+            **foreign_report,
+            "dropped": True,
+            "removed_chars": strip_report.get("removed", 0),
+            "text_fingerprint_after": fingerprint(text),
+        }
+
     novel = RawNovel(
-        title=title, platform=platform, source_url=source_url, status="imported"
+        title=title,
+        platform=platform,
+        source_url=source_url,
+        # 检出混书但没有剔除 ⇒ 这份语料需要人复核，不能当成「已导入干净语料」。
+        status=(
+            "imported_review"
+            if foreign_report.get("detected") and not foreign_report.get("dropped")
+            else "imported"
+        ),
     )
     db.add(novel)
     db.flush()
@@ -69,6 +95,7 @@ def ingest_text(
     # `clean_novel_text` 内部顺序固定（跨书污染依赖「同段重复 N 次」的信号，
     # 必须先于去重），报告含 marks / duplicate_paragraphs / cross_novel 三块。
     cleaned_text, clean_report = clean_novel_text(text)
+    clean_report = {**(clean_report or {}), "foreign_blocks": foreign_report}
     novel.clean_report = clean_report
 
     # v2.245 第二步清洗：通用「重复段」广告识别。
@@ -154,6 +181,8 @@ def ingest_text(
     return {
         "novel_id": novel.id,
         "title": title,
+        # imported / imported_review（检出混书但未剔除 ⇒ 待人工确认）
+        "status": novel.status,
         "chapters": len(chapters),
         "chunks": len(pieces),
         # 解析层判为 HTML/服务器错误页并丢弃的章节（正常语料为空列表）

@@ -28,7 +28,78 @@ from app.corpus_health import scan_watermarks, strip_watermarks
 #: 便于事后区分「旧报告」与「新报告」（老报告缺字段时按缺失处理）。
 #: v2：新增 rejected_candidates / thresholds（记录「考虑过但排除」的候选）。
 #: v3：新增 duplicate_paragraphs（整段重复/近乎双份）与 cross_novel（跨书污染）。
-CLEAN_REPORT_VERSION = 3
+#: v4：新增 site_residue（站点块精确区间删除）与 site_marker_lines（整行站点标记）。
+CLEAN_REPORT_VERSION = 4
+#: 站点清洗的**行为**版本号（写进报告的 `site_residue.version`）。
+#: 清洗行为变了就要 +1，否则事后无法区分「这份报告是哪套判据产出的」。
+#: v5：新增站点块的**结构判据**（闭合括号块 / 域名 token / 以站点短语开头的整行）。
+CONSUMPTION_CLEAN_VERSION = 5
+
+#: 报告里每类站点证据最多留几条样本（总量另有 removed_count / unresolved_count）。
+#: 上限的作用是防单本重度污染把 clean_report 撑成几百 KB —— 证据留样本即可，
+#: 统计量单独记，不需要把每一个 span 都塞进 JSON。
+_MAX_SITE_SAMPLES = 50
+
+#: 站点块的**标记词**：只放盗版站固定短语，不放任何普通中文词。
+#: 「收藏」「红票」「纵横」这类在正文里常见的词**不在这里** —— 它们只进
+#: `_SUSPECT_RESIDUE`（只标记不删），否则会把正常句子当垃圾删掉。
+#: 「天才一秒记住本站地址」是盗版站的固定标语，作为一个整体进标记表；
+#: 单独的「天才」是常用词，不能进（否则「天才知道…」那类正文行会被整行删掉）。
+_SITE_BLOCK_MARKERS = (r'天才[一壹]秒[记記]住|一秒记住|壹秒記住|最快更新|更新快|小说网站|'
+                        r'无弹窗|精彩小说|手机用户可访问|手机请访问|看本书最新章节')
+_SITE_RESIDUE_PATTERNS = (
+    re.compile(r"<strong>小说txt下载</strong>|<长-风>文学", re.I),
+    # Exact closed templates only; malformed/bare domains remain review evidence.
+    re.compile(r"\.info\[\]|\(\.\.info\)|\[\.\.info超多好看小说\]|（\.\.info无弹窗广告）", re.I),
+    re.compile(r"一秒记住[ \t]*[【\[][^\x0d\n】\]]{0,100}\.info[】\]](?:[，,]?[ \t]*为您提供精彩小说阅读[。.]?)?", re.I),
+    re.compile(r"(?m)^[ \t]*为您提供精彩小说阅读[。.]?[ \t]*(?=\x0d?$)"),
+    re.compile(r"更新时间[ \t]*[:：][ \t]*\d{4}-\d{1,2}-\d{1,2}(?:[ \t]+\d{1,2}:\d{2}(?::\d{2})?)?"),
+    re.compile(r"[【\[][^\x0d\n【】\[\]]{1,40}(?:全文阅读|小说5200)[】\]]"),
+    # ---- v5：站点块的**结构判据** ----
+    # 盗版站把广告插进正文，载体是「域名 token」/「括号块」/「整行」。
+    # 这三种载体都**自带边界**，所以只删边界以内的那一段，块外的字一律不动。
+    # 统计判据（scan_watermarks）只认「紧跟句号的高频汉字串」，对这三种载体
+    # 天生不适用（实测语料里这三类残留，统计口径基本 0 命中）。
+    #
+    # (1) 域名尾巴 token：wap..info / .info / <strong>..info</strong>
+    #     **只在边界上删**（紧跟句末标点、行首，或被 <strong> 包着）。
+    #     嵌在词里的裸域名（`甲.info乙`）**保留为复核证据** ——
+    #     这条策略是既有契约（「宁可漏报，不可误删」，见模块文档的留痕约定）：
+    #     站点真正的注入点都在句读边界上，
+    #     所以按边界收口既守住契约，又不漏掉实测的注入点。
+    re.compile(r"(?:</?strong>)[ \t]*(?:[A-Za-z0-9]{0,8}\.{1,2}info)(?:[ \t]*</?strong>)", re.I),
+    re.compile(r"(?<=[\u3002\uff01\uff1f\x0d\n])(?:</?strong>){0,2}[ \t]*"
+               r"(?:[A-Za-z0-9]{0,8}\.{1,2}info)(?:[ \t]*</?strong>){0,2}", re.I),
+    # (2) 括号块：块内出现站点标记 → 整块删（块的边界就是括号）
+    #     只认**闭合**的括号块；不闭合的形态（`（..info好看的小说`）保留为复核证据。
+    re.compile(r"[\[【（(][^\[\]【】（）()\x0d\n]{0,200}?(?:" + _SITE_BLOCK_MARKERS + r"|\.{1,2}info)"
+                r"[^\[\]【】（）()\x0d\n]{0,200}?[\]】）)]", re.I),
+    # (3) 以站点短语**开头**的整行：行的边界就是行
+    #     结尾用 (?=\x0d?$) 而不是 $ —— 语料里 \r\n 与 \n 两种行尾都存在。
+    re.compile(r"(?m)^[ \t]*(?:" + _SITE_BLOCK_MARKERS + r")[^\x0d\n]{0,120}(?=\x0d?$)", re.I),
+)
+_SUSPECT_RESIDUE = re.compile(r"一秒记住|为您提供精彩小说阅读|更新时间|全文阅读|小说5200|\.{1,2}info", re.I)
+
+#: 站点/公告类**行级**标记（高精度）。
+#:
+#: 为什么要单独一套：`_SITE_RESIDUE_PATTERNS` 删的是**有边界**的块（域名 token、
+#: 闭合括号块、整行广告），删完还能拼回原句。但盗版站还有一类是**把 SEO 词插进
+#: 句子中间**（实测语料里有这个形态）：
+#:
+#:     立即隐相最新章节去别院拿来三根黄瓜
+#:     小宁这才狠狠说道最低调的巨星最新章节：“你说的那笔买卖还作数？”
+#:     跟这种草包过日子轻笑忘最新章节，岂不是要被天下人耻笑。
+#:
+#: 原来的词**已经被替换掉了**，删掉标记词也拼不回原文（硬修只会造出另一句假话），
+#: 所以这类只能**整行不取用**，不能修。
+#:
+#: 精度要求：这些串在小说正文里基本不出现。「收藏」「更新」「免费」这类正文常用词
+#: **不在表里** —— 只有带站点语境的完整短语才算。
+SITE_LINE_MARKERS = re.compile(
+    r"最新章节|首发域名|手机版阅读|阅读网址|微信公众号|一秒记住|最快更新|无弹窗|"
+    r"精彩小说|求收藏|求推荐票|求月票|笔趣|txt下载|请记住本书|免费阅读|"
+    r"未完待续|本章完|\.{1,2}info"
+)
 
 #: 报告里最多留几条水印结论、每条留几个原文样本。
 #: 至少 2 条样本（team-lead 的验收要求），这里取 3 条留余量；
@@ -277,6 +348,80 @@ def strip_duplicate_paragraphs(text: str) -> tuple[str, dict]:
     return _join_blocks(kept, text), report
 
 
+def is_site_marker_line(line: str) -> bool:
+    """这一行是不是站点/公告的残留（不是小说正文）。"""
+    return bool(SITE_LINE_MARKERS.search(line or ""))
+
+
+def strip_site_marker_lines(text: str) -> tuple[str, int]:
+    """删掉含站点标记的**整行**，返回 (新文本, 删掉的行数)。
+
+    保留其余字符与行序（含换行结构）。没有命中时原样返回。
+
+    ## 为什么是「删行」而不是「修字」
+
+    站点 SEO 词是被**插进句子中间**的，原词已被替换 —— 删掉标记词拼不回原句。
+    硬修会造出另一句假话，比留着站点词更坏（模型会把站点词当普通词学）。
+    「保留原文、只做取用侧过滤」这条老做法解决不了入库语料里的站点行：
+    它们会进 `novel_chunks` 参与检索召回，也会被 KG 抽取当正文证据。
+    所以入库前整行剔除，删了多少写进清洗报告的 `site_marker_lines`。
+    """
+    raw = text or ""
+    lines = raw.split("\n")
+    kept = [ln for ln in lines if not is_site_marker_line(ln)]
+    dropped = len(lines) - len(kept)
+    if not dropped:
+        return raw, 0
+    return "\n".join(kept), dropped
+
+
+def clean_site_residue(text: str) -> tuple[str, dict]:
+    """只删**精确区间**的站点残留（域名 token / 闭合括号块 / 整行广告）。
+
+    与 `strip_site_marker_lines` 的分工：这里删的是自带边界的 span，删完其余
+    字符原样拼回（含换行）；拿不准的形态**不删**，只作为 `unresolved` 证据留下
+    —— 「宁可漏报，不可误删」。
+
+    报告里的 `chars_in/chars_out/removed_chars` 是**本阶段输入**的口径
+    （此时水印已剔），不是全书原始字数；全书口径看顶层报告的 `chars_in/chars_out`。
+    """
+    raw = text or ""
+    spans = sorted((m.start(), m.end()) for p in _SITE_RESIDUE_PATTERNS for m in p.finditer(raw))
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    parts, cursor = [], 0
+    for start, end in merged:
+        parts.append(raw[cursor:start])
+        cursor = end
+    parts.append(raw[cursor:])
+    cleaned = "".join(parts)
+    unresolved: list[dict] = []
+    unresolved_count = 0
+    for m in _SUSPECT_RESIDUE.finditer(cleaned):
+        unresolved_count += 1
+        if len(unresolved) < _MAX_SITE_SAMPLES:
+            unresolved.append({
+                "start": m.start(), "end": m.end(), "marker": m.group(),
+                "excerpt": cleaned[max(0, m.start()-40):m.end()+60],
+                "reason": "no_safe_template_boundary",
+            })
+    return cleaned, {
+        "version": CONSUMPTION_CLEAN_VERSION, "cleaned": cleaned != raw,
+        "chars_in": len(raw), "chars_out": len(cleaned),
+        "removed_chars": len(raw)-len(cleaned), "removed_count": len(merged),
+        # 样本封顶：总量用 removed_count / unresolved_count 表达，
+        # 列表只留前 _MAX_SITE_SAMPLES 条给人复核。
+        "removed_spans": [{"start": a, "end": b, "text": raw[a:b]}
+                          for a, b in merged[:_MAX_SITE_SAMPLES]],
+        "unresolved": unresolved,
+        "unresolved_count": unresolved_count,
+    }
+
+
 def detect_marks(text: str, **kwargs) -> list[dict]:
     """检出可疑水印串（`corpus_health.scan_watermarks` 的薄封装，只取 flagged）。
 
@@ -296,6 +441,8 @@ def build_clean_report(
     thresholds: dict | None = None,
     duplicate_report: dict | None = None,
     cross_novel_report: dict | None = None,
+    site_residue_report: dict | None = None,
+    site_marker_lines: int = 0,
 ) -> dict:
     """把「检出结论 + 被拒候选 + 清洗前后字数」组装成可持久化、可复核的清洗报告。
 
@@ -346,9 +493,17 @@ def build_clean_report(
     removed = chars_in - chars_out
     dup = duplicate_report or {"enabled": False, "removed_paragraphs": 0, "removed_chars": 0}
     cross = cross_novel_report or {"enabled": False, "removed_paragraphs": 0, "removed_chars": 0}
+    site = site_residue_report or {
+        "version": CONSUMPTION_CLEAN_VERSION, "cleaned": False,
+        "removed_chars": 0, "removed_count": 0,
+        "removed_spans": [], "unresolved": [], "unresolved_count": 0,
+    }
     return {
         "version": CLEAN_REPORT_VERSION,
-        "cleaned": bool(marks or dup.get("removed_paragraphs") or cross.get("removed_paragraphs")),
+        "cleaned": bool(
+            marks or dup.get("removed_paragraphs") or cross.get("removed_paragraphs")
+            or site.get("removed_count") or site_marker_lines
+        ),
         "chars_in": chars_in,
         "chars_out": chars_out,
         "removed_chars": removed,
@@ -363,14 +518,20 @@ def build_clean_report(
         # 段落级清洗：整段重复 / 跨书污染（各自带删除量 + 3 条原文样本）。
         "duplicate_paragraphs": dup,
         "cross_novel": cross,
+        # 站点块清洗：精确区间删除（带删除区间与未解决证据）+ 整行站点标记计数。
+        "site_residue": site,
+        "site_marker_lines": int(site_marker_lines),
     }
 
 
 def clean_novel_text(text: str, **kwargs) -> tuple[str, dict]:
-    """完整清洗：水印 → 跨书污染 → 整段重复，返回 ``(清洗后文本, 报告)``。
+    """完整清洗：水印 → 站点残留/站点行 → 跨书污染 → 整段重复，返回 ``(清洗后文本, 报告)``。
 
-    顺序有讲究：跨书污染要**先**判（它依赖「同一段落重复 N 次」这个信号，
-    去重之后重复就没了）；整段重复再去掉剩余的副本、只留首次出现。
+    顺序有讲究：
+    - 站点清洗在段落级判定**之前**：它删的是自带边界的 span/整行，
+      不影响「同一段落重复 N 次」这个跨书判据所依赖的段落切分；
+    - 跨书污染要先于去重（它依赖重复次数，去重之后重复就没了）；
+    - 整段重复最后做，去掉剩余副本、只留首次出现。
 
     未检出任何问题时**原样返回**文本，报告里 ``cleaned=False``、``removed_chars=0``，
     但 ``rejected_candidates`` 仍记录被排除的候选 —— 干净语料与「有候选但都没达标」
@@ -379,10 +540,13 @@ def clean_novel_text(text: str, **kwargs) -> tuple[str, dict]:
     scan = scan_watermarks(text, **kwargs)
     hits = scan["flagged"]
     cleaned = strip_watermarks(text, hits)
+    cleaned, site_rep = clean_site_residue(cleaned)
+    cleaned, site_lines = strip_site_marker_lines(cleaned)
     cleaned, cross_rep = strip_cross_novel_paragraphs(cleaned)
     cleaned, dup_rep = strip_duplicate_paragraphs(cleaned)
     return cleaned, build_clean_report(
         text, cleaned, hits,
         rejected=scan["rejected"], thresholds=scan["thresholds"],
         duplicate_report=dup_rep, cross_novel_report=cross_rep,
+        site_residue_report=site_rep, site_marker_lines=site_lines,
     )

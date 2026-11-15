@@ -1,6 +1,6 @@
 """小说/语料相关路由：上传、种子、列表、分片查看。"""
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -17,7 +17,12 @@ router = APIRouter(prefix="/api/novels", tags=["novels"])
 
 
 @router.post("/upload", response_model=UploadResult)
-def upload(file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
+def upload(
+    file: UploadFile = File(...),
+    # 混书剔除默认关闭：检测结论只报不删，剔除必须由调用方显式选择。
+    drop_foreign_blocks: bool = Form(False),
+    db: Session = Depends(get_db),
+) -> dict:
     data = file.file.read()
     if len(data) > settings.upload_max_bytes:
         raise HTTPException(
@@ -31,7 +36,13 @@ def upload(file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
         text, detected = decode_text(data, filename=file.filename)
     except EncodingDetectionError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    result = ingest_text(db, text, title=file.filename, platform="upload")
+    result = ingest_text(
+        db,
+        text,
+        title=file.filename,
+        platform="upload",
+        drop_foreign_blocks=drop_foreign_blocks,
+    )
     # 把检出编码一并回显，便于追溯「这本是按什么编码读的」。
     result["detected_encoding"] = detected
     return result

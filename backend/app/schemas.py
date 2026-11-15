@@ -46,6 +46,8 @@ class ChunkOut(BaseModel):
 class UploadResult(BaseModel):
     novel_id: int
     title: Optional[str]
+    # imported / imported_review（后者 = 检出混书但未剔除，待人工确认）
+    status: Optional[str] = None
     chapters: int
     chunks: int
     # 导入时的清洗报告（第 8 步）：上传响应里随即回显，用户立刻能看到洗掉了什么。

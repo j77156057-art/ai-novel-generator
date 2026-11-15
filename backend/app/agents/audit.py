@@ -15,7 +15,8 @@
 | `empty_or_short_chunks` | warn | 分片文本为空或短于 `MIN_CHUNK_CHARS`（切分/解析事故） |
 | `duplicate_chunks` | warn | 文本完全相同的分片（重复入库/重复切分） |
 | `suspected_injection_strings` | warn | 复用 `app.corpus_health` 的水印判据（句末位置分布） |
-| `missing_style_profile` | info | 语料未拟合文体档案（不影响可用性，影响文风注入） |
+| `foreign_book_blocks` | warn | 复用入库时的混书体检结论（`clean_report.foreign_blocks`，只报不删） |
+| `missing_style_profile` | info | 语料未被任何已拟合项目引用（判「实际生效的档案」，不是恒真的语料槽位） |
 | `chunks_without_embedding` | warn | 分片未建 embedding（混合检索的向量路失效） |
 
 ### 知识图谱（`run_kg_audit`，按项目，generated 图）
@@ -319,14 +320,126 @@ def rule_corpus_injection_strings(
     return issues, notes
 
 
+def rule_corpus_foreign_blocks(
+    novels: dict[int, RawNovel], chunks_by_novel: dict[int, list[NovelChunk]], taken: set[str],
+) -> tuple[list[DiagnosticIssue], dict[str, Any]]:
+    """语料里**混进了别的书**（盗版站把多本书拼成一个 txt）。
+
+    ## 判据在哪
+
+    判定在 `app.corpus_health.find_foreign_blocks`（人物聚集度 + 排他性），
+    **入库时**已经跑过一遍，结论存在 `raw_novels.clean_report.foreign_blocks` 里。
+    这里直接读那份结论，不重扫 —— 一是快（重扫一本 400 万字的书要 2 秒，
+    18 本就是 1 分钟，审核接口等不起），二是**与用户投放时看到的是同一份**。
+
+    ## 为什么要单列一条
+
+    「注入水印」是往句子里粘字；「混进来的书」是**整章正文来自另一本书**。
+    后者污染的是三样东西：文体档案（混合统计）、风格样例（取到外书段落）、
+    检索召回（外书情节）。三样都不是「文本脏」能解释的。
+
+    ## 只报不删
+
+    删的是整章正文，判据万一错了丢的是真内容 ⇒ 这里只给证据与建议。
+    """
+    issues: list[DiagnosticIssue] = []
+    notes: dict[str, Any] = {}
+    for novel_id in sorted(novels):
+        novel = novels[novel_id]
+        report = novel.clean_report or {}
+        foreign = report.get("foreign_blocks")
+        if not isinstance(foreign, dict) or not foreign.get("detected"):
+            notes[f"novel:{novel_id}"] = {
+                "foreign_block_scan": "not_detected",
+                "reason": (
+                    "入库时未检出混书"
+                    if isinstance(foreign, dict)
+                    else "这份语料入库时还没有「混书体检」这一项（历史语料）"
+                ),
+            }
+            continue
+        blocks = foreign.get("blocks") or []
+        top = blocks[0] if blocks else {}
+        terms = "、".join(str(t) for t in (top.get("terms") or [])[:6])
+        evidence = tuple(
+            IssueEvidence(
+                kind="novel",
+                source=_novel_source(novel_id),
+                ref_id=f"foreign_block:{i}",
+                snippet=(
+                    f"{int(b.get('chars', 0)):,} 字｜{b.get('chapter_count')} 章｜"
+                    f"独占词：{'、'.join(str(t) for t in (b.get('terms') or [])[:5])}"
+                    f"｜样本：{str(b.get('sample', ''))[:60]}"
+                ),
+                score=0.7,
+            )
+            for i, b in enumerate(blocks[:MAX_EVIDENCE_PER_ISSUE])
+        )
+        issues.append(
+            DiagnosticIssue(
+                id=make_issue_id("foreign_book_blocks", f"novel{novel_id}", taken),
+                type="corpus_quality",
+                severity="warn",
+                title=f"语料 {novel_id} 混进了别的书（{foreign.get('block_count')} 段 / "
+                      f"{int(foreign.get('chars', 0)):,} 字）",
+                claim=(
+                    f"novel_id={novel_id}（《{novel.title or '未命名'}》）里有 "
+                    f"{foreign.get('block_count')} 段共 {int(foreign.get('chars', 0)):,} 字"
+                    f"（占全文 {float(foreign.get('ratio', 0)) * 100:.2f}%）来自**另一本书**。"
+                    f"判据是「人物聚集度 + 排他性」：这些章里的常用词只在这一小片出现"
+                    f"（典型独占词：{terms}），而本书的人物遍布全书。"
+                    f"样本：{str(top.get('sample', ''))[:80]}。"
+                ),
+                suggestion=(
+                    "混进来的书会同时污染文体档案、风格样例与检索召回。"
+                    "重新投放这份语料并开启「剔除混书块」，或用 "
+                    "app.corpus_health.strip_foreign_blocks 剔除后重新入库；"
+                    "**不要**手工删分片（分片 id 会被蒸馏绑定引用）。"
+                ),
+                rule="foreign_book_blocks",
+                evidence=evidence,
+            )
+        )
+    return issues, notes
+
+
+def _fitted_novel_ids(db: Any) -> set[int]:
+    """哪些语料**已经**被某个项目拟合过文体档案（查项目侧那份真正生效的档案）。"""
+    from app.models import Project
+    fitted: set[int] = set()
+    for project in db.scalars(select(Project)).all():
+        if not (project.style_profile or {}):
+            continue
+        for nid in (project.reference_novel_ids or []):
+            try:
+                fitted.add(int(nid))
+            except (TypeError, ValueError):
+                continue
+    return fitted
+
+
 def rule_corpus_missing_style_profile(
-    novels: dict[int, RawNovel], chunks_by_novel: dict[int, list[NovelChunk]], taken: set[str]
+    novels: dict[int, RawNovel], chunks_by_novel: dict[int, list[NovelChunk]], taken: set[str],
+    fitted_novel_ids: set[int] | None = None,
 ) -> list[DiagnosticIssue]:
-    """缺 style_profile 的语料。"""
+    """没拟合过文体档案的语料。
+
+    ## 判据要查「实际生效的那份」
+
+    文体档案**实际存在的地方**是 `projects.style_profile`（按项目从选定的参考
+    语料拟合，`app.style.pipeline.project_profile`）。`raw_novels.style_profile`
+    这个语料级槽位**当前没有任何生产代码写它** —— 拿它当判据，这条规则会**恒真**
+    （每本书都报「未拟合」），而它给的建议（去项目里触发一次拟合）说的又是
+    项目级，自相矛盾。
+
+    所以「已拟合」算两条：语料自己那个槽位有值（旧路径，留着兼容），
+    **或者有项目引用了它、而那个项目拟合过文体档案**（实际生效的那条路径）。
+    """
+    fitted = set(fitted_novel_ids or ())
     missing = [
         nid
         for nid in sorted(novels)
-        if not (novels[nid].style_profile or {})
+        if not (novels[nid].style_profile or {}) and nid not in fitted
     ]
     if not missing:
         return []
@@ -443,6 +556,7 @@ def run_corpus_audit(
     issues: list[DiagnosticIssue] = []
     rule_errors: dict[str, Any] = {}
     watermark_notes: dict[str, Any] = {}
+    foreign_notes: dict[str, Any] = {}
 
     def _run(name: str, func) -> None:
         try:
@@ -466,9 +580,18 @@ def run_corpus_audit(
         watermark_notes = notes
 
     _run("suspected_injection_strings", _injection)
+
+    def _foreign_blocks() -> None:
+        nonlocal foreign_notes
+        found, notes = rule_corpus_foreign_blocks(novels, chunks_by_novel, taken)
+        issues.extend(found)
+        foreign_notes = notes
+
+    _run("foreign_book_blocks", _foreign_blocks)
     _run(
         "missing_style_profile",
-        lambda: issues.extend(rule_corpus_missing_style_profile(novels, chunks_by_novel, taken)),
+        lambda: issues.extend(rule_corpus_missing_style_profile(
+            novels, chunks_by_novel, taken, fitted_novel_ids=_fitted_novel_ids(db))),
     )
     _run(
         "chunks_without_embedding",
@@ -479,6 +602,7 @@ def run_corpus_audit(
         "novels_audited": len(novels),
         "chunks_audited": sum(len(v) for v in chunks_by_novel.values()),
         "watermark_scan": watermark_notes,
+        "foreign_block_scan": foreign_notes,
         "rule_errors": rule_errors,
     }
     report = DiagnosticReport(
@@ -489,6 +613,7 @@ def run_corpus_audit(
             "empty_or_short_chunks",
             "duplicate_chunks",
             "suspected_injection_strings",
+            "foreign_book_blocks",
             "missing_style_profile",
             "chunks_without_embedding",
         ],
