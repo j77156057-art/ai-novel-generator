@@ -49,6 +49,10 @@ def _make_db():
         Column("chapter_no", Integer, nullable=True),
         Column("idx", Integer, nullable=False),
         Column("text", Text, nullable=False),
+        # 与 app.models.NovelChunk 保持同列：`_load_novel_chapters` 用 ORM
+        # `select(NovelChunk)`，模型新增 raw_text 后手建表少了这列会直接报
+        # 「no such column: novel_chunks.raw_text」。这里只是补齐夹具列。
+        Column("raw_text", Text, nullable=True),
         Column("embedding", Text, nullable=True),
     )
     md.create_all(engine)
