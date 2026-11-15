@@ -470,6 +470,23 @@ def get_project(project_id: int, db: Session = Depends(get_db)) -> Project:
     return proj
 
 
+@router.get("/{project_id}/style-profile/fingerprint")
+def get_style_profile_fingerprint(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """文体档案的「量尺/规格书」对齐状态（只读，不重蒸）。
+
+    `state=stale` 表示档案来自旧版测量口径，**仍然可用**，只是数值与新尺不可比；
+    要不要重蒸由用户决定（重蒸走既有的蒸馏/apply 端点，不在这里自动发生）。
+    """
+    from app.style.pipeline import profile_fingerprint_state
+
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    return profile_fingerprint_state(
+        db, proj, unit_chars=int(proj.generation_length or 4000)
+    )
+
+
 #: 两个「书」字段的人话名。校验报错时直接用，避免前端只看到裸字段名。
 _BOOK_FIELD_LABELS = {
     "active_novel_id": "事实来源书",

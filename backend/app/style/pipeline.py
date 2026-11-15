@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.corpus_health import find_repeated_watermarks, strip_watermarks
-from app.style.stylometry import PROFILE_VERSION, fit_profile, fit_profile_v2
+from app.style.stylometry import MEASUREMENT_VERSION, PROFILE_VERSION, fit_profile, fit_profile_v2
 
 #: 每本语料最多留几条水印结论、每条留几个原文样本（防止档案 JSON 膨胀）
 MAX_MARK_ROWS = 5
@@ -35,6 +35,13 @@ PROFILE_MAX_JSON_BYTES = 32_768
 #: 依然匹配 → 永远沿用缺字段的旧档案，前端拿到的摘要也就永远少一块。
 #: 实测踩过：加了 `marks[].final` 之后，预检响应里 `final` 一直是 KeyError。
 PIPELINE_SCHEMA = "log_buckets_v1"
+
+#: **规格书**（style spec：可执行的高层规格 + 逐章规格）的版本。
+#:
+#: 规格书本体 `build_spec` 属台账第 8 批（`app/style/spec.py`）；本次只先把
+#: 「规格书是哪一版」记进档案指纹，让「档案与规格书不同版」这件事**可查询**。
+#: 等规格书搬进来时，把它挪到 `app/style/spec.py` 并换成真版本号。
+SPEC_VERSION = 1
 
 #: `corpus_health[*].marks[]` 的字段清单 —— 档案里存什么、预检响应下发什么，
 #: 以这一处为准。预检接口按这份清单逐字段挑，避免 `**m` 展开时被多余字段带出去。
@@ -133,17 +140,55 @@ def build_reference_profile(
 
 
 def profile_fingerprint(source_ids: list[int], unit_chars: int) -> dict:
-    """档案失效判据：语料集合 / 粒度 / 统计口径 / **档案形状**，任一变了就重算。
+    """档案失效判据：语料集合 / 粒度 / 统计口径 / **量尺** / **规格书** / 档案形状。
 
-    加 `schema` 还有一个副作用是好的：老档案里的 fingerprint 只有三个键，
-    新指纹多一个键 → 字典直接不相等 → 老档案自动失效，不用写迁移。
+    两个新增键（2026-11-15，搬自 main）：
+
+    - `measurement`：`stylometry.MEASUREMENT_VERSION` —— 同一段文字被**怎么量**。
+      换分母 / 改分句 / 加特征都会让它变，老档案的数值与新测量**不是一把尺**；
+    - `spec`：`SPEC_VERSION` —— 档案与规格书不同版时，规格书里的阈值是按另一版
+      统计量定的。
+
+    ## ⚠️ 这两键**不会**让老档案自动重拟
+
+    老档案的 fingerprint 里没有这两个键 ⇒ 字典不相等。若照旧走「不等就重拟」，
+    加指纹本身就把所有项目档案悄悄重蒸了一遍 —— 那是**用户没同意的写操作**。
+
+    所以 `project_profile` 把失配分成两类（见 `profile_mismatch_kind`）：
+    **硬失配**（语料集合 / 粒度 / 结构版本 / schema 变了）照旧重拟；
+    **软失配**（只差 measurement / spec 这两把新尺）⇒ **继续用老档案**，
+    只把状态标成 `stale`，由用户决定要不要重蒸。
     """
     return {
         "source_ids": sorted(int(i) for i in source_ids),
         "unit_chars": int(unit_chars),
         "version": PROFILE_VERSION,
         "schema": PIPELINE_SCHEMA,
+        "measurement": MEASUREMENT_VERSION,
+        "spec": SPEC_VERSION,
     }
+
+
+#: 软失配的键：只差这些 ⇒ 老档案**仍然可用**，只是数值来自旧尺。
+SOFT_MISMATCH_KEYS = ("measurement", "spec")
+
+
+def profile_mismatch_kind(cached_fp, want: dict) -> str:
+    """档案指纹与期望值的关系：`match` / `stale`（软失配） / `hard`（必须重拟） / `none`。
+
+    - `match`：逐键相等；
+    - `stale`：除了 `measurement` / `spec` 之外全相等（老档案缺这两把新尺）；
+    - `hard`：语料集合 / 粒度 / 结构版本 / schema 变了 —— 继续用会算错；
+    - `none`：老档案里根本没有 fingerprint（早于指纹机制）。
+    """
+    if not isinstance(cached_fp, dict):
+        return "none"
+    if cached_fp == want:
+        return "match"
+    hard_keys = [k for k in want if k not in SOFT_MISMATCH_KEYS]
+    if all(cached_fp.get(k) == want.get(k) for k in hard_keys):
+        return "stale"
+    return "hard"
 
 
 def _load_novel_text(db: Session, novel_id: int) -> tuple[str, str]:
@@ -176,8 +221,14 @@ def project_profile(
 
     want = profile_fingerprint(ids, unit_chars)
     cached = project.style_profile or {}
-    if not force and isinstance(cached, dict) and cached.get("fingerprint") == want:
-        return cached
+    if not force and isinstance(cached, dict) and cached:
+        kind = profile_mismatch_kind(cached.get("fingerprint"), want)
+        # 软失配（只差 measurement / spec）：**沿用老档案，不重拟**。
+        # 重拟是写操作（会覆盖 project.style_profile 并 commit），
+        # 不能让「加了两把新尺」这件事替用户做决定。状态由
+        # `profile_fingerprint_state` 暴露，用户想重蒸时显式 force。
+        if cached.get("fingerprint") == want or kind == "stale":
+            return cached
 
     texts: dict[str, str] = {}
     for nid in ids:
@@ -191,6 +242,46 @@ def project_profile(
     project.style_profile = profile
     db.commit()
     return profile
+
+
+def profile_fingerprint_state(
+    db: Session,
+    project,  # noqa: ANN001
+    *,
+    unit_chars: int,
+) -> dict:
+    """项目档案与当前「量尺/规格书」的关系（**只读**，用于查询是否需要重蒸）。
+
+    返回：
+
+    - `state`：`match` / `stale`（软失配：老档案来自旧尺，仍可用）/
+      `hard`（必须重拟：语料集合、粒度、结构版本变了）/ `none`（无指纹）/
+      `absent`（项目还没有档案）；
+    - `mismatched`：哪些键对不上（`stale`/`hard` 时非空）；
+    - `cached` / `expected`：两边指纹，便于人复核；
+    - `needs_recompute`：只有 `hard` / `none` 为 True —— 这两种情况下老档案
+      **算错了**；`stale` 不置 True（那是「尺不一样」，不是「算错」）。
+
+    **本函数不写库**：重蒸必须由调用方显式 `project_profile(..., force=True)`。
+    """
+    ids = [int(i) for i in (project.reference_novel_ids or [])]
+    want = profile_fingerprint(ids, unit_chars)
+    cached = project.style_profile or {}
+    if not isinstance(cached, dict) or not cached:
+        return {
+            "state": "absent", "mismatched": [], "cached": None,
+            "expected": want, "needs_recompute": bool(ids),
+        }
+    kind = profile_mismatch_kind(cached.get("fingerprint"), want)
+    cached_fp = cached.get("fingerprint") if isinstance(cached.get("fingerprint"), dict) else {}
+    mismatched = [k for k in want if cached_fp.get(k) != want.get(k)]
+    return {
+        "state": kind,
+        "mismatched": mismatched,
+        "cached": cached_fp or None,
+        "expected": want,
+        "needs_recompute": kind in ("hard", "none"),
+    }
 
 
 def project_profile_safe(
