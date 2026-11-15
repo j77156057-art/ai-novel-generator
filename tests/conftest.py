@@ -30,6 +30,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import os
+import sqlite3
 import sys
 import tempfile
 
@@ -61,9 +62,77 @@ def _fingerprint(path: str) -> dict | None:
     return {"size": st.st_size, "mtime": st.st_mtime, "sha256": h.hexdigest()}
 
 
-#: 会话开始（import conftest 时）对真实库做的快照，供护栏测试比对。
+#: KG worker 心跳键前缀。别的会话在跑生成/回填时，worker 每 15s 往 `app_settings`
+#: 写一次 `kg.worker.<id>`，整库字节必然变化——这属正常活动，不是「测试写坏真实库」。
+HEARTBEAT_KEY_PREFIX = "kg.worker."
+
+#: 超过这个行数的表只比行数、不逐行摘要：414MB 的主库逐行摘要把门禁拖慢到不可接受，
+#: 而「测试误写真实库」现实形态是清表/建表/批量插入，这些都会先被行数与 schema 抓住。
+_MAX_INLINE_ROWS = 5000
+
+
+def _db_logical_fingerprint(path: str) -> dict | None:
+    """真实库的**逻辑内容**指纹：schema + 每表行数 + 小表逐行摘要（跳过心跳行）。
+
+    与 `_fingerprint`（整文件字节）的分工：
+      - 字节指纹最敏感，但会被 15s 一次的心跳噪声打红；
+      - 逻辑指纹只跳过 `app_settings` 里的 `kg.worker.%` 行，其余照旧，既不会被
+        心跳误伤，也仍能抓住「测试 drop_all / 清表 / 插数据」。
+    文件不存在或打不开时返回 None（干净检出场景）。
+    """
+    if not os.path.isfile(path):
+        return None
+    uri = "file:" + path.replace("\\", "/") + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+    except sqlite3.Error:
+        return None
+    try:
+        tables = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        ]
+        schema = hashlib.sha256()
+        for name, sql in conn.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name"):
+            schema.update(f"{name}\x00{sql or ''}\n".encode())
+
+        counts: dict[str, int] = {}
+        content = hashlib.sha256()
+        heartbeat_rows = 0
+        for table in tables:
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')]
+            where = ""
+            if table == "app_settings" and "key" in cols:
+                where = f" WHERE key NOT LIKE '{HEARTBEAT_KEY_PREFIX}%'"
+                heartbeat_rows = conn.execute(
+                    f'SELECT count(*) FROM "{table}" '
+                    f"WHERE key LIKE '{HEARTBEAT_KEY_PREFIX}%'"
+                ).fetchone()[0]
+            n = conn.execute(f'SELECT count(*) FROM "{table}"{where}').fetchone()[0]
+            counts[table] = n
+            if n <= _MAX_INLINE_ROWS:
+                for row in conn.execute(f'SELECT * FROM "{table}"{where}'):
+                    content.update((table + "\x00" + repr(tuple(row)) + "\n").encode())
+        return {
+            "schema": schema.hexdigest(),
+            "counts": counts,
+            "content": content.hexdigest(),
+            "heartbeat_rows": heartbeat_rows,
+        }
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+#: 会话开始（import conftest 时）对真实库做的**逻辑**内容快照，供护栏测试比对。
+#: 只跳过 `kg.worker.%` 心跳行，其余（schema/行数/小表内容）都要逐项不变。
 REAL_DB_SNAPSHOT: dict[str, dict | None] = {
-    p: _fingerprint(p) for p in sorted(_REAL_DB_FILES)
+    p: _db_logical_fingerprint(p) for p in sorted(_REAL_DB_FILES)
 }
 
 REAL_DB_FILES: tuple[str, ...] = tuple(sorted(_REAL_DB_FILES))

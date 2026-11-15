@@ -26,8 +26,15 @@ from app.llm.provider import ZhipuChatProvider
 
 
 class _Resp:
+    """假响应：接口对齐 `http.client.HTTPResponse`。
+
+    provider 按 64KiB 窗口分块读（`read1(n)` 优先、`read(n)` 兜底），
+    所以 `read` 必须接受长度参数并在 EOF 返回 b""。
+    """
+
     def __init__(self, payload: bytes):
         self._p = payload
+        self._pos = 0
 
     def __enter__(self):
         return self
@@ -35,19 +42,17 @@ class _Resp:
     def __exit__(self, *a):
         return False
 
-    def read(self):
-        return self._p
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._p[self._pos:] if n is None or n < 0 else self._p[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def read1(self, n: int = -1) -> bytes:
+        return self.read(n)
 
 
-class _StreamResp:
-    def __init__(self, payload: bytes):
-        self._p = payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+class _StreamResp(_Resp):
+    """流式假响应：SSE 帧以字节形式返回，由 provider 自己拼行。"""
 
     def __iter__(self):
         for line in self._p.splitlines(keepends=True):

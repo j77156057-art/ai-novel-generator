@@ -73,8 +73,14 @@ class DistillStubProvider(AsyncChatStub):
 
 
 class SelfcheckStubProvider(AsyncChatStub):
-    """Writer 用的假 provider：第 1 次 chat 返回带 AI 腔的正文（触发重写），
-    第 2 次起返回改写后的正文；记录每次 chat 收到的 (system, user)。
+    """Writer 用的假 provider：初稿/补完返回带 AI 腔的正文，重写返回干净文本。
+
+    2026-11-14 起**重写轮也走 stream_chat**（engine `_rewrite_with_evidence`
+    为了避开首字节硬顶改用流式），所以：
+      - `chat` 只剩「初稿」与「初稿补完」两类调用，一律返回 `_AI_TEXT`，
+        这样补完不会把 AI 腔洗掉、重写前提才成立；
+      - `stream_chat` 同时承载「流式初稿」和「重写」，按 system 是否含重写
+        标记分流，并**同样记录 prompt**（只记 chat 会看不到重写 prompt）。
 
     为什么要记 user：本文件断言的是「重写 prompt 里有没有原文对照」，
     必须能看到真正送进模型的那串文本，而不是另造一份去比对。
@@ -87,14 +93,14 @@ class SelfcheckStubProvider(AsyncChatStub):
     def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
         self.chat_calls += 1
         self.prompts.append((system, user))
-        # 第 1 次 = 生成正文（要带 AI 腔才会触发重写）；第 2 次起 = 重写
-        return _AI_TEXT if self.chat_calls == 1 else _REWRITTEN
+        return _AI_TEXT
 
     def summarize(self, text: str) -> str:
         return "测试摘要"
 
     def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
-        yield _AI_TEXT
+        self.prompts.append((system, user))
+        yield _REWRITTEN if "你是一位资深中文网文编辑" in system else _AI_TEXT
 
 
 @pytest.fixture(autouse=True)
@@ -180,11 +186,11 @@ def _add_finding(db, project_id: int, segment_no: int = 3,
 
 
 def _rewrite_user_of(stub: SelfcheckStubProvider) -> str:
-    """取重写那次 chat 的 user。
+    """取重写那次调用的 user（chat / stream_chat 都记在同一份 prompts 里）。
 
     按 system 内容识别（重写 system 含「你是一位资深中文网文编辑」），
-    **不按调用序号猜**——流式路径的正文走 stream_chat，重写的 chat 是第 1 次
-    而不是第 2 次（实测踩过：按序号取会取错并误判为「重写未触发」）。
+    **不按调用序号猜**——初稿、补完、重写三类调用混在两个入口里，
+    序号随链路变化（实测踩过：按序号取会取错并误判为「重写未触发」）。
     """
     for system, user in stub.prompts:
         if "你是一位资深中文网文编辑" in system:

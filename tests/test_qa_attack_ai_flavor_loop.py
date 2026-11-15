@@ -943,6 +943,33 @@ def test_e1_byte_identical_without_override_vs_pre_change(tmp_path):
         "- 避免堆叠四字格：连续使用四字成语/对仗句会显得机械、像 AI 生成的「金句段」；\n"
         "人物对话和叙事以自然口语/长短句为主，四字格用一处即止。\n"
     )
+    #: prompts v17（2026-11-15 定稿）的三处基线变更。逐条显式扣除后**仍要求与
+    #: `4227c73^` 逐字节相同**——证明的仍然是「未设置 override 时零额外字符」，
+    #: 只是把基线变更记录在案，不是放宽断言。
+    #: ① 伏笔措辞：「集中兑现」→「本节最多推进一条，其余留待后续」；
+    #: ② 新增【字数硬上限（写完必须自查）】块；
+    #: ③ 续写纪律：「每轮控制在指定字数内」→「每轮不少于本节要求的字数」。
+    v17_deltas = [
+        (
+            "以下是已埋下、暂不打烊的悬念，**本节最多推进一条，其余留待后续**；"
+            "不要在本节集中兑现多个伏笔，也不要用台词直接说出伏笔本身：",
+            "以下是已埋下、暂不打烊的悬念，你可以在后续段落里慢慢推进、隐晦呼应，"
+            "或暂时不提；**不要在本次续写中集中兑现多个伏笔**，"
+            "也不要用台词直接说出伏笔本身：",
+        ),
+        (
+            "【字数硬上限（写完必须自查）】\n"
+            "- 正文**汉字数**（不含标点与空白）上限 4800 字，目标 4000 字；"
+            "超过 4800 字直接判不合格并触发重写。\n"
+            "- 超出时只许压缩、合并、删冗句，不许靠加场景、加人物、加支线来凑长度。\n\n",
+            "",
+        ),
+        (
+            "；每轮**不少于**本节要求的字数：未写够不要写【本节完】，"
+            "也不要用总结句、抒情句或「从此……」式收尾提前结束。",
+            "；每轮控制在指定字数内。",
+        ),
+    ]
     cases = 0
     for reminders in _REMINDERS_CASES:
         for bible in _BIBLE_CASES:
@@ -952,9 +979,13 @@ def test_e1_byte_identical_without_override_vs_pre_change(tmp_path):
                 new_sys = prompts_new.build_system_prompt(
                     "测试项目", reminders, dims, bible, None, None,
                     style_suffix=None, constraint_note=None)
-                assert new_sys.replace(master_additions, "") == old_sys, (
-                    "除 master 有意新增的 2 条 AI 腔禁忌外，无覆写时 system prompt "
-                    "必须与 4227c73^ 逐字节相同")
+                normalized = new_sys.replace(master_additions, "")
+                for new_frag, old_frag in v17_deltas:
+                    normalized = normalized.replace(new_frag, old_frag)
+                assert normalized == old_sys, (
+                    "除 master 的 2 条 AI 腔禁忌与 prompts v17 的三处基线变更外，"
+                    "无覆写时 system prompt 必须与 4227c73^ 逐字节相同"
+                )
                 new_sys_empty = prompts_new.build_system_prompt(
                     "测试项目", reminders, dims, bible, None, None,
                     style_suffix="", constraint_note="")

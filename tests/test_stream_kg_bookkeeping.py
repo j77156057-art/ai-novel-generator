@@ -224,7 +224,12 @@ def test_bookkeeping_failure_does_not_break_stream(db_session, monkeypatch):
     gen = db_session.scalars(
         select(Generation).where(Generation.project_id == proj.id)
     ).one()
-    assert gen.text == SEG_TEXT, f"正文未照常落库，实际 {gen.text!r}"
+    # 落库口径（现行契约）：`merge_ultra_short_dialogue` 结束时把段落统一重排为
+    # 空行分隔（`"\n\n".join`），所以单换行正文落库后必然变成空行分隔——
+    # 断言的应是「段落内容与顺序不变」，不是字面换行数不变。
+    assert gen.text == SEG_TEXT.replace("\n", "\n\n"), (
+        f"正文未照常落库（应按空行分段），实际 {gen.text!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,19 +248,37 @@ def test_rewrite_failure_does_not_crash_generation(db_session):
     ai_text = "就在这时他不禁深吸一口气，心中充满了怒火，他知道，要出事了。突然之间灯灭了。"
 
     class BoomOnRewriteProvider(StubProvider):
-        """生成正常返回（带 AI 腔以触发重写），重写那次抛错。"""
+        """生成正常返回（带 AI 腔以触发重写），重写那次抛错。
 
-        def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
+        重写轮自 2026-11-14 起走 `stream_chat`，所以两个入口都要按 system
+        标记抛错——只改 `chat` 的话重写会走 StubProvider.stream_chat 正常返回，
+        这条「重写失败」路径根本不会被执行。
+        """
+
+        @staticmethod
+        def _boom_if_rewrite(system: str) -> None:
             if "你是一位资深中文网文编辑" in system:
                 raise RuntimeError("重写时模型炸了")
+
+        def chat(self, system: str, user: str, constraints: dict | None = None, **kwargs) -> str:
+            self._boom_if_rewrite(system)
             return ai_text
+
+        def stream_chat(self, system: str, user: str, constraints: dict | None = None, **kwargs):
+            self._boom_if_rewrite(system)
+            yield self.text
 
     proj = _make_project(db_session)
     # 不得抛异常（修复前这里会抛 NameError: name 'logging' is not defined）
     result = generate_next_segment(db_session, proj, provider=BoomOnRewriteProvider())
 
     assert result.get("text") == ai_text, "重写失败应保留原文"
-    assert result.get("rewrite_info") is None, "重写失败不应产出 rewrite_info"
+    # 现行契约（engine `_rewrite_rounds`：「失败也留痕」）：重写失败必须写
+    # `rewrite_info = {"failed": True, "error": ...}`，否则失败又被静默吞掉、
+    # 事后无法区分「没触发重写」与「重写炸了」。
+    info = result.get("rewrite_info") or {}
+    assert info.get("failed") is True, f"重写失败必须留痕，实际 {info!r}"
+    assert "重写时模型炸了" in str(info.get("error") or ""), f"失败原因没记上：{info!r}"
 
 
 def test_nonstream_kg_update_unchanged(db_session):

@@ -61,7 +61,7 @@ from app.generation.engine import (  # noqa: E402
 )
 from app.generation.prompts import build_system_prompt  # noqa: E402
 from app.kg.build import merge_segment_into_kg  # noqa: E402
-from app.models import Generation, Project  # noqa: E402
+from app.models import Generation, KgEvent, Project  # noqa: E402
 
 #: `describe_narrative`（app/style/narrative.py:2123）产出的块首行——用它做路径级断言，
 #: 不依赖具体规则文字，避免测试与档案内容耦合。
@@ -82,8 +82,13 @@ def _disable_guards(monkeypatch) -> None:
 
 
 #: 一份形状合法（rules + forbidden）的叙事档案，`describe_narrative` 会渲染出非空块。
+#: 规则需带「证据：」与章号：四层选条会硬过滤无证据/无章号的条目（否则块为空，
+#: 路径级断言测的就不是「有没有传档案」而是「档案有没有被过滤光」）。
 NARRATIVE = {
-    "rules": {"人物描写手法": [{"rule": "出场先写环境再写人（证据：她抬起头）"}]},
+    "rules": {"人物描写手法": [{
+        "rule": "出场先写环境再写人（证据：她抬起头，看见走廊尽头的灯一盏盏亮起。）",
+        "chapter_no": 2,
+    }]},
     "forbidden": {"禁用转折词": ["就在这时"]},
 }
 
@@ -215,6 +220,15 @@ def test_regenerate_stream_system_includes_narrative_block(db_session, monkeypat
     proj = _make_project(db_session)
     _seed_segment(db_session, proj, 1, SEG1)
     _seed_segment(db_session, proj, 2, SEG2)
+    # 续写渲染强制要求 KG 时间线（describe_narrative 缺 timeline 直接 ValueError），
+    # 生产项目由 merge_segment_into_kg 之外的事件抽取写入 kg_events。这里补一条
+    # is_current 事件，让 `_narrative_timeline` 能返回真实时间线（不是 monkeypatch
+    # 空壳），测试走的就是生产路径。
+    db_session.add(KgEvent(
+        project_id=proj.id, sequence=1, chapter=1, segment_no=1,
+        event_type="incident", summary="林夜推开木门回家", is_current=True,
+    ))
+    db_session.commit()
 
     # —— 重生成路径 ——
     regen = RecordingProvider()
@@ -261,6 +275,9 @@ def test_no_archive_project_output_unchanged_documented_equivalence(db_session, 
         proj.title, engine_mod.get_reminders(db_session, proj.id, source="generated"),
         engine_mod._style_info(proj), proj.plot_bible,
         engine_mod._style_profile(db_session, proj),
+        # before_segment=1 → 首段。2026-11-12 起首段不列伏笔清单，
+        # 旧基线必须带同一个 is_opening 才可比。
+        is_opening=True,
     )
 
     assert system == legacy, (

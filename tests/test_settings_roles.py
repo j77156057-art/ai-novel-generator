@@ -296,7 +296,7 @@ def test_put_writer_role_invalidates_only_writer_cache(db_session):
 
 
 def test_put_writer_role_rejects_max_tokens_and_timeout(db_session):
-    """b58c763 红线：chat timeout=120 / stream_timeout=180 不提供改写入口。"""
+    """b58c763 红线：chat timeout（2026-11-14 起 180）/ stream_timeout=180 不提供改写入口。"""
     from fastapi import HTTPException
 
     for bad in ({"max_tokens": 4096}, {"timeout": 300}):
@@ -315,7 +315,9 @@ def test_put_writer_role_still_reports_singleton_values_on_get(db_session):
     reset_provider_registry()
 
     block = _get(db_session)["writer"]
-    assert block["timeout"] == 120
+    # 2026-11-14：Writer chat 超时 120 → 180（与 stream 同档）。GET 必须如实
+    # 展示单例的真实值，不是展示某个历史常量。
+    assert block["timeout"] == 180
     # 不硬编码具体数字：这条断言的是「GET 如实展示单例配置的
     # 真实值」，不是「Writer 的 max_tokens 恰好是 2048」。原先写死 2048，结果
     # 2026-10-14 调到 4096（给 3000 字目标留余量）后就超结果炸了。

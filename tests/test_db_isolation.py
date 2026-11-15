@@ -15,9 +15,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 
 # 复用 conftest 的常量与函数（pytest 会把 conftest 所在目录放进导入路径）。
-from conftest import REAL_DB_FILES, _fingerprint  # noqa: E402
+from conftest import (  # noqa: E402
+    REAL_DB_FILES,
+    _db_logical_fingerprint,
+    _fingerprint,
+)
 
 
 def test_test_db_is_isolated_to_temp_file(test_database_url):
@@ -39,20 +44,30 @@ def test_test_db_is_isolated_to_temp_file(test_database_url):
 
 
 def test_real_dev_db_untouched_by_test_session(real_db_snapshot):
-    """真实库文件指纹（mtime+size+sha256）自会话开始起**没有被改动**。"""
+    """真实库的**逻辑内容**自会话开始起没有被改动（允许 KG worker 心跳）。
+
+    为什么不比整文件 sha256：别的会话在跑生成/回填时，KG worker 每 15s 往
+    `app_settings` 写一次 `kg.worker.<id>`，整库字节必然变化——那是正常活动，
+    不是「测试写坏真实库」。这里比 schema + 每表行数 + 小表逐行摘要，
+    且跳过 `kg.worker.%` 心跳行，口径见 conftest.`_db_logical_fingerprint`。
+    """
     checked = 0
     for path, before in real_db_snapshot.items():
         if before is None:
             # 真实库不存在（干净检出）——没得比，跳过
             continue
-        after = _fingerprint(path)
+        after = _db_logical_fingerprint(path)
         assert after is not None, f"真实库 {path} 在跑测期间消失了！"
-        assert after["sha256"] == before["sha256"], (
-            f"真实库 {path} 的内容在跑测期间被改动（sha256 变了）——测试隔离失效！\n"
-            f"  before sha256={before['sha256']}\n  after  sha256={after['sha256']}"
+        assert after["schema"] == before["schema"], (
+            f"真实库 {path} 的 schema 变了（有表/索引被建或删）——测试隔离失效！"
         )
-        assert after["size"] == before["size"], f"真实库 {path} 大小变了"
-        assert after["mtime"] == before["mtime"], f"真实库 {path} mtime 变了"
+        assert after["counts"] == before["counts"], (
+            f"真实库 {path} 的行数变了（清表或灌数）——测试隔离失效！\n"
+            f"  before={before['counts']}\n  after ={after['counts']}"
+        )
+        assert after["content"] == before["content"], (
+            f"真实库 {path} 的小表内容变了（除 kg.worker.* 心跳外也动了）——测试隔离失效！"
+        )
         checked += 1
     # 至少校验到一个真实库（否则这护栏形同虚设）
     assert checked >= 1, "未找到任何可校验的真实库；护栏未生效"
@@ -75,3 +90,42 @@ def test_hashing_is_stable():
     assert hashlib.sha256(b"abc").hexdigest() == (
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     )
+
+
+def test_logical_fingerprint_ignores_only_heartbeat_rows(tmp_path):
+    """自检：只忽略 `kg.worker.*` 心跳行，其他任何改动都必须判出来。
+
+    否则把判法从「整文件 sha256」换成「逻辑指纹」就会变成放宽断言。
+    """
+    p = tmp_path / "x.db"
+    conn = sqlite3.connect(str(p))
+    conn.execute("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE chapters (id INTEGER PRIMARY KEY, body TEXT)")
+    conn.execute("INSERT INTO app_settings VALUES ('kg.worker.a', '{\"ts\":1}')")
+    conn.execute("INSERT INTO app_settings VALUES ('writer_role', '{}')")
+    conn.execute("INSERT INTO chapters (body) VALUES ('x')")
+    conn.commit()
+
+    before = _db_logical_fingerprint(str(p))
+    assert before is not None
+
+    # 心跳刷新 → 不算改动
+    conn.execute("UPDATE app_settings SET value='{\"ts\":2}' WHERE key='kg.worker.a'")
+    conn.commit()
+    assert _db_logical_fingerprint(str(p)) == before
+
+    # 非心跳键内容变化 → 必须判出来
+    conn.execute("UPDATE app_settings SET value='{\"changed\":1}' WHERE key='writer_role'")
+    conn.commit()
+    assert _db_logical_fingerprint(str(p))["content"] != before["content"]
+
+    # 业务表被清空 → 行数必须判出来
+    conn.execute("DELETE FROM chapters")
+    conn.commit()
+    assert _db_logical_fingerprint(str(p))["counts"] != before["counts"]
+
+    # 表被删 → schema 必须判出来
+    conn.execute("DROP TABLE chapters")
+    conn.commit()
+    assert _db_logical_fingerprint(str(p))["schema"] != before["schema"]
+    conn.close()

@@ -16,7 +16,9 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 
 _BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend"))
@@ -32,6 +34,7 @@ from app.models import DistillRun, NovelChunk, Project, RawNovel  # noqa: E402
 from app.style import narrative as narrative_mod  # noqa: E402
 from app.style.narrative import (  # noqa: E402
     TIER_FAST,
+    describe_narrative,
     extract_narrative_profile,
     project_narrative,
 )
@@ -178,26 +181,31 @@ def test_cache_hit_generation_path_skips_hash_and_library(
     assert persist_spy["n"] == 1, "蒸馏路径的落库被误伤——蒸馏库会永远为空"
 
 
-def test_generation_path_extraction_still_commits_project_cache(
+def test_generation_path_without_cache_refuses_sync_distill(
     db_session, monkeypatch, stub_llm
 ):
-    """生成路径罕见地走到真实提取（缓存失效+库未命中）时：
-    新档案必须落进项目缓存（commit），否则下次生成又全量重跑。"""
+    """生成路径（缓存失效 + 库未命中）：拒绝同步蒸馏，返回 None 且不写任何缓存。
+
+    新契约（narrative.py `persist_library=False` 分支，2026-11）：
+    生成请求里**绝不允许**跑分钟级蒸馏——那会把请求静默挂到超时。拿不到可用
+    旧档就返回 None，由调用方按「不注入文风」处理，并提示先走
+    `POST /api/projects/{id}/distill`。旧断言「必须顺手把档案落进项目缓存」
+    已作废。"""
     nid = _make_corpus(db_session)
     proj = _make_project(db_session, nid, tier=TIER_FAST)
 
     profile = project_narrative(
         db_session, proj, tier=TIER_FAST, persist_library=False
     )
-    assert profile and profile.get("fingerprint")
+    assert profile is None, "生成路径无缓存时必须拒绝同步蒸馏、返回 None"
 
-    # 新 session 读库：档案必须已经落库（不是只挂在 session 里）
+    # 也不能把半成品写进项目缓存：下次生成仍应走「请先蒸馏」的分支。
     db_session.expire_all()
     fresh = SessionLocal()
     try:
         row = fresh.get(Project, proj.id)
-        assert (row.style_narrative or {}).get("fingerprint"), (
-            "生成路径提取的档案没落进项目缓存——下次生成又会全量重跑"
+        assert not (row.style_narrative or {}).get("fingerprint"), (
+            "生成路径拒绝同步蒸馏时写了项目缓存——会把空档当成已蒸馏"
         )
     finally:
         fresh.close()
@@ -217,7 +225,8 @@ def test_all_chunks_failed_raises_instead_of_silent_success(db_session):
     nid = _make_corpus(db_session)
     proj = _make_project(db_session, nid, tier=TIER_FAST)
 
-    with pytest.raises(ValueError, match="3 个语料块全部未产出任何规则") as exc:
+    # 30 章 ÷ 5 章/块 = 6 块（`MIN_CHAPTERS_PER_CHUNK` 现行契约，见 narrative.py）
+    with pytest.raises(ValueError, match="6 个语料块全部未产出任何规则") as exc:
         extract_narrative_profile(
             db_session, proj, [nid], provider=BoomProvider(), tier=TIER_FAST
         )
@@ -233,7 +242,7 @@ def test_all_chunks_unparseable_also_raises(db_session):
         def chat(self, system: str, user: str, **kwargs) -> str:
             return "我不是 JSON，我是兜底文案"
 
-    with pytest.raises(ValueError, match="3 个语料块全部未产出任何规则") as exc:
+    with pytest.raises(ValueError, match="6 个语料块全部未产出任何规则") as exc:
         extract_narrative_profile(
             db_session, proj, [nid], provider=GarbageProvider(), tier=TIER_FAST
         )
@@ -262,8 +271,8 @@ def test_partial_chunk_failure_recorded_not_raised(db_session):
     profile = extract_narrative_profile(
         db_session, proj, [nid], provider=FirstOkThenBoomProvider(), tier=TIER_FAST
     )
-    # 快速档 30 章 → 3 块：第 1 块成功，后 2 块失败
-    assert profile["failed_chunks"] == 2, "部分失败数没记上——前端无从提示"
+    # 30 章 ÷ 5 章/块 = 6 块：第 1 块成功，后 5 块失败
+    assert profile["failed_chunks"] == 5, "部分失败数没记上——前端无从提示"
     rule_count = sum(len(v) for v in profile["rules"].values() if isinstance(v, list))
     assert rule_count > 0, "有成功的块就必须有规则产出"
 
@@ -285,7 +294,7 @@ def test_run_distill_job_partial_failure_visible_in_stage(db_session, monkeypatc
     db_session.expire_all()
     done = db_session.get(DistillRun, run.id)
     assert done.status == STATUS_SUCCESS
-    assert "2 个语料块调用失败" in (done.stage or ""), (
+    assert "5 个语料块调用失败" in (done.stage or ""), (
         f"部分失败没写进 stage：{done.stage!r}"
     )
     assert done.rule_count > 0
@@ -314,3 +323,86 @@ def test_content_hash_param_avoids_recompute(db_session, monkeypatch, stub_llm):
 
     assert hash_spy["n"] == 0, "传了 hash 还在全量加语料重算——P2-2 没修掉"
     assert received.get("hash") == "deadbeef", "调用方算的 hash 没被用上"
+
+
+# ====================================================================
+# 文风漂移分析：按书保留（2026-11-12）
+#
+# 缺陷：`all_rules["文风漂移分析"] = [...]` 是整键覆盖，每本书各算一次，
+# 后一本把前一本的结论覆盖掉，档案里永远只剩最后一本。后果是参考书收窄到
+# 只剩书 5 时，这一维渲染为空——明明书 5 蒸过。
+# ====================================================================
+
+
+class DriftProvider(AsyncChatStub):
+    """主提炼返回一条合法规则；漂移 prompt 按被问的语料号返回各自结论。"""
+
+    def chat(self, system: str, user: str, **kwargs) -> str:
+        if "文风差异" in system:
+            m = re.search(r"语料(\d+)", user)
+            label = m.group(1) if m else "?"
+            return json.dumps(
+                {
+                    "漂移总结": f"书{label}的漂移结论",
+                    "早期特点": ["句子长"],
+                    "后期特点": ["句子短"],
+                    "最大变化": "句长",
+                },
+                ensure_ascii=False,
+            )
+        return '{"人物描写手法": ["出场先写环境再写人（证据：医院里她抬起头）"]}'
+
+
+def _two_book_project(db) -> tuple[Project, int, int]:
+    nid_a = _make_corpus(db)
+    nid_b = _make_corpus(db)
+    proj = _make_project(db, nid_a, tier=TIER_FAST)
+    proj.reference_novel_ids = [nid_a, nid_b]
+    db.commit()
+    return proj, nid_a, nid_b
+
+
+def test_drift_kept_per_book_not_overwritten(db_session):
+    """两本书各一条漂移结论，后一本不许覆盖前一本；收窄到单书仍取得到。"""
+    proj, nid_a, nid_b = _two_book_project(db_session)
+
+    profile = extract_narrative_profile(
+        db_session, proj, [nid_a, nid_b], provider=DriftProvider(), tier=TIER_FAST
+    )
+    drift = profile["rules"]["文风漂移分析"]
+    assert [it["novel_id"] for it in drift] == [nid_a, nid_b], (
+        f"漂移结论被整键覆盖了，只剩：{[it.get('novel_id') for it in drift]}"
+    )
+    assert f"书{nid_a}" in drift[0]["rule"]
+    assert f"书{nid_b}" in drift[1]["rule"]
+
+    # 收窄到只剩一本书：必须能取到这本书的结论，且看不到另一本。
+    narrowed = describe_narrative(profile, allowed_novel_ids={nid_a})
+    assert f"书{nid_a}" in narrowed, "收窄到单书后这一维空了"
+    assert f"书{nid_b}" not in narrowed
+    assert "[语料" not in narrowed, "单书档案不应加书标识（要与改动前逐字一致）"
+
+    # 多书：每条都标出语料，能看出归属。
+    both = describe_narrative(profile)
+    assert f"[语料 {nid_a}]" in both and f"[语料 {nid_b}]" in both
+
+
+def test_drift_checkpoint_replay_does_not_collapse_to_last_book(db_session):
+    """断点续跑回放：两本书都从 aux_drift_{nid} 回灌，不互相覆盖。"""
+    proj, nid_a, nid_b = _two_book_project(db_session)
+
+    first = extract_narrative_profile(
+        db_session, proj, [nid_a, nid_b], provider=DriftProvider(), tier=TIER_FAST
+    )
+    assert len(first["rules"]["文风漂移分析"]) == 2
+
+    # 第二次全走断点：provider 一调就炸，能跑完就证明没有重新请求模型。
+    replayed = extract_narrative_profile(
+        db_session, proj, [nid_a, nid_b], provider=BoomProvider(),
+        tier=TIER_FAST, resume=True,
+    )
+    drift = replayed["rules"]["文风漂移分析"]
+    assert [it["novel_id"] for it in drift] == [nid_a, nid_b], (
+        f"断点回放把前一本覆盖了：{[it.get('novel_id') for it in drift]}"
+    )
+    assert f"书{nid_a}" in drift[0]["rule"] and f"书{nid_b}" in drift[1]["rule"]

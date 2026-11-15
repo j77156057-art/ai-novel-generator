@@ -52,6 +52,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 
@@ -71,6 +72,7 @@ from app.generation.engine import (  # noqa: E402
 from app.kg.build import merge_segment_into_kg  # noqa: E402
 from app.models import (  # noqa: E402
     Generation,
+    KgEvent,
     KgNode,
     NovelChunk,
     Project,
@@ -105,7 +107,16 @@ PLOT_BIBLE = {
 #:   `node_prompt` / `kg_slice` 在本用例的参数下均为 None，不产生字符）。
 #:
 #: 这两行若再变，说明重生成的提示词口径又被动过，必须**重新论证**而不是改常数。
-PROMPT_SHA256 = "7f5540770baba952ff3f0d4e626871d54c17a3f036f07dc204ea7c05f0859349"
+#:
+#: - `b6ffd53d…` 2026-11-15 按 prompts v17 定稿重算。**差异来源已逐条核对**（与
+#:   `test_qa_attack_ai_flavor_loop.py::test_e1` 的 v17_deltas 同源）：
+#:   ① 新增【字数硬上限（写完必须自查）】块（汉字数上限 4800 / 目标 4000）；
+#:   ② 续写纪律由「每轮控制在指定字数内」改为「每轮**不少于**本节要求的字数」；
+#:   ③ 伏笔措辞改为「本节最多推进一条，其余留待后续」。
+#:   已知观测：字数硬上限块上线同期，第 33 章一稿只写 2710 字；但第 34–41 章
+#:   六章均正常（3362–4123 汉字）。故判为**单次自停，不是指令性伤害**，
+#:   也**不构成「该指令有效」的证据**。
+PROMPT_SHA256 = "b6ffd53de8bd17f31029cf2f0a2abb3cc233a0e238cb28acb2d2c38c908a9132"
 
 
 class RecordingProvider:
@@ -352,12 +363,21 @@ def test_regenerate_executes_no_sql_against_novel_chunks(db_session, monkeypatch
     assert any(e.get("type") == "done" for e in events), "重生成未产出 done 事件"
     assert statements, "没有捕获到任何 SQL——监听器没挂上，本断言无意义"
 
-    offenders = [s for s in statements if "novel_chunks" in s]
+    # 现行契约（2026-11 起 `_rhythm_params` 进生成链路）：节奏参数需要参考语料的
+    # **统计量**（`count(*)` 做缓存键、`sum(length(text))` 算章长分布），这是有意
+    # 为之、且不读正文。禁止的是把分片正文/整行读进来——那才是 RAG 检索与风格
+    # 样例的特征。所以：允许聚合，其他 chunk SQL 一律算违规。
+    chunk_stmts = [s for s in statements if "novel_chunks" in s]
+    aggregate = [
+        s for s in chunk_stmts
+        if re.match(r"\s*SELECT\s+(count|sum)\(", s, re.IGNORECASE)
+    ]
+    offenders = [s for s in chunk_stmts if s not in aggregate]
     assert offenders == [], (
-        "重生成路径读了语料分片（SQL 含 novel_chunks）："
+        "重生成路径读了语料分片正文（非聚合 SQL 命中 novel_chunks）："
         f"{len(offenders)} 条，示例={offenders[:1]}。"
         "重生成的 user prompt 是无 RAG 的（`[]  # 重生成不带 RAG 素材`），"
-        "读这些分片纯属浪费"
+        "读这些分片纯属浪费；只有节奏统计的 count/sum 例外"
     )
 
 
@@ -382,6 +402,16 @@ def test_only_style_fit_touches_chunks_not_whole_rows(db_session):
     """
     proj, novel_ids = _fixture(db_session, title="档案边界")
     assert len(novel_ids) == 2, "本用例要 2 本语料，才能让档案加载与整行加载都可辨"
+
+    # 续写渲染自 2026-11 起硬要求 KG 时间线（缺了 `describe_narrative` 直接
+    # ValueError）。真实项目走到重生成时至少有一章正文与对应事件；本夹具是
+    # 纯语料夹具，补一条最小事件让「重生成」具备它承诺的前提，而不是绕过契约。
+    db_session.add(KgEvent(
+        project_id=proj.id, novel_id=None, sequence=1, segment_no=1,
+        chapter=None, event_type="incident", summary="测试事件：她在雨里等车。",
+        is_current=True,
+    ))
+    db_session.commit()
 
     from app.style.narrative import narrative_fingerprint
 
@@ -438,6 +468,57 @@ def test_only_style_fit_touches_chunks_not_whole_rows(db_session):
         "（`style/pipeline._load_novel_text` 每本一次，2026-10-17 于本夹具实测）。"
         "这条一变，说明「冷档案一次性成本」的形状变了——必须重新论证，"
         "不能随手改常数"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T2c（红→绿）：零 KG 事件的项目也能重生成，不因缺时间线打成 500
+# ---------------------------------------------------------------------------
+
+
+def test_regenerate_works_with_zero_kg_events(db_session, monkeypatch):
+    """KG 空项目（零事件）重生成必须成功，且提示写明「尚无已抽取剧情」。
+
+    修复前：`engine._narrative_timeline` 在无 `KgEvent` 时返回 None，而续写
+    渲染契约（`_render_kg_timeline`）要求 timeline 必填 → `describe_narrative`
+    抛 ValueError → 接口 500。修复后返回最小空时间线，生成链路正常走完。
+
+    这里**必须**给一个非空叙事档案：`_narrative_block` 在档案为空时直接返回
+    ""，连时间线都不渲染——那样即使 timeline 是 None 也不会触发 ValueError，
+    测不到原来的故障路径。
+    """
+    monkeypatch.setattr(engine_mod, "_require_distill_ready", lambda db, p: None)
+    monkeypatch.setattr(engine_mod, "_style_profile", lambda db, p: None)
+    monkeypatch.setattr(engine_mod, "_style_narrative", lambda db, p: {
+        "rules": {"人物描写手法": [{"rule": "出场先写环境再写人（证据：她抬起头）"}]},
+        "forbidden": {},
+    })
+
+    ids = [_make_corpus(db_session, "零事件")]
+    proj = _make_project(db_session, "零事件项目", ids)
+    # 直接写 Generation，不走 merge_segment_into_kg：本用例要保证「零 KgEvent」。
+    db_session.add(Generation(
+        project_id=proj.id, segment_no=1, text=SEG1, summary={"text": "段1摘要"},
+    ))
+    db_session.commit()
+    assert db_session.query(KgEvent).filter_by(project_id=proj.id).count() == 0, (
+        "夹具必须零 KG 事件，否则测不到「空时间线」分支"
+    )
+
+    prov = RecordingProvider()
+    events = list(
+        regenerate_segment_stream(db_session, proj, segment_no=1, provider=prov)
+    )
+    assert any(e.get("type") == "done" for e in events), (
+        "零事件项目重生成未产出 done 事件（很可能仍抛 ValueError 被打成 500）"
+    )
+    assert prov.systems, "重生成未把提示词交给 provider"
+    # 第一次 chat 是时间线节点规划（不带 constraints），真正的生成调用才带
+    # constraints；按 constraints 非空定位生成用的 system prompt。
+    gen_idx = next(i for i, c in enumerate(prov.constraints) if c is not None)
+    assert "尚无已抽取剧情" in prov.systems[gen_idx], (
+        "KG 空项目的时间线块必须写明「尚无已抽取剧情」，"
+        "不能让模型把「没有时间线」误读成可以自由编造此前事件"
     )
 
 

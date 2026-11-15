@@ -100,6 +100,8 @@ def test_character_supported_set_covers_renderer():
     for key in (
         "name", "名字", "role", "motivation",
         "background", "身世", "来历", "背景",
+        "voice", "sample_lines",
+        "gender", "性别", "first_chapter", "首次出场章节", "首次出场",
         "境界", "修炼", "量级", "量级细层", "量级序号", "出手规模",
     ):
         assert key in SUPPORTED_CHARACTER_KEYS, key
@@ -119,7 +121,7 @@ def test_known_unsupported_top_level_keys_warn():
 
 
 def test_known_unsupported_character_fields_warn():
-    silent = ["功法", "等级", "品阶", "power_level", "level", "gender"]
+    silent = ["功法", "等级", "品阶", "power_level", "level"]
     assert set(silent) <= set(KNOWN_UNSUPPORTED_CHARACTER_KEYS)
     for key in silent:
         bible = {"characters": [{"name": "林夜", "role": "主角", key: "X"}]}
@@ -152,6 +154,7 @@ def test_supported_bible_has_no_warnings():
             "修炼": {"当前境界": "金丹"},
             "量级": "B", "量级细层": "三品", "量级序号": 3,
             "出手规模": "一城",
+            "gender": "男", "first_chapter": 1,
         }],
     }
     assert validate_bible_keys(bible) == []
@@ -186,6 +189,29 @@ def test_character_background_renders_into_system():
     assert "  · 林夜（主角）" in _sys(base)
 
 
+def test_character_voice_and_samples_render_into_system():
+    bible = {"characters": [{
+        "name": "林夜", "role": "主角",
+        "voice": {
+            "self_ref": "我",
+            "address": {"长辈": "您", "同伴": "老白"},
+            "tics": ["行，我先看看", "这个不归我管"],
+            "sentence": "短句，先给结论",
+            "under_pressure": "越急越贫",
+            "taboo": ["不说包在我身上"],
+        },
+        "sample_lines": ["行，我先看看。", "这个不归我管。"],
+    }]}
+    prompt = _sys(bible)
+    for fragment in (
+        "自称：我", "称呼：长辈→您", "口头禅：“行，我先看看”",
+        "句长/节奏：短句，先给结论", "急时：越急越贫",
+        "禁说：不说包在我身上", "台词参考：“行，我先看看。”",
+    ):
+        assert fragment in prompt, fragment
+    assert validate_bible_keys(bible) == []
+
+
 # ======================================================================
 # B2-5 原本无声的键：md5 不变 + 必须告警（二者同时成立）
 # ======================================================================
@@ -194,11 +220,16 @@ def test_previously_silent_keys_warn_and_do_not_render():
     base_md5 = _md5(_sys(base))
     for key, value in (
         ("功法", "天地一刀斩"), ("等级", "甲等"), ("品阶", "一品"),
-        ("power_level", 9), ("level", 9), ("gender", "男"),
+        ("power_level", 9), ("level", 9),
     ):
         bible = {"characters": [{"name": "林夜", "role": "主角", key: value}]}
         assert _md5(_sys(bible)) == base_md5, key          # 仍然不渲染
         assert validate_bible_keys(bible), key              # 但不再静默
+    # gender 已升级为渲染字段（角色行输出「性别」与代词），不再是「静默无效键」。
+    gendered = {"characters": [{"name": "林夜", "role": "主角", "gender": "男"}]}
+    assert _md5(_sys(gendered)) != base_md5
+    assert validate_bible_keys(gendered) == []
+    # 顶层 gender 仍没有读取者（只支持角色卡内 gender）。
     for key in ("功法", "等级", "品阶", "power_level", "level", "gender"):
         assert _md5(_sys({key: "X"})) == _md5(_sys({})), key
         assert validate_bible_keys({key: "X"}), key
@@ -236,18 +267,37 @@ def test_supported_power_keys_change_power_block():
 
 
 def test_supported_user_prompt_keys_change_user_prompt():
+    """bible 支持键必须真的进 prompt——但首段只注入 conflicts。
+
+    2026-11-12 起，synopsis / direction / relationships / foreshadowing 是
+    「整条弧光」，首段注入会让模型在第一节演完（p5 实测 750 字收口），
+    统一延后到第 2 节；因此这里按段型分别断言。
+    """
     base = {"characters": [{"name": "林夜", "role": "主角"}]}
-    base_text = build_user_prompt([], [], None, 1000, plot_bible=base)
-    for key, value in (
+    arc_keys = (
         ("synopsis", "主角复仇"),
         ("direction", "走向结局"),
-        ("conflicts", ["灭门之仇"]),
         ("relationships", [{"a": "林夜", "b": "白光", "relation": "师徒"}]),
         ("foreshadowing", ["钥匙的来历"]),
-    ):
+    )
+
+    # 首段：弧光键一律不注入，只有 conflicts（本节可切入的冲突）生效
+    opening_base = build_user_prompt([], [], None, 1000, plot_bible=base)
+    for key, value in arc_keys:
         text = build_user_prompt([], [], None, 1000,
                                  plot_bible={**base, key: value})
-        assert _md5(text) != _md5(base_text), key
+        assert _md5(text) == _md5(opening_base), f"首段不应注入 {key}"
+    conflict_text = build_user_prompt(
+        [], [], None, 1000, plot_bible={**base, "conflicts": ["灭门之仇"]}
+    )
+    assert _md5(conflict_text) != _md5(opening_base), "conflicts"
+
+    # 第 2 节起：五个键全部恢复注入
+    later_base = build_user_prompt(["上一段"], [], None, 1000, plot_bible=base)
+    for key, value in arc_keys + (("conflicts", ["灭门之仇"]),):
+        text = build_user_prompt(["上一段"], [], None, 1000,
+                                 plot_bible={**base, key: value})
+        assert _md5(text) != _md5(later_base), key
 
 
 # ======================================================================

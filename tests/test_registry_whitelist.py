@@ -48,18 +48,17 @@ def test_r5_register_rejects_tool_not_in_allowlist():
 # T2：默认白名单里的工具必须全部注册成功，且集合与白名单一致。
 # ------------------------------------------------------------------
 def test_r5_default_specs_all_register_and_match_allowlist():
-    """② 回归：_DEFAULT_SPECS 全部注册不报错，注册表最终恰好 12 个工具名。
+    """② 回归：_DEFAULT_SPECS 全部注册不报错，注册表与白名单一一对应。
 
     证明白名单与默认注册集合保持同步——二者数量、成员必须逐一对应。
-    12 = 原 11 个只读工具 + `query_ai_flavor_memory`（AI 腔记忆库查询，
-    见 `feat(assistant): 记忆库注册为只读 skill`）。
+    数量以白名单为准（会随工具增减变化），不写死数字，避免加工具就红。
     """
     reg = AssistantToolRegistry()
     # register_many 内部逐个调用 register，会触发白名单校验
     reg.register_many(_DEFAULT_SPECS)
 
     registered = reg.names()
-    assert len(registered) == 12
+    assert len(registered) == len(ALLOWED_READ_ONLY_TOOLS)
     # 新工具必须在册（防止"数量对但成员被换掉"）
     assert "query_ai_flavor_memory" in registered
     # 默认规格的工具名必须**恰好**等于白名单（顺序无所谓，集合一致即可）

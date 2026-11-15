@@ -24,8 +24,15 @@ BODY = "小杨的指甲在生锈的铁皮上划出刺耳声响。"
 
 
 class _FakeResp:
+    """非流式假响应，接口对齐 `http.client.HTTPResponse`。
+
+    provider 自 2026-11-14 起按 64KiB 窗口分块读（`read1(n)` 优先、`read(n)` 兜底），
+    用来把「总时长」切成可检查的片段；假响应只实现无参 `read()` 会直接 TypeError。
+    """
+
     def __init__(self, payload: bytes):
         self._payload = payload
+        self._pos = 0
 
     def __enter__(self):
         return self
@@ -33,19 +40,17 @@ class _FakeResp:
     def __exit__(self, *a):
         return False
 
-    def read(self):
-        return self._payload
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._payload[self._pos:] if n is None or n < 0 else self._payload[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def read1(self, n: int = -1) -> bytes:
+        return self.read(n)
 
 
-class _FakeStreamResp:
-    def __init__(self, payload: bytes):
-        self._payload = payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+class _FakeStreamResp(_FakeResp):
+    """流式假响应：SSE 帧以字节形式返回，由 provider 自己拼行。"""
 
     def __iter__(self):
         for line in self._payload.splitlines(keepends=True):

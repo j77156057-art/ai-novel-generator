@@ -272,11 +272,16 @@ def test_legacy_channel_field_helper_directly():
 
 
 def test_qa_endpoint_really_reaches_assistant_chat(monkeypatch):
-    """`/api/assistant/qa` 拿到真实渠道 provider 后，必须真的调用它的 chat。
+    """`/api/assistant/qa` 拿到真实渠道 provider 后，必须真的调用它的模型方法。
 
     这条用例是本次缺陷的**永久哨兵**：修复前 provider 是 LocalFallback，
     chat 一样「成功返回」（返回的是本地模板），端点照样 200 —— 所以只有把
-    「被调用的是哪一个 chat」记下来，才能把「模型没被调到」从隐形缺陷变成红灯。
+    「被调用的是哪一个 provider 方法」记下来，才能把「模型没被调到」从隐形
+    缺陷变成红灯。
+
+    2026-11-14 接入 function calling 后，/qa 的模型入口从 `chat()` 换成
+    `complete_message()`（需要拿结构化 `tool_calls`）；哨兵随之盯住新入口，
+    判定目标不变：**必须是配置渠道的真实 provider，而不是 LocalFallback**。
     """
     from app.agents.registry import reset_tool_registry
     from app.db import Base, SessionLocal, engine
@@ -290,13 +295,20 @@ def test_qa_endpoint_really_reaches_assistant_chat(monkeypatch):
     settings.assistant_model = "glm-4-flash"
     settings.zhipu_api_key = "unit-test-key"
 
-    calls: list[tuple[str, str]] = []
+    calls: list[list[dict]] = []
 
-    def fake_chat(self, system: str, user: str, constraints: dict | None = None) -> str:
-        calls.append((system, user))
-        return "【模型回答】基于 evidence，主角当前最大的困境是身份可能暴露。"
+    def fake_complete_message(self, messages, *, tools=None, tool_choice=None,
+                              stop_sequences=None) -> dict:
+        calls.append(list(messages))
+        return {
+            "content": "【模型回答】基于 evidence，主角当前最大的困境是身份可能暴露。",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "usage": None,
+            "model": "glm-4-flash",
+        }
 
-    monkeypatch.setattr(ZhipuChatProvider, "chat", fake_chat)
+    monkeypatch.setattr(ZhipuChatProvider, "complete_message", fake_complete_message)
 
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -322,8 +334,9 @@ def test_qa_endpoint_really_reaches_assistant_chat(monkeypatch):
         reset_provider_registry()
         llm_provider_mod.reset_assistant_provider_cache()
 
-    assert len(calls) == 1, f"ZhipuChatProvider.chat 应被调用 1 次，实际 {len(calls)} 次"
-    system, user = calls[0]
+    assert len(calls) == 1, f"ZhipuChatProvider.complete_message 应被调用 1 次，实际 {len(calls)} 次"
+    system = next(m["content"] for m in calls[0] if m["role"] == "system")
+    user = next(m["content"] for m in calls[0] if m["role"] == "user")
     assert "助手" in system
     assert "主角当前最大的困境是什么？" in user
     # 返回的是模型的答案，而不是本地兜底模板
@@ -352,7 +365,10 @@ def test_writer_config_unchanged_by_assistant_fix():
 
 
 def test_writer_singleton_keeps_its_own_key_and_timeouts():
-    """硬红线：Writer 单例仍用 llm_provider 渠道的 key，chat=120 / stream=180 不变。
+    """硬红线：Writer 单例仍用 llm_provider 渠道的 key，chat=180 / stream=180 不变。
+
+    注：chat 超时在 2026-11-14 由 120 提到 180（与 stream_timeout 同档，长章
+    实测一次生成需 180s 上下）；本断言随之更新，不是本次 tool-calling 改动。
 
     对照组意义：Assistant 借用 legacy **字段**读 key，不得反过来把 Writer 的
     单例、key 或超时改成 Assistant 的 60 / 60。
@@ -369,7 +385,7 @@ def test_writer_singleton_keeps_its_own_key_and_timeouts():
 
     assert isinstance(writer, ZhipuChatProvider)
     assert writer.api_key == "writer-channel-key"
-    assert writer.timeout == 120
+    assert writer.timeout == 180
     assert writer.stream_timeout == 180
 
     assert isinstance(assistant, ZhipuChatProvider)

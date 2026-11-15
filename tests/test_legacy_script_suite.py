@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import _db_logical_fingerprint  # noqa: E402
+
 _BACKEND = Path(__file__).resolve().parent.parent / "backend"
 _REPO = _BACKEND.parent
 _PY = _BACKEND / "venv" / "Scripts" / "python.exe"
@@ -92,19 +94,23 @@ def _params() -> list:
 SCRIPTS = _params()
 
 
-def _db_fingerprint() -> dict[str, tuple[int, float]]:
-    out: dict[str, tuple[int, float]] = {}
+def _db_fingerprint() -> dict[str, dict | None]:
+    """真实库的**逻辑**指纹（schema + 行数 + 小表内容，跳过 kg.worker.* 心跳）。
+
+    不能用整文件字节：别的会话在跑生成/回填时，KG worker 每 15s 写一次心跳，
+    整库 sha256 必变。口径见 `conftest._db_logical_fingerprint`。
+    """
+    out: dict[str, dict | None] = {}
     for name in _REAL_DBS:
         p = _BACKEND / name
         if p.exists():
-            st = p.stat()
-            out[name] = (st.st_size, st.st_mtime)
+            out[name] = _db_logical_fingerprint(str(p))
     return out
 
 
 @pytest.fixture(scope="module")
 def real_db_untouched():
-    """真实库守卫：本文件跑完后，真实库必须一字节未变。"""
+    """真实库守卫：本文件跑完后，真实库除心跳外必须一字未变。"""
     before = _db_fingerprint()
     yield
     after = _db_fingerprint()
@@ -112,7 +118,9 @@ def real_db_untouched():
     assert not changed, (
         f"真实库被测试脚本改动了：{changed}。\n"
         f"改动前 {before} / 改动后 {after}\n"
-        "门禁绝不允许写真实库——请让脚本改用临时库（DATABASE_URL 或 :memory:）。"
+        "门禁绝不允许写真实库——请让脚本改用临时库（DATABASE_URL 或 :memory:）。\n"
+        "（ps. schema / 行数 / 小表内容任一变化都算；只有 app_settings 的 "
+        "kg.worker.* 心跳行被忽略。）"
     )
 
 

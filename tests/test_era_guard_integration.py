@@ -1,13 +1,15 @@
 """时代越界护栏接入产品链路的回归测试。
 
-盯七件事：
-1. 默认关闭（`Settings.era_guard_enabled` 的默认值就是 False）；
-2. 基线必须由项目显式声明；没有声明 → 不注入、meta 记 `baseline_unknown`；
-3. 显式声明但认不出 → 同样不注入，绝不回落王朝；
-4. meta 三态可区分：`disabled` / `baseline_unknown` / `active`；
-5. 默认 report：扫描但不改正文；
-6. 改写必须显式开关（report 下 provider 一次都不许被调）；
-7. system 提示注入是纯新增：不传约束时逐字节不变。
+盯八件事：
+1. 默认打开（总开关 + 约束注入 + 扫描留痕三个默认值都是 True，模式 report）；
+2. 两个子开关互不牵连：关注入不影响扫描，关扫描不影响注入；
+3. 基线必须由项目显式声明；没有声明 → 不注入、不扫描，meta 记 `baseline_unknown`；
+4. 显式声明但认不出 → 同样不注入，绝不回落王朝；
+5. meta 状态可区分：`disabled` / `constraint_disabled` / `scan_disabled` /
+   `baseline_unknown` / `active`；
+6. 默认 report：扫描但不改正文；
+7. 改写必须显式开关（report 下 provider 一次都不许被调）；
+8. 例外通道命中但同句缺引出人 → 降级为 `record_only`，不进 counts/violations。
 """
 from __future__ import annotations
 
@@ -33,15 +35,139 @@ def _project(*, genre: str = "", **bible) -> SimpleNamespace:
 
 @pytest.fixture
 def era_on(monkeypatch):
-    """显式打开开关（默认是关的），模式为 report。"""
+    """确保总开关与两个子开关都开，模式 report（默认即如此，这里显式钉住）。"""
     monkeypatch.setattr(settings, "era_guard_enabled", True)
+    monkeypatch.setattr(settings, "era_guard_prompt_enabled", True)
+    monkeypatch.setattr(settings, "era_guard_scan_enabled", True)
     monkeypatch.setattr(settings, "era_guard_mode", "report")
     return settings
 
 
-def test_switch_defaults_to_off():
-    field = type(settings).model_fields["era_guard_enabled"]
-    assert field.default is False
+def test_switches_default_to_on():
+    fields = type(settings).model_fields
+    for name in (
+        "era_guard_enabled",
+        "era_guard_prompt_enabled",
+        "era_guard_scan_enabled",
+    ):
+        assert fields[name].default is True
+
+
+def test_prompt_switch_off_still_scans(era_on, monkeypatch):
+    """关掉约束注入不影响扫描：本组就是「约束未注入」的纯观测口径。"""
+    monkeypatch.setattr(settings, "era_guard_prompt_enabled", False)
+    monkeypatch.setattr(settings, "era_guard_scan_enabled", True)
+    project = _project(world={"baseline": "王朝"})
+    block, meta = constraint_for(project)
+    assert block == ""
+    assert meta["status"] == "constraint_disabled"
+    assert meta["prompt_injected"] is False
+
+    text = "他拿起电脑查看账册。"
+    out, scan = apply_to_text(text, project, provider=None, segment_no=1)
+    assert out == text
+    assert scan["status"] == "active"
+    assert scan["counts"].get("hard_ban") == 1
+
+
+def test_scan_switch_off_still_injects(era_on, monkeypatch):
+    """关掉扫描不影响约束注入：两开关互不牵连。"""
+    monkeypatch.setattr(settings, "era_guard_prompt_enabled", True)
+    monkeypatch.setattr(settings, "era_guard_scan_enabled", False)
+    project = _project(world={"baseline": "王朝"})
+    block, meta = constraint_for(project)
+    assert block
+    assert meta["prompt_injected"] is True
+
+    _, scan = apply_to_text("他拿起电脑查看账册。", project, provider=None, segment_no=1)
+    assert scan["status"] == "scan_disabled"
+    assert scan["counts"] == {}
+    assert scan["records"] == []
+
+
+def test_channel_hit_without_introducer_is_record_only(era_on):
+    """通道命中但同句没引出人：记录不判，不进 counts/violations。"""
+    project = _project(world={"baseline": "王朝"}, characters=[{"name": "张三"}])
+    text = "系统提示先弹出来：缺少原持有人印章。"
+    out, meta = apply_to_text(text, project, provider=None, segment_no=1)
+    assert out == text
+    assert meta["status"] == "active"
+    assert meta["counts"] == {}
+    assert meta["record_counts"] == {"channel_hit_no_introducer": 1}
+    assert meta["records"][0]["violation"] == "record_only"
+
+
+def test_period_lexicon_only_loaded_for_modern_baseline(era_on):
+    """前现代档位只对声明的基线装载；王朝书零影响。"""
+    from app.kg.era_check import project_profile
+    from app.kg.era_guard import EraGuard
+
+    modern = EraGuard(profile=project_profile(_project(genre="都市")))
+    assert modern.lexicon["衙门"]["level"] == "前现代"
+    assert modern.lexicon["衙门"]["allowed"] is False
+    # 与原生档重名的词被移出原生、挂到前现代（对现代基线才是错位）
+    assert modern.lexicon["铜钱"]["level"] == "前现代"
+
+    dynasty = EraGuard(profile=project_profile(_project(world={"baseline": "王朝"})))
+    assert "衙门" not in dynasty.lexicon
+    assert dynasty.lexicon["铜钱"]["level"] == "原生"
+    assert dynasty.lexicon["铜钱"]["allowed"] is True
+
+
+def test_period_lexicon_excludes_cultivation_terms(era_on):
+    """题材词不进时代表：宗门/掌门/长老/弟子/灵石。"""
+    from app.kg.era_check import project_profile
+    from app.kg.era_guard import EraGuard
+
+    guard = EraGuard(profile=project_profile(_project(genre="都市")))
+    for word in ("宗门", "掌门", "长老", "弟子", "灵石"):
+        assert word not in guard.lexicon
+
+
+def test_period_term_flags_in_modern_book(era_on):
+    """都市书里的前现代制度词：判 needs_authorization，来源记 period_mismatch。"""
+    project = _project(genre="都市")
+    _, meta = apply_to_text("知府大人让人把卷宗抬进衙门。", project, None, segment_no=1)
+    assert meta["status"] == "active"
+    assert meta["note_counts"].get("period_mismatch", 0) >= 1
+    assert meta["counts"].get("needs_authorization", 0) >= 1
+    levels = {item["tech_level"] for item in meta["violations"]}
+    assert levels == {"前现代"}
+
+
+def test_period_term_not_loaded_for_dynasty_book(era_on):
+    """王朝书里「银子」不装表，不产生任何 mention。"""
+    project = _project(world={"baseline": "王朝"})
+    _, meta = apply_to_text("他掏出银子放在桌上。", project, None, segment_no=1)
+    assert meta["mentions"] == 0
+    assert meta["counts"] == {}
+
+
+def test_period_legit_context_is_record_only(era_on):
+    """道具/剧组语境：只留痕不判罚，不进 counts。"""
+    project = _project(genre="都市")
+    _, meta = apply_to_text("剧组道具，展柜里摆着一面衙门旧匾。", project, None, segment_no=1)
+    assert meta["counts"] == {}
+    assert meta["record_counts"].get("period_legit") == 1
+    assert meta["violations"] == []
+
+
+def test_channel_abuse_aggregates_threshold_and_streak():
+    from app.kg.era_check import CHANNEL_ABUSE_KEY, channel_abuse
+
+    hit = {CHANNEL_ABUSE_KEY: 3}
+    out = channel_abuse(hit, [{}, {}], threshold=3, streak=2)
+    assert out["flagged"] is True
+    assert "chapter_threshold" in out["flags"]
+
+    one = {CHANNEL_ABUSE_KEY: 1}
+    out2 = channel_abuse(one, [one], threshold=3, streak=2)
+    assert out2["consecutive"] == 2
+    assert "consecutive_chapters" in out2["flags"]
+
+    out3 = channel_abuse({}, [one], threshold=3, streak=2)
+    assert out3["flagged"] is False
+    assert out3["consecutive"] == 0
 
 
 def test_disabled_when_off(monkeypatch):

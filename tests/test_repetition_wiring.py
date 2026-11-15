@@ -25,6 +25,7 @@ from app.generation.repetition import (
 )
 from app.models import Base, Generation, GenerationSnapshot, Project
 from fixtures_repetition_segments import SEGMENTS
+from fixtures_summary_style import SUMMARY_750
 
 DEGENERATE = SEGMENTS[4]["text"]
 NORMAL = SEGMENTS[1]["text"]
@@ -79,7 +80,7 @@ def _patch_common(monkeypatch, merge_calls: list):
     """把生成链路的外围依赖全部换成桩，只留落库与判据走真实代码。"""
     monkeypatch.setattr(engine, "_require_distill_ready", lambda db, p: None)
     monkeypatch.setattr(engine, "_rollup_summary_tree", lambda db, p, prov: {})
-    monkeypatch.setattr(engine, "build_context", lambda db, p, ids=None: {
+    monkeypatch.setattr(engine, "build_context", lambda db, p, ids=None, **kw: {
         "reminders": {}, "prior_summaries": [], "rag_context": "",
         "prior_blocks": [], "constraints": {},
     })
@@ -87,7 +88,7 @@ def _patch_common(monkeypatch, merge_calls: list):
     monkeypatch.setattr(engine, "_prompt_overrides",
                         lambda db, pid: defaultdict(lambda: None))
     monkeypatch.setattr(engine, "current_node_prompt",
-                        lambda p, written, prov, db=None: None)
+                        lambda p, written, prov, db=None, **kw: None)
     monkeypatch.setattr(engine, "_guard_blocks", lambda p: ("", {}, "", {}))
     monkeypatch.setattr(engine, "_style_info", lambda p: {})
     monkeypatch.setattr(engine, "_style_profile", lambda db, p: None)
@@ -97,9 +98,9 @@ def _patch_common(monkeypatch, merge_calls: list):
     monkeypatch.setattr(engine, "_apply_era_guard",
                         lambda text, p, prov, no, reminders: (text, {}))
     monkeypatch.setattr(engine, "_judge_and_advance",
-                        lambda db, p, prov, text, written: {"advanced": False})
+                        lambda db, p, prov, text, written, **kw: {"advanced": False})
     monkeypatch.setattr(engine, "_enqueue_v3_extraction",
-                        lambda db, p, no, text: None)
+                        lambda db, p, no, text, **kw: None)
     monkeypatch.setattr(engine, "_shadow_ingest", lambda p, no, text: None)
     monkeypatch.setattr(engine, "_load_timeline_state_for_branch",
                         lambda db, p, written: None)
@@ -211,9 +212,29 @@ def test_p1_writes_ok_and_merges_kg_for_normal(db, project, monkeypatch):
     result = engine.generate_next_segment(db, project, provider=StubProvider(NORMAL))
 
     gen = _row(db, result["segment_no"])
-    assert parse_quality(gen.quality_json)["repetition"]["verdict"] == "ok"
+    q = parse_quality(gen.quality_json)
+    assert q["repetition"]["verdict"] == "ok"
+    # 1413 / 3000 = 47.1% → 篇幅不足；梗概化不命中。两个字段都随 INSERT 落库。
+    assert q["length"]["verdict"] == "short"
+    assert q["summary_style"]["verdict"] == "ok"
+    assert result["length"]["verdict"] == "short"
+    assert result["summary_style"]["verdict"] == "ok"
     assert len(merge_calls) == 1
     assert result["kg_update"]["merged"] is True
+
+
+def test_p1_writes_summary_style_mark_for_750_skeleton(db, project, monkeypatch):
+    """750 字罗列式段：P1 落库时必须同时带「篇幅不足」和「梗概化」。"""
+    _patch_common(monkeypatch, [])
+
+    result = engine.generate_next_segment(
+        db, project, provider=StubProvider(SUMMARY_750["text"]))
+
+    q = parse_quality(_row(db, result["segment_no"]).quality_json)
+    assert q["length"]["verdict"] == "short"
+    assert q["summary_style"]["verdict"] == "summary_style"
+    assert "meet_verb_object" in q["summary_style"]["signals"]
+    assert result["summary_style"]["verdict"] == "summary_style"
 
 
 def test_p2_stream_writes_quality_and_skips_kg(db, project, monkeypatch):
@@ -225,8 +246,12 @@ def test_p2_stream_writes_quality_and_skips_kg(db, project, monkeypatch):
     done = [e for e in events if e["type"] == "done"][-1]
 
     gen = _row(db, done["segment_no"])
-    assert parse_quality(gen.quality_json)["repetition"]["verdict"] == "degenerate"
+    q = parse_quality(gen.quality_json)
+    assert q["repetition"]["verdict"] == "degenerate"
+    assert q["summary_style"]["verdict"] == "ok"
     assert done["repetition"]["verdict"] == "degenerate"
+    assert done["length"]["verdict"] == "short"
+    assert done["summary_style"]["verdict"] == "ok"
     assert done["warnings"]
     assert merge_calls == []
 
@@ -255,8 +280,13 @@ def test_p3_old_path_writes_quality(db, project, monkeypatch):
 
     gen = _row(db, 1)
     assert gen.text == DEGENERATE
-    assert parse_quality(gen.quality_json)["repetition"]["verdict"] == "degenerate"
+    q = parse_quality(gen.quality_json)
+    assert q["repetition"]["verdict"] == "degenerate"
+    # 改写路径不按整段预算报「篇幅不足」，跌幅归 detect_length_drop。
+    assert q["length"]["verdict"] == "not_applicable"
+    assert q["summary_style"]["verdict"] == "ok"
     assert done["repetition"]["verdict"] == "degenerate"
+    assert done["length"]["verdict"] == "not_applicable"
 
 
 def test_p3_snapshot_path_writes_quality_in_same_update(db, project, monkeypatch):
@@ -283,7 +313,10 @@ def test_p3_snapshot_path_writes_quality_in_same_update(db, project, monkeypatch
     gen = _row(db, 1)
     snap = db.get(GenerationSnapshot, snap.id)
     assert gen.text == DEGENERATE
-    assert parse_quality(gen.quality_json)["repetition"]["verdict"] == "degenerate"
+    q = parse_quality(gen.quality_json)
+    assert q["repetition"]["verdict"] == "degenerate"
+    assert q["length"]["verdict"] == "not_applicable"
+    assert q["summary_style"]["verdict"] == "ok"
     assert snap.status == "applied"
     assert done["repetition"]["verdict"] == "degenerate"
 

@@ -144,16 +144,18 @@ def test_sampling_axis_really_differs(monkeypatch):
     """采样轴：第一档按百分比采样，后两档固定 30 章。
 
     比例值本身**不在这里钉死**——它就是可调参数（2026-10-19 的 984f059 为了
-    角色覆盖不足把它从 0.15 提到 0.30）。钉死会让「调参」和「采样轴坏了」
-    这两种情况给出同一个红灯，分不清。这里断言的是**轴的结构**：
-    第一档 = 语料 × SAMPLE_RATIO 且随语料放大，后两档恒定 30 章。
+    角色覆盖不足把它从 0.15 提到 0.30；2026-11-14 完整档改为 1.0 读全本）。
+    钉死会让「调参」和「采样轴坏了」这两种情况给出同一个红灯，分不清。
+    这里断言的是**轴的结构**：第一档 = 语料 × 本档 `sample_ratio` 且随语料放大，
+    后两档恒定 30 章。完整档 ratio=1.0 即全取，同样满足这个结构。
     """
     full = TIER_REGISTRY[TIER_FULL]
     balanced = TIER_REGISTRY[TIER_BALANCED]
     fast = TIER_REGISTRY[TIER_FAST]
 
     assert full.sampling_mode == "percentage"
-    assert full.sample_ratio == SAMPLE_RATIO
+    # 完整档读全本：不再 30% 抽样（抽掉一半会让跨几百章的铺垫/回收断链）。
+    assert full.sample_ratio == 1.0
     assert 0 < SAMPLE_RATIO < 1, f"SAMPLE_RATIO 越界：{SAMPLE_RATIO}"
     assert full.fixed_chapters is None
 
@@ -168,36 +170,36 @@ def test_sampling_axis_really_differs(monkeypatch):
     n_balanced = len(sample_chapters_for_tier(chapters, balanced))
     n_fast = len(sample_chapters_for_tier(chapters, fast))
 
-    # 百分比档 = max(10, 语料 × SAMPLE_RATIO)；`max(10, …)` 是 _sample_chapters_v6
-    # 的下限保护，语料小到比例值不足 10 章时生效。
-    assert n_full == max(10, int(200 * SAMPLE_RATIO))
+    # 百分比档 = max(10, 语料 × 本档 sample_ratio)；`max(10, …)` 是
+    # _sample_chapters_v6 的下限保护，语料小到比例值不足 10 章时生效。
+    assert n_full == max(10, int(200 * full.sample_ratio))
     assert n_balanced == 30
     assert n_fast == 30
     # 轴不同的本质：语料放大到 600 章，百分比档跟着涨，固定档一动不动
     chapters_big = [(i + 1, f"第{i + 1}章内容") for i in range(600)]
     big_full = len(sample_chapters_for_tier(chapters_big, full))
-    assert big_full == max(10, int(600 * SAMPLE_RATIO))
+    assert big_full == max(10, int(600 * full.sample_ratio))
     assert big_full > n_full, "百分比档没随语料放大——采样轴失效"
     assert len(sample_chapters_for_tier(chapters_big, balanced)) == 30  # 固定 30
     assert len(sample_chapters_for_tier(chapters_big, fast)) == 30
 
 
 def test_dimension_axis_really_differs():
-    """维度轴：完整/平衡全维度（14），快速档是 11 的真子集。"""
+    """维度轴：完整/平衡全维度（13），快速档是 11 的真子集。"""
     full = TIER_REGISTRY[TIER_FULL]
     balanced = TIER_REGISTRY[TIER_BALANCED]
     fast = TIER_REGISTRY[TIER_FAST]
 
-    assert full.dimension_count == 14
-    assert balanced.dimension_count == 14
+    assert full.dimension_count == 13
+    assert balanced.dimension_count == 13
     assert fast.dimension_count == 11, (
-        f"快速档维度数应为 11（14 − 3 个 v5 增量维度），实际 {fast.dimension_count}"
+        f"快速档维度数应为 11（13 − 2 个 v5 增量维度），实际 {fast.dimension_count}"
     )
 
     # 快速档必须是**真子集**，不是重排
     assert set(fast.dimensions) < set(full.dimensions)
     dropped = set(full.dimensions) - set(fast.dimensions)
-    assert dropped == {"节拍序列", "高频场景模板", "潜台词模式"}, dropped
+    assert dropped == {"节拍序列", "潜台词模式"}, dropped
 
 
 def test_cleaning_and_normalization_axes_differ():
@@ -377,9 +379,9 @@ def test_reduced_tiers_sample_fewer_chapters(monkeypatch):
     monkeypatch.setattr(_narrative_mod, "MIN_SAMPLE_CHARS", 0)
     """采样轴端到端：后两档的采样章数必须少于完整档。
 
-    用 600 章语料：完整档 = 600 × SAMPLE_RATIO，后两档固定 30。
-    比例值不钉死（它是可调参数，984f059 已把它从 0.15 提到 0.30），
-    这里钉的是**结构**：完整档严格多于固定档。
+    用 600 章语料：完整档 = 600 × full.sample_ratio（现为 1.0，即全本），
+    后两档固定 30。比例值不钉死（它是可调参数，984f059 已把它从 0.15 提到
+    0.30，2026-11-14 完整档改为 1.0），这里钉的是**结构**：完整档严格多于固定档。
     """
     db = SessionLocal()
     try:
@@ -393,7 +395,9 @@ def test_reduced_tiers_sample_fewer_chapters(monkeypatch):
             )
             counts[key] = profile["n_chapters"]
 
-        assert counts[TIER_FULL] == max(10, int(600 * SAMPLE_RATIO)), counts
+        assert counts[TIER_FULL] == max(
+            10, int(600 * TIER_REGISTRY[TIER_FULL].sample_ratio)
+        ), counts
         assert counts[TIER_BALANCED] == 30, counts
         assert counts[TIER_FAST] == 30, counts
         assert counts[TIER_FULL] > counts[TIER_BALANCED], counts
@@ -753,8 +757,8 @@ def test_legacy_profile_without_tier_field_is_not_a_cache_hit():
 
 
 def test_narrative_dimensions_unchanged_by_tier_work():
-    """档位机制不许改动全局维度清单（全维度档依赖它仍是 14）。"""
-    assert len(NARRATIVE_DIMENSIONS) == 14
+    """档位机制不许改动全局维度清单（全维度档依赖它仍是 13）。"""
+    assert len(NARRATIVE_DIMENSIONS) == 13
     assert TIER_REGISTRY[TIER_FULL].dimensions == tuple(NARRATIVE_DIMENSIONS)
     assert TIER_REGISTRY[TIER_BALANCED].dimensions == tuple(NARRATIVE_DIMENSIONS)
     assert len(NARRATIVE_DIMENSIONS) == len(TIER_REGISTRY[TIER_FULL].dimensions)

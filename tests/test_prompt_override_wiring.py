@@ -226,10 +226,19 @@ def test_no_override_output_unchanged(db_session, monkeypatch):
         engine_mod._style_info(proj), proj.plot_bible,
         engine_mod._style_profile(db_session, proj),
         engine_mod._style_narrative(db_session, proj),
+        # 该夹具没有已写段落 → 首段。2026-11-12 起首段不列伏笔清单，
+        # 旧基线必须带同一个 is_opening 才可比。
+        is_opening=True,
     )
     tree = engine_mod._summary_tree(proj)
     blocks, _ = compose_prior(
         tree, budget_chars=budget_for_generation(proj.generation_length)
+    )
+    # 2026-11-15：初稿字数下限改由 engine 传入（与补完触发线同源），旧调用没有
+    # 这个参数。复刻时显式带上同一个下限值，否则比的是两套字数口径，不是接线差异。
+    prompt_min_chars = engine_mod._draft_prompt_min_chars(
+        proj.generation_length or 4000,
+        engine_mod._archive_rhythm(db_session, proj),
     )
     legacy_user = build_user_prompt(
         l1_chain(tree),
@@ -239,6 +248,7 @@ def test_no_override_output_unchanged(db_session, monkeypatch):
         proj.plot_bible,
         proj.premise,
         prior_blocks=blocks,
+        min_chars=prompt_min_chars,
     )
 
     assert system == legacy_system, "未设置覆写时 system 与改动前不一致——接入改变了既有行为"

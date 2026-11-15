@@ -33,20 +33,33 @@ import pytest  # noqa: E402
 
 from app.generation.repetition import (  # noqa: E402
     DEFAULT_THRESHOLDS,
+    LENGTH_VERDICT_NOT_APPLICABLE,
+    LENGTH_VERDICT_OK,
+    LENGTH_VERDICT_SHORT,
     MAX_DUP20,
     MAX_REPEATED_SENTENCE_COVERAGE,
     MAX_TOP_SENTENCE_REPEAT,
+    MEET_VERB_OBJECT_MIN_HITS,
     MIN_CHARS,
+    READ_VERDICT_UNDETECTED,
+    SUMMARY_STYLE_VERDICT_FLAGGED,
+    SUMMARY_STYLE_VERDICT_OK,
+    SUMMARY_VERB_MIN_PER_1K,
     VERDICT_DEGENERATE,
     VERDICT_OK,
     VERDICT_SKIPPED_SHORT,
     RepetitionThresholds,
+    analyze_length,
     analyze_repetition,
+    analyze_summary_style,
     find_loop_window,
     measure_repetition,
+    parse_quality,
+    quality_payload,
     split_sentences,
 )
 from fixtures_repetition_segments import DEGENERATE_IDS, NORMAL_IDS, SEGMENTS  # noqa: E402
+from fixtures_summary_style import SUMMARY_750  # noqa: E402
 
 # 五段的期望指标：与 2026-11-12 诊断表（metrics_all.json / final_table.txt）逐项一致。
 # 字段顺序：chars, sentences, unique_ratio, top_repeat, coverage, dup5, dup20,
@@ -276,3 +289,113 @@ def test_degenerate_segment_loop_window_covers_tail():
 def test_loop_window_requires_enough_sentences():
     """句数不足 `loop_min_sentences` 时不构造循环窗（避免把短文本的重复当循环）。"""
     assert find_loop_window("同一句话。" * 5) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R7 篇幅不足（正文 vs 项目字数预算；与 length_drop 是两件事）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_length_short_on_750_segment_against_3000_budget():
+    report = analyze_length(SUMMARY_750["text"], 3000)
+    assert report.verdict == LENGTH_VERDICT_SHORT
+    assert report.chars == 750
+    assert report.budget == 3000
+    assert report.ratio == 0.25
+    assert "篇幅不足" in report.reason_text
+
+
+def test_length_boundary_is_exactly_80_percent():
+    # 2400/3000 = 0.800 → ok；2399/3000 = 0.7997 → short
+    assert analyze_length("字" * 2400, 3000).verdict == LENGTH_VERDICT_OK
+    assert analyze_length("字" * 2399, 3000).verdict == LENGTH_VERDICT_SHORT
+
+
+def test_length_missing_budget_is_undetected_not_ok():
+    """老项目没设 generation_length：未检测，绝不能冒充达标。"""
+    for budget in (None, 0, -1):
+        report = analyze_length(SEGMENTS[2]["text"], budget)
+        assert report.verdict == READ_VERDICT_UNDETECTED
+        assert report.ratio is None
+
+
+def test_length_rewrite_is_not_applicable():
+    """局部改写不按整段预算报「篇幅不足」，跌幅归 detect_length_drop。"""
+    report = analyze_length("短" * 100, 3000, is_rewrite=True)
+    assert report.verdict == LENGTH_VERDICT_NOT_APPLICABLE
+    assert "length_drop" in report.reason_text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R8 梗概式推进 / 罗列式推进
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_summary_style_flags_750_skeleton():
+    report = analyze_summary_style(SUMMARY_750["text"])
+    assert report.verdict == SUMMARY_STYLE_VERDICT_FLAGGED
+    assert "meet_verb_object" in report.signals
+    assert "summary_verb_density" in report.signals
+    assert report.metrics.meet_verb_object_hits == 3
+    assert report.metrics.summary_verb_per_1k == 20.0
+    assert report.metrics.dialogue_ratio == 0.037
+    assert "梗概式推进" in report.reason_text
+
+
+@pytest.mark.parametrize("gen_id", NORMAL_IDS)
+def test_summary_style_ok_on_normal_segments(gen_id: int):
+    """p1 三段 + p5 旧段 1 都不得被误标为梗概化。"""
+    report = analyze_summary_style(SEGMENTS[gen_id]["text"])
+    assert report.verdict == SUMMARY_STYLE_VERDICT_OK
+    assert report.metrics.summary_verb_per_1k < SUMMARY_VERB_MIN_PER_1K
+    assert report.metrics.meet_verb_object_hits < MEET_VERB_OBJECT_MIN_HITS
+
+
+def test_degenerate_loop_keeps_repetition_verdict_and_is_not_style_flagged():
+    """2273 字旧循环稿：复读结论不变，新判据不掺和。"""
+    text = SEGMENTS[4]["text"]
+    assert analyze_repetition(text).verdict == VERDICT_DEGENERATE
+    assert analyze_summary_style(text).verdict == SUMMARY_STYLE_VERDICT_OK
+
+
+def test_summary_style_skips_short_text():
+    report = analyze_summary_style("他找到了程野。")
+    assert report.verdict == VERDICT_SKIPPED_SHORT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R9 落库 / 回读：三个字段各自独立，缺键 = 未检测
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_payload_carries_ok_sections_for_normal_segment():
+    text = SEGMENTS[2]["text"]
+    payload = quality_payload(
+        analyze_repetition(text),
+        length=analyze_length(text, 1000),
+        summary_style=analyze_summary_style(text),
+    )
+    assert payload["repetition"]["verdict"] == "ok"
+    assert payload["length"]["verdict"] == LENGTH_VERDICT_OK
+    assert payload["summary_style"]["verdict"] == SUMMARY_STYLE_VERDICT_OK
+
+    parsed = parse_quality(json.dumps(payload, ensure_ascii=False))
+    assert parsed["repetition"]["verdict"] == "ok"
+    assert parsed["length"]["verdict"] == LENGTH_VERDICT_OK
+    assert parsed["summary_style"]["verdict"] == SUMMARY_STYLE_VERDICT_OK
+
+
+def test_parse_quality_missing_new_sections_maps_to_undetected():
+    """接线前的行（只有 repetition）：新字段读成未检测，已有复读结论不丢。"""
+    payload = quality_payload(analyze_repetition(SEGMENTS[2]["text"]))
+    parsed = parse_quality(json.dumps(payload, ensure_ascii=False))
+    assert parsed["repetition"]["verdict"] == "ok"
+    assert parsed["length"]["verdict"] == READ_VERDICT_UNDETECTED
+    assert parsed["summary_style"]["verdict"] == READ_VERDICT_UNDETECTED
+
+
+def test_parse_quality_null_maps_all_three_to_undetected():
+    parsed = parse_quality(None)
+    for key in ("repetition", "length", "summary_style"):
+        assert parsed[key]["verdict"] == READ_VERDICT_UNDETECTED
+

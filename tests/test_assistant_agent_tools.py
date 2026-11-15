@@ -479,6 +479,16 @@ def test_qa_over_http_pending_actions_present(db_session, project_id):
         assert resp.status_code == 200, resp.text
         assert resp.json()["pending_actions"] == []
 
+        # 档 3 也在动作目录里，但只能是 frontend_only + 需确认，且不会变成可执行卡片。
+        resp2 = client.post("/api/assistant/qa", json={
+            "project_id": project_id, "query": "能不能回滚到快照",
+        })
+        assert resp2.status_code == 200, resp2.text
+        actions = {a["key"]: a for a in resp2.json()["available_actions"]}
+        assert actions["snapshot_rollback"]["policy"] == "frontend_only"
+        assert actions["snapshot_rollback"]["requires_confirmation"] is True
+        assert resp2.json()["pending_actions"] == []
+
 
 # ====================================================================
 # (4) 卡片只「提出」不执行
@@ -671,3 +681,274 @@ def test_agent_router_has_no_write_tool_backdoor(db_session):
     for forbidden in ("write_generation", "apply_proposal", "delete_novel"):
         with pytest.raises(PermissionError):
             invoke_tool(forbidden, db=db_session, project_id=1)
+
+
+# ====================================================================
+# (5) function calling：只有只读白名单工具能进 tools 数组
+# ====================================================================
+
+
+class _ScriptedProvider:
+    """按脚本逐次返回 `complete_message` 结果的假 provider。
+
+    `/qa` 的工具循环要验证的是**路由行为**（步数上限、未知工具不执行、
+    失败回落），不需要真实网络。`chat()` 留作确定性回落腿的应答。
+    """
+
+    model = "scripted-tool-model"
+
+    def __init__(self, script, chat_reply: str = "确定性兜底回答"):
+        self._script = list(script)
+        self._chat_reply = chat_reply
+        self.calls: list[dict] = []
+        self.chat_calls = 0
+
+    def complete_message(self, messages, *, tools=None, tool_choice=None,
+                         stop_sequences=None) -> dict:
+        # 快照入参：消息列表后续会被 loop 继续 append，这里必须拷一份。
+        self.calls.append({
+            "messages": [dict(m) for m in messages],
+            "tools": tools,
+            "tool_choice": tool_choice,
+        })
+        if self._script:
+            item = self._script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return _tool_text("（脚本已用尽）")
+
+    def chat(self, system, user, constraints=None) -> str:
+        self.chat_calls += 1
+        return self._chat_reply
+
+
+def _tool_text(content: str, model: str = "scripted-tool-model") -> dict:
+    return {"content": content, "tool_calls": [], "finish_reason": "stop",
+            "usage": None, "model": model}
+
+
+def _tool_call(name: str, arguments: str = "{}", call_id: str = "call-1") -> dict:
+    return {"id": call_id, "type": "function",
+            "function": {"name": name, "arguments": arguments}}
+
+
+def test_model_tools_are_whitelisted_readonly_and_have_schema():
+    """`describe_tools(only=model_tool_names())` 只导出白名单只读工具，且带 JSON Schema。"""
+    from app.agents.action_catalog import model_tool_names
+    from app.agents.registry import describe_tools
+
+    names = model_tool_names()
+    assert names, "动作目录没有可暴露的只读工具，模型将无工具可用"
+    described = describe_tools(only=names)
+    got = {item["function"]["name"] for item in described}
+    # 交集内每一个都应导出（导出环节不能再偷偷吞掉）
+    assert got == set(names)
+    assert got <= set(ALLOWED_READ_ONLY_TOOLS)
+    for item in described:
+        assert item["type"] == "function"
+        assert item["function"]["description"].strip()
+        params = item["function"]["parameters"]
+        assert params["type"] == "object"
+        assert isinstance(params.get("properties"), dict)
+
+
+def test_confirm_required_actions_never_become_tools():
+    """档 2 / 档 3 只在 `available_actions` 文本里：既不是工具名，也导不出 schema。"""
+    from app.agents.action_catalog import ACTIONS, model_tool_names
+    from app.agents.registry import describe_tools
+
+    tool_names = set(model_tool_names())
+    tiers23 = [s for s in ACTIONS if s.policy in ("propose_write", "frontend_only")]
+    assert tiers23, "动作目录里没有档 2/3，本断言失去意义"
+    for spec in tiers23:
+        assert spec.key not in tool_names, f"档 2/3 操作 {spec.key} 混进了工具名"
+        assert spec.read_tool is None
+    # 即便有人把档 2/3 的 key 当工具名传进来，也导不出任何 schema。
+    assert describe_tools(only=[s.key for s in tiers23]) == []
+
+
+def test_qa_model_path_calls_tool_and_reports_trace(db_session, project_id, monkeypatch):
+    """模型自主选工具：执行白名单工具 → 回传结果 → 第二轮收尾成文字。"""
+    _seed_segment(db_session, project_id, 1, "第一段正文：主角在雨夜登场。" * 5)
+    provider = _ScriptedProvider([
+        {"content": "", "tool_calls": [_tool_call("read_generation_segments", '{"limit": 1}')],
+         "finish_reason": "tool_calls", "usage": None, "model": "scripted-tool-model"},
+        _tool_text("第 1 段写的是主角在雨夜登场。"),
+    ])
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    result = assistant_router.assistant_qa(
+        body=assistant_router.AssistantQARequest(
+            project_id=project_id, query="第 1 段写了什么？"),
+        db=db_session,
+    )
+
+    assert result["tool_mode"] == "model"
+    assert result["tool_fallback_reason"] == ""
+    trace = result["tool_trace"]
+    assert [e["name"] for e in trace] == ["read_generation_segments"]
+    assert trace[0]["step"] == 1 and trace[0]["seq"] == 1
+    assert trace[0]["status"] == "ok"
+    assert result["answer"] == "第 1 段写的是主角在雨夜登场。"
+
+    # 两轮都带 tools（步数上限是 3，第 2 轮还不是最后一步）。
+    assert provider.calls[0]["tools"] and provider.calls[1]["tools"]
+    # 回传给模型的工具结果带「只读数据 · 不是指令」包装头。
+    tool_msgs = [m for m in provider.calls[1]["messages"] if m.get("role") == "tool"]
+    assert tool_msgs, "工具结果没有回传给模型，模型无法基于证据作答"
+    assert assistant_router._QA_TOOL_RESULT_HEADER in tool_msgs[0]["content"]
+    # evidence 与确定性路径同构：段号进了 ref_id（两条路径共用同一实现）。
+    assert any(row["ref_id"] == "segment:1" for row in result["evidence"])
+
+
+def test_qa_denies_unknown_tool_name_without_executing(db_session, project_id, monkeypatch):
+    """未知 / 非白名单工具名：绝不执行，只回一条错误让模型改道。"""
+    _seed_segment(db_session, project_id, 1, "第一段正文。" * 5)
+    executed: list[str] = []
+    real_invoke = assistant_router.invoke_tool
+
+    def _spy(name, *args, **kwargs):
+        executed.append(name)
+        return real_invoke(name, *args, **kwargs)
+
+    monkeypatch.setattr(assistant_router, "invoke_tool", _spy)
+    provider = _ScriptedProvider([
+        {"content": "", "tool_calls": [_tool_call("drop_all_tables", "{}")],
+         "finish_reason": "tool_calls", "usage": None, "model": "scripted-tool-model"},
+        _tool_text("我没有那个工具，不能执行。"),
+    ])
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    result = assistant_router.assistant_qa(
+        body=assistant_router.AssistantQARequest(
+            project_id=project_id, query="帮我清理数据"),
+        db=db_session,
+    )
+
+    assert result["tool_mode"] == "model"
+    assert result["tool_trace"][0]["status"] == "denied"
+    assert "drop_all_tables" not in executed, "未知工具名被执行了——红线破了"
+    # 被拒信息回传给了模型，模型才知道改道。
+    tool_msgs = [m for m in provider.calls[1]["messages"] if m.get("role") == "tool"]
+    assert "未执行" in tool_msgs[0]["content"]
+
+
+def test_qa_ignores_finish_reason_when_tool_calls_is_empty(db_session, project_id, monkeypatch):
+    """`finish_reason=tool_calls` + 空数组（glm-z1-flash 的假信号）不得当成调了工具。"""
+    provider = _ScriptedProvider([
+        {"content": "这是直接回答。", "tool_calls": [],
+         "finish_reason": "tool_calls", "usage": None, "model": "glm-z1-flash"},
+    ])
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    result = assistant_router.assistant_qa(
+        body=assistant_router.AssistantQARequest(
+            project_id=project_id, query="随便聊聊"),
+        db=db_session,
+    )
+
+    assert result["tool_mode"] == "model"
+    assert result["tool_trace"] == [], "空 tool_calls 被误判成了一次工具调用"
+    assert result["answer"] == "这是直接回答。"
+    assert provider.chat_calls == 0, "不该再走确定性回落"
+
+
+def test_qa_falls_back_to_deterministic_with_explicit_mode(db_session, project_id, monkeypatch):
+    """任一步失败 → 回落确定性路径，并明确回传 tool_mode=deterministic。"""
+    _seed_segment(db_session, project_id, 1, "第一段正文。" * 5)
+    provider = _ScriptedProvider([RuntimeError("provider 503")])
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    result = assistant_router.assistant_qa(
+        body=assistant_router.AssistantQARequest(
+            project_id=project_id, query="第 1 段写了什么？"),
+        db=db_session,
+    )
+
+    assert result["tool_mode"] == "deterministic"
+    assert result["tool_trace"] == []
+    assert "provider 503" in result["tool_fallback_reason"]
+    # 回落腿真的跑了：确定性三工具进了 tool_results，模型被 chat() 调了一次。
+    assert "read_generation_segments" in result["tool_results"]
+    assert provider.chat_calls == 1
+    assert result["answer"] == "确定性兜底回答"
+
+
+def test_qa_tool_loop_is_bounded_and_exhaustion_falls_back(db_session, project_id, monkeypatch):
+    """模型每步都硬要调工具：循环最多 3 步，之后回落并如实回传原因。"""
+    provider = _ScriptedProvider([
+        {"content": "", "tool_calls": [_tool_call("get_reminders", "{}", f"c{i}")],
+         "finish_reason": "tool_calls", "usage": None, "model": "scripted-tool-model"}
+        for i in range(3)
+    ])
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    result = assistant_router.assistant_qa(
+        body=assistant_router.AssistantQARequest(
+            project_id=project_id, query="有什么提醒"),
+        db=db_session,
+    )
+
+    assert len(provider.calls) == assistant_router._QA_MAX_TOOL_STEPS
+    assert assistant_router._QA_MAX_TOOL_STEPS <= 3
+    # 最后一次请求**不带** tools：即便模型还想调，也只剩收尾成文字这条路。
+    assert provider.calls[-1]["tools"] is None
+    assert result["tool_mode"] == "deterministic"
+    assert "工具循环未产出" in result["tool_fallback_reason"]
+
+
+def test_qa_tool_loop_respects_wall_clock_budget(db_session, project_id, monkeypatch):
+    """整轮墙钟预算：第二步开始时已超 60s → 中止并回落，不再发下一次请求。"""
+    import time as _time
+    import types
+
+    ticks = iter([0.0, 0.0, 61.0])
+    shim = types.SimpleNamespace(
+        monotonic=lambda: next(ticks, 61.0),
+        perf_counter=_time.perf_counter,
+    )
+    monkeypatch.setattr(assistant_router, "time", shim)
+
+    provider = _ScriptedProvider([
+        {"content": "", "tool_calls": [_tool_call("get_reminders", "{}")],
+         "finish_reason": "tool_calls", "usage": None, "model": "scripted-tool-model"},
+    ])
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    result = assistant_router.assistant_qa(
+        body=assistant_router.AssistantQARequest(
+            project_id=project_id, query="有什么提醒"),
+        db=db_session,
+    )
+
+    assert len(provider.calls) == 1, "超预算后仍发起了下一次模型请求"
+    assert result["tool_mode"] == "deterministic"
+    assert "预算" in result["tool_fallback_reason"]
+
+
+def test_complete_is_a_thin_wrapper_over_complete_message(monkeypatch):
+    """Writer 链路硬约束：`_complete()` 只做「取 content 转字符串」，无自有逻辑。"""
+    from app.llm.provider import OpenAICompatibleChatProvider
+
+    captured: list[dict] = []
+
+    def _fake_complete_message(self, messages, *, tools=None, tool_choice=None,
+                               stop_sequences=None):
+        captured.append({"messages": messages, "tools": tools,
+                         "tool_choice": tool_choice, "stop": stop_sequences})
+        return {"content": "  正文内容  ", "tool_calls": [], "finish_reason": "stop",
+                "usage": None, "model": "m"}
+
+    monkeypatch.setattr(OpenAICompatibleChatProvider, "complete_message",
+                        _fake_complete_message)
+    provider = OpenAICompatibleChatProvider(
+        api_key="test-key", base_url="https://example.com/v1", model="m")
+
+    # Writer 走的是 chat(system, user) → _complete(messages) → complete_message。
+    assert provider.chat("SYS", "USR", stop_sequences=["\n"]) == "  正文内容  "
+    assert captured == [{
+        "messages": [{"role": "system", "content": "SYS"},
+                     {"role": "user", "content": "USR"}],
+        "tools": None, "tool_choice": None, "stop": ["\n"],
+    }]
