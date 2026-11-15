@@ -1217,8 +1217,10 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
         if interrupted:
             duration_ms = None
         claim_owner = note.get("claim_owner")
-        claim_expired = (_claim_expired(r, now)
-                         if r.status == "running" and claim_owner else False)
+        # 认领是一条 UPDATE，**不改 status**：pending 行也可能已被认领。
+        # 所以过期只看 claim_until，不能再用 status == "running" 当门禁，
+        # 否则「pending 且租约已过期」会被显示成健康。
+        claim_expired = _claim_expired(r, now) if claim_owner else False
         owner_alive = (_worker_alive(claim_owner, db)
                        if claim_owner else None)
         if note.get("empty"):
@@ -1227,7 +1229,9 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
             summary["overflow"] += 1
         if note.get("abandoned"):
             summary["abandoned"] += 1
-        if r.status == "running" and note.get("claim_owner"):
+        # 认领标记与 status 正交：pending 也会带 claim_owner（认领不改 status）。
+        # 按「有认领标记」计数，才不会再恒为 0；过期与否由逐行 claim_expired 表达。
+        if note.get("claim_owner"):
             summary["claimed"] += 1
         items.append({
             "id": r.id,
