@@ -30,3 +30,27 @@ def book_for_project(project) -> int | None:
     if active is not None:
         return int(active)
     return None
+
+
+def prompt_scope_book_ids(project) -> tuple[int | None, ...]:
+    """生成 prompt 的 KG 切片允许出现的书维度集合。
+
+    与 ``book_for_project`` 的区别：那边的 ``None`` 表示「不按书过滤」（写侧
+    兼容老数据），这里返回的是**读侧白名单**，永远非空：
+
+    - 项目有续写书/来源书 → ``(本书, None)``：本书事实 + 项目级通配；
+    - 两列都空（原创项目）→ ``(None,)``：只认项目级事实。此时带 ``novel_id``
+      的行都是「从某本参考书抽出来的」，按约定不得进入本书上下文。
+
+    只用项目字段，不写死书名或项目 id；新增一本书不需要改这里。
+    """
+    own = book_for_project(project)
+    return (own, None) if own is not None else (None,)
+
+
+def scope_sql_values(scope: tuple[int | None, ...]) -> tuple[int, ...]:
+    """把书维度白名单折成 SQL 可比值：``NULL`` 用 ``-1`` 代表。
+
+    与 ``COALESCE(novel_id, -1)`` 同口径（实体唯一键、事件过滤都这么写）。
+    """
+    return tuple(-1 if b is None else int(b) for b in scope)

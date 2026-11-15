@@ -72,6 +72,12 @@ class EraGuard:
                     "origin": None,
                 }
         self.period_mismatch = self.profile.get("period_mismatch", {"enabled": False})
+        # v18：前现代档位。等级名与「免可操作性」家族都由 profile 配置，
+        # 不在代码里写死类别名。
+        self.period_level = str(self.profile.get("period_level") or "前现代")
+        self.period_no_operability = {
+            str(f) for f in self.period_mismatch.get("skip_operability_families") or []
+        }
         self.blocklist = {
             k: v for k, v in self.profile.get("context_blocklist", {}).items() if not k.startswith("_")
         }
@@ -264,12 +270,23 @@ class EraGuard:
                                  "treat_as_unknown", trace, unknown_scope=True)
             return self._entity_row(text, start, end, term, info, sent, rel, clause, channel, trace)
 
-        # 可操作性兜底：能被使用/传递/损毁/摆放才算实体
-        if not operable:
+        # 可操作性兜底：能被使用/传递/损毁/摆放才算实体。
+        # v18 例外：前现代档位的制度/货币/纪年/官场称呼不是物理器物，不该要求
+        # 同句有动作线索（否则「知府大人让人把卷宗抬进衙门」会被整句漏掉）；
+        # 哪些家族免检由 period_mismatch.skip_operability_families 配置。
+        if not operable and not self._period_no_operability(info):
             return self._row(text, start, end, term, info, sent, "non_entity", "not_judged",
                              "operability", trace)
 
         return self._entity_row(text, start, end, term, info, sent, rel, clause, None, trace)
+
+    def _period_no_operability(self, info: dict) -> bool:
+        """前现代档位里的非器物家族（制度/货币/纪年/称呼）免可操作性兜底。"""
+        return (
+            info.get("level") == self.period_level
+            and bool(self.period_mismatch.get("enabled"))
+            and info.get("family") in self.period_no_operability
+        )
 
     def _entity_row(self, text, start, end, term, info, sent, rel, clause, forced_channel, trace):
         owner = self._owner(clause, rel, term)
@@ -286,17 +303,18 @@ class EraGuard:
                              "channel" if forced_channel else "operability", trace,
                              owner=owner, origin=info["origin"] or "native", introduced_by=None)
 
-        # 时代错位：baseline 不允许的「前现代」器物。属于本世界历史器物，
-        # 有收藏/文具/装饰等正当化语境时走豁免，否则记「需授权（period_mismatch）」。
-        if info["level"] == "前现代" and self.period_mismatch.get("enabled"):
+        # 时代错位：baseline 不允许的「前现代」器物/制度。属于本世界历史遗存，
+        # 有道具/剧组/博物馆等正当化语境时**只留痕不判罚**（record_only），
+        # 否则记「需授权（period_mismatch）」。等级名走 profile 配置。
+        if info["level"] == self.period_level and self.period_mismatch.get("enabled"):
             cue = self._first_in(sent, self.period_mismatch.get("legit_cues", []))
             if cue:
                 trace["period_legit"] = cue[0]
-                return self._row(text, start, end, term, info, sent, "entity", "exempt",
+                return self._row(text, start, end, term, info, sent, "entity", "not_judged",
                                  "period_legit", trace, owner=owner, origin=info["origin"],
                                  introduced_by=None, exempt=True,
                                  exempt_channel=self.period_mismatch.get("legit_channel", "period_legit"),
-                                 violation="needs_authorization")
+                                 violation="record_only", violation_note="period_legit")
             return self._row(text, start, end, term, info, sent, "entity", "violation",
                              "period_mismatch", trace, owner=owner, origin=info["origin"],
                              introduced_by=None, violation="needs_authorization",
@@ -309,10 +327,13 @@ class EraGuard:
                              introduced_by=introducer, exempt=True, exempt_channel=channel,
                              violation="needs_authorization")
         if channel and not introducer:
-            return self._row(text, start, end, term, info, sent, "entity", "violation",
+            # v17：例外通道命中但同句没有引出人 → **降级为记录不判**（不再 hard_ban）。
+            # 不把通道变成放行通道：仍留一条 record_only（note=channel_hit_no_introducer），
+            # 进 meta 的 records，不进 violations / counts，供人工复核通道是否被滥用。
+            return self._row(text, start, end, term, info, sent, "entity", "not_judged",
                              "exception_channel", trace, owner=owner, origin=origin,
-                             introduced_by=None, violation="hard_ban",
-                             violation_note="missing_introducer")
+                             introduced_by=None, violation="record_only",
+                             violation_note="channel_hit_no_introducer")
         return self._row(text, start, end, term, info, sent, "entity", "violation",
                          "operability", trace, owner=owner, origin=None,
                          introduced_by=introducer, violation="hard_ban",

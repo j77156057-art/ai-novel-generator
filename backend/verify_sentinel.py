@@ -37,7 +37,6 @@ from app.kg.sentinel import (
     E_REALM_UP,
     E_REVIVE,
     E_SPEAK,
-    REALM_SYSTEMS,
     STATE_LIFE,
     STATE_OWNER,
     STATE_REALM,
@@ -52,6 +51,18 @@ PASSED: list[str] = []
 FAILED: list[str] = []
 
 NAMES = ["陆见微", "沈砚", "陈九"]
+
+#: 验证用的**测试夹具**阶梯，不是生产默认值。
+#:
+#: 生产侧已删掉内置表（`realm_order` 一律从项目设定读，未配则不判定），
+#: 但 F2 要证明「多套刻度互不可比」这件事本身，仍然需要一份二维夹具。
+#: 刻意留在脚本里：它是样例数据，改生产模式时不会顺手把它改掉。
+_FIXTURE_SYSTEMS: tuple[tuple[str, ...], ...] = (
+    ("凡人", "炼气", "筑基", "金丹", "元婴", "化神", "炼虚", "合体", "大乘", "渡劫",
+     "真仙", "金仙", "太乙", "大罗"),
+    ("黄阶", "玄阶", "地阶", "天阶", "圣阶", "神阶"),
+    ("一星", "二星", "三星", "四星", "五星", "六星", "七星", "八星", "九星"),
+)
 
 #: 离线兜底占位正文的标记（`app/llm/provider.py:412`）。
 #: 项目 4/5 的正文只有这一行占位符，**没有角色名是正确的**，不是抽取器哑了。
@@ -112,15 +123,18 @@ def section(t: str) -> None:
 
 
 def kinds(text: str, seg: int = 1, **kw) -> list[str]:
+    kw.setdefault("realm_order", _FIXTURE_SYSTEMS)
     return [e.kind for e in extract_events(text, segment_no=seg, names=NAMES, **kw)]
 
 
 def events(text: str, seg: int = 1, **kw):
+    kw.setdefault("realm_order", _FIXTURE_SYSTEMS)
     return extract_events(text, segment_no=seg, names=NAMES, **kw)
 
 
 def audit(segs: list[str], **kw) -> list[str]:
     """跑一条多段链，返回告警规则名（按判定顺序）。"""
+    kw.setdefault("realm_order", _FIXTURE_SYSTEMS)
     st: dict = {}
     out: list[str] = []
     for i, s in enumerate(segs, 1):
@@ -328,8 +342,8 @@ def main() -> int:
     # E1 跨度自证：告警给的 span 必须能切回原文
     text = "陆见微死了。后来陆见微说道：「我不甘心。」"
     st, findings = {}, []
-    seg1 = extract_events(text[:6], segment_no=1, names=NAMES)
-    seg2 = extract_events(text[6:], segment_no=2, names=NAMES)
+    seg1 = extract_events(text[:6], segment_no=1, names=NAMES, realm_order=_FIXTURE_SYSTEMS)
+    seg2 = extract_events(text[6:], segment_no=2, names=NAMES, realm_order=_FIXTURE_SYSTEMS)
     for e in seg1:
         apply_event(st, e)
     findings = check_segment(st, seg2)
@@ -364,7 +378,7 @@ def main() -> int:
     st = {}
     segs = [s for s in body.split("\n\n")]
     for i, s in enumerate(segs, 1):
-        ev = extract_events(s, segment_no=i, names=NAMES)
+        ev = extract_events(s, segment_no=i, names=NAMES, realm_order=_FIXTURE_SYSTEMS)
         check_segment(st, ev)
         for e in ev:
             apply_event(st, e)
@@ -452,6 +466,15 @@ def main() -> int:
           [(e.kind, e.value, e.scale) for e in got] == [(E_REALM_UP, "斗皇", "ladder:0")],
           str([(e.kind, e.value, e.scale) for e in got]))
 
+    # F3b 未配置 = 不判定。删掉内置默认表之后，不传 realm_order 必须一条境界事件都不产，
+    # 而不是退回某一套内置阶梯 —— 那等于把别的书的档位带进本书的正文。
+    got = extract_events("萧炎突破到金丹。", segment_no=1, names=["萧炎"])
+    check("F3b 未传 realm_order → 不抽境界事件（不退回内置阶梯）",
+          got == [], f"实得 {[(e.kind, e.value) for e in got]}")
+    got = extract_events("萧炎修为跌落到炼气。", segment_no=1, names=["萧炎"])
+    check("F3b 未传 realm_order → 也不抽境界跌落事件",
+          got == [], f"实得 {[(e.kind, e.value) for e in got]}")
+
     # --------------------------------------------------------------------- #
     # F4 复合档位 `N段<阶梯>` —— 这是《斗破苍穹》真正的核心句式。
     #
@@ -527,7 +550,8 @@ def main() -> int:
                 if not real_names:
                     no_name_segs += 1
                     continue
-                ev = extract_events(t, segment_no=no, names=real_names)
+                ev = extract_events(t, segment_no=no, names=real_names,
+                                    realm_order=_FIXTURE_SYSTEMS)
                 total_ev += len(ev)
                 for e in ev:
                     # 跨度自证：抽出来的事件必须能切回原文
@@ -552,7 +576,8 @@ def main() -> int:
         # 早先这条写的是 `no_name_segs >= 0` —— 恒真的断言，什么都没验。
         # 真正该验的是：空名字表下事件数必须为 0（模式全都锚在名字上）。
         # 这一条是可证伪的：谁加一个不锚名字的模式，它立刻红。
-        ghost = sum(len(extract_events(t, segment_no=no, names=[]))
+        ghost = sum(len(extract_events(t, segment_no=no, names=[],
+                                       realm_order=_FIXTURE_SYSTEMS))
                     for pid, segs in by_proj.items() for no, t in segs
                     if not list(extract_from_text(t, segment_no=no)[0].characters))
         check("G4 空名字表下一条事件都不产（哨兵不会凭空造主体）",
@@ -590,10 +615,13 @@ def main() -> int:
             victim = probe_names[0]
             st = {}
             for _no, _t in segs0:
-                for e in extract_events(_t, segment_no=_no, names=probe_names):
+                for e in extract_events(_t, segment_no=_no, names=probe_names,
+                                        realm_order=_FIXTURE_SYSTEMS):
                     apply_event(st, e)
             carrier = segs0[-1][1] + f"\n\n{victim}死了。\n\n{victim}说道：「我不甘心。」"
-            probe = check_segment(st, extract_events(carrier, segment_no=99, names=probe_names))
+            probe = check_segment(st, extract_events(carrier, segment_no=99,
+                                                     names=probe_names,
+                                                     realm_order=_FIXTURE_SYSTEMS))
             check(f"G5 阳性对照：真实文本里注入「{victim}死了 + {victim}说话」→ 必须报 dead_speaks",
                   any(x.rule == "dead_speaks" for x in probe),
                   f"实得 {[x.rule for x in probe]}",
@@ -651,7 +679,7 @@ def main() -> int:
         for nid, parts in by_novel.items():
             text = "".join(parts)
             segs = [text[i:i + 3000] for i in range(0, len(text), 3000)]
-            ladder = LADDERS.get(nid, REALM_SYSTEMS)
+            ladder = LADDERS.get(nid, _FIXTURE_SYSTEMS)
             c: collections.Counter = collections.Counter()
             for i, s in enumerate(segs):
                 for n in set(extract_from_text(s, segment_no=i + 1)[0].characters):
@@ -712,7 +740,7 @@ def main() -> int:
         sample: tuple[str, str] | None = None   # (book, 构造片段)
         for nid, parts in by_novel.items():
             text = "".join(parts)
-            ladder = LADDERS.get(nid, REALM_SYSTEMS)
+            ladder = LADDERS.get(nid, _FIXTURE_SYSTEMS)
             realm_words = [w for g in _system_words(ladder) for w in g]
             probe_realm = re.compile(
                 rf"(?:{_REALM_VERB_PROBE})(?:到|至|了)?(?:第)?[一二三四五六七八九十百]*"
@@ -750,7 +778,7 @@ def main() -> int:
                     frag = sample[1][sample[1].index(verb):]
                     break
             got_h4 = extract_events("萧炎" + frag, segment_no=1, names=["萧炎"],
-                                    realm_order=LADDERS.get(3, REALM_SYSTEMS))
+                                    realm_order=LADDERS.get(3, _FIXTURE_SYSTEMS))
             check("H4a 真实语料的境界构造，补上主语后必须抽得出来（模式认得真实句式）",
                   bool(got_h4), f"实得 {[(e.kind, e.value) for e in got_h4]}；片段 {frag}",
                   "连补了主语都抽不出来，说明模式与真实句式对不上")
@@ -819,7 +847,8 @@ def main() -> int:
             st: dict = {}
             rules: list[str] = []
             for i, s in enumerate(segs, 1):
-                ev = extract_events(s, segment_no=i, names=NAMES)
+                ev = extract_events(s, segment_no=i, names=NAMES,
+                                    realm_order=_FIXTURE_SYSTEMS)
                 rules += [f.rule for f in check_segment(st, ev)]
                 for e in ev:
                     apply_event(st, e)
@@ -857,7 +886,8 @@ def main() -> int:
               f"实得 {reloaded.get(('realm', '陆见微'), {}).get('segment_no')}",
               "累加说明状态被当成计数器写了")
         snapped = state_facts_from_events(
-            extract_events("陆见微说道：「走。」", segment_no=1, names=NAMES),
+            extract_events("陆见微说道：「走。」", segment_no=1, names=NAMES,
+                           realm_order=_FIXTURE_SYSTEMS),
             project_id=proj.id)
         check("I6 库里没有 `tracked` 之外的多余状态种类",
               {r["key"].split(":", 1)[0] for r in snapped} <= {"life", "owner", "realm",

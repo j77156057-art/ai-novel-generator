@@ -91,7 +91,19 @@ RULES: dict[str, tuple[str, str]] = {
 # 各规则判定
 # --------------------------------------------------------------------------- #
 
-def check_teleportation(db, project_id: int, text: str, segment_no: int) -> list[JudgeFinding]:
+def _book_cond(model, novel_id: int | None) -> list:
+    """事件表的书维度过滤：指定书 + 项目级（novel_id IS NULL）。
+
+    项目挂两本书时，若只按 project_id 取事件，会把别书的历史事件混进本段的
+    巡检（瞬移/年号倒序/伏笔超期都会误报）。
+    """
+    if novel_id is None:
+        return []
+    return [model.novel_id.in_((novel_id, None))]
+
+
+def check_teleportation(db, project_id: int, text: str, segment_no: int,
+                        novel_id: int | None = None) -> list[JudgeFinding]:
     """瞬移：本段角色出现在某地点，但其最近一次 location 状态是别处，且无移动动词衔接。
 
     判据（保守）：
@@ -106,6 +118,7 @@ def check_teleportation(db, project_id: int, text: str, segment_no: int) -> list
         select(KgCharacterState).where(
             KgCharacterState.project_id == project_id,
             KgCharacterState.state_type == "location",
+            KgCharacterState.is_current.is_(True),  # 只跟当前版本状态比
         ).order_by(KgCharacterState.segment_no)
     ):
         latest_loc[st.character_id] = st
@@ -116,6 +129,8 @@ def check_teleportation(db, project_id: int, text: str, segment_no: int) -> list
             KgEvent.project_id == project_id,
             KgEvent.segment_no == segment_no,
             KgEvent.location_id.isnot(None),
+            KgEvent.is_current.is_(True),
+            *_book_cond(KgEvent, novel_id),
         )
     ).all()
     if not seg_events or not latest_loc:
@@ -125,7 +140,8 @@ def check_teleportation(db, project_id: int, text: str, segment_no: int) -> list
     mentioned_entities = {
         m.entity_id for m in db.scalars(
             select(KgMention).where(
-                KgMention.project_id == project_id, KgMention.segment_no == segment_no
+                KgMention.project_id == project_id, KgMention.segment_no == segment_no,
+                KgMention.is_current.is_(True),
             )
         )
     }
@@ -171,10 +187,11 @@ def check_unauthorized_knowledge(db, project_id: int, text: str, segment_no: int
     - kg_entity_knowledge 里没有 X→S 的学习记录（learned_at ≤ segment_no）
     """
     findings: list[JudgeFinding] = []
-    # 本段提到的角色
+    # 本段提到的角色（只认当前版本提及；同章旧稿的提及只留档）
     mentions = db.scalars(
         select(KgMention).where(
-            KgMention.project_id == project_id, KgMention.segment_no == segment_no
+            KgMention.project_id == project_id, KgMention.segment_no == segment_no,
+            KgMention.is_current.is_(True),
         )
     ).all()
     mentioned = {m.entity_id for m in mentions}
@@ -249,7 +266,8 @@ def check_secret_leak(db, project_id: int, text: str, segment_no: int) -> list[J
     mentioned = {
         m.entity_id for m in db.scalars(
             select(KgMention).where(
-                KgMention.project_id == project_id, KgMention.segment_no == segment_no
+                KgMention.project_id == project_id, KgMention.segment_no == segment_no,
+                KgMention.is_current.is_(True),
             )
         )
     }
@@ -314,7 +332,8 @@ def check_secret_leak(db, project_id: int, text: str, segment_no: int) -> list[J
     return findings
 
 
-def check_impossible_sequences(db, project_id: int, text: str, segment_no: int) -> list[JudgeFinding]:
+def check_impossible_sequences(db, project_id: int, text: str, segment_no: int,
+                               novel_id: int | None = None) -> list[JudgeFinding]:
     """时间穿越：事件 sequence 顺序与故事内时间矛盾。
 
     判据（保守）：事件按 sequence 递增时，故事内时间不应倒退。
@@ -336,6 +355,8 @@ def check_impossible_sequences(db, project_id: int, text: str, segment_no: int) 
         select(KgEvent).where(
             KgEvent.project_id == project_id,
             KgEvent.in_story_date.isnot(None),
+            KgEvent.is_current.is_(True),
+            *_book_cond(KgEvent, novel_id),
         ).order_by(KgEvent.sequence)
     ).all()
     prev: tuple[str | None, int, int, str] | None = None   # (era, year, sequence, summary)
@@ -361,7 +382,8 @@ def check_impossible_sequences(db, project_id: int, text: str, segment_no: int) 
 
 
 def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
-                            current_chapter: int | None = None) -> list[JudgeFinding]:
+                            current_chapter: int | None = None,
+                            novel_id: int | None = None) -> list[JudgeFinding]:
     """伏笔超期：planned_payoff_chapter 已过仍未 paid_off。
 
     判据：status ∈ {planted, developing} 且 planned_payoff_chapter < current_chapter。
@@ -372,7 +394,11 @@ def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
         from sqlalchemy import func
 
         current_chapter = db.scalar(
-            select(func.max(KgEvent.chapter)).where(KgEvent.project_id == project_id)
+            select(func.max(KgEvent.chapter)).where(
+                KgEvent.project_id == project_id,
+                KgEvent.is_current.is_(True),
+                *_book_cond(KgEvent, novel_id),
+            )
         ) or 0
     for fs in db.scalars(
         select(KgForeshadow).where(
@@ -516,15 +542,18 @@ def load_judge_findings(db, project_id: int) -> list[dict]:
 
 
 def judge_segment(db, project_id: int, text: str, segment_no: int,
-                  current_chapter: int | None = None) -> dict:
+                  current_chapter: int | None = None,
+                  novel_id: int | None = None) -> dict:
     """审计一段：跑全部规则，返回 {findings, rules}。
 
     只读 KG，不改正文、不推进状态（状态推进由 sentinel + batch_worker 负责）。
     作者豁免的 (rule, entity) 不再报。失败静默兜底（调用方 try）。
+    ``novel_id``：项目当前书；事件表按书过滤，避免两本书的事件混在一起巡检。
     """
     findings: list[JudgeFinding] = []
     try:
-        findings += check_teleportation(db, project_id, text, segment_no)
+        findings += check_teleportation(db, project_id, text, segment_no,
+                                        novel_id=novel_id)
     except Exception:  # noqa: BLE001 —— 单规则失败不影响其他
         pass
     try:
@@ -536,11 +565,13 @@ def judge_segment(db, project_id: int, text: str, segment_no: int,
     except Exception:  # noqa: BLE001
         pass
     try:
-        findings += check_impossible_sequences(db, project_id, text, segment_no)
+        findings += check_impossible_sequences(db, project_id, text, segment_no,
+                                               novel_id=novel_id)
     except Exception:  # noqa: BLE001
         pass
     try:
-        findings += check_foreshadow_expiry(db, project_id, text, segment_no, current_chapter)
+        findings += check_foreshadow_expiry(db, project_id, text, segment_no,
+                                            current_chapter, novel_id=novel_id)
     except Exception:  # noqa: BLE001
         pass
     try:

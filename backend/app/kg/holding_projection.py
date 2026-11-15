@@ -185,6 +185,7 @@ def collect_pairs(result: dict, batch: list, *,
 def project_holdings(*, project_id: int, book: int | None, result: dict,
                      batch: list, kind_of: Callable[[str], str | None],
                      owner_lookup: Callable[[str], tuple[int | None, str | None]],
+                     event_lookup: Callable[[str, str, int | None], int | None] | None = None,
                      generated_db: str | None = None) -> dict:
     """把本批抽取的持有主张投影进 ``generated.db``，返回可观测统计。
 
@@ -215,9 +216,21 @@ def project_holdings(*, project_id: int, book: int | None, result: dict,
                     stats["surface_conflicts"].append(
                         {"item": p["item"], **reg["surface_conflict"]})
                 owner_id, owner_kind = owner_lookup(p["owner"])
+                # transfer_event_id：这条持有是「哪件事」造成的。按
+                # (主体=持有者, 客体=物品) 反查本批已落库事件；查不到留空，
+                # 不拿别的角色的事件硬凑。
+                transfer_id = None
+                if event_lookup is not None:
+                    try:
+                        transfer_id = event_lookup(
+                            p["item"], p["owner"], p.get("segment_no"))
+                    except Exception:  # noqa: BLE001 —— 查事件失败不阻断持有投影
+                        transfer_id = None
                 res = generated_store.record_holding(
                     con, p["item"], HOLD_TYPE, p["owner"], p["chapter"],
                     owner_id=owner_id, owner_kind=owner_kind or "character",
+                    transfer_event_id=transfer_id,
+                    event_object=(p["item"] if transfer_id is not None else None),
                     reason_code=p["source"], evidence=p["evidence"],
                     confidence=p["confidence"], novel_id=book,
                     project_id=project_id)

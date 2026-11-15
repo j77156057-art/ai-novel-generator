@@ -11,11 +11,11 @@ import json
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.corpus_health import scan_watermarks, strip_watermarks, strip_repeated_ads
+from app.corpus_health import strip_repeated_ads
 from app.db import IS_SQLITE
 from app.embeddings.provider import get_embedding_provider
 from app.ingestion.chunk import chunk_text
-from app.ingestion.clean import build_clean_report
+from app.ingestion.clean import clean_novel_text
 from app.ingestion.parse_txt import parse_txt
 from app.models import NovelChunk, RawNovel
 
@@ -65,16 +65,11 @@ def ingest_text(
     db.add(novel)
     db.flush()
 
-    # —— 清洗阶段：检出 → 剔除 → 留痕（报告进 raw_novels.clean_report）——
-    # scan_watermarks 同时给出 flagged 与 rejected（含拒绝原因），后者也写进报告，
-    # 让「考虑过但没删」的候选可见（避免静默丢候选）。
-    scan = scan_watermarks(text)
-    hits = scan["flagged"]
-    cleaned_text = strip_watermarks(text, hits)
-    novel.clean_report = build_clean_report(
-        text, cleaned_text, hits,
-        rejected=scan["rejected"], thresholds=scan["thresholds"],
-    )
+    # —— 清洗阶段：水印 → 跨书污染 → 整段重复 → 段级广告 ——
+    # `clean_novel_text` 内部顺序固定（跨书污染依赖「同段重复 N 次」的信号，
+    # 必须先于去重），报告含 marks / duplicate_paragraphs / cross_novel 三块。
+    cleaned_text, clean_report = clean_novel_text(text)
+    novel.clean_report = clean_report
 
     # v2.245 第二步清洗：通用「重复段」广告识别。
     # scan_watermarks 抓不到段首广告（final_ratio 判据 0% 全漏），
@@ -94,15 +89,25 @@ def ingest_text(
             },
         }
 
+    parse_report: dict = {}
     if chapter_meta is not None:
         # 章元数据路径：body 已由上游解析，这里用**同一批**检出串清洗各章 body，
         # 保证与文本解析路径的清洗口径一致（正文里其余内容一律不动）。
         chapters = [
-            {**ch, "body": strip_watermarks(ch.get("body", "") or "", hits)}
+            {**ch, "body": clean_novel_text(ch.get("body", "") or "")[0]}
             for ch in chapter_meta
         ]
     else:
-        chapters = parse_txt(content=cleaned_text)
+        chapters = parse_txt(content=cleaned_text, report=parse_report)
+        if parse_report.get("parse_failed"):
+            # 解析层拦下的 HTML/服务器错误页：留痕到 clean_report，可经 API 复核
+            novel.clean_report = {
+                **(novel.clean_report or {}),
+                "parse_failed": {
+                    "count": parse_report["parse_failed_count"],
+                    "samples": parse_report["parse_failed"],
+                },
+            }
     pieces: list[tuple[int | None, int, str]] = []
     for ch in chapters:
         for i, piece in enumerate(
@@ -151,6 +156,8 @@ def ingest_text(
         "title": title,
         "chapters": len(chapters),
         "chunks": len(pieces),
+        # 解析层判为 HTML/服务器错误页并丢弃的章节（正常语料为空列表）
+        "parse_failed": parse_report.get("parse_failed", []),
         # 清洗报告随导入结果一并回显（上传响应 / load_corpus 打印都用它）。
         "clean_report": novel.clean_report,
     }

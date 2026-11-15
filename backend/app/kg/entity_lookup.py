@@ -25,7 +25,8 @@ KIND_ORDER = ("character", "item", "faction", "location", "power_system", "world
 
 def resolve_entity_by_name(db, project_id: int, name: str, *,
                            kind: str | None = None,
-                           novel_id: int | None = None):
+                           novel_id: int | None = None,
+                           own_only: bool = False):
     """按规范名取一个实体；没有返回 ``None``，同名多行时行为确定。
 
     Args:
@@ -35,6 +36,9 @@ def resolve_entity_by_name(db, project_id: int, name: str, *,
         kind: 指定类别时只在该类里查。
         novel_id: 传了才按书收窄（**这本书 + NULL 通配**），且同名时真书行优先；
             不传 = 只按项目隔离，与加书维度之前逐字一致。
+        own_only: 只认 ``novel_id IS NULL``（本书行）。原创项目没有独立书 id，
+            ``book=None`` 就是本书值而不是「不过滤」——用这个开关把「本书」
+            和「不按书过滤」区分开，避免本书抽取解析到参考书的同名实体。
 
     Returns:
         ``KgEntity`` 或 ``None``。
@@ -51,7 +55,9 @@ def resolve_entity_by_name(db, project_id: int, name: str, *,
     )
     if kind is not None:
         stmt = stmt.where(KgEntity.kind == kind)
-    if novel_id is not None:
+    if own_only:
+        stmt = stmt.where(KgEntity.novel_id.is_(None))
+    elif novel_id is not None:
         stmt = stmt.where(or_(KgEntity.novel_id.is_(None),
                               KgEntity.novel_id == novel_id))
 

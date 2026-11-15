@@ -138,6 +138,37 @@ def _entity_id(conn: sqlite3.Connection, project_id: int, name: str,
     return row[0] if row else None
 
 
+def _mention_grounded(conn: sqlite3.Connection, pid: int,
+                      d: dict) -> tuple[bool, str]:
+    """回放前的两层守卫（与批量抽取同一口径）。
+
+    第一层（词表/实体）：entity_id 必须属于本项目；
+    第二层（文本归属）：必须绑定到真实 generation，且实体名确实出现在该段正文。
+    任一层不过就拒绝回放——否则会把「点名字跳不到原文」的坏行重新写回去。
+    """
+    eid = d.get("entity_id")
+    row = conn.execute(
+        "SELECT canonical_name FROM kg_entities WHERE id=? AND project_id=?",
+        (eid, pid)).fetchone()
+    if row is None:
+        return False, "entity_id 不存在或不属于本项目"
+    name = row["canonical_name"]
+    gid = d.get("generation_id")
+    if gid is None:
+        return False, "没有 generation_id（回放后仍点不到原文）"
+    gen = conn.execute("SELECT text, segment_no FROM generations WHERE id=?",
+                       (gid,)).fetchone()
+    if gen is None:
+        return False, f"generation_id={gid} 不存在"
+    text = gen["text"] or ""
+    if not name or name not in text:
+        return False, f"实体名「{name}」未出现在 generation={gid} 正文"
+    seg = d.get("segment_no")
+    if seg is not None and gen["segment_no"] is not None and seg != gen["segment_no"]:
+        return False, f"segment_no={seg} 与 generation 的段号 {gen['segment_no']} 不符"
+    return True, ""
+
+
 def restore(conn: sqlite3.Connection, rid: int) -> None:
     """把一条隔离行按快照回放到业务表。"""
     r = conn.execute("SELECT * FROM kg_ingest_quarantine WHERE id=?",
@@ -154,6 +185,10 @@ def restore(conn: sqlite3.Connection, rid: int) -> None:
     if kind == "mention":
         if not d.get("entity_id"):
             print(f"#{rid} mention 缺 entity_id，无法回放")
+            return
+        ok, why = _mention_grounded(conn, pid, d)
+        if not ok:
+            print(f"#{rid} 守卫拒绝回放：{why}")
             return
         conn.execute(
             "INSERT OR IGNORE INTO kg_mentions "

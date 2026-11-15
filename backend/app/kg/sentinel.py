@@ -37,7 +37,7 @@
    它本身就不是个可靠的信号源。所以现在只有**登记过**（`seed_tracked`）
    或**被交接证伪过唯一性**的物品才产生归属主张。
 4. **境界必须有序，而且必须同量纲**。两条独立的闸门：
-   `REALM_ORDER` 外的写法不参与比较；再加一条 —— `order` 只是整数，
+   `realm_order` 外的写法不参与比较；再加一条 —— `order` 只是整数，
    序号写法（`三阶`→3）和词表位次（`金丹`→4）落在同一个整数空间里但**是两把尺子**，
    不比量纲就会把「金丹之后写三阶」判成倒退（实测确实如此，4 组用例全是误报）。
    量纲共三种：`ord:<单位>`、`ord:段@<子阶梯>`（`第七段斗之气`）、`ladder:<体系号>`。
@@ -157,26 +157,18 @@ _REALM_UP = "突破|晋升|进阶|踏入|达到|进入|迈入|跨入|凝结|结�
 #: 境界跌落谓词
 _REALM_DOWN = "跌落|跌至|跌到|退到|退回|退至|散尽|尽失|被废|崩碎"
 
-#: 境界**体系**（每个内层 tuple 是一套自洽的阶梯）。
+#: 境界阶梯**不再内置默认表**，一律从 ``plot_bible["realm_order"]`` 读。
 #:
-#: 为什么必须是二维的：境界表里混着好几套互不相干的刻度 —— 修仙档位（炼气→大罗）、
-#: 器物档位（黄阶→神阶）、星阶（一星→九星）。它们各自有序，但**彼此不可比**。
-#: 拍平成一维以后，`一星`（第 21 位）后面写 `黄阶`（第 15 位）就会被判成「境界倒退」，
-#: 而这两件事根本不在一个刻度上 —— 这是纯粹的误报源。
-#: 实测（见 `verify_sentinel.py` F2）：拍平时 4 组跨刻度用例全是误报。
+#: 结构与口径：
+#: - 一维列表 = 本书只有一套阶梯（多数书如此）；二维列表 = 多套互不可比
+#:   （修仙档位 / 器物档位 / 星阶各自有序，拍平会把跨刻度误判成「境界倒退」——
+#:   见 `verify_sentinel.py` F2：拍平时 4 组跨刻度用例全是误报）。
+#: - **未配置 = 不注入、不判定**，与 `generation/power_prompt._realm_order_line`
+#:   同口径：境界正则根本不编译，不会拿别的书的档位去抽本书的正文。
 #:
-#: **可配置**：`extract_events(realm_order=...)` 可传本结构，也可传一维 tuple
-#: （表示「本书只有一套阶梯」——多数书确实如此）。
-#: 不在表里的写法一律不参与大小比较 —— 少报优于误报。
-REALM_SYSTEMS: tuple[tuple[str, ...], ...] = (
-    ("凡人", "炼气", "筑基", "金丹", "元婴", "化神", "炼虚", "合体", "大乘", "渡劫",
-     "真仙", "金仙", "太乙", "大罗"),
-    ("黄阶", "玄阶", "地阶", "天阶", "圣阶", "神阶"),
-    ("一星", "二星", "三星", "四星", "五星", "六星", "七星", "八星", "九星"),
-)
-#: 拍平后的默认表（保持一维形态，供 `_REALM_ALT` 与外部只读消费）
-REALM_ORDER: tuple[str, ...] = tuple(r for sys_ in REALM_SYSTEMS for r in sys_)
-_REALM_ALT = "|".join(re.escape(r) for r in sorted(REALM_ORDER, key=len, reverse=True))
+#: 为什么删掉内置表：早先这里写死三套玄幻阶梯，等于把 novel 7 的设定带进
+#: 运行时代码——新书不配也能「跑」，但抽出来的是别人的境界名；而每加一本书
+#: 都要回来改代码。改为纯数据后，新书接入只需在 plot_bible 里给 realm_order。
 
 #: 序号类境界的**单位**（量纲的一部分）。正则与解析共用一处，避免两边漂移。
 _ORDINAL_UNITS = "阶|层|品|重|级"
@@ -318,7 +310,7 @@ class Extractors:
     realm_down: re.Pattern | None
 
 
-def build_extractors(names: list[str], realm_order=REALM_SYSTEMS) -> Extractors:
+def build_extractors(names: list[str], realm_order=None) -> Extractors:
     """编译模式集。**名字表或境界阶梯变了都要重建。**
 
     境界阶梯必须进正则 —— 曾经的实现只把 `realm_order` 用在排名上，正则却在
@@ -326,16 +318,18 @@ def build_extractors(names: list[str], realm_order=REALM_SYSTEMS) -> Extractors:
     （`斗之气/斗者/…/斗帝`），`萧炎突破到斗皇。` 一个字都抽不出来，
     而 `萧炎突破到金丹。`（默认表里有）却能抽 —— 抽取结果取决于一张**调用方
     根本没见过的表**。这个 bug 是靠「真实语料上 0 条境界事件」暴露出来的。
+
+    `realm_order` 为空（项目没配）时不编译境界正则：不注入、不判定。
     """
     names = [n for n in names if n]
     if not names:
         return Extractors([], None, None, None, None, None, None, None)
     alt = _name_alt(names)
     nm = f"(?P<name>{alt})"
-    # 本调用方自己的阶梯 → 本调用方自己的交替式
+    # 本调用方自己的阶梯 → 本调用方自己的交替式；空表 = 不做境界抽取
+    ladder_words = (r for g in _as_systems(realm_order) for r in g)
     realm_alt = "|".join(
-        re.escape(r) for r in sorted((r for g in _as_systems(realm_order) for r in g),
-                                     key=len, reverse=True)
+        re.escape(r) for r in sorted(ladder_words, key=len, reverse=True)
     )
 
     # 死亡，三个语序都要覆盖（缺一个就是漏报一种写法）：
@@ -363,34 +357,40 @@ def build_extractors(names: list[str], realm_order=REALM_SYSTEMS) -> Extractors:
         rf"{nm}(?:[一-鿿]{{0,4}})?(?P<verb>{_HOLD_VERBS})(?:了)?(?:自己的)?"
         rf"(?P<item>{_ITEM_CH}{{2,4}})"
     )
-    realm = re.compile(
-        rf"{nm}(?:的)?(?:修为|境界)?(?:已经|已)?(?:{_REALM_UP})(?:到|至|了)?"
-        rf"(?P<realm>"
-        # 复合档位：`第七段斗之气` —— 后面**必须**紧跟阶梯词才认。
-        # 不设这道后视守卫，`突破了一段时间` 会被切成 `一段` 判成突破（实测会踩）。
-        rf"(?:第)?(?P<seg>[一二三四五六七八九十百]+)段(?=(?P<sub>{realm_alt}))"
-        rf"|(?:第)?(?P<ord>[一二三四五六七八九十百]+(?:{_ORDINAL_UNITS}))"
-        rf"|{realm_alt}"
-        rf")"
-    )
-    realm_down = re.compile(
-        rf"{nm}(?:的)?(?:修为|境界)?(?:{_REALM_DOWN})(?:到|至|了)?"
-        rf"(?P<realm>"
-        rf"(?:第)?(?P<seg>[一二三四五六七八九十百]+)段(?=(?P<sub>{realm_alt}))"
-        rf"|(?:第)?(?P<ord>[一二三四五六七八九十百]+(?:{_ORDINAL_UNITS}))"
-        rf"|{realm_alt}"
-        rf")?"
-    )
+    if realm_alt:
+        realm = re.compile(
+            rf"{nm}(?:的)?(?:修为|境界)?(?:已经|已)?(?:{_REALM_UP})(?:到|至|了)?"
+            rf"(?P<realm>"
+            # 复合档位：`第七段斗之气` —— 后面**必须**紧跟阶梯词才认。
+            # 不设这道后视守卫，`突破了一段时间` 会被切成 `一段` 判成突破（实测会踩）。
+            rf"(?:第)?(?P<seg>[一二三四五六七八九十百]+)段(?=(?P<sub>{realm_alt}))"
+            rf"|(?:第)?(?P<ord>[一二三四五六七八九十百]+(?:{_ORDINAL_UNITS}))"
+            rf"|{realm_alt}"
+            rf")"
+        )
+        realm_down = re.compile(
+            rf"{nm}(?:的)?(?:修为|境界)?(?:{_REALM_DOWN})(?:到|至|了)?"
+            rf"(?P<realm>"
+            rf"(?:第)?(?P<seg>[一二三四五六七八九十百]+)段(?=(?P<sub>{realm_alt}))"
+            rf"|(?:第)?(?P<ord>[一二三四五六七八九十百]+(?:{_ORDINAL_UNITS}))"
+            rf"|{realm_alt}"
+            rf")?"
+        )
+    else:
+        # 空表**不编译**：`(?P<realm>|...)` 会匹配空串，等于给每句都塞一条境界事件。
+        realm = realm_down = None
     return Extractors(names, death, revive, speak, give, hold, realm, realm_down)
 
 
 def _as_systems(order) -> tuple[tuple[str, ...], ...]:
-    """把 `realm_order` 归一成「体系列表」。
+    """把 `realm_order` 归一成「体系列表」；没配（None/空）返回空元组。
 
     传一维 tuple 表示**本书只有一套阶梯**（多数书确实如此）；
     传二维 tuple 则是显式声明多套互不可比的体系。
     """
-    if order and isinstance(order[0], (tuple, list)):
+    if not order:
+        return ()
+    if isinstance(order[0], (tuple, list)):
         return tuple(tuple(g) for g in order)
     return (tuple(order),)
 
@@ -433,7 +433,7 @@ def extract_events(
     *,
     segment_no: int,
     names: list[str],
-    realm_order=REALM_SYSTEMS,
+    realm_order=None,
     alive_entities: set[str] | None = None,
 ) -> list[Event]:
     """从一段文本里抽出状态事件。
@@ -1097,23 +1097,25 @@ def replace_state_facts(db, project_id: int, rows: list[dict],
 
 
 def realm_order_from_project(project) -> tuple:
-    """项目自己的境界阶梯，没配就用默认表。
+    """项目自己的境界阶梯；**没配就返回空 tuple（不注入、不判定）**。
 
     阶梯挂在 `plot_bible["realm_order"]` 下 —— 不新增数据库字段就能配：
-    一维列表是「本书只有一套阶梯」，二维列表是「多套互不可比」（见 `REALM_SYSTEMS`）。
+    一维列表是「本书只有一套阶梯」，二维列表是「多套互不可比」。
+    与 `generation/power_prompt._realm_order_line` 同口径：未配置不注入，
+    绝不退回一套内置阶梯（那会把别的书的档位带进本书的正文）。
     配错了不致命：取不到序数就不判，不会乱报。
     """
     bible = getattr(project, "plot_bible", None) or {}
     raw = bible.get("realm_order") if isinstance(bible, dict) else None
     if not raw or not isinstance(raw, (list, tuple)):
-        return REALM_SYSTEMS
+        return ()
     groups: list[tuple[str, ...]] = []
     for g in raw:
         if isinstance(g, (list, tuple)):
             groups.append(tuple(str(w) for w in g if w))
         elif isinstance(g, str) and g:
             groups.append((g,))
-    return tuple(g for g in groups if g) or REALM_SYSTEMS
+    return tuple(g for g in groups if g)
 
 
 def audit_segment(

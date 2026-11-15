@@ -822,28 +822,36 @@ ITEM_ALIAS_BLOCKLIST = frozenset({
     "黑金刀",
 })
 
-#: 派生 item 实体：抽取链路会把它们当独立物品抽出来，但它们不是物品。
-#: 「地书碎片」指地书本身（碎片粒度走 ``kg_item_instance``），「地书聊天群」指
-#: 地书的群聊通道（通信手段，不可持有）。在 ``normalize_extraction`` 入口整条
-#: 摘掉，关系/状态/情报里的引用一并清，避免悬空端点。
+#: 派生 item 名单的项目级配置键：``plot_bible["derived_item_names"]``。
+#:
+#: 语义：这些名字是**某本书**里某件物品的派生写法（「地书碎片」指地书本体、
+#: 「地书聊天群」指地书的通信通道），不该单独建 item 实体。
+#:
+#: **不再内置任何具体书名**。早先这里是 ``DERIVED_ITEM_NAMES = {"地书碎片",
+#: "地书聊天群"}``，等于把 novel 7 的词表写进代码：换一本书要么改代码，要么
+#: 被这套名单误伤（同名但确实是独立物品的书会被整条丢掉）。现在改为读项目
+#: 设定，**未配置就不启用**，归一入口不会凭空丢弃任何实体。
 #:
 #: 为什么不复用另外三张表（各管一段，语义不能混）：
 #: - ``NON_ENTITY_NAMES``：**建词表时**剔抽象词（cleaned/mixed 源），命中就进不了
-#:   canon；但这两个是专指某件东西的派生名，进了词表也拦不住 v3 抽取。
+#:   canon；但派生名是专指某件东西的写法，进了词表也拦不住 v3 抽取。
 #: - ``ITEM_ALIAS_BLOCKLIST``：**折叠之后**剔别名，只动 ``aliases``、不删实体，
 #:   而且剔的是「镜子/长刀」这类任何物品都可能被叫的通名。
-#: - ``ITEM_ALIASES``：把异写折到同一规范名。这里不能折——「地书碎片」折成
+#: - ``ITEM_ALIASES``：把异写折到同一规范名。派生名不能折——把「地书碎片」折成
 #:   「地书」会把碎片粒度（九面镜子各一件）与本体混成一件，与 2026-11-10
 #:   「九件套通称不折」的既有口径直接冲突。
 #: - ``GENERIC_ALIASES``（迁移脚本 ``apply_item_merge.py`` 内）是泛称组别名，
 #:   运行时不读，也不承载「写侧直接丢弃」这个动作。
-#:
-#: 已知事实（2026-11-11 核过真实库）：这两个词当前 0 持有 / 0 提及 / 0 关系 /
-#: 0 事件，**本次不清理任何历史数据**；它拦的是「以后重跑/新批再把它们抽出来」。
-DERIVED_ITEM_NAMES = frozenset({
-    "地书碎片",
-    "地书聊天群",
-})
+DERIVED_ITEM_NAMES_KEY = "derived_item_names"
+
+
+def derived_item_names_from_project(project) -> frozenset[str]:
+    """从项目设定读派生 item 名单；没配返回空集（不丢任何实体）。"""
+    bible = getattr(project, "plot_bible", None) or {}
+    raw = bible.get(DERIVED_ITEM_NAMES_KEY) if isinstance(bible, dict) else None
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(str(n).strip() for n in raw if str(n).strip())
 
 
 def fold_item_aliases(result: dict) -> dict:
@@ -899,8 +907,11 @@ def fold_item_aliases(result: dict) -> dict:
     return result
 
 
-def drop_derived_items(result: dict) -> dict:
-    """丢弃 ``DERIVED_ITEM_NAMES`` 里的派生 item 实体（原地修改并返回）。
+def drop_derived_items(result: dict, names=None) -> dict:
+    """丢弃 ``names`` 里的派生 item 实体（原地修改并返回）。
+
+    ``names`` 由调用方按项目配置传入（``derived_item_names_from_project``）；
+    为空时直接返回，与「未配置不启用」的口径一致。
 
     为什么放在同步层而不是改抽取提示词：提示词管不住模型换说法（碎片/群/
     聊天群），而历史批已经抽出来了；在归一入口兜底，才能让「不建实体、不建组」
@@ -911,13 +922,16 @@ def drop_derived_items(result: dict) -> dict:
     ``batch_worker._persist_extraction`` 转进 ``ExtractionStats``，最终落在
     ``agent_runs.note.batch_stats`` 里可查——不静默消失。
     """
+    derived = frozenset(str(n).strip() for n in (names or ()) if str(n).strip())
+    if not derived:
+        return result
     ents = result.get("entities") or []
     dropped: dict[str, int] = {}
     kept = []
     for ent in ents:
         name = (ent.get("canonical_name") or "").strip() \
             if isinstance(ent, dict) else ""
-        if name in DERIVED_ITEM_NAMES and (ent.get("kind") or "") == "item":
+        if name in derived and (ent.get("kind") or "") == "item":
             dropped[name] = dropped.get(name, 0) + 1
             continue
         kept.append(ent)
@@ -927,7 +941,7 @@ def drop_derived_items(result: dict) -> dict:
 
     def _is_derived(row: dict, field: str) -> bool:
         value = row.get(field)
-        return isinstance(value, str) and value.strip() in DERIVED_ITEM_NAMES
+        return isinstance(value, str) and value.strip() in derived
 
     # 关系 / 状态变化 / 情报：两端或主语是派生词时整条丢掉（落库也需要端点
     # 可解析，留着只会是悬空行）；事件保留剧情，只清空指向派生词的字段。
@@ -954,11 +968,11 @@ def drop_derived_items(result: dict) -> dict:
     result["derived_refs_dropped"] = refs
     _log.warning(
         "丢弃派生 item 实体 %s（连带清理引用 %d 条）：它们不是物品实体，"
-        "见 canon_source.DERIVED_ITEM_NAMES", dropped, refs)
+        "见 plot_bible.%s", dropped, refs, DERIVED_ITEM_NAMES_KEY)
     return result
 
 
-def normalize_extraction(result: dict) -> dict:
+def normalize_extraction(result: dict, *, derived_item_names=None) -> dict:
     """把 v3 抽取结果的称呼写法折到实体规范名（原地修改并返回）。
 
     原文词保留：实体原有写法进 aliases，mention 的 context_window 仍是原文。
@@ -966,7 +980,8 @@ def normalize_extraction(result: dict) -> dict:
     """
     # 派生 item 实体与词表无关（legacy 下也要生效），放在折叠之前：
     # 先摘掉它们，后面的别名折叠/称呼归一就不会再碰到。
-    result = drop_derived_items(result)
+    # 名单来自项目配置；未配置时这一步是恒等，不丢任何实体。
+    result = drop_derived_items(result, derived_item_names)
     # 物品别名折叠与 canon 词表无关（legacy 下也要生效），先做。
     result = fold_item_aliases(result)
     if source() not in (SOURCE_CLEANED, SOURCE_MIXED) or not _index():

@@ -147,6 +147,18 @@ _ROLE_VERB_TRIGGERS = (
 )
 #: 「两位同僚」「他们二人」这类同位语，只有前一小句的并列名单能解。
 _APPELLATION = re.compile(r"^(?:这)?(?:两位|二位|两人|二人|俩|他们|她们)")
+#: R10：数量词/群体指代紧贴触发词左侧时，关系名词指一群人而不是某一个人，
+#: 不能把小句外的单个名字绑成关系另一端（「随两位同僚走向李玉春的办公室」）。
+_QUANTITY_BEFORE_NOUN = re.compile(
+    r"(?:两位|二位|两员|二员|两人|二人|三人|几人|数人|数名|多名|"
+    r"一群|一众|众位|诸位|各位|众人|等人)[^\n，。！？；：]{0,2}$"
+)
+#: R11：受事/与事框架——名字紧跟在「分发给/交给/告诉」后面时是动作对象，
+#: 不是关系名词所指的那个人。
+_RECIPIENT_BEFORE_NAME = re.compile(
+    r"(?:分发给|分给|交给|递给|送给|转交给|拿给|告诉|通知|介绍给|引见给)$"
+)
+_COPULA_BEFORE_NOUN = re.compile(r"(?:是|为|乃是|都是|皆为)[^，。！？；：\n]{0,4}$")
 
 #: 关系失效触发词：与建边触发词分表，命中只「关旧边」，不新增边。
 INVALIDATION_TRIGGERS: dict[str, tuple[str, ...]] = {
@@ -501,9 +513,16 @@ def _attribution_gate(text: str, a: str, b: str, rel: str, trigger: str,
             pair = _coordination_pair(text, _prev_clause_span(text, c_start),
                                       form_re, forms)
             return (True, "") if pair and {a, b} == pair else (False, "endpoint_mismatch")
-        # A 和 B 是 Y：Y 作谓语，a、b 就是 Y 的双方。
-        if _coordinated(clause, a, b) and re.search(r"是[^，。！？；：\n]{0,4}$", before):
-            return True, ""
+        # R10：数量词紧贴触发词 → 「同僚」是群体，句外的单个名字不是另一端。
+        if _QUANTITY_BEFORE_NOUN.search(before):
+            return False, "endpoint_mismatch"
+        # R13：A 和 B 是/为 Y → 只认并列名单这一对，名单外的第三人一律不绑。
+        if _COPULA_BEFORE_NOUN.search(before):
+            pair = _coordination_pair(text, (c_start, c_end), form_re, forms)
+            if pair is not None:
+                return (True, "") if {a, b} == pair else (False, "endpoint_mismatch")
+            if _coordinated(clause, a, b):
+                return True, ""
         # X 和诸位 Y：Y 只是并列项之一，名单外的人无从确认。
         if re.search(r"(?:和|与|跟|及)(?:诸位|各位|众|一众)?$", before):
             return False, "endpoint_mismatch"
@@ -512,9 +531,23 @@ def _attribution_gate(text: str, a: str, b: str, rel: str, trigger: str,
                    _mentions_in(text, (c_start, tpos), form_re, forms)}
         others = ({name for _s, _e, name in
                    _mentions_in(text, (s_start, s_end), form_re, forms)} - holders)
-        if len(others) == 1:
+        # R12：唯一指代收紧为三条件——持有者恰 1 人、其它专名恰 1 人、该第三人
+        # 位于触发词右侧 6 字内的谓语名词位（「他的同僚」）。任一不满足即拒：
+        # holders 已有两人时，关系双方其实都在小句里，句外第三人只是旁证
+        # （ch495「X 是 Y 的好友」、ch806「A 与 B 为同僚」）。
+        if len(holders) == 1 and len(others) == 1:
             ref = next(iter(others))
-            if (a in holders and b == ref) or (b in holders and a == ref):
+            near = {name for _s, _e, name in _mentions_in(
+                text, (tend, min(len(text), tend + 6)), form_re, forms)}
+            if ref in near and ((a in holders and b == ref)
+                                or (b in holders and a == ref)):
+                # R11：ref 若出现在受事框架里（「分发给许七安三人」），
+                # 它是动作对象而不是关系名词所指的人。
+                for _s, _e, name in _mentions_in(
+                        text, (s_start, s_end), form_re, forms):
+                    if name == ref and _RECIPIENT_BEFORE_NAME.search(
+                            text[max(0, _s - 3):_s]):
+                        return False, "endpoint_mismatch"
                 return True, ""
         return False, "endpoint_mismatch"
 

@@ -706,13 +706,19 @@ def attribute_event_segments(out: dict, texts: list[tuple[int, str, int | None]]
     return out
 
 
-def extract_segment(provider, text: str, segment_no: int, chapter: int | None = None) -> dict:
+def extract_segment(provider, text: str, segment_no: int, chapter: int | None = None,
+                    note: str | None = None) -> dict:
     """单段抽取（LLM）。失败返回**带 `_error` 的空骨架**（不抛异常，不阻塞主链）。
 
     返回 normalize_extraction 后的规范 dict。调用方必须检查 `ERROR_FIELD`：
     有值时这一批是抽取失败，不是「抽了但没有」。
+
+    ``note``：追加在 user 末尾的本次调用附加约束（默认 None = 行为不变），
+    用于长段输出被模型上限截断时压 JSON 体量。
     """
     user = _SEGMENT_TEMPLATE.format(segment_no=segment_no, chapter=chapter or "?", text=text)
+    if note:
+        user = user + "\n\n" + note
     try:
         raw = provider.chat(_EXTRACT_SYSTEM, user)
     except Exception as exc:  # noqa: BLE001 —— 不抛，但必须留失败标记
@@ -724,23 +730,30 @@ def extract_segment(provider, text: str, segment_no: int, chapter: int | None = 
     return attribute_event_segments(out, [(segment_no, text, chapter)])
 
 
-def extract_batch(provider, texts: list[tuple[int, str, int | None]]) -> dict:
+def extract_batch(provider, texts: list[tuple[int, str, int | None]],
+                  note: str | None = None) -> dict:
     """批量抽取（一次抽 N 段合并——省 LLM 调用 + 跨段一致性）。
 
     texts: [(segment_no, text, chapter), ...]
     返回的 events 每条都带 ``segment``（``attribute_event_segments`` 按模型标注 +
     段内命中归属；落库直接用，不再统一记批首段）。
     失败返回带 `ERROR_FIELD` 的空骨架，调用方据此判 failed。
+
+    ``note``：追加在 user 末尾的本次调用附加约束（默认 None = 行为不变）。
+    参考语料补建用它压输出预算——3 章窗口不设限时会把 JSON 顶到模型 4096
+    输出上限被截断，整窗解析失败。
     """
     if not texts:
         return normalize_extraction({})
     if len(texts) == 1:
         seg_no, text, chapter = texts[0]
-        return extract_segment(provider, text, seg_no, chapter)
+        return extract_segment(provider, text, seg_no, chapter, note=note)
     joined = "\n\n—— 段分隔 ——\n\n".join(
         f"【第{s} 段】\n{t}" for s, t, _c in texts
     )
     user = _BATCH_TEMPLATE.format(n=len(texts), joined=joined)
+    if note:
+        user = user + "\n\n" + note
     try:
         raw = provider.chat(_EXTRACT_SYSTEM, user)
     except Exception as exc:  # noqa: BLE001 —— 不抛，但必须留失败标记
@@ -884,7 +897,7 @@ class ExtractionStats:
     mentions_alias_added: int = 0
     #: 持有投影统计（组/写法/持有段/错误）；空 dict = 本批没投影（测试直调）。
     projection: dict = field(default_factory=dict)
-    #: 归一时丢弃的派生 item 实体（名字 → 条数，见 canon_source.DERIVED_ITEM_NAMES）。
+    #: 归一时丢弃的派生 item 实体（名字 → 条数，见 canon_source.DERIVED_ITEM_NAMES_KEY）。
     #: 空 = 本批没抽到；有值说明「为什么没建这个实体」，落在 note.batch_stats 可查。
     derived_items_dropped: dict = field(default_factory=dict)
     #: 随派生实体一并清理的引用行数（关系/状态/情报整条、事件字段清空）。

@@ -29,12 +29,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.kg import canon_source
-from app.kg.book_scope import book_for_project
+from app.kg.book_scope import book_for_project, scope_sql_values
 from app.models import (
     AgentRun, AppSetting, Generation, KgEntity, KgRelation, KgEvent, KgEventLink,
     KgCharacterState, KgForeshadow, KgEntityKnowledge, KgIngestQuarantine,
@@ -52,6 +52,13 @@ WORKER_THREADS = 1
 #: 同批失败后的立即重试上限。只覆盖网络抖动；持续挂是 key/配额问题，
 #: 重试解决不了——暴露成 failed 行给人看（requeue API 手动重捞）才是对的。
 RETRY_LIMIT = 2
+#: parse_failed 的定向重抽约束：模型输出被 4096 token 上限截断时，只压「条数」
+#: 让 JSON 收得进一个回复；抽取口径（kind/枚举/证据要求）不变。
+_OUTPUT_BUDGET_NOTE = (
+    "【输出预算】整段 JSON 必须能一次输出完：实体最多 10 个、事件最多 5 条、"
+    "关系最多 5 条、状态变化最多 4 条、其它数组最多 4 项；只保留对剧情最关键"
+    "的信息，宁少勿多，不要输出解释。"
+)
 #: AgentRun 里 kg 批抽行的 role 标识（assistant 端点按 role 过滤，互不污染）
 ROLE_KG_EXTRACT = "kg_batch_extract"
 #: mention 来源标记（读侧不区分，统计可分开看）：
@@ -106,6 +113,9 @@ class _QueueItem:
     chapter: int | None = None
     #: 对应的 AgentRun 行 id（溢出丢弃时用它留痕；None = 无行的历史调用）
     run_id: int | None = None
+    #: 显式按章重建：同章旧版本（含本段自身）一律置非当前，新结果写为新版本。
+    #: 普通新章入库为 False（只把**同章其它段**的旧版本置非当前）。
+    rebuild: bool = False
 
 
 class _BatchQueue:
@@ -150,6 +160,12 @@ class _BatchQueue:
             q = self._queues.get(project_id)
             return len(q) if q else 0
 
+    def queued_segments(self, project_id: int) -> set[int]:
+        """本进程内存队列里已排队的段号（周期扫描排除它们，避免重复入队）。"""
+        with self._lock:
+            q = self._queues.get(project_id)
+            return {it.segment_no for it in q} if q else set()
+
     def signal_flush(self) -> None:
         self._flush_event.set()
 
@@ -177,14 +193,20 @@ class KgEnqueueError(RuntimeError):
 
 
 def enqueue_segment(db: Session, project_id: int, segment_no: int, text: str,
-                    chapter: int | None = None) -> int:
+                    chapter: int | None = None, *, rebuild: bool = False) -> int:
     """段 commit 后调用：入队等待异步批抽。零 LLM、零阻塞。
 
     顺序固定为「先落库、再入队」：
-    1. 写一行 AgentRun(role=kg_batch_extract, status=running) 并**自己 commit**。
+    1. 写一行 AgentRun(role=kg_batch_extract, status=pending) 并**自己 commit**。
        不再依赖调用方后续（如 `_rollup_summary_tree`）的 commit——那一步之前一旦
        抛异常，入队行就丢了，worker 捞不到、库里也查不到。
     2. 行落地成功后才进内存队列，避免 worker 抢在 commit 之前处理、查不到行。
+
+    为什么是 pending 而不是「running + 入队即认领」：写章进程是短命的（每章一个
+    CLI 进程，落库后立刻退出），由它认领等于把行交给一个马上要死的 owner，常驻
+    worker 只能等 15 分钟租约过期再接管——每章白等一个租约。改成 pending 后，
+    「谁认领」由真正跑抽取的 worker 决定：本进程若是常驻服务，内存队列直接处理；
+    若是短命写章进程，常驻 worker 通过 `_discover_pending` 扫到并认领。
 
     request_hash = sha256("{project_id}:{segment_no}")，稳定可关联（重捞时按它找回）。
     失败抛 `KgEnqueueError`（调用方必须感知），不返回 None。
@@ -192,16 +214,15 @@ def enqueue_segment(db: Session, project_id: int, segment_no: int, text: str,
     """
     now = datetime.now(timezone.utc)
     try:
-        # 入队即认领：这一行从这里起归本进程（claim_owner）。否则别的进程在同一
-        # 时刻启动/恢复时，会把「本进程正在排队」的行当成孤儿再捞一遍。
+        # 只记录「谁写进来的」用于追责，不预占：认领权归真正执行抽取的 worker。
         payload = json.dumps({
             "segment_no": segment_no, "chapter": chapter,
-            "claim_owner": WORKER_ID,
-            "claim_at": now.isoformat(),
-            "claim_until": (now + timedelta(minutes=CLAIM_LEASE_MINUTES)).isoformat(),
+            "rebuild": bool(rebuild),
+            "enqueued_by": WORKER_ID,
+            "enqueued_at": now.isoformat(),
         }, ensure_ascii=False)
         row = AgentRun(
-            project_id=project_id, role=ROLE_KG_EXTRACT, status="running",
+            project_id=project_id, role=ROLE_KG_EXTRACT, status="pending",
             started_at=now,
             request_hash=hashlib.sha256(
                 f"{project_id}:{segment_no}".encode("utf-8")).hexdigest(),
@@ -218,7 +239,7 @@ def enqueue_segment(db: Session, project_id: int, segment_no: int, text: str,
 
     dropped = _queue.put(_QueueItem(
         project_id=project_id, segment_no=segment_no,
-        text=text, chapter=chapter, run_id=row_id))
+        text=text, chapter=chapter, run_id=row_id, rebuild=bool(rebuild)))
     if dropped:
         # 队列满：被挤掉的段必须在库里留痕（不能只打日志）
         try:
@@ -243,19 +264,20 @@ def flush_project(project_id: int) -> None:
     契约：**返回时该项目的队列已空，且没有在飞的批**——包括批已经被后台
     worker 抢先取走的情况。实现靠 ``_run_gate`` 把「取批 + LLM 抽取 + 落库」
     整段互斥：flush 拿不到闸门时会等 worker 当前这批跑完，再去排干剩余。
-    （``_enqueue_v3_extraction`` 会顺手 ``ensure_worker()``，所以
-    「enqueue 后立刻 flush」在旧实现里可能 flush 到空队列并提前返回。）
+    （同一进程里若 worker 已先取走批，flush 会等它跑完——闸门保证不会提前返回。）
     """
     _run_batches(project_id)
 
 
 #: worker 线程引用（status API 看存活用；ensure_worker 幂等赋值）
 _worker_thread: threading.Thread | None = None
+#: 周期扫描线程引用（与批抽线程分离，见 ``_sweep_loop``）
+_sweep_thread: threading.Thread | None = None
 
 
 def ensure_worker() -> None:
-    """确保后台 worker 线程在跑（幂等）。顺带启动心跳（多进程判活用）。"""
-    global _worker_started, _worker_thread
+    """确保后台 worker 与扫描线程在跑（幂等）。顺带启动心跳（多进程判活用）。"""
+    global _worker_started, _worker_thread, _sweep_thread
     _ensure_heartbeat()
     with _worker_lock:
         if _worker_started:
@@ -263,6 +285,9 @@ def ensure_worker() -> None:
         t = threading.Thread(target=_worker_loop, daemon=True, name="kg-v3-batch-worker")
         t.start()
         _worker_thread = t
+        s = threading.Thread(target=_sweep_loop, daemon=True, name="kg-v3-stuck-sweeper")
+        s.start()
+        _sweep_thread = s
         _worker_started = True
 
 
@@ -272,25 +297,200 @@ def worker_alive() -> bool:
     return bool(t is not None and t.is_alive())
 
 
+def _discover_pending(*, limit: int = 50) -> int:
+    """把库里 ``pending`` 的批抽行补进本进程内存队列（跨进程入队用）。
+
+    写章进程是短命的：它只落 pending 行、不跑抽取（见 ``enqueue_segment``）。
+    常驻 worker 靠这条路径发现这些行——入队到认领的延迟由此降到一次轮询
+    （≤5 秒），不再需要等 15 分钟认领租约。
+
+    只做「发现 + 入队」，不认领：认领仍在 ``_rows_for`` 里按行原子做，多进程
+    同时发现同一行时由那次条件 UPDATE 决出唯一赢家。本进程认领中的行
+    （``claim_owner == WORKER_ID``）跳过，避免同一段在本进程被抽两遍。
+
+    正文缺失的行标 failed 留痕（与 ``_requeue_row`` 同口径，不静默丢）。
+    """
+    from app.db import SessionLocal
+
+    added = 0
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        rows = db.scalars(select(AgentRun).where(
+            AgentRun.role == ROLE_KG_EXTRACT,
+            AgentRun.status == "pending",
+        ).order_by(AgentRun.id).limit(limit)).all()
+        if not rows:
+            return 0
+        chapter_maps: dict[int, dict[int, int | None]] = {}
+        for row in rows:
+            note = _note_dict(row)
+            seg_no = note.get("segment_no")
+            if seg_no is None:
+                row.status = "failed"
+                row.finished_at = now
+                _merge_note(row, {"error": "pending_segment_missing"})
+                continue
+            if note.get("claim_owner") == WORKER_ID:
+                continue  # 本进程已认领（正在跑），不再重复排队
+            if seg_no in _queue.queued_segments(row.project_id):
+                continue
+            gen = db.scalar(select(Generation).where(
+                Generation.project_id == row.project_id,
+                Generation.segment_no == seg_no,
+            ))
+            if gen is None or not (gen.text or "").strip():
+                row.status = "failed"
+                row.finished_at = now
+                _merge_note(row, {"error": "pending_text_missing",
+                                  "segment_no": seg_no})
+                _log.warning(
+                    "kg 待跑行正文缺失：项目 %s run %s 段 %s，已标 failed 留痕",
+                    row.project_id, row.id, seg_no)
+                continue
+            if row.project_id not in chapter_maps:
+                chapter_maps[row.project_id] = _segment_chapter_map(db, row.project_id)
+            dropped = _queue.put(_QueueItem(
+                project_id=row.project_id, segment_no=seg_no,
+                text=gen.text,
+                chapter=(_chapter_of(gen)
+                         or chapter_maps[row.project_id].get(seg_no)),
+                run_id=row.id, rebuild=bool(note.get("rebuild"))))
+            if dropped:
+                _mark_overflow(db, dropped, reason="discover_overflow")
+                if any(it.run_id == row.id for it in dropped):
+                    continue
+            added += 1
+        db.commit()
+    if added:
+        _signal_flush()
+    return added
+
+
+#: 空闲时扫 pending 行的最小间隔（秒）：既是「入队→认领」的延迟上限，
+#: 也防止「发现了却认领不到」时变成忙等。
+_DISCOVER_MIN_INTERVAL = 3.0
+#: 上一次扫 pending 的时刻（monotonic；0 = 本进程还没扫过）
+_last_discover_at: float = 0.0
+#: 最近一次扫 pending 的结果（status API 暴露）：排查「行 pending 却没人认领」时
+#: 先看这里——ticks 不动 = 线程没跑到，error 非空 = 扫库/入队异常。
+_discover_stat: dict = {"ticks": 0, "added": 0, "at": None, "error": None}
+
+
 def _worker_loop() -> None:
-    """worker 主循环：轮询各项目队列，攒批抽取落库。"""
+    """worker 主循环：轮询各项目队列，攒批抽取落库。
+
+    空闲时扫一次库里的 pending 行（``_discover_pending``）：写章进程只落
+    pending、不跑 worker，常驻 worker 必须自己发现它们。
+
+    周期扫描**不在这里**：LLM 批抽是同步阻塞的（实测单批约 4 分钟），扫描
+    若与它共用线程，批抽在飞时扫描会被一起挡住——孤儿 running 行因此可能
+    超过两个扫描周期无人处理。扫描交给独立的 ``_sweep_loop`` 线程。
+    """
+    global _last_discover_at
     while not _queue._stop:
         projects = _queue.pending_projects()
         if not projects:
-            _queue.wait_flush(timeout=10.0)
+            now = time.monotonic()
+            if now - _last_discover_at >= _DISCOVER_MIN_INTERVAL:
+                _last_discover_at = now
+                _discover_stat["ticks"] += 1
+                _discover_stat["at"] = datetime.now(timezone.utc).isoformat()
+                try:
+                    n = _discover_pending()
+                    _discover_stat["added"] = n
+                    _discover_stat["error"] = None
+                    if n:
+                        continue
+                except Exception as exc:  # noqa: BLE001 —— 发现失败不影响正常批抽
+                    _discover_stat["error"] = f"{type(exc).__name__}: {exc}"[:300]
+                    _log.warning("kg 待跑行发现失败（忽略，下轮再试）", exc_info=True)
+            _queue.wait_flush(timeout=5.0)
             continue
         for pid in projects:
             try:
                 _run_batches(pid)
             except Exception:  # noqa: BLE001 —— 单项目失败不影响其他项目
-                import logging
-                logging.getLogger(__name__).warning("kg v3 批抽项目 %d 失败", pid, exc_info=True)
+                _log.warning("kg v3 批抽项目 %d 失败", pid, exc_info=True)
+
+
+def _sweep_loop() -> None:
+    """独立的周期扫描线程：按 ``kg_stuck_sweep_seconds`` 重捞 stuck 行。
+
+    与批抽线程分离，保证「扫描在两分钟内跑一次」不被长批抽拖垮。
+    """
+    global _last_sweep_at
+    while not _queue._stop:
+        interval = _sweep_interval()
+        if interval <= 0:
+            time.sleep(10.0)
+            continue
+        try:
+            _sweep_stuck()
+            _last_sweep_at = time.monotonic()
+        except Exception:  # noqa: BLE001 —— 扫描失败不影响正常批抽
+            _log.warning("kg 批抽周期扫描失败（忽略，下轮再试）", exc_info=True)
+        time.sleep(interval)
+
+
+def _sweep_interval() -> float:
+    """周期扫描间隔（秒）：配置 ``kg_stuck_sweep_seconds``，缺省 120。
+
+    配置读不到（老配置/测试环境）时退回缺省值，绝不让扫描因配置缺失而停摆。
+    """
+    try:
+        from app.config import settings
+
+        return float(getattr(settings, "kg_stuck_sweep_seconds", 120) or 0)
+    except Exception:  # noqa: BLE001
+        return 120.0
+
+
+def _sweep_stuck() -> dict:
+    """扫库把超时 running 行重新入队（不依赖进程重启）。
+
+    只处理「已经超 STUCK_MINUTES」的行，并且跳过本进程内存队列里已排队的段
+    （否则同一段会被排两次，白跑一次 LLM）。按项目分组调用 ``recover_running``，
+    认领/去重/正文缺失留痕全部复用那条路径，不另写一套。
+    """
+    from app.db import SessionLocal
+
+    out = {"projects": 0, "requeued": 0, "segments": []}
+    with SessionLocal() as db:
+        project_ids = db.scalars(
+            select(AgentRun.project_id).where(
+                AgentRun.role == ROLE_KG_EXTRACT,
+                AgentRun.status == "running",
+            ).distinct()
+        ).all()
+        for pid in project_ids:
+            try:
+                res = recover_running(
+                    db, pid, stuck_only=True,
+                    skip_segments=_queue.queued_segments(pid),
+                )
+            except Exception:  # noqa: BLE001 —— 单项目失败不影响其他项目
+                _log.warning("kg 周期扫描项目 %s 失败", pid, exc_info=True)
+                db.rollback()
+                continue
+            if res.get("requeued"):
+                out["projects"] += 1
+                out["requeued"] += res["requeued"]
+                out["segments"].extend(res.get("segments") or [])
+        if out["requeued"]:
+            _log.info("kg 周期扫描：重捞 %d 段（项目 %s）",
+                      out["requeued"], [s.get("segment_no") for s in out["segments"]])
+    return out
 
 
 #: 取批 + 抽取 + 落库的互斥闸门（可重入：flush 内部再调 _run_batches 不会自锁）。
 #: 没有它，`enqueue → flush_project` 会被 `_enqueue_v3_extraction` 顺手起的
 #: worker 抢跑：worker 把批取走、flush 看到空队列秒返回，调用方以为跑完了。
 _run_gate = threading.RLock()
+
+#: 上一次周期扫描的时刻（time.monotonic；None = 本进程还没扫过）。
+#: 只用于可观测性：`/kg-v3/worker/status` 的 last_sweep_seconds_ago——
+#: 「worker_alive=true」不等于扫描在跑，有这个字段才能确认扫描周期在推进。
+_last_sweep_at: float | None = None
 
 
 def _run_batches(project_id: int) -> None:
@@ -314,7 +514,11 @@ def _run_batches_locked(project_id: int) -> None:
     from app.kg.extractor_v3 import ERROR_FIELD, ExtractionStats, extract_batch
 
     def _rows_for(batch: list[_QueueItem]) -> dict[int, AgentRun]:
-        """本批各段对应的 AgentRun 行（request_hash 精确匹配）。"""
+        """本批各段对应的 AgentRun 行（request_hash 精确匹配）+ 原子认领。
+
+        pending 行（写章进程只写不认领）在这里由真正跑抽取的 worker 认领；
+        别的进程持有的行不重复抽。
+        """
         out: dict[int, AgentRun] = {}
         for it in batch:
             h = hashlib.sha256(f"{project_id}:{it.segment_no}".encode("utf-8")).hexdigest()
@@ -322,16 +526,38 @@ def _run_batches_locked(project_id: int) -> None:
                 AgentRun.project_id == project_id,
                 AgentRun.role == ROLE_KG_EXTRACT,
                 AgentRun.request_hash == h,
-                AgentRun.status == "running",
+                AgentRun.status.in_(("pending", "running")),
             ))
             if row is None:
                 continue
             # 只处理本进程认领的行：别的进程（租约内）认领的段即使误入了本进程
             # 内存队列，也不能再抽一遍。
             owner = _note_dict(row).get("claim_owner")
-            if owner not in (None, WORKER_ID):
-                _log.warning("kg 批抽跳过他人认领的行：项目 %s 段 %s（owner=%s）",
-                             project_id, it.segment_no, owner)
+            if owner == WORKER_ID:
+                out[it.segment_no] = row
+                continue
+            if owner:
+                now = datetime.now(timezone.utc)
+                if _claim_orphaned(row, now, db):
+                    # 同机 owner PID 已死：立即接管，不等 15 分钟租约。
+                    # （短命 CLI 认领后进程被杀会留下 pending+owner 的行，
+                    #  只有这里能把它捞回来——discover 只看 pending，sweep 只看 running）
+                    _merge_note(row, {"claim_owner": None, "claim_at": None,
+                                      "claim_until": None,
+                                      "requeue_reason": "orphan_owner_dead"})
+                    db.commit()
+                    _log.warning(
+                        "kg 批抽接管同机死进程认领的行：项目 %s 段 %s（owner=%s）",
+                        project_id, it.segment_no, owner)
+                else:
+                    _log.warning("kg 批抽跳过他人认领的行：项目 %s 段 %s（owner=%s）",
+                                 project_id, it.segment_no, owner)
+                    continue
+            # 无主行（pending）：必须显式认领后再抽，否则两个进程会各抽一遍。
+            err = _claim_row(db, row)
+            if err:
+                _log.warning("kg 批抽认领失败：项目 %s 段 %s（%s）",
+                             project_id, it.segment_no, err)
                 continue
             out[it.segment_no] = row
         return out
@@ -412,6 +638,14 @@ def _run_batches_locked(project_id: int) -> None:
                     provider.chat("连通性探针，请回复 ok", "ok")
                     result = extract_batch(provider, texts)
                     err = result.get(ERROR_FIELD)
+                    if err and str(err).startswith("parse_failed"):
+                        # 输出被模型 4096 token 上限截断（长段常见）：加一条输出
+                        # 预算约束重抽一次。只压「条数」，不改抽取口径；仍失败
+                        # 就按原逻辑记 failed，不无限重试。
+                        squeezed = extract_batch(
+                            provider, texts, note=_OUTPUT_BUDGET_NOTE)
+                        if not squeezed.get(ERROR_FIELD):
+                            result, err = squeezed, None
                     if err:
                         raise RuntimeError(str(err))
                     stats = _persist_extraction(db, project_id, result, batch,
@@ -443,12 +677,20 @@ def _run_batches_locked(project_id: int) -> None:
                 note_extra: dict = {"batch_stats": stats.__dict__.copy(),
                                     "text_gate_alert": gate_alert,
                                     "canon": canon_meta,
+                                    # 成功路径要显式清掉上一轮失败留下的降级标记，
+                                    # 否则 note 里会一直挂着 alias_only=true 误导排查
+                                    "alias_only": False,
                                     # 失败可见性：试了几次 / 上限几次 / 是否已放弃
                                     "attempts": attempts_made,
                                     "max_attempts": RETRY_LIMIT + 1,
                                     "abandoned": False}
                 if empty:
                     note_extra["empty"] = True
+                # 零事件静默通过：实体抽到了、批也 success，但一条事件都没落。
+                # 实测 ch21/22/25/31/33 都是这种形态，成功判定完全看不出来。
+                # 只做可见性：不改 status、不改重试策略。
+                if stats.events_added == 0 and stats.entities_upserted > 0:
+                    note_extra["empty_events"] = True
                 proj = stats.projection or {}
                 proj_errors = [str(e) for e in (proj.get("errors") or [])]
                 if proj:
@@ -504,6 +746,15 @@ def _run_batches_locked(project_id: int) -> None:
                     project_id, len(batch), err, attempts_made,
                     RETRY_LIMIT + 1, added)
         finally:
+            # 每 5 章质量表：随批抽落库自动刷新（不再依赖人记得跑）。
+            # 失败只记日志，绝不拖累批抽主链。
+            try:
+                from app.kg.quality_report import maybe_emit_after_batch
+                maybe_emit_after_batch(
+                    db, project_id,
+                    {it.chapter for it in batch if it.chapter})
+            except Exception:  # noqa: BLE001 —— 报表是旁路
+                _log.warning("kg 五章质量表刷新失败（忽略）", exc_info=True)
             db.close()
 
 
@@ -660,7 +911,7 @@ def _claim_execute(db: Session, sql: str, params: dict):
 
 def _claim_row(db: Session, row: AgentRun, *, now=None,
                force: bool = False) -> str | None:
-    """按行原子认领一条 running 的批抽行。
+    """按行原子认领一条批抽行（pending / running）。
 
     返回 ``None`` = 认领成功（本进程独占该行）；否则返回失败原因（用于留痕）。
     多进程下不会双领的原因：认领是一条带条件的 ``UPDATE``，条件（未认领 /
@@ -702,7 +953,7 @@ def _claim_row(db: Session, row: AgentRun, *, now=None,
     res = _claim_execute(db, (
         f"UPDATE agent_runs SET note = json_set({_NOTE_JSON}, "
         "'$.claim_owner', :me, '$.claim_at', :now, '$.claim_until', :until) "
-        "WHERE id = :id AND role = :role AND status = 'running' "
+        "WHERE id = :id AND role = :role AND status IN ('pending', 'running') "
         f"AND (json_extract({_NOTE_JSON}, '$.claim_owner') IS NULL "
         f"OR json_extract({_NOTE_JSON}, '$.claim_owner') = :me "
         f"OR json_extract({_NOTE_JSON}, '$.claim_until') IS NULL "
@@ -781,7 +1032,9 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
     """批抽 worker 状态总览（GET /kg-v3/worker/status 的数据源）。
 
     - worker_alive：线程引用 is_alive（从未启动=False）
-    - pending：内存队列积压段数（重启即清零——持久状态看 runs）
+    - pending：内存队列积压段数（重启即清零——持久状态看 summary.pending）
+    - summary.pending：库里 status=pending 的待认领行（写章进程只落 pending，
+      常驻 worker 扫到后认领）
     - stuck：running 且 started_at 超 STUCK_MINUTES（进程重启的残留/真卡死）
     - recent_runs：最近 N 行（新的在前），note 里的 JSON 已解析
     """
@@ -792,7 +1045,8 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
         AgentRun.role == ROLE_KG_EXTRACT,
     ).order_by(AgentRun.id.desc()).limit(recent_limit)).all()
     now = datetime.now(timezone.utc)
-    summary = {"success": 0, "failed": 0, "running": 0, "stuck": 0, "empty": 0,
+    summary = {"success": 0, "failed": 0, "running": 0, "pending": 0,
+               "stuck": 0, "empty": 0,
                # 失败可见性 / 溢出留痕的汇总（recent_runs 里可看逐行明细）
                "abandoned": 0, "overflow": 0, "claimed": 0}
     items = []
@@ -805,8 +1059,7 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
             finished = finished.replace(tzinfo=timezone.utc)
         duration_ms = (int((finished - started).total_seconds() * 1000)
                        if started and finished else None)
-        stuck = (r.status == "running" and started is not None
-                 and (now - started).total_seconds() > STUCK_MINUTES * 60)
+        stuck = _is_stuck(r, now, db)
         if stuck:
             summary["stuck"] += 1
         elif r.status in summary:
@@ -815,6 +1068,11 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
             note = json.loads(r.note) if r.note else {}
         except (ValueError, TypeError):
             note = {"raw": r.note}
+        claim_owner = note.get("claim_owner")
+        claim_expired = (_claim_expired(r, now)
+                         if r.status == "running" and claim_owner else False)
+        owner_alive = (_worker_alive(claim_owner, db)
+                       if claim_owner else None)
         if note.get("empty"):
             summary["empty"] += 1
         if note.get("error_kind") == "queue_overflow":
@@ -838,16 +1096,27 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
             "max_attempts": note.get("max_attempts"),
             "abandoned": bool(note.get("abandoned")),
             "queue_overflow": note.get("queue_overflow"),
-            # 多进程认领：谁领的、租约到什么时候
-            "claim_owner": note.get("claim_owner"),
+            # 多进程认领：谁领的、租约到什么时候、认领者是否还活着
+            "claim_owner": claim_owner,
             "claim_until": note.get("claim_until"),
-            "claimed_by_me": note.get("claim_owner") == WORKER_ID,
+            "claim_expired": claim_expired,
+            "owner_alive": owner_alive,
+            "claimed_by_me": claim_owner == WORKER_ID,
             "started_at": started.isoformat() if started else None,
         })
     return {
         "worker_id": WORKER_ID,
         "worker_alive": worker_alive(),
         "pending": _queue.pending_count(project_id),
+        # 周期扫描可观测性：worker_alive=true 只代表线程活着，
+        # last_sweep_seconds_ago 才会随每个扫描周期增长/归零，是「扫描在跑」的直接证据
+        "sweep_interval_seconds": _sweep_interval(),
+        "last_sweep_seconds_ago": (
+            round(time.monotonic() - _last_sweep_at, 1)
+            if _last_sweep_at is not None else None
+        ),
+        # 入队→认领链路自检：ticks 是否在涨、last error 是什么
+        "discover": dict(_discover_stat),
         "summary": summary,
         "recent_runs": items,
     }
@@ -862,14 +1131,63 @@ def _aware(dt):
     return dt
 
 
-def _is_stuck(row: AgentRun, now=None) -> bool:
-    """running 且 started_at 超过 STUCK_MINUTES = 进程残留/真卡死。"""
+def _claim_expired(row: AgentRun, now) -> bool:
+    """认领租约是否已过期（无租约字段按过期处理）。"""
+    until = _note_dict(row).get("claim_until")
+    if not until:
+        return True
+    try:
+        at = datetime.fromisoformat(until)
+    except (ValueError, TypeError):
+        return True
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at < now
+
+
+def _owner_same_host(owner: str) -> bool:
+    """认领者是否在本机（worker_id 形如 ``host#pid#nonce``）。"""
+    return bool(owner) and owner.partition("#")[0] == socket.gethostname()
+
+
+def _claim_orphaned(row: AgentRun, now, db: Session | None = None) -> bool:
+    """认领者已死、行已不归任何活进程：等同于 stuck。
+
+    两个判据：
+    - **同机 owner PID 已消失**：立即算孤儿，不等租约。同机 PID 判活是精确的，
+      而租约只是「防止抢正在跑的长批」的保守兜底；owner 进程都没了，再等租约
+      只是白等（实测每章白等 15 分钟）。租约维持 15 分钟不动——它仍是跨机 /
+      拿不到 PID 信息时的唯一判据。
+    - **租约过期且认领者不活**（含跨机心跳过期）：兜底判据。
+    无认领信息的老行不在这里判（交给年龄判据），避免把旧版本在飞的行抢重。
+    """
+    owner = _note_dict(row).get("claim_owner")
+    if not owner:
+        return False
+    same_host = _owner_same_host(owner)
+    if same_host and not _worker_alive(owner, db):
+        return True
+    if not _claim_expired(row, now):
+        return False
+    return not _worker_alive(owner, db)
+
+
+def _is_stuck(row: AgentRun, now=None, db: Session | None = None) -> bool:
+    """running 且满足任一：年龄超 ``STUCK_MINUTES`` / 认领者已不可用。
+
+    后者覆盖「进程被杀但行没跑满 30 分钟」：同机 owner PID 已消失即刻算孤儿，
+    跨机则等租约过期 + 心跳过期，不能等年龄判据。
+    """
     from datetime import datetime, timezone
 
     now = now or datetime.now(timezone.utc)
+    if row.status != "running":
+        return False
     started = _aware(row.started_at)
-    return (row.status == "running" and started is not None
-            and (now - started).total_seconds() > STUCK_MINUTES * 60)
+    if (started is not None
+            and (now - started).total_seconds() > STUCK_MINUTES * 60):
+        return True
+    return _claim_orphaned(row, now, db)
 
 
 def _note_dict(row: AgentRun) -> dict:
@@ -878,6 +1196,67 @@ def _note_dict(row: AgentRun) -> dict:
     except (ValueError, TypeError):
         value = {}
     return value if isinstance(value, dict) else {}
+
+
+def _chapter_of(gen: Generation | None) -> int | None:
+    """从 generation.chapter_range 的章节标签派生故事章号（``第12章`` → 12）。
+
+    章号一律按标签派生：同一章重写会产生新的段号（实测「第1章」有 5 个段），
+    拿段号当章号会把同一章写成 5 个不同章。解析不出返回 None，调用方按
+    ``_segment_chapter_map`` 回退到写作顺序上最近的有标签章（**不拿段号顶章号**）。
+    """
+    if gen is None:
+        return None
+    return _chapter_of_label(getattr(gen, "chapter_range", None) or "")
+
+
+def _chapter_of_label(label: str) -> int | None:
+    """``第12章`` → 12；解析不出返回 None。"""
+    if not label:
+        return None
+    try:
+        from app.coherence import chapter_index
+
+        return chapter_index(label)
+    except Exception:  # noqa: BLE001 —— 标签解析失败只影响章号，不阻断重捞
+        return None
+
+
+def _nearest_labeled_chapter(seg_no: int,
+                             labeled: list[tuple[int, int]]) -> int | None:
+    """段号没有章节标签时，取写作顺序上最近的**有标签章**（先前再后）。
+
+    旧稿（``段1``/``段2``…）是开篇的碎片：它前面的章不存在时归到后面最早的
+    一章（即第 1 章）。只解决「归属哪一章」，不授予当前资格。
+    """
+    prev: int | None = None
+    for seg, ch in labeled:
+        if seg < seg_no:
+            prev = ch
+        elif seg > seg_no:
+            return prev if prev is not None else ch
+    return prev
+
+
+def _segment_chapter_map(db: Session, project_id: int) -> dict[int, int | None]:
+    """段号 → 章号：标签派生优先，派生不出才按写作顺序回退到最近的有标签章。
+
+    不能拿段号顶章号：段号是篇幅序号，章号是故事章。直接顶用会与真正的同号章
+    碰撞（旧段 1 撞上新写的第 1 章），产物被写成别人的旧版本、``is_current=0``，
+    等于白抽；回退只决定归属，不改变当前资格（旧稿仍是非当前版本）。
+    """
+    rows = db.execute(
+        select(Generation.segment_no, Generation.chapter_range)
+        .where(Generation.project_id == project_id)
+        .order_by(Generation.segment_no, Generation.id)
+    ).all()
+    labeled = [(seg, ch) for seg, label in rows
+               if (ch := _chapter_of_label(label or "")) is not None]
+    out: dict[int, int | None] = {}
+    for seg, label in rows:
+        ch = _chapter_of_label(label or "")
+        out[seg] = ch if ch is not None else _nearest_labeled_chapter(seg, labeled)
+    return out
 
 
 def _requeue_row(db: Session, row: AgentRun, *, reason: str) -> tuple[str, int | None]:
@@ -907,7 +1286,13 @@ def _requeue_row(db: Session, row: AgentRun, *, reason: str) -> tuple[str, int |
     now = datetime.now(timezone.utc)
     dropped = _queue.put(_QueueItem(
         project_id=row.project_id, segment_no=seg_no,
-        text=gen.text, chapter=note.get("chapter"), run_id=row.id))
+        # 章号以章节标签为准（重捞时按最新正文重算）；标签解析不出才回退到
+        # 写作顺序上最近的有标签章（不拿段号顶章号）
+        text=gen.text,
+        chapter=(_chapter_of(gen)
+                 or _segment_chapter_map(db, row.project_id).get(seg_no)),
+        run_id=row.id,
+        rebuild=bool(note.get("rebuild"))))
     if any(it.run_id == row.id for it in dropped):
         # 重捞的动作本身把队列挤爆了：这一段没入队，必须标 failed 留痕，
         # 而不是重置成 running 假装它在跑。
@@ -925,8 +1310,11 @@ def _requeue_row(db: Session, row: AgentRun, *, reason: str) -> tuple[str, int |
     _merge_note(row, {
         "requeued_at": now.isoformat(),
         "requeue_reason": reason,
-        # 重捞重置重试计数；上一次的错误留档（last_error），别让「曾经失败过」消失
+        # 重捞重置重试计数；上一次的错误留档（last_error），别让「曾经失败过」消失。
+        # error_kind 同步清空：它是「这次失败的分类」，重捞后还挂着会让
+        # success 行看起来像失败（status 才是终态）。
         "error": None,
+        "error_kind": None,
         "last_error": note.get("error"),
         "attempts": 0,
         "abandoned": False,
@@ -985,13 +1373,17 @@ def requeue_failed(db: Session, project_id: int, run_ids: list[int]) -> dict:
 
 
 def recover_running(db: Session, project_id: int | None = None, *,
-                    stuck_only: bool = False) -> dict:
+                    stuck_only: bool = False,
+                    skip_segments: set[int] | None = None) -> dict:
     """把库里停在 running 的批抽行重新入队（启动恢复 / 手动超时重捞）。
 
     - ``stuck_only=False``（启动时用）：**所有** running 行都重入队。启动那一刻
       本进程的内存队列一定是空的，所以「running 行」等价于「上一进程留下的、
       永远没人处理的段」——不需要等它超时（30 分钟）才恢复。
-    - ``stuck_only=True``（手动 API）：只重捞超过 STUCK_MINUTES 的 running 行。
+    - ``stuck_only=True``（手动 API / worker 周期扫描）：只重捞超过
+      STUCK_MINUTES 的 running 行。
+    - ``skip_segments``（周期扫描用）：这些段已在本进程内存队列里排着，
+      跳过它们，避免同一段被排两次、白跑一次 LLM。
 
     同一段存在多条 running 行时只重入队一次，其余标 failed（duplicate 留痕），
     避免同一段被重复抽取。
@@ -1028,10 +1420,14 @@ def recover_running(db: Session, project_id: int | None = None, *,
     segments: list[dict] = []
     seen: set[tuple[int, int | None]] = set()
     for row in rows:
-        if stuck_only and not _is_stuck(row, now):
+        if stuck_only and not _is_stuck(row, now, db):
             skipped.append({"run_id": row.id, "reason": "not_stuck"})
             continue
         note = _note_dict(row)
+        if skip_segments and note.get("segment_no") in skip_segments:
+            # 本进程内存队列里已经排着这一段：再入队只会白跑一次 LLM。
+            skipped.append({"run_id": row.id, "reason": "already_queued"})
+            continue
         key = (row.project_id, note.get("segment_no"))
         if key in seen:
             row.status = "failed"
@@ -1100,6 +1496,7 @@ def backfill_project(db: Session, project_id: int) -> dict:
 
     enqueued: list[dict] = []
     skipped: list[dict] = []
+    resolved_ch = _segment_chapter_map(db, project_id)
     for seg_no, gen in sorted(by_seg.items()):
         h = hashlib.sha256(f"{project_id}:{seg_no}".encode("utf-8")).hexdigest()
         existing = db.scalar(select(AgentRun).where(
@@ -1118,7 +1515,10 @@ def backfill_project(db: Session, project_id: int) -> dict:
                          project_id, seg_no)
             continue
         try:
-            rid = enqueue_segment(db, project_id, seg_no, gen.text, chapter=seg_no)
+            # 章号按章节标签派生；解析不出才回退最近的有标签章（不拿段号顶章号）
+            rid = enqueue_segment(db, project_id, seg_no, gen.text,
+                                  chapter=(_chapter_of(gen)
+                                           or resolved_ch.get(seg_no)))
         except KgEnqueueError as exc:
             skipped.append({"segment_no": seg_no,
                             "reason": f"enqueue_failed:{str(exc)[:120]}"})
@@ -1139,6 +1539,65 @@ def backfill_project(db: Session, project_id: int) -> dict:
         f"（跳过原因：{skipped}）" if skipped else "",
     )
     return report
+
+
+def rebuild_chapter(db: Session, project_id: int, chapter: int) -> dict:
+    """显式「按章重建」v3 KG（修数据入口，走版本化，不删行）。
+
+    与普通生成的差别只有一点：``rebuild=True`` 入队——批抽落库时把**同章所有
+    旧版本**（含本段自身旧稿）的 events/states/relations/mentions 置
+    ``is_current=0``，新结果作为当前版本写入。旧行留在库里可回溯，读侧只认
+    当前版本（检索/切片/状态渲染/时间线均已按 is_current 过滤）。
+
+    章号一律从 ``generation.chapter_range`` 的标签派生（``_chapter_of``），
+    解析不出标签的段不参与——不猜、不按段号冒充章号。同章多稿取**段号最大**
+    的一稿（同章重写产生更大的段号）。
+
+    同段若还有未完成的 running 行，先标 failed(error=superseded_by_rebuild)
+    留痕：``_rows_for`` 按 request_hash 只认一行，不清理会让新旧行互相抢。
+
+    返回 ``{project_id, chapter, segment_no, run_id, superseded_runs}``；
+    找不到该章正文时 ``run_id=None`` 且带 ``reason``。
+    """
+    now = datetime.now(timezone.utc)
+    gens = db.scalars(
+        select(Generation)
+        .where(Generation.project_id == project_id)
+        .order_by(Generation.segment_no, Generation.id)
+    ).all()
+    matched = [g for g in gens
+               if (g.text or "").strip() and _chapter_of(g) == chapter]
+    if not matched:
+        _log.warning("kg 按章重建：项目 %s 第 %s 章没有可用的正文（标签派生不到）",
+                     project_id, chapter)
+        return {"project_id": project_id, "chapter": chapter, "segment_no": None,
+                "run_id": None, "superseded_runs": [],
+                "reason": "chapter_text_missing"}
+    latest = matched[-1]
+    seg_no = latest.segment_no
+
+    superseded: list[int] = []
+    for row in db.scalars(select(AgentRun).where(
+        AgentRun.project_id == project_id,
+        AgentRun.role == ROLE_KG_EXTRACT,
+        AgentRun.status == "running",
+    )).all():
+        if _note_dict(row).get("segment_no") != seg_no:
+            continue
+        row.status = "failed"
+        row.finished_at = now
+        _merge_note(row, {"error": "superseded_by_rebuild",
+                          "abandoned": True, "superseded_at": now.isoformat()})
+        superseded.append(row.id)
+    if superseded:
+        db.commit()
+
+    rid = enqueue_segment(db, project_id, seg_no, latest.text,
+                          chapter=chapter, rebuild=True)
+    _log.info("kg 按章重建：项目 %s 第 %s 章 → 段 %s（run %s），作废旧 running 行 %s",
+              project_id, chapter, seg_no, rid, superseded or "无")
+    return {"project_id": project_id, "chapter": chapter, "segment_no": seg_no,
+            "run_id": rid, "superseded_runs": superseded}
 
 
 def _get_provider():
@@ -1432,6 +1891,227 @@ def text_gate_no_generation_summary(db: Session,
     }
 
 
+def _chapter_generation_map(db: Session, project_id: int
+                            ) -> tuple[dict[int, int], dict[int, set[int]], dict[int, set[int]]]:
+    """项目内「章号 → 最新 generation id」「章号 → 全部 generation id」
+    「章号 → 全部段号」。
+
+    章号从 ``generation.chapter_range`` 的标签派生（``_chapter_of``）；派生不出的
+    旧段按写作顺序回退到最近的有标签章（``_segment_chapter_map``），**不再拿段号
+    顶章号**。同一章可能有多行（重写会新增段），**最新一行才是当前版本**，用于
+    判定本次入库的产物是否应写成 current。
+    """
+    newest: dict[int, int] = {}
+    all_ids: dict[int, set[int]] = {}
+    segs: dict[int, set[int]] = {}
+    rows = db.execute(
+        select(Generation.id, Generation.segment_no, Generation.chapter_range)
+        .where(Generation.project_id == project_id)
+    ).all()
+    resolved = _segment_chapter_map(db, project_id)
+    for gid, seg_no, _label in rows:
+        ch = resolved.get(seg_no)
+        if ch is None:
+            continue
+        all_ids.setdefault(ch, set()).add(gid)
+        segs.setdefault(ch, set()).add(seg_no)
+        newest[ch] = max(newest.get(ch, 0), gid)
+    return newest, all_ids, segs
+
+
+def _max_version(db: Session, model, project_id: int, chapter: int | None) -> int:
+    """该项目该章已有的最大版本号（无行 = 0）。"""
+    if chapter is None:
+        return 0
+    return int(db.scalar(
+        select(func.max(model.version)).where(
+            model.project_id == project_id, model.chapter == chapter)
+    ) or 0)
+
+
+def _state_segment(state: dict, batch: list[_QueueItem]) -> int | None:
+    """给 LLM 的 state_changes 找它所属的段（不改抽取口径，只做证据归属）。
+
+    旧实现一律记 ``batch[0].segment_no``：一次抽 5 段时后 4 段的状态全挂到首段。
+    这里按「new_value 原文命中 → 角色名命中」在批内定位；唯一命中才认，
+    多处命中/零命中退回批首段（保持旧行为，不猜）。
+    """
+    if not batch:
+        return None
+    if len(batch) == 1:
+        return batch[0].segment_no
+    raw = (state.get("new_value") or "").strip().strip("“”\"'「」『』（）() 。，,")
+    probes = [p for p in (raw[:24], raw) if p]
+    for probe in probes:
+        hits = [it.segment_no for it in batch if probe in (it.text or "")]
+        if len(hits) == 1:
+            return hits[0]
+    name = (state.get("character") or "").strip()
+    if name:
+        hits = [it.segment_no for it in batch if name in (it.text or "")]
+        if len(hits) == 1:
+            return hits[0]
+    return batch[0].segment_no
+
+
+def _supersede_previous_versions(
+    db: Session, project_id: int, batch: list[_QueueItem],
+    *, book: int | None, seg_to_gen: dict[int, int | None],
+    blocked: dict[int, str] | None = None,
+) -> tuple[dict[int, int], dict[int, tuple[bool, int]]]:
+    """把同章旧版本置 ``is_current=0``，并给出本章新版本号。
+
+    口径（2026-11-14 裁决）：**不物理删行**，旧事件/提及/关系/状态留在库里，
+    只标非当前；切片/检索/状态渲染只认 current。
+
+    - 「当前版本」= 同章 generation id 最大的那一行；显式 ``rebuild`` 的批也按
+      当前版本写（重建入口只对最新 generation 调用）。
+    - 普通新章入库只把**同章其它段**的旧版本置非当前；显式 rebuild 连本段自身
+      的旧产物一起置非当前（原地重写同一段的情况）。
+    - 作用域按 prompt 书白名单收窄，避免把参考书语料在同一章号上的行误标非当前。
+
+    返回：
+    - ``{章号: 新版本号}``（无 generation 可绑定的段不在此表，调用方按 1 写）
+    - ``{段号: (是否当前版本, 版本号)}``（落库逐段用）
+    """
+    resolved_ch = _segment_chapter_map(db, project_id)
+    ch_of_seg = {
+        it.segment_no: (it.chapter if it.chapter is not None
+                        else resolved_ch.get(it.segment_no))
+        for it in batch
+    }
+    gen_of_seg = {seg: gid for seg, gid in seg_to_gen.items() if gid is not None}
+    newest, all_ids, segs_by_ch = _chapter_generation_map(db, project_id)
+    rebuild = any(it.rebuild for it in batch)
+    # 被正文门拦下的段不参与「置非当前」：本轮产物先进隔离区、不落业务表，
+    # 若照样把旧版本标非当前，这一章会变成「一条当前行都没有」——读侧直接空窗。
+    blocked = blocked or {}
+    # 「本章没有任何 generation」的段按当前写：generation 行不带章号标签时
+    # `_chapter_generation_map` 的 newest 表里查不到本章，此时「谁更新」无据可判，
+    # 若一律标非当前，导入/手写正文的提及会被 `_refresh_mention_counts` 全量排除
+    # （mention_count 恒 0），读侧空窗。本章有带章号的 generation 时口径不变：
+    # 只有绑到本章最新 generation 的段才是当前。
+    current_chs = {
+        ch for seg, ch in ch_of_seg.items()
+        if ch is not None and seg not in blocked
+        and (rebuild or newest.get(ch) is None
+             or gen_of_seg.get(seg) == newest.get(ch))
+    }
+    version_by_ch: dict[int, int] = {}
+    for ch in set(ch_of_seg.values()):
+        if ch is None:
+            continue
+        ev_v = _max_version(db, KgEvent, project_id, ch)
+        st_v = _max_version(db, KgCharacterState, project_id, ch)
+        version_by_ch[ch] = max(ev_v, st_v) + 1
+
+    # 整个项目一个章号标签都没有（导入/手写正文按「段N」切）：没有任何「谁更新」
+    # 可比，一律按当前写。否则 current_chs 为空会把全项目 KG 写成非当前，
+    # `_refresh_mention_counts` 只数 current → mention_count 恒 0，切片/检索/
+    # 状态渲染永远空窗（项目 1、5 就是这种形态；旧数据是靠旧代码写的才读得到）。
+    no_label_at_all = bool(ch_of_seg) and all(
+        ch is None for ch in ch_of_seg.values())
+    if not current_chs:
+        return version_by_ch, {
+            seg: (bool(no_label_at_all and seg not in blocked), 1)
+            for seg in ch_of_seg
+        }
+
+    scope = scope_sql_values((book, None) if book is not None else (None,))
+    in_scope_ent = select(KgEntity.id).where(
+        KgEntity.project_id == project_id,
+        func.coalesce(KgEntity.novel_id, -1).in_(scope),
+    )
+    # 事件：同章全部 current → 非当前（重抽命中会在下面翻回来）
+    db.execute(
+        update(KgEvent).where(
+            KgEvent.project_id == project_id,
+            KgEvent.chapter.in_(current_chs),
+            KgEvent.is_current.is_(True),
+            func.coalesce(KgEvent.novel_id, -1).in_(scope),
+        ).values(is_current=False)
+    )
+    # 角色状态：同章、角色在白名单内
+    db.execute(
+        update(KgCharacterState).where(
+            KgCharacterState.project_id == project_id,
+            KgCharacterState.chapter.in_(current_chs),
+            KgCharacterState.is_current.is_(True),
+            KgCharacterState.character_id.in_(in_scope_ent),
+        ).values(is_current=False)
+    )
+    # 关系：同章起始、两端都在白名单内（端点收窄避免误伤参考书语料的同章关系）
+    db.execute(
+        update(KgRelation).where(
+            KgRelation.project_id == project_id,
+            KgRelation.since_chapter.in_(current_chs),
+            KgRelation.is_current.is_(True),
+            KgRelation.from_id.in_(in_scope_ent),
+            KgRelation.to_id.in_(in_scope_ent),
+        ).values(is_current=False)
+    )
+    # 提及：同章其它 generation 的提及 → 非当前；rebuild 时连本段自己的一起
+    other_gens: set[int] = set()
+    for ch in current_chs:
+        other_gens |= all_ids.get(ch, set())
+    if not rebuild:
+        other_gens -= set(gen_of_seg.values())
+    if other_gens:
+        db.execute(
+            update(KgMention).where(
+                KgMention.project_id == project_id,
+                KgMention.generation_id.in_(other_gens),
+                KgMention.is_current.is_(True),
+            ).values(is_current=False)
+        )
+    # 提及：版本化之前的老行没有 generation 归属（generation_id 为空），上面那条
+    # 永远命中不到它们，旧稿 mentions 会一直留在 current。按「章覆盖的段号」收窄，
+    # 一起置非当前——只看段号，不碰其它章。
+    # 书维度必须一起收窄：参考书语料的提及也是 generation_id 为空，段号与本书
+    # 章节撞车（参考书按 1/4/7… 切段，本书按 1..N 连续），只按段号会把参考书的
+    # 当前提及误标非当前（实测 9 个撞车段 169 行）。
+    ch_segs: set[int] = set()
+    for ch in current_chs:
+        ch_segs |= segs_by_ch.get(ch, set())
+    if ch_segs:
+        db.execute(
+            update(KgMention).where(
+                KgMention.project_id == project_id,
+                KgMention.generation_id.is_(None),
+                KgMention.segment_no.in_(ch_segs),
+                KgMention.is_current.is_(True),
+                func.coalesce(KgMention.novel_id, -1).in_(scope),
+            ).values(is_current=False)
+        )
+
+    seg_ctx = {
+        seg: (ch in current_chs, version_by_ch.get(ch, 1))
+        for seg, ch in ch_of_seg.items()
+    }
+    return version_by_ch, seg_ctx
+
+
+def _relation_chapter(forms_a: tuple[str, ...], forms_b: tuple[str, ...],
+                      seg_items: list[tuple[int, int | None, str]],
+                      fallback: int | None) -> int | None:
+    """关系章归属：优先「两端实体名同段共现」的唯一章，否则退回 fallback。
+
+    关系没有段号，旧实现一律取批内最小章，批内后几章的关系会被最早章吸附
+    （实测 ch19/ch20 并批时 ch20 的 7 条边全记到 ch19）。这里用批内各段正文
+    判归属：
+    - 恰好一段同时出现两端名字 → 该段所在章（多段同章也算唯一章）
+    - 零命中（模型给的关系在原文里没有直呼其名）/ 多段跨章命中（分不清在哪
+      一章成立）→ 退回批内最小章，保守，与 corpus_ingest 的 chapters[0] 同口径
+    """
+    hits: set[int] = set()
+    for _seg, ch, txt in seg_items:
+        if ch is None or not txt:
+            continue
+        if any(f in txt for f in forms_a) and any(f in txt for f in forms_b):
+            hits.add(ch)
+    return next(iter(hits)) if len(hits) == 1 else fallback
+
+
 def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[_QueueItem],
                         *, mention_guards: frozenset[str] | None = None,
                         book: int | None = None):
@@ -1448,7 +2128,12 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
     # 称呼层归一（cleaned 源生效时才动手）：许郎/许公子/魏公/许二叔 等写法折到
     # 实体规范名，原文词进 aliases；关系两端同步归一，避免同一人被拆成两个节点。
     # legacy 源下 normalize 是恒等函数，行为不变。
-    canon_source.normalize_extraction(result)
+    # 派生 item 名单按项目设定传（plot_bible.derived_item_names）；没配就不丢。
+    _proj = db.get(Project, project_id)
+    canon_source.normalize_extraction(
+        result,
+        derived_item_names=canon_source.derived_item_names_from_project(_proj),
+    )
     # 归一里丢掉的派生 item 实体（地书碎片/地书聊天群等）：计数带进批 stats，
     # 否则「为什么没建这个实体」在库里没有线索。
     if result.get("derived_items_dropped"):
@@ -1473,6 +2158,25 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         item.segment_no in blocked for item in batch)
     gate_run_id = _run_id_of(batch)
 
+    # —— 章节版本化（2026-11-14 裁决：不删行，只置非当前）——
+    # 章号按 generation 的章节标签派生；派生不出的旧段回退到最近的有标签章
+    # （不拿段号顶章号）。同章最新段才是当前版本。
+    # 这里先落「旧版本 → is_current=0」，后面的 upsert 命中会把同名行翻回来，
+    # 从而保证：新稿是新版本、旧稿保留可回溯、提示词里不会新旧混出。
+    resolved_ch = _segment_chapter_map(db, project_id)
+    ch_of_seg = {
+        it.segment_no: (it.chapter if it.chapter is not None
+                        else resolved_ch.get(it.segment_no))
+        for it in batch
+    }
+    version_by_ch, seg_ctx = _supersede_previous_versions(
+        db, project_id, batch, book=book, seg_to_gen=seg_to_gen, blocked=blocked)
+
+    def _ver_ctx(seg: int | None) -> tuple[bool, int, int | None]:
+        ch = ch_of_seg.get(seg) if seg is not None else None
+        is_cur, ver = seg_ctx.get(seg, (False, 1)) if seg is not None else (False, 1)
+        return is_cur, ver, ch
+
     def _ent(name: str) -> int | None:
         """本批实体优先；跨批反查只认同书或通配（绝不串到另一本书的实体）。"""
         return name_to_id.get(name) or _lookup_entity_id(
@@ -1495,6 +2199,33 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             stats.entities_upserted += 1
 
     # —— 2. relations upsert（两端名字解析为 id，缺失跳过）——
+    # 关系模型里没有段号，只有「从哪章开始」；不写 since_chapter 会导致两个后果：
+    # 按章统计关系永远是 0（全被算成 NULL），同章重写时 supersede 也定位不到
+    # 这些边（条件是 since_chapter in 当前章）。
+    # 章归属优先「两端实体名同段共现」的段（见 _relation_chapter）；零命中或
+    # 跨章多命中才退回批内最小章（保守，与 corpus_ingest 的 chapters[0] 同口径）。
+    _rel_chs = [ch for ch in ch_of_seg.values() if ch is not None]
+    rel_chapter = min(_rel_chs) if _rel_chs else None
+    seg_items = [(it.segment_no, ch_of_seg.get(it.segment_no), it.text or "")
+                 for it in batch]
+    batch_chapters = set(_rel_chs)
+    _forms_cache: dict[int, tuple[str, ...]] = {}
+
+    def _rel_forms(eid: int, name: str) -> tuple[str, ...]:
+        """关系的名字形态（本批名 + 规范名 + 别名），用于段内共现判定。"""
+        forms = _forms_cache.get(eid)
+        if forms is None:
+            ent = db.get(KgEntity, eid)
+            cand = [name, getattr(ent, "canonical_name", None)]
+            cand += list(getattr(ent, "aliases", None) or [])
+            forms = tuple(dict.fromkeys(
+                c for c in cand if isinstance(c, str) and len(c) >= 2))
+            _forms_cache[eid] = forms
+        return forms
+
+    # 关系演化行延后到事件落库后再写：evolution 要尽量挂到「本批哪件事」上，
+    # 而事件在关系之后才建（见步骤 3），这里只登记待写项。
+    rel_evo_pending: list[tuple[KgRelation, float | None, float, str]] = []
     # 集合端点门（与 v2.6 同一条判定逻辑）：成员/归属类边挂在集合/上位节点、
     # 且窗口里没有任何具体人名 → 落 status='candidate'，不删边。
     # 窗口取本批文本里同时提到两端的那一句；人名表用词表人物 + 本批抽到的人物。
@@ -1502,6 +2233,11 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
     batch_text = "\n".join(item.text or "" for item in batch)
     kind_by_name = {e.get("canonical_name"): e.get("kind")
                     for e in result.get("entities", []) if e.get("canonical_name")}
+    # 关系边受 uq（实体对+类型）约束只能原地升版：本批若含当前版本章，
+    # 重断言的边翻回 current 并升版；若整批都是被替换掉的旧稿，则新边写成非当前。
+    _cur_vers = [v for ok, v in seg_ctx.values() if ok]
+    rel_is_current = bool(_cur_vers)
+    rel_version = max(_cur_vers) if _cur_vers else 1
     for r in result.get("relations", []):
         if blocked:
             # 关系没有段号，无法逐段证明归属；本批只要有一段正文不一致，
@@ -1527,6 +2263,11 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             or _endpoint_kind(db, r["to"], b_id, kind_by_name) == "item"
         )
         status = "candidate" if (gate_reason or item_endpoint) else "active"
+        # 本批证据判定的章：唯一共现章优先，否则批内最小章
+        rel_hit = _relation_chapter(
+            _rel_forms(a_id, r["from"]), _rel_forms(b_id, r["to"]),
+            seg_items, None)
+        rel_ch = rel_hit if rel_hit is not None else rel_chapter
         rel = db.scalar(
             select(KgRelation).where(
                 KgRelation.project_id == project_id,
@@ -1537,23 +2278,35 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         if rel is None:
             rel = KgRelation(project_id=project_id, from_id=a_id, to_id=b_id,
                              rel_type=r["rel_type"], strength=r.get("strength", 0.5),
-                             status=status,
-                             description="item_endpoint" if item_endpoint else None)
+                             status=status, since_chapter=rel_ch,
+                             description="item_endpoint" if item_endpoint else None,
+                             is_current=rel_is_current, version=rel_version)
             db.add(rel)
+            rel_evo_pending.append((rel, None, rel.strength or 0.5, "批抽建立"))
             stats.relations_upserted += 1
         else:
+            # 老行（早期批抽产物）没有 since_chapter：补上，否则永远按章查不到。
+            cur_ch = rel.since_chapter
+            if rel_ch is not None and (cur_ch is None or rel_ch < cur_ch):
+                rel.since_chapter = rel_ch
+            elif (rel_hit is not None and cur_ch is not None
+                  and cur_ch != rel_hit and cur_ch in batch_chapters):
+                # 同批内改判：证据只在另一章出现 → 把边还给它自己的章。
+                # 旧逻辑只降不升（rel_chapter < since_chapter 才写），批内被
+                # 最早章 min() 吸附后，后几章重抽也永远拿不回来。
+                rel.since_chapter = rel_hit
+            if rel_is_current and not rel.is_current:
+                # 同章重写后边被重新断言 → 翻回当前版本（行不删，历史在 evolution）
+                rel.is_current = True
+                rel.version = max(int(rel.version or 1), rel_version)
             if rel.status != "active" and status == "active":
                 # 只升不降：同一对实体在别的章里有明确人名支撑时转正；
                 # 单章上下文弱不足以把已有正式边降级。
                 rel.status = "active"
             if abs((rel.strength or 0.5) - r.get("strength", 0.5)) > 0.01:
                 # strength 变化 → 追加 evolution 行（记过程不记快照）
-                from app.models import KgRelationEvolution
-
-                db.add(KgRelationEvolution(
-                    project_id=project_id, edge_id=rel.id,
-                    strength=r.get("strength", 0.5), note="批抽更新",
-                ))
+                rel_evo_pending.append(
+                    (rel, rel.strength, r.get("strength", 0.5), "批抽更新"))
                 rel.strength = r.get("strength", 0.5)
 
     # —— 3. events 追加（sequence 项目内连续）——
@@ -1607,7 +2360,15 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             KgEvent.summary == summary,
         ))
         llm_seq = ev.get("sequence")
+        ev_cur, ev_ver, ev_ch = _ver_ctx(ev_seg)
+        # 章号一律用权威值（章节标签派生），模型自己从正文里猜的章号只作回退：
+        # 实测同一段会同时出现 chapter=1 与 chapter=N 两种，按章读会漏/串。
+        if ev_ch is None:
+            ev_ch = ev.get("chapter")
         if dup_id is not None:
+            # 重抽命中同一条：翻回当前版本（版本号对齐本章），不再追加行
+            db.execute(update(KgEvent).where(KgEvent.id == dup_id).values(
+                chapter=ev_ch, is_current=ev_cur, version=ev_ver))
             stats.events_skipped += 1
             if llm_seq is not None:
                 seq_map[llm_seq] = dup_id
@@ -1616,7 +2377,7 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             project_id=project_id,
             novel_id=book,
             sequence=next_seq,
-            chapter=ev.get("chapter"),
+            chapter=ev_ch,
             segment_no=ev_seg,
             event_type=event_type,
             summary=summary,
@@ -1625,6 +2386,8 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             object_id=object_id,
             location_id=location_id,
             in_story_date=(ev.get("in_story_date") or "")[:64],
+            is_current=ev_cur,
+            version=ev_ver,
         )
         next_seq += 1
         db.add(event)
@@ -1724,10 +2487,30 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         char_id = _ent(s.get("character") or "")
         if char_id is None:
             continue
+        # 状态归属到**证据所在段**（旧实现一律 batch[0]：一次抽 5 段时后 4 段
+        # 的状态全挂首段），章号跟着该段的权威章号走，不再写 chapter=None。
+        st_seg = _state_segment(s, batch)
+        st_cur, st_ver, st_ch = _ver_ctx(st_seg)
+        st_type = s.get("state_type", "mood")
+        st_val = (s.get("new_value") or "")[:500]
+        dup_st = db.scalar(select(KgCharacterState.id).where(
+            KgCharacterState.project_id == project_id,
+            KgCharacterState.character_id == char_id,
+            KgCharacterState.chapter == st_ch,
+            KgCharacterState.state_type == st_type,
+            KgCharacterState.new_value == st_val,
+        )) if st_ch is not None else None
+        if dup_st is not None:
+            # 同章同状态重抽命中：翻回当前版本，不追加重复行
+            db.execute(update(KgCharacterState).where(
+                KgCharacterState.id == dup_st).values(
+                segment_no=st_seg, is_current=st_cur, version=st_ver))
+            continue
         db.add(KgCharacterState(
             project_id=project_id, character_id=char_id,
-            chapter=None, segment_no=batch[0].segment_no if batch else None,
-            state_type=s.get("state_type", "mood"), new_value=(s.get("new_value") or "")[:500],
+            chapter=st_ch, segment_no=st_seg,
+            state_type=st_type, new_value=st_val,
+            is_current=st_cur, version=st_ver,
         ))
         stats.state_changes += 1
 
@@ -1760,6 +2543,11 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         stats.foreshadows += 1
 
     # —— 6. mentions 反向索引（实体×段，context_window 原文片段）——
+    # 本批内按「唯一键口径」先去重：SessionLocal 是 autoflush=False，上面那条
+    # select 看不到同批尚未 flush 的新增行；同一实体被两个抽取名解析到（或两段
+    # 共用同一 generation）时会插两条同 (project, entity, generation) 的行，
+    # 撞 uq_kg_mention 让整批重试也必失败（run 168 三次全挂在这）。
+    seen_mention: set[tuple[int, int]] = set()
     guards = (mention_guards if mention_guards is not None
               else _item_mention_guards(db, project_id))
     for item in batch:
@@ -1785,13 +2573,33 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
                     gate_stats["quarantined"]["mention"] += 1
                     continue
                 gen_id = seg_to_gen.get(item.segment_no)
-                existing = db.scalar(
-                    select(KgMention).where(
-                        KgMention.project_id == project_id,
-                        KgMention.entity_id == ent_id,
-                        KgMention.segment_no == item.segment_no,
+                # 唯一键是 (project, entity, generation)；generation 为空时 SQLite
+                # 唯一键不生效，退回按段去重。
+                ukey = (ent_id, gen_id if gen_id is not None else -item.segment_no)
+                if ukey in seen_mention:
+                    continue
+                seen_mention.add(ukey)
+                mn_cur, mn_ver, _ = _ver_ctx(item.segment_no)
+                # 查询键必须与唯一键 `(project, entity, generation)` 对齐：按段号查
+                # 时，同一 generation 换段号重入（或并发重抽）查不到已有行，插入
+                # 就会撞 uq（ch19 的 `UNIQUE constraint failed: kg_mentions`）。
+                # generation 为空（无绑定）时唯一键不生效，才退回按段去重。
+                if gen_id is not None:
+                    existing = db.scalar(
+                        select(KgMention).where(
+                            KgMention.project_id == project_id,
+                            KgMention.entity_id == ent_id,
+                            KgMention.generation_id == gen_id,
+                        )
                     )
-                )
+                else:
+                    existing = db.scalar(
+                        select(KgMention).where(
+                            KgMention.project_id == project_id,
+                            KgMention.entity_id == ent_id,
+                            KgMention.segment_no == item.segment_no,
+                        )
+                    )
                 if existing is None:
                     db.add(KgMention(
                         project_id=project_id, entity_id=ent_id, generation_id=gen_id,
@@ -1799,7 +2607,12 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
                         segment_no=item.segment_no,
                         context_window=_window_around(item.text, form),
                         mention_kind=MENTION_KIND_LLM,
+                        is_current=mn_cur, version=mn_ver,
                     ))
+                else:
+                    # 同段重抽命中：翻回当前版本（旧稿版本化保留，不删行）
+                    existing.is_current = mn_cur
+                    existing.version = mn_ver
 
     # 6.5 提及补漏：LLM 没抽到、但库里**已有**实体（尤其 41 条物品）在正文里
     # 出现时同样要落提及。p5 的 8 条提及全指向 character、item 提及 0 条，根因
@@ -1808,12 +2621,178 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
         db, project_id, batch, book=book, guards=guards,
         seg_to_gen=seg_to_gen,
         candidates=_mention_candidates(db, project_id, novel_id=book),
-        blocked=blocked,
+        blocked=blocked, seg_ctx=seg_ctx,
     )
     stats.mentions_alias_added = added_alias
     _refresh_mention_counts(db, project_id, set(name_to_id.values()) | alias_touched)
+    # —— 6.6 事件投影：状态 / 伏笔 / 情报 / 关系演化 ——
+    # 这四张表此前的写入只依赖抽取器原样返回的 state_changes / foreshadows /
+    # entity_knowledge / strength 变化，模型几乎不产出 → 四张表长期 0 行。这里
+    # 从**本批已落库的事件**做机械投影（不新增抽取口径），保证读侧（judge /
+    # retrieval / bible）查得到数据；没有依据的字段留空，不猜。
+    id_to_name = {v: k for k, v in name_to_id.items()}
+    _project_event_facts(
+        db, project_id=project_id, events=created,
+        name_of=lambda eid: (id_to_name.get(eid)
+                             or (_entity_name(db, eid))),
+        rel_evo_pending=rel_evo_pending, stats=stats,
+    )
     db.commit()
     return stats
+
+
+def _entity_name(db: Session, entity_id: int | None) -> str | None:
+    if entity_id is None:
+        return None
+    from app.models import KgEntity
+
+    ent = db.get(KgEntity, entity_id)
+    return ent.canonical_name if ent is not None else None
+
+
+def _project_event_facts(db: Session, *, project_id: int,
+                         events: list[tuple[int | None, "KgEvent"]],
+                         name_of, rel_evo_pending: list, stats) -> None:
+    """把本批事件投影进四张「事件派生表」，只拆列不做新判定。
+
+    - ``kg_character_state``：事件带 location → 主体位置状态；death → alive=false
+    - ``kg_foreshadows``：foreshadow_plant / foreshadow_payoff 事件 → 伏笔状态机
+    - ``kg_entity_knowledge``：revelation 事件 → 主体得知客体
+    - ``kg_relation_evolution``：本批新建/改强度的关系各补一条演化行，章号尽量
+      取自同时涉及两端的事件（事件是关系变化的依据）
+    """
+    from app.models import (
+        KgCharacterState, KgEntityKnowledge, KgForeshadow, KgRelationEvolution,
+    )
+
+    latest: dict[tuple[int, str], str | None] = {}
+
+    def _latest_state(character_id: int, state_type: str) -> str | None:
+        key = (character_id, state_type)
+        if key not in latest:
+            row = db.scalar(
+                select(KgCharacterState).where(
+                    KgCharacterState.project_id == project_id,
+                    KgCharacterState.character_id == character_id,
+                    KgCharacterState.state_type == state_type,
+                    # 只跟「当前版本」比：旧版本的旧值不该挡住本次投影
+                    KgCharacterState.is_current.is_(True),
+                ).order_by(
+                    KgCharacterState.segment_no.desc(),
+                    KgCharacterState.id.desc(),
+                ).limit(1)
+            )
+            latest[key] = row.new_value if row is not None else None
+        return latest[key]
+
+    def _add_state(character_id: int, state_type: str, value: str,
+                   chapter, segment_no, event_id: int,
+                   is_current: bool = True, version: int = 1) -> None:
+        # 同章同值已有（当前或历史）行 → 翻回当前版本，不追加重复行
+        dup = db.scalar(select(KgCharacterState.id).where(
+            KgCharacterState.project_id == project_id,
+            KgCharacterState.character_id == character_id,
+            KgCharacterState.chapter == chapter,
+            KgCharacterState.state_type == state_type,
+            KgCharacterState.new_value == value[:500],
+        )) if chapter is not None else None
+        if dup is not None:
+            db.execute(update(KgCharacterState).where(
+                KgCharacterState.id == dup).values(
+                segment_no=segment_no, cause_event_id=event_id,
+                is_current=is_current, version=version))
+            latest[(character_id, state_type)] = value[:500]
+            return
+        db.add(KgCharacterState(
+            project_id=project_id, character_id=character_id,
+            chapter=chapter, segment_no=segment_no,
+            state_type=state_type, new_value=value[:500],
+            cause_event_id=event_id, is_current=is_current, version=version,
+        ))
+        latest[(character_id, state_type)] = value[:500]
+        stats.state_changes += 1
+
+    for _, ev in events:
+        # 1) 位置 / 死亡（事件自带 subject + location / event_type）
+        if ev.subject_id and ev.location_id:
+            place = name_of(ev.location_id)
+            if place and _latest_state(ev.subject_id, "location") != place:
+                _add_state(ev.subject_id, "location", place,
+                           ev.chapter, ev.segment_no, ev.id,
+                           is_current=bool(ev.is_current), version=int(ev.version or 1))
+        if ev.subject_id and ev.event_type == "death":
+            if _latest_state(ev.subject_id, "alive") != "false":
+                _add_state(ev.subject_id, "alive", "false",
+                           ev.chapter, ev.segment_no, ev.id,
+                           is_current=bool(ev.is_current), version=int(ev.version or 1))
+
+        # 2) 伏笔状态机：摘要即伏笔标签（抽取层没有单独的伏笔名字段）
+        if ev.event_type in ("foreshadow_plant", "foreshadow_payoff"):
+            label = (ev.summary or "").strip()[:200]
+            if not label:
+                continue
+            fs = db.scalar(select(KgForeshadow).where(
+                KgForeshadow.project_id == project_id,
+                KgForeshadow.name == label))
+            if ev.event_type == "foreshadow_plant":
+                if fs is None:
+                    db.add(KgForeshadow(
+                        project_id=project_id, name=label, status="planted",
+                        planted_event_id=ev.id, planted_chapter=ev.chapter,
+                        description=label[:500]))
+                    stats.foreshadows += 1
+                elif fs.planted_event_id is None:
+                    fs.planted_event_id = ev.id
+                    fs.planted_chapter = fs.planted_chapter or ev.chapter
+            else:
+                if fs is None:
+                    db.add(KgForeshadow(
+                        project_id=project_id, name=label, status="paid_off",
+                        payoff_event_id=ev.id,
+                        actual_payoff_chapter=ev.chapter,
+                        description=label[:500]))
+                else:
+                    fs.status = "paid_off"
+                    fs.payoff_event_id = ev.id
+                    fs.actual_payoff_chapter = ev.chapter
+                stats.foreshadows += 1
+
+        # 3) 情报：revelation = 主体得知客体
+        if (ev.event_type == "revelation" and ev.subject_id and ev.object_id
+                and ev.subject_id != ev.object_id):
+            dup = db.scalar(select(KgEntityKnowledge.id).where(
+                KgEntityKnowledge.project_id == project_id,
+                KgEntityKnowledge.entity_id == ev.subject_id,
+                KgEntityKnowledge.known_entity_id == ev.object_id,
+            ))
+            if dup is None:
+                db.add(KgEntityKnowledge(
+                    project_id=project_id, entity_id=ev.subject_id,
+                    known_entity_id=ev.object_id, known_kind="entity",
+                    learned_at_event_id=ev.id,
+                    learned_at_chapter=ev.chapter,
+                ))
+                stats.entity_knowledge_added += 1
+
+    if not rel_evo_pending:
+        return
+    # 4) 关系演化：优先挂「同时涉及两端」的事件，其次用本批首个事件的章号
+    db.flush()  # 新关系此时才有 id
+    pair_events: dict[frozenset[int], "KgEvent"] = {}
+    for _, ev in events:
+        if ev.subject_id and ev.object_id:
+            pair_events.setdefault(
+                frozenset((ev.subject_id, ev.object_id)), ev)
+    first_chapter = events[0][1].chapter if events else None
+    for rel, _old, new_strength, note in rel_evo_pending:
+        if rel.id is None:
+            continue
+        ev = pair_events.get(frozenset((rel.from_id, rel.to_id)))
+        db.add(KgRelationEvolution(
+            project_id=project_id, edge_id=rel.id,
+            chapter=(ev.chapter if ev is not None else first_chapter),
+            strength=new_strength, note=note,
+        ))
 
 
 def _project_holdings(db: Session, project_id: int, result: dict,
@@ -1840,8 +2819,38 @@ def _project_holdings(db: Session, project_id: int, result: dict,
         eid = _lookup_entity_id(db, project_id, name, novel_id=book)
         return eid, _endpoint_kind(db, name, eid, batch_kinds)
 
+    def _event_id(item_name: str, owner_name: str,
+                  segment_no: int | None) -> int | None:
+        """反查「持有者拿到物品」的那条事件 id（transfer_event_id 用）。
+
+        只认主体=持有者、客体=物品的真实事件；同段优先，其次取最新一条。
+        查不到返回 None——不拿别的事件硬凑。
+        """
+        from app.models import KgEvent
+
+        owner_id = _lookup_entity_id(db, project_id, owner_name, novel_id=book)
+        item_id = _lookup_entity_id(db, project_id, item_name, novel_id=book)
+        if owner_id is None or item_id is None:
+            return None
+        cond = [KgEvent.project_id == project_id,
+                KgEvent.subject_id == owner_id,
+                KgEvent.object_id == item_id]
+        if book is not None:
+            cond.append(KgEvent.novel_id.in_((None, book)))
+        if segment_no is not None:
+            hit = db.scalar(
+                select(KgEvent.id).where(*cond,
+                                         KgEvent.segment_no == segment_no)
+                .order_by(KgEvent.sequence.desc()).limit(1))
+            if hit is not None:
+                return hit
+        return db.scalar(
+            select(KgEvent.id).where(*cond)
+            .order_by(KgEvent.sequence.desc()).limit(1))
+
     return project_holdings(project_id=project_id, book=book, result=result,
-                            batch=batch, kind_of=_kind, owner_lookup=_owner)
+                            batch=batch, kind_of=_kind, owner_lookup=_owner,
+                            event_lookup=_event_id)
 
 
 def _mention_candidates(db: Session, project_id: int,
@@ -1849,17 +2858,25 @@ def _mention_candidates(db: Session, project_id: int,
     """库里**已有**实体的 mention 匹配写法：规范名 + aliases（item 与 character）。
 
     降级路径不依赖本批 LLM 结果——这是「抽取失败也还能落 mention」的前提。
-    ``novel_id`` 传了才按书收窄（这本书 + NULL 通配），None = 与加列前一致。
+    书维度**始终收窄**（与读侧 ``prompt_scope_book_ids`` 同口径）：
+    - 有本书 id → 本书实体 + ``novel_id IS NULL`` 通配；
+    - 原创项目（``novel_id=None``）→ 只认 ``novel_id IS NULL`` 的项目级实体。
+
+    不能把 ``None`` 当「不过滤」：原创项目的书值本来就是 NULL，而不是「未知」。
+    早先这里按 None 放开，别名匹配把参考书实体（如 novel_id=7 的人物）配进了
+    本书正文，写出「mention 行 novel_id=NULL、却指向参考书实体」的错配（第 10 章
+    121 条里 103 条如此）；读侧第二道实体门虽然挡住了，但这类行本身就是脏的。
     """
     from sqlalchemy import or_
+    from app.kg.book_scope import prompt_scope_book_ids, scope_sql_values
 
+    scope = scope_sql_values(
+        (novel_id, None) if novel_id is not None else (None,))
     stmt = select(KgEntity.id, KgEntity.canonical_name, KgEntity.aliases).where(
         KgEntity.project_id == project_id,
         KgEntity.kind.in_(MENTION_KINDS),
+        func.coalesce(KgEntity.novel_id, -1).in_(scope),
     )
-    if novel_id is not None:
-        stmt = stmt.where(or_(KgEntity.novel_id.is_(None),
-                              KgEntity.novel_id == novel_id))
     rows = db.execute(stmt).all()
     out: list[tuple[int, list[str]]] = []
     for ent_id, canonical, aliases in rows:
@@ -1888,13 +2905,16 @@ def _first_mentioned_form(text: str, forms: list[str],
 
 def _refresh_mention_counts(db: Session, project_id: int,
                             entity_ids: set[int]) -> None:
-    """按 ``kg_mentions`` 实际行数回写 ``entity.mention_count``（两条写路径共用）。"""
-    from sqlalchemy import func
+    """按 ``kg_mentions`` **当前版本**行数回写 ``entity.mention_count``。
 
+    两条写路径共用；旧版本提及仍留在库里（版本化不删行），计数只看 current，
+    否则重写一章会把提及数灌成 2 倍。
+    """
     for ent_id in entity_ids:
         cnt = db.scalar(
             select(func.count()).select_from(KgMention).where(
-                KgMention.project_id == project_id, KgMention.entity_id == ent_id
+                KgMention.project_id == project_id, KgMention.entity_id == ent_id,
+                KgMention.is_current.is_(True),
             )
         )
         ent = db.get(KgEntity, ent_id)
@@ -1906,7 +2926,9 @@ def _alias_mentions_into(db: Session, project_id: int, batch: list[_QueueItem], 
                          book: int | None, guards: frozenset[str],
                          seg_to_gen: dict[int, int | None],
                          candidates: list[tuple[int, list[str]]],
-                         blocked: dict[int, str] | None = None
+                         blocked: dict[int, str] | None = None,
+                         is_current: bool = True, version: int = 1,
+                         seg_ctx: dict[int, tuple[bool, int]] | None = None,
                          ) -> tuple[int, set[int]]:
     """用「已有实体的规范名 + aliases」给本批各段补 mention（**不 commit**）。
 
@@ -1931,14 +2953,26 @@ def _alias_mentions_into(db: Session, project_id: int, batch: list[_QueueItem], 
             empty_segments.append(item.segment_no)
             continue
         per_seg[item.segment_no] = 0
+        item_gen = seg_to_gen.get(item.segment_no)
         for ent_id, forms in candidates:
-            existing = db.scalar(
-                select(KgMention.id).where(
-                    KgMention.project_id == project_id,
-                    KgMention.entity_id == ent_id,
-                    KgMention.segment_no == item.segment_no,
+            # 与唯一键 `(project, entity, generation)` 对齐（见主路径同款注释）：
+            # 按段号查会漏掉「同 generation 换了段号」的已有行，补漏再插就撞 uq。
+            if item_gen is not None:
+                existing = db.scalar(
+                    select(KgMention.id).where(
+                        KgMention.project_id == project_id,
+                        KgMention.entity_id == ent_id,
+                        KgMention.generation_id == item_gen,
+                    )
                 )
-            )
+            else:
+                existing = db.scalar(
+                    select(KgMention.id).where(
+                        KgMention.project_id == project_id,
+                        KgMention.entity_id == ent_id,
+                        KgMention.segment_no == item.segment_no,
+                    )
+                )
             if existing is not None:
                 continue
             # 正文命中守卫：必须真实命中规范名/aliases，绝不放宽成「按实体存在就算提及」
@@ -1949,6 +2983,8 @@ def _alias_mentions_into(db: Session, project_id: int, batch: list[_QueueItem], 
                 # 文本归属门：被拦段不做别名补漏（LLM 路径已按段留痕，
                 # 降级路径由 _index_mentions_only 统一留段级隔离行）。
                 continue
+            m_cur, m_ver = (seg_ctx or {}).get(
+                item.segment_no, (is_current, version))
             db.add(KgMention(
                 project_id=project_id, entity_id=ent_id,
                 generation_id=seg_to_gen.get(item.segment_no),
@@ -1956,6 +2992,7 @@ def _alias_mentions_into(db: Session, project_id: int, batch: list[_QueueItem], 
                 segment_no=item.segment_no,
                 context_window=_window_around(text, form),
                 mention_kind=MENTION_KIND_ALIAS,
+                is_current=m_cur, version=m_ver,
             ))
             added += 1
             touched.add(ent_id)
@@ -2051,14 +3088,20 @@ def _lookup_entity_id(db: Session, project_id: int, name: str,
         return None
 
     def _in_book(e) -> bool:
-        return novel_id is None or e.novel_id in (None, novel_id)
+        if novel_id is None:
+            # book=None 是**本书值**（原创项目没有独立书 id），不是通配：
+            # 只认同书行，否则本书抽取会把同名实体并到参考书那本上（ch13 的
+            # 「照片」「协议」就是这样挂到 novel_id=7 实体上的）。
+            return e.novel_id is None
+        return e.novel_id in (None, novel_id)
 
     # 1) 精确匹配 canonical_name（不限 kind：关系端点可以是物品，最终 kind 由
     #    _endpoint_kind 另行判定）。同名跨 kind 时不能交给 db.scalar 抛
     #    MultipleResultsFound，走确定性解析。
     from app.kg.entity_lookup import resolve_entity_by_name
 
-    ent = resolve_entity_by_name(db, project_id, name, novel_id=novel_id)
+    ent = resolve_entity_by_name(db, project_id, name, novel_id=novel_id,
+                                 own_only=(novel_id is None))
     if ent is not None:
         return ent.id
     # 2) aliases 反查
@@ -2125,7 +3168,10 @@ def _upsert_entity(db: Session, project_id: int, e: dict,
     from app.kg.entity_resolve import should_merge, merge_target
 
     def _in_book(row) -> bool:
-        return novel_id is None or row.novel_id in (None, novel_id)
+        if novel_id is None:
+            # 同 _lookup_entity_id：book=None 只认本书行，不跨书合并同名实体。
+            return row.novel_id is None
+        return row.novel_id in (None, novel_id)
 
     rows = db.scalars(
         select(KgEntity).where(

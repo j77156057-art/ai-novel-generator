@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from sqlalchemy import select, func
@@ -72,7 +73,9 @@ KNOWN_UNSUPPORTED_BIBLE_KEYS: dict[str, str] = {
             "不会进入生成提示词。",
     "power_level": "未登记的量级写法。请改用 characters[].量级 / 量级细层 / 量级序号。",
     "level": "未登记的量级写法。请改用 characters[].量级 / 量级细层 / 量级序号。",
-    "gender": "生成提示词不渲染性别。如需影响写法，请写进 characters[].role 或 motivation。",
+    "gender": "顶层 gender 没有读取者。角色性别请写 characters[].gender（或 性别）。",
+    "first_chapter": "顶层 first_chapter 没有读取者。角色首次出场请写 "
+                     "characters[].first_chapter（或 首次出场章节）。",
     "background": "顶层 background 没有读取者。角色背景请写 characters[].background"
                   "（或身世/来历）；世界基线请写 设定/背景 容器里的 baseline。",
     "身世": "顶层 身世 没有读取者。请写 characters[].身世。",
@@ -84,6 +87,12 @@ SUPPORTED_CHARACTER_KEYS: frozenset[str] = frozenset({
     # prompts.py：system 角色行
     "name", "名字", "role", "motivation",
     "background", "身世", "来历", "背景",
+    # prompts.py：角色行口吻与台词示例
+    "voice", "sample_lines",
+    # prompts.py：角色行性别与代词（gender/性别）
+    "gender", "性别",
+    # prompts.py：按章过滤「本章可用角色」（first_chapter/首次出场章节）
+    "first_chapter", "首次出场章节", "首次出场",
     # power_prompt.py：量级与体系块
     "境界", "修炼", "量级", "量级细层", "量级序号", "出手规模",
 })
@@ -95,7 +104,6 @@ KNOWN_UNSUPPORTED_CHARACTER_KEYS: dict[str, str] = {
     "品阶": "角色卡不渲染品阶；品阶只用于 v3 item。",
     "power_level": "不渲染。请用 量级 / 量级细层 / 量级序号。",
     "level": "不渲染。请用 量级 / 量级细层 / 量级序号。",
-    "gender": "不渲染。如需影响写法，请写进 role 或 motivation。",
     "goal": "只用于 apply 时的 KG 冲突扫描，不进入生成提示词；请用 motivation。",
     "current_goal": "只用于 apply 时的 KG 冲突扫描，不进入生成提示词；请用 motivation。",
 }
@@ -153,6 +161,96 @@ def _card_has_scale(card: dict) -> bool:
     nested = card.get("量级")
     raw = {**card, **nested} if isinstance(nested, dict) else card
     return any(raw.get(k) not in (None, "") for k in ("量级", "量级细层", "量级序号"))
+
+
+# ── 角色卡：性别 / 首次出场章节（生成侧按章过滤与代词渲染的读侧口径）──
+
+_GENDER_ALIASES: dict[str, str] = {
+    "女": "女", "女性": "女", "女生": "女", "female": "女", "f": "女", "woman": "女", "girl": "女",
+    "男": "男", "男性": "男", "男生": "男", "male": "男", "m": "男", "man": "男", "boy": "男",
+    "其他": "其他", "其它": "其他", "非二元": "其他", "other": "其他", "nonbinary": "其他",
+}
+
+_GENDER_KEYS: tuple[str, ...] = ("gender", "性别")
+_FIRST_CHAPTER_KEYS: tuple[str, ...] = (
+    "first_chapter", "首次出场章节", "首次出场", "first_appearance_chapter",
+)
+
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_number(s: str) -> int | None:
+    """中文数字 → int（0~999）。解析不了返回 None。"""
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    total, section = 0, 0
+    for ch in s:
+        if ch in _CN_DIGITS:
+            section = _CN_DIGITS[ch]
+        elif ch == "十":
+            total += (section or 1) * 10
+            section = 0
+        elif ch == "百":
+            total += (section or 1) * 100
+            section = 0
+        else:
+            return None
+    return total + section
+
+
+def character_gender(card: Any) -> str:
+    """角色卡性别，归一为「男 / 女 / 其他」；没写或认不出返回空串（不猜）。"""
+    if not isinstance(card, dict):
+        return ""
+    for key in _GENDER_KEYS:
+        raw = card.get(key)
+        if raw in (None, ""):
+            continue
+        text = str(raw).strip().lower()
+        if text in _GENDER_ALIASES:
+            return _GENDER_ALIASES[text]
+    return ""
+
+
+def character_pronoun(card: Any) -> str:
+    """按性别给出第三人称代词；未知返回空串。"""
+    return {"女": "她", "男": "他"}.get(character_gender(card), "")
+
+
+def character_first_chapter(card: Any) -> int | None:
+    """角色首次出场章节（1-based）。支持 3 / "3" / "第3章" / "第三章"。"""
+    if not isinstance(card, dict):
+        return None
+    for key in _FIRST_CHAPTER_KEYS:
+        raw = card.get(key)
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            value = int(raw)
+            return value if value > 0 else None
+        text = str(raw).strip()
+        if not text:
+            continue
+        m = re.search(r"(?:第\s*)?([0-9]+|[零〇一二三四五六七八九十百]+)", text)
+        if m:
+            value = _cn_number(m.group(1))
+            return value if value and value > 0 else None
+    return None
+
+
+def set_character_gender(card: dict, gender: str) -> None:
+    """回写性别（保留用户原有键名：有 gender 写 gender，否则写 性别）。"""
+    key = "gender" if "gender" in card else "性别"
+    card[key] = gender
+
+
+def set_character_first_chapter(card: dict, chapter: int) -> None:
+    """回写首次出场章节（保留用户原有键名：有 first_chapter 写它，否则写 首次出场章节）。"""
+    key = "first_chapter" if "first_chapter" in card else "首次出场章节"
+    card[key] = int(chapter)
 
 
 def validate_bible_keys(bible: Any) -> list[dict]:
@@ -351,6 +449,7 @@ def detect_conflicts(db: Session, project_id: int, new_bible: Any) -> list[dict]
             existing = db.scalars(select(KgRelation).where(
                 KgRelation.project_id == project_id,
                 KgRelation.status == "active",  # 候选边不参与冲突扫描
+                KgRelation.is_current.is_(True),  # 已被重写章否定的旧边不参与
                 ((KgRelation.from_id == ea.id) & (KgRelation.to_id == eb.id))
                 | ((KgRelation.from_id == eb.id) & (KgRelation.to_id == ea.id))
             )).all()

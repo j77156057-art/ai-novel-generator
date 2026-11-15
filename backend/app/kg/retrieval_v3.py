@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from sqlalchemy import select, func
 
-from app.kg.book_scope import book_for_project
+from app.kg.book_scope import book_for_project, prompt_scope_book_ids, scope_sql_values
 from app.kg.entity_lookup import resolve_entity_by_name
 from app.models import (
     KgCharacterState, KgEntity, KgEntityKnowledge, KgEvent, KgForeshadow, KgMention,
@@ -44,6 +44,10 @@ def slice_for_prompt(
     max_relations: 关系清单上限（关系只列当前段实体之间的边，不写人物小传）
     active_characters: 当前段涉及的角色名（用于取状态和情报）；None 则用本段全部
 
+    书维度：只取「本书 + 项目级 NULL」（见 `book_scope.prompt_scope_book_ids`）。
+    参考书（`project.reference_novel_ids`）抽出来的实体/事件/关系/情报不进
+    prompt —— 否则同号段的别书内容会被当成本书「已发生的事实」。
+
     返回：
     {
       "recent_entities": [{"name","kind","context","mention_count"}],
@@ -55,16 +59,34 @@ def slice_for_prompt(
     }
     """
     lo = max(1, current_segment_no - window + 1)
-    # 事件按书收窄：续写书 → 来源书 → None（不按书过滤），与写侧同一个取值点。
+    # 书维度白名单：本书 + 项目级 NULL。参考书（reference_novel_ids）抽出来的
+    # 实体/事件/情报一律不进 prompt —— 那是给检索线用的语料，不是本书已发生的事。
+    # 项目对象取不到时按「只认项目级」处理：宁少给，不串书。
     project = db.get(Project, project_id)
-    book = book_for_project(project) if project is not None else None
+    own_book = book_for_project(project) if project is not None else None
+    scope = prompt_scope_book_ids(project) if project is not None else (None,)
+    scope_sql = scope_sql_values(scope)
+
+    def _in_scope(novel_id) -> bool:
+        """该行的事实是否属于本书可见范围（NULL = 项目级通配，始终可见）。"""
+        return novel_id is None or novel_id in scope
 
     # —— 1. 最近 N 段涉及的实体（mention 反向索引）——
+    # 书维度必须在**排序前**就卡掉，不能等取完 top-K 再过滤：参考书的 mention
+    # 频次远高于本书（同号段撞号），先取 top-K 会把预算占满，本书实体一个都进不来。
+    # 两个维度都要卡：mention 行的 novel_id（这条提及来自哪本书）+ 实体自身的
+    # novel_id（这个实体属于哪本书）。老数据前者可能是 NULL，后者才是准的。
     recent_mentions = db.scalars(
-        select(KgMention).where(
+        select(KgMention).join(
+            KgEntity, KgEntity.id == KgMention.entity_id,
+        ).where(
             KgMention.project_id == project_id,
             KgMention.segment_no >= lo,
             KgMention.segment_no <= current_segment_no,
+            func.coalesce(KgMention.novel_id, -1).in_(scope_sql),
+            func.coalesce(KgEntity.novel_id, -1).in_(scope_sql),
+            # 同章旧版本提及只留档，不进切片（否则重写章会新旧两版同时出现）
+            KgMention.is_current.is_(True),
         ).order_by(KgMention.segment_no.desc())
     ).all()
     # 按实体聚合：取最近一次 mention 的 context + 累计 mention 数
@@ -83,7 +105,8 @@ def slice_for_prompt(
     ent_books: dict[int, int | None] = {}
     for eid in top_ent_ids:
         ent = db.get(KgEntity, eid)
-        if ent is None:
+        # 第二道门：提及行的书维度可能缺失，实体本身的书才是准的。
+        if ent is None or not _in_scope(ent.novel_id):
             continue
         ent_names[eid] = ent.canonical_name
         ent_books[eid] = ent.novel_id
@@ -102,8 +125,9 @@ def slice_for_prompt(
             # （「长刀」「黄金」这类），不带 kind 时 db.scalar 在两者并存后
             # 会直接抛 MultipleResultsFound；本块语义是「角色的最新状态」，
             # 只认 character。
-            ent = resolve_entity_by_name(db, project_id, name, kind="character")
-            if ent is None:
+            ent = resolve_entity_by_name(db, project_id, name, kind="character",
+                                         novel_id=own_book)
+            if ent is None or not _in_scope(ent.novel_id):
                 continue
             anchor_ids.add(ent.id)
             ent_names[ent.id] = ent.canonical_name
@@ -113,6 +137,8 @@ def slice_for_prompt(
                 select(KgCharacterState).where(
                     KgCharacterState.project_id == project_id,
                     KgCharacterState.character_id == ent.id,
+                    # 只取当前版本状态：旧版本保留可回溯，但不再参与渲染
+                    KgCharacterState.is_current.is_(True),
                 ).order_by(KgCharacterState.segment_no)
             ):
                 latest[st.state_type] = st
@@ -124,13 +150,22 @@ def slice_for_prompt(
                 })
 
     # —— 3. active 伏笔（planted/developing）——
+    # kg_foreshadows 表**没有书维度**，只能按等价口径挡参考书：
+    # 原创项目（无续写/来源书）写到第 N 段时，不可能在自己的正文里埋下
+    # 第 N+ 章才出现的伏笔；planted_chapter 晚于当前进度的行，只可能是
+    # 参考书语料抽出来的，注入就是把别书的后续剧透塞进本章。
+    # 有续写书时不加这道门：那本书的旧章节伏笔对续写是有效上下文。
+    fs_q = select(KgForeshadow).where(
+        KgForeshadow.project_id == project_id,
+        KgForeshadow.status.in_(["planted", "developing"]),
+    )
+    if own_book is None:
+        fs_q = fs_q.where(
+            (KgForeshadow.planted_chapter.is_(None))
+            | (KgForeshadow.planted_chapter <= current_segment_no)
+        )
     active_foreshadows = []
-    for fs in db.scalars(
-        select(KgForeshadow).where(
-            KgForeshadow.project_id == project_id,
-            KgForeshadow.status.in_(["planted", "developing"]),
-        ).order_by(KgForeshadow.planted_chapter)
-    ):
+    for fs in db.scalars(fs_q.order_by(KgForeshadow.planted_chapter)):
         active_foreshadows.append({
             "name": fs.name,
             "status": fs.status,
@@ -145,8 +180,9 @@ def slice_for_prompt(
     if active_characters:
         for name in active_characters:
             # 同上：情报的归属者是角色，kind 必须限定，否则同名 item 会串味/多结果。
-            ent = resolve_entity_by_name(db, project_id, name, kind="character")
-            if ent is None:
+            ent = resolve_entity_by_name(db, project_id, name, kind="character",
+                                         novel_id=own_book)
+            if ent is None or not _in_scope(ent.novel_id):
                 continue
             knows: list[str] = []
             for k in db.scalars(
@@ -155,7 +191,7 @@ def slice_for_prompt(
                     KgEntityKnowledge.entity_id == ent.id,
                 )
             ):
-                label = _knowledge_label(db, k)
+                label = _knowledge_label(db, k, scope)
                 if label and label not in knows:
                     knows.append(label)
                 if len(knows) >= 8:  # prompt 预算：单角色情报上限
@@ -164,19 +200,18 @@ def slice_for_prompt(
                 known_facts.append({"character": ent.canonical_name, "knows": knows})
 
     # —— 5. 最近 N 段的事件（in_story_date 喂物理时间校验 prompt）——
-    # 书维度（2026-11-18）：本书显式事件优先、项目级 NULL 事件作通配、别书事件绝不参与。
-    # SQLite 里 NULL 互不相等，折成 -1 再比（与既有 COALESCE(novel_id,-1) 同口径）；
-    # book 为 None（项目没指定书）时保持加列前的行为：不按书过滤。
+    # 书维度：只取本书 + 项目级 NULL。参考书的事件**绝不参与** —— 段号撞号时
+    # 它们会以「近期事件」的身份被当成本书已发生的事，正是串书的入口。
+    # SQLite 里 NULL 互不相等，折成 -1 再比（与 COALESCE(novel_id,-1) 同口径）。
     event_q = select(KgEvent).where(
         KgEvent.project_id == project_id,
         KgEvent.segment_no >= lo,
         KgEvent.segment_no <= current_segment_no,
+        func.coalesce(KgEvent.novel_id, -1).in_(scope_sql),
+        # 只取当前版本事件：同章旧稿的事件留档但不注入
+        KgEvent.is_current.is_(True),
     )
-    event_order = [KgEvent.segment_no.desc()]
-    if book is not None:
-        event_q = event_q.where(
-            func.coalesce(KgEvent.novel_id, -1).in_((book, -1)))
-        event_order.append(func.coalesce(KgEvent.novel_id, -1).desc())
+    event_order = [KgEvent.segment_no.desc(), func.coalesce(KgEvent.novel_id, -1).desc()]
     recent_events = []
     for ev in db.scalars(event_q.order_by(*event_order)):
         recent_events.append({
@@ -187,13 +222,13 @@ def slice_for_prompt(
 
     # —— 6. 当前段实体之间已发生的关系（kg_relations）——
     # kg_relations 表本身没有 novel_id，书维度用「两端实体的 novel_id」替代：
-    # 只有两端都在本段实体集合里、且都在当前书可见范围内（NULL=通配）才取。
+    # 只有两端都在本段实体集合里、且都在本书可见范围内（NULL=通配）才取。
     # 这样既不会把别书的边（如「镇国剑归镇北王」）注进无关故事，也不会把整张
     # 关系图铺成人物小传。
     relationships: list[dict] = []
     visible = {
         eid for eid in anchor_ids
-        if eid in ent_names and (book is None or ent_books.get(eid) in (None, book))
+        if eid in ent_names and _in_scope(ent_books.get(eid))
     }
     if visible:
         seen: set[tuple[frozenset[int], str]] = set()
@@ -201,6 +236,7 @@ def slice_for_prompt(
             select(KgRelation).where(
                 KgRelation.project_id == project_id,
                 KgRelation.status == "active",  # 候选边（集合端点门降级）不注入
+                KgRelation.is_current.is_(True),  # 旧版本被重写章否定的边不注入
                 KgRelation.from_id.in_(visible),
                 KgRelation.to_id.in_(visible),
             ).order_by(KgRelation.strength.desc(), KgRelation.id)
@@ -229,27 +265,42 @@ def slice_for_prompt(
     }
 
 
-def _knowledge_label(db, k) -> str | None:
+def _label_in_scope(obj, scope: tuple[int | None, ...]) -> bool:
+    """标签行指向的实体/事件是否属于本书可见范围（NULL = 项目级通配）。"""
+    if obj is None:
+        return False
+    nid = getattr(obj, "novel_id", None)
+    return nid is None or nid in scope
+
+
+def _knowledge_label(db, k, scope: tuple[int | None, ...] = ()) -> str | None:
     """一条 entity_knowledge 行 → 给 prompt 的事实标签（三类 known_kind）。
 
-    返回 None 的行不渲染（三类都解析失败的脏行）。
+    返回 None 的行不渲染：三类都解析失败的脏行，或指向参考书实体/事件的
+    情报（那是别书的事实，注入本书 prompt 等于把别人的剧情当已知情报）。
     """
     kind = (k.known_kind or "").strip()
     if not kind:
         # 老行容错：kind 缺失时按 id 先实体后事件解析（老库行为兼容）
         known_ent = db.get(KgEntity, k.known_entity_id) if k.known_entity_id is not None else None
         if known_ent is not None:
-            return known_ent.canonical_name
+            return known_ent.canonical_name if _label_in_scope(known_ent, scope) else None
         known_ev = db.get(KgEvent, k.known_entity_id) if k.known_entity_id is not None else None
         if known_ev is not None:
+            if not _label_in_scope(known_ev, scope):
+                return None
             return f"事件：{(known_ev.summary or '')[:80]}"
         return (k.known_text or "").strip() or None
     if kind == "entity":
         known_ent = db.get(KgEntity, k.known_entity_id) if k.known_entity_id is not None else None
-        return known_ent.canonical_name if known_ent else None
+        if known_ent is None or not _label_in_scope(known_ent, scope):
+            return None
+        return known_ent.canonical_name
     if kind == "event":
         known_ev = db.get(KgEvent, k.known_entity_id) if k.known_entity_id is not None else None
         if known_ev is not None:
+            if not _label_in_scope(known_ev, scope):
+                return None
             return f"事件：{(known_ev.summary or '')[:80]}"
         return f"事件：{(k.known_text or '').strip()[:80]}" if k.known_text else None
     if kind == "secret":
@@ -307,6 +358,7 @@ def relation_curve(db, project_id: int, from_name: str, to_name: str) -> list[di
     rels = db.scalars(select(KgRelation).where(
         KgRelation.project_id == project_id,
         KgRelation.status == "active",  # 候选边（集合端点门降级）不进演变曲线
+        KgRelation.is_current.is_(True),  # 同章旧稿关系只留档，不进曲线
         KgRelation.from_id.in_([a.id, b.id]),
         KgRelation.to_id.in_([a.id, b.id]),
     )).all()
@@ -390,7 +442,8 @@ def rhythm_analysis(db, project_id: int, window: int = 10) -> dict:
     """节奏分析：每实体在最近 N 段的 mention 分布（谁在唱主角）。"""
     segs = db.scalars(
         select(KgMention.segment_no).where(
-            KgMention.project_id == project_id
+            KgMention.project_id == project_id,
+            KgMention.is_current.is_(True),
         ).distinct().order_by(KgMention.segment_no.desc()).limit(window)
     ).all()
     if not segs:
@@ -399,7 +452,8 @@ def rhythm_analysis(db, project_id: int, window: int = 10) -> dict:
     rows = db.execute(
         select(KgEntity.canonical_name, KgEntity.kind, func.count(KgMention.id).label("n"))
         .join(KgMention, KgMention.entity_id == KgEntity.id)
-        .where(KgMention.project_id == project_id, KgMention.segment_no >= lo)
+        .where(KgMention.project_id == project_id, KgMention.segment_no >= lo,
+               KgMention.is_current.is_(True))
         .group_by(KgEntity.id)
         .order_by(func.count(KgMention.id).desc())
         .limit(20)
