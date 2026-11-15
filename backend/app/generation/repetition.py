@@ -61,7 +61,54 @@ AI 腔。本模块补的是第三种、也是 2026-11-12 诊断里真正出问�
 本模块**不含任何处置动作**：不写库、不改文本、不决定要不要重生成。
 处置在调用点（`engine.py` 的 P1/P2/P3）：标记 + 跳过 KG 抽取，不拒绝落库；
 落库列与接口契约见文档《复读闸门插入点说明》。
+
+## 2026-11-12 追加的两条判据（只标记、不拦截）
+
+### A. 篇幅不足（`analyze_length`）
+
+对象是**新生成整段**的字数相对**项目字数预算**（`projects.generation_length`）
+的比例；`< 80%` 判 `short`。与 `scope_guard.detect_length_drop` **不是一回事**：
+后者比较「同一段改写前后的原文」，适用于局部改写；本判据比较「正文 vs 预算」，
+适用于整段生成。局部改写路径传 `is_rewrite=True`，本判据返回
+`not_applicable`，跌幅仍由 `length_drop` 单独报告——两者不合并、不互相覆盖。
+预算缺失（老项目没设）返回 `undetected`，**不得**当成 `ok`。
+80% 与重写提示词里的「80%–120%」同源：提示词说应该写到 80% 以上，这里验实际。
+
+### B. 梗概式推进 / 罗列式推进（`analyze_summary_style`）
+
+可测量代理：一段文字如果**大量用「告诉/得知/明白/决定/意识到/发现/怀疑…」
+把事件压成结论**（转述密度高），又**没有把读者放进现场**（场景要素少或对白少），
+还出现**「找到/见到/拜访/联系/询问/走访 + 2~3 字人名」的连续会面**，就是梗概。
+四路信号（均为固定词表/正则，可逐字复现）：
+
+| 信号 | 阈值 | 750 字目标段实测 | 正常文本实测 |
+|---|---|---|---|
+| S1 转述动词密度 | `>= 12/千字` | **20.0** | 其余 59 段最大 5.36（p50 0.9） |
+| S2 场景要素密度 | `< 4/千字` | 6.67（**未触发**） | p50 5.03；60 段中 21 段 <4 |
+| S3 对白占比 | `< 5%` | **3.7%** | p50 22.5%（p1s1 1.2%） |
+| S4 会面动词+人名 | `>= 2 次` | **3 次** | 60 段中除目标段外全部 ≤1 次 |
+
+判定式：`(S1 或 S4) 且 (S2 或 S3)`。先要求「推进方式」证据（S1/S4），再要求
+「展示缺失」（S2/S3），避免把「只是没对白/场景词少」的普通叙述误判成梗概。
+阈值来源：
+
+- S1 的 12 = 正常文本最大值的 2.24 倍（5.36 → 12），目标段 20 的 60%；
+- S4 的 2：目标段 3 次，其余 59 段非退化文本 0 次（1 次留给正常的单次会面）；
+- S3 的 5%：正常文本 p50 22.5%，最低 1.2%（p1s1），目标 3.7%——单独不判别，
+  只与 S2 组成「展示缺失」；
+- S2 的 4：60 段正常文本中 21 段 <4，说明**单看它几乎没有判别力**，所以它
+  只作为 S3 的替代项，且整条规则必须先满足 S1/S4。
+
+误报实测（2026-11-12，只读）：工作区 66 段去重历史正文中，6 段已被复读判据
+判退化（排除），其余 **60 段里只有目标 750 字段命中，59 段正常文本 0 命中**。
+主库 p1 三段、p5 第二段、旧 p5s1（1413 字）全部 `ok`；2273 字旧循环稿
+`repetition=degenerate` 不变、`summary_style=ok`（0/4）。
+
+已知漏报形态：**用「他去了 A，又去了 B」式的短句罗列、但会面动词不在词表里**
+（如「安排」「吩咐」「拨通」），或通篇转述却恰好保留了 5% 以上对白。词表是
+显式常量，扩词等于改判据，必须在提交里附新的误报实测。
 """
+
 
 from __future__ import annotations
 
@@ -118,6 +165,63 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？])|\n+")
 VERDICT_OK = "ok"
 VERDICT_DEGENERATE = "degenerate"
 VERDICT_SKIPPED_SHORT = "skipped_short"
+
+
+# ─── 判据 A：篇幅不足（正文 vs 项目字数预算，不是 vs 改写前原文）──────────────
+
+#: 低于预算的这个比例判 `short`。与重写提示词的 80%–120% 区间同源。
+MIN_LENGTH_RATIO = 0.80
+
+LENGTH_VERDICT_OK = "ok"
+LENGTH_VERDICT_SHORT = "short"
+LENGTH_VERDICT_NOT_APPLICABLE = "not_applicable"
+
+
+# ─── 判据 B：梗概式推进（词表/正则固定，阈值依据见模块 docstring）─────────────
+
+#: 低于此字数不判文体（句子太少，句均长与密度的方差过大）。
+SUMMARY_STYLE_MIN_CHARS = 300
+
+#: S1：转述/总结动词密度下限（每千字）。正常文本实测最大 5.36。
+SUMMARY_VERB_MIN_PER_1K = 12.0
+
+#: S2：场景要素密度上限（每千字）。正常文本 p50 为 5.03，单看无判别力，
+#: 只作为 S3 的替代项，且必须与 S1/S4 同时成立。
+SCENE_ELEMENT_MAX_PER_1K = 4.0
+
+#: S3：对白占比上限。正常文本 p50 22.5%。
+DIALOGUE_MAX_RATIO = 0.05
+
+#: S4：会面动词 + 2~3 字人名（如「找到了程野，」）出现次数下限。
+#: 正常文本（除目标段）实测 0 次；1 次留给正常的单次会面。
+MEET_VERB_OBJECT_MIN_HITS = 2
+
+SUMMARY_STYLE_VERDICT_OK = "ok"
+SUMMARY_STYLE_VERDICT_FLAGGED = "summary_style"
+
+#: 转述/总结动词表：把「发生过什么」压成一句结论，而不是把读者放进现场。
+_SUMMARY_VERB_RE = re.compile(
+    r"告诉|得知|明白|决定|意识到|发现|了解|怀疑|震惊|清楚|认为|原来|从此"
+)
+
+#: 会面推进句式：动词 + 2~3 字对象 + 句读。对象长度限制把
+#: 「他找到了答案，」这类抽象宾语排除在外（答案/真相/线索都是 2 字，仍会中，
+#: 故还要求整段出现 ≥2 次；单次会面不判）。
+_MEET_VERB_OBJECT_RE = re.compile(
+    r"(?:找到了|见到|拜访了|联系了|询问了|走访了)"
+    r"([\u4e00-\u9fa5]{2,3})(?=[，。、！？；“”])"
+)
+
+#: 场景要素词表（环境/感官）：两字词优先，避免「目光/时光」被单字「光」充数。
+_SCENE_ELEMENTS = (
+    "灯光", "阳光", "月光", "光线", "影子", "阴影", "窗外", "门口", "房门",
+    "风", "雨", "雪", "夜色", "声音", "响声", "气味", "冷风", "空气",
+    "房间", "街道", "城市", "昏暗", "天空", "墙壁", "桌上", "椅子", "杯子",
+    "烟", "雾", "云", "星", "月",
+)
+
+#: 对白：中文引号/直角引号/英文双引号内的内容。
+_QUOTE_SPAN_RE = re.compile(r"[“「]([^”」]{1,400})[”」]|\"([^\"\n]{1,400})\"")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,6 +365,72 @@ class RepetitionReport:
             ),
             "triggers": list(self.triggers),
             "reasons": list(self.reasons),
+        }
+
+
+@dataclass(frozen=True)
+class LengthReport:
+    """篇幅判据结论（正文 vs 项目字数预算）。
+
+    四态：`ok` / `short` / `undetected`（预算缺失）/ `not_applicable`
+    （局部改写路径，跌幅归 `scope_guard.detect_length_drop`）。
+    """
+
+    verdict: str
+    chars: int
+    budget: int | None
+    ratio: float | None
+    reason_text: str
+    min_ratio: float = MIN_LENGTH_RATIO
+
+    def to_dict(self) -> dict:
+        return {
+            "verdict": self.verdict,
+            "chars": self.chars,
+            "budget": self.budget,
+            "ratio": self.ratio,
+            "min_ratio": self.min_ratio,
+            "reason_text": self.reason_text,
+        }
+
+
+@dataclass(frozen=True)
+class SummaryStyleMetrics:
+    """梗概化判据的原始指标（全部是固定词表/正则的可复现值）。"""
+
+    chars: int
+    sentences: int
+    dialogue_ratio: float
+    meet_verb_object_hits: int
+    meet_verb_object_per_1k: float
+    summary_verb_per_1k: float
+    scene_element_per_1k: float
+
+
+@dataclass(frozen=True)
+class SummaryStyleReport:
+    """梗概式推进结论：`ok` / `summary_style` / `skipped_short`。"""
+
+    verdict: str
+    metrics: SummaryStyleMetrics
+    signals: tuple[str, ...] = ()
+    reason_text: str = ""
+
+    def to_dict(self) -> dict:
+        m = self.metrics
+        return {
+            "verdict": self.verdict,
+            "signals": list(self.signals),
+            "reason_text": self.reason_text,
+            "metrics": {
+                "chars": m.chars,
+                "sentences": m.sentences,
+                "dialogue_ratio": m.dialogue_ratio,
+                "meet_verb_object_hits": m.meet_verb_object_hits,
+                "meet_verb_object_per_1k": m.meet_verb_object_per_1k,
+                "summary_verb_per_1k": m.summary_verb_per_1k,
+                "scene_element_per_1k": m.scene_element_per_1k,
+            },
         }
 
 
@@ -539,6 +709,186 @@ def analyze_repetition(
     )
 
 
+def analyze_length(
+    text: str,
+    budget: int | None,
+    *,
+    is_rewrite: bool = False,
+    min_ratio: float = MIN_LENGTH_RATIO,
+) -> LengthReport:
+    """篇幅判据：正文相对**项目字数预算**（`projects.generation_length`）。
+
+    与 `scope_guard.detect_length_drop` 的分工（不要合并）：
+
+    - 本函数：`chars / budget < 80%` → `short`。用于**新生成的整段**。
+    - `detect_length_drop`：改写后相对**改写前原文**跌幅 >20% → 提示。
+      用于**局部改写**，此时本函数传 `is_rewrite=True`，返回
+      `not_applicable`，两者各报各的。
+
+    Args:
+        text: 正文（`None` 按空串）。
+        budget: 项目字数预算；`None`/`<=0` → `undetected`（不得当成 ok）。
+        is_rewrite: 是否为改写既有段落的路径。
+        min_ratio: 判定线（生产用默认 0.80）。
+
+    Returns:
+        `LengthReport`，verdict ∈ {ok, short, undetected, not_applicable}。
+    """
+    chars = len(text or "")
+    if is_rewrite:
+        return LengthReport(
+            verdict=LENGTH_VERDICT_NOT_APPLICABLE,
+            chars=chars,
+            budget=None,
+            ratio=None,
+            reason_text=(
+                "改写路径不按整段字数预算判定；篇幅跌幅由 "
+                "scope_guard.detect_length_drop 单独报告"
+            ),
+            min_ratio=min_ratio,
+        )
+    if not budget or int(budget) <= 0:
+        return LengthReport(
+            verdict=READ_VERDICT_UNDETECTED,
+            chars=chars,
+            budget=None,
+            ratio=None,
+            reason_text=(
+                "未检测：项目未设置 generation_length（字数预算），"
+                "无法计算篇幅比例"
+            ),
+            min_ratio=min_ratio,
+        )
+    budget = int(budget)
+    # 判定用**未取整**的比例：2399/3000=0.79967 必须判 short，
+    # 若先取整成 0.800 就会漏判。取整只用于展示。
+    ratio_raw = chars / budget
+    ratio = round(ratio_raw, ROUND_DIGITS)
+    if ratio_raw < min_ratio:
+        return LengthReport(
+            verdict=LENGTH_VERDICT_SHORT,
+            chars=chars,
+            budget=budget,
+            ratio=ratio,
+            reason_text=(
+                f"篇幅不足：正文 {chars} 字，仅为字数预算 {budget} 字的 "
+                f"{_fmt_pct(ratio)}（<{_fmt_pct(min_ratio)}）"
+            ),
+            min_ratio=min_ratio,
+        )
+    return LengthReport(
+        verdict=LENGTH_VERDICT_OK,
+        chars=chars,
+        budget=budget,
+        ratio=ratio,
+        reason_text=(
+            f"篇幅达标：正文 {chars} 字，达到字数预算 {budget} 字的 "
+            f"{_fmt_pct(ratio)}（>={_fmt_pct(min_ratio)}）"
+        ),
+        min_ratio=min_ratio,
+    )
+
+
+def analyze_summary_style(text: str) -> SummaryStyleReport:
+    """梗概式推进 / 罗列式推进判据（只标记，不拦截）。
+
+    判定式：`(S1 或 S4) 且 (S2 或 S3)`——先要有「推进方式」证据，再要有
+    「展示缺失」。四路信号与阈值见模块 docstring 的实测表：
+
+    - S1 转述动词密度 ≥ `SUMMARY_VERB_MIN_PER_1K`（固定动词表）；
+    - S2 场景要素密度 < `SCENE_ELEMENT_MAX_PER_1K`（固定场景词表）；
+    - S3 对白占比 < `DIALOGUE_MAX_RATIO`（引号内字符 / 全文字符）；
+    - S4 会面动词 + 2~3 字对象 ≥ `MEET_VERB_OBJECT_MIN_HITS` 次。
+
+    误报实测（2026-11-12）：工作区 60 段非退化历史正文 + 主库 5 段，
+    只有目标 750 字段命中，其余 0 命中。正文短于 `SUMMARY_STYLE_MIN_CHARS`
+    返回 `skipped_short`（不判定，不是 ok）。
+    """
+    raw = text or ""
+    chars = len(raw)
+    sentences = split_sentences(raw)
+    per_1k = max(chars, 1) / 1000.0
+
+    quotes = [a or b for a, b in _QUOTE_SPAN_RE.findall(raw)]
+    dialogue_ratio = (
+        round(sum(len(q) for q in quotes) / chars, ROUND_DIGITS) if chars else 0.0
+    )
+    meet_hits = len(_MEET_VERB_OBJECT_RE.findall(raw))
+    metrics = SummaryStyleMetrics(
+        chars=chars,
+        sentences=len(sentences),
+        dialogue_ratio=dialogue_ratio,
+        meet_verb_object_hits=meet_hits,
+        meet_verb_object_per_1k=round(meet_hits / per_1k, ROUND_DIGITS),
+        summary_verb_per_1k=round(
+            len(_SUMMARY_VERB_RE.findall(raw)) / per_1k, ROUND_DIGITS),
+        scene_element_per_1k=round(
+            sum(raw.count(w) for w in _SCENE_ELEMENTS) / per_1k, ROUND_DIGITS),
+    )
+
+    if chars < SUMMARY_STYLE_MIN_CHARS:
+        return SummaryStyleReport(
+            verdict=VERDICT_SKIPPED_SHORT,
+            metrics=metrics,
+            reason_text=(
+                f"正文仅 {chars} 字 < {SUMMARY_STYLE_MIN_CHARS} 字门槛，"
+                "不判文体"
+            ),
+        )
+
+    s1 = metrics.summary_verb_per_1k >= SUMMARY_VERB_MIN_PER_1K
+    s2 = metrics.scene_element_per_1k < SCENE_ELEMENT_MAX_PER_1K
+    s3 = metrics.dialogue_ratio < DIALOGUE_MAX_RATIO
+    s4 = metrics.meet_verb_object_hits >= MEET_VERB_OBJECT_MIN_HITS
+
+    signals: list[str] = []
+    reasons: list[str] = []
+    if s1:
+        signals.append("summary_verb_density")
+        reasons.append(
+            f"转述动词 {metrics.summary_verb_per_1k}/千字"
+            f"（>={SUMMARY_VERB_MIN_PER_1K}）"
+        )
+    if s2:
+        signals.append("scene_element_density")
+        reasons.append(
+            f"场景要素 {metrics.scene_element_per_1k}/千字"
+            f"（<{SCENE_ELEMENT_MAX_PER_1K}）"
+        )
+    if s3:
+        signals.append("dialogue_ratio")
+        reasons.append(
+            f"对白占比 {_fmt_pct(metrics.dialogue_ratio)}"
+            f"（<{_fmt_pct(DIALOGUE_MAX_RATIO)}）"
+        )
+    if s4:
+        signals.append("meet_verb_object")
+        reasons.append(
+            f"会面动词+人名 {metrics.meet_verb_object_hits} 次"
+            f"（>={MEET_VERB_OBJECT_MIN_HITS}）"
+        )
+
+    if (s1 or s4) and (s2 or s3):
+        return SummaryStyleReport(
+            verdict=SUMMARY_STYLE_VERDICT_FLAGGED,
+            metrics=metrics,
+            signals=tuple(signals),
+            reason_text="梗概式推进：" + "、".join(reasons),
+        )
+    detail = (
+        f"转述动词 {metrics.summary_verb_per_1k}/千字、"
+        f"场景要素 {metrics.scene_element_per_1k}/千字、"
+        f"对白占比 {_fmt_pct(metrics.dialogue_ratio)}、"
+        f"会面动词+人名 {metrics.meet_verb_object_hits} 次"
+    )
+    return SummaryStyleReport(
+        verdict=SUMMARY_STYLE_VERDICT_OK,
+        metrics=metrics,
+        signals=tuple(signals),
+        reason_text=f"未命中梗概化判据：{detail}",
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 落库 / 回读（`generations.quality_json`）
 #
@@ -554,15 +904,24 @@ READ_VERDICT_UNDETECTED = "undetected"
 _UNDETECTED_REASON = "未检测：这段写作时还没有复读闸门，不代表内容正常"
 
 
-def quality_payload(report: RepetitionReport,
-                    checked_at: str | None = None) -> dict:
+def quality_payload(
+    report: RepetitionReport,
+    checked_at: str | None = None,
+    *,
+    length: LengthReport | None = None,
+    summary_style: SummaryStyleReport | None = None,
+) -> dict:
     """把报告压成落库/响应共用的最小结构（方案稿 §3.1）。
 
     `truncated` 与 verdict **独立**：短文本也会因 `ends_complete=False`
     被打上截断标记（短文本不判定退化，但仍可能被截断）。
+
+    `length` / `summary_style` 是 2026-11-12 追加的两个**独立**字段：
+    调用点传了才写（生产路径 P1/P2/P3 一律传），读取侧缺失会映射成
+    `undetected`。三者不合并成一个布尔。
     """
     m = report.metrics
-    return {
+    payload = {
         "repetition": {
             "verdict": report.verdict,
             "triggers": list(report.triggers),
@@ -575,6 +934,31 @@ def quality_payload(report: RepetitionReport,
         "checked_at": checked_at or datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"),
     }
+    if length is not None:
+        payload["length"] = length.to_dict()
+    if summary_style is not None:
+        payload["summary_style"] = summary_style.to_dict()
+    return payload
+
+
+def _undetected_length() -> dict:
+    return {
+        "verdict": READ_VERDICT_UNDETECTED,
+        "chars": None,
+        "budget": None,
+        "ratio": None,
+        "min_ratio": MIN_LENGTH_RATIO,
+        "reason_text": "未检测：这段写作时还没有篇幅判据，不代表篇幅合理",
+    }
+
+
+def _undetected_summary_style() -> dict:
+    return {
+        "verdict": READ_VERDICT_UNDETECTED,
+        "signals": [],
+        "reason_text": "未检测：这段写作时还没有梗概化判据，不代表文体正常",
+        "metrics": None,
+    }
 
 
 def parse_quality(raw: str | None) -> dict:
@@ -582,7 +966,11 @@ def parse_quality(raw: str | None) -> dict:
 
     `NULL` / 空串 / 坏 JSON **一律**映射成 `verdict="undetected"`（未检测），
     绝不返回 `ok`——「没测过」不能被读成「正常」。返回形状与写入侧一致，
-    前端只需读 `quality.repetition.verdict`。
+    前端只需读 `quality.repetition.verdict` / `quality.length.verdict` /
+    `quality.summary_style.verdict`。
+
+    `repetition` / `length` / `summary_style` 三个字段各自独立兜底：老行
+    （只有 repetition、没有新字段）不会因为缺键而丢掉已有的复读结论。
     """
     empty = {
         "repetition": {
@@ -590,8 +978,12 @@ def parse_quality(raw: str | None) -> dict:
             "triggers": [],
             "reason_text": _UNDETECTED_REASON,
         },
+        "length": _undetected_length(),
+        "summary_style": _undetected_summary_style(),
         "truncated": None,
         "checked_at": None,
+        # 老行 / 未检测：一致性层没有结论时是 None，不给空数组（空数组会被读成「查过，零问题」）
+        "coherence": None,
     }
     if not raw:
         return empty
@@ -604,8 +996,19 @@ def parse_quality(raw: str | None) -> dict:
     rep = data.get("repetition")
     if not isinstance(rep, dict) or not rep.get("verdict"):
         return empty
+    length = data.get("length")
+    if not isinstance(length, dict) or not length.get("verdict"):
+        length = _undetected_length()
+    style = data.get("summary_style")
+    if not isinstance(style, dict) or not style.get("verdict"):
+        style = _undetected_summary_style()
     return {
         "repetition": rep,
+        "length": length,
+        "summary_style": style,
         "truncated": data.get("truncated"),
         "checked_at": data.get("checked_at"),
+        # 一致性层（说话人/时间线/指代/伏笔）。老行没有这个键 → None（未检测），
+        # 与「检测过且零问题」区分开，读取侧不需要额外判断。
+        "coherence": data.get("coherence"),
     }

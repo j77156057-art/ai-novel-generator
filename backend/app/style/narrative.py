@@ -34,6 +34,7 @@ import hashlib
 import json
 import logging
 import re
+import statistics
 from datetime import datetime, timezone
 
 from dataclasses import dataclass, replace
@@ -41,6 +42,10 @@ from typing import Any, Callable
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+#: 切句口径的唯一真源在 `stylometry.split_sentences`（R16）。
+from app.config import settings
+from app.style import stylometry
 
 #: 进度回调签名：`(阶段人话文本, 已完成数, 总数)`。
 #:
@@ -90,6 +95,12 @@ MIN_SAMPLE_CHARS = 300_000
 #: 每块最少章节数（太少提炼不出模式）
 MIN_CHAPTERS_PER_CHUNK = 5
 
+#: 证据句下限（2026-11-12）。短于 20 字的证据在章内无法唯一定位，只能做两端锚定，
+#: 等于没有锚点。抽取提示词已同步改成「20–60 字，少于 20 字不作为证据」，
+#: 这里再硬卡一次：不足 20 字的规则**不落库**，不靠事后模糊匹配兜。
+#: 与 `app/retrieval/catalog_config.EVIDENCE_MIN_CHARS` 同值；两边都改才算改。
+EVIDENCE_MIN_CHARS = 20
+
 #: 场景类型关键词（用于场景均衡采样，确保每种场景都有足够样本）
 SCENE_KEYWORDS = {
     "病房/医疗": ["手术室", "病房", "医院", "医生", "护士", "病床", "抢救", "急救"],
@@ -100,7 +111,19 @@ SCENE_KEYWORDS = {
     "家中/起居": ["客厅", "卧室", "厨房", "书房", "沙发", "床上"],
 }
 
-#: 叙事档案要覆盖的维度（与 writer-novel-style-distiller 的维度设计对齐）
+#: **已停用**的维度：不再提取，但历史档案里的行原样保留、仍可读可回查。
+#:
+#: 高频场景模板（2026-11-13 停用，**有意为之，不是丢数据**）：
+#: 档案里 3,448 条中标题唯一的有 3,371 条（97.8%），实际是逐章剧情摘要而不是
+#: 「反复出现的场景模板」；建卡硬过滤只淘汰 53 条（全是模糊词），说明它不是被
+#: 过滤掉的，而是**本身就没有可复用的信号**。渲染侧每轮只取 1 条，而
+#: `chunk_meta.summary` + `scene_labels` 已覆盖同一用途。停用后每块少 1 次调用。
+#:
+#: 下一个看到维度清单少一项的人，先看这条，别当成漏抽。
+DEPRECATED_DIMENSIONS = ("高频场景模板",)
+
+#: 叙事档案要覆盖的维度（与 writer-novel-style-distiller 的维度设计对齐）。
+#: 已停用的维度不在此列，见 `DEPRECATED_DIMENSIONS`。
 NARRATIVE_DIMENSIONS = [
     "人物描写手法",
     "对白风格",
@@ -116,7 +139,6 @@ NARRATIVE_DIMENSIONS = [
     "文笔量化审计",
     # —— v5 新增维度 ——
     "节拍序列",
-    "高频场景模板",
     "潜台词模式",
 ]
 
@@ -193,7 +215,7 @@ DEFAULT_TIER = TIER_FULL
 #: 键是档位 key，新增档位时必须在这里补一项，否则 `to_public_dict` 会抛 KeyError
 #: ——宁可响亮地失败，也不要静默给错提示。
 _COST_HINTS: dict[str, str] = {
-    TIER_FULL: "最高（完整蒸馏：按语料量百分比采样、全维度、含角色名归一化）",
+    TIER_FULL: "最高（完整蒸馏：读全本、全维度、含角色名归一化）",
     TIER_BALANCED: "中等（固定 30 章，维度齐全，省掉角色名归一化）",
     TIER_FAST: "最低（固定 30 章 + 精简维度，只验证管线）",
 }
@@ -271,18 +293,21 @@ class NarrativeTier:
         }
 
 
-#: 快速档砍掉的三个维度。都是 v5 才引入的「增量能力」，对应 docs 里 v3 档的
-#: 实测维度数 11（14 − 3）。砍这三个 = 每块少 3 次 LLM 调用。
-_FAST_TIER_DROP_DIMENSIONS = ("节拍序列", "高频场景模板", "潜台词模式")
+#: 快速档砍掉的两个维度（都在 v5 引入的增量能力里）。砍这两个 = 每块少 2 次
+#: LLM 调用，维度数 13 → 11（与停用「高频场景模板」之前的快速档同为 11 维）。
+_FAST_TIER_DROP_DIMENSIONS = ("节拍序列", "潜台词模式")
 
 
 TIER_REGISTRY: dict[str, NarrativeTier] = {
     TIER_FULL: NarrativeTier(
         key=TIER_FULL,
         name="完整",
-        description="生产用。按语料量百分比采样，全维度，含语料自证的角色名归一化与全量伪角色清洗。最准也最慢。",
+        description="生产用。读全本（全书每一章），全维度，含语料自证的角色名归一化与全量伪角色清洗。最准也最慢。",
         sampling_mode="percentage",
-        sample_ratio=SAMPLE_RATIO,
+        # 1.0 = 全本。完整档不再按 30% 抽样——抽样只能看到每个故事弧的片段，
+        # 长篇的铺垫/回收经常隔着几百章，抽掉一半就断链。比例轴保留是为了
+        # 让 sample_cap / 其它档位仍能复用它；完整档固定取满。
+        sample_ratio=1.0,
         dimensions=tuple(NARRATIVE_DIMENSIONS),
         normalize_character_names=True,
         fake_character_cleaning="full",
@@ -430,6 +455,29 @@ def _load_done_chunks(db: Session, project_id: int, scope: str) -> dict[str, dic
         return {}
 
 
+def _chunk_provenance(db: Session, project_id: int, scope: str) -> dict[str, str]:
+    """读断点块的来源（`provider` 列）；老行没记过 → `"未知"`。
+
+    用途只有一个：续跑时把「这批断点是谁产的」写进日志。跨 provider 续跑时，
+    若来源分布出现多代，说明早先的块不是当前网关产的，排查证据质量时要分开看。
+    """
+    try:
+        from app.models import DistillChunk
+
+        rows = db.execute(
+            select(DistillChunk.chunk_key, DistillChunk.provider).where(
+                DistillChunk.project_id == project_id,
+                DistillChunk.scope == scope,
+            )
+        ).all()
+        return {str(k): (p or "未知") for k, p in rows}
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "读取断点来源失败 project_id=%s: %s", project_id, exc
+        )
+        return {}
+
+
 def _save_done_chunk(
     db: Session,
     project_id: int,
@@ -438,10 +486,15 @@ def _save_done_chunk(
     chunk_key: str,
     chapter_range: str,
     payload: dict,
+    provider: str | None = None,
+    endpoint: str | None = None,
 ) -> None:
     """落一个块的完成标记（幂等 upsert）。
 
     失败只记日志：存断点是增强，不能因为存断点失败就把整次蒸馏搞挂。
+
+    `provider` / `endpoint` 记录「这块是谁产的」：同 scope 下可能跨 provider 续跑，
+    没有这两列就分不清哪些块来自旧网关。老行保持 NULL，不回填。
     """
     try:
         from app.models import DistillChunk
@@ -455,6 +508,8 @@ def _save_done_chunk(
         )
         if existing is not None:
             existing.payload = payload
+            existing.provider = provider
+            existing.endpoint = endpoint
         else:
             start = end = None
             parts = (chapter_range or "").split("-")
@@ -469,6 +524,8 @@ def _save_done_chunk(
                     chapter_start=start,
                     chapter_end=end,
                     payload=payload,
+                    provider=provider,
+                    endpoint=endpoint,
                 )
             )
         db.commit()
@@ -499,6 +556,36 @@ def _clear_scope_chunks(db: Session, project_id: int, scope: str) -> None:
             db.rollback()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _clear_stale_scope_chunks(db: Session, project_id: int, keep_scope: str) -> int:
+    """换档/换语料后清掉旧 scope 的断点，返回删除行数。
+
+    scope 由「语料集合 + 档位 + 章数上限」算得：任一项变了，旧块就永远不会
+    再被续跑读到，留着只会残留过期语料、并在排查时混淆「这批切块哪来的」。
+    只删同项目的其它 scope，不动本次 scope 的断点。
+    """
+    try:
+        from app.models import DistillChunk
+
+        n = int(db.query(DistillChunk).filter(
+            DistillChunk.project_id == project_id,
+            DistillChunk.scope != keep_scope,
+        ).delete(synchronize_session=False))
+        db.commit()
+        if n:
+            logging.getLogger(__name__).info(
+                "清理换档残留蒸馏断点 project_id=%s keep=%s 删除=%s",
+                project_id, keep_scope, n)
+        return n
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "清理换档残留蒸馏断点失败 project_id=%s: %s", project_id, exc)
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
 
 
 def count_done_chunks(db: Session, project_id: int, scope: str) -> int:
@@ -534,16 +621,46 @@ def _apply_chunk_payload(
             all_forbidden.setdefault(str(dim), []).extend(items)
 
 
+def _merge_rows_into_chapters(rows) -> list[tuple[int, str]]:
+    """把同一 ``chapter_no`` 的块按 ``idx`` 顺序拼回整章。
+
+    入参 ``rows`` 必须已按 ``(chapter_no, idx, id)`` 排好序；本函数只做聚合，
+    不再排序。``chapter_no`` 为空的历史数据退化为用 ``idx`` 当章号。
+    """
+    chapters: list[list] = []
+    for row in rows:
+        ch_no = row.chapter_no if row.chapter_no is not None else row.idx
+        ch_no = int(ch_no)
+        text = row.text or ""
+        if chapters and chapters[-1][0] == ch_no:
+            if text:
+                prev = chapters[-1][1]
+                chapters[-1][1] = f"{prev}\n\n{text}" if prev else text
+        else:
+            chapters.append([ch_no, text])
+    return [(int(ch_no), str(text)) for ch_no, text in chapters]
+
+
 def _load_novel_chapters(db: Session, novel_id: int) -> list[tuple[int, str]]:
-    """加载一本语料的全部章节，返回 [(chapter_no, text), ...]，按章节号排序。"""
+    """加载一本语料的全部章节，返回 [(chapter_no, text), ...]，按章节号排序。
+
+    ``novel_chunks.idx`` 是**章内块序号**（每章从 0 重数），不能单独作为全书
+    排序键；这里按 ``(chapter_no, idx)`` 排序后，再把同一章的块拼回整章。
+    这样返回的每个元素才是一章完整正文，采样、漂移首尾章与 ``chapter_range``
+    都以真实章节为单位。
+    """
     from app.models import NovelChunk
 
     rows = db.scalars(
         select(NovelChunk)
         .where(NovelChunk.novel_id == novel_id)
-        .order_by(NovelChunk.idx)
+        .order_by(
+            func.coalesce(NovelChunk.chapter_no, NovelChunk.idx),
+            NovelChunk.idx,
+            NovelChunk.id,
+        )
     ).all()
-    return [(r.chapter_no or r.idx, r.text or "") for r in rows]
+    return _merge_rows_into_chapters(rows)
 
 
 def _sample_chapters(
@@ -593,14 +710,17 @@ def build_deterministic_features(chunk_text: str) -> dict:
     paras = [p.strip() for p in chunk_text.split("\n") if p.strip()]
     if not paras:
         return {}
-    sents = [s.strip() for s in re.split(r"(?<=[。！？…])", chunk_text) if s.strip()]
+    sents = stylometry.split_sentences(chunk_text)
     sent_lens = [len(s) for s in sents] or [0]
     para_lens = [len(p) for p in paras]
     n = len(chunk_text)
     per1k = 1000.0 / n if n else 0.0
 
-    # 对白：引号内容
-    dialogues = re.findall(r"[“「]([^”」]{1,500})[”」]", chunk_text)
+    # 对白：引号内容。
+    # 不加长度上限：旧写法 `{1,500}` 会让超过 500 字的整段对白**一条都不匹配**，
+    # 直接从「对白句数 / 平均长度 / 占正文比」里消失（P2-2 实测对白占比偏低）。
+    # 该修正只影响此后新蒸馏的块；已有档案里的历史块数字保持原样，不重算。
+    dialogues = re.findall(r"[“「]([^”」]+)[”」]", chunk_text)
     dlg_lens = [len(d) for d in dialogues]
     dlg_chars = sum(dlg_lens)
 
@@ -628,11 +748,19 @@ def build_deterministic_features(chunk_text: str) -> dict:
     variance = sum((x - mean_sl) ** 2 for x in sent_lens) / len(sent_lens)
     short_runs = re.findall(r"1+", ",".join("1" if x <= 5 else "0" for x in sent_lens))
 
+    # 口径警告（短句率差三倍的根因）：
+    # 这里的「短句」= 整句长度 <= 5，len(s) 含句末标点；不是全文统计里常见的
+    # 「<15 字」。novel 7 实测：块级 ≤5 中位 14.7%；全文 <15 为 41.0%。
+    # 差三倍是「阈值 5 vs 15」和「块级中位 vs 全文汇总」两个口径叠加的结果，
+    # 两者不可直接对账。保留 ≤15 一列只为以后比较，不替换 ≤5。
+    le5 = sum(1 for x in sent_lens if x <= 5) / len(sent_lens)
+    le15 = sum(1 for x in sent_lens if x <= 15) / len(sent_lens)
     return {
         "句长": {
             "均值": round(mean_sl, 1),
             "标准差": round(variance ** 0.5, 1),
-            "短句占比": round(sum(1 for x in sent_lens if x <= 5) / len(sent_lens), 3),
+            "短句占比": round(le5, 3),
+            "短句15占比": round(le15, 3),
             "最长连续短句": max((len(r) for r in short_runs), default=0),
         },
         "段落": {
@@ -674,9 +802,12 @@ def _format_features_prefix(feats: dict) -> str:
     )
     ratio = em.get("直陈除以动作")
     ratio_txt = f"，情绪直陈/动作承载 = {ratio}" if ratio is not None else ""
+    short_txt = f"短句(≤5字) {sl.get('短句占比', 0):.1%}"
+    if sl.get("短句15占比") is not None:
+        short_txt += f"（≤15字 {sl.get('短句15占比', 0):.1%}）"
     return (
         "【本块客观统计（系统计算，非模型推测）】\n"
-        f"句长 {sl.get('均值')}±{sl.get('标准差')} 字，短句(≤5字) {sl.get('短句占比', 0):.1%}，"
+        f"句长 {sl.get('均值')}±{sl.get('标准差')} 字，{short_txt}，"
         f"最长连续短句 {sl.get('最长连续短句')} 句\n"
         f"段落 {pa.get('段数')} 段，段长均值 {pa.get('段长均值')} 字，"
         f"一两句短段占 {pa.get('一两句短段占比', 0):.1%}，对白开头段占 {pa.get('对白开头段占比', 0):.1%}\n"
@@ -712,7 +843,11 @@ def _format_features_rule(feats: dict) -> str:
     su = feats.get("悬念", {})
     parts = [
         f"句长 {sl.get('均值')}±{sl.get('标准差')} 字",
-        f"短句占 {sl.get('短句占比', 0):.1%}",
+        f"短句(≤5字)占 {sl.get('短句占比', 0):.1%}",
+    ]
+    if sl.get("短句15占比") is not None:
+        parts.append(f"短句(≤15字)占 {sl.get('短句15占比', 0):.1%}")
+    parts += [
         f"一两句短段占 {pa.get('一两句短段占比', 0):.1%}",
         f"对白开头段占 {pa.get('对白开头段占比', 0):.1%}",
         f"对白占正文 {dl.get('占正文比', 0):.1%}",
@@ -748,13 +883,13 @@ def _build_extract_prompt(chunk_text: str, chunk_label: str) -> tuple[str, str]:
         "规则要求：\n"
         "1. 每条规则必须是**抽象的写作手法描述**，用你自己的话概括作者「怎么写的」，"
         "**绝对不要直接复制原文句子作为规则**\n"
-        "2. 规则描述后面括号里附**原文证据**——引用一句原文（≤20 字）证明这条规则存在\n"
+        "2. 规则描述后面括号里附**原文证据**——引用一句原文（20–60 字，少于 20 字不作为证据）证明这条规则存在\n"
         "3. 规则要**具体可操作**，例如「用连续动作描写紧张感」而不是「文笔好」\n"
         "4. 只提炼原文中**确实反复出现**的模式，不要编造\n"
         "5. 按以下维度分类输出\n\n"
         "**正确的规则示例**：\n"
-        "  人物描写手法: [\"用动作和神态暗示情绪，不直接写'害怕/紧张'（证据：指尖不自觉收紧）\", "
-        "\"对白后紧跟动作描写，不用'说道'收尾（证据：南宫爵沉声道）\"]\n"
+        "  人物描写手法: [\"用动作和神态暗示情绪，不直接写'害怕/紧张'（证据：他指尖不自觉收紧，连呼吸都放轻了，生怕被人听见）\", "
+        "\"对白后紧跟动作描写，不用'说道'收尾（证据：南宫爵沉声道：'你确定要现在动手？'说完已按住剑柄）\"]\n"
         "**错误的规则示例（不要这样输出）**：\n"
         "  人物描写手法: [\"小钟这话，可是壮着胆子说的。\", \"听言，南宫爵的黑眸顿时涌起了一阵冷厉。\"]\n\n"
         "输出格式（JSON）：\n"
@@ -846,12 +981,13 @@ def _build_extract_character_prompt(
         "3. **角色声音词典**：具体角色的说话习惯（口头禅/自称/语气/句长）\n\n"
         "规则要求：\n"
         "1. 每条规则必须是**抽象的写作手法描述**，不要直接复制原文\n"
-        "2. 规则后面括号里附**原文证据**——引用一句原文（≤20 字）\n"
+        "2. 规则后面括号里附**原文证据**——引用一句原文（20–60 字，少于 20 字不作为证据）\n"
         "3. 只提炼原文中**确实反复出现**的模式\n"
-        "4. **角色声音词典**里必须写出具体角色名，不能用「某角色」\n\n"
+        "4. **角色声音词典**里必须写出具体角色名，不能用「某角色」\n"
+        "5. 证据必须是原文中**连续的一整段**，不能把两句拼在一起，不能用省略号跳过中间内容\n\n"
         "**正确示例**：\n"
-        "  人物描写手法: [\"用动作暗示心理，不直接写内心独白（证据：指尖不自觉收紧）\"]\n"
-        "  角色声音词典: [\"徐凤年：口头禅「本世子」语气轻佻 句长短句 关系：对下属命令式（证据：本世子今日高兴）\"]\n\n"
+        "  人物描写手法: [\"用动作和神态暗示情绪，不直接写『害怕/紧张』（证据：他指尖不自觉收紧，连呼吸都放轻了，生怕被人听见）\"]\n"
+        "  角色声音词典: [\"徐凤年：口头禅「本世子」语气轻佻 句长短句 关系：对下属命令式（证据：南宫爵沉声道：『你确定要现在动手？』说完已按住剑柄）\"]\n\n"
         "**错误示例（不要这样输出）**：\n"
         "  人物描写手法: [\"小钟这话，可是壮着胆子说的。\"]\n\n"
         "输出格式（JSON）：\n"
@@ -888,7 +1024,7 @@ def _build_extract_narrative_prompt(
     """
     system = (
         "你是一位资深中文网文编辑，专精**结构与技法分析**。\n\n"
-        "本任务只提炼 7 个维度，全部围绕**叙事结构与文风技法**：\n"
+        "本任务提炼 7 个维度的规则，并附 **3 个块级字段**：\n"
         "1. **段落编排**：段长分布、段间过渡、对话与叙述的穿插\n"
         "2. **场景构建**：环境描写方式、空间切换手法\n"
         "3. **情绪表达**：情绪承载方式（动作/环境/直陈的取舍）\n"
@@ -898,12 +1034,24 @@ def _build_extract_narrative_prompt(
         "7. **伏笔与悬念设计**：悬念如何设置、揭示、回收\n\n"
         "规则要求：\n"
         "1. 每条规则必须是**抽象的写作手法描述**，不要直接复制原文\n"
-        "2. 规则后面括号里附**原文证据**——引用一句原文（≤20 字）\n"
+        "2. 规则后面括号里附**原文证据**——引用一句原文（20–60 字，少于 20 字不作为证据）\n"
         "3. 只提炼原文中**确实反复出现**的模式\n"
-        "4. 这 7 维关注的是「作者怎么写」而不是「写了什么」\n\n"
+        "4. 这 7 维关注的是「作者怎么写」而不是「写了什么」\n"
+        "5. 证据必须是原文中**连续的一整段**，不能把两句拼在一起，不能用省略号跳过中间内容\n"
+        "6. 另附三个**块级字段**（不是规则，不要写成多条句子）：\n"
+        "   - primary_scene：本段**主场景，有且只有一个**，从下面 14 个 key 里选：\n"
+        "     combat / daily / groupchat / trade / cultivate / travel / interrogate /\n"
+        "     reveal / intimacy / farewell / banquet / misunderstand / rescue / night\n"
+        "     过渡段、设定说明段没有明确场景时，写 \"none\"，不要硬套一个场景。\n"
+        "   - secondary_scenes：**0–1 个**次场景，没有就写空数组 []。\n"
+        "     **不要为了凑数而上报标签**——只有确实贯穿本段才写；\n"
+        "   - 章节摘要：**80–120 字**，只写本段发生了什么（人物、地点、冲突、结果），\n"
+        "     不评价、不抒情、不写「本段展现了…」这类分析句\n"
+        "   - 人物别名：本段出现的角色，「规范名」用最常见的完整姓名，\n"
+        "     「称呼」列文中用过的简称/称号/代称；**不要收**「那名男子」「安保队长」这类泛称\n\n"
         "**正确示例**：\n"
-        "  段落编排: [\"短段切对话节奏，长段铺环境氛围（证据：北凉王府龙盘虎踞于清凉山）\"]\n"
-        "  节奏控制: [\"冲突升级通过对话长度骤变，从短对白跳到大段独白（证据：萧炎说了一句……，然后……）\"]\n\n"
+        "  段落编排: [\"短段切对话节奏，长段铺环境氛围（证据：北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛，一眼望不到尽头）\"]\n"
+        "  节奏控制: [\"冲突升级通过对话长度骤变，从短对白跳到大段独白（证据：他话音还没落下，屋里的灯忽然灭了，院外传来一声极轻的脚步声）\"]\n\n"
         "**错误示例（不要这样输出）**：\n"
         "  段落编排: [\"北凉王府龙盘虎踞于清凉山，千门万户，极土木之盛。\"]\n\n"
         "输出格式（JSON）：\n"
@@ -914,7 +1062,11 @@ def _build_extract_narrative_prompt(
         '  "节奏控制": ["抽象规则（证据：原文引用）", ...],\n'
         '  "世界观呈现": ["抽象规则（证据：原文引用）", ...],\n'
         '  "剧情编排模式": ["伏笔埋设/冲突升级/转折手法（证据：原文引用）", ...],\n'
-        '  "伏笔与悬念设计": ["悬念如何设置/揭示/回收（证据：原文引用）", ...]\n'
+        '  "伏笔与悬念设计": ["悬念如何设置/揭示/回收（证据：原文引用）", ...],\n'
+        '  "primary_scene": "daily",\n'
+        '  "secondary_scenes": [],\n'
+        '  "章节摘要": "80–120 字，只写发生了什么",\n'
+        '  "人物别名": [{"规范名": "宋书航", "称呼": ["书航", "宋师兄"]}]\n'
         '}\n'
     )
     feats = build_deterministic_features(chunk_text)
@@ -962,7 +1114,7 @@ def _build_extract_structure_prompt(
         "3. **伏笔与悬念设计**：钩子如何埋设、悬念如何悬置、答案如何回收\n\n"
         "规则要求：\n"
         "1. 每条规则必须是**抽象的写作手法描述**，不要直接复制原文\n"
-        "2. 规则后面括号里附**原文证据**——引用一句原文（≤20 字）\n"
+        "2. 规则后面括号里附**原文证据**——引用一句原文（20–60 字，少于 20 字不作为证据）\n"
         "3. 只提炼原文中**确实反复出现**的模式\n"
         "4. 关注「作者怎么安排结构」而不是「写了什么剧情」\n"
         "5. 若这一块看不出一场完整冲突，就不要硬写「剧情编排模式」\n\n"
@@ -1009,7 +1161,7 @@ def _build_extract_technique_prompt(
         "4. **世界观呈现**：设定如何透露给读者（对话/旁白/动作/道具），而不是直接解释\n\n"
         "规则要求：\n"
         "1. 每条规则必须是**抽象的写作手法描述**，不要直接复制原文\n"
-        "2. 规则后面括号里附**原文证据**——引用一句原文（≤20 字）\n"
+        "2. 规则后面括号里附**原文证据**——引用一句原文（20–60 字，少于 20 字不作为证据）\n"
         "3. 只提炼原文中**确实反复出现**的模式\n"
         "4. 关注「作者怎么营造」而不是「营造出了什么」\n\n"
         "**正确示例**：\n"
@@ -1189,7 +1341,10 @@ def _validate_evidence(rule: str, chunk_text: str) -> bool:
         # LLM 可能直接引用了原文句子作为规则，没有加「证据：」前缀
         evidence = rule.strip()
 
-    if not evidence or len(evidence) < 4:
+    if not evidence or len(evidence) < EVIDENCE_MIN_CHARS:
+        # 2026-11-12：短证据不落库。短于 20 字的引文在章内无法唯一定位，
+        # 事后只能做两端锚定（弱锚点），模型看错上下文比没有更糟。
+        # 历史档案不重蒸，由检索侧的章窗口兜底；新档案必须从源头卡住。
         return False
 
     # 归一化：去空白 + 统一引号（LLM 常用单引号，原文用双引号）
@@ -1302,6 +1457,9 @@ def _sample_chapters_v6(
 ) -> list[tuple[int, str]]:
     """按百分比采样 + 对话密集优先 + 场景均衡。
 
+    ``chapters`` 必须是**真实章节**（一个 ``chapter_no`` 一条完整正文），由
+    ``_load_novel_chapters`` 按章聚合后传入；不再是 ``novel_chunks`` 的块行。
+
     策略：
     1. 按 ratio 计算采样量（603 章 × 30% = 180 章）
     2. 按场景类型分组，每种场景至少采样几章（确保覆盖面）
@@ -1336,7 +1494,7 @@ def _sample_chapters_v6(
         if not text:
             return 0.0
         quote_chars = 0
-        for q in ['"', '"', '"', "'", "'", "'"]:
+        for q in ("'", "\u2018", "\u2019", "\u201c", "\u201d", '"'):
             quote_chars += text.count(q)
         return quote_chars / max(len(text), 1)
 
@@ -1348,7 +1506,9 @@ def _sample_chapters_v6(
         st = _scene_type(text)
         scene_groups.setdefault(st, []).append((dialogue_ratio(text), ch_no, text))
 
-    # 每种场景至少取 3 章（对话密度最高的）
+    # 每种场景至少取 3 章（对话密度最高的）。
+    # chapters 已按章聚合，正常情况下 chapter_no 唯一；picked_nos 只用于防御
+    # 调用方传入未聚合的块行，避免同一章被重复计入。
     picked: list[tuple[int, str]] = []
     picked_nos: set[int] = set()
     per_scene_min = 3
@@ -1367,6 +1527,9 @@ def _sample_chapters_v6(
             key=lambda x: -x[0],
         )
         for _, ch_no, text in all_scored[:remaining]:
+            # 防御未聚合输入：同一章只收一次，避免重复块虚增覆盖。
+            if ch_no in picked_nos:
+                continue
             picked.append((ch_no, text))
             picked_nos.add(ch_no)
 
@@ -1378,6 +1541,10 @@ def _sample_chapters_fixed(
     chapters: list[tuple[int, str]], n_chapters: int
 ) -> list[tuple[int, str]]:
     """固定章数采样：均匀取 n_chapters 章，优先取后2/3（避开早期稚嫩期）。
+
+    ``chapters`` 是真实章节（一个 ``chapter_no`` 一条完整正文）。"取后 2/3"
+    指按章节号跳过全书前 1/3 的**章节**，再从剩余章节里均匀采样；不再是按
+    ``novel_chunks`` 块行跳过前 1/3（那会误把各章开头块当成"早期章节"）。
 
     平衡档 / 快速档用这个（docs 记载v3/v5 时代就是固定 30 章）。
     与 `_sample_chapters_v6` 的区别：**不做**对话密度排序、**不做**场景均衡——
@@ -2322,7 +2489,8 @@ _NAME_AUDIT_SYSTEM = (
 
 
 def _audit_character_names(
-    provider, voices: list[dict], *, max_names: int = 80,
+    provider, voices: list[dict], *, batch_size: int = 60,
+    max_names: int | None = None,
 ) -> dict:
     """用 LLM 粗筛角色名，**只标记不删除**（v2.265）。
 
@@ -2343,14 +2511,28 @@ def _audit_character_names(
     「能不能用来指人」是纯语言常识，不需要书的知识——换这个问法后
     真角色零误伤。
 
+    ## 全量覆盖，不静默截断（2026-11-12）
+
+    旧实现取 `audit_candidates[:80]` 后把 `skipped` 置真——417 条声音只审了
+    80 个名字。现在默认按 `batch_size` 分批审**全部候选**，`checked / batches /
+    failed_batches` 如实回报；单批失败只记失败，不阻断其余批次。
+
+    ## `max_names`：调用方显式限额（2026-11-15）
+
+    `max_names=None`（生产调用）保持全量覆盖；显式传入正整数时按上限截断
+    候选并把 `skipped` 置真——这是**调用方主动要求**的限额，不是静默截断。
+    旧签名缺这个参数，导致按旧契约调用的一侧直接 `TypeError` 崩掉。
+
     Args:
         provider: LLM provider。
         voices: 角色声音规则列表（每项含 "rule" 字段）。
-        max_names: 一次最多审多少个名字（控制 prompt 长度）。
+        batch_size: 每批送审多少个名字（控制单次 prompt 长度）。
+        max_names: 送审候选上限；None = 全量。
 
     Returns:
-        ``{"suspicious": [...], "checked": N, "skipped": bool}``。
-        **调用失败时返回空结果，不阻断蒸馏**。
+        ``{"suspicious": [...], "checked": N, "candidates": N,
+        "batches": N, "failed_batches": N, "skipped": bool}``。
+        **调用失败时如实记录，不阻断蒸馏**。
     """
     names: list[str] = []
     seen: set[str] = set()
@@ -2364,7 +2546,8 @@ def _audit_character_names(
             names.append(nm)
 
     if len(names) < 3:
-        return {"suspicious": [], "checked": len(names), "skipped": True}
+        return {"suspicious": [], "checked": len(names), "candidates": len(names),
+                "batches": 0, "failed_batches": 0, "skipped": True}
 
     # v2.265：先做**廉价预过滤**，只把「可疑候选」送给 LLM。
     #
@@ -2394,40 +2577,55 @@ def _audit_character_names(
     audit_candidates = [n for n in names if not _looks_like_person(n)]
 
     if not audit_candidates:
-        return {"suspicious": [], "checked": 0, "skipped": False,
+        return {"suspicious": [], "checked": 0, "candidates": 0,
+                "batches": 0, "failed_batches": 0, "skipped": False,
                 "note": "全部名字都是姓+名或具体化称谓，无需 LLM 审计"}
 
-    batch = audit_candidates[:max_names]
-    result = {"suspicious": [], "checked": len(batch),
-              "skipped": len(names) > max_names}
+    # 调用方显式限额（None = 全量）：截断候选并如实标 skipped。
+    truncated = False
+    if max_names is not None and max_names > 0 and len(audit_candidates) > max_names:
+        audit_candidates = audit_candidates[:max_names]
+        truncated = True
 
-    try:
-        raw = provider.chat(_NAME_AUDIT_SYSTEM, "词语：\n" + "、".join(batch))
-    except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).warning(
-            "角色名审计调用失败（不阻断）: %s", exc
-        )
-        return result
+    step = max(1, batch_size)
+    batches = [audit_candidates[i:i + step]
+               for i in range(0, len(audit_candidates), step)]
+    result = {"suspicious": [], "checked": 0, "candidates": len(audit_candidates),
+              "batches": len(batches), "failed_batches": 0, "skipped": truncated}
+    suspicious: list[str] = []
 
     import re as _re
     import json as _json
-    if not isinstance(raw, str):
-        return result
-    m = _re.search(r"\{.*\}", raw, _re.S)
-    if not m:
-        return result
-    try:
-        parsed = _json.loads(m.group(0))
-    except Exception:  # noqa: BLE001
-        return result
+    for batch in batches:
+        # `checked` 记**送审数**（含失败批次），失败另由 `failed_batches` 如实回报；
+        # 这样「调用失败」的返回里 checked 不会假性归零。
+        result["checked"] += len(batch)
+        try:
+            raw = provider.chat(_NAME_AUDIT_SYSTEM, "词语：\n" + "、".join(batch))
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "角色名审计调用失败（不阻断，本批 %d 个名字）: %s", len(batch), exc
+            )
+            result["failed_batches"] += 1
+            continue
+        if not isinstance(raw, str):
+            continue
+        m = _re.search(r"\{.*\}", raw, _re.S)
+        if not m:
+            continue
+        try:
+            parsed = _json.loads(m.group(0))
+        except Exception:  # noqa: BLE001
+            continue
 
-    bad = parsed.get("not_person") if isinstance(parsed, dict) else None
-    if not isinstance(bad, list):
-        return result
+        bad = parsed.get("not_person") if isinstance(parsed, dict) else None
+        if not isinstance(bad, list):
+            continue
 
-    # 只接受在本次清单里的词（防 LLM 编造）
-    valid = [b for b in bad if isinstance(b, str) and b in seen]
-    result["suspicious"] = valid
+        # 只接受在本次清单里的词（防 LLM 编造）
+        suspicious.extend(b for b in bad if isinstance(b, str) and b in seen)
+
+    result["suspicious"] = list(dict.fromkeys(suspicious))
     return result
 
 
@@ -2444,14 +2642,19 @@ def _build_beat_prompt(chunk_text: str, chunk_label: str) -> tuple[str, str]:
         "- 爆发：冲突顶点如何处理（谁说最后一句话/什么动作打断）\n"
         "- 余波：爆发后如何收束（沉默/转身离去/一句冷话）\n"
         "- 新钩子：如何引出下一场冲突\n\n"
-        "输出格式（JSON）：\n"
+        "证据要求：每步单独给一个「证据」字段，必须是从**给定文本逐字摘抄的连续 20–60 字**；"
+        "少于 20 字不作为证据，不能拼接两句，不能用省略号跳过中间内容。\n"
+        "章号要求：每步还要给「章」字段——这件事发生在第几章，必须是标题「第X-Y章」范围内的整数。\n"
+        "**禁止**把「证据」写成「原文引用」「原文连续 20–60 字」「略」这类占位说明，"
+        "必须是真实存在的那句话。\n\n"
+        "输出格式（JSON，示例仅示范结构，证据必须来自给定文本）：\n"
         '{\n'
         '  "节拍序列": [\n'
-        '    {"步骤": "铺垫", "写法": "具体怎么写（证据：原文引用）"},\n'
-        '    {"步骤": "升温", "写法": "具体怎么写（证据：原文引用）"},\n'
-        '    {"步骤": "爆发", "写法": "具体怎么写（证据：原文引用）"},\n'
-        '    {"步骤": "余波", "写法": "具体怎么写（证据：原文引用）"},\n'
-        '    {"步骤": "新钩子", "写法": "具体怎么写（证据：原文引用）"}\n'
+        '    {"步骤": "铺垫", "章": 11, "写法": "用环境细节先压一层不安，不点破", "证据": "楼道里的声控灯忽明忽暗，他敲了三下门，里面一直没动静"},\n'
+        '    {"步骤": "升温", "章": 12, "写法": "对话变短，只留问句", "证据": "「谁？」他贴着门问。屋里安静了几秒，才传来椅子腿刮地板的声音。"},\n'
+        '    {"步骤": "爆发", "章": 12, "写法": "用一个动作打断对话", "证据": "门忽然向内开了一条缝，一只手从缝隙里伸出来，抓向他的衣领。"},\n'
+        '    {"步骤": "余波", "章": 13, "写法": "不写结果，写旁观者的沉默", "证据": "走廊里没人说话，只有那盏灯还在响，一明一暗地照着他空掉的手。"},\n'
+        '    {"步骤": "新钩子", "章": 13, "写法": "用一句反常台词收尾", "证据": "「你终于来了。」门后的人说，「他们等你很久了。」"}\n'
         '  ]\n'
         '}\n'
     )
@@ -2476,11 +2679,14 @@ def _build_scene_template_prompt(chunk_text: str, chunk_label: str) -> tuple[str
         "2. 人物站位（谁站着/谁坐着/距离多远）\n"
         "3. 典型动作链（进入→对峙→动作→离场）\n"
         "4. 情绪基调（压抑/紧张/暧昧/冰冷）\n\n"
-        "输出格式（JSON）：\n"
+        "证据要求：每个场景必须有「证据」字段，是从**给定文本逐字摘抄的连续 20–60 字**；"
+        "少于 20 字不作为证据，不能拼接两句，不能用省略号。\n"
+        "**禁止**把「证据」写成「原文连续 20–60 字」「原文引用」「略」这类占位说明。\n\n"
+        "输出格式（JSON，示例仅示范结构，证据必须来自给定文本）：\n"
         '{\n'
         '  "场景模板": [\n'
-        '    {"场景": "病房", "环境": "...", "站位": "...", "动作链": "...", "基调": "..."},\n'
-        '    {"场景": "宴会", "环境": "...", "站位": "...", "动作链": "...", "基调": "..."}\n'
+        '    {"场景": "病房", "环境": "消毒水味、走廊白光、监护仪滴答", "站位": "病人靠床，家属背对门站着", "动作链": "进门→压低声音→看仪器→退到窗边", "基调": "压抑", "证据": "消毒水的味道混着走廊的白光涌进来，监护仪的滴答声一下一下敲在墙上"},\n'
+        '    {"场景": "宴会", "环境": "水晶灯、碰杯声、香水味", "站位": "主人居中，客人围成半圈", "动作链": "迎客→寒暄→敬酒→找角落", "基调": "热闹里带试探", "证据": "水晶灯下人影晃动，酒杯碰在一起的声音一阵接一阵，谁也听不清谁在说什么"}\n'
         '  ]\n'
         '}\n'
     )
@@ -2505,11 +2711,14 @@ def _build_subtext_prompt(chunk_text: str, chunk_label: str) -> tuple[str, str]:
         "3. 沉默/停顿（不说话比说话更有力）\n"
         "4. 借题发挥（借他人之事说自己）\n"
         "5. 命令式关心（用命令语气表达担心）\n\n"
-        "输出格式（JSON）：\n"
+        "证据要求：每个模式必须有「证据」字段，是从**给定文本逐字摘抄的连续 20–60 字**；"
+        "少于 20 字不作为证据，不能拼接两句，不能用省略号。\n"
+        "**禁止**把「证据」写成「原文连续 20–60 字」「原文引用」「略」这类占位说明。\n\n"
+        "输出格式（JSON，示例仅示范结构，证据必须来自给定文本）：\n"
         '{\n'
         '  "潜台词模式": [\n'
-        '    {"模式": "反话正说", "写法": "具体怎么写（证据：原文引用）"},\n'
-        '    {"模式": "沉默施压", "写法": "具体怎么写（证据：原文引用）"}\n'
+        '    {"模式": "反话正说", "写法": "嘴上说没事，手上动作暴露", "证据": "「我挺好的。」她说着，把杯子放回桌上，杯底磕出一声轻响。"},\n'
+        '    {"模式": "沉默施压", "写法": "不接话，只重复对方的问句", "证据": "「你真要这么做？」他没抬头，又慢慢问了一遍：「你真要这么做？」"}\n'
         '  ]\n'
         '}\n'
     )
@@ -2517,6 +2726,40 @@ def _build_subtext_prompt(chunk_text: str, chunk_label: str) -> tuple[str, str]:
         f"以下是《{chunk_label}》的片段，请提炼对白潜台词模式：\n\n"
         f"{chunk_text}\n\n"
         "请按上述格式输出 JSON。每个模式必须附原文证据。"
+    )
+    return system, user
+
+
+def _build_kg_events_prompt(chunk_text: str, chunk_label: str) -> tuple[str, str]:
+    """构造「每块 KG 事件」抽取 prompt（第 6 个调用，默认关闭）。
+
+    为什么单独一次调用而不是塞进主提炼：主提炼输出的是「怎么写」的抽象规则，
+    事件抽取输出的是「发生了什么」的事实清单，两者在提示词里互相稀释。
+    做成开关（`with_kg_events`）是为了先拿主流程的数据，再决定是否默认开。
+
+    字段与 `kg/build.py` 的 timeline 节点对齐：章号 + 事件 + 人物 + 地点 + 后果。
+    """
+    system = (
+        "你是一位中文小说的事件抽取器。任务：从给定片段中抽出**剧情事件**，"
+        "供故事线时间线使用。\n\n"
+        "规则：\n"
+        "1. 只抽**推动剧情的事实**（谁做了什么、结果如何），不抽氛围描写、心理活动、设定说明\n"
+        "2. 每块最多 12 条，按时间顺序排列；同一件事不要拆成多条\n"
+        "3. 「章」必须是标题「第X-Y章」范围内的整数\n"
+        "4. 「人物」只写规范全名，不要写「他」「那名男子」这类代称\n"
+        "5. 「证据」必须是从给定文本逐字摘抄的连续 20–60 字，禁止写占位说明\n"
+        "6. 没有明显剧情事件的过渡块，返回空数组 `[]`，不要硬凑\n\n"
+        "输出格式（JSON）：\n"
+        '{\n'
+        '  "事件": [\n'
+        '    {"章": 12, "事件": "宋书航在楼道被伏击，对方抢走玉简", "人物": ["宋书航", "羽柔子"], "地点": "公寓楼道", "后果": "玉简丢失，主线目标转为追查", "证据": "他刚走到三楼拐角，一道黑影从消防通道里闪出来，抬手就朝他怀里的布包抓去"}\n'
+        '  ]\n'
+        '}\n'
+    )
+    user = (
+        f"以下是《{chunk_label}》的片段，请抽取剧情事件：\n\n"
+        f"{chunk_text}\n\n"
+        "请按上述格式输出 JSON。"
     )
     return system, user
 
@@ -2813,10 +3056,14 @@ def _extract_character_voices(
     return results
 
 
-def _build_drift_prompt(chunks_info: list[tuple[str, str]], chunk_label: str) -> tuple[str, str]:
+def _build_drift_prompt(chunks_info: list[tuple[str, str]], chunk_label: str,
+                        metrics_text: str = "") -> tuple[str, str]:
     """构造文风漂移对比的 prompt。
 
-    传入多个时间段的文本片段，让 LLM 对比文风变化。
+    `chunks_info` 是**整段全文**（早期前 5 章 / 晚期后 5 章），不再截 2000 字——
+    不到一章的样本得不出「对白密度变化」这种需要跨章统计的结论。
+    `metrics_text` 是同一时期首/末 10 块的确定性统计，要求模型解释数字而不是
+    凭观感猜（历史上它曾给出与 635 个量化块相反的「对白密度升高」）。
     """
     system = (
         "你是一位资深中文网文编辑。你的任务是对比**同一作者在不同时期的文风差异**。\n\n"
@@ -2826,6 +3073,11 @@ def _build_drift_prompt(chunks_info: list[tuple[str, str]], chunk_label: str) ->
         "3. 描写细腻度变化\n"
         "4. 叙事结构复杂度变化\n"
         "5. 用词偏好变化\n\n"
+        "硬性要求：\n"
+        "- 每个结论必须引用下面给出的客观统计数字，说明方向（变大/变小）与幅度"
+        "（约几个百分点 / 几个字）。\n"
+        "- 如果文本读感与统计数字冲突，**以统计数字为准**，并解释为什么读起来会不同。\n"
+        "- 不许出现没有任何数字支撑的纯观感描述。\n\n"
         "输出格式（JSON）：\n"
         '{\n'
         '  "漂移总结": "整体趋势描述",\n'
@@ -2836,13 +3088,43 @@ def _build_drift_prompt(chunks_info: list[tuple[str, str]], chunk_label: str) ->
     )
     parts = []
     for period_name, text in chunks_info:
-        parts.append(f"【{period_name}】\n{text[:2000]}")
-    user = (
-        f"以下是《{chunk_label}》在不同时期的片段：\n\n"
-        + "\n\n---\n\n".join(parts)
-        + "\n\n请按上述维度对比输出 JSON。"
-    )
+        parts.append(f"【{period_name}】\n{text}")
+    user = f"以下是《{chunk_label}》在不同时期的全文片段：\n\n" + "\n\n---\n\n".join(parts)
+    if metrics_text:
+        user += "\n\n" + metrics_text
+    user += "\n\n请按上述维度对比输出 JSON，所有结论都要引用上面的统计数字。"
     return system, user
+
+
+def _format_drift_metrics(early_feats: dict, late_feats: dict) -> str:
+    """把首/末 10 块的确定性指标渲染成漂移 prompt 的对照数据。"""
+    if not early_feats or not late_feats:
+        return ""
+
+    def row(label, getter):
+        e, l = getter(early_feats), getter(late_feats)
+        if e is None or l is None:
+            return None
+        return f"- {label}：早期 {e} → 晚期 {l}"
+
+    rows = [
+        row("对白占正文比", lambda f: f"{f['对白']['占正文比']:.1%}"),
+        row("对白平均长度（字）", lambda f: f["对白"]["平均长度"]),
+        row("句长均值（字）", lambda f: f["句长"]["均值"]),
+        row("短句(≤5字)占比", lambda f: f"{f['句长']['短句占比']:.1%}"),
+        row("段长均值（字）", lambda f: f["段落"]["段长均值"]),
+        row("一两句短段占比", lambda f: f"{f['段落']['一两句短段占比']:.1%}"),
+        row("情绪直陈/千字", lambda f: f["情绪"]["直陈密度每千字"]),
+        row("动作承载/千字", lambda f: f["情绪"]["动作承载密度每千字"]),
+        row("问号/千字", lambda f: f["悬念"]["问号每千字"]),
+        row("省略号/千字", lambda f: f["悬念"]["省略号每千字"]),
+    ]
+    rows = [r for r in rows if r]
+    return (
+        "【系统实测：首 10 块 vs 末 10 块（确定性统计，非模型推测）】\n"
+        + "\n".join(rows)
+        + "\n以上数字是精确计算的结果，结论必须与它们一致。"
+    )
 
 
 def resolve_distill_provider():
@@ -3114,6 +3396,78 @@ def _gather_chat(
     return asyncio.run(_gather_chat_async(provider, prompts, max_concurrent, on_done))
 
 
+def _stream_chunks(
+    provider,
+    chunk_specs: list[dict],
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+    on_done: Callable[[int, int], None] | None = None,
+    on_chunk: Callable[[dict, list], None] | None = None,
+) -> None:
+    """按**块**流式执行：某块的 prompt 全部返回就立刻回调，不再等整本 gather。
+
+    ## 为什么不能再用一次大 gather（2026-11-12 五小时额度墙的教训）
+
+    旧实现把一个语料所有块的 5 个 prompt 拍平成几百条，一次
+    `asyncio.gather` 等**全部**返回后才逐块处理、逐块 `_save_done_chunk`。
+    于是 04:56 撞上 MiniMax 五小时额度墙时，一整本书已经跑完的 160 块也
+    一起丢在内存里（`distill_chunks` 一行没写），只能从头再来。
+
+    现在每个块是一个独立协程：它自己的 5 条调用一返回，就立刻把这块交给
+    `on_chunk` 解析并落库。撞墙最多损失**在飞的十几块**，已完成块全部保住。
+
+    `max_concurrent` 仍然限制**单条 LLM 调用**的并发（不是块数），与旧口径
+    一致；`on_done` 仍是每有一条调用返回就触发的心跳。
+    """
+
+    if not chunk_specs:
+        return
+    asyncio.run(
+        _stream_chunks_async(provider, chunk_specs, max_concurrent, on_done, on_chunk)
+    )
+
+
+async def _stream_chunks_async(
+    provider,
+    chunk_specs: list[dict],
+    max_concurrent: int,
+    on_done: Callable[[int, int], None] | None,
+    on_chunk: Callable[[dict, list], None] | None,
+) -> None:
+    sem = asyncio.Semaphore(max_concurrent)
+    total = sum(len(s["prompts"]) for s in chunk_specs)
+    done = 0
+
+    async def _call(prompt: tuple[str, str, dict | None]):
+        nonlocal done
+        async with sem:
+            try:
+                return await provider.async_chat(
+                    prompt[0], prompt[1], constraints=prompt[2]
+                )
+            except Exception as exc:  # noqa: BLE001 —— 单条失败只回传给本块
+                return exc
+            finally:
+                done += 1
+                if on_done is not None:
+                    try:
+                        on_done(done, total)
+                    except Exception:  # noqa: BLE001 —— 心跳失败不阻断蒸馏
+                        pass
+
+    async def _one_chunk(spec: dict):
+        raws = await asyncio.gather(*(_call(p) for p in spec["prompts"]))
+        if on_chunk is not None:
+            try:
+                on_chunk(spec, list(raws))
+            except Exception as exc:  # noqa: BLE001 —— 单块解析/落库失败不阻断其余块
+                logging.getLogger(__name__).warning(
+                    "蒸馏块处理失败 novel_id=%s range=%s: %s",
+                    spec.get("nid"), spec.get("cr"), exc,
+                )
+
+    await asyncio.gather(*(_one_chunk(s) for s in chunk_specs))
+
+
 def _ensure_reference_graphs(
     db: Session,
     project,
@@ -3183,6 +3537,157 @@ def _ensure_reference_graphs(
     return stats
 
 
+#: 14 个 L2 场景 key（与 `retrieval/catalog_config.py` 的 SCENE_LEXICON 对齐）。
+#: 蒸馏时由模型标注，检索时只作**先验/软信号**，不当 ground truth 用。
+SCENE_LABEL_KEYS = (
+    "combat", "daily", "groupchat", "trade", "cultivate", "travel",
+    "interrogate", "reveal", "intimacy", "farewell", "banquet",
+    "misunderstand", "rescue", "night",
+)
+
+_SCENE_LABEL_ALIASES = {
+    "战斗对峙": "combat", "日常琐事": "daily", "群聊多声部": "groupchat",
+    "交易交换": "trade", "修炼疗伤": "cultivate", "赶路移动": "travel",
+    "审讯盘问": "interrogate", "揭示爆料": "reveal", "情感亲密": "intimacy",
+    "离别告别": "farewell", "宴席聚会": "banquet", "误会冲突": "misunderstand",
+    "救援脱困": "rescue", "夜谈独处": "night",
+}
+
+
+def _norm_scene_label(value: Any) -> str | None:
+    """把模型给的场景标签归一到 14 个 ASCII key；不认识返回 None。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text in SCENE_LABEL_KEYS:
+        return text
+    if text in _SCENE_LABEL_ALIASES:
+        return _SCENE_LABEL_ALIASES[text]
+    low = text.lower()
+    return low if low in SCENE_LABEL_KEYS else None
+
+
+def _parse_chunk_meta(
+    parsed: dict, novel_id: int, chapter_range: str
+) -> tuple[dict, list[str]]:
+    """从主提炼结果里取三个块级字段，**逐字段容错**。
+
+    返回 `(meta, missing_fields)`。任何字段缺失/类型不对只记名字，
+    不抛异常、不拖垮同块的其他字段与规则落库。
+    """
+    missing: list[str] = []
+    meta: dict = {
+        "novel_id": int(novel_id),
+        "chapter_range": chapter_range,
+        "primary_scene": "",
+        "secondary_scenes": [],
+        "scene_labels": [],
+        "summary": "",
+        "characters": [],
+    }
+
+    # 主场景：有且只有一个；"none" 表示过渡/设定说明段，不算缺失。
+    raw_primary = parsed.get("primary_scene")
+    primary: str | None = None
+    if isinstance(raw_primary, str):
+        text = raw_primary.strip()
+        if text.lower() == "none":
+            primary = "none"
+        else:
+            primary = _norm_scene_label(text)
+    # 兼容上一版提示词的「场景标签」数组：只取第一个当主场景。
+    if primary is None and isinstance(parsed.get("场景标签"), list):
+        legacy = parsed["场景标签"]
+        primary = _norm_scene_label(legacy[0]) if legacy else None
+    if primary is None:
+        missing.append("primary_scene")
+
+    # 次场景：0–1 个；没有就是空数组，不许凑数。
+    secondary: list[str] = []
+    raw_secondary = parsed.get("secondary_scenes")
+    if isinstance(raw_secondary, list):
+        for item in raw_secondary:
+            key = _norm_scene_label(item)
+            if not key or key == primary or key in secondary:
+                continue
+            secondary.append(key)
+        secondary = secondary[:1]
+
+    meta["primary_scene"] = primary or ""
+    meta["secondary_scenes"] = secondary
+    # 兼容字段：主 + 次（旧消费方读 scene_labels 时仍能拿到）。
+    meta["scene_labels"] = (
+        ([primary] if primary and primary != "none" else []) + secondary
+    )
+
+    raw_summary = parsed.get("章节摘要")
+    if isinstance(raw_summary, str) and raw_summary.strip():
+        meta["summary"] = raw_summary.strip()
+    else:
+        missing.append("章节摘要")
+
+    raw_chars = parsed.get("人物别名")
+    if isinstance(raw_chars, list):
+        for item in raw_chars:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("规范名") or "").strip()
+            if not name:
+                continue
+            aliases = [
+                str(a).strip() for a in (item.get("称呼") or [])
+                if str(a).strip()
+            ]
+            meta["characters"].append({"name": name, "aliases": aliases[:8]})
+        if not meta["characters"]:
+            missing.append("人物别名")
+    else:
+        missing.append("人物别名")
+
+    return meta, missing
+
+
+def _parse_kg_events(
+    parsed: dict, novel_id: int, chapter_range: str, chapter_nos: list[int]
+) -> tuple[list[dict], list[str]]:
+    """解析每块 KG 事件（可选第 6 个调用）。逐条容错。"""
+    missing: list[str] = []
+    raw = parsed.get("事件")
+    if not isinstance(raw, list):
+        return [], ["kg_events"]
+    events: list[dict] = []
+    for item in raw[:12]:
+        if not isinstance(item, dict):
+            continue
+        desc = str(item.get("事件") or "").strip()
+        if not desc:
+            continue
+        chapter_no: int | None = None
+        try:
+            chapter_no = int(item.get("章"))
+        except (TypeError, ValueError):
+            chapter_no = None
+        chapter_ok = chapter_no is not None and chapter_no in chapter_nos
+        if not chapter_ok:
+            missing.append("kg_events.章")
+            chapter_no = chapter_nos[0] if chapter_nos else None
+        events.append({
+            "novel_id": int(novel_id),
+            "chapter_range": chapter_range,
+            "chapter_no": chapter_no,
+            "chapter_guess_ok": chapter_ok,
+            "event": desc,
+            "characters": [
+                str(c).strip() for c in (item.get("人物") or [])
+                if str(c).strip()
+            ],
+            "location": str(item.get("地点") or "").strip(),
+            "impact": str(item.get("后果") or "").strip(),
+            "evidence": str(item.get("证据") or "").strip(),
+        })
+    return events, missing
+
+
 def extract_narrative_profile(
     db: Session,
     project,
@@ -3193,6 +3698,8 @@ def extract_narrative_profile(
     progress: ProgressCallback | None = None,
     heartbeat: HeartbeatCallback | None = None,
     resume: bool = False,
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+    with_kg_events: bool = False,
 ) -> dict:
     """从参考语料提炼叙事档案。
 
@@ -3211,6 +3718,11 @@ def extract_narrative_profile(
         resume: 是否复用 `distill_chunks` 里已完成的块（断点续跑）。True 时
             已完成块不建 prompt、不调 LLM，直接回灌净产出；False（默认）时
             行为与引入续跑之前逐字节一致——生成路径走的就是不传的那条。
+        max_concurrent: 单本语料的 LLM 并发数（默认 5，按智谱免费档调过）。
+            付费模型可调高；只是并发窗口，不影响采样、维度与产出结构。
+        with_kg_events: 是否每块多跑一次「KG 事件抽取」（第 6 个调用）。
+            默认关闭；开启后单块 6 次调用，产出 `kg_events` 顶层字段。
+            做成开关是为了先看主流程数据，再决定是否默认开。
 
     返回结构（可直接 JSON 落库到 `Project.style_narrative`）：
     {
@@ -3244,6 +3756,11 @@ def extract_narrative_profile(
         dim: [] for dim in tier_dims + ["文风漂移分析"]
     }
     all_forbidden: dict[str, list[str]] = {dim: [] for dim in FORBIDDEN_DIMENSIONS}
+    #: 块级附加字段（场景标签 / 章节摘要 / 人物别名）与 KG 事件。
+    #: 逐字段容错：某个字段解析失败只记 field_missing，不影响规则落库。
+    all_chunk_meta: list[dict] = []
+    all_kg_events: list[dict] = []
+    field_missing: dict[str, int] = {}
     rejected = 0
     #: v2.265 角色名审计结果（只标记不删除，供人工复核）
     voice_audit: dict | None = None
@@ -3271,11 +3788,18 @@ def extract_narrative_profile(
     # —— 断点续跑：先读本 scope 下已完成的块 ——
     # 只有 resume=True 才回灌；False 时整条链路与引入续跑之前一致。
     scope = distill_resume_scope(novel_ids, cfg, max_chapters)
+    # 换档/换语料 → 旧 scope 的切块清掉，避免下一次蒸馏读到过期语料。
+    _clear_stale_scope_chunks(db, project.id, scope)
     done_chunks: dict[str, dict] = (
         _load_done_chunks(db, project.id, scope) if resume else {}
     )
     #: 起始进度 = 已保留的主提炼块数。不归零——续跑的进度条要从上次停的地方接着走。
     blocks_done = sum(1 for k in done_chunks if not k.startswith(_AUX_KEY_PREFIX))
+    if resume and done_chunks:
+        prov: dict[str, int] = {}
+        for src in _chunk_provenance(db, project.id, scope).values():
+            prov[src] = prov.get(src, 0) + 1
+        logging.getLogger(__name__).info("断点来源分布：%s", prov)
 
     if progress is not None:
         progress("正在准备参考语料", 0, 0)
@@ -3295,18 +3819,24 @@ def extract_narrative_profile(
     # 这里做前置补齐：缺图才建，已有则跳过（幂等，一次全量规则抽取，实测秒级）。
     _ensure_reference_graphs(db, project, novel_ids, progress=progress)
 
+    novel_texts: dict[int, str] = {}
     for book_idx, nid in enumerate(novel_ids, start=1):
         chapters = _load_novel_chapters(db, nid)
         if not chapters:
             continue
+        # 角色声音的出场频次按**全书**精确计数（不是按采样块），供渲染层按用途排序。
+        novel_texts[int(nid)] = "\n".join(t for _, t in chapters if t)
 
         # 按档位采样：完整档走百分比 + 对话密集优先 + 场景均衡；
         # 平衡/快速档走固定章数均匀采样。
         sampled = sample_chapters_for_tier(chapters, cfg)
         total_chapters += len(sampled)
 
-        # 分块：每块约 20 章（180 章 / 3 块 = 60 章/块，但限制块大小防止 prompt 过长）
-        chunk_size = max(MIN_CHAPTERS_PER_CHUNK, min(len(sampled) // 3, 20))
+        # 分块：固定 5 个真实章节一块（= MIN_CHAPTERS_PER_CHUNK）。
+        # 20 章一块在完整档读全本后单块可达 16 万字，超出多数模型上下文；
+        # 5 章一块把单块压到约 3~4 万字，同时保留足够的跨章上下文。
+        # 章已按 chapter_no 聚合，块内 chapter_range 单调递增。
+        chunk_size = MIN_CHAPTERS_PER_CHUNK
         chunk_starts = list(range(0, len(sampled), chunk_size))
         n_chunks = len(chunk_starts)
 
@@ -3337,6 +3867,10 @@ def extract_narrative_profile(
                 pending_chunks.append(spec)
                 continue
             _apply_chunk_payload(stored, all_rules, all_forbidden)
+            if isinstance(stored.get("meta"), dict):
+                all_chunk_meta.append(stored["meta"])
+            if isinstance(stored.get("kg_events"), list):
+                all_kg_events.extend(stored["kg_events"])
             rejected += int(stored.get("rejected") or 0)
             chunks_attempted += 1
             restored_here += 1
@@ -3418,7 +3952,11 @@ def extract_narrative_profile(
             chunk_prompts.append((en_system, en_user, None))
             chunk_prompt_kinds.append("extract_narrative")
 
-            if i == 0:
+            # 反向禁忌只取全书第一块：这是「作者从不用的表达」的全局结论，
+            # 每块都跑一遍既贵又容易被局部片段带偏。这里必须用块序号 ci 判断；
+            # 旧代码误用了上一个循环遗留的 i（= 最后一块的起始下标），
+            # 导致多块语料永远不构造这条 prompt，FORBIDDEN_DIMENSIONS 恒为空。
+            if ci == 0:
                 f_system, f_user = _build_forbidden_prompt(chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
                 chunk_prompts.append((f_system, f_user, None))
                 chunk_prompt_kinds.append("forbidden")
@@ -3438,8 +3976,16 @@ def extract_narrative_profile(
                 chunk_prompts.append((st_system, st_user, None))
                 chunk_prompt_kinds.append("subtext")
 
+            if with_kg_events:
+                k_system, k_user = _build_kg_events_prompt(
+                    chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章"
+                )
+                chunk_prompts.append((k_system, k_user, None))
+                chunk_prompt_kinds.append("kg_events")
+
             chunk_specs.append({
                 "ci": ci,
+                "nid": nid,
                 "text": chunk_text,
                 "chunk": chunk,
                 "cr": chapter_range,
@@ -3448,51 +3994,22 @@ def extract_narrative_profile(
                 "kinds": chunk_prompt_kinds,
             })
 
-        # 拍平所有 prompt + meta，跑一次 gather
-        flat_prompts: list[tuple[str, str, dict | None]] = []
-        flat_meta: list[dict] = []  # 与 flat_prompts 一一对应
-        for spec in chunk_specs:
-            for kind, p in zip(spec["kinds"], spec["prompts"]):
-                flat_prompts.append(p)
-                flat_meta.append({"ci": spec["ci"], "kind": kind, "spec": spec})
+        def _consume_chunk(spec: dict, raws: list) -> None:
+            """一块的 5 个维度都回来了：解析 → 并入累加器 → 立刻落库并 commit。
 
-        if flat_prompts:
-            try:
-                flat_raws = _gather_chat(
-                    provider, flat_prompts,
-                    on_done=_bind_heartbeat(
-                        heartbeat, f"语料 {book_idx}/{total_books}：并发提炼中"
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logging.getLogger(__name__).warning(
-                    "叙事提炼全 chunk 失败 novel_id=%s: %s", nid, exc
-                )
-                flat_raws = [Exception(str(exc))] * len(flat_prompts)
-        else:
-            flat_raws = []
-
-        # 按 ci 桶回来
-        bucketed: dict[int, dict] = {}
-        for raw, meta in zip(flat_raws, flat_meta):
-            ci = meta["ci"]
-            if ci not in bucketed:
-                spec = meta["spec"]
-                bucketed[ci] = {
-                    "raws": [],
-                    "kinds": [],
-                    "text": spec["text"],
-                    "chunk": spec["chunk"],
-                    "cr": spec["cr"],
-                    "key": spec["key"],
-                }
-            bucketed[ci]["raws"].append(raw)
-            bucketed[ci]["kinds"].append(meta["kind"])
-
-        # 按 ci 顺序处理（保证输出可复现）
-        for ci in sorted(bucketed.keys()):
-            b = bucketed[ci]
-
+            由 `_stream_chunks` 在**每块自己的调用全部返回后**立即回调，不再
+            等整本语料 gather。块解析/落库异常由调用方兜住，不影响其余块。
+            """
+            nonlocal blocks_done, rejected, chunks_attempted, failed_chunks
+            ci = spec["ci"]
+            b = {
+                "raws": raws,
+                "kinds": spec["kinds"],
+                "text": spec["text"],
+                "chunk": spec["chunk"],
+                "cr": spec["cr"],
+                "key": spec["key"],
+            }
             # 每处理完一块 blocks_done 就 +1（含失败块——它也算「跑过」）。
             # blocks_done 起始值已含续跑回灌的块数，所以进度条不会归零。
             blocks_done += 1
@@ -3507,6 +4024,26 @@ def extract_narrative_profile(
             chunk_text = b["text"]
             chunk = b["chunk"]
             chunk_key = b["key"]
+
+            # 2026-11-12：本块的**真实** novel_chunks 行与整章文本，一次查好。
+            # 旧档案只写 chunk[0][0]（蒸馏块起始章），证据实际章最多偏 4 章，
+            # 检索侧只能拿 5 章窗口硬找。新档案逐条写 chunk_id + evidence_chapter_no。
+            block_rows, chapter_norm = _load_block_chunk_rows(
+                db, nid, [ch for ch, _ in chunk]
+            )
+
+            def _anchor_fields(rule: str) -> dict:
+                """证据 → 真实块 id + 证据实际章号的落库字段。"""
+                cid, ech = _resolve_evidence_anchor(
+                    _rule_evidence(rule), block_rows, chapter_norm
+                )
+                return {
+                    "chunk_id": cid,
+                    "distill_chunk_key": chunk_key,
+                    "chapter_range": chapter_range,
+                    "evidence_chapter_no": ech if ech is not None else chunk[0][0],
+                }
+
             # 本块净产出先收在局部：解析成功才一次性并入累加器 + 落断点。
             # 失败块什么都不写（续跑时会被重新尝试），因此 failed_chunks 不会跨轮累加。
             chunk_rules: dict[str, list[dict]] = {}
@@ -3518,10 +4055,12 @@ def extract_narrative_profile(
             # 这是该维度从 LLM 输出清单里移除后唯一的数据来源。
             _feats = build_deterministic_features(chunk_text)
             if _feats:
+                _feat_rule = _format_features_rule(_feats)
                 chunk_rules.setdefault("文笔量化审计", []).append({
-                    "rule": _format_features_rule(_feats),
+                    "rule": _feat_rule,
                     "novel_id": nid,
                     "chapter_no": chunk[0][0],
+                    **_anchor_fields(_feat_rule),
                 })
 
             # 按 kind 取出 raw
@@ -3572,7 +4111,31 @@ def extract_narrative_profile(
                 # 「文笔量化审计」不依赖 LLM，没有理由跟着失败一起丢。
                 for dim, items in chunk_rules.items():
                     all_rules.setdefault(dim, []).extend(items)
-                continue
+                return  # 失败块不落断点（续跑时重试），本块到此结束
+
+            # —— 块级附加字段（场景标签 / 章节摘要 / 人物别名）——
+            # 逐字段容错：缺哪个就记 field_missing，其余字段照常落库。
+            chunk_meta, meta_missing = _parse_chunk_meta(parsed, nid, chapter_range)
+            for name in meta_missing:
+                field_missing[name] = field_missing.get(name, 0) + 1
+
+            # —— 可选：KG 事件（第 6 个调用）——
+            chunk_kg: list[dict] = []
+            if with_kg_events:
+                kg_raw = _raw_for("kg_events")
+                kg_parsed = (
+                    _parse_extract_result(kg_raw) if kg_raw is not None else None
+                )
+                if isinstance(kg_parsed, dict):
+                    chunk_kg, kg_missing = _parse_kg_events(
+                        kg_parsed, nid, chapter_range, [ch for ch, _ in chunk]
+                    )
+                    for name in kg_missing:
+                        field_missing[name] = field_missing.get(name, 0) + 1
+                else:
+                    field_missing["kg_events"] = (
+                        field_missing.get("kg_events", 0) + 1
+                    )
 
             for dim in tier_dims:
                 items = parsed.get(dim)
@@ -3593,6 +4156,7 @@ def extract_narrative_profile(
                         "rule": rule.strip(),
                         "novel_id": nid,
                         "chapter_no": chunk[0][0],
+                        **_anchor_fields(rule),
                     })
 
             # —— 反向禁忌提取 ——
@@ -3617,12 +4181,31 @@ def extract_narrative_profile(
                     beats = b_parsed.get("节拍序列") or []
                     for beat in beats:
                         if isinstance(beat, dict) and beat.get("步骤") and beat.get("写法"):
-                            rule = f"{beat['步骤']}：{beat['写法']}"
-                            if not _is_verbatim_copy(rule, chunk_text):
+                            raw_rule = f"{beat['步骤']}：{beat['写法']}"
+                            # 独立「证据」字段优先；模型若仍把证据写在写法里，
+                            # 走原来的内联格式（_rule_evidence 能直接取到）。
+                            ev = str(beat.get("证据") or "").strip()
+                            rule = (
+                                f"{_rule_body(raw_rule)}（证据：{ev}）" if ev else raw_rule
+                            )
+                            beat_ch = None
+                            try:
+                                beat_ch = int(beat.get("章"))
+                            except (TypeError, ValueError):
+                                beat_ch = None
+                            if beat_ch not in {ch for ch, _ in chunk}:
+                                beat_ch = None
+                                field_missing["beat_chapter_no"] = (
+                                    field_missing.get("beat_chapter_no", 0) + 1
+                                )
+                            if (_evidence_long_enough(rule)
+                                    and not _is_verbatim_copy(rule, chunk_text)):
                                 chunk_rules.setdefault("节拍序列", []).append({
                                     "rule": rule,
                                     "novel_id": nid,
                                     "chapter_no": chunk[0][0],
+                                    "beat_chapter_no": beat_ch,
+                                    **_anchor_fields(rule),
                                 })
 
             # —— v5：高频场景模板提取 ——
@@ -3639,10 +4222,16 @@ def extract_narrative_profile(
                                 f"动作链={scene.get('动作链','')} "
                                 f"基调={scene.get('基调','')}"
                             )
+                            ev = str(scene.get("证据") or "").strip()
+                            if ev:
+                                rule = f"{rule}（证据：{ev}）"
+                            if not _evidence_long_enough(rule):
+                                continue
                             chunk_rules.setdefault("高频场景模板", []).append({
                                 "rule": rule,
                                 "novel_id": nid,
                                 "chapter_no": chunk[0][0],
+                                **_anchor_fields(rule),
                             })
 
             # —— v5：潜台词模式提取 ——
@@ -3653,12 +4242,18 @@ def extract_narrative_profile(
                     patterns = st_parsed.get("潜台词模式") or []
                     for pat in patterns:
                         if isinstance(pat, dict) and pat.get("模式") and pat.get("写法"):
-                            rule = f"{pat['模式']}：{pat['写法']}"
-                            if not _is_verbatim_copy(rule, chunk_text):
+                            raw_rule = f"{pat['模式']}：{pat['写法']}"
+                            ev = str(pat.get("证据") or "").strip()
+                            rule = (
+                                f"{_rule_body(raw_rule)}（证据：{ev}）" if ev else raw_rule
+                            )
+                            if (_evidence_long_enough(rule)
+                                    and not _is_verbatim_copy(rule, chunk_text)):
                                 chunk_rules.setdefault("潜台词模式", []).append({
                                     "rule": rule,
                                     "novel_id": nid,
                                     "chapter_no": chunk[0][0],
+                                    **_anchor_fields(rule),
                                 })
 
             # —— 块完成：并入累加器 + 落断点 ——
@@ -3668,6 +4263,8 @@ def extract_narrative_profile(
                 all_rules.setdefault(dim, []).extend(items)
             for dim, items in chunk_forbidden.items():
                 all_forbidden.setdefault(dim, []).extend(items)
+            all_chunk_meta.append(chunk_meta)
+            all_kg_events.extend(chunk_kg)
             rejected += chunk_rejected
             _save_done_chunk(
                 db,
@@ -3680,7 +4277,24 @@ def extract_narrative_profile(
                     "rules": chunk_rules,
                     "forbidden": chunk_forbidden,
                     "rejected": chunk_rejected,
+                    "meta": chunk_meta,
+                    "kg_events": chunk_kg,
                 },
+                provider=getattr(provider, "label", None),
+                endpoint=getattr(provider, "base_url", None),
+            )
+
+        # 按块流式跑：每块自己的 5 条调用一返回就回调 `_consume_chunk` 并入 +
+        # 落库 + commit。撞额度墙时只损失在飞的块，已完成块全部保住。
+        if chunk_specs:
+            _stream_chunks(
+                provider,
+                chunk_specs,
+                max_concurrent=max_concurrent,
+                on_done=_bind_heartbeat(
+                    heartbeat, f"语料 {book_idx}/{total_books}：并发提炼中"
+                ),
+                on_chunk=_consume_chunk,
             )
 
         # 本语料的块已全部跑完。块数已在逐块处理时累加（含续跑回灌的块），
@@ -3719,7 +4333,9 @@ def extract_narrative_profile(
 
             voice_key = f"{_AUX_KEY_PREFIX}voice_{nid}"
             stored_voice = done_chunks.get(voice_key)
-            if stored_voice is not None:
+            # 只有「有内容」的断点才算完成。04:56 撞额度墙时 12 批声音调用
+            # 全部 429，旧代码仍把空列表写成已完成，续跑会直接跳过、永远补不回。
+            if stored_voice is not None and stored_voice.get("voices"):
                 # 上次已完成：跳过这一轮的全部角色声音调用，直接用存下来的原始结果。
                 # 存的是**去重前**的 LLM 原始产出——去重依赖本轮重算的 canonical/alias，
                 # 存归一化后的结果会让档位或语料微调后对不上名字。
@@ -3734,10 +4350,14 @@ def extract_narrative_profile(
                         heartbeat, f"语料 {book_idx}/{total_books}：提取角色声音"
                     ),
                 )
-                _save_done_chunk(
-                    db, project.id, scope, nid, voice_key, "",
-                    {"voices": voice_results},
-                )
+                # 空结果不落断点：多数是限流/全部单条失败，不是「这本书没有声音」。
+                if voice_results:
+                    _save_done_chunk(
+                        db, project.id, scope, nid, voice_key, "",
+                        {"voices": voice_results},
+                        provider=getattr(provider, "label", None),
+                        endpoint=getattr(provider, "base_url", None),
+                    )
             # 去重 + 角色名归一化（小落→安小落、宫爵→南宫爵、过滤角色A/时间）
             voice_results = _dedup_character_voices(
                 voice_results, norm_canonical, norm_alias, clean_fake=clean_fake
@@ -3770,18 +4390,34 @@ def extract_narrative_profile(
         drift_key = f"{_AUX_KEY_PREFIX}drift_{nid}"
         stored_drift = done_chunks.get(drift_key)
         try:
-            if stored_drift is not None:
-                # 上次已完成：跳过这一次 LLM 调用，回放存下来的漂移结论
-                if stored_drift.get("rules"):
-                    all_rules["文风漂移分析"] = list(stored_drift["rules"])
+            # 空断点同样不算完成（撞墙时的空结论会让续跑永远缺这一条）。
+            if stored_drift is not None and stored_drift.get("rules"):
+                # 上次已完成：跳过这一次 LLM 调用，回放存下来的漂移结论。
+                # 断点键本身按书隔离（aux_drift_{nid}），回放必须**追加**而不是
+                # 整键赋值——后者会让后一本书的结论覆盖掉前一本书的。
+                for item in stored_drift.get("rules") or []:
+                    if isinstance(item, dict) and item.get("novel_id") is None:
+                        # 极老断点可能没写 novel_id：按本断点的书补上，否则
+                        # 渲染侧无法按书过滤、也无法在多书档案里标出归属。
+                        item = {**item, "novel_id": nid}
+                    all_rules["文风漂移分析"].append(item)
             elif len(chapters) >= 20:
                 early = chapters[:5]
                 late = chapters[-5:]
-                early_text = "\n\n".join(t for _, t in early if t)[:2000]
-                late_text = "\n\n".join(t for _, t in late if t)[:2000]
+                # 整章全文，不截 2000 字：不到一章的样本撑不起「对白密度」结论。
+                early_text = "\n\n".join(t for _, t in early if t)
+                late_text = "\n\n".join(t for _, t in late if t)
+                # 首/末 10 块（≈50 章）的系统实测指标，要求模型解释数字而非凭观感猜。
+                early_feats = build_deterministic_features(
+                    "\n\n".join(t for _, t in chapters[:50] if t)
+                )
+                late_feats = build_deterministic_features(
+                    "\n\n".join(t for _, t in chapters[-50:] if t)
+                )
                 drift_system, drift_user = _build_drift_prompt(
-                    [("早期（前5章）", early_text), ("晚期（后5章）", late_text)],
+                    [("早期（前5章全文）", early_text), ("晚期（后5章全文）", late_text)],
                     f"语料{nid}",
+                    _format_drift_metrics(early_feats, late_feats),
                 )
                 drift_raw = provider.chat(drift_system, drift_user)
                 drift_parsed = _parse_extract_result(drift_raw)
@@ -3817,7 +4453,7 @@ def extract_narrative_profile(
                             late_str = "、".join(str(x) for x in late_feats[:5])
                         else:
                             late_str = str(late_feats)[:200]
-                        all_rules["文风漂移分析"] = [{
+                        entry = {
                             "rule": (
                                 f"整体趋势：{summary}；"
                                 f"早期：{early_str}；"
@@ -3826,10 +4462,15 @@ def extract_narrative_profile(
                             ),
                             "novel_id": nid,
                             "chapter_no": 0,
-                    }]
+                        }
+                        # 按书保留：每本书一条，后一本不许覆盖前一本。
+                        all_rules["文风漂移分析"].append(entry)
                         _save_done_chunk(
                             db, project.id, scope, nid, drift_key, "",
-                            {"rules": all_rules["文风漂移分析"]},
+                            # 断点按书存，只存本次这一条——回放时才不会把别的书带进来。
+                            {"rules": [entry]},
+                            provider=getattr(provider, "label", None),
+                            endpoint=getattr(provider, "base_url", None),
                         )
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning(
@@ -3850,6 +4491,10 @@ def extract_narrative_profile(
     if chunks_attempted and failed_chunks == chunks_attempted:
         raise ValueError(_format_distill_failure(failed_chunks, failed_reasons, provider))
 
+    # 角色声音的渲染排序索引：出场频次 + 非人标记（只进档案顶层，不改规则条目）。
+    voice_stats, voice_non_human = build_voice_stats(
+        all_rules.get(CHARACTER_VOICE_DIMENSION) or [], novel_texts
+    )
     return {
         "version": NARRATIVE_VERSION,
         "source_ids": sorted(int(i) for i in novel_ids),
@@ -3863,11 +4508,21 @@ def extract_narrative_profile(
         "rejected": rejected,
         # 部分块失败时 >0：任务仍算成功，但前端/日志能看见「有块被跳过」
         "failed_chunks": failed_chunks,
+        # 声音排序索引：渲染层按用途（原创/续写/对话）用不同口径取前 N 条。
+        "voice_stats": voice_stats,
+        "voice_non_human": voice_non_human,
         # v2.265：角色名审计（只标记不删除）。
         # 给出「模型认为这些词不像人名」，供前端/人工复核决定是否处理。
         # 不做自动删除——审计本身会误判（雪中「红薯」是丫鬟名却被标为普通名词）。
         "voice_name_audit": voice_audit or {"suspicious": [], "checked": 0,
                                             "skipped": False},
+        # —— 块级附加索引（2026-11-12）——
+        # 每条带 chapter_range，可按章检索；场景标签只是模型的软标注，
+        # 后续要用锚点原文抽检一致率，不能直接当 ground truth。
+        "chunk_meta": all_chunk_meta,
+        "kg_events": all_kg_events,
+        # 逐字段容错账本：某个字段缺了多少次。全 0 表示 5 个字段全齐。
+        "field_missing": field_missing,
     }
 
 
@@ -4030,60 +4685,125 @@ def _usable_narrative(profile) -> bool:
             and bool(profile.get("rules") or profile.get("forbidden")))
 
 
+def _covers_sources(archive_ids, want_ids) -> bool:
+    """档案来源是否覆盖当前参考书（相等或超集）。
+
+    只放行「项目收窄参考书」：档案按 [5, 6] 蒸馏、项目现在只读 [5]，渲染侧
+    `filter_rules_by_source` 会把书 6 的条目滤掉，档案仍然可用。
+    反向（项目新增了书、档案没覆盖）不放行——那会静默少一本书的规则。
+    """
+    archive = {int(i) for i in (archive_ids or [])}
+    want = {int(i) for i in (want_ids or [])}
+    return bool(want) and want.issubset(archive)
+
+
+def reusable_narrative(db: Session, project, ids=None, cfg=None,
+                       cached=None) -> dict | None:
+    """生成路径**不蒸馏**就能用上的档案；判据只有这一份。
+
+    预检（`generation/engine._require_distill_ready`）与取档
+    （`project_narrative`）都调它。此前两边各写一套：取档侧已放宽到「超集可
+    复用」，预检侧仍要求指纹完全相等，收窄参考书后预检永远先 raise，放宽的
+    代码根本走不到（2026-11-12 修复）。
+
+    取档顺序（全部只读）：
+    1. 项目缓存：指纹完全相等 → 原样复用（与旧行为一致，空壳档案也算就绪）。
+    2. 项目缓存：来源覆盖当前参考书且内容可用 → 复用（渲染侧按当前参考书过滤）。
+    3. 蒸馏库：来源覆盖当前参考书、active、且**按档案自己的 source_ids** 重算的
+       正文 hash 与库里记录一致 → 复用。
+    4. 都没有 → None（调用方按「不注入」处理）。
+
+    ## content_hash 的口径（预检当初对不上的原因）
+
+    库里行的 `content_hash` 是**按那一行自己的 source_ids** 算的：两行都是
+    `[5, 6]` → `5a3437…`。项目收窄到 `[5]` 后若拿 `corpus_content_hash([5])`
+    （`b36a30…`）去比，永远不相等——那不是「语料变了」，而是「比错了集合」。
+    正确口径是 `corpus_content_hash(row.source_ids) == row.content_hash`：
+    它验证的是「这一行当初蒸馏的语料正文至今没变」，与项目现在读几本书无关。
+    多出来的那本书由渲染侧来源过滤处理。
+    这笔 hash 只在**项目缓存不可用**时才付（约 1 秒/来源集合，只读）。
+    """
+    if ids is None:
+        ids = [int(i) for i in (project.reference_novel_ids or [])]
+    ids = [int(i) for i in ids]
+    if not ids:
+        return None
+    if cfg is None:
+        cfg = resolve_tier(getattr(project, "narrative_tier", None))
+        cap = getattr(project, "narrative_sample_chapters", None)
+        if cap is not None:
+            cfg = tier_with_sampling(cfg, int(cap))
+    if cached is None:
+        cached = project.style_narrative or {}
+    want = narrative_fingerprint(ids, cfg)
+    # 指纹完全相等：与旧行为一致，直接算就绪（哪怕档案内容为空壳）。
+    if isinstance(cached, dict) and cached.get("fingerprint") == want:
+        return cached
+    return _degraded_narrative(db, project, ids, cfg, want, cached)
+
+
 def _degraded_narrative(db: Session, project, ids: list[int], cfg,
                         want: dict, cached) -> dict | None:
-    """生成路径（``persist_library=False``）的降级取档：**绝不**同步蒸馏。
+    """`reusable_narrative` 的降级取档部分：**绝不**同步蒸馏。
 
     修的是「tier 与缓存指纹不匹配就静默起一次几十分钟全量蒸馏」：
     生成请求里没有等蒸馏的预算，静默起蒸馏只会把请求挂到超时。
 
-    取档顺序（全部只读）：
-    1. 项目缓存：同一批参考语料且内容可用 → 直接复用（哪怕档位/版本与
-       期望不符）。这是 p5 的情形（项目要 balanced、缓存是 fast）。
-    2. 蒸馏库：同语料集合 + **同正文 hash** + active，档位不限 → 复用。
-       要求正文 hash 一致，避免把「语料被重新导入/清洗后」的旧档案当新的用。
-    3. 都没有 → 返回 None（调用方按「不注入」处理）。
-
+    判据见 `reusable_narrative`（唯一一份）；这里只负责具体查找与 WARN。
     每次降级都 WARN 写明「期望档位 / 实际档位 / 未触发蒸馏」，不静默。
     """
     log = logging.getLogger(__name__)
     if _usable_narrative(cached):
         fp = cached.get("fingerprint") or {}
         cached_ids = sorted(int(i) for i in (fp.get("source_ids") or []))
-        if cached_ids == sorted(int(i) for i in ids):
+        # 允许「档案来源覆盖当前参考书」：项目把 refs 从多本收窄到其中一本后，
+        # 档案仍是按原集合蒸馏的。渲染侧会按项目当前参考书集合过滤
+        # （`filter_rules_by_source`），所以这里可以继续用这份档案；若坚持
+        # 指纹完全相等，就会从「跨书规则」直接退化成「整份档案消失」。
+        # 反向（项目新增了书、档案没覆盖）不放行。
+        if _covers_sources(cached_ids, ids):
             log.warning(
                 "生成路径叙事档案降级：项目 %s 期望 tier=%s（指纹 %s），"
-                "实际使用项目缓存 tier=%s（指纹 %s）；未触发同步蒸馏。"
+                "实际使用项目缓存 tier=%s（指纹 %s，来源 %s）；按当前参考书 %s "
+                "做渲染侧来源过滤，未触发同步蒸馏。"
                 "如需目标档位请先 POST /api/projects/%s/distill。",
                 getattr(project, "id", None), cfg.key, want.get("tier_signature"),
-                fp.get("tier"), fp.get("tier_signature"), getattr(project, "id", None),
+                fp.get("tier"), fp.get("tier_signature"), cached_ids, ids,
+                getattr(project, "id", None),
             )
             return cached
 
     from app.models import StyleDistill
 
-    # 先按「同语料集合」轻查（只读索引列），**没有候选就不算正文 hash**——
-    # corpus_content_hash 要加载全部语料，不能为了一个注定空手的结果付这笔钱。
+    # 不能按 source_ids_hash 精确查：收窄后的项目与超集行哈希不同，会漏掉。
+    # 库表是跨项目共享的小表，按 active 全取后在内存里筛「来源覆盖」。
     rows = db.scalars(
-        select(StyleDistill).where(
-            StyleDistill.source_ids_hash == _source_ids_hash(ids),
-            StyleDistill.status == "active",
-        ).order_by(StyleDistill.applied_at.desc(), StyleDistill.id.desc())
+        select(StyleDistill).where(StyleDistill.status == "active")
+        .order_by(StyleDistill.applied_at.desc(), StyleDistill.id.desc())
     ).all()
-    usable = [r for r in rows if _usable_narrative(r.style_narrative)]
-    if not usable:
-        return None
-    content_hash = corpus_content_hash(ids, db)
-    for row in usable:
+    #: 同一来源集合只算一次 hash；口径是**档案自己的** source_ids，
+    #: 不是项目当前 ids（后者会让超集行永远对不上）。
+    hashes: dict[tuple[int, ...], str] = {}
+    for row in rows:
+        if not _usable_narrative(row.style_narrative):
+            continue
+        row_ids = sorted(int(i) for i in (row.source_ids or []))
+        if not _covers_sources(row_ids, ids):
+            continue
+        key = tuple(row_ids)
+        if key not in hashes:
+            hashes[key] = corpus_content_hash(row_ids, db)
         # 正文 hash 必须一致，避免把「语料被重新导入/清洗后」的旧档案当新的用。
-        if row.content_hash == content_hash:
-            log.warning(
-                "生成路径叙事档案降级：项目 %s 期望 tier=%s，蒸馏库命中 tier=%s；"
-                "未触发同步蒸馏。如需目标档位请先 POST /api/projects/%s/distill。",
-                getattr(project, "id", None), cfg.key, row.tier,
-                getattr(project, "id", None),
-            )
-            return dict(row.style_narrative)
+        if row.content_hash != hashes[key]:
+            continue
+        log.warning(
+            "生成路径叙事档案降级：项目 %s 期望 tier=%s，蒸馏库命中 tier=%s"
+            "（来源 %s）；未触发同步蒸馏。如需目标档位请先 "
+            "POST /api/projects/%s/distill。",
+            getattr(project, "id", None), cfg.key, row.tier, row_ids,
+            getattr(project, "id", None),
+        )
+        return dict(row.style_narrative)
     return None
 
 
@@ -4123,7 +4843,8 @@ def project_narrative(
         resume: 是否复用 `distill_chunks` 里已完成的块（断点续跑）。
             **只对后台蒸馏任务传 True**；生成路径不传，行为与引入续跑之前一致。
             `force=True` 会顺带清掉本 scope 的块级断点——用户明确要求重算时
-            不能拿上一次的半成品拼出新档案。
+            不能拿上一次的半成品拼出新档案。`resume=True` 时不清：续跑必须
+            先读到断点，清了就等于整轮重跑。
 
     Raises:
         ValueError: tier / project.narrative_tier 是未知档位 key。
@@ -4149,9 +4870,11 @@ def project_narrative(
     cached = project.style_narrative or {}
     profile = None
 
-    if force:
-        # 用户明确要求重算：清掉本 scope 的块级断点，否则「重算」会跳过已完成块，
-        # 拿上一次的半成品拼出一份看起来全新的档案。
+    if force and not resume:
+        # 用户明确要求重算（且不是续跑）：清掉本 scope 的块级断点，否则「重算」会
+        # 跳过已完成块，拿上一次的半成品拼出一份看起来全新的档案。
+        # resume=True 时**绝不能清**：续跑的全部价值就是复用这些断点，先清再读
+        # 等于每次都从零开始。清理只对非 resume 的整轮重跑生效。
         _clear_scope_chunks(
             db, project.id, distill_resume_scope(ids, cfg, max_chapters)
         )
@@ -4180,7 +4903,9 @@ def project_narrative(
             # 以前指纹不匹配会一路走到 extract_narrative_profile（分钟级），
             # 生成请求被静默挂到超时；现在改为复用可用旧档并 WARN，或返回
             # None 让调用方按「不注入」处理。
-            profile = _degraded_narrative(db, project, ids, cfg, want, cached)
+            # 预检与取档共用 `reusable_narrative`：判据只有一份，避免「预检
+            # 要求完全相等、取档已放宽」这种改一份漏一份的分叉。
+            profile = reusable_narrative(db, project, ids, cfg, cached=cached)
             if profile is None:
                 logging.getLogger(__name__).warning(
                     "生成路径拒绝同步蒸馏：项目 %s 期望 tier=%s（指纹 %s），"
@@ -4217,6 +4942,17 @@ def project_narrative(
             )
             profile["fingerprint"] = want
             project.style_narrative = profile
+
+    # 四层选条缓存：蒸馏收尾算一次，渲染时只查表（书 7 全量约 10s，
+    # 之后单次渲染 ~40ms）。失败不影响档案本身。
+    if isinstance(profile, dict):
+        ensure_rule_scores(db, profile, ids)
+        # 节拍骨架缓存：只对超长节拍做确定性压缩（不调模型），没有超长条目时不写字段。
+        ensure_beat_skeletons(db, profile, ids)
+        try:
+            project.style_narrative = profile
+        except Exception:  # noqa: BLE001
+            pass
 
     # —— 统一收尾：任何一次「完成的蒸馏」都把产物落进全局蒸馏库（幂等 upsert）——
     # 「蒸馏完成的加一个库」的核心：无论命中项目缓存、命中蒸馏库、还是真实提取，
@@ -4271,31 +5007,2741 @@ def project_narrative_safe(
         return None
 
 
-def describe_narrative(profile: dict | None, max_rules_per_dim: int = 3) -> str:
+#: 声音词典里「整名就是一个职务/称谓」的封闭词表。
+#:
+#: 为什么不能只靠后缀判断：中文称谓没有稳定的构词后缀。「钟姨」是书里的
+#: 唯一指代（真角色），「王爷」「王妃」「国师」却只是身份；两者同形。反过来
+#: 「南总」是称呼、也可能是某人的唯一指代。所以这里只做**整名匹配**，
+#: 且只收「不能单独指认某个具体人」的词；带修饰的具体称呼由
+#: `_is_specific_title` 放行，不在本表管辖内。
+_VOICE_ROLE_ONLY = frozenset({
+    "公主", "王妃", "国师", "武夫", "司天", "董事长",
+    "总裁", "总经理", "董事", "皇帝", "太子", "王爷", "将军", "夫人",
+})
+
+#: 地名后缀：只对 2–3 字名生效（4 字以上更可能是复姓全名）。
+_PLACE_SUFFIXES = ("州", "城", "府", "县", "镇", "关", "京", "都")
+
+#: 职务后缀：中文商业/官场里「姓 + 职务」的常见写法（南总、李董）。
+_OFFICE_SUFFIXES = ("总", "董")
+
+#: 单条角色声音的形态上下限。低于下限基本是「名字 + 一句话」的半成品，
+#: 高于上限则是多条规则粘连（LLM 把两段输出拼在一起）。
+_VOICE_RULE_MIN_CHARS = 40
+_VOICE_RULE_MAX_CHARS = 400
+
+#: 「证据型薄条目」（名字 + 单个声音字段 + 一句原文证据）的字符下限。
+#:
+#: targeted 配音对配角只提得出这一种形态（柴杏儿 53 字、李灵素 33 字）；
+#: 它们有真名和原文出处，不是半句截断。理论最短（名字 + 字段 + 10 字证据）
+#: 约 22 字，这里取 30 是为了拦住「（证据：好。）」这类占位，实测最短的
+#: 合法证据条目是 33 字。
+_VOICE_EVIDENCED_MIN_CHARS = 30
+
+#: 证据正文至少这么长才算真引了原文，否则只是「（证据：无）」。
+_VOICE_EVIDENCE_MIN_CHARS = 10
+
+#: 一条角色声音至少要覆盖两个声音字段，否则只是「语气冷静」这类空话。
+#: 带真实证据的薄条目降为 1 个字段（见 `_voice_item_reject_reason`）。
+_VOICE_FIELDS = ("自称", "口头禅", "句长", "语气", "节奏", "关系动态", "代表台词")
+
+#: A′（2026-11-14）泛称排除词：职务、称谓、群像、种属。
+#:
+#: 只在「字段不足 + 定向对白证据」这条新放行路径上使用——这些条目此前一律
+#: 按「字段不足」剔除，所以本表哪怕误判，也不会改变既有保留集合。
+#:
+#: 来源与退回（v14，2026-11-15）：此前是代码常量，现降级为配置项
+#: `settings.voice_generic_markers`——配置非空时优先用配置，否则用下面这张
+#: **退回表**。它**无法由参考书频次分位生成**：频次分不出「职务/群像泛称」与
+#: 「高频具体角色」（主角同样高频），也没有可判别的分位信号；按上级口径不硬造，
+#: 改为配置化并在 `.trae/documents/写死值审计-2026-11-14.md` 登记一条。
+_VOICE_GENERIC_MARKERS_FALLBACK = (
+    "大师", "婆婆", "郡主", "女侠", "布政使", "宦官", "密探", "探子", "僧人",
+    "道首", "老道", "道长", "妇人", "金刚", "护法", "捕头", "县令", "公主",
+    "公公", "贵妃", "阿姨", "和尚", "太妃", "秘书", "皇后", "国舅", "老鸨",
+    "王爷", "干尸", "妈妈", "男子", "少爷", "师兄", "族老", "算仙", "战士",
+    "尊者", "岛主", "灵皇", "女修", "书生", "邪魔", "真人", "老祖", "魔君",
+    "劫仙", "兽修", "仙子", "少女", "天人", "大帝", "上人", "仙姬", "分身",
+    "道姑", "金卦", "君主", "前辈", "系统", "道人", "老板娘", "姑娘", "元君",
+    "罗汉", "菩萨", "男人", "尚书", "郎中", "经纪", "银锣", "皇子", "御史",
+    "长老", "围观者", "小女孩", "校长", "保镖", "狱卒", "婶婶", "二哥", "二叔",
+    "吏员", "店小二", "林父", "林母", "莫父", "莫母", "何母", "宋妈妈",
+    "监正", "平阳郡主", "飞燕女侠", "守门宦官", "黑袍密探", "黑袍探子",
+    "盘树僧人", "大理寺丞", "九尾公主", "绑架男人", "陌生男人", "红毛男人",
+    "白领男子", "年轻妈妈", "年轻妇人", "金发女修", "金发少女", "提刀书生",
+    "海胆战士", "楚姓族老", "六品天人", "白毛兽修", "胖球分身", "苏氏绳结",
+    "修聊系统", "墨家天志", "大霸宋", "善尸", "海王", "虎妖", "邪魔熊", "戏精马",
+)
+
+#: 单字泛称后缀：卒、兵、僧、道、婆、父、母、帝、后、妃…… 只用于新放行路径。
+_VOICE_GENERIC_SUFFIXES = frozenset(
+    "卒兵女男人僧道士婆婶爷叔姨哥姐妹父母官宦后妃帝王娘汉妇童孩者辈"
+    "尊仙魔妖兽鬼神佛侠首使监令吏员军长主客生尸号"
+)
+
+
+def _voice_generic_markers() -> tuple[str, ...]:
+    """泛称排除词：配置优先，缺省用退回表（v14 起不再是唯一来源）。"""
+    configured = getattr(settings, "voice_generic_markers", None)
+    if configured:
+        cleaned = tuple(str(x).strip() for x in configured if str(x).strip())
+        if cleaned:
+            return cleaned
+    return _VOICE_GENERIC_MARKERS_FALLBACK
+
+
+def _is_generic_voice_name(name: str) -> bool:
+    """名字本身是职务/称谓/群像/种属泛称，而不是某个具体角色的指代。"""
+    if not name:
+        return True
+    if any(marker in name for marker in _voice_generic_markers()):
+        return True
+    return name[-1] in _VOICE_GENERIC_SUFFIXES
+
+
+def _has_targeted_dialogue(rule: str) -> bool:
+    """证据段有成对引号对白，且证据点名该角色本人。
+
+    A′（2026-11-14）：`_VOICE_FIELDS` 从门槛降为加分项后，字段不足的条目
+    靠这条判据放行——既要有引号对白，也要能确认是对白属于这个角色，
+    否则「某某：语气冷静（证据：“滚！”）」这类泛称条目会重新混进来。
+    """
+    name, _, body = rule.partition("：")
+    name = name.strip()
+    evidence = _voice_evidence_text(body)
+    if not name or not evidence:
+        return False
+    return name in evidence and bool(_VOICE_QUOTE_RE.search(evidence))
+
+
+def _voice_name_reject_reason(name: str, names: list[str],
+                              truncations: frozenset[str] | None = None) -> str | None:
+    """角色名是否该被丢掉；返回原因（None = 保留）。
+
+    判据全部可解释，不是黑名单拍脑袋：
+
+    1. `_is_valid_voice_char_name`：2–4 个汉字、纯中文、非伪角色/泛称；
+    2. 整名等于职务/称谓词（`_VOICE_ROLE_ONLY`）；
+    3. 2–3 字且以地名后缀结尾（云州、洛城）；
+    4. 2–3 字且以职务后缀结尾（南总、李董）；
+    5. **截断**：与同一份词典里另一个更长的名字构成前缀关系
+       （楚元→楚元缜）。后缀同形不判截断——「仙子」「前辈」这类
+       书名/称谓本身可能就是独立指代（如「仙子」与「六修仙子」）。
+       词典里没有全名时这条抓不到——那需要蒸馏阶段落库的别名映射，
+       见 `_normalize_character_name`。
+    """
+    if not _is_valid_voice_char_name(name):
+        return "非法人名"
+    if name in _VOICE_ROLE_ONLY:
+        return "职务/称谓"
+    if len(name) <= 3 and name.endswith(_PLACE_SUFFIXES):
+        return "地名"
+    if 2 <= len(name) <= 3 and name.endswith(_OFFICE_SUFFIXES):
+        return "职务/称谓"
+    if truncations is not None:
+        if name in truncations:
+            return "疑似截断"
+        return None
+    for other in names:
+        if other == name or not (2 <= len(other) <= 4):
+            continue
+        if other.startswith(name):
+            return f"疑似截断（{other}）"
+    return None
+
+
+def _voice_truncation_index(names: list[str]) -> frozenset[str]:
+    """一次算好「哪些短名是别的长名的前缀」，避免逐条 O(n²) 比对。
+
+    只收前缀：中文名截断通常丢尾字（楚元→楚元缜、苏氏阿→苏氏阿十六）；
+    后缀同形更多是独立称谓（仙子/六修仙子、前辈/白前辈），不能一刀切。
+    """
+    found: set[str] = set()
+    for other in names:
+        if not (2 <= len(other) <= 4):
+            continue
+        for k in (2, 3):
+            if k < len(other):
+                found.add(other[:k])
+    return frozenset(found)
+
+
+def _voice_names(items: list) -> list[str]:
+    return [
+        it.get("rule", "").split("：", 1)[0].strip()
+        for it in items
+        if isinstance(it, dict) and "：" in it.get("rule", "")
+    ]
+
+
+def _evidence_len(body: str) -> int:
+    """条目里「（证据：…）」的正文长度；没有证据标记返回 0。"""
+    m = re.search(r"证据\s*[:：]\s*(.+?)\s*[）)]?\s*$", body)
+    return len(m.group(1).strip()) if m else 0
+
+
+#: 说话证据里的动作词。用户定的口径：说/道/问/喊/答/笑 任一即可。
+_SPEECH_VERBS = ("说", "道", "问", "喊", "答", "笑")
+
+#: 成对引号对白（「」/“”/‘’ 都算）。「代表台词：」也落在这个形态里，
+#: 所以宋书航/白前辈/羽柔子这种「自称 + 代表台词」的条目不会被误杀。
+_VOICE_QUOTE_RE = re.compile(r"[“「‘][^”」’]{2,}[”」’]")
+
+
+def _voice_evidence_text(body: str) -> str:
+    """取「证据：…」正文；没有证据标记时返回空串。"""
+    m = re.search(r"证据\s*[:：]\s*(.+?)\s*[）)]?\s*$", body, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def _has_speaking_evidence(rule: str) -> bool:
+    """条目是否带「说话证据」：证据段有说话动作，或条目内有成对引号对白。
+
+    只做读取侧判定，不改已落库条目。没有说话证据的条目不能证明「这个人会说话」，
+    在提示词里会退化成外貌/身份描述——按用户口径一律不进提示词（记为
+    `non_human`：保留在库里，但不占提示词配额）。
+    """
+    _, _, body = rule.partition("：")
+    evidence = _voice_evidence_text(body)
+    if evidence and any(v in evidence for v in _SPEECH_VERBS):
+        return True
+    return bool(_VOICE_QUOTE_RE.search(rule))
+
+
+def _voice_item_reject_reason(item, names: list[str],
+                              truncations: frozenset[str] | None = None) -> str | None:
+    """一条角色声音为什么不该进提示词（None = 保留）。"""
+    rule = item.get("rule", "") if isinstance(item, dict) else ""
+    if "：" not in rule:
+        return "形态不符"
+    name, body = rule.split("：", 1)
+    reason = _voice_name_reject_reason(name.strip(), names, truncations)
+    if reason:
+        return reason
+    evidence_len = _evidence_len(body)
+    has_evidence = evidence_len >= _VOICE_EVIDENCE_MIN_CHARS
+    min_chars = _VOICE_EVIDENCED_MIN_CHARS if has_evidence else _VOICE_RULE_MIN_CHARS
+    if not (min_chars <= len(rule) <= _VOICE_RULE_MAX_CHARS):
+        return "长度越界"
+    if rule.count("「") != rule.count("」"):
+        return "引号未闭合"
+    fields = sum(1 for f in _VOICE_FIELDS if f in body)
+    if fields < 2 and not (fields == 1 and has_evidence):
+        # A′（2026-11-14）：`_VOICE_FIELDS` 从门槛降为加分项。字段不足不再
+        # 直接判死，改看「定向对白证据」：证据里既有成对引号对白，也点名了
+        # 这个角色本人。泛称（职务/称谓/群像）即使证据命中也不放行。
+        if _has_targeted_dialogue(rule):
+            return "泛称" if _is_generic_voice_name(name.strip()) else None
+        return "字段不足"
+    # 用户口径（2026-11-12）：没有说话证据的条目一律不进提示词。它是
+    # 「不会说话的非人角色/泛称」，保留在库里，但不占提示词配额。
+    if not _has_speaking_evidence(rule):
+        return "无说话证据"
+    return None
+
+
+def audit_voice_items(items: list) -> dict:
+    """按判据统计角色声音条目的保留/剔除情况（供测试与人工核对）。"""
+    names = _voice_names(items)
+    truncations = _voice_truncation_index(names)
+    report = {"total": len(items), "kept": 0, "rejected": {}}
+    for it in items:
+        reason = _voice_item_reject_reason(it, names, truncations)
+        if reason:
+            report["rejected"][reason] = report["rejected"].get(reason, 0) + 1
+        else:
+            report["kept"] += 1
+    return report
+
+
+def clean_voice_items(items: list) -> list:
+    """剔除职务词/地名/截断名与形态不完整的角色声音条目（保持原顺序）。"""
+    names = _voice_names(items)
+    truncations = _voice_truncation_index(names)
+    return [it for it in items if _voice_item_reject_reason(it, names, truncations) is None]
+
+
+
+def filter_rules_by_source(profile: dict | None,
+                           allowed_novel_ids: set[int] | list[int] | None) -> dict | None:
+    """只留下 `novel_id` 在允许集合内的规则；无来源字段的条目按保留处理。
+
+    续写项目只应看到续写书自己的角色口吻；原创项目按当前参考书集合取。
+    禁忌词是纯字符串、没有来源，不做过滤。
+    """
+    if not profile or not allowed_novel_ids:
+        return profile
+    allowed = {int(x) for x in allowed_novel_ids}
+
+    def keep(item) -> bool:
+        if not isinstance(item, dict):
+            return True
+        nid = item.get("novel_id")
+        return nid is None or int(nid) in allowed
+
+    rules = {
+        dim: [it for it in (items or []) if keep(it)]
+        for dim, items in (profile.get("rules") or {}).items()
+    }
+    return {**profile, "rules": rules}
+
+
+#: 首段降权的「压缩倾向」词。参考语料的后期趋势常是「越写越短」，开篇若照着
+#: 「句式逐渐精简 / 减少细节 / 结构紧凑 / 短段推进」写，会把第一节写成梗概。
+_OPENING_COMPRESSION_MARKERS = (
+    "精简", "减少细节", "紧凑", "短段", "简洁", "压缩", "削减", "简略", "概括",
+)
+
+#: 首段渲染时插在叙事档案最前的优先级说明。
+_OPENING_LENGTH_PRIORITY = (
+    "【篇幅优先】本节是开篇：篇幅与完整性优先于简洁倾向，不要把本节写成梗概或短摘要。"
+)
+
+
+def _drop_compression_trends(rules: dict) -> dict:
+    """首段：剔除「文风漂移分析」里指向压缩的趋势句子（档案本身不改）。"""
+    items = rules.get("文风漂移分析") or []
+    kept = []
+    for item in items:
+        text = item.get("rule", "") if isinstance(item, dict) else str(item)
+        if not text:
+            kept.append(item)
+            continue
+        # 只切掉压缩类的句子，不整条丢：同一条漂移里常同时有「对白变多」这类
+        # 仍然有用的观察，整条剔除会把整本书的漂移结论删空。
+        sentences = re.split(r"(?<=[。；！？])", text)
+        kept_sentences = [
+            s for s in sentences
+            if not any(marker in s for marker in _OPENING_COMPRESSION_MARKERS)
+        ]
+        cleaned = "".join(kept_sentences).strip()
+        if not cleaned:
+            continue
+        kept.append({**item, "rule": cleaned} if isinstance(item, dict) else cleaned)
+    return {**rules, "文风漂移分析": kept}
+
+
+#: 去近重复用的标点/空白表（只保留文字与数字，避免标点差异骗过去重）。
+_DEDUPE_STRIP_RE = re.compile(r"[\s，。、；：！？“”‘’\"'（）()【】\[\]—…·,.;:!?~～]+")
+
+
+def _rule_text(item) -> str:
+    return item.get("rule", "") if isinstance(item, dict) else str(item)
+
+
+#: 反向节奏判定：不再按字面词表命中，只看规则里给出的**数值**是否与档案分位相反。
+#:
+#: 判定口径（`audit` = `_parse_audit_metrics(profile)`，档案缺该指标 → 不判）：
+#:   - 句长类：规则声称 c 字，档案中位 a → c < 0.6a 或 c > 1.8a 判矛盾；
+#:   - 占比类：c 为百分数 → c > max(2a, a+20) 或 c < max(0, a/2-10) 判矛盾。
+#: 只解析「证据：」之前的正文（证据原文里的数字不参与判定）；命中只删该分句。
+#: 一条数字都没有的规则不判——没有矛盾证据就原样保留（退回值 = 不删）。
+_PACING_CLAIMS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(
+        r"短句\s*[(（]\s*[≤<]\s*15[^)）]{0,4}[)）][^。；，]{0,6}?(\d+(?:\.\d+)?)\s*[%％]"
+    ), "短句15占比"),
+    (re.compile(
+        r"短句(?!\s*[(（]?\s*[≤<]\s*15)[^。；，]{0,8}?(\d+(?:\.\d+)?)\s*[%％]"
+    ), "短句占比"),
+    (re.compile(r"长句[^。；，]{0,8}?(\d+(?:\.\d+)?)\s*[%％]"), "长句占比"),
+    (re.compile(r"短段[^。；，]{0,8}?(\d+(?:\.\d+)?)\s*[%％]"), "短段占比"),
+    (re.compile(r"对白开头段?[^。；，]{0,8}?(\d+(?:\.\d+)?)\s*[%％]"), "对白开头段占比"),
+    (re.compile(r"短对白[^。；，]{0,8}?(\d+(?:\.\d+)?)\s*[%％]"), "短对白占比"),
+    (re.compile(r"(?<!短)对白[^。；，]{0,8}?(\d+(?:\.\d+)?)\s*[%％]"), "对白占比"),
+    (re.compile(r"句长[^。；，]{0,8}?(\d+(?:\.\d+)?)\s*字"), "句长"),
+)
+
+#: 「证据：」之后是原文引用，里面的数字不是规则主张，不能参与判定。
+_EVIDENCE_SPLIT = re.compile(r"证据\s*[：:]")
+
+
+def _pacing_claims_conflict(text: str, audit: dict[str, float]) -> bool:
+    """规则正文里的数值是否与档案分位相反（无数字 / 无该指标 → False）。"""
+    head = _EVIDENCE_SPLIT.split(text or "", maxsplit=1)[0]
+    for pattern, metric in _PACING_CLAIMS:
+        a = audit.get(metric)
+        if not isinstance(a, (int, float)) or a <= 0:
+            continue
+        for m in pattern.finditer(head):
+            c = float(m.group(1))
+            if metric == "句长":
+                if c < 0.6 * a or c > 1.8 * a:
+                    return True
+            elif c > max(2 * a, a + 20) or c < max(0.0, a / 2 - 10):
+                return True
+    return False
+
+
+#: 指标名 → 档案字段。只认**指标名**（档案与闸门里本来就叫这些名字），不再列举
+#: 「一两句短段」「大量使用短段落」这类具体措辞；是否矛盾一律由档案值决定。
+_PACING_METRIC_NAMES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"极短(?:纯)?对白"), "极短纯对白段占比"),
+    (re.compile(r"(?:叙述)?单句成段|单句段"), "叙述单句段占比"),
+)
+
+#: 档案里该指标 ≤2% 视为「基本不出现」。此时任何建议使用它的规则，都是在建议
+#: 做参考书自己几乎不做的事——按与档案自身统计矛盾判掉。
+_PACING_NEAR_ZERO = 0.02
+
+
+def _archive_pacing_bound(metric: str) -> float | None:
+    """档案该指标的章级上界：`GEN_GATE_LIMITS` 由档案章级分位推出，缺失返回 None。"""
+    from app.style.consistency import GEN_GATE_LIMITS
+
+    row = GEN_GATE_LIMITS.get(metric)
+    if not isinstance(row, dict):
+        return None
+    val = row.get("max")
+    return float(val) if isinstance(val, (int, float)) else None
+
+
+def _pacing_metric_conflict(text: str, audit: dict[str, float]) -> bool:
+    """无数字的祈使句是否建议了档案里「基本不出现」的指标。
+
+    与 `_pacing_claims_conflict` 分工：带百分数的分句有具体数值可比，走数值判定；
+    这里只处理「建议使用极短对白/单句成段」这种没有数字的祈使句——拿档案自己的
+    实测上界（`GEN_GATE_LIMITS`，非手拍值）判：上界 ≤ `_PACING_NEAR_ZERO` 才算
+    矛盾，档案本来就常用该指标时规则保留。
+    """
+    head = _EVIDENCE_SPLIT.split(text or "", maxsplit=1)[0]
+    if re.search(r"\d+(?:\.\d+)?\s*[%％]", head):
+        return False
+    for pattern, metric in _PACING_METRIC_NAMES:
+        if not pattern.search(head):
+            continue
+        bound = _archive_pacing_bound(metric)
+        if bound is not None and bound <= _PACING_NEAR_ZERO:
+            return True
+    return False
+
+
+def _drop_reverse_pacing_rules(
+    rules: dict, audit: dict[str, float] | None = None,
+) -> dict:
+    """全程：剔除与档案自身统计**矛盾**的节奏分句（档案本身不改）。
+
+    旧实现按 `_REVERSE_PACING_MARKERS` 字面命中删句——换一本书就会漏配（新书用
+    别的措辞）或误删（同一措辞在新书里是正确指导）。现在两条判据都只看档案：
+
+    1. 带数的分句：句长/占比落在档案分位反方向（`_pacing_claims_conflict`）；
+    2. 不带数的祈使句：建议使用档案里「基本不出现」的指标
+       （`_pacing_metric_conflict`，指标名 → `GEN_GATE_LIMITS` 的档案上界）。
+
+    同一条里正常的观察原样保留。`audit` 为空时第 1 条不判，第 2 条照常生效
+    （它只依赖档案上界，不依赖本档的量化审计块）。
+    `文笔量化审计` 是硬锚不是规则，整维原样透传（其中短段锚点由
+    `_render_audit_block(include_short_para=False)` 单独摘掉）。
+    """
+    out: dict = {}
+    for dim, items in (rules or {}).items():
+        if dim == "文笔量化审计":
+            out[dim] = items
+            continue
+        kept = []
+        for item in items or []:
+            text = _rule_text(item)
+            if not text:
+                kept.append(item)
+                continue
+            # 只切「证据：」之前的规则正文：证据是原文引用，按句号切开再删句会
+            # 留下「”）」「不过，你的墓碑…。）」这类残片，它们仍算一条规则、还会
+            # 参与选条。正文删空则整条丢掉，证据原样跟随保留的正文。
+            head = _EVIDENCE_SPLIT.split(text, maxsplit=1)[0]
+            if not head.strip():
+                kept.append(item)
+                continue
+            sentences = re.split(r"(?<=[。；！？])", head)
+            kept_sentences = [
+                s for s in sentences
+                if not _pacing_metric_conflict(s, audit or {})
+                and not (audit and _pacing_claims_conflict(s, audit))
+            ]
+            cleaned = "".join(kept_sentences).strip()
+            if not cleaned:
+                continue
+            cleaned += text[len(head):]
+            if cleaned == text:
+                kept.append(item)
+            else:
+                kept.append(
+                    {**item, "rule": cleaned} if isinstance(item, dict) else cleaned
+                )
+        out[dim] = kept
+    return out
+
+
+def _rule_dedupe_key(item) -> str:
+    """近重复判定键：去标点后取前 30 字。"""
+    return _DEDUPE_STRIP_RE.sub("", _rule_text(item))[:30]
+
+
+def _rule_quality(item) -> tuple[int, int, int]:
+    """证据质量：有成对引号 > 证据更长 > 规则更完整。"""
+    text = _rule_text(item)
+    has_quote = 1 if re.search(r"[“\"「][^”\"」]{2,}[”\"」]", text) else 0
+    evid = 0
+    m = re.search(r"证据[：:]\s*(.+)$", text, re.S)
+    if m:
+        evid = len(m.group(1).strip())
+    return has_quote, evid, min(len(text), 160)
+
+
+def _select_rules_by_chapter(items: list, limit: int) -> list:
+    """按章号分层选条：把全书切成 `limit` 个区间，每区间挑证据最好的一条。
+
+    旧行为是 `items[:limit]`——按落库顺序取，结果 60 条里 57 条来自前 796 章。
+    分层后每条规则落在不同的章段上，维度内规则铺满全书；同一维度内先去近重复，
+    避免 6 条结构性重复占掉配额。
+    """
+    if limit <= 0 or not items:
+        return []
+    entries = []
+    for idx, it in enumerate(items):
+        ch = it.get("chapter_no") if isinstance(it, dict) else None
+        entries.append((idx, it, ch if isinstance(ch, int) and ch > 0 else None))
+    positioned = [e for e in entries if e[2] is not None]
+    # 章号覆盖不足（老档案/辅助条目）时保持原顺序，避免选条逻辑把内容选空。
+    if len(positioned) < max(4, limit):
+        return items[:limit]
+
+    lo = min(e[2] for e in positioned)
+    hi = max(e[2] for e in positioned)
+    span = max(hi - lo + 1, 1)
+    n = min(limit, len(positioned))
+    seen: set[str] = set()
+    picked: list[tuple[int, object, int]] = []
+
+    def _best(cands, allow_dup=False):
+        ranked = sorted(
+            cands,
+            key=lambda e: (
+                -_rule_quality(e[1])[0],
+                -_rule_quality(e[1])[1],
+                -_rule_quality(e[1])[2],
+                e[2],
+                e[0],
+            ),
+        )
+        for e in ranked:
+            key = _rule_dedupe_key(e[1])
+            if not allow_dup and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            return e
+        return None
+
+    for b in range(n):
+        b_lo = lo + span * b // n
+        b_hi = lo + span * (b + 1) // n - 1
+        if b == n - 1:
+            b_hi = hi
+        cands = [e for e in positioned if b_lo <= e[2] <= b_hi]
+        chosen = _best(cands) if cands else None
+        if chosen is None:
+            # 该区间没有条目（或都被去重掉）：从全局按证据质量补一条。
+            chosen = _best(positioned)
+        if chosen is not None:
+            picked.append(chosen)
+
+    picked.sort(key=lambda e: (e[2], e[0]))
+    return [e[1] for e in picked]
+
+
+# ====================================================================
+# 选条四层：硬过滤 → 四维打分 → 配额内 MMR → 生成后反馈
+# ====================================================================
+#
+# ## 为什么需要第四层
+#
+# 前三层保证「选进来的单条更硬」；第四层负责让档案学会「这条模型到底用不用得上」。
+# 反馈权重按**项目**落库（`narrative_rule_weights`），不是内存里的临时系数。
+#
+# ## 性能约定
+#
+# 渲染时只做「查缓存 + 硬过滤 + 小池 MMR」，打分本身（尤其对照组相似度）
+# 由 `build_rule_score_cache` 离线算好、写进档案顶层 `rule_scores`。
+# 缓存缺失时退化为不跑对照组（discriminability=0.5），并在统计里标记。
+
+RULE_SCORE_VERSION = 3
+
+#: 硬过滤/降级标记位（存进缓存时压成一个整数）。
+FLAG_NO_EVIDENCE = 1
+FLAG_NO_CHAPTER = 2
+FLAG_TOO_LONG = 4
+FLAG_VAGUE = 8
+FLAG_NON_HUMAN = 16
+FLAG_TRUNCATED = 32
+FLAG_GENERIC = 64
+FLAG_VERIFY_MISMATCH = 128
+FLAG_VERIFIED = 256
+
+_HARD_FILTER_MASK = (
+    FLAG_NO_EVIDENCE | FLAG_NO_CHAPTER | FLAG_TOO_LONG | FLAG_VAGUE
+    | FLAG_NON_HUMAN | FLAG_TRUNCATED | FLAG_GENERIC
+)
+
+_FLAG_REASONS: tuple[tuple[int, str], ...] = (
+    (FLAG_NO_EVIDENCE, "无证据（规则里没有「证据：」原文）"),
+    (FLAG_NO_CHAPTER, "无章号（无法证明这条在书里真实出现）"),
+    (FLAG_TOO_LONG, "规则过长"),
+    (FLAG_VAGUE, "含模糊词（可以/有时/或许/往往）"),
+    (FLAG_NON_HUMAN, "牵涉非人角色或无说话证据"),
+    (FLAG_TRUNCATED, "牵涉截断名/伪角色"),
+    (FLAG_GENERIC, "三本书通用套话（书 5、书 6 同样成立）"),
+    (FLAG_VERIFY_MISMATCH, "量化对账不通过"),
+)
+
+
+@dataclass(frozen=True)
+class RuleScoringConfig:
+    """四层选条的阈值与权重。改这里必须同时 +1 `RULE_SCORE_VERSION`。"""
+
+    # ── 第一层 硬过滤 ──
+    max_rule_chars: int = 280
+    min_evidence_chars: int = 8
+    vague_markers: tuple[str, ...] = ("可以", "有时", "或许", "往往")
+    near_dup_similarity: float = 0.80
+
+    # ── 第二层 四维权重（顺序：可执行 / 区分 / 证据 / 可验证）──
+    weights: tuple[float, float, float, float] = (0.35, 0.28, 0.22, 0.15)
+    #: 与对照书（5、6）的 2-gram 内容相似度；两本都 ≥ 该值 = 通用套话。
+    #: 阈值来自实测分布：书 7 规则对两本对照书的中位相似度约 0.27，
+    #: 0.45 只留下「换词也还是同一句话」的 top 一档。
+    control_similarity: float = 0.45
+
+    # ── 第三层 MMR ──
+    mmr_lambda: float = 0.72
+    mmr_pool_factor: int = 6
+    coverage_bonus: float = 0.08
+
+    # ── 聚类（证据章号散布）──
+    spread_similarity: float = 0.60
+
+    # ── 第四层 反馈 ──
+    feedback_hit_step: float = 0.05
+    feedback_miss_step: float = 0.10
+    weight_min: float = 0.2
+    weight_max: float = 2.0
+
+
+DEFAULT_RULE_SCORING = RuleScoringConfig()
+
+_EVIDENCE_RE = re.compile(r"证据[：:]\s*(.+)$", re.S)
+_PUNCT_RE = re.compile(r"[\s，。、；：！？“”‘’\"'（）()【】\[\]—…·,.;:!?~～]+")
+
+
+def _rule_body(item) -> str:
+    """去掉「证据：…」尾巴的规则正文（判可执行性/区分度用）。"""
+    text = _rule_text(item)
+    return _EVIDENCE_RE.sub("", text).strip()
+
+
+def _rule_evidence(item) -> str:
+    m = _EVIDENCE_RE.search(_rule_text(item))
+    return m.group(1).strip() if m else ""
+
+
+def _evidence_long_enough(rule: str) -> bool:
+    """落库前的通用长度门槛：证据不足 20 字一律不落库。
+
+    主提取路径走 `_validate_evidence`（长度 + 原文包含双重校验）；节拍 / 场景模板 /
+    潜台词这三类结构化规则没有走那条路，但同样受「证据 20–60 字」约束，这里补齐。
+    """
+    return len(_rule_evidence(rule).rstrip("）) ")) >= EVIDENCE_MIN_CHARS
+
+
+def _norm_evidence(s: str) -> str:
+    """证据定位用的归一化：去空白/标点/引号差异，只比字。"""
+    return _PUNCT_RE.sub("", s or "")
+
+
+#: 多段引文的分隔：旧档案里常见「原文写“A”又写“B”」这种拼接证据。
+_QUOTE_SPLIT_RE = re.compile(r"[“”‘’「」『』【】\"]+")
+#: 证据按句切分的边界。归一化前先切，再逐句去标点匹配。
+_EVIDENCE_SENTENCE_RE = re.compile(r"[。！？；!?;]+")
+#: 证据「核心」的最短长度：证据开头几个字被模型改写（补主语、换称呼）时，
+#: 跳过开头 1–6 字再匹配；14 字连续原文在章内的区分度足够，不会锚错块。
+_EVIDENCE_CORE_MIN_CHARS = 14
+_EVIDENCE_JOIN_RE = re.compile(
+    r"(?:原文写|原文是|原文|又写|并写|以及|叙述接|前面紧接|紧接着|后接|"
+    r"—{2,}|／|/|\|)+"
+)
+
+
+def _evidence_segments(evidence: str) -> list[str]:
+    """把拼接证据切成可单独定位的引文段，长的在前。
+
+    新蒸馏要求证据是**一段连续原文**，正常不会走到这里；但 LLM 偶尔仍会输出
+    「引文 A + 转述 + 引文 B」，整串匹配必然失败。切段后只认长度 ≥12 字的段，
+    并保证每个段仍是原文的子串——宁可锚到其中一段，也不写一个假 chunk_id。
+    """
+    parts: list[str] = []
+    for chunk in _QUOTE_SPLIT_RE.split(evidence or ""):
+        parts.extend(_EVIDENCE_JOIN_RE.split(chunk))
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in sorted((_norm_evidence(p) for p in parts), key=len, reverse=True):
+        if len(part) >= 12 and part not in seen:
+            seen.add(part)
+            out.append(part)
+    return out
+
+
+def _resolve_evidence_anchor(
+    evidence: str,
+    block_rows: list[tuple[int, int, str]],
+    chapter_norm: list[tuple[int, str]],
+) -> tuple[int | None, int | None]:
+    """定位证据落在哪个真实块、哪一章。
+
+    2026-11-12：档案里必须写 `chunk_id`（真实 `novel_chunks.id`）和
+    `evidence_chapter_no`（证据实际所在章）。旧档案把 `chapter_no` 写成
+    「蒸馏块的起始章」，导致证据最多偏 4 章，事后只能靠 5 章窗口硬找。
+
+    Args:
+        evidence: `证据：` 后面的原文引文。
+        block_rows: `[(novel_chunks.id, chapter_no, 归一化文本)]`，按 (章, idx) 排好。
+        chapter_norm: `[(chapter_no, 归一化整章文本)]`，证据跨块时兜底拿章号。
+
+    Returns:
+        `(novel_chunk_id, chapter_no)`；块级定位不到但章级能定位时 id 为 None；
+        都定位不到返回 `(None, None)`。
+    """
+    ev = _norm_evidence(evidence)
+    if len(ev) < 8:
+        return None, None
+    # 候选顺序：整串 → 引号/转述切段 → **按句切分**。
+    # 最后一步专治「模型把相邻两句拼成一句证据」：去标点归一化救不了拼接
+    # （两个原句中间没有可对齐的边界），逐句重试才能命中其中一句。
+    candidates = [ev] + [s for s in _evidence_segments(evidence) if s != ev]
+    for sentence in _EVIDENCE_SENTENCE_RE.split(evidence):
+        sent = _norm_evidence(sentence)
+        # 少于 10 字的句子区分度太低（「他说。」这种能命中半本书），不单独作为候选。
+        if len(sent) >= 10 and sent not in candidates:
+            candidates.append(sent)
+    for cand in candidates:
+        for cid, chno, ntext in block_rows:
+            if cand in ntext:
+                return cid, chno
+    for cand in candidates:
+        for chno, ntext in chapter_norm:
+            if cand in ntext:
+                return None, chno
+    # 最后一档：证据开头几个字被改写过（补主语 / 换称呼），整串和整句都对不上，
+    # 但跳过后半段仍是原文。只跳过开头、不动结尾——结尾被截断时通常是模型
+    # 把两句连写，那种情况上一档的逐句切分已经处理。
+    cores: list[str] = []
+    for cand in candidates:
+        for skip in range(1, 7):
+            core = cand[skip:]
+            if len(core) >= _EVIDENCE_CORE_MIN_CHARS and core not in cores:
+                cores.append(core)
+    for core in cores:
+        for cid, chno, ntext in block_rows:
+            if core in ntext:
+                return cid, chno
+    for core in cores:
+        for chno, ntext in chapter_norm:
+            if core in ntext:
+                return None, chno
+    return None, None
+
+
+def _load_block_chunk_rows(
+    db: Session, novel_id: int, chapter_nos: list[int]
+) -> tuple[list[tuple[int, int, str]], list[tuple[int, str]]]:
+    """取本蒸馏块的 `novel_chunks` 行与整章文本，供证据定位。
+
+    只在本块处理时查一次：块内每条规则复用，不按规则发查询。
+    """
+    from app.models import NovelChunk
+
+    rows = db.scalars(
+        select(NovelChunk)
+        .where(
+            NovelChunk.novel_id == novel_id,
+            NovelChunk.chapter_no.in_(chapter_nos),
+        )
+        .order_by(NovelChunk.chapter_no, NovelChunk.idx, NovelChunk.id)
+    ).all()
+    block_rows = [
+        (int(r.id), int(r.chapter_no), _norm_evidence(r.text or "")) for r in rows
+    ]
+    by_chapter: dict[int, list[str]] = {}
+    for r in rows:
+        by_chapter.setdefault(int(r.chapter_no), []).append(r.text or "")
+    chapter_norm = [
+        (ch, _norm_evidence("".join(parts))) for ch, parts in by_chapter.items()
+    ]
+    return block_rows, chapter_norm
+
+
+def _rule_score_key(item, dim: str) -> str:
+    raw = f"{dim}\x00{_rule_text(item)}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:20]
+
+
+def _rule_text_hash(item) -> str:
+    return hashlib.sha1(_rule_text(item).encode("utf-8")).hexdigest()[:20]
+
+
+#: 相似度归一化时剔掉的高频虚词/框架词。保留「短句/对白/段落/动作」这类
+#: 真正承载规则内容的词，避免「人物」「用」把任何两条规则都拉到一起。
+_STOP_CHARS = frozenset(
+    "的地得了着是在用通过让人物角色对话句子段落写作作者本书全文规则证据"
+    "时和与及或而为以对把将被从到于之其这那一个种些里中上下后前再又也都很"
+    "更最可要会能需应该就还只"
+)
+
+
+def _grams(text: str, n: int = 2) -> frozenset[str]:
+    """规则内容的 n-gram 集合（默认 2-gram + 去虚词）。
+
+    3-gram 对中文改写太脆：同一手法换两个词就几乎零重叠（实测中位 0.15）。
+    2-gram 去虚词后中位 0.27，能区分「大致同题」与「换词复述」。
+    """
+    clean = "".join(
+        ch for ch in _PUNCT_RE.sub("", text) if ch not in _STOP_CHARS
+    )
+    if len(clean) <= n:
+        return frozenset([clean]) if clean else frozenset()
+    return frozenset(clean[i:i + n] for i in range(len(clean) - n + 1))
+
+
+def _containment(a: frozenset[str], b: frozenset[str]) -> float:
+    """包含度：短的一侧有多少比例出现在长的里（对证据长度差异稳健）。"""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / min(len(a), len(b))
+
+
+class _GramIndex:
+    """3-gram 倒排索引：为一条新规则找最相似的对照规则。"""
+
+    def __init__(self, texts: list[str]):
+        self.postings: dict[str, list[int]] = {}
+        self.grams: list[frozenset[str]] = []
+        for i, text in enumerate(texts):
+            g = _grams(_rule_body(text) or text)
+            self.grams.append(g)
+            for gram in g:
+                self.postings.setdefault(gram, []).append(i)
+
+    def best_containment(self, grams: frozenset[str]) -> float:
+        if not grams or not self.postings:
+            return 0.0
+        counts: dict[int, int] = {}
+        # 只查出现次数最少的 12 个 gram：常见 gram 的倒排太长，收益低。
+        for gram in sorted(grams, key=lambda g: len(self.postings.get(g, ())))[:12]:
+            for idx in self.postings.get(gram, ()):
+                counts[idx] = counts.get(idx, 0) + 1
+        best = 0.0
+        for idx, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:8]:
+            best = max(best, _containment(grams, self.grams[idx]))
+            if best >= 0.95:
+                break
+        return best
+
+
+def _cluster_deciles(items: list, dim: str,
+                     config: RuleScoringConfig = DEFAULT_RULE_SCORING) -> dict[int, int]:
+    """把同维度近义规则聚成簇，返回「每条规则所属簇覆盖了几个十分位」。
+
+    证据散布不是单条规则自己的章号（一条只有一个章号），而是**同一说法在全书
+    重复出现的跨度**。书 7 的 3,172 章切成 10 个十分位，簇覆盖 ≥10 个说明这个
+    写法贯穿全书；只在 2 个十分位出现说明是局部桥段。
+    """
+    chapters = [
+        it.get("chapter_no") if isinstance(it, dict) else None for it in items
+    ]
+    valid = [c for c in chapters if isinstance(c, int) and c > 0]
+    if not valid:
+        return {}
+    lo, hi = min(valid), max(valid)
+    span = max(hi - lo + 1, 1)
+    reps: list[tuple[frozenset[str], set[int]]] = []
+    index: dict[str, list[int]] = {}
+    out: dict[int, int] = {}
+
+    for pos, item in enumerate(items):
+        ch = chapters[pos]
+        grams = _grams(_rule_body(item) or _rule_text(item))
+        if not grams:
+            out[pos] = 1
+            continue
+        counts: dict[int, int] = {}
+        for gram in sorted(grams, key=lambda g: len(index.get(g, ())))[:10]:
+            for cid in index.get(gram, ()):
+                counts[cid] = counts.get(cid, 0) + 1
+        best_id, best_sim = None, 0.0
+        for cid, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:6]:
+            sim = _containment(grams, reps[cid][0])
+            if sim > best_sim:
+                best_id, best_sim = cid, sim
+        if best_id is not None and best_sim >= config.spread_similarity:
+            reps[best_id][1].add((ch - lo) * 10 // span if isinstance(ch, int) and ch > 0 else -1)
+            for gram in grams:
+                index.setdefault(gram, []).append(best_id)
+            out[pos] = best_id
+        else:
+            cid = len(reps)
+            reps.append((grams, {(ch - lo) * 10 // span if isinstance(ch, int) and ch > 0 else -1}))
+            for gram in grams:
+                index.setdefault(gram, []).append(cid)
+            out[pos] = cid
+
+    deciles = {cid: len({d for d in ds if d >= 0}) for cid, (_, ds) in enumerate(reps)}
+    return {pos: max(1, deciles[cid]) for pos, cid in out.items()}
+
+
+def _parse_audit_metrics(profile: dict) -> dict[str, float]:
+    """从「文笔量化审计」条目里取全书分块实测的中位数。
+
+    这些条目每块一条（book 7 = 635 条），中位数代表全书常态，用来对账
+    「规则里声称的数字」。没有任何条目时返回空 dict（可验证性按 0.5 中性处理）。
+    """
+    items = ((profile or {}).get("rules") or {}).get("文笔量化审计") or []
+    patterns = {
+        "句长": r"句长\s*([\d.]+)\s*(?:±|\+|字)",
+        "短句占比": r"短句(?:\(≤5字\))?占\s*([\d.]+)\s*%",
+        "短句15占比": r"短句\(≤15字\)占\s*([\d.]+)\s*%",
+        "长句占比": r"长句占\s*([\d.]+)\s*%",
+        "短段占比": r"一两句短段占\s*([\d.]+)\s*%",
+        "对白占比": r"对白占正文\s*([\d.]+)\s*%",
+        "对白开头段占比": r"对白开头段占\s*([\d.]+)\s*%",
+        "短对白占比": r"短对白占\s*([\d.]+)\s*%",
+        "情绪直陈": r"情绪直陈\s*([\d.]+)\s*/千字",
+        "动作承载": r"动作承载\s*([\d.]+)\s*/千字",
+        "问号": r"问号\s*([\d.]+)\s*/千字",
+        "省略号": r"省略号\s*([\d.]+)\s*/千字",
+    }
+    buckets: dict[str, list[float]] = {k: [] for k in patterns}
+    for item in items:
+        text = _rule_text(item)
+        for key, pattern in patterns.items():
+            m = re.search(pattern, text)
+            if m:
+                buckets[key].append(float(m.group(1)))
+    return {k: statistics.median(v) for k, v in buckets.items() if v}
+
+
+def _numeric_claims(text: str) -> list[dict]:
+    """规则正文里对量化审计字段的声称。只认能对账的字段。"""
+    patterns = (
+        ("句长", r"句长\s*([\d.]+)\s*字"),
+        ("句长", r"平均\s*([\d.]+)\s*字"),
+        ("短句占比", r"短句(?:\(≤5字\))?占(?:比)?\s*([\d.]+)\s*%"),
+        ("短句15占比", r"短句\(≤15字\)占(?:比)?\s*([\d.]+)\s*%"),
+        ("长句占比", r"长句占(?:比)?\s*([\d.]+)\s*%"),
+        ("对白占比", r"(?<!短)对白(?:字)?占(?:正文|比)?\s*([\d.]+)\s*%"),
+        ("段均句数", r"段均句数\s*([\d.]+)"),
+        ("动作承载", r"动作承载\s*([\d.]+)\s*/?千字"),
+    )
+    claims = []
+    for metric, pattern in patterns:
+        for m in re.finditer(pattern, text):
+            claims.append({"metric": metric, "value": float(m.group(1)),
+                           "raw": m.group(0)})
+    return claims
+
+
+def _claim_tolerance(metric: str, value: float) -> float:
+    if metric in ("短句占比", "短句15占比", "长句占比", "对白占比"):
+        return max(3.0, abs(value) * 0.2)
+    if metric == "句长":
+        return 2.5
+    if metric == "段均句数":
+        return 0.35
+    return max(0.5, abs(value) * 0.25)
+
+
+def _verify_rule(item, audit: dict[str, float]) -> tuple[float, int, str | None]:
+    """可验证性：有数字声称就必须真对账；对不上降级并记原因。"""
+    text = _rule_text(item)
+    claims = _numeric_claims(text)
+    if claims:
+        if not audit:
+            return 0.5, 0, "无量化审计数据可对账，按中性处理"
+        checked = []
+        for claim in claims:
+            actual = audit.get(claim["metric"])
+            if actual is None:
+                continue
+            ok = abs(claim["value"] - actual) <= _claim_tolerance(claim["metric"], claim["value"])
+            checked.append((claim, actual, ok))
+        if not checked:
+            return 0.5, 0, "声称的数字不在审计字段内，无法核对"
+        bad = [(c, a) for c, a, ok in checked if not ok]
+        if bad:
+            claim, actual = bad[0]
+            return 0.05, FLAG_VERIFY_MISMATCH, (
+                f"降级：声称{claim['metric']} {claim['value']:g}，"
+                f"审计实测 {actual:g}，对不上"
+            )
+        claim, actual, _ = checked[0]
+        return 0.95, FLAG_VERIFIED, (
+            f"核对通过：{claim['metric']} {claim['value']:g} ≈ 审计 {actual:g}"
+        )
+    # 没有数字，但提到可量化审计的维度 → 部分可验证
+    if any(k in text for k in ("句长", "对白", "段落", "段长", "动作", "标点", "短句", "长句")):
+        return 0.55, 0, None
+    return 0.25, 0, None
+
+
+_IMPERATIVE_RE = re.compile(
+    r"(^|[。；，])(不要|不得|避免|必须|务必|应|须|优先|尽量|用|以|通过|保持|控制|"
+    r"增加|减少|省略|插入|采用|选择|把|将|让|先把|直接)"
+)
+_CONCRETE_MARKERS = (
+    "句长", "字数", "占比", "比例", "对白", "短句", "长句", "段落", "段长", "标点",
+    "称谓", "自称", "口头禅", "用词", "场景", "动作", "语气", "节奏",
+)
+_VAGUE_ADJECTIVES = ("生动", "流畅", "自然", "细腻", "丰富", "有张力", "感染力",
+                     "恰到好处", "巧妙", "精彩")
+
+
+def _execution_score(text: str) -> float:
+    """可执行性：祈使句式 + 具体参数加分；只有形容词的「语言生动」低分。"""
+    body = _rule_body({"rule": text} if isinstance(text, str) else text)
+    score = 0.35
+    if _IMPERATIVE_RE.search(body):
+        score += 0.2
+    params = 0
+    if re.search(r"\d+(\.\d+)?\s*(%|字|句|段|次|个|/千字)", body):
+        params += 1
+    if any(k in body for k in _CONCRETE_MARKERS):
+        params += 1
+    score += min(params, 2) * 0.15
+    if params == 0 and any(w in body for w in _VAGUE_ADJECTIVES):
+        score -= 0.2
+    if body.startswith(("人物", "作者", "本书", "文中", "全书", "角色")) and params == 0:
+        score -= 0.1
+    return max(0.0, min(1.0, score))
+
+
+def _evidence_score(item, deciles: int) -> float:
+    """证据强度：引号对白证据 + 说法在全书十分位上的散布。"""
+    evidence = _rule_evidence(item)
+    has_quote = bool(re.search(r"[“\"「][^”\"」]{2,}[”\"」]", evidence or _rule_text(item)))
+    quote_part = 1.0 if has_quote else 0.25
+    spread_part = min(max(deciles, 1) / 10.0, 1.0)
+    return 0.45 * quote_part + 0.55 * spread_part
+
+
+def _distinctiveness(text: str, indexes: dict[int, _GramIndex] | None,
+                     config: RuleScoringConfig = DEFAULT_RULE_SCORING) -> tuple[float, bool]:
+    """区分度：与对照书（5、6）逐本比，两本都成立 = 通用套话。"""
+    if not indexes:
+        return 0.5, False
+    grams = _grams(_rule_body({"rule": text}) if isinstance(text, str) else text)
+    sims = [idx.best_containment(grams) for idx in indexes.values()]
+    if not sims:
+        return 0.5, False
+    generic = min(sims) >= config.control_similarity
+    return max(0.05, 1.0 - max(sims)), generic
+
+
+def _score_rule(item, dim: str, *, deciles: int, audit: dict[str, float],
+                indexes: dict[int, _GramIndex] | None,
+                config: RuleScoringConfig = DEFAULT_RULE_SCORING) -> dict:
+    """给一条规则打四维分（0–1），并给出硬过滤标记。"""
+    text = _rule_text(item)
+    evidence = _rule_evidence(item)
+    flags = 0
+    if len(_PUNCT_RE.sub("", text)) > config.max_rule_chars:
+        flags |= FLAG_TOO_LONG
+    if len(_PUNCT_RE.sub("", evidence)) < config.min_evidence_chars:
+        flags |= FLAG_NO_EVIDENCE
+    ch = item.get("chapter_no") if isinstance(item, dict) else None
+    if not isinstance(ch, int) or ch <= 0:
+        flags |= FLAG_NO_CHAPTER
+    if any(w in text for w in config.vague_markers):
+        flags |= FLAG_VAGUE
+    if dim == CHARACTER_VOICE_DIMENSION:
+        if _voice_item_reject_reason(item, _voice_names([item])) is not None:
+            flags |= FLAG_NON_HUMAN
+        name = _voice_item_name(item)
+        if name and re.search(r"[A-Za-z]|[0-9]|的|了|是|在", name):
+            flags |= FLAG_TRUNCATED
+
+    execution = _execution_score(text)
+    distinct, generic = _distinctiveness(text, indexes, config)
+    if generic:
+        flags |= FLAG_GENERIC
+    evidence_score = _evidence_score(item, deciles)
+    verifiable, vflag, note = _verify_rule(item, audit)
+    flags |= vflag
+    total = (
+        config.weights[0] * execution
+        + config.weights[1] * distinct
+        + config.weights[2] * evidence_score
+        + config.weights[3] * verifiable
+    )
+    return {
+        "execution": round(execution, 3),
+        "distinctiveness": round(distinct, 3),
+        "evidence": round(evidence_score, 3),
+        "verifiability": round(verifiable, 3),
+        "total": round(total, 3),
+        "flags": flags,
+        "deciles": deciles,
+        "note": note,
+    }
+
+
+def build_rule_score_cache(profile: dict, control_profile: dict | None = None,
+                           config: RuleScoringConfig = DEFAULT_RULE_SCORING) -> dict:
+    """离线算全量打分并返回可写进档案顶层的缓存（零 LLM）。
+
+    对照组：`control_profile` 是书 5/6 的档案（id=3），按 `novel_id` 拆成两本，
+    **两本都高度相似才算通用套话**——一本书里的俗套不足以否定书 7 的风格。
+    """
+    indexes: dict[int, _GramIndex] | None = None
+    if control_profile:
+        by_book: dict[int, list[str]] = {}
+        for items in ((control_profile.get("rules") or {}).values()):
+            for item in items or []:
+                nid = item.get("novel_id") if isinstance(item, dict) else None
+                if isinstance(nid, int):
+                    by_book.setdefault(nid, []).append(_rule_text(item))
+        if len(by_book) >= 2:
+            indexes = {nid: _GramIndex(texts) for nid, texts in by_book.items()}
+
+    audit = _parse_audit_metrics(profile)
+    scores: dict[str, list[int]] = {}
+    shortlist: dict[str, list[list[int]]] = {}
+    notes: dict[str, str] = {}
+    generic: list[str] = []
+    generic_rules: list[list] = []
+    feedback_rules: list[dict] = []
+    stats = {"total": 0, "generic": 0, "hard_rejected": 0,
+             "verified": 0, "verify_mismatch": 0, "by_dim": {}}
+
+    for dim, items in (profile.get("rules") or {}).items():
+        if dim in (CHARACTER_VOICE_DIMENSION, "文风漂移分析"):
+            continue
+        items = items or []
+        deciles = _cluster_deciles(items, dim, config)
+        dim_stats = {"total": len(items), "generic": 0, "hard_rejected": 0,
+                     "verified": 0, "verify_mismatch": 0}
+        dim_rows: list[list[int]] = []
+        for pos, item in enumerate(items):
+            key = _rule_score_key(item, dim)
+            scored = _score_rule(
+                item, dim, deciles=deciles.get(pos, 1), audit=audit,
+                indexes=indexes, config=config,
+            )
+            flags = scored["flags"]
+            compact = [
+                int(scored["execution"] * 100), int(scored["distinctiveness"] * 100),
+                int(scored["evidence"] * 100), int(scored["verifiability"] * 100),
+                int(flags), int(scored["deciles"]),
+            ]
+            scores[key] = compact
+            dim_rows.append([
+                pos, _rule_text_hash(item), int(scored["total"] * 1000),
+                compact[2], int(flags), int(scored["deciles"]),
+            ])
+            if scored.get("note"):
+                notes[key] = scored["note"]
+            if flags & FLAG_GENERIC:
+                generic.append(key)
+                if dim != "文笔量化审计":
+                    generic_rules.append([dim, _rule_text(item),
+                                          item.get("chapter_no") if isinstance(item, dict) else None])
+                dim_stats["generic"] += 1
+            if flags & _HARD_FILTER_MASK:
+                dim_stats["hard_rejected"] += 1
+            if flags & FLAG_VERIFIED:
+                dim_stats["verified"] += 1
+            if flags & FLAG_VERIFY_MISMATCH:
+                dim_stats["verify_mismatch"] += 1
+            if dim != "文笔量化审计" and _numeric_claims(_rule_text(item)):
+                feedback_rules.append({"dim": dim, "text": _rule_text(item)})
+        # 渲染只用「按分数排好的前 200 条」：硬过滤/打分的全量结果留在
+        # `rule_scores` 里供审计，但渲染不必为 3,000 条各算一次哈希。
+        dim_rows.sort(key=lambda r: (-r[2], r[0]))
+        shortlist[dim] = dim_rows[:200]
+        stats["by_dim"][dim] = dim_stats
+        stats["total"] += dim_stats["total"]
+        stats["generic"] += dim_stats["generic"]
+        stats["hard_rejected"] += dim_stats["hard_rejected"]
+        stats["verified"] += dim_stats["verified"]
+        stats["verify_mismatch"] += dim_stats["verify_mismatch"]
+
+    return {
+        "version": RULE_SCORE_VERSION,
+        "config": {
+            "max_rule_chars": config.max_rule_chars,
+            "near_dup_similarity": config.near_dup_similarity,
+            "weights": list(config.weights),
+            "control_similarity": config.control_similarity,
+            "mmr_lambda": config.mmr_lambda,
+        },
+        "scores": scores,
+        "shortlist": shortlist,
+        "generic": generic,
+        "generic_rules": generic_rules,
+        "notes": notes,
+        "audit_metrics": {k: round(v, 4) for k, v in audit.items()},
+        "feedback_rules": feedback_rules,
+        "stats": stats,
+    }
+
+
+def ensure_rule_scores(db, profile: dict | None, source_ids=None) -> dict | None:
+    """确保档案带当前版本的四层选条缓存（蒸馏收尾时调用一次）。
+
+    对照组取**另一套 source_ids** 的 active 档案（书 5/6 之于书 7）。找不到
+    对照组也照样建缓存——区分度按 0.5 中性处理，但硬过滤/可执行/证据/可验证
+    照常生效，不会静默退回旧选法。
+    """
+    if not isinstance(profile, dict) or not _usable_narrative(profile):
+        return profile
+    if profile.get("rule_score_version") == RULE_SCORE_VERSION:
+        return profile
+    control = None
+    try:
+        from app.models import StyleDistill
+
+        source_set = set(source_ids or [])
+        for row in db.scalars(select(StyleDistill).where(
+                StyleDistill.status == "active")).all():
+            other = getattr(row, "style_narrative", None)
+            if not isinstance(other, dict) or not other.get("rules"):
+                continue
+            if set(row.source_ids or []) == source_set:
+                continue
+            control = other
+            break
+    except Exception:  # noqa: BLE001 —— 对照组建不起来不影响主缓存
+        logging.getLogger(__name__).debug("查找对照档案失败", exc_info=True)
+    try:
+        cache = build_rule_score_cache(profile, control)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("构建四层选条打分缓存失败（已忽略）", exc_info=True)
+        return profile
+    profile.update({
+        "rule_scores": cache["scores"],
+        "rule_shortlist": cache["shortlist"],
+        "rule_score_version": RULE_SCORE_VERSION,
+        "rule_score_config": cache["config"],
+        "rule_score_stats": cache["stats"],
+        "rule_score_notes": cache["notes"],
+        "generic_rule_hashes": cache["generic"],
+        "generic_rules": cache["generic_rules"],
+        "audit_metrics": cache["audit_metrics"],
+        "feedback_rules": cache["feedback_rules"],
+    })
+    return profile
+
+
+def _cached_score(item, dim: str, profile: dict,
+                  config: RuleScoringConfig = DEFAULT_RULE_SCORING) -> dict | None:
+    raw = (profile.get("rule_scores") or {}).get(_rule_score_key(item, dim))
+    if not raw or len(raw) < 6:
+        return None
+    w = config.weights
+    return {
+        "execution": raw[0] / 100.0,
+        "distinctiveness": raw[1] / 100.0,
+        "evidence": raw[2] / 100.0,
+        "verifiability": raw[3] / 100.0,
+        "total": round(
+            w[0] * raw[0] / 100 + w[1] * raw[1] / 100
+            + w[2] * raw[2] / 100 + w[3] * raw[3] / 100, 3
+        ),
+        "flags": int(raw[4]),
+        "deciles": int(raw[5]),
+        "note": (profile.get("rule_score_notes") or {}).get(_rule_score_key(item, dim)),
+    }
+
+
+def _reason_for_flags(flags: int) -> str | None:
+    for bit, reason in _FLAG_REASONS:
+        if flags & bit:
+            return reason
+    return None
+
+
+#: 同维度矛盾判定：出现左侧词 vs 右侧词的两条规则视为对撞。
+_CONFLICT_POLES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("短句", "短段", "断句", "简洁"), ("长句", "长段", "铺陈", "绵长")),
+    (("多对白", "对白密集", "对白为主"), ("少对白", "对白稀疏", "对白较少")),
+    (("快节奏", "节奏快", "推进快", "加速"), ("慢节奏", "节奏慢", "放缓", "延宕")),
+    (("克制", "留白"), ("直白", "外化", "写满")),
+)
+
+
+def _conflict_pole(text: str) -> int:
+    body = _rule_body(text)
+    for i, (left, right) in enumerate(_CONFLICT_POLES):
+        if any(w in body for w in left):
+            return i * 2 + 1
+        if any(w in body for w in right):
+            return i * 2 + 2
+    return 0
+
+
+def _in_conflict(a: str, b: str) -> bool:
+    pa, pb = _conflict_pole(a), _conflict_pole(b)
+    return bool(pa and pb and pa != pb and (pa + 1) // 2 == (pb + 1) // 2)
+
+
+def select_rules_with_audit(
+    items: list, limit: int, *, dim: str, profile: dict,
+    config: RuleScoringConfig = DEFAULT_RULE_SCORING, audit: bool = False,
+) -> tuple[list, list[dict]]:
+    """四层选条：硬过滤 → 打分排序 → 对撞/去重 → MMR 取 `limit` 条。
+
+    返回 `(selected, decisions)`。`decisions` 仅在 `audit=True` 时逐条生成，
+    渲染路径传 False 避免为 3,000 条规则各建一个 dict。
+    """
+    if limit <= 0 or not items:
+        return [], []
+
+    weights = profile.get("rule_weights") or {}
+    entries = []
+    decisions: list[dict] = []
+    short = (profile.get("rule_shortlist") or {}).get(dim)
+    if short and not audit:
+        # 快速路径：只碰已排好序的前 200 条，不再为全维度算哈希。
+        for row in short:
+            pos, text_hash, total_milli, evidence_int, flags, deciles = row
+            if flags & _HARD_FILTER_MASK:
+                continue
+            item = items[pos]
+            weight = float(weights.get(text_hash, 1.0) or 1.0) if weights else 1.0
+            entries.append({
+                "pos": pos,
+                "item": item,
+                "ch": item.get("chapter_no") if isinstance(item, dict) else None,
+                "scores": {
+                    "total": total_milli / 1000.0,
+                    "evidence": evidence_int / 100.0,
+                    "flags": flags,
+                    "deciles": deciles,
+                },
+                "weight": weight,
+                "total": (total_milli / 1000.0) * weight,
+                "fallback": False,
+                "grams": None,
+            })
+    else:
+        for pos, item in enumerate(items):
+            scored = _cached_score(item, dim, profile, config)
+            fallback = False
+            if scored is None:
+                fallback = True
+                scored = _score_rule(
+                    item, dim, deciles=1, audit=profile.get("audit_metrics") or {},
+                    indexes=None, config=config,
+                )
+            weight = float(weights.get(_rule_text_hash(item), 1.0) or 1.0)
+            entry = {
+                "pos": pos,
+                "item": item,
+                "ch": item.get("chapter_no") if isinstance(item, dict) else None,
+                "scores": scored,
+                "weight": weight,
+                "total": scored["total"] * weight,
+                "fallback": fallback,
+                "grams": None,
+            }
+            entries.append(entry)
+            if audit:
+                decisions.append({
+                    "item": item, "dim": dim, "pos": pos,
+                    "chapter_no": entry["ch"], "scores": scored,
+                    "weight": weight, "total": entry["total"],
+                    "selected": False,
+                    "reason": _reason_for_flags(scored["flags"]) if scored["flags"] else None,
+                    "stage": "hard" if scored["flags"] & _HARD_FILTER_MASK else "candidate",
+                })
+
+    survivors = [
+        e for e in entries if not (e["scores"]["flags"] & _HARD_FILTER_MASK)
+    ]
+    if not survivors:
+        return [], decisions
+    survivors.sort(key=lambda e: (-e["total"], e["pos"]))
+
+    # 池子只取前 limit×6：近重复/矛盾对撞不需要看完全部 3,000 条。
+    pool_size = max(limit * config.mmr_pool_factor, 24)
+    pool = survivors[:pool_size]
+
+    def _grams_of(entry) -> frozenset[str]:
+        if entry["grams"] is None:
+            entry["grams"] = _grams(_rule_body(entry["item"]))
+        return entry["grams"]
+
+    # 第一层补刀：与更强候选语义相似度 ≥0.8 的近重复淘汰。
+    deduped: list[dict] = []
+    for entry in pool:
+        g = _grams_of(entry)
+        dup = next(
+            (other for other in deduped
+             if _containment(g, _grams_of(other)) >= config.near_dup_similarity),
+            None,
+        )
+        if dup is not None:
+            if audit:
+                row = next((d for d in decisions if d["pos"] == entry["pos"]), None)
+                if row:
+                    row["stage"] = "near_dup"
+                    row["reason"] = (
+                        f"与已选条近重复（相似度 ≥ {config.near_dup_similarity:.0%}）"
+                    )
+            continue
+        deduped.append(entry)
+
+    # 同维矛盾显式对撞：留证据更多、覆盖更广的一条。
+    resolved: list[dict] = []
+    for entry in deduped:
+        text = _rule_text(entry["item"])
+        clash = next((o for o in resolved if _in_conflict(text, _rule_text(o["item"]))), None)
+        if clash is None:
+            resolved.append(entry)
+            continue
+        better = entry if (
+            (entry["scores"]["evidence"], entry["scores"]["deciles"], entry["total"])
+            >= (clash["scores"]["evidence"], clash["scores"]["deciles"], clash["total"])
+        ) else clash
+        loser = clash if better is entry else entry
+        if audit:
+            row = next((d for d in decisions if d["pos"] == loser["pos"]), None)
+            if row:
+                row["stage"] = "conflict"
+                row["reason"] = "与同维另一条矛盾，保留证据更多/覆盖更广的一条"
+        if better is entry:
+            resolved.remove(clash)
+            resolved.append(entry)
+
+    # 第三层 MMR：每选一条，压掉与它相近的候选，避免 60 条说同一件事。
+    selected: list[dict] = []
+    used_deciles: set[int] = set()
+    remaining = list(resolved)
+    while remaining and len(selected) < limit:
+        best, best_rank = None, None
+        for entry in remaining:
+            base = min(entry["total"], 1.0)
+            decile = min(entry["ch"], 10) if isinstance(entry["ch"], int) and entry["ch"] > 0 else 0
+            coverage = config.coverage_bonus if decile not in used_deciles else 0.0
+            redundancy = 0.0
+            if selected:
+                g = _grams_of(entry)
+                redundancy = max(
+                    _containment(g, _grams_of(chosen)) for chosen in selected
+                )
+            rank = config.mmr_lambda * (base + coverage) - (1 - config.mmr_lambda) * redundancy
+            if best_rank is None or rank > best_rank:
+                best, best_rank = entry, rank
+        remaining.remove(best)
+        selected.append(best)
+        if isinstance(best["ch"], int) and best["ch"] > 0:
+            used_deciles.add(min(best["ch"], 10))
+
+    if audit:
+        chosen_pos = {e["pos"] for e in selected}
+        for row in decisions:
+            if row["selected"] or row["stage"] not in ("candidate", "hard"):
+                continue
+            if row["pos"] in chosen_pos:
+                row["selected"] = True
+                row["reason"] = None
+            elif row["stage"] == "candidate":
+                row["stage"] = "mmr"
+                row["reason"] = "通过硬过滤，但 MMR 排名在配额之外"
+            elif row["stage"] == "hard":
+                row["reason"] = row["reason"] or "硬过滤淘汰"
+    return [e["item"] for e in selected], decisions
+
+
+# ====================================================================
+# 节拍序列：跨书骨架化 + 同书放宽
+# ====================================================================
+#
+# 节拍序列的规则天然偏长（「先…再…然后…最后…」），且常带具体人名/招式/证物。
+# 直接放宽进原创档会把参考书的专名带进新书（跨书串味），所以：
+#   - 原创：280 字上限不放宽；超长条目必须先骨架化（去专名、只留结构节点）；
+#   - 续写：同书可放宽到 480 字（同一本书的专名不是串味，是上下文）；
+#     跨书仍走骨架化。
+# 骨架化优先用离线小模型改写（脚本批量生成后落库），没有改写结果时退回
+# 确定性压缩。两条路径都必须通过同一套校验：长度、结构节点、专名黑名单。
+
+BEAT_DIMENSION = "节拍序列"
+BEAT_SKELETON_MAX_CHARS = 280
+BEAT_CONTINUATION_MAX_CHARS = 480
+#: 骨架缓存的形状版本。与 `RULE_SCORE_VERSION` 同理：它是**选条缓存**，
+#: 不是蒸馏产出的字段，改它只需重算骨架，不必让整份档案失效（NARRATIVE_VERSION 不动）。
+BEAT_SKELETON_VERSION = 1
+#: 骨架条目的执行分折价系数。**只折价、不重算**：骨架是原文的压缩，
+#: 重算 `_execution_score` 会因为「正文变短」把执行难度判低/判高，两条路都错。
+#: 沿用原条目的 execution 再乘 0.95，保证同一条件下骨架总分**永远低于原文**
+#: （总分对 execution 线性、权重为正），骨架化不会变成刷分路径。
+BEAT_SKELETON_SCORE_FACTOR = 0.95
+_BEAT_NODE_RE = re.compile(
+    r"(?:^|[，。；：])\s*(先|再|然后|接着|随后|最后|最终)"
+)
+_BEAT_SPEECH_NAME_RE = re.compile(
+    r"([\u4e00-\u9fff]{2,4})(?:吼道|叫道|笑道|问道|答道|喝道|喊道|沉声道|冷声道|"
+    r"低声道|轻声道|开口道|点头|摇头|皱眉|冷笑|大喝|暴喝|道[：:，。])"
+)
+_GENERIC_ROLE_WORDS = frozenset({
+    "前辈", "小友", "老夫", "女子", "少女", "大叔", "老师", "真君", "散人",
+    "道友", "姑娘", "少年", "男子", "它们", "我们", "你们", "他们", "她们",
+    "众人", "对方", "自己", "有人", "那人", "此人", "大家", "主角", "对手",
+    "同伴", "旁观者", "旁人",
+})
+
+
+def _beat_body(text: str) -> str:
+    # 「证据：…」前面通常还有一个「（」，剥掉尾巴后要一并清掉这个孤立括号。
+    return _EVIDENCE_RE.sub("", text or "").rstrip("（( \t").strip()
+
+
+def _beat_label(body: str) -> tuple[str, str]:
+    """拆出「爆发：/升温：」这类节拍类型标签。"""
+    label, sep, rest = body.partition("：")
+    if sep and 1 <= len(label) <= 10 and not re.search(r"[，。；！？]", label):
+        return label.strip(), rest.strip()
+    return "", body
+
+
+def _beat_nodes(body: str) -> list[str]:
+    """按出现顺序取**去重后**的结构节点（先/再/然后/最后…）。
+
+    原文里「先…再…先…再」很常见，旧写法返回重复节点，校验时会要求骨架
+    把这些重复词一个不落地复现，正常改写必然被判「丢节点」。结构节点只关心
+    「用过哪几种」，不关心用了几次。
+    """
+    seen: list[str] = []
+    for m in _BEAT_NODE_RE.finditer(body):
+        if m.group(1) not in seen:
+            seen.append(m.group(1))
+    return seen
+
+
+def _beat_name_candidates(text: str) -> set[str]:
+    """从「某某道/某某冷笑」这类说话归属里抽候选名，补 KG 名单的漏。"""
+    return {m.group(1) for m in _BEAT_SPEECH_NAME_RE.finditer(text or "")}
+
+
+def _replace_terms(text: str, terms: dict) -> str:
+    """专名 → 角色/事物。
+
+    主角**由 `terms["protagonists"]` 指定**，不能按名字长度排序猜测——旧写法
+    会把最长的名字（常是「某某的下属」这类长别名）当主角，骨架的角色关系直接错位。
+    其余人物按在原文中首次出现的顺序依次分配对手/同伴/旁观者；名字仍按长度
+    倒序替换，避免「宋书」先吃掉「宋书航」。
+    """
+    names = [n for n in (terms.get("characters") or []) if n]
+    protagonists = {n for n in (terms.get("protagonists") or []) if n}
+    ordered = sorted(set(names) | protagonists, key=len, reverse=True)
+
+    assigned: dict[str, str] = {}
+    for name in ordered:
+        if name in _GENERIC_ROLE_WORDS:
+            continue
+        if name in protagonists:
+            assigned[name] = "主角"
+    extras = [
+        n for n in ordered
+        if n not in assigned and n not in _GENERIC_ROLE_WORDS and len(n) >= 2
+    ]
+    extras.sort(key=lambda n: (text.find(n) if text.find(n) >= 0 else 10 ** 9, -len(n)))
+    roles = ("对手", "同伴", "旁观者")
+    for i, name in enumerate(extras):
+        assigned[name] = roles[i] if i < len(roles) else "旁观者"
+
+    for name in ordered:
+        role = assigned.get(name)
+        if role:
+            text = text.replace(name, role)
+    for item in sorted(set(terms.get("items") or []), key=len, reverse=True):
+        if item and len(item) >= 3 and item not in _GENERIC_ROLE_WORDS:
+            text = text.replace(item, "某一事物")
+    return text
+
+
+def skeletonize_beat_rule(text: str, terms: dict, *,
+                          limit: int = BEAT_SKELETON_MAX_CHARS) -> str | None:
+    """确定性骨架化：去证据、去引号/书名、专名换角色，只留结构节点。"""
+    body = _beat_body(text)
+    if len(body) <= limit:
+        return body
+    label, rest = _beat_label(body)
+    names = list(terms.get("characters") or [])
+    names += list(_beat_name_candidates(body))
+    names += list(terms.get("protagonists") or [])
+    rest = _replace_terms(rest, {**terms, "characters": names})
+    rest = re.sub(r"[“「『][^”」』]*[”」』]", "某一细节", rest)
+    rest = re.sub(r"《[^》]*》|【[^】]*】|［[^］]*］", "某一事物", rest)
+    rest = re.sub(r"[（(][^）)]*[）)]", "", rest)
+
+    clauses = [c.strip(" ，。；：、\n\t")
+               for c in re.split(r"[，。；：、\n]", rest)]
+    clauses = [c for c in clauses if c]
+    picked: list[str] = []
+    for clause in clauses:
+        if not picked:
+            picked.append(clause)
+        elif clause.startswith(("先", "再", "然后", "接着", "随后", "最后", "最终", "同时")):
+            picked.append(clause)
+    if len(picked) < 2:
+        picked = clauses[:4]
+
+    def render(parts: list[str]) -> str:
+        joined = "；".join(parts)
+        return f"{label}：{joined}" if label else joined
+
+    skeleton = render(picked)
+    while len(skeleton) > limit and len(picked) > 2:
+        picked.pop()
+        skeleton = render(picked)
+    return skeleton if len(skeleton) <= limit else None
+
+
+def validate_beat_skeleton(original: str, skeleton: str, terms: dict, *,
+                           limit: int = BEAT_SKELETON_MAX_CHARS) -> str | None:
+    """返回不合格原因；None = 通过。
+
+    校验三件事：长度、结构节点没丢、没有遗留/新增专名。
+    「新增专名」用 KG 人物/物品名单 + 原文说话归属候选名做黑名单；模型若
+    凭空造名，只要不在黑名单里就会漏检，因此提示词同时禁止新增专名，
+    并在批量生成后人工抽检。
+    """
+    if not skeleton or not skeleton.strip():
+        return "骨架为空"
+    if len(skeleton) > limit:
+        return f"骨架 {len(skeleton)} 字，超过 {limit}"
+    if "证据" in skeleton:
+        return "骨架里还留着证据段"
+    if re.search(r"[“”「」『』《》【】]", skeleton):
+        return "骨架里还留着引号/书名号"
+    body = _beat_body(original)
+    want = _beat_nodes(body)
+    lost = [node for node in want if node not in skeleton]
+    if lost:
+        return f"丢了结构节点：{'/'.join(lost)}"
+    forbidden = set(terms.get("characters") or [])
+    # 物品只查 3 字及以上：KG 的 item 里混着「环境」「资源」这类通用名词，
+    # 它们出现在骨架里是正常表达，不是跨书专名。真正的功法/法宝名基本 ≥3 字。
+    forbidden |= {n for n in (terms.get("items") or []) if len(n) >= 3}
+    forbidden |= _beat_name_candidates(body)
+    forbidden -= _GENERIC_ROLE_WORDS
+    leaked = sorted((n for n in forbidden if n and n in skeleton), key=len, reverse=True)
+    if leaked:
+        return f"还有专名：{'、'.join(leaked[:3])}"
+    return None
+
+
+def build_beat_skeletons(profile: dict, terms: dict, *,
+                         rewriter=None,
+                         limit: int = BEAT_SKELETON_MAX_CHARS) -> dict:
+    """为超长节拍生成骨架，返回 {skeletons, skipped, stats}。
+
+    `rewriter(body, hint)` 可选；不传则用确定性压缩。改写结果必须过
+    `validate_beat_skeleton`，不过就丢进 skipped，宁缺毋滥。
+    """
+    items = ((profile or {}).get("rules") or {}).get(BEAT_DIMENSION) or []
+    skeletons: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+    seen: set[str] = set()
+    stats = {"long": 0, "ok": 0, "skipped": 0, "rewritten": 0}
+    for item in items:
+        text = _rule_text(item)
+        if not text or _beat_char_len(text) <= limit:
+            # 用与硬过滤相同的口径判断「超长」：证据占比高的条目正文可能很短，
+            # 但整条规则仍被 FLAG_TOO_LONG 淘汰，必须一并骨架化。
+            continue
+        key = _rule_score_key(item, BEAT_DIMENSION)
+        if key in seen:
+            continue
+        seen.add(key)
+        stats["long"] += 1
+        skeleton = None
+        if rewriter is not None:
+            try:
+                skeleton = rewriter(_beat_body(text), "")
+                stats["rewritten"] += 1
+            except Exception:  # noqa: BLE001 —— 改写失败退回确定性压缩
+                skeleton = None
+        if skeleton is not None:
+            reason = validate_beat_skeleton(text, skeleton, terms, limit=limit)
+            if reason:
+                # 一次重试，把不合格原因回传给改写器。
+                try:
+                    retried = rewriter(_beat_body(text), reason)
+                    stats["rewritten"] += 1
+                    skeleton = retried if not validate_beat_skeleton(
+                        text, retried, terms, limit=limit) else None
+                except Exception:  # noqa: BLE001
+                    skeleton = None
+            if skeleton is None:
+                skipped[key] = reason
+        if skeleton is None and rewriter is None:
+            skeleton = skeletonize_beat_rule(text, terms, limit=limit)
+            reason = validate_beat_skeleton(text, skeleton or "", terms, limit=limit)
+            if reason:
+                skipped[key] = reason
+                skeleton = None
+        if skeleton:
+            skeletons[key] = skeleton
+            stats["ok"] += 1
+        else:
+            stats["skipped"] += 1
+    return {"skeletons": skeletons, "skipped": skipped, "stats": stats}
+
+
+def build_beat_terms(db, profile: dict | None = None, source_ids=None) -> dict:
+    """收集骨架化用的专名表：KG 人物/物品 + 声音词典里的名字。
+
+    `protagonists` 取 KG 里 mention_count 最高的 2 个角色，供确定性兜底指定主角；
+    LLM 改写路径不依赖它，但仍用它做校验黑名单。
+    """
+    characters: list[str] = []
+    items: list[str] = []
+    protagonists: list[str] = []
+    if db is not None:
+        try:
+            from app.models import KgEntity
+
+            ids = [int(x) for x in (source_ids or [])]
+            query = select(KgEntity).where(KgEntity.kind.in_(("character", "item")))
+            if ids:
+                query = query.where(KgEntity.novel_id.in_(ids))
+            rows = db.scalars(query).all()
+            chars = [r for r in rows if r.kind == "character"]
+            for row in rows:
+                target = characters if row.kind == "character" else items
+                name = (row.canonical_name or "").strip()
+                if 2 <= len(name) <= 8:
+                    target.append(name)
+                for alias in (row.aliases or []):
+                    if isinstance(alias, str) and 2 <= len(alias) <= 8:
+                        target.append(alias.strip())
+            ranked = sorted(
+                (r for r in chars if 2 <= len(r.canonical_name or "") <= 8),
+                key=lambda r: -(r.mention_count or 0),
+            )
+            protagonists = [
+                r.canonical_name.strip() for r in ranked
+                if r.canonical_name.strip() not in _GENERIC_ROLE_WORDS
+            ][:2]
+        except Exception:  # noqa: BLE001 —— KG 不可用不影响确定性骨架
+            logging.getLogger(__name__).debug("读取 KG 专名失败", exc_info=True)
+    for name in ((profile or {}).get("voice_stats") or {}):
+        bare = name.split("|", 1)[-1].strip()
+        if 2 <= len(bare) <= 8:
+            characters.append(bare)
+    return {
+        "characters": sorted(set(characters)),
+        "items": sorted(set(items)),
+        "protagonists": protagonists,
+    }
+
+
+def ensure_beat_skeletons(db, profile: dict | None, source_ids=None, *,
+                          rewriter=None) -> dict | None:
+    """确保档案带当前版本的节拍骨架缓存（蒸馏收尾时调用一次）。
+
+    与 `ensure_rule_scores` 分开：打分缓存和骨架缓存各有版本，改其中一个
+    不必让另一个重算。没有超长节拍时不写任何字段，档案形状保持不变。
+    """
+    if not isinstance(profile, dict):
+        return profile
+    if profile.get("beat_skeleton_version") == BEAT_SKELETON_VERSION:
+        return profile
+    terms = build_beat_terms(db, profile, source_ids)
+    built = build_beat_skeletons(profile, terms, rewriter=rewriter)
+    if built["stats"]["long"] == 0:
+        return profile
+    profile.update({
+        "beat_skeletons": built["skeletons"],
+        "beat_skeleton_skipped": built["skipped"],
+        "beat_skeleton_version": BEAT_SKELETON_VERSION,
+        "beat_skeleton_stats": built["stats"],
+    })
+    return profile
+
+
+def _beat_char_len(text: str) -> int:
+    """节拍长度口径：与硬过滤一致（去标点、含证据）。
+
+    `_beat_body` 只用于骨架化（去掉「证据：」）；判断「是否超长」必须用
+    `FLAG_TOO_LONG` 打标时的同一口径，否则会出现「缓存说超长、这里说不超长」
+    的分叉，超长条目会绕过骨架化直接带着专名进池。
+    """
+    return len(_PUNCT_RE.sub("", text or ""))
+
+
+def _select_beat_items(
+    items: list,
+    limit: int,
+    *,
+    mode: str,
+    allowed_novel_ids,
+    profile: dict,
+    config: RuleScoringConfig = DEFAULT_RULE_SCORING,
+) -> list:
+    """节拍序列专用选条：原创只收 ≤280；续写同书放宽到 480，跨书走骨架。
+
+    席位口径（用户 2026-11-12 定稿）：
+
+    - 普通席位：按四维总分排序，取前 `limit * mmr_pool_factor`（下限 24）条
+      做近重复压制与 MMR；
+    - 结构席位（走过骨架化的条目）：原创 1、续写 2，**从普通候选池外单独取**，
+      不占普通池的 24 条名额；不足时由普通席位补位，反之亦然；
+    - 骨架条目的 execution 沿用原分 ×0.95，不重算，保证总分不高于原文；
+    - 总配额与字数上限都不因留席而改变。
+    """
+    skeletons = profile.get("beat_skeletons") or {}
+    allowed = {int(x) for x in (allowed_novel_ids or [])}
+    items_novels = {
+        int(it["novel_id"]) for it in items
+        if isinstance(it, dict) and isinstance(it.get("novel_id"), int)
+    }
+    if not allowed and len(items_novels) == 1:
+        allowed = set(items_novels)
+
+    candidates = []
+    for pos, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        text = _rule_text(item)
+        if not text:
+            continue
+        cached = _cached_score(item, BEAT_DIMENSION, profile, config)
+        if cached is None:
+            continue
+        # 硬过滤与风格规则同一套，只对 TOO_LONG 网开一面（走骨架/同书放宽）。
+        if cached["flags"] & (_HARD_FILTER_MASK & ~FLAG_TOO_LONG):
+            continue
+        novel_id = item.get("novel_id")
+        same_book = bool(allowed) and isinstance(novel_id, int) and int(novel_id) in allowed
+        too_long = bool(cached["flags"] & FLAG_TOO_LONG)
+        raw_len = _beat_char_len(text)
+        relax_limit = BEAT_CONTINUATION_MAX_CHARS if mode == RENDER_MODE_CONTINUATION else 0
+        can_relax = mode == RENDER_MODE_CONTINUATION and same_book and raw_len <= relax_limit
+
+        effective = text
+        used_skeleton = False
+        if too_long and not can_relax:
+            effective = skeletons.get(_rule_score_key(item, BEAT_DIMENSION)) or ""
+            used_skeleton = True
+            if not effective:
+                continue
+            if len(effective) > BEAT_SKELETON_MAX_CHARS:
+                # 骨架按原样渲染进提示词，直接用原始长度卡 280。
+                continue
+        elif not too_long and raw_len > BEAT_SKELETON_MAX_CHARS:
+            # 未打 TOO_LONG 但正文已超 280：理论上不会发生（口径已对齐），
+            # 仍然拦下并记录，避免将来改阈值时静默放行。
+            logging.getLogger(__name__).debug(
+                "节拍条目长度口径不一致：%s 字但未打 TOO_LONG", raw_len)
+            continue
+
+        flags = cached["flags"] & ~FLAG_TOO_LONG
+        if effective == text:
+            scores = dict(cached)
+            scores["flags"] = flags
+            total = cached["total"]
+        else:
+            # 骨架条目沿用原条目的 execution 分 ×0.95，**不重算**：
+            # 重算会因为压缩后正文变短而判出一个新分数，与原文不可比；
+            # 折价保证同一条件下骨架总分不高于原文，骨架化不能变成刷分路径。
+            exec_score = round(
+                float(cached["execution"]) * BEAT_SKELETON_SCORE_FACTOR, 4
+            )
+            scores = dict(cached)
+            scores["execution"] = exec_score
+            scores["flags"] = flags
+            w = config.weights
+            total = (
+                w[0] * exec_score + w[1] * scores["distinctiveness"]
+                + w[2] * scores["evidence"] + w[3] * scores["verifiability"]
+            )
+        candidates.append({
+            "pos": pos,
+            "item": dict(item, rule=effective, _beat_skeleton=used_skeleton),
+            "text": effective,
+            "ch": item.get("chapter_no"),
+            "scores": scores,
+            "total": total,
+        })
+
+    # 与通用选条一致：只对得分靠前的候选做近重复/MMR。全量 2,800 条两两
+    # 算包含度是 O(n²)，实测单次要 120 秒；节拍维度不能拖垮生成路径。
+    candidates.sort(key=lambda e: (-e["total"], e["pos"]))
+
+    # —— 席位拆分 ——
+    # 结构型（走过骨架化）条目单独留席：配额来自 `RenderPreset.structural_seats`
+    # （原创 1、续写 2、角色对话 0）。骨架条目的 execution 折价后排在 24 条池外，
+    # 若与普通条目抢同一批席位就永远选不中；留席后它们从池外单独取，
+    # **不占**普通席位的 24 条池子名额。总配额不变。
+    struct_seats = resolve_render_preset(mode).structural_seats
+    struct_limit = max(0, min(struct_seats, limit))
+    normal_limit = limit - struct_limit
+    structural = [e for e in candidates if e["item"].get("_beat_skeleton")]
+    normal = [e for e in candidates if not e["item"].get("_beat_skeleton")]
+
+    used_deciles: set[int] = set()
+    taken: set[int] = set()
+    selected: list[dict] = []
+
+    def _take(cands: list[dict], n: int) -> list[dict]:
+        """近重复 + MMR 选 n 条。`taken` 里的条目不重复选，总配额由调用方控制。"""
+        if n <= 0:
+            return []
+        # 与通用选条一致：只对得分靠前的候选做近重复/MMR。
+        pool = [e for e in cands if e["pos"] not in taken][
+            : max(n * config.mmr_pool_factor, 24)
+        ]
+        deduped: list[dict] = []
+        for entry in pool:
+            g = _grams(entry["text"])
+            if any(_containment(g, _grams(o["text"])) >= config.near_dup_similarity
+                   for o in deduped):
+                continue
+            deduped.append(entry)
+
+        picked: list[dict] = []
+        remaining = list(deduped)
+        while remaining and len(picked) < n:
+            best, best_rank = None, None
+            for entry in remaining:
+                base = min(entry["total"], 1.0)
+                decile = min(entry["ch"], 10) if isinstance(entry["ch"], int) and entry["ch"] > 0 else 0
+                coverage = config.coverage_bonus if decile not in used_deciles else 0.0
+                redundancy = 0.0
+                if selected or picked:
+                    g = _grams(entry["text"])
+                    redundancy = max(
+                        _containment(g, _grams(o["text"]))
+                        for o in (selected + picked)
+                    )
+                rank = config.mmr_lambda * (base + coverage) - (1 - config.mmr_lambda) * redundancy
+                if best_rank is None or rank > best_rank:
+                    best, best_rank = entry, rank
+            remaining.remove(best)
+            picked.append(best)
+            if isinstance(best["ch"], int) and best["ch"] > 0:
+                used_deciles.add(min(best["ch"], 10))
+        return picked
+
+    def _commit(entries: list[dict]) -> None:
+        selected.extend(entries)
+        taken.update(e["pos"] for e in entries)
+
+    # 普通席位：24 条池内近重复 + MMR；结构席位：池外按总分取。
+    _commit(_take(normal, normal_limit))
+    _commit(_take(structural, struct_limit))
+    # 互相补位：一边候选不够时用另一边补齐，总配额不变（不扩池、不放宽字数）。
+    if len(selected) < limit:
+        _commit(_take(structural, limit - len(selected)))
+    if len(selected) < limit:
+        _commit(_take(normal, limit - len(selected)))
+    return [entry["item"] for entry in selected]
+
+
+# ====================================================================
+# 渲染用途（mode）与配额
+# ====================================================================
+#
+# ## 为什么按用途分三套
+#
+# 同一份档案在三种生成场景里要读的东西不一样：
+#   - 原创：要把「作者怎么写」学像，文风维度是主体，声音只要够定称呼/自称/口头禅；
+#   - 续写：既要接文风，也要接人物与时间线，三者并重；
+#   - 角色对话：要把某个角色说话的方式演像，声音词典是主体，文风退为辅助。
+#
+# 旧实现是「每维 3 条 + 声音 20 条」一套通吃，等于让三种场景读同一份配比。
+# 这里把三套配额**显式注册**成配置（不在渲染逻辑里散落 if/else），
+# 调用方必须显式传 `mode`；传错直接报错，不静默落回默认。
+
+RENDER_MODE_ORIGINAL = "original"
+RENDER_MODE_CONTINUATION = "continuation"
+RENDER_MODE_DIALOGUE = "dialogue"
+
+
+@dataclass(frozen=True)
+class RenderPreset:
+    """一种生成用途的渲染配额。"""
+
+    key: str
+    name: str
+    #: 未在 `dim_limits` 里单独指定的维度取几条
+    per_dim: int
+    #: 维度级覆盖：{维度名: 条数}
+    dim_limits: dict[str, int]
+    #: 角色声音渲染条数
+    voice_count: int
+    #: 反向禁忌每组最多渲染几条
+    forbidden_per_group: int
+    #: 整块提示词的字数上限（含禁忌）
+    char_limit: int
+    #: 声音排序口径："address"（称呼体系）/ "frequency"（出场频次）/ "imitation"（可模仿度）
+    voice_order: str
+    #: 首段是否额外压低压缩类漂移句子（原创开篇沿用旧行为）
+    drop_compression: bool = True
+    #: 结构型（走过骨架化）条目的留席数：原创 1、续写 2、角色对话 0。
+    #: 骨架条目 execution 折价后必然排在 24 条候选池外，不给留席就永远选不中；
+    #: 留席从池外单独取，**不占**普通席位名额，总配额与字数上限都不因此改变。
+    structural_seats: int = 0
+
+    def limit_for(self, dim: str) -> int:
+        return self.dim_limits.get(dim, self.per_dim)
+
+
+RENDER_PRESETS: dict[str, RenderPreset] = {
+    RENDER_MODE_ORIGINAL: RenderPreset(
+        key=RENDER_MODE_ORIGINAL,
+        name="原创",
+        per_dim=2,
+        dim_limits={
+            # 文风主体：对白/节奏/段落/情绪/场景/人物给足
+            "人物描写手法": 4,
+            "对白风格": 5,
+            "段落编排": 4,
+            "场景构建": 4,
+            "情绪表达": 4,
+            "节奏控制": 4,
+            "剧情编排模式": 3,
+            # 非文风维度让位
+            "世界观呈现": 1,
+            "伏笔与悬念设计": 1,
+            "节拍序列": 1,
+            "高频场景模板": 1,
+            "潜台词模式": 1,
+        },
+        # 声音只要够定称呼/自称/口头禅的一致性，不占大份
+        voice_count=6,
+        forbidden_per_group=8,
+        char_limit=9000,
+        voice_order="address",
+        structural_seats=1,
+    ),
+    RENDER_MODE_CONTINUATION: RenderPreset(
+        key=RENDER_MODE_CONTINUATION,
+        name="续写",
+        per_dim=3,
+        dim_limits={
+            # 文风维度
+            "人物描写手法": 5,
+            "对白风格": 4,
+            "段落编排": 3,
+            "场景构建": 3,
+            "情绪表达": 3,
+            "节奏控制": 3,
+            # 时间线（用户口径：节拍序列、剧情编排模式、伏笔与悬念、文风漂移）
+            "节拍序列": 4,
+            "剧情编排模式": 4,
+            "伏笔与悬念设计": 4,
+            # 其余辅助
+            "世界观呈现": 2,
+            "高频场景模板": 1,
+            "潜台词模式": 2,
+        },
+        voice_count=12,
+        forbidden_per_group=6,
+        char_limit=10000,
+        voice_order="frequency",
+        structural_seats=2,
+    ),
+    RENDER_MODE_DIALOGUE: RenderPreset(
+        key=RENDER_MODE_DIALOGUE,
+        name="角色对话",
+        per_dim=1,
+        dim_limits={
+            # R36-1（2026-11-12 用户定）：角色对话**只取对白维度 + 声音**。
+            # 场景、节奏、情绪、段落等一律不进——对话要像本人说话，不是像作者写景。
+            "对白风格": 4,
+        },
+        voice_count=30,
+        forbidden_per_group=4,
+        char_limit=7000,
+        voice_order="imitation",
+    ),
+}
+
+
+def resolve_render_preset(mode: str | None) -> RenderPreset:
+    """解析渲染用途。传错必须响亮失败——静默落回原创会让角色对话读错配比。"""
+    key = mode or RENDER_MODE_ORIGINAL
+    preset = RENDER_PRESETS.get(key)
+    if preset is None:
+        valid = "、".join(f"{k}（{v.name}）" for k, v in RENDER_PRESETS.items())
+        raise ValueError(f"未知的叙事档案渲染用途：{mode!r}；可选：{valid}")
+    return preset
+
+
+def _voice_item_name(item) -> str:
+    rule = item.get("rule", "") if isinstance(item, dict) else ""
+    if "：" not in rule:
+        return ""
+    return rule.split("：", 1)[0].strip()
+
+
+def _voice_stat(item, stats: dict) -> dict | None:
+    """取某条声音的频次统计。key 先按 `novel_id|名字`，再退回纯名字。"""
+    if not stats:
+        return None
+    name = _voice_item_name(item)
+    if not name:
+        return None
+    nid = item.get("novel_id") if isinstance(item, dict) else None
+    if nid is not None and f"{int(nid)}|{name}" in stats:
+        return stats[f"{int(nid)}|{name}"]
+    return stats.get(name)
+
+
+def build_voice_stats(items: list, texts_by_novel: dict[int, str]) -> tuple[dict, list[str]]:
+    """用**语料精确计数**给每条声音补出场频次，并标出不会说话的非人条目。
+
+    只产读取侧索引（进档案顶层 `voice_stats` / `voice_non_human`），
+    不改规则条目本身，也不产生任何 LLM 调用。
+
+    Returns:
+        (stats, non_human_names)
+        stats: {"<novel_id>|<名字>": {"mentions": int, "non_human": bool}}
+    """
+    stats: dict[str, dict] = {}
+    non_human: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        name = _voice_item_name(item)
+        if not name:
+            continue
+        nid = item.get("novel_id") if isinstance(item, dict) else None
+        text = texts_by_novel.get(int(nid)) if nid is not None else None
+        key = f"{int(nid)}|{name}" if nid is not None else name
+        if key in seen:
+            continue
+        seen.add(key)
+        flag = not _has_speaking_evidence(
+            item.get("rule", "") if isinstance(item, dict) else str(item)
+        )
+        stats[key] = {
+            "mentions": text.count(name) if text else 0,
+            "non_human": flag,
+        }
+        if flag:
+            non_human.append(name)
+    return stats, non_human
+
+
+def _voice_address_score(item) -> int:
+    """原创用：这条声音定义了多少「怎么称呼别人」的信息。"""
+    rule = item.get("rule", "") if isinstance(item, dict) else ""
+    return rule.count("称") * 100 + (40 if "关系动态" in rule else 0)
+
+
+def _voice_imitation_score(item) -> int:
+    """角色对话用：这条声音有多少可模仿的说话特征（越具体越高）。"""
+    rule = item.get("rule", "") if isinstance(item, dict) else ""
+    score = 0
+    for marker, weight in (("自称", 30), ("口头禅", 40), ("句长", 25),
+                           ("语气", 20), ("节奏", 20), ("代表台词", 25)):
+        if marker in rule:
+            score += weight
+    score += min(_evidence_len(rule), 200) // 5
+    return score
+
+
+def _select_voice_items(items: list, stats: dict, *, limit: int,
+                        order: str = "frequency") -> list:
+    """按用途排序角色声音，取前 `limit` 条。
+
+    排序口径：
+      - address：称呼体系（原创）——定义了多少「称人」方式优先
+      - imitation：可模仿度（角色对话）——自称/口头禅/句长/语气/代表台词优先
+      - frequency：出场频次（续写）——语料精确计数优先
+    没有频次索引（旧档案）时保持原顺序，行为与改动前一致。
+    """
+    if not items:
+        return []
+    if not stats:
+        return items[:limit]
+    decorated = []
+    for idx, item in enumerate(items):
+        stat = _voice_stat(item, stats) or {}
+        mentions = int(stat.get("mentions") or 0)
+        if order == "address":
+            primary = _voice_address_score(item)
+        elif order == "imitation":
+            primary = _voice_imitation_score(item)
+        else:
+            primary = mentions
+        decorated.append((primary, mentions, -idx, item))
+    decorated.sort(reverse=True)
+    ordered = [d[3] for d in decorated]
+
+    # 硬性保底：全书出场频次最高的 3 个名字（主角 + 主要配角）必进，
+    # 不受当前用途排序口径影响。旧实现按落库顺序取前 20，宋书航/羽柔子/
+    # 白前辈（书内频次最高的一档）会被挤出去。
+    guaranteed: list = []
+    locked: set[str] = set()
+    for item in sorted(items, key=lambda it: -int((_voice_stat(it, stats) or {}).get("mentions") or 0)):
+        name = _voice_item_name(item)
+        if not name or name in locked:
+            continue
+        if len(guaranteed) >= min(3, limit):
+            break
+        guaranteed.append(item)
+        locked.add(name)
+    rest = [it for it in ordered if _voice_item_name(it) not in locked]
+    return (guaranteed + rest)[:limit]
+
+
+def _voice_mapping_sources(profile: dict) -> list[str]:
+    """项目角色 → 参考声音映射里的参考角色名，保持映射表顺序。"""
+    mapping = profile.get("voice_mapping") if isinstance(profile, dict) else None
+    if not isinstance(mapping, list):
+        return []
+    names: list[str] = []
+    for row in mapping:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("source_character") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _promote_mapped_voices(selected: list, items: list, profile: dict,
+                           limit: int) -> list:
+    """映射里的参考角色必须出现在最终词典里，否则映射指向空气。
+
+    先按映射顺序放进参考条目，再用原排序结果补足 `limit`。
+    """
+    source_names = _voice_mapping_sources(profile)
+    if not source_names:
+        return selected
+    by_name: dict[str, dict] = {}
+    for item in items:
+        name = _voice_item_name(item)
+        if name and name not in by_name:
+            by_name[name] = item
+    promoted: list = []
+    seen: set[str] = set()
+    for name in source_names:
+        item = by_name.get(name)
+        if item is not None and name not in seen:
+            promoted.append(item)
+            seen.add(name)
+    for item in selected:
+        if len(promoted) >= limit:
+            break
+        name = _voice_item_name(item)
+        if name and name not in seen:
+            promoted.append(item)
+            seen.add(name)
+    return promoted[:limit]
+
+
+def _render_voice_mapping(profile: dict, available_names: set[str]) -> list[str]:
+    """渲染在【角色声音词典】前的项目映射；只列真正出现在词典里的参考角色。"""
+    mapping = profile.get("voice_mapping") if isinstance(profile, dict) else None
+    if not isinstance(mapping, list):
+        return []
+    rows: list[str] = []
+    for row in mapping:
+        if not isinstance(row, dict):
+            continue
+        character = str(row.get("character") or "").strip()
+        source = str(row.get("source_character") or "").strip()
+        borrow = str(row.get("borrow_point") or "").strip()
+        if not character or not source or not borrow:
+            continue
+        if source not in available_names:
+            continue
+        rows.append(f"  · {character} ← {source}：{borrow}")
+    if not rows:
+        return []
+    return [
+        "【本项目角色声音映射（只借类型，不借人名）】",
+        "  下列“角色声音词典”是参考素材，不是本项目人设；按上面的映射借用类型。",
+        *rows,
+    ]
+
+
+#: 规则声称的指标 → 生成正文实测字段（`style.consistency.measure`）。
+#: 百分比字段在 measure 里是 0–1 小数，比较前 ×100。
+_FEEDBACK_METRIC_MAP = {
+    "句长": "句长均值",
+    "短句占比": "短句占比",
+    "长句占比": "长句占比",
+    "对白占比": "对白字占比",
+    "段均句数": "段均句数",
+}
+
+_FEEDBACK_PERCENT_METRICS = {"短句占比", "长句占比", "对白占比"}
+
+
+def load_rule_weights(db, project_id: int) -> dict[str, float]:
+    """读某项目的规则反馈权重（rule_hash → weight）。读不到返回空 dict。"""
+    from app.models import NarrativeRuleWeight
+
+    rows = db.scalars(
+        select(NarrativeRuleWeight).where(
+            NarrativeRuleWeight.project_id == project_id
+        )
+    ).all()
+    return {r.rule_hash: float(r.weight or 1.0) for r in rows}
+
+
+def attach_rule_weights(db, profile: dict | None, project_id: int | None) -> dict | None:
+    """把反馈权重挂到档案副本上（不改 `project.style_narrative` 本身）。
+
+    返回**浅拷贝**：`project_narrative` 返回的可能是项目缓存那个 dict，直接原地
+    加键会污染缓存（下次渲染拿到过期权重），也可能被 SQLAlchemy 当成脏数据。
+    """
+    if not profile or not project_id:
+        return profile
+    try:
+        weights = load_rule_weights(db, project_id)
+    except Exception:  # noqa: BLE001 —— 权重是增强，读不到照常渲染
+        logging.getLogger(__name__).debug("读取叙事规则反馈权重失败", exc_info=True)
+        return profile
+    if not weights:
+        return profile
+    merged = dict(profile)
+    merged["rule_weights"] = weights
+    return merged
+
+
+def _bump_rule_weight(db, project_id: int, rule_hash: str, *, hit: bool,
+                      reason: str, config: RuleScoringConfig) -> None:
+    from app.models import NarrativeRuleWeight
+
+    row = db.scalars(
+        select(NarrativeRuleWeight).where(
+            NarrativeRuleWeight.project_id == project_id,
+            NarrativeRuleWeight.rule_hash == rule_hash,
+        )
+    ).first()
+    if row is None:
+        row = NarrativeRuleWeight(
+            project_id=project_id, rule_hash=rule_hash, weight=1.0,
+            hits=0, misses=0,
+        )
+    if hit:
+        row.hits = int(row.hits or 0) + 1
+        row.weight = min(config.weight_max, float(row.weight or 1.0) + config.feedback_hit_step)
+    else:
+        row.misses = int(row.misses or 0) + 1
+        row.weight = max(config.weight_min, float(row.weight or 1.0) - config.feedback_miss_step)
+    row.last_reason = reason
+    row.updated_at = datetime.now(timezone.utc)
+    db.add(row)
+
+
+def record_narrative_feedback(db, project, text: str, *, metric: dict | None = None,
+                              config: RuleScoringConfig = DEFAULT_RULE_SCORING) -> int:
+    """第四层：按生成正文实测指标调整规则权重，**落库**（零 LLM）。
+
+    只核对「档案里真的有数字声称」的规则（书 7 这类规则只有 26 条，逐段跑
+    成本可忽略）；没有数字的规则无法判定是否遵守，不调权。
+
+    返回本次调整的规则条数。任何异常都不外抛——反馈是增强，不能拖垮生成。
+    """
+    profile = getattr(project, "style_narrative", None)
+    if not isinstance(profile, dict):
+        return 0
+    try:
+        if metric is None:
+            from app.style.consistency import measure
+
+            metric = measure(text or "")
+        core = (metric or {}).get("core") or {}
+        if not core:
+            return 0
+        generated: dict[str, float] = {}
+        for metric_name, value in core.items():
+            if value is None:
+                continue
+            if metric_name in ("短句占比", "长句占比", "对白字占比"):
+                generated[metric_name] = float(value) * 100.0
+            else:
+                generated[metric_name] = float(value)
+
+        rows: list[dict] = profile.get("feedback_rules") or []
+        if not rows:
+            # 老档案没有预计算索引：只扫有数字声称的条目（不遍历全部 3 万条）。
+            for dim, items in (profile.get("rules") or {}).items():
+                if dim in (CHARACTER_VOICE_DIMENSION, "文风漂移分析", "文笔量化审计"):
+                    continue
+                for item in items or []:
+                    if _numeric_claims(_rule_text(item)):
+                        rows.append({"dim": dim, "text": _rule_text(item)})
+
+        updated = 0
+        seen: set[str] = set()
+        for row in rows:
+            text_rule = row.get("text") or ""
+            claims = _numeric_claims(text_rule)
+            if not claims:
+                continue
+            rule_hash = hashlib.sha1(text_rule.encode("utf-8")).hexdigest()[:20]
+            if rule_hash in seen:
+                continue
+            seen.add(rule_hash)
+            checked = []
+            for claim in claims:
+                key = _FEEDBACK_METRIC_MAP.get(claim["metric"])
+                actual = generated.get(key) if key else None
+                if actual is None:
+                    continue
+                ok = abs(claim["value"] - actual) <= _claim_tolerance(
+                    claim["metric"], claim["value"]
+                )
+                checked.append((claim, actual, ok))
+            if not checked:
+                continue
+            bad = [(c, a) for c, a, ok in checked if not ok]
+            if bad:
+                claim, actual = bad[0]
+                reason = (
+                    f"模型未遵守：规则声称{claim['metric']} {claim['value']:g}，"
+                    f"本段实测 {actual:.2f}，降权"
+                )
+                _bump_rule_weight(db, project.id, rule_hash, hit=False,
+                                  reason=reason, config=config)
+            else:
+                claim, actual, _ = checked[0]
+                reason = (
+                    f"模型遵守：{claim['metric']} {claim['value']:g} ≈ 本段 {actual:.2f}，升权"
+                )
+                _bump_rule_weight(db, project.id, rule_hash, hit=True,
+                                  reason=reason, config=config)
+            updated += 1
+        if updated:
+            db.commit()
+        return updated
+    except Exception:  # noqa: BLE001 —— 反馈失败绝不拖垮生成
+        logging.getLogger(__name__).warning("叙事规则反馈权重更新失败（已忽略）", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+
+
+def _trim_to_budget(text: str, limit: int) -> str:
+    """按总字数上限截断（在最后一个换行处切，避免切碎半条规则）。"""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    if cut < max(1, limit // 2):
+        cut = limit
+    return text[:cut].rstrip() + "\n…（已达本用途的字数上限，余下条目从略）"
+
+
+#: 续写/角色对话用的 KG 时间线契约（KG 侧接口形状待定，先固定读取键）：
+#:
+#:   {
+#:     "current_chapter": int,                      # 必填：当前写到第几章
+#:     "events": [{"chapter_no": int, "summary": str}],  # 按章号排序，可乱序传入
+#:     "open_plot_holes": [str],                    # 未回收伏笔
+#:     "character_states": [{"name": str, "state": str}],  # 关键人物状态
+#:     "relations": [str],                          # 角色对话要的关系摘要
+#:   }
+#:
+#: 「时间线有两个来源」：文风侧的节拍/剧情编排/伏笔/漂移在档案里，KG 侧的
+#: 事件序列由这里传入。续写缺 KG 部分必须报错，不能静默降级成只有文风。
+
+
+def _render_kg_timeline(timeline: dict | None, preset: RenderPreset) -> str:
+    """把 KG 侧时间线渲染成提示词块（原创不渲染，避免串味）。"""
+    if preset.key == RENDER_MODE_ORIGINAL:
+        return ""
+    if not timeline:
+        if preset.key == RENDER_MODE_CONTINUATION:
+            raise ValueError(
+                "续写渲染必须提供 KG 时间线（timeline）："
+                "当前写到第几章、此前事件、未回收伏笔、关键人物状态；"
+                "缺少 KG 侧会让续写只剩文风、接不上这本书走到哪了。"
+            )
+        return ""
+    current = timeline.get("current_chapter")
+    if preset.key == RENDER_MODE_CONTINUATION:
+        if not isinstance(current, int) or current <= 0:
+            raise ValueError("续写渲染的 timeline 必须包含正整数 current_chapter")
+
+    lines: list[str] = []
+    if preset.key == RENDER_MODE_CONTINUATION:
+        events = [
+            e for e in (timeline.get("events") or [])
+            if isinstance(e, dict) and isinstance(e.get("chapter_no"), int)
+            and (current is None or e["chapter_no"] <= current)
+        ]
+        events.sort(key=lambda e: e["chapter_no"])
+        if events:
+            lines.append(f"【剧情时间线（KG）：此前事件，截至第 {current} 章】")
+            # 最近的 40 条足够接上上下文；更早的由档案里的剧情编排模式承担。
+            for e in events[-40:]:
+                lines.append(f"  · 第 {e['chapter_no']} 章：{e.get('summary', '')}")
+        elif not (timeline.get("events") or []):
+            # KG 空项目（尚未抽取任何剧情）：如实写明，避免模型把「没有时间线」
+            # 误读成「可以自由编造此前事件」。生成侧 `_narrative_timeline` 会返回
+            # 最小空时间线，而不是 None（None 在续写模式下会直接抛错）。
+            lines.append(
+                "【剧情时间线（KG）】尚无已抽取剧情：本书还没有可用的 KG 事件，"
+                "续写请依据基线人物与大纲推进，不要编造未发生过的事件。"
+            )
+        holes = [h for h in (timeline.get("open_plot_holes") or []) if h]
+        if holes:
+            lines.append("【未回收伏笔（KG）】" + "；".join(holes[:12]))
+        states = [
+            s for s in (timeline.get("character_states") or [])
+            if isinstance(s, dict) and s.get("name")
+        ]
+        if states:
+            lines.append("【关键人物状态（KG）】")
+            for s in states[:12]:
+                lines.append(f"  · {s['name']}：{s.get('state', '')}")
+    else:
+        # 角色对话：只要人物近期状态与关系，不铺整条事件序列。
+        states = [
+            s for s in (timeline.get("character_states") or [])
+            if isinstance(s, dict) and s.get("name")
+        ]
+        if states:
+            lines.append("【人物近况（KG）：对话时保持一致】")
+            for s in states[-8:]:
+                lines.append(f"  · {s['name']}：{s.get('state', '')}")
+        relations = [r for r in (timeline.get("relations") or []) if r]
+        if relations:
+            lines.append("【人物关系（KG）】" + "；".join(relations[:10]))
+    return "\n".join(lines)
+
+
+#: 量化审计常驻块：中位数 1 条 + 跨章实测 3 条（用户口径 3–5 条）。
+AUDIT_BLOCK_ITEMS = 4
+
+
+def _audit_item_body(item) -> str:
+    text = _rule_text(item).strip()
+    prefix = "本块实测："
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def _pick_audit_items(items: list, picks: int) -> list:
+    """按章号分位取代表性实测块——开篇、中段、后段各留一个硬锚。"""
+    positioned = []
+    for it in items:
+        ch = it.get("chapter_no") if isinstance(it, dict) else None
+        if isinstance(ch, int) and ch > 0 and _rule_text(it).strip():
+            positioned.append((ch, it))
+    if not positioned or picks <= 0:
+        return []
+    positioned.sort(key=lambda pair: pair[0])
+    n = min(picks, len(positioned))
+    if n == 1:
+        return [positioned[len(positioned) // 2][1]]
+    idxs = [round(i * (len(positioned) - 1) / (n - 1)) for i in range(n)]
+    chosen, seen = [], set()
+    for idx in idxs:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        chosen.append(positioned[idx][1])
+    return chosen
+
+
+def _format_audit_median(audit: dict[str, float],
+                         include_short_para: bool = True) -> str:
+    """把全书块级中位数压成一行可对账的硬锚。
+
+    `include_short_para=False` 时摘掉「一两句短段 X%」——它会让模型按
+    「大多数段只有一两句」去写，与段长/极短纯对白段硬指标反向。
+    """
+    if not audit:
+        return ""
+    parts = []
+    if "句长" in audit:
+        parts.append(f"句长 {audit['句长']:.1f} 字")
+    if "短句占比" in audit:
+        parts.append(f"短句(≤5字)占比 {audit['短句占比']:.1f}%")
+    if "短句15占比" in audit:
+        parts.append(f"短句(≤15字)占比 {audit['短句15占比']:.1f}%")
+    if include_short_para and "短段占比" in audit:
+        parts.append(f"一两句短段 {audit['短段占比']:.1f}%")
+    if "对白占比" in audit:
+        parts.append(f"对白占正文 {audit['对白占比']:.1f}%")
+    if "对白开头段占比" in audit:
+        parts.append(f"对白开头段 {audit['对白开头段占比']:.1f}%")
+    if "短对白占比" in audit:
+        parts.append(f"短对白 {audit['短对白占比']:.1f}%")
+    if "情绪直陈" in audit:
+        parts.append(f"情绪直陈 {audit['情绪直陈']:.2f}/千字")
+    if "动作承载" in audit:
+        parts.append(f"动作承载 {audit['动作承载']:.2f}/千字")
+    if "问号" in audit:
+        parts.append(f"问号 {audit['问号']:.2f}/千字")
+    if "省略号" in audit:
+        parts.append(f"省略号 {audit['省略号']:.2f}/千字")
+    return "；".join(parts)
+
+
+_SHORT_PARA_CLAUSE_RE = re.compile(
+    r"(?:一两句短段|短段占比?)\s*[\d.]+%[，；]?"
+)
+
+
+def _strip_short_para_clause(text: str) -> str:
+    """摘掉审计条目里的「一两句短段 X%」，保留同一条的其他实测数字。"""
+    return _SHORT_PARA_CLAUSE_RE.sub("", text).strip("；， ")
+
+
+def _render_audit_block(rules: dict, limit: int = AUDIT_BLOCK_ITEMS,
+                        include_short_para: bool = True) -> str:
+    """量化审计独立注入块：**不参与选条**（它不是风格规则）。
+
+    这一维是全书唯一能被程序核对的东西：硬过滤里「必须有引号证据」和
+    「跨书通用套话」两条判据本来就不适用于它，所以按 3–5 条常驻注入，
+    不参加 MMR、不占风格规则配额。首行是全书中位数（最稳的锚），
+    其余按章号分位取实测块，让模型看到「开篇 / 中段 / 后段」的数字都在同一量级。
+
+    `include_short_para=False`：全书与分章两处都摘掉「一两句短段 X%」，
+    其余硬锚（句长 / 短句 / 对白 / 问号）照常保留。
+    """
+    items = (rules or {}).get("文笔量化审计") or []
+    if not items:
+        return ""
+    audit = _parse_audit_metrics({"rules": {"文笔量化审计": items}})
+    median_line = _format_audit_median(audit, include_short_para=include_short_para)
+    chapter_items = _pick_audit_items(items, max(limit - 1, 0))
+
+    lines = [
+        "【文笔量化审计：程序逐块实测的硬锚（非模型推测，写作时按此对标）】"
+    ]
+    if median_line:
+        lines.append(f"  · 全书 {len(items)} 块中位数：{median_line}")
+    for it in chapter_items:
+        body = _audit_item_body(it)
+        if not include_short_para:
+            body = _strip_short_para_clause(body)
+        if body:
+            # 历史块存的是「短句占 X%」，没带阈值；渲染时统一补上 ≤5 字，
+            # 否则同一块里中位数写了阈值、分章实测没写，模型仍会按常识理解。
+            body = re.sub(r"短句占(?!\s*[（(])", "短句(≤5字)占", body)
+            lines.append(f"  · 第 {it['chapter_no']} 章实测：{body}")
+    if len(lines) == 1:
+        return ""
+    lines.append(
+        "  口径：短句按整句≤5字（含句末标点）计，不是全文统计常用的<15字口径，勿混用。"
+    )
+    # 观测值 vs 目标值（2026-11-14）：这一段是「参考语料长什么样」的描述，
+    # 模型曾把中位数当成本章要凑的比值来读，与用户提示里的绝对句数配额打架
+    # （第 10 章实测：中位 14.7%，配额下限 5.3%，两个数差近三倍，结果两个都没执行）。
+    lines.append(
+        "  **以上是观测分布，不是目标值、也不是配额**：它只描述参考语料的样子；"
+        "本章实际执行标准以用户提示中的配额数字为准，没有配额时才按各指标带内处理。"
+    )
+    lines.append("  以上数字由程序算出，不要再重新估数。")
+    return "\n".join(lines)
+
+
+def describe_narrative(profile: dict | None, max_rules_per_dim: int | None = None,
+                       *, allowed_novel_ids: set[int] | list[int] | None = None,
+                       opening: bool = False,
+                       mode: str = RENDER_MODE_ORIGINAL,
+                       timeline: dict | None = None) -> str:
     """把叙事档案翻成一段确定性文字，用于 system prompt 的静态【叙事档案】块。
 
-    只取每个维度的前 max_rules_per_dim 条规则，防止 system prompt 膨胀。
-    确定性意味着：同一份档案永远产出同一段文本，不随段号变化。
+    `mode` 决定配额（原创/续写/角色对话，见 `RENDER_PRESETS`），调用方必须显式传；
+    传错直接抛 ValueError。`max_rules_per_dim` 是可选的全局硬上限（旧测试用），
+    None = 完全按 preset。
+
+    `opening=True`（首段）：在来源过滤之后，再剔除「文风漂移分析」里的压缩趋势，
+    并在块首加一句「篇幅与完整性优先于简洁倾向」。档案本身不改。
+
+    `timeline`：KG 侧的剧情时间线（见 `_render_kg_timeline` 的契约）。续写必填，
+    缺了直接 ValueError；角色对话只用人物近况与关系；原创忽略（避免串味）。
     """
+    preset = resolve_render_preset(mode)
+    timeline_block = _render_kg_timeline(timeline, preset)
     if not profile:
-        return ""
+        return timeline_block
+    # 来源隔离：续写项目只留续写书自己的规则；原创项目按当前参考书集合取。
+    profile = filter_rules_by_source(profile, allowed_novel_ids)
     rules = profile.get("rules") or {}
+    # 全程生效：剔除与档案分位**数值相反**的节奏分句（旧实现按字面词表命中，
+    # 换书会漏配/误删；第 3/4 章曾直接吃到「极短对白 + 单句成段 + 短段 86%」）。
+    rules = _drop_reverse_pacing_rules(rules, audit=_parse_audit_metrics(profile))
+    if opening:
+        rules = _drop_compression_trends(rules)
     forbidden = profile.get("forbidden") or {}
     if not rules and not forbidden:
         return ""
 
+    # 短段锚点（「一两句短段 X%」）同上：全程不注入，其余硬锚保留。
+    audit_block = _render_audit_block(rules, include_short_para=False)
     lines: list[str] = []
     all_dims = NARRATIVE_DIMENSIONS + ["文风漂移分析"]
+    voice_stats = profile.get("voice_stats") or {}
     for dim in all_dims:
+        if dim == "文笔量化审计":
+            # 量化审计不是风格规则：它没有引号证据、天生跨书通用，过不了为风格
+            # 规则设计的硬过滤。改走下面的独立常驻块，不参与 MMR / 不占配额。
+            continue
         items = rules.get(dim) or []
+        if dim == CHARACTER_VOICE_DIMENSION:
+            # 清污：职务词/地名/截断名、无说话证据的非人条目不进提示词。
+            items = clean_voice_items(items)
         if not items:
             continue
-        # 角色声音词典：每个角色一条，不截断（角色多才有效）
-        limit = 20 if dim == CHARACTER_VOICE_DIMENSION else max_rules_per_dim
+        if dim == CHARACTER_VOICE_DIMENSION:
+            limit = preset.voice_count
+        elif dim == "文风漂移分析":
+            # 每本书一条结论，条数 = 参考书数量，不套每维配额。
+            limit = len(items)
+        else:
+            limit = preset.limit_for(dim)
+            if max_rules_per_dim is not None:
+                limit = min(limit, max_rules_per_dim)
+        # 多书档案：给每条标出语料，否则几本书的趋势并排却分不清归属。
+        # 只含一本书时保持原样（逐字不变）。
+        drift_books = {
+            it.get("novel_id") for it in items
+            if isinstance(it, dict) and it.get("novel_id") is not None
+        }
+        tag_book = dim == "文风漂移分析" and len(drift_books) > 1
+        # 非声音/非漂移维度走四层选条（硬过滤 → 四维打分 → MMR）。旧的分层选条
+        # 只解决覆盖与证据，不解决「重要性」；打分缓存由蒸馏落库时预计算。
+        if dim == CHARACTER_VOICE_DIMENSION:
+            selected = _select_voice_items(
+                items, voice_stats, limit=limit, order=preset.voice_order
+            )
+            selected = _promote_mapped_voices(selected, items, profile, limit)
+        elif dim == "文风漂移分析":
+            selected = items[:limit]
+        elif dim == BEAT_DIMENSION:
+            # 节拍：原创 280 不放宽；续写同书 480；跨书/原创超长走骨架化。
+            selected = _select_beat_items(
+                items, limit, mode=mode,
+                allowed_novel_ids=allowed_novel_ids, profile=profile,
+            )
+        else:
+            selected, _ = select_rules_with_audit(
+                items, limit, dim=dim, profile=profile
+            )
+        if not selected:
+            continue
+        if dim == CHARACTER_VOICE_DIMENSION:
+            available = {_voice_item_name(it) for it in selected}
+            lines.extend(_render_voice_mapping(profile, available))
         lines.append(f"【{dim}】")
-        for item in items[:limit]:
+        for item in selected:
             if isinstance(item, dict):
-                lines.append(f"  · {item.get('rule', '')}")
+                rule_text = item.get("rule", "")
+                if tag_book and item.get("novel_id") is not None:
+                    rule_text = f"[语料 {item['novel_id']}] {rule_text}"
+                lines.append(f"  · {rule_text}")
             else:
                 lines.append(f"  · {item}")
 
@@ -4312,13 +7758,31 @@ def describe_narrative(profile: dict | None, max_rules_per_dim: int = 3) -> str:
             if x not in seen:
                 seen.add(x)
                 unique.append(x)
-        forbidden_lines.append(f"【{dim}】禁止使用：{'、'.join(unique[:8])}")
+        forbidden_lines.append(
+            f"【{dim}】禁止使用：{'、'.join(unique[:preset.forbidden_per_group])}"
+        )
 
-    if not lines and not forbidden_lines:
+    if not lines and not forbidden_lines and not timeline_block and not audit_block:
         return ""
     parts = []
+    if opening:
+        # 放在最前：先立「篇幅优先」，再读后面的手法规则，避免整块被读成「写得越短越好」。
+        parts.append(_OPENING_LENGTH_PRIORITY)
+    if audit_block:
+        # 紧跟篇幅句：硬锚要最先被读到，也避免被尾部裁剪吃掉。
+        parts.append(audit_block)
     if lines:
         parts.append("【叙事档案：从参考语料提炼，生成时请遵循以下叙事手法】\n" + "\n".join(lines))
+    if timeline_block:
+        parts.append(timeline_block)
     if forbidden_lines:
         parts.append("【反向禁忌：参考作者从不使用以下表达，严禁出现在生成文本中】\n" + "\n".join(forbidden_lines))
-    return "\n".join(parts)
+    # 总字数上限：只压「叙事档案」正文，保留篇幅优先句与反向禁忌块。
+    text = "\n".join(parts)
+    if len(text) > preset.char_limit and lines:
+        others = sum(len(p) + 1 for p in parts if not p.startswith("【叙事档案"))
+        budget = max(1, preset.char_limit - others)
+        idx = next(i for i, p in enumerate(parts) if p.startswith("【叙事档案"))
+        parts[idx] = _trim_to_budget(parts[idx], budget)
+        text = "\n".join(parts)
+    return _trim_to_budget(text, preset.char_limit)

@@ -68,13 +68,14 @@ class ReasoningFilter:
     不影响「首字即显」的低延迟承诺。
     """
 
-    __slots__ = ("_buf", "_in_think", "_saw", "_skip_nl")
+    __slots__ = ("_buf", "_in_think", "_saw", "_skip_nl", "_dropped")
 
     def __init__(self) -> None:
         self._buf = ""
         self._in_think = False
         self._saw = False
         self._skip_nl = False
+        self._dropped = 0
 
     def feed(self, piece: str) -> str:
         """喂入一个 delta，返回可以安全下发的文本（可能为空串）。"""
@@ -96,6 +97,9 @@ class ReasoningFilter:
                 if i < 0:
                     self._buf = buf  # 还在推理中，继续攒（丢弃）
                     return ""
+                # 闭标签之前的这段是**确定被丢弃的思考文本**；只在这里计数，
+                # 避免把上一轮留在 _buf 里的内容重复统计。
+                self._dropped += i
                 buf = buf[i + len(_CLOSE):]
                 # 闭标签后紧跟的换行要跳过，但不能在这里做 lstrip：
                 # 那个换行往往作为**独立的一次 feed** 到达的，当时不在
@@ -123,6 +127,9 @@ class ReasoningFilter:
         不是正文。已经持有的非推理尾巴正常下发。
         """
         rest = "" if (self._in_think or self._skip_nl) else self._buf
+        if self._in_think:
+            # 未闭合的 think 块整段丢弃，这里面全是思考文本。
+            self._dropped += len(self._buf)
         self._buf = ""
         self._in_think = False
         self._skip_nl = False
@@ -132,3 +139,8 @@ class ReasoningFilter:
     def saw_reasoning(self) -> bool:
         """本流是否**曾经**出现过推理块（粘性标志，flush 之后仍可查）。"""
         return self._saw
+
+    @property
+    def dropped_chars(self) -> int:
+        """被当作推理丢掉的字符数（只统计确定落在 think 块内的部分）。"""
+        return self._dropped

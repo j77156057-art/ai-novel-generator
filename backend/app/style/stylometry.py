@@ -34,6 +34,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import math
 import re
 import statistics
@@ -66,8 +67,13 @@ _ELLIPSIS_RUN = re.compile(r"[…]{2,}|\.{3,}")
 #: 连续汉字串。用一次 findall 而不是逐字符 match —— 百万字语料上后者慢两个数量级。
 _CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
-#: 引号内的对白（中文网文以 “” 为主，兼容「」『』）
-_QUOTE_PAIRS = (("“", "”"), ("「", "」"), ("『", "』"))
+#: 引号内的对白（中文网文以 “” 为主，兼容「」『』与中文单引号 ‘’）
+_QUOTE_PAIRS = (("“", "”"), ("「", "」"), ("『", "』"), ("‘", "’"))
+#: 同字符开合的 ASCII 直引号：按出现顺序两两配对（第 1、2 个是一对，3、4 个是下一对）。
+#: 2026-11-13 加：第 8 段重写把弯引号规范成了直引号，旧实现把 28.7% 对白读成 0。
+_QUOTE_SAME = ('"', "'")
+#: 全部引号字符（剥段首段尾、判断段落是否含对白用）
+_QUOTE_CHARS = "“”「」『』‘’\"'"
 
 _METAPHOR = re.compile(r"(像|如同|仿佛|彷佛|宛如|好似|犹如)")
 #: 情绪直陈（贴标签式情绪描写，AI 腔典型）
@@ -207,21 +213,319 @@ def sentences(para: str) -> list[str]:
     return out
 
 
+def split_sentences(text: str) -> list[str]:
+    """蒸馏与生成**共用**的切句口径（R16 唯一真源）。
+
+    逐字沿用 `narrative.build_deterministic_features` 的历史写法：
+    在 ``。！？…`` 之后断开、句末标点保留、``strip()`` 后丢空串，且**不按段切**。
+
+    不要改成 `sentences()` 的口径（它按段切、先归一省略号）：档案里的块级
+    指标就是按这把尺算出来的，换尺会让历史档案与新的 `style_check` 不可比。
+    """
+    return [s.strip() for s in re.split(r"(?<=[。！？…])", text or "") if s.strip()]
+
+
+#: 句长类指标的**计数口径版本**。v1 = `split_sentences` 原样计数（含纯标点片段）；
+#: v2 = 只用「至少含一个汉字」的句子。换尺必须同时重算阈值，见
+#: `consistency.GEN_GATE_VERSION = gen-gate-v19`。
+SENTENCE_METRIC_SCOPE = "hanzi-only.v2"
+
+#: 判断一个片段是不是「句子」的唯一标准：至少含一个汉字。
+#: 为什么要这一步：`split_sentences` 每遇一个 `…` 就切一刀，中文的 `……`
+#: 因此被切成两个单「…」片段；参考书每章中位 14 个这样的片段、约占「句数」
+#: 的 9%，若照单全收，`短句占比`（≤4/≤5 字）量到的其实是标点碎片密度。
+#: 收尾引号 `”` 同理。`split_sentences` 本身保持不动（档案块级指标由它算出，
+#: 换切分口径会让历史档案与新指标不可比），只在**统计句长时**过滤。
+_HANZI = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+
+
+def sentence_lens(text: str) -> list[int]:
+    """句长（含句末标点），只保留至少含一个汉字的句子。
+
+    这是 v2 口径的唯一入口：`consistency.measure` 的 5 项句长指标、
+    `generation_gate` 的 4 项句长指标、以及由它们推出的全部分位与阈值，
+    都必须走这里，否则「尺子」和「阈值」会各用一套。
+    """
+    return [len(s) for s in split_sentences(text) if _HANZI.search(s)]
+
+
+def paragraph_sentence_counts(text: str) -> list[int]:
+    """每个自然段的「含汉字句数」，按**全文**切句后归属到段。
+
+    与逐段 `sentence_lens` 的区别（v20）：上一段末尾没有句末标点时，
+    逐段切会给它单独记一句、下一段再记一句，同一句话被数了两次；
+    全文切句只记一次。因此这里满足
+    ``sum(paragraph_sentence_counts(t)) == len(sentence_lens(t))``，
+    `段均句数 × 句长均值` 才能还原 `段长均值`（三角校核的前提）。
+
+    归属规则：句子的起始字符落在哪一段就记给哪一段；纯标点片段不计。
+    """
+    raw = text or ""
+    starts: list[int] = []
+    pos = 0
+    for line in raw.split("\n"):
+        if line.strip():
+            starts.append(pos + len(line) - len(line.lstrip()))
+        pos += len(line) + 1
+    counts = [0] * len(starts)
+    if not counts:
+        return counts
+    prev = 0
+    for m in re.finditer(r"(?<=[。！？…])", raw):
+        seg, seg_start = raw[prev:m.end()], prev
+        prev = m.end()
+        h = _HANZI.search(seg)
+        if h:
+            # 归属按「第一个汉字」算：句首常带着上一段的收尾引号/换行
+            counts[max(0, bisect.bisect_right(starts, seg_start + h.start()) - 1)] += 1
+    tail = raw[prev:]
+    h = _HANZI.search(tail)
+    if h:
+        counts[max(0, bisect.bisect_right(starts, prev + h.start()) - 1)] += 1
+    return counts
+
+
 def dialogue_char_count(text: str) -> int:
-    """引号内的字符总数（对白篇幅）。跨段引号按段内配对处理。"""
+    """引号内的字符总数（对白篇幅）。跨段引号按段内配对处理。
+
+    2026-11-13：加认 ASCII 直引号（`"` / `'`）与中文单引号（‘’）。
+    第 8 段的第二遍重写把中文弯引号统一换成了 ASCII 直引号，旧实现只认
+    `“”/「」/『』`，于是同一段 28.7% 对白的正文被读成 0。直引号同字符开合，
+    按出现顺序两两配对；落单的最后一个不计（无法确定是开口还是收尾）。
+    """
+    src = text or ""
     n = 0
     for open_q, close_q in _QUOTE_PAIRS:
         i = 0
         while True:
-            a = text.find(open_q, i)
+            a = src.find(open_q, i)
             if a < 0:
                 break
-            b = text.find(close_q, a + 1)
+            b = src.find(close_q, a + 1)
             if b < 0:
                 break
             n += b - a - 1
             i = b + 1
+    for q in _QUOTE_SAME:
+        pos = [k for k, ch in enumerate(src) if ch == q]
+        for a, b in zip(pos[0::2], pos[1::2]):
+            n += b - a - 1
     return n
+
+
+def strip_edge_quotes(text: str) -> str:
+    """剥掉段首、段尾的引号字符（不动句子内部的引号）。
+
+    用途：按段切句前先剥端点。`“好。”` 直接切会被 `。` 断成
+    `['“好。', '”']` 两句，独立成行的短对白就数不进「对白单句段」；
+    剥成 `好。` 之后正确判成 1 句。`他说，“好。”` → `他说，“好。`，
+    仍然切出 2 句，不会被误判成单句段。
+    """
+    s = (text or "").strip()
+    return s.strip(_QUOTE_CHARS) if s else ""
+
+
+#: 对白里的语气词 / 句末助词（人物口吻的直接标记，不含「的/了」这类通用虚词）。
+DIALOGUE_PARTICLES = "吧吗啊呢嘛哦呀哈啦呗"
+#: 对白句首叹词——单独一类语气，不计入陈述句（「啊？」≠「我想想。」）。
+INTERJECTIONS = frozenset("啊哎唉哦嗯嘿诶呀哈喂咦唔噢哟")
+#: 对白句长只数「实字」：去掉空白与中英文标点后再数，避免逗号把 3 字句算成 4 字。
+_DIALOGUE_TRIM = re.compile(r"[\s。！？…；，、：,.!?;:\"'“”‘’「」『』\-—～]+")
+
+
+def dialogue_spans(text: str) -> list[str]:
+    """引号内的对白内容（不含引号），与 `dialogue_char_count` 同一套配对规则。
+
+    中文网文以 “” 为主，兼容「」『』‘’；ASCII 直引号同字符开合，按出现顺序
+    两两配对（落单的最后一个不计）。
+    """
+    src = text or ""
+    out: list[str] = []
+    ranges: list[tuple[int, int]] = []
+    for open_q, close_q in _QUOTE_PAIRS:
+        i = 0
+        while True:
+            a = src.find(open_q, i)
+            if a < 0:
+                break
+            b = src.find(close_q, a + 1)
+            if b < 0:
+                break
+            out.append(src[a + 1:b])
+            ranges.append((a, b))
+            i = b + 1
+    for q in _QUOTE_SAME:
+        pos = [k for k, ch in enumerate(src) if ch == q]
+        for a, b in zip(pos[0::2], pos[1::2]):
+            out.append(src[a + 1:b])
+            ranges.append((a, b))
+    items = sorted(zip(ranges, out), key=lambda x: x[0])
+    return [inner for _, inner in items]
+
+
+def dialogue_sentences(text: str) -> list[str]:
+    """对白句：引号内容按 `split_sentences` 再切句，去掉首尾标点后返回实字串。
+
+    句长直接用 `len()`（即实字个数）；没有实字的片段（如单独的「……」）不计数。
+    """
+    out: list[str] = []
+    for inner in dialogue_spans(text):
+        for s in split_sentences(inner):
+            core = _DIALOGUE_TRIM.sub("", s)
+            if core:
+                out.append(core)
+    return out
+
+
+def _pure_dialogue_paragraph(para: str) -> int | None:
+    """若整段只有引号内容、没有任何叙述字，返回引号内实字数；否则 None。
+
+    「只有引号内容」= 去掉全部引号段后，剩下的只有空白/标点。
+    """
+    rest_parts: list[str] = []
+    pos = 0
+    inner_chars = 0
+    for a, b in _dialogue_ranges(para):
+        rest_parts.append(para[pos:a])
+        inner_chars += len(_DIALOGUE_TRIM.sub("", para[a + 1:b]))
+        pos = b
+    rest_parts.append(para[pos:])
+    if inner_chars <= 0:
+        return None
+    if _DIALOGUE_TRIM.sub("", "".join(rest_parts)):
+        return None
+    return inner_chars
+
+
+def _dialogue_ranges(text: str) -> list[tuple[int, int]]:
+    """引号段起止（含引号本身），按出现顺序。"""
+    src = text or ""
+    ranges: list[tuple[int, int]] = []
+    for open_q, close_q in _QUOTE_PAIRS:
+        i = 0
+        while True:
+            a = src.find(open_q, i)
+            if a < 0:
+                break
+            b = src.find(close_q, a + 1)
+            if b < 0:
+                break
+            ranges.append((a, b + 1))
+            i = b + 1
+    for q in _QUOTE_SAME:
+        pos = [k for k, ch in enumerate(src) if ch == q]
+        for a, b in zip(pos[0::2], pos[1::2]):
+            ranges.append((a, b + 1))
+    return sorted(ranges)
+
+
+def dialogue_profile(text: str) -> dict[str, float | int | None]:
+    """对白专项画像（2026-11-13 对白校准）。
+
+    与 `generation_gate` / 报告共用同一把尺。所有比值都是「对白句」或「段」的
+    占比，密度以去空白字符数为分母（/千字），与 `features()` 的密度口径一致。
+
+    Returns（部分）：
+        对白句数 / 对白句长中位 / 对白≤4占比 / 对白5–9占比 /
+        对白10–19占比 / 对白≥20占比 /
+        纯对白段占比 / 极短纯对白段占比（≤4 字纯对白段 / 全部段）/
+        纯对白段字数中位 / 语气词密度千字 / 含助词对白句占比 /
+        对白问句占比 / 对白感叹句占比 / 对白陈述句占比 / 对白叹词起头占比 /
+        消息段字数中位 / 纯消息段占比 / 消息含助词占比 / 消息平均间隔
+    """
+    src = text or ""
+    paras = paragraphs(src)
+    total = len("".join(src.split()))
+    per1k = 1000.0 / total if total else 0.0
+    sents = dialogue_sentences(src)
+    lens = [len(s) for s in sents]
+    n_sent = len(lens)
+
+    def _share(pred) -> float | None:
+        return sum(1 for x in lens if pred(x)) / n_sent if n_sent else None
+
+    # 语气类别：用带标点的原始句尾判断，问号/感叹号必须保留。
+    q = e = st = 0
+    for inner in dialogue_spans(src):
+        for s in split_sentences(inner):
+            raw = s.strip()
+            if not _DIALOGUE_TRIM.sub("", raw):
+                continue
+            tail = raw[-1]
+            if tail in "？?":
+                q += 1
+            elif tail in "！!":
+                e += 1
+            else:
+                st += 1
+    interj = sum(1 for s in sents if s[0] in INTERJECTIONS)
+
+    pure_chars: list[int] = []
+    for p in paras:
+        c = _pure_dialogue_paragraph(p)
+        if c is not None:
+            pure_chars.append(c)
+    short_pure = sum(1 for c in pure_chars if c <= 4)
+    particles = sum(src.count(ch) for ch in DIALOGUE_PARTICLES)
+
+    # 消息段：含引号的自然段（群聊消息、带说话人的对白行都算）。
+    msg_idx = [i for i, p in enumerate(paras) if _dialogue_ranges(p)]
+    # 消息段字数 = 整段去空白字符数（含「北河散人：」这类说话人前缀），
+    # 因为「谁说的、什么口吻」本身就是这段的字数来源。
+    msg_lens = [len("".join(paras[i].split())) for i in msg_idx]
+    msg_paras = [paras[i] for i in msg_idx]
+    msg_with_particle = sum(
+        1 for p in msg_paras if any(ch in p for ch in DIALOGUE_PARTICLES)
+    )
+    gaps: list[int] = []
+    for a, b in zip(msg_idx, msg_idx[1:]):
+        gaps.append(max(b - a - 1, 0))
+    pure_msg = 0
+    for p in msg_paras:
+        c = _pure_dialogue_paragraph(p)
+        if c is not None:
+            pure_msg += 1
+
+    def _med(vals: list[float]) -> float | None:
+        return statistics.median(vals) if vals else None
+
+    return {
+        "对白句数": n_sent,
+        "对白句长中位": _med(lens),
+        "对白句长均值": round(statistics.fmean(lens), 2) if lens else None,
+        "对白≤4占比": _round(_share(lambda x: x <= 4)),
+        "对白5–9占比": _round(_share(lambda x: 5 <= x <= 9)),
+        "对白10–19占比": _round(_share(lambda x: 10 <= x <= 19)),
+        "对白≥20占比": _round(_share(lambda x: x >= 20)),
+        "纯对白段占比": round(len(pure_chars) / len(paras), 3) if paras else None,
+        "极短纯对白段占比": (
+            round(short_pure / len(paras), 3) if paras else None
+        ),
+        "纯对白段字数中位": _med([float(c) for c in pure_chars]),
+        "语气词密度千字": round(particles * per1k, 2),
+        "含助词对白句占比": (
+            round(sum(1 for s in sents if any(ch in s for ch in DIALOGUE_PARTICLES))
+                  / n_sent, 3) if n_sent else None
+        ),
+        "对白问句占比": _round(q / n_sent) if n_sent else None,
+        "对白感叹句占比": _round(e / n_sent) if n_sent else None,
+        "对白陈述句占比": _round(st / n_sent) if n_sent else None,
+        "对白叹词起头占比": _round(interj / n_sent) if n_sent else None,
+        "消息段字数中位": _med([float(x) for x in msg_lens]),
+        "纯消息段占比": (
+            round(pure_msg / len(msg_paras), 3) if msg_paras else None
+        ),
+        "消息含助词占比": (
+            round(msg_with_particle / len(msg_paras), 3) if msg_paras else None
+        ),
+        "消息平均间隔": (
+            round(statistics.fmean(gaps), 2) if gaps else None
+        ),
+    }
+
+
+def _round(x: float | None) -> float | None:
+    return round(x, 3) if x is not None else None
 
 
 def _runs(text: str) -> list[int]:
@@ -276,7 +580,7 @@ def features(text: str, *, unit_chars: int = 3000) -> dict[str, float]:
     sents_per_para = [len(sentences(p)) for p in paras]
 
     dlg_chars = dialogue_char_count(text)
-    dlg_paras = sum(1 for p in paras if any(q in p for q, _ in _QUOTE_PAIRS))
+    dlg_paras = sum(1 for p in paras if any(ch in p for ch in _QUOTE_CHARS))
 
     elevate = 0
     for p in paras:

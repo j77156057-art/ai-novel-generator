@@ -20,8 +20,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import urllib.request
+import uuid
 
 from app.config import settings
 from app.llm.reasoning import ReasoningFilter, strip_reasoning
@@ -61,6 +63,106 @@ _RETRYABLE_HTTP = {429, 500, 502, 503, 529}
 # 429/403 重试当前模型无意义（免费档限流/无权限是配额问题），应换模型
 _SWITCH_HTTP = {429, 403}
 
+# ── 挂起判据：吞吐为主、总时长为备（2026-11-14）──────────────────────────────
+#
+# 为什么拆两条：720s 的单一总时长上限把第 17 章一次「慢但正常」的重写掐断
+# （终稿回落初稿、段均 19.4 违规）；而 19 分钟卡死是服务端**每 1s 滴 1 字节**——
+# 总时长上很长、速率上接近零。两种场景用一个尺子必然二选一。
+#
+# 下限 8 B/s 的依据：11 章历史日志（单轮耗时上界 × 初稿汉字数≈响应体 UTF-8 字节）
+# 反推的隐含速率 min=13.3（第 17 章，该死的那次被 720s 掐断，耗时不真）/
+# median=38.5 / max=58.3 B/s；只看成功样本则最慢 24.1 B/s。取最慢成功样本的
+# 约 1/3 → 8 B/s。1 B/s 滴包只有下限的 1/8，一个窗口即判死。
+# 该反推用的是耗时**上界**，所以速率是**下界**——下限据此取，偏保守（不会误杀）。
+# 成功日志现在开始记真实字节数与平均速率，后续可按实测分布再校。
+# 窗口 30s：正常非流式响应是「攒完一次性到达」，窗口几乎跑不满；且窗口从
+# **首字节**开始计时，首字节前的长等待（慢调用）不会被误判成低速率。
+_RATE_WINDOW_SECONDS = 30.0
+_RATE_FLOOR_BPS = 8.0
+
+
+class _RateGuard:
+    """首字节之后的吞吐窗口判据——**非流式与流式共用同一份**。
+
+    两条传输路径都只是「字节在到达」，判据没有理由写两份：
+    - 非流式：`_read_body` 每读一块 `feed()` 一次；
+    - 流式：`_iter_stream_lines` 每读一个 chunk `feed()` 一次（不是按行——按行
+      会漏掉「只滴字节、很久不出换行」的假活）。
+
+    首字节之前不判：那时没有字节可测，生成期可能长达数分钟，交给调用方的
+    总时长硬顶兜住（流式路径没有硬顶，靠 `stream_timeout` 的空闲超时）。
+    """
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.started: float | None = None
+        self.bytes = 0
+
+    @property
+    def open(self) -> bool:
+        """是否已经收到过字节（速率窗口是否已开）。"""
+        return self.started is not None
+
+    def feed(self, n: int, now: float) -> None:
+        if self.started is None:
+            self.started = now  # 首个字节到达才开始计时，首字节前的等待不算速率
+        self.bytes += n
+        self.check(now)
+
+    def check(self, now: float) -> None:
+        if self.started is None:
+            return
+        span = now - self.started
+        if span < _RATE_WINDOW_SECONDS:
+            return
+        rate = self.bytes / span
+        if rate < _RATE_FLOOR_BPS:
+            raise TimeoutError(
+                f"{self.label} 响应吞吐 {rate:.1f}B/s 低于下限 "
+                f"{_RATE_FLOOR_BPS:g}B/s（{span:.0f}s 窗口只收到 {self.bytes} 字节），"
+                "判定为挂起"
+            )
+        self.started, self.bytes = now, 0
+
+
+def _iter_stream_lines(resp, guard: _RateGuard):
+    """把 SSE 响应切成行，同时把每次到达的字节喂给速率判据。
+
+    直接 `for raw in resp` 是 `readline()`：服务端每 1s 滴 1 字节且迟迟不出
+    换行时，每行都读不到、但 socket 从不空闲，既不会超时也不会产出 chunk——
+    第 19 章日志里的 `[stream] 113.0s chars=8` 就是这种形态。改用 `read1()`
+    拿到每块到达的字节先过判据，再拼行。
+    """
+    reader = getattr(resp, "read1", None) or resp.read
+    buf = b""
+    while True:
+        chunk = reader(65536)
+        if not chunk:
+            if buf:
+                yield buf
+            return
+        guard.feed(len(chunk), time.monotonic())
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            yield line
+
+
+def _stream_ms(started: float) -> int:
+    """从 `started` 到现在的毫秒数（流式留痕统一口径）。"""
+    return int((time.monotonic() - started) * 1000)
+
+
+def _reasoning_source(field_chars: int, inline_chars: int) -> str | None:
+    """这条流的 reasoning 字符数从哪来；都没有就 None（不是 0）。"""
+    if field_chars and inline_chars:
+        return "both"
+    if field_chars:
+        return "reasoning_content"
+    if inline_chars:
+        return "inline_think"
+    return None
+
 
 def _http_code(exc: Exception) -> int | None:
     return getattr(exc, "code", None)
@@ -97,9 +199,60 @@ def _backoff(attempt: int) -> float:
     return base + (time.time() % 1)
 
 
+class ToolsUnsupportedError(RuntimeError):
+    """当前模型链上没有任何「可安全使用 tools」的模型。
+
+    调用方（`/qa` 工具循环）捕获它后回落确定性路径。**不要**降级成
+    「不发 tools 但照常请求」——那会让模型在看不见工具的情况下作答，
+    用户却以为它查过了。明确失败、明确回落，才是可解释的行为。
+    """
+
+
+def tools_unsupported_models() -> set[str]:
+    """配置项 `assistant_tools_unsupported_models` 的解析结果。
+
+    来源是 2026-11-14 的实测探针（见 `config.py` 同名字段的注释）：
+    `glm-z1-flash` 会返回 `finish_reason=tool_calls` 但 `tool_calls=[]`，
+    所以按模型名硬排除，而不是运行时探测（探测会被这个假信号骗过）。
+    """
+    raw = str(getattr(settings, "assistant_tools_unsupported_models", "") or "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
 class LLMProvider:
     def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
         raise NotImplementedError  # pragma: no cover - 接口
+
+    def complete_message(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        tool_choice: str | None = None,
+        stop_sequences: list[str] | None = None,
+    ) -> dict:
+        """结构化补全：返回 `{content, tool_calls, finish_reason, usage, model}`。
+
+        基类兜底实现把 messages 拍平成 system / user 后走 `chat()`，**永远**
+        返回空 `tool_calls`——没有 function calling 能力的 provider（本地兜底、
+        只实现 chat 的渠道）因此天然走「不调用工具」这条路，调用方据此回落
+        确定性路径，不需要 isinstance 判断。
+
+        子类（OpenAI 兼容层）重写本方法以真正透传 `tools` / `tool_choice`。
+        """
+        system = "\n".join(
+            str(m.get("content") or "") for m in messages if m.get("role") == "system"
+        )
+        user = "\n".join(
+            str(m.get("content") or "") for m in messages if m.get("role") != "system"
+        )
+        return {
+            "content": self.chat(system, user),
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "usage": None,
+            "model": getattr(self, "model", "") or "",
+        }
 
     async def async_chat(self, system: str, user: str, constraints: dict | None = None) -> str:
         """v2.225+：异步包装同步 chat，用 loop.run_in_executor（避免 to_thread 跨 loop 问题）。
@@ -199,23 +352,49 @@ class OpenAICompatibleChatProvider(LLMProvider):
 
     ADR-2026-10-12 增加 max_tokens / timeout / stream_timeout 三个字段，默认值与
     b58c763 的硬编码值**完全一致**（max_tokens=None 即「不写入请求体」；
-    timeout=120 即 chat 路径 120 秒；stream_timeout=180 即流式续写 180 秒——
-    长文首字到达前的整个连接窗口必须留够，否则会被截断）。
-    任何调用方未显式传这三个参数时，Writer 行为**绝对不变**。
+    timeout=180 即 chat 路径 180 秒，2026-11-14 由 120 提到与 stream_timeout 同档；
+    stream_timeout=180 即流式续写 180 秒——长文首字到达前的整个连接窗口必须留够，
+    否则会被截断）。任何调用方未显式传这三个参数时，Writer 行为**绝对不变**。
     """
 
     label = "LLM"
 
+    #: 429 时**同模型**重试的等待序列（秒）。默认空 = 旧行为（429 直接换模型）。
+    #: MiniMax 五小时额度墙是账号级硬限额，换模型无益；只能退避后重试同一条。
+    _RATE_LIMIT_BACKOFFS: tuple[float, ...] = ()
+
+    #: 单模型 `max_tokens` 上限（子类按模型声明，未声明 = 不裁剪）。
+    #: 模型链上不同模型的输出上限并不一致，同一个 `writer.max_tokens` 直接下发会被
+    #: 小上限模型整条 400 拒掉——2026-11-13 实测第 4 章首轮：M3.1-Flash 失败后回退到
+    #: `MiniMax-Text-01`，后者直接 400
+    #: `invalid params, model[MiniMax-Text-01] does not support max tokens > 40000`，
+    #: 重写轮因此被静默吞掉（正文与首轮逐字节相同）。
+    _MODEL_MAX_TOKENS: dict[str, int] = {}
+
+    def _effective_max_tokens(self, model: str) -> int | None:
+        """本次请求对**该模型**实际下发的 max_tokens（受 `_MODEL_MAX_TOKENS` 裁剪）。"""
+        if self.max_tokens is None:
+            return None
+        cap = self._MODEL_MAX_TOKENS.get(model)
+        if cap and self.max_tokens > cap:
+            return cap
+        return self.max_tokens
+
     def __init__(self, api_key: str, base_url: str, model: str, extra_body: dict | None = None,
                  models: list[str] | None = None,
-                 max_tokens: int | None = None, timeout: int = 120,
-                 stream_timeout: int = 180) -> None:
+                 max_tokens: int | None = None, timeout: int | None = None,
+                 stream_timeout: int | None = None,
+                 total_timeout: int | None = None,
+                 extra_headers: dict | None = None) -> None:
         if not api_key:
             raise ValueError(f"{self.label} 需要 API key")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.extra_body = extra_body or {}
+        # 厂商要求的额外请求头（opencode go 必须带 x-opencode-session 与浏览器 UA，
+        # 否则 400 MissingSessionID / Cloudflare 403）。默认空 = 行为不变。
+        self.extra_headers = dict(extra_headers or {})
         # None = 不在请求体里加 max_tokens（保留 Writer 原行为，调用方需明确给值才注入）
         self.max_tokens = max_tokens
         # 最近一次调用的 finish_reason（'length' = 被 max_tokens 截断）。
@@ -225,12 +404,37 @@ class OpenAICompatibleChatProvider(LLMProvider):
         # 2026-11-07：此前兼容层完全丢弃 usage，导致成本报表里 token 全为 null；
         # 这里只做解析留痕，不改返回内容，也不改请求体。
         self.last_usage: dict | None = None
-        # chat 路径默认 120s = b58c763 硬编码值；Assistant 可独立调小（诊断必须快速失败）
-        self.timeout = timeout
+        # 最近一次**流式**调用的增量留痕：请求/首帧/首正文耗时、reasoning 与
+        # 正文字符数。MiniMax 流式不回 usage，`last_usage` 全空，「首字等待到底
+        # 花在思考还是供应商排队」无从判断；这里在读取 SSE 时自行累计。
+        # None = 这次调用没有任何可测信号（**不是**「0 个字符」）。
+        self.last_stream_stats: dict | None = None
+        # chat 路径默认 180s（2026-11-14 由 120s 提到与流式同档）：4000 字级单章
+        # 实测一次生成需 180s 上下，120s 的同步入口必然读超时、零产出。
+        # Assistant 仍显式传 timeout=60（诊断必须快速失败），不受此默认值影响。
+        # 2026-11-14：默认值改从 settings 读（writer_timeout / writer_stream_timeout，
+        # 默认均为 180），不再把秒数钉在函数签名里。
+        self.timeout = (
+            int(timeout) if isinstance(timeout, int) and timeout > 0
+            else settings.writer_timeout
+        )
         # stream_chat 路径默认 180s = b58c763 硬编码值；**不能**与 chat 共用默认 120s，
         # 否则长文流式续写会从 180s 截到 120s（QA 报告 3.1 节已记）。Assistant 不走流式
         # 但 build_assistant_provider 仍显式传 stream_timeout=60 保持防御性。
-        self.stream_timeout = stream_timeout
+        self.stream_timeout = (
+            int(stream_timeout) if isinstance(stream_timeout, int) and stream_timeout > 0
+            else settings.writer_stream_timeout
+        )
+        # 非流式补全的**总时长硬顶**（含换模型与重试退避）：`self.timeout` 只是
+        # 首字节之后的单次 recv 空闲超时；服务端慢速滴包会不断重置它，模型链 ×
+        # 每模型 max_attempts 次重试还会相乘。2026-11-14 第 16 章实测一次重写
+        # 静默挂 19 分钟，就是这两层都没有上限。默认值来自
+        # settings.writer_total_timeout（960s）；Assistant / Distiller 走
+        # build_provider，那里按各自 recv 超时×2 另算，不共用 Writer 预算。
+        self.total_timeout = (
+            int(total_timeout) if isinstance(total_timeout, int) and total_timeout > 0
+            else settings.writer_total_timeout
+        )
         # 候选模型链：去重保序，默认模型置首；仅首个之后的模型用于限流时切换
         chain = [model] + [m for m in (models or []) if m and m != model]
         self._models = chain
@@ -254,6 +458,31 @@ class OpenAICompatibleChatProvider(LLMProvider):
         return self._models
 
     def _complete(self, messages: list[dict], stop_sequences: list[str] | None = None) -> str:
+        """纯文本补全 = `complete_message` 的薄包装。
+
+        Writer 只依赖这个字符串接口。**行为必须与改造前逐字节一致**：
+        同样的 payload、同样的模型链、同样的重试 / 429 换模型、同样的
+        `strip_reasoning` 后 `.strip()`。所有结构化能力都放在
+        `complete_message` 里，本方法不再持有任何逻辑。
+        """
+        message = self.complete_message(messages, stop_sequences=stop_sequences)
+        return str(message.get("content") or "")
+
+    def complete_message(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        tool_choice: str | None = None,
+        stop_sequences: list[str] | None = None,
+    ) -> dict:
+        """结构化补全：透传 `tools` / `tool_choice`，返回完整 message。
+
+        返回 `{content, tool_calls, finish_reason, usage, model}`。
+        **`tool_calls` 是判定「模型是否真的调了工具」的唯一依据**：
+        `glm-z1-flash` 实测会给出 `finish_reason=tool_calls` 但
+        `tool_calls=[]`，任何用 finish_reason 判定的写法都会静默错判。
+        """
         payload_base = {
             "messages": messages,
             # 小说续写要克制的文风：温度压到 0.7，避免"漂亮但套路"的堆料输出
@@ -268,25 +497,99 @@ class OpenAICompatibleChatProvider(LLMProvider):
         effective_stop = stop_sequences if stop_sequences is not None else self._stop_sequences
         if effective_stop:
             payload_base["stop"] = effective_stop
+        if tools:
+            payload_base["tools"] = tools
+            if tool_choice:
+                payload_base["tool_choice"] = tool_choice
         last_exc: Exception | None = None
-        for model in self._model_chain():
+        # 整条链（换模型 + 每模型重试）共享同一个硬截止：总时长上限。
+        deadline = time.monotonic() + self.total_timeout
+        # 带 tools 的请求**不能**落到实测不可用的模型上：那会返回
+        # `finish_reason=tool_calls` + 空数组的假信号。整条链都不可用时
+        # 明确抛 ToolsUnsupportedError，由调用方回落确定性路径。
+        chain = self._model_chain()
+        if tools:
+            unsupported = tools_unsupported_models()
+            chain = [m for m in chain if m not in unsupported]
+            if not chain:
+                raise ToolsUnsupportedError(
+                    f"{self.label} 模型链 {self._model_chain()} 均不支持 function calling"
+                )
+        for model in chain:
+            # 总时长已用尽：不再换模型/重试，直接按失败返回（调用方走回退路径）。
+            if time.monotonic() >= deadline:
+                break
             payload = {**payload_base, "model": model}
+            mt = self._effective_max_tokens(model)
+            if mt is not None:
+                payload["max_tokens"] = mt
+                if self.max_tokens is not None and mt != self.max_tokens:
+                    logger.info(
+                        "%s 模型 %s 上限 %s < 配置 %s，本次按 %s 请求（避免 400）",
+                        self.label, model, mt, self.max_tokens, mt,
+                    )
             body = json.dumps(payload).encode("utf-8")
-            for attempt in range(_RETRIES_PER_MODEL):
+            rl_attempt = 0
+            max_attempts = max(
+                _RETRIES_PER_MODEL, 1 + len(self._RATE_LIMIT_BACKOFFS)
+            )
+            for attempt in range(max_attempts):
                 req = urllib.request.Request(f"{self.base_url}/chat/completions", data=body, method="POST")
                 req.add_header("Authorization", f"Bearer {self.api_key}")
                 req.add_header("Content-Type", "application/json")
+                for hk, hv in self.extra_headers.items():
+                    req.add_header(hk, hv)
                 try:
-                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 1:
+                        last_exc = TimeoutError(
+                            f"{self.label} 非流式补全超过总时长上限 {self.total_timeout}s"
+                        )
+                        break
+                    # 首字节前的等待**只受硬顶约束**，不再用 `self.timeout`（180s）。
+                    # 2026-11-14 第 18 章实测：MiniMax 一次重写 4 个尝试各卡在 180s
+                    # 空闲超时上（"The read operation timed out"），总耗时 896.8s
+                    # 仍无产出——而重写轮生成期本来就可能是几分钟，180s 会误杀
+                    # 「慢但正常」的调用。首字节之后由 _read_body 的速率判据接管，
+                    # 那里不需要也不该有长等待。
+                    with urllib.request.urlopen(
+                        req, timeout=max(1, remaining)
+                    ) as resp:
+                        raw = self._read_body(resp, deadline)
+                    data = json.loads(raw.decode("utf-8"))
                     self._note_usage(data.get("usage"))
                     choice = data["choices"][0]
                     self._note_finish_reason(
-                        choice.get("finish_reason"), self.label, model, self.max_tokens
+                        choice.get("finish_reason"), self.label, model, mt
                     )
-                    return strip_reasoning(
-                        choice["message"].get("content") or ""
-                    ).strip()
+                    message = choice.get("message") or {}
+                    # 单次非流式调用耗时留痕：历史上没有这项统计，只能拿整章耗时
+                    # 反推上界（p50/p90/max 见 settings.writer_total_timeout 注释）。
+                    cost = time.monotonic() - (deadline - self.total_timeout)
+                    # 字节数 + 平均速率一并留痕：这是「速率判据下限」的观测来源
+                    # （此前只有整章耗时，取不到真实字节速率分布）。
+                    logger.info(
+                        "%s 非流式调用完成 %.1fs（model=%s，响应 %d 字节，"
+                        "平均 %.1fB/s）",
+                        self.label, cost, model, len(raw),
+                        len(raw) / cost if cost > 0 else 0.0,
+                    )
+                    if cost > self.timeout * 2:
+                        logger.warning(
+                            "%s 非流式调用偏慢 %.1fs（model=%s，预算 %ds 的 %.0f%%）",
+                            self.label, cost, model, self.total_timeout,
+                            cost / self.total_timeout * 100,
+                        )
+                    return {
+                        # 只对正文剥推理：tool_calls 是结构化字段，不能过 strip_reasoning
+                        "content": strip_reasoning(
+                            message.get("content") or ""
+                        ).strip(),
+                        "tool_calls": list(message.get("tool_calls") or []),
+                        "finish_reason": choice.get("finish_reason"),
+                        "usage": self.last_usage,
+                        "model": model,
+                    }
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
                     # 429/403（限流/无权限）：换下一个模型；网络抖动：同模型短退避重试
@@ -296,12 +599,87 @@ class OpenAICompatibleChatProvider(LLMProvider):
                                 "%s 账号免费日限额已用完（所有 :free 模型共享，换模型无益），直接失败", self.label
                             )
                             raise RuntimeError(f"{self.label} chat 调用失败: {last_exc}") from last_exc
+                        # MiniMax 等单模型渠道：429 是同模型硬限额，按配置退避后重试同一条。
+                        if (
+                            _http_code(exc) == 429
+                            and rl_attempt < len(self._RATE_LIMIT_BACKOFFS)
+                        ):
+                            wait = self._RATE_LIMIT_BACKOFFS[rl_attempt]
+                            rl_attempt += 1
+                            logger.warning(
+                                "%s 模型 %s 429，%.0fs 后重试同一条（%d/%d）",
+                                self.label, model, wait, rl_attempt,
+                                len(self._RATE_LIMIT_BACKOFFS),
+                            )
+                            time.sleep(max(0.0, min(wait, deadline - time.monotonic())))
+                            continue
                         logger.warning("%s 模型 %s 受限（%s），切换下一个候选模型", self.label, model, _http_code(exc))
                         break
-                    if not _is_retryable(exc) or attempt == _RETRIES_PER_MODEL - 1:
+                    if not _is_retryable(exc) or attempt == max_attempts - 1:
                         break
-                    time.sleep(_backoff(attempt))
+                    if deadline - time.monotonic() <= 1:
+                        break
+                    time.sleep(max(0.0, min(_backoff(attempt), deadline - time.monotonic())))
+        # 链尾失败必须留痕：模型链上每个模型都失败时，调用方只看到一句
+        # RuntimeError 是不够的——这次实测里 404（Text-01 已下线）与 400（max_tokens
+        # 非法）都被压成「HTTP Error」，排查时无法区分。这里把整条链和最后错误打进日志。
+        logger.error(
+            "%s 模型链全部失败，候选=%s，最后错误: %s",
+            self.label, self._model_chain(), last_exc,
+        )
         raise RuntimeError(f"{self.label} chat 调用失败: {last_exc}") from last_exc
+
+    def _read_body(self, resp, deadline: float) -> bytes:
+        """分块读响应体：**吞吐判据为主、总时长硬顶为备**。
+
+        为什么不能直接 `resp.read()`：那是一次阻塞调用，`urlopen(timeout=)` 只约束
+        **每次 recv 的空闲时间**；服务端慢速滴包（或分块传输里持续有心跳）时，
+        每次 recv 都不超时，整个读取可以无限长。分块读 + 逐块重设 socket 超时，
+        才能把总时长切成可检查的片段。
+
+        为什么光有总时长不够（2026-11-14）：720s 硬顶把第 17 章一次「慢但正常」
+        的重写掐断，终稿回落初稿、段均 19.4 违规；而 19 分钟卡死是服务端
+        **每 1 秒滴 1 字节**——总时长上很长，速率上接近零。同一个尺子必然二选一，
+        所以拆成两条：
+
+        1. **吞吐判据（主）**：首字节到达后按 30s 滚动窗口统计到达字节数，
+           低于 `_RATE_FLOOR_BPS` 立即判挂起并抛错。正常「攒完一次性到达」的
+           响应跑不满一个窗口，不会误杀慢调用；
+        2. **总时长硬顶（备）**：`total_timeout` 只在极端情况兜底。
+        """
+        buf: list[bytes] = []
+        # `read(n)` 在 chunked 传输里会**内部循环**直到读满 n 字节才返回——单次
+        # 调用仍然可以无限长。`read1(n)` 只返回当前已到达的一块，才能把「总时长」
+        # 切成可检查的片段（实测：每 1s 滴 1 字节的服务端，read(65536) 挂满 120s）。
+        reader = getattr(resp, "read1", None) or resp.read
+        guard = _RateGuard(self.label)
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self.label} 读取响应超过总时长上限 {self.total_timeout}s"
+                )
+            # 首个正文字节到达前：只受硬顶约束（同 urlopen 的理由——生成期可能
+            # 长达数分钟，180s 的 socket 空闲超时会误杀慢调用）；首字节之后：
+            # 空闲上限压到速率窗口内，服务端假活在一个窗口内就会被判死。
+            if not guard.open:
+                sock_timeout = max(0.5, remaining)
+            else:
+                sock_timeout = max(
+                    0.5,
+                    min(float(self.timeout), remaining, _RATE_WINDOW_SECONDS),
+                )
+            try:
+                resp.fp.raw._sock.settimeout(sock_timeout)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 —— 拿不到底层 socket 就退回原超时
+                pass
+            guard.check(time.monotonic())
+            piece = reader(65536)
+            if not piece:
+                return b"".join(buf)
+            buf.append(piece)
+            guard.feed(len(piece), time.monotonic())
 
     def _note_usage(self, usage: dict | None) -> None:
         """解析并留痕本次调用的 token 用量（含推理 token）。
@@ -398,25 +776,48 @@ class OpenAICompatibleChatProvider(LLMProvider):
         if effective_stop:
             payload_base["stop"] = effective_stop
         last_exc: Exception | None = None
+        # 本次调用从头留痕：重试/换模型都不沿用上一次的数字。
+        self.last_stream_stats = None
         for model in self._model_chain():
             payload = {**payload_base, "model": model}
+            mt = self._effective_max_tokens(model)
+            if mt is not None:
+                payload["max_tokens"] = mt
             body = json.dumps(payload).encode("utf-8")
             for attempt in range(_RETRIES_PER_MODEL):
                 yielded = False
                 finish_reason: str | None = None
+                # —— 流式增量留痕（只记，不参与任何判定）——
+                # 计时起点在**请求发出前**：含建连、供应商排队、首 token 生成，
+                # 这样「首字等待」才能拆成 request_ms（到响应头）与后续差异。
+                started = time.monotonic()
+                request_ms: int | None = None
+                first_frame_ms: int | None = None
+                first_reasoning_ms: int | None = None
+                first_content_ms: int | None = None
+                reasoning_chars = 0
+                reasoning_chars_before_content: int | None = None
+                content_chars = 0
+                usage_note: dict | None = None
                 try:
                     req = urllib.request.Request(
                         f"{self.base_url}/chat/completions", data=body, method="POST"
                     )
                     req.add_header("Authorization", f"Bearer {self.api_key}")
                     req.add_header("Content-Type", "application/json")
+                    for hk, hv in self.extra_headers.items():
+                        req.add_header(hk, hv)
                     with urllib.request.urlopen(req, timeout=self.stream_timeout) as resp:
+                        request_ms = _stream_ms(started)
                         # 推理块逐 token 到达，不能逐块简单替换——开标签会被
                         # token 边界切断（"<thi" + "nk>"）。过滤器对"可能是开
                         # 标签前缀"的尾巴持有不发，故不会漏出推理内容。
                         # 每次尝试新建：重试必须从干净状态重来。
                         rfilter = ReasoningFilter()
-                        for raw in resp:
+                        # 速率窗口与非流式共用同一份判据；每次尝试新建，
+                        # 窗口不跨重试累计。
+                        guard = _RateGuard(self.label)
+                        for raw in _iter_stream_lines(resp, guard):
                             line = raw.decode("utf-8", "replace").strip()
                             if not line.startswith("data:"):
                                 continue
@@ -430,17 +831,43 @@ class OpenAICompatibleChatProvider(LLMProvider):
                             choice0 = obj.get("choices", [{}])[0]
                             if obj.get("usage"):
                                 self._note_usage(obj["usage"])
+                                usage_note = dict(self.last_usage or {})
                             if choice0.get("finish_reason"):
                                 finish_reason = choice0["finish_reason"]
-                            delta = choice0.get("delta", {})
+                            delta = choice0.get("delta") or {}
+                            # 部分兼容层（MiniMax/DashScope 等）把思考放在
+                            # `reasoning_content`，OpenRouter 系可能叫 `reasoning`；
+                            # 两者都只计数、**绝不**混进正文。
+                            reasoning_piece = delta.get("reasoning_content")
+                            if not isinstance(reasoning_piece, str):
+                                alt = delta.get("reasoning")
+                                reasoning_piece = alt if isinstance(alt, str) else ""
                             piece = delta.get("content") or ""
+                            if reasoning_piece or piece:
+                                if first_frame_ms is None:
+                                    first_frame_ms = _stream_ms(started)
+                            if reasoning_piece:
+                                reasoning_chars += len(reasoning_piece)
+                                if first_reasoning_ms is None:
+                                    first_reasoning_ms = _stream_ms(started)
                             if piece:
                                 safe = rfilter.feed(piece)
                                 if safe:
+                                    if first_content_ms is None:
+                                        # 用户真正看到首字的那一刻：把此前已到达的
+                                        # 思考字符数一起定格，用于归因首字等待。
+                                        first_content_ms = _stream_ms(started)
+                                        inline = rfilter.dropped_chars
+                                        reasoning_chars_before_content = (
+                                            reasoning_chars + inline
+                                            if (reasoning_chars or inline) else None
+                                        )
+                                    content_chars += len(safe)
                                     yielded = True
                                     yield safe
                         tail = rfilter.flush()
                         if tail:
+                            content_chars += len(tail)
                             yielded = True
                             yield tail
                         if rfilter.saw_reasoning:
@@ -448,7 +875,35 @@ class OpenAICompatibleChatProvider(LLMProvider):
                                 "%s 模型 %s 的流里含推理块，已剥离", self.label, model
                             )
                         self._note_finish_reason(
-                            finish_reason, self.label, model, self.max_tokens
+                            finish_reason, self.label, model, mt
+                        )
+                        inline_reasoning = rfilter.dropped_chars
+                        reasoning_total = reasoning_chars + inline_reasoning
+                        self.last_stream_stats = {
+                            "model": model,
+                            "attempt": attempt + 1,
+                            "request_ms": request_ms,
+                            "first_frame_ms": first_frame_ms,
+                            "first_reasoning_ms": first_reasoning_ms,
+                            "first_content_ms": first_content_ms,
+                            "reasoning_chars_before_content": (
+                                reasoning_chars_before_content
+                            ),
+                            "reasoning_chars": (
+                                reasoning_total if reasoning_total else None
+                            ),
+                            "content_chars": content_chars if content_chars else None,
+                            "reasoning_source": _reasoning_source(
+                                reasoning_chars, inline_reasoning
+                            ),
+                            "usage": usage_note,
+                        }
+                        logger.info(
+                            "%s 模型 %s 流式留痕：首帧=%sms 首正文=%sms "
+                            "reasoning=%s字 正文=%s字 usage=%s",
+                            self.label, model, first_frame_ms, first_content_ms,
+                            self.last_stream_stats["reasoning_chars"],
+                            self.last_stream_stats["content_chars"], usage_note,
                         )
                     return
                 except Exception as exc:  # noqa: BLE001
@@ -543,6 +998,12 @@ class ZhipuChatProvider(OpenAICompatibleChatProvider):
 
     label = "Zhipu"
 
+    #: 单模型输出上限（token）。`glm-4-flash-250414` 拒绝 `writer.max_tokens: 65536`：
+    #: 2026-11-13 实测 400 `{"code":"1210","message":"max_tokens参数非法：限制数值范围[1,16384]"}`；
+    #: 回退到旧 `glm-4-flash` 虽接受该值，但会直接 `finish_reason=length` 拦腰截断
+    #: （第 4 章只出 1,167 字符）。按模型裁到 16384，两条路都不会再 400/截断。
+    _MODEL_MAX_TOKENS = {"glm-4-flash-250414": 16384}
+
 
 class SiliconFlowChatProvider(OpenAICompatibleChatProvider):
     """硅基流动 SiliconFlow（api.siliconflow.cn）：国产开源模型最全，国内低延迟。
@@ -566,8 +1027,23 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
 
     label = "MiniMax"
 
-    # 强制 adaptive thinking 的模型：禁传 thinking 参数，否则 400
-    _ADAPTIVE_THINKING_MODELS = ("MiniMax-M3.1-Flash-Preview",)
+    # 强制 adaptive thinking 的模型：禁传 thinking 参数，否则 400。
+    # 2026-11-12：官方只剩正式版 `MiniMax-M3.1-Flash`，`-Preview` 名已归一成正式 id，
+    # 因此用前缀匹配覆盖两者——漏掉正式 id 会被塞 thinking={"type":"disabled"} 直接 400。
+    _ADAPTIVE_THINKING_MODELS = ("MiniMax-M3.1-Flash",)
+
+    # 五小时额度墙是账号级硬限额，换模型无益：429 时同一条退避重试 3 次。
+    # 2026-11-12 04:56 实测：五小时窗口内跑满约 15.5M token 后开始 429，
+    # 当时 12 批角色声音 + 漂移全部直接判失败，档案缺条目。退避后重试能把
+    # 「瞬时/窗口边界」的 429 吃掉；真正的额度耗尽仍会在 3 次后失败。
+    _RATE_LIMIT_BACKOFFS = (2.0, 5.0, 12.0)
+
+    #: 单模型输出上限（token）。`MiniMax-Text-01` 官方硬上限 40000，配置里
+    #: `writer.max_tokens: 65536` 直接下发会被整条 400 拒掉：
+    #: 2026-11-13 实测响应体
+    #: `invalid params, model[MiniMax-Text-01] does not support max tokens > 40000 (2013)`。
+    #: 只裁这一个模型，M3.1-Flash 仍需 65536 给 adaptive thinking 留余量。
+    _MODEL_MAX_TOKENS = {"MiniMax-Text-01": 40000}
 
     def __init__(self, api_key: str, base_url: str, model: str,
                  models: list[str] | None = None, **kwargs) -> None:
@@ -576,6 +1052,89 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
             # 老模型（M3/M2.x）会吐思维链，能关则关；关不掉由 _strip_thinking 兜底
             extra["thinking"] = {"type": "disabled"}
         super().__init__(api_key, base_url, model, extra_body=extra, models=models, **kwargs)
+
+
+class OpenCodeGoChatProvider(OpenAICompatibleChatProvider):
+    """opencode go（https://opencode.ai/inference/go/openai/v1）：按量计费的 OpenAI 兼容网关。
+
+    2026-11-12 实测（deepseek-v4.1-flash，context 1,000,000 / max output 384,000）：
+    - 形状与 OpenAI `/chat/completions` 一致，`Authorization: Bearer <OC_KEY>`；
+    - **必带浏览器风格 User-Agent**：urllib 默认 UA 会被 Cloudflare 拦成 403 / error 1010；
+    - **必带 `x-opencode-session`**：缺失直接 400 `MissingSessionID`（用于路由/计费）。
+      任意稳定字符串即可，本类默认每个实例生成一个 `novel-<uuid>`。
+    - 支持 `reasoning_effort`（low/high/max），低档延迟约 3s。
+    """
+
+    label = "OpenCodeGo"
+
+    DEFAULT_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
+    DEFAULT_MODEL = "deepseek-v4.1-flash"
+    _BROWSER_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self, api_key: str, base_url: str | None = None, model: str | None = None,
+                 session_id: str | None = None,
+                 models: list[str] | None = None, **kwargs) -> None:
+        headers = {
+            "User-Agent": self._BROWSER_UA,
+            "x-opencode-session": session_id or f"novel-{uuid.uuid4().hex}",
+        }
+        super().__init__(
+            api_key,
+            base_url or self.DEFAULT_BASE_URL,
+            model or self.DEFAULT_MODEL,
+            models=models,
+            extra_headers=headers,
+            **kwargs,
+        )
+
+
+class CommandCodeChatProvider(OpenAICompatibleChatProvider):
+    """Command Code Provider API（https://api.commandcode.ai/provider/v1）：OpenAI 兼容网关。
+
+    2026-11-12 实测（Goat 套餐密钥，`/provider/v1/models` 与 `/chat/completions` 均 200）：
+    - `Authorization: Bearer <COMMAND_CODE_GOAT_KEY>`；**UA 必须伪装**：Cloudflare 对
+      `Python-urllib/*` 直接 403 / error 1010，浏览器 UA 与 `openai-python/*` 放行；
+    - 模型 id 带厂商前缀（`deepseek/deepseek-v4.1-flash`），与 opencode go 的
+      `deepseek-v4.1-flash` **不是同一个字符串**，切换 provider 时必须一起换 id；
+    - 模型元数据只有 `context_length` / `supported_endpoints`，未暴露 max output、
+      pricing、参数能力，这些要实测；
+    - 额度口径与 opencode go 独立（同一模型的 `go` 套餐额度烧完不影响这里）。
+
+    key 默认从环境变量 `COMMAND_CODE_GOAT_KEY` 读，**不落盘、不写进 providers.yaml**。
+    """
+
+    label = "CommandCode"
+
+    DEFAULT_BASE_URL = "https://api.commandcode.ai/provider/v1"
+    DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
+    KEY_ENV = "COMMAND_CODE_GOAT_KEY"
+    #: Cloudflare 会按 UA 拦：`Python-urllib/3.13` 直接 403 / error 1010，
+    #: 浏览器 UA 与 `openai-python/*` 都放行（2026-11-12 实测）。
+    _BROWSER_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self, api_key: str | None = None, base_url: str | None = None,
+                 model: str | None = None, models: list[str] | None = None,
+                 **kwargs) -> None:
+        key = api_key or os.environ.get(self.KEY_ENV) or ""
+        if not key:
+            raise ValueError(
+                f"{self.KEY_ENV} 未设置：Command Code 的 key 只从环境变量读，"
+                "不接受硬编码或写进配置文件。"
+            )
+        super().__init__(
+            key,
+            base_url or self.DEFAULT_BASE_URL,
+            model or self.DEFAULT_MODEL,
+            models=models,
+            extra_headers={"User-Agent": self._BROWSER_UA},
+            **kwargs,
+        )
 
 
 class GenericOpenAIChatProvider(OpenAICompatibleChatProvider):
@@ -643,6 +1202,11 @@ def get_llm_provider() -> LLMProvider:
     global _PROVIDER
     if _PROVIDER is not None:
         return _PROVIDER
+    # 超时从 settings 取（默认 180 / 180 = 现网值），不再依赖类默认参数。
+    _timeouts = {
+        "timeout": settings.writer_timeout,
+        "stream_timeout": settings.writer_stream_timeout,
+    }
     if settings.llm_provider == "openrouter" and settings.openrouter_api_key:
         _PROVIDER = OpenRouterChatProvider(
             settings.openrouter_api_key,
@@ -650,6 +1214,7 @@ def get_llm_provider() -> LLMProvider:
             settings.openrouter_model,
             models=settings.openrouter_model_list,
             max_tokens=settings.writer_max_tokens,
+            **_timeouts,
         )
     elif settings.llm_provider == "zhipu" and settings.zhipu_api_key:
         _PROVIDER = ZhipuChatProvider(
@@ -658,6 +1223,7 @@ def get_llm_provider() -> LLMProvider:
             settings.zhipu_model,
             models=settings.zhipu_model_list,
             max_tokens=settings.writer_max_tokens,
+            **_timeouts,
         )
     elif settings.llm_provider == "siliconflow" and settings.siliconflow_api_key:
         _PROVIDER = SiliconFlowChatProvider(
@@ -666,6 +1232,7 @@ def get_llm_provider() -> LLMProvider:
             settings.siliconflow_model,
             models=settings.siliconflow_model_list,
             max_tokens=settings.writer_max_tokens,
+            **_timeouts,
         )
     elif settings.llm_provider == "minimax" and settings.minimax_api_key:
         _PROVIDER = MiniMaxChatProvider(
@@ -674,6 +1241,7 @@ def get_llm_provider() -> LLMProvider:
             settings.minimax_model,
             models=settings.minimax_model_list,
             max_tokens=settings.writer_max_tokens,
+            **_timeouts,
         )
     # ------------------------------------------------------------------
     # 通用 OpenAI 兼容渠道（第 8 步新增，判据与上面 5 个分支同形）。
@@ -699,12 +1267,14 @@ def get_llm_provider() -> LLMProvider:
             settings.openai_model,
             models=settings.openai_model_list,
             max_tokens=settings.writer_max_tokens,
+            **_timeouts,
         )
     elif settings.llm_provider == "dashscope" and settings.dashscope_api_key:
         base = settings.llm_base_url or settings.dashscope_base_url
         _PROVIDER = DashScopeChatProvider(
             settings.dashscope_api_key, base, settings.llm_model,
             max_tokens=settings.writer_max_tokens,
+            **_timeouts,
         )
     else:
         # 未配置 key 或显式 local：降级本地兜底，保证离线可跑
@@ -751,40 +1321,56 @@ def apply_runtime_config(overrides: dict[str, str | None]) -> None:
 
 
 def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
-                   max_tokens: int | None = None, timeout: int = 120,
-                   stream_timeout: int = 180) -> LLMProvider:
+                   max_tokens: int | None = None, timeout: int | None = None,
+                   stream_timeout: int | None = None,
+                   total_timeout: int | None = None) -> LLMProvider:
     """按渠道名直接构造 provider 实例（测试端点用，不走缓存/单例）。
 
     max_tokens / timeout / stream_timeout 是 ADR-2026-10-12 新增字段：
     - Assistant 工厂会显式传 timeout=60 / stream_timeout=60；
-    - 其它调用方（settings.py 的连通性测试）不传 → 默认 None / 120 / 180 =
-      与 b58c763 行为一致（stream_timeout=180 是关键，不能与 chat 共用 120）。
+    - 其它调用方（settings.py 的连通性测试）不传 → 取 `settings.llm_probe_timeout`
+      / `llm_stream_timeout`（默认 120 / 180 = 与 b58c763 逐秒一致，
+      stream_timeout=180 是关键，不能与 chat 共用 120）。
     """
+    if timeout is None or not isinstance(timeout, int) or timeout <= 0:
+        timeout = settings.llm_probe_timeout
+    if stream_timeout is None or not isinstance(stream_timeout, int) or stream_timeout <= 0:
+        stream_timeout = settings.llm_stream_timeout
+    # 非流式硬顶：本入口只服务 Assistant / Distiller / 连通性测试，一律按**本次
+    # 的 recv 超时**推（×2），不能沿用 settings.writer_total_timeout——那是 Writer
+    # 的 960s 预算，挂在诊断/QA 路径上会把「快速失败」变成「长等」。
+    if total_timeout is None or not isinstance(total_timeout, int) or total_timeout <= 0:
+        total_timeout = max(120, timeout * 2)
     if provider == "openrouter":
         url = base_url or settings.openrouter_base_url
         return OpenRouterChatProvider(api_key, url, model, models=[model],
                                        max_tokens=max_tokens, timeout=timeout,
-                                       stream_timeout=stream_timeout)
+                                       stream_timeout=stream_timeout,
+                                       total_timeout=total_timeout)
     if provider == "zhipu":
         url = base_url or settings.zhipu_base_url
         return ZhipuChatProvider(api_key, url, model, models=[model],
                                   max_tokens=max_tokens, timeout=timeout,
-                                  stream_timeout=stream_timeout)
+                                  stream_timeout=stream_timeout,
+                                  total_timeout=total_timeout)
     if provider == "siliconflow":
         url = base_url or settings.siliconflow_base_url
         return SiliconFlowChatProvider(api_key, url, model, models=[model],
                                         max_tokens=max_tokens, timeout=timeout,
-                                        stream_timeout=stream_timeout)
+                                        stream_timeout=stream_timeout,
+                                        total_timeout=total_timeout)
     if provider == "minimax":
         url = base_url or settings.minimax_base_url
         return MiniMaxChatProvider(api_key, url, model, models=[model],
                                     max_tokens=max_tokens, timeout=timeout,
-                                    stream_timeout=stream_timeout)
+                                    stream_timeout=stream_timeout,
+                                    total_timeout=total_timeout)
     if provider == "dashscope":
         url = base_url or settings.dashscope_base_url
         return DashScopeChatProvider(api_key, url, model,
                                       max_tokens=max_tokens, timeout=timeout,
-                                      stream_timeout=stream_timeout)
+                                      stream_timeout=stream_timeout,
+                                      total_timeout=total_timeout)
     if provider == "openai":
         # 通用 OpenAI 兼容渠道：任何实现了 /chat/completions + Bearer 鉴权的端点
         # （官方 / one-api / vLLM / LM Studio / 中转站…）。端点优先取调用方给的
@@ -795,7 +1381,8 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
         url = base_url or settings.openai_base_url
         return GenericOpenAIChatProvider(api_key, url, model, models=[model],
                                          max_tokens=max_tokens, timeout=timeout,
-                                         stream_timeout=stream_timeout)
+                                         stream_timeout=stream_timeout,
+                                         total_timeout=total_timeout)
     return LocalFallbackLLMProvider()
 
 

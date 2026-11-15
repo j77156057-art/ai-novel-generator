@@ -252,18 +252,24 @@ def plan_branch_node(provider, current_main_node, signal: KgSignal) -> "PlotNode
     )
 
 
-def attach_branch_to_state(state, branch: "PlotNode") -> "TimelineState":
-    """v2.5 纯函数：把支线节点挂到当前主干 children，并切换 current_node 到支线。
+def attach_branch_to_state(state, branch: "PlotNode", *, chapter_based: bool = False) -> "TimelineState":
+    """v2.5 纯函数：把支线节点挂到当前主干 children，并登记为并行支线。
 
     注意：
     - 不改 main 节点（只 append children）
-    - 把 current_node 切到支线 id
+    - ``chapter_based=True``（章模式）：current_node **不切到支线**——章模式下
+      注入的「当前剧情点」必须与章号对齐，支线只记到 ``branch_current`` 并行
+      推进。旧实现把 current_node 设成支线，导致注入点停在 0-0 区间、章号对不上。
+    - ``chapter_based=False``（段模式）：保持原行为，current_node 切到支线。
+    - 挂载锚点按模式区分（2026-11-15 定稿）：章模式把支线挂在**主干**层
+      （current_node 意外是支线时归一化到父主干）；段模式**保持嵌套挂载**
+      ——挂到当前节点（可能是上一条支线）下，保留「支线从哪一段长出来」的溯源。
     - branch_used += 1（占一段预算）
     - 不动 current_beat（支线无节拍概念，但保留字段以兼容）
     """
     from app.generation.timeline import TimelineState
 
-    # copy
+    # copy（新增字段必须一起带过去，否则被覆盖丢失）
     st = TimelineState(
         nodes=dict(state.nodes),
         order=list(state.order),
@@ -274,24 +280,43 @@ def attach_branch_to_state(state, branch: "PlotNode") -> "TimelineState":
         branch_budget=state.branch_budget,
         branch_used=state.branch_used,
         seg_counts=dict(state.seg_counts),
+        early_done=set(state.early_done),
+        branch_current=state.branch_current,
     )
+    # 锚点选择（**按模式区分**，2026-11-15 定稿）：
+    # - 章模式（chapter_based=True）：current_node 永远停在主干上，但防御性归一化
+    #   ——若它意外指向支线，取父主干（父缺失则回退第一个主干），保证后续支线
+    #   仍挂在主干层，章号与注入点对齐。
+    # - 段模式（chapter_based=False）：**不做归一化**，保持嵌套挂载——支线挂到
+    #   「它从哪一段长出来的」那个节点下（可能是上一条支线）。段模式没有章边界，
+    #   同级挂会丢掉这条溯源信息。
+    anchor = st.current_node
+    cur = st.nodes.get(anchor) if anchor else None
+    if chapter_based and cur is not None and cur.kind == "branch":
+        anchor = cur.parent if cur.parent in st.order else (st.order[0] if st.order else None)
     # 把支线加到 nodes（不在 order 里——order 是主干推进顺序）
     st.nodes[branch.id] = branch
-    # 挂到当前主干的 children
-    if st.current_node and st.current_node in st.nodes:
-        main = st.nodes[st.current_node]
+    if anchor and anchor in st.nodes:
+        main = st.nodes[anchor]
         if branch.id not in main.children:
             main.children = list(main.children) + [branch.id]
-    # 切 current_node 到支线，branch_used + 1
-    st.current_node = branch.id
+        branch.parent = anchor
+    # 支线指针：章模式不顶替 current_node，段模式保持原行为
+    st.branch_current = branch.id
+    if not chapter_based:
+        st.current_node = branch.id
     st.branch_used = st.branch_used + 1
     return st
 
 
 def roll_branch(
-    db, project, state, provider, written: int, last_branch_written: int | None
+    db, project, state, provider, written: int, last_branch_written: int | None,
+    *, chapter_based: bool = False,
 ) -> tuple:
-    """v2.5 包装：检查 + 切 + 挂 + 切 current_node + 落库。
+    """v2.5 包装：检查 + 切 + 挂 + 记并行支线 + 落库。
+
+    ``chapter_based=True``（章模式）时只登记 branch_current，current_node 保持
+    章号对齐——支线可并行推进，但不顶替「当前节点」。
 
     Returns:
         (new_state, info_dict)
@@ -329,7 +354,7 @@ def roll_branch(
         info["reason"] = "plan_branch returned None"
         return state, info
 
-    new_state = attach_branch_to_state(state, branch)
+    new_state = attach_branch_to_state(state, branch, chapter_based=chapter_based)
     info["rolled"] = True
     info["skipped"] = False
     info["reason"] = "rolled"

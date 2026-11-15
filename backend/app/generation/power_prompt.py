@@ -132,6 +132,30 @@ def _character_scale_rows(bible: dict, *, limit: int = 12) -> list[str]:
     return rows
 
 
+def _realm_order_line(bible: dict) -> str:
+    """境界阶梯：**只给顺序、不给数值**（R36-2，2026-11-12 用户定）。
+
+    `realm_order` 之前只用于校验、从不进提示词。这里只把它按顺序念一遍，
+    并明说「不知道差几阶」——给了序号或跨度，模型就会自己折算成战力差值，
+    那是档案里没有的事实。
+    """
+    raw = bible.get("realm_order")
+    if not isinstance(raw, (list, tuple)):
+        return ""
+    flat: list[str] = []
+    for item in raw:
+        if isinstance(item, (list, tuple)):
+            flat.extend(str(x).strip() for x in item if str(x).strip())
+        elif isinstance(item, str) and item.strip():
+            flat.append(item.strip())
+    if len(flat) < 2:
+        return ""
+    return (
+        "境界阶梯（只给顺序，不给差值）：" + " ＞ ".join(flat)
+        + "。只知道谁在谁之上，不知道差几阶，不要自行算跨度或折算战力。"
+    )
+
+
 def build_power_constraint(project, max_chars: int = 900) -> str:
     """渲染量级约束块；开关关闭时返回空串（拼接结果逐字节不变）。"""
     # 用 getattr 读开关：本模块与 config 的 power 字段物理分块，单侧批次里
@@ -159,6 +183,10 @@ def build_power_constraint(project, max_chars: int = 900) -> str:
             f"{level}={SCALE_HINTS.get(level, '')}" for level in SCALE_LEVELS
         )
     )
+    # R36-2：境界阶梯只给顺序（配置了才给，未配置不塞默认阶梯）。
+    realm_line = _realm_order_line(bible)
+    if realm_line:
+        head.append(realm_line)
 
     ladder: list[str] = []
     if _uses_15_ladder(bible) and SCALE_SEQ_BY_LABEL:
