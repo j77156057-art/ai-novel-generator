@@ -10,9 +10,9 @@
 
 | # | 路径 | 入口 | 实际写正文的位置 | 经 `_commit_segment` |
 |---|---|---|---|---|
-| P1 | 续写（非流式） | `generate_next_segment` [engine.py#L1535](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1535) | [`_commit_segment` L1628](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1628) → [L473](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L473) | 是 |
-| P2 | 续写（SSE，前端实际走这条） | `generate_next_segment_stream` [L1721](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1721) | [`_commit_segment` L1817](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1817) | 是 |
-| P3 | 重写某一段 | `regenerate_segment_stream` [L1976](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1976) | 旧路径 `target.text = text` [L2225](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L2225)（分支 [L2223](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L2223)）；快照路径 `finalize_snapshot` [L2242](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L2242)（SQL 级 UPDATE） | **否** |
+| P1 | 续写（非流式） | `generate_next_segment` [engine.py#L1535](backend/app/generation/engine.py#L1535) | [`_commit_segment` L1628](backend/app/generation/engine.py#L1628) → [L473](backend/app/generation/engine.py#L473) | 是 |
+| P2 | 续写（SSE，前端实际走这条） | `generate_next_segment_stream` [L1721](backend/app/generation/engine.py#L1721) | [`_commit_segment` L1817](backend/app/generation/engine.py#L1817) | 是 |
+| P3 | 重写某一段 | `regenerate_segment_stream` [L1976](backend/app/generation/engine.py#L1976) | 旧路径 `target.text = text` [L2225](backend/app/generation/engine.py#L2225)（分支 [L2223](backend/app/generation/engine.py#L2223)）；快照路径 `finalize_snapshot` [L2242](backend/app/generation/engine.py#L2242)（SQL 级 UPDATE） | **否** |
 | P4 | 回滚 | `rollback`（`app/agents/dialog/snapshot.py`） | 把 `before_text` 写回 | **否** |
 | P5 | 助手端点 | `POST /api/assistant/invoke-generation` | 复用 P1 / P3 | 随 P1 / P3 |
 
@@ -87,12 +87,35 @@
     "repeated_sentence_coverage": 0.525,
     "dup20": 0.566
   },
+  "length": {
+    "verdict": "short",
+    "chars": 2273,
+    "budget": 3000,
+    "ratio": 0.758,
+    "min_ratio": 0.8,
+    "reason_text": "篇幅不足：正文 2273 字，仅为字数预算 3000 字的 75.8%（<80.0%）"
+  },
+  "summary_style": {
+    "verdict": "ok",
+    "signals": [],
+    "reason_text": "未命中梗概化判据：…",
+    "metrics": {"chars": 2273, "sentences": 124, "dialogue_ratio": 0.2,
+                "meet_verb_object_hits": 1, "meet_verb_object_per_1k": 0.44,
+                "summary_verb_per_1k": 0.88, "scene_element_per_1k": 3.52}
+  },
   "truncated": true,
   "checked_at": "2026-11-12T…Z"
 }
 ```
 
-只存「判定 + 命中的线 + 一句话原因 + 3 个关键数」，不存全量指标（列随行读取，越短越好）。
+只存「判定 + 命中的线 + 一句话原因 + 关键数」，不存全量指标（列随行读取，越短越好）。
+**三个字段彼此独立**：`repetition`（复读）、`length`（正文 vs `generation_length`）、
+`summary_style`（梗概式推进）。不要把三者压成一个布尔；`ok` 也要写。
+
+`length.verdict` 的取值：`ok` / `short` / `undetected`（项目没设预算）/ `not_applicable`
+（P3 改写路径，跌幅归 `detect_length_drop`，不在这条里报）。
+`summary_style.verdict` 的取值：`ok` / `summary_style` / `skipped_short`（<300 字不判文体）。
+判据阈值与误报实测见 `repetition.py` 模块 docstring。
 
 与早先「`summary` 兄弟键」方案的关键差别：**`verdict == "ok"` 与 `"skipped_short"` 也要写**
 （值更短，如 `{"repetition":{"verdict":"ok"},"truncated":false,"checked_at":…}`）。
@@ -103,9 +126,9 @@
 
 | 路径 | 检测时机（commit 前） | 标记写到哪 | 跳过什么 | 失败语义 | 快照 | 摘要树 | 前端 |
 |---|---|---|---|---|---|---|---|
-| P1 同步续写 | era 自检之后、[`_commit_segment` L1628](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1628) 之前（≈L1627） | `_commit_segment(..., quality=…)` 建行时写 `quality_json`（同一次 INSERT） | [L1642](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1642) `_merge_segment_into_graph` 前按同一份报告跳过 | 检测异常一律吞掉 + warning，正文照常落库 | 无（此路径不建快照） | **照写** | 响应体 `repetition` + `warnings` |
-| P2 流式续写 | 同 P1，[L1817](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1817) 之前（≈L1816） | 同上（同一次 INSERT） | [L1833](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1833) 同 P1 | 同上 | 无 | 照写 | `done` 事件带 `repetition` / `warnings` |
-| P3 重写 | `new_summary` 构造之后（L2210-2214）、落库分支 [L2223](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L2223) 之前 | 旧路径：`target.text = text`（[L2225](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L2225)）之后紧接 `target.quality_json = …`，同一次 UPDATE / commit；快照路径：`finalize_snapshot(..., quality=…)` 写进同一条 SQL UPDATE（[snapshot.py L697-709](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/agents/dialog/snapshot.py#L697-L709)），与 applied 同一事务 | **无需跳过**：该路径本就不调 `_merge_segment_into_graph` | 同上 | 正文照写、`finalize_snapshot` 照常；**不** `fail_snapshot`（拒绝语义已排除） | 照写 | 响应体同上 |
+| P1 同步续写 | era 自检之后、[`_commit_segment` L1628](backend/app/generation/engine.py#L1628) 之前（≈L1627） | `_commit_segment(..., quality=…)` 建行时写 `quality_json`（同一次 INSERT） | [L1642](backend/app/generation/engine.py#L1642) `_merge_segment_into_graph` 前按同一份报告跳过 | 检测异常一律吞掉 + warning，正文照常落库 | 无（此路径不建快照） | **照写** | 响应体 `repetition` + `warnings` |
+| P2 流式续写 | 同 P1，[L1817](backend/app/generation/engine.py#L1817) 之前（≈L1816） | 同上（同一次 INSERT） | [L1833](backend/app/generation/engine.py#L1833) 同 P1 | 同上 | 无 | 照写 | `done` 事件带 `repetition` / `warnings` |
+| P3 重写 | `new_summary` 构造之后（L2210-2214）、落库分支 [L2223](backend/app/generation/engine.py#L2223) 之前 | 旧路径：`target.text = text`（[L2225](backend/app/generation/engine.py#L2225)）之后紧接 `target.quality_json = …`，同一次 UPDATE / commit；快照路径：`finalize_snapshot(..., quality=…)` 写进同一条 SQL UPDATE（[snapshot.py L697-709](backend/app/agents/dialog/snapshot.py#L697-L709)），与 applied 同一事务 | **无需跳过**：该路径本就不调 `_merge_segment_into_graph` | 同上 | 正文照写、`finalize_snapshot` 照常；**不** `fail_snapshot`（拒绝语义已排除） | 照写 | 响应体同上 |
 | P4 回滚 | 不检测（只恢复既有文本） | 不写 | 不跳过 | **只 `logger.warning`**，不改行为、不让回滚失败 | 回滚自身事务不变 | 不变 | 不变 |
 
 逐条说明：
@@ -148,9 +171,18 @@
 | `quality` | 展示 | 含义 |
 |---|---|---|
 | `null` | **未检测** | 这段写作时还没有闸门；不代表内容正常 |
-| `{"repetition":{"verdict":"ok"},…}` | 正常 | 检测过，未命中退化线 |
-| `{"repetition":{"verdict":"degenerate"},…}` | 疑似复读（附 `reason_text`） | 命中退化线 |
-| `{"repetition":{"verdict":"skipped_short"},…}` | 段落过短，未判定 | <200 字，判据不适用 |
+| `repetition.verdict = "ok"` | 复读：正常 | 检测过，未命中退化线 |
+| `repetition.verdict = "degenerate"` | 疑似复读（附 `reason_text`） | 命中退化线 |
+| `repetition.verdict = "skipped_short"` | 段落过短，未判定 | <200 字，复读判据不适用 |
+| `length.verdict = "short"` | **篇幅不足**（附预算与比例） | 正文 < 项目 `generation_length` 的 80% |
+| `length.verdict = "undetected"` | 篇幅：未检测 | 项目没设预算（老项目） |
+| `length.verdict = "not_applicable"` | 篇幅：改写不判 | P3 改写路径，跌幅看 `length_drop` |
+| `summary_style.verdict = "summary_style"` | **梗概化 / 罗列式推进** | 命中转述+展示缺失判据 |
+| `summary_style.verdict = "skipped_short"` | 文体：段落过短未判定 | <300 字 |
+| `summary_style.verdict = "undetected"` | 文体：未检测 | 接线前的行 / 判据异常 |
+
+三个字段都要单独展示：一段可以「复读=ok、篇幅=短、梗概化=命中」，也可以「复读=退化、
+篇幅=短、梗概化=ok」。**不要**把任何一个 `undetected` 显示成「正常」。
 
 - **不要**在读接口里现算再展示：读时检测会让同一段的历史结论随代码版本漂移，与「写入时判定、
   写入时跳过 KG」的口径不一致；判据也不该由前端或读路径承担。
@@ -165,7 +197,7 @@
 
 **三条代码事实**（已核对）：
 
-1. 只有非流式 `chat()` 记录 `finish_reason`（[_note_finish_reason L326](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/llm/provider.py#L326)，调用点 L284）；
+1. 只有非流式 `chat()` 记录 `finish_reason`（[_note_finish_reason L326](backend/app/llm/provider.py#L326)，调用点 L284）；
 2. **`stream_chat()` 完全没有 `finish_reason` 解析**——而前端实际走 SSE（P2）；
 3. `provider.last_finish_reason` 会被随后的 `provider.summarize()` 覆盖（`summarize` → `_complete`
    → 同一条 `chat` 链路），在 `_commit_segment` 里读它**读不到**。
