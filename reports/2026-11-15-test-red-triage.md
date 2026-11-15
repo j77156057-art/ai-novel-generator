@@ -164,7 +164,7 @@ $env:DATABASE_URL="sqlite:///D:/Temp/x.db"; $env:PYTHONPATH="<repo>\backend"
 
 - 进度条到 **[100%]**（16 行），符号合计 **1128**：`.` 1101 + `F` 23 + `X` 2 + `s` 2。
 - `short test summary info` 完整：23 条 FAILED、2 条 SKIPPED、2 条 XPASS，**0 ERROR**。
-- 异常点：日志**没有** pytest 最后那行 `23 failed, 1101 passed, ... in ...s`，文件在最后一条 FAILED 之后直接就是 `EXIT=1`。按进度 100% + 汇总清单完整 + 退出码 1（有失败）判定为「跑完、有红」，末行计数属收尾丢写；上面的 1101/23/2/2 是按进度符号还原的。
+- 异常点：日志**没有** pytest 最后那行 `23 failed, 1101 passed, ... in ...s`，文件在最后一条 FAILED 之后直接就是 `EXIT=1`。按进度 100% + 汇总清单完整 + 退出码 1（有失败）判定为「跑完、有红」；上面的 1101/23/2/2 是按进度符号还原的。**归因更正（见 §8.6）**：不是收尾丢写，而是 pytest 8.3.4 在 `-q` 下不打印末尾 tally 行。
 - 项次 1127 → **1128**（+1）：06:49 给 `test_db_isolation.py` 加了逻辑指纹自检用例，属收集漂移。
 - 按你的要求**没有重跑**。
 
@@ -215,6 +215,34 @@ $env:DATABASE_URL="sqlite:///D:/Temp/x.db"; $env:PYTHONPATH="<repo>\backend"
 4. **提示词金标准**（qa_attack 1 + regenerate 1）：prompts 最后写入 05:25，已停手，可以逐条写变更说明再重算哈希。
 5. `branch.py` 段模式（1 条）：需 branch 作者一句确认。
 6. 4 条既有失败：维持旧账，不在本轮范围。
+
+### 8.6 重跑复测（2026-11-15 15:19–15:39，单会话整轮）
+
+| 项 | 值 |
+|---|---|
+| 命令 | `python -m pytest -o addopts="-ra" --junitxml=D:\Temp\full_retest_rerun.xml 2>&1 \| Tee-Object -FilePath D:\Temp\full_retest2.log -Append` |
+| commit | `989abce`（14:41 首轮跑测后，另一会话把 230 项改动提交了；首轮快照是 `563666b` + 230 项脏） |
+| 工作区 | **干净**：DIRTY=0 / STAGED=0 / UNTRACKED=0（开跑时记录） |
+| 日志 | `D:\Temp\full_retest2.log` 追加段，15:19:39 → 15:39:15，**19 min 32 s** |
+| 收集 | **1130 items**（`testpaths=tests`，与首轮一致） |
+
+**汇总行原文**
+
+```text
+= 3 failed, 1123 passed, 2 skipped, 2 xpassed, 4 warnings in 1172.64s (0:19:32) =
+```
+
+**FAILED 清单（3 条，全部既有失败）**
+
+1. `tests/test_legacy_script_suite.py::test_legacy_script_passes[backend·tests·test_evidence_quotes.py]`
+2. `tests/test_legacy_script_suite.py::test_legacy_script_passes[backend·tests·test_extract_split.py]`
+3. `tests/test_legacy_script_suite.py::test_legacy_script_passes[backend·tests·test_stat_evidence.py]`
+
+**与 §8.2 对差**：项次 1128 → 1130（+2）；failed **23 → 3（−20）**；passed 1101 → 1123（+22）；skipped 2 → 2；xpassed 2 → 2；error 0 → 0。**预期 3 failed 命中，无第 4 条红。**
+
+**关于「末尾计数行」**：`pytest.ini` 的 `addopts = -ra -q`，pytest 8.3.4 在 `-q` 下不输出末尾 tally 行。已用 7 条的小样本复现：`-q` 无末行；`-o addopts=""` 输出 `7 passed in 10.50s`。因此本次重跑用 `-o addopts="-ra"`（测试集不变）让汇总行落盘；§8.2 的「收尾丢写」归因据此更正。
+
+**兜底解析**：`D:\Temp\full_retest_rerun.xml` 已生成（日志中 `generated xml file:` 一行），可作为失败/通过数的机器可读兜底。
 
 ## 9. 修复落地（2026-11-15 11:xx–12:xx，未 commit）
 
