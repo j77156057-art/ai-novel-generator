@@ -16,6 +16,7 @@ from sqlalchemy import func, or_, select
 
 from app.agents.prompt_overrides import PromptKey, resolve_prompt_block
 from app.config import settings
+from app.generation.chapter_labels import commit_meta as _chapter_commit_meta
 from app.generation.prompts import (
     PROMPT_REVISION,
     build_system_prompt,
@@ -2185,6 +2186,12 @@ def _commit_segment(db, project: Project, text: str, summary: str,
     """
     segment_no = _next_segment_no(db, project.id)
     label = chapter_range or f"段{segment_no}"
+    # 章身份旁路：只有 `第N章` 标签才写 `chapter_meta`（段标签返回 None）。
+    # 这是「outline 取不到标题」唯一的可见化出口：`title_source="missing_outline"`
+    # 说明该章在 project.outline 里没条目，而不是被悄悄写成无标题章。
+    chapter_meta = _chapter_commit_meta(project, label)
+    if chapter_meta is not None:
+        quality = {**(quality or {}), "chapter_meta": chapter_meta}
     # 一致性层：与文风闸门并排，写进 quality_json 的独立键。
     # 只加键、不改既有键的语义，老数据缺 `coherence` 时读取侧判 None 即可。
     if quality is not None:
@@ -4218,13 +4225,34 @@ def _total_segments(project: Project) -> int:
 
 
 def _chapter_ordinal(label: str | None) -> int | None:
-    """从章节标签取章号（复用一致性层的解析口径，不另写一套）。"""
+    """从章节标签取章号（复用一致性层的解析口径，不另写一套）。
+
+    `第44–46章` 这类区间标签取**起章** 44：一个 Generation 行覆盖多章时，
+    它仍然属于 44 这一章（节点选择、台账归属），推进量另用 `_chapter_last_ordinal`。
+    """
     if not label:
         return None
     try:
         from app.coherence import chapter_index
+        from app.generation.chapter_labels import label_span
 
+        span = label_span(label)
+        if span is not None:
+            return span[0]
         return chapter_index(label)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _chapter_last_ordinal(label: str | None) -> int | None:
+    """区间标签取**末章**（`第44–46章` → 46）；推进量必须按末章算，否则少算两章。"""
+    if not label:
+        return None
+    try:
+        from app.generation.chapter_labels import label_span
+
+        span = label_span(label)
+        return span[1] if span is not None else _chapter_ordinal(label)
     except Exception:  # noqa: BLE001
         return None
 
@@ -4263,7 +4291,7 @@ def _timeline_progress(db, project: Project) -> tuple[int, bool]:
         ).scalars().all()
     except Exception:  # noqa: BLE001
         return 0, False
-    ordinals = [o for o in (_chapter_ordinal(r) for r in rows) if o]
+    ordinals = [o for o in (_chapter_last_ordinal(r) for r in rows) if o]
     if ordinals:
         return max(ordinals), True
     return len(rows), False
@@ -5683,6 +5711,7 @@ def regenerate_segment_stream(
     snapshot_id: int | None = None,
     expected_before: str | None = None,
     selected_scope: dict | None = None,
+    chapter_label: str | None = None,
 ):
     """重生成单段（流式）：删除目标段旧内容、依前文摘要链重生成插回、重建摘要链。
 
@@ -5707,6 +5736,9 @@ def regenerate_segment_stream(
     v2.3：传 `node_prompt` 给 `_build_generation_prompts`——重生成用时间线模式
     剔除全故事信息。**不**调 `_judge_and_advance`——重生成替换第 N 段语义
     上不改 `_next_segment_no`（已存在），不应触发 state advance。
+    `chapter_label`（2026-11-15）：调用方已解析好的章标签，只**改标签**不改段号。
+    为 None 时保留目标段原标签（原本是段标签则维持 `段N`，不擅自换章号）；
+    非 None 时用它覆盖，并据此选节点/算证据窗口。
     """
     from app.llm.provider import get_llm_provider
 
@@ -5733,8 +5765,11 @@ def regenerate_segment_stream(
     # 锁定名单、尾部 constraints 列了另一套」的自相矛盾提示词。
     reminders = get_reminders(db, project.id, source="generated")
     # 修复项 2：重生成按目标段的**章号**选节点；重写同一章不推进时间线。
+    # 章标签：入参优先，其次目标段原标签——重写不改章号身份，避免同一段被
+    # 悄悄推到未来的章号上。
+    label = chapter_label or target.chapter_range
     timeline_written, chapter_based = _timeline_progress(db, project)
-    chapter = _chapter_ordinal(target.chapter_range)
+    chapter = _chapter_ordinal(label)
     if chapter is None and chapter_based:
         chapter = timeline_written
     node_prompt = current_node_prompt(
@@ -5974,7 +6009,11 @@ def regenerate_segment_stream(
         # —— 旧路径（/regenerate-stream、测试）：逐字节不变 ——
         target.text = text
         target.summary = new_summary
-        target.chapter_range = target.chapter_range or f"段{segment_no}"
+        target.chapter_range = label or f"段{segment_no}"
+        # 章身份旁路：只有 `第N章` 标签才写（段标签返回 None），与 _commit_segment 同口径。
+        regen_meta = _chapter_commit_meta(project, target.chapter_range)
+        if regen_meta is not None:
+            quality = {**quality, "chapter_meta": regen_meta}
         # 与正文同一次 commit：正文与标记不可能分叉。
         target.quality_json = _quality_json(quality)
 
@@ -6103,15 +6142,26 @@ def generate_loop(
     provider=None,
     segments: int = 1,
     max_chars: int | None = None,
+    chapter_labels: list[str] | None = None,
 ) -> list[dict]:
     """连续续写（默认单段）。需批量时才传 segments>1；逐段落库，后段读前段总结作前情。
+
+    `chapter_labels`：调用方（路由）已解析好的逐段章标签，长度应与 segments 一致。
+    这里**不推导章号**（推导只在 `app.generation.chapter_labels` 一处），传 None 即段模式。
 
     注意：segments 过大会在单次请求里反复调用 LLM，前情摘要链虽短，但仍有会话压缩风险；
     生产建议「用户逐次点生成」而非一次性 loop 多段。
     """
+    labels = list(chapter_labels or [])
+    if labels and len(labels) != segments:
+        raise ValueError(
+            f"chapter_labels 长度 {len(labels)} 与 segments {segments} 不一致")
     results: list[dict] = []
-    for _ in range(segments):
-        results.append(generate_next_segment(db, project, novel_ids, provider, max_chars))
+    for idx in range(segments):
+        results.append(generate_next_segment(
+            db, project, novel_ids, provider, max_chars,
+            chapter_range=(labels[idx] if labels else None),
+        ))
     project.status = "loop_done" if project.status == "generating" else project.status
     db.commit()
     return results

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 import json as _json
 
 from app.db import get_db
+from app.generation import chapter_labels
 from app.generation import (
     build_context,
     generate_loop,
@@ -35,6 +36,9 @@ class GenerateBody(StrictRequest):
     project_id: int
     novel_ids: list[int] | None = None  # 缺省用 project.reference_novel_ids
     max_chars: int | None = None  # 缺省用 project.generation_length
+    # 章号/章区间：`"44"` 或 `"44-46"`。缺省由 `chapter_labels.resolve` 推导
+    # （库内最大章号 +1），前端不改也能出章。
+    chapter_range: str | None = None
 
 
 class GenerateLoopBody(StrictRequest):
@@ -46,6 +50,7 @@ class GenerateLoopBody(StrictRequest):
     # 缺省不该悄悄替用户连生成 3 段、还让他以为只写了一段。
     segments: int = 1
     max_chars: int | None = None
+    chapter_range: str | None = None
 
 
 class GeneratePlanBody(StrictRequest):
@@ -58,6 +63,8 @@ class RegenerateBody(StrictRequest):
     segment_no: int
     novel_ids: list[int] | None = None
     max_chars: int | None = None
+    # 只是「改标签」：重写不改章号，所以这里允许指向已存在的章。
+    chapter_range: str | None = None
 
 
 def _require_project(db: Session, project_id: int) -> Project:
@@ -71,6 +78,16 @@ def _resolve_novel_ids(proj: Project, override: list[int] | None) -> list[int]:
     if override:
         return override
     return list(proj.reference_novel_ids or [])
+
+
+def _chapter_plan(
+    db: Session, proj: Project, raw: str | None, *, allow_existing: bool = False
+) -> dict:
+    """章号入参 → 章标签；非法/撞章一律 400，不静默改数。"""
+    try:
+        return chapter_labels.resolve(db, proj, raw, allow_existing=allow_existing)
+    except chapter_labels.ChapterRangeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _to_generation_out(gen: Generation) -> dict:
@@ -90,9 +107,12 @@ def _to_generation_out(gen: Generation) -> dict:
 def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
+    # 章号：入参优先，缺省推导；冲突/越界在调模型前就 400（不烧额度）
+    plan = _chapter_plan(db, proj, body.chapter_range)
     try:
         result = generate_next_segment(
-            db, proj, novel_ids=novel_ids, max_chars=body.max_chars
+            db, proj, novel_ids=novel_ids, max_chars=body.max_chars,
+            chapter_range=plan["label"],
         )
     except ValueError as exc:
         # 档案预检失败（未蒸馏）等可操作错误：409 + 明确指引，
@@ -123,6 +143,7 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
     """
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
+    plan = _chapter_plan(db, proj, body.chapter_range)
 
     def event_stream():
         from app.db import SessionLocal
@@ -132,7 +153,8 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
         try:
             p = sdb.get(Project, proj.id)
             for ev in generate_next_segment_stream(
-                sdb, p, novel_ids=novel_ids, max_chars=body.max_chars
+                sdb, p, novel_ids=novel_ids, max_chars=body.max_chars,
+                chapter_range=plan["label"],
             ):
                 yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 把异常也作为 SSE 事件下发，前端可提示
@@ -153,9 +175,22 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
 
 @router.post("/regenerate-stream")
 def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
-    """重生成单段（流式 SSE）：与 /generate-stream 同协议，额外带 segment_no。"""
+    """重生成单段（流式 SSE）：与 /generate-stream 同协议，额外带 segment_no。
+
+    章标签：**重写不推导新章号**。不传时保留目标段原标签（原本是 `段N` 就仍是
+    `段N`）——重写不产生新内容，「本次章号 = 库内最大章号 +1」会把这个旧段悄悄
+    挪到未来章节上，破坏按章号的趋势与台账；传了才改，且允许指向已存在的章
+    （重写本身就是声明重写）。
+    """
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
+    target = _generation_by_no(db, proj.id, body.segment_no)
+    if target is None:
+        raise HTTPException(status_code=404, detail="段不存在")
+    if body.chapter_range:
+        label = _chapter_plan(db, proj, body.chapter_range, allow_existing=True)["label"]
+    else:
+        label = None  # 引擎保留原标签
 
     def event_stream():
         from app.db import SessionLocal
@@ -165,7 +200,8 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
         try:
             p = sdb.get(Project, proj.id)
             for ev in regenerate_segment_stream(
-                sdb, p, body.segment_no, novel_ids=novel_ids, max_chars=body.max_chars
+                sdb, p, body.segment_no, novel_ids=novel_ids, max_chars=body.max_chars,
+                chapter_label=label,
             ):
                 yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 异常也作为 SSE 事件下发
@@ -188,9 +224,15 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
 def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)) -> dict:
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
+    # 逐段章标签：一次解析完整段（区间入参按段展开），引擎只收标签不推导章号
+    try:
+        plans = chapter_labels.resolve_many(db, proj, body.chapter_range, body.segments)
+    except chapter_labels.ChapterRangeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         results = generate_loop(
-            db, proj, novel_ids=novel_ids, segments=body.segments, max_chars=body.max_chars
+            db, proj, novel_ids=novel_ids, segments=body.segments, max_chars=body.max_chars,
+            chapter_labels=[p["label"] for p in plans],
         )
     except ValueError as exc:
         # 档案预检失败（未蒸馏）→ 409 + 指引，不挂死、不 500

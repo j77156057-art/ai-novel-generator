@@ -1360,16 +1360,24 @@ def run(project_id: int, db: Session = Depends(get_db)) -> dict:
     segments = int(answers.get("chapters") or 1)
     max_chars = int(answers.get("length") or project.generation_length or 3000)
 
+    from app.generation import chapter_labels
     from app.generation.engine import generate_loop
 
     try:
+        # 章身份：引导页选的是「几章」不是「几段」。推导统一走 chapter_labels
+        # （库内最大章号 +1）——否则从引导直接开写会落成 `段1..段N`，之后平台
+        # 续写再推 `第1章`，同一个项目里就同时存在两套编号了。
+        plans = chapter_labels.resolve_many(db, project, None, segments)
         rows = generate_loop(
             db,
             project,
             novel_ids=None,
             segments=segments,
             max_chars=max_chars,
+            chapter_labels=[p["label"] for p in plans],
         )
+    except chapter_labels.ChapterRangeError as exc:  # 先于 ValueError（子类）
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:  # 未蒸馏等可操作错误：如实返回，不吞成 500
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
