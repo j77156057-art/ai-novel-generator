@@ -173,6 +173,17 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     kg_stuck_sweep_seconds: int = 120
 
+    # 启动时收割「上次进程遗留的 running 行」（`kg.batch_worker.reap_stale_runs`）。
+    #
+    # 周期扫描（上面那个）只处理**超过 STUCK_MINUTES** 的行；进程被重启时
+    # 队列（内存 deque）直接丢失，那一批行永远 running，要等 30 分钟才被扫到。
+    # 启动收割把 `started_at` 早于本次启动的 running 行直接标 failed
+    # （带 `interrupted` 标记，前端才不会算出「跑了 3 天」）。
+    #
+    # **默认关闭**：它会写库（改 AgentRun 状态），是否在启动时自动动手由部署方决定。
+    # 关闭时仍可手动调 `reap_stale_runs(db)`。
+    kg_reap_stale_on_startup: bool = False
+
     # 作者 agent 的「写后定向自查」（app.generation.author_research）。
     # 默认关闭（2026-11-13）：段 11 实测用段 9 的 1/58 自查 token 只换来与段 9
     # 持平的闸门表现（差 3），且段落类缺口在参考语料里方向相反，检索会帮倒忙。

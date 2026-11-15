@@ -55,6 +55,19 @@ async def lifespan(app: FastAPI):
     # 放在 init_db() 之后、用独立 session；失败不拖垮启动（恢复本身有日志留痕）。
     try:
         from app.kg.batch_worker import ensure_worker, recover_running
+        from app.config import settings as _settings
+
+        # 策略开关（默认关）：开 = 先「收割」再恢复 —— 上一进程遗留的 running 行
+        # 直接标 failed（带 interrupted 标记）；关 = 交给 recover_running 重新入队。
+        if getattr(_settings, "kg_reap_stale_on_startup", False):
+            from app.kg.batch_worker import reap_stale_runs
+
+            with SessionLocal() as db:
+                reaped = reap_stale_runs(db)
+            if reaped:
+                logging.getLogger(__name__).warning(
+                    "启动收割 KG 批抽：%s 条 running 行因服务重启被标记为失败", reaped
+                )
 
         ensure_worker()
         with SessionLocal() as db:

@@ -28,7 +28,7 @@ from sqlalchemy import select
 from app.kg.era_convert import extract_era_name, parse_story_time
 from app.kg.knowledge_match import normalize_fact
 from app.models import (
-    KgCharacterState, KgEntity, KgEntityKnowledge, KgEvent, KgForeshadow, KgMention,
+    Generation, KgCharacterState, KgEntity, KgEntityKnowledge, KgEvent, KgForeshadow, KgMention,
 )
 
 
@@ -65,6 +65,9 @@ class JudgeFinding:
     entity: str
     message: str
     evidence: list[str] = field(default_factory=list)
+    #: 这条告警**没有正文证据可核**（空库 / 无 Generation 行 / 读取失败），
+    #: 是只按数值不变式判出来的。用于区分「真超期」与「没法验证」。
+    evidence_unavailable: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -73,6 +76,7 @@ class JudgeFinding:
             "entity": self.entity,
             "message": self.message,
             "evidence": self.evidence,
+            "evidence_unavailable": self.evidence_unavailable,
         }
 
 
@@ -381,13 +385,55 @@ def check_impossible_sequences(db, project_id: int, text: str, segment_no: int,
     return findings
 
 
+def _project_written_text(db, project_id: int) -> tuple[str, bool]:
+    """这个项目已写正文的全文（章号证据用）与「正文是否可用」。
+
+    返回 `(text, available)`：**取不到**（读取失败 / 没有 Generation 行 /
+    全为空串）时 `available=False`。调用方必须区分这两种情况：
+    「正文可用且确无回收章证据」⇒ 静音；「正文取不到」⇒ 不能当成「没有」，
+    要按数值不变式照报并标 `evidence_unavailable`。
+    """
+    try:
+        rows = db.scalars(
+            select(Generation.text).where(
+                Generation.project_id == project_id,
+                Generation.text.isnot(None),
+            ).order_by(Generation.segment_no)
+        ).all()
+    except Exception:  # noqa: BLE001 —— 读取失败：证据不可用，不是「没有证据」
+        return "", False
+    joined = "\n".join(str(r or "") for r in rows)
+    return joined, bool(joined.strip())
+
+
 def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
                             current_chapter: int | None = None,
-                            novel_id: int | None = None) -> list[JudgeFinding]:
+                            novel_id: int | None = None,
+                            text_available: bool | None = None) -> list[JudgeFinding]:
     """伏笔超期：planned_payoff_chapter 已过仍未 paid_off。
 
     判据：status ∈ {planted, developing} 且 planned_payoff_chapter < current_chapter。
     current_chapter 缺省用 events 的最大 chapter 估算。
+
+    ## ⚠️ 回收章必须先过判据（2026-10-29）
+
+    `planned_payoff_chapter = 0`（第 0 章不存在）比任何 current_chapter 都小
+    ⇒ 直接命中「已超期」。实测老账本里这样的行有 **84 条**，
+    报出来的是「计划第 0 章回收，已超期 9 章仍未揭晓」——**纯噪音**。
+
+    另有 `50/30/12` 这类值：抽取提示的 JSON 示例里写着 `"planned_payoff_chapter": 50`，
+    模型照抄示例（实测 18 条全填 50）。
+
+    ⇒ 告警前先问「这个回收章**说得通吗**」（数值不变式 + 正文证据，
+    判据见 `app/kg/foreshadow_quality.py`）。说不通的 ⇒ **当未知，不报**。
+
+    ## 证据三态（2026-11-15）：不许把「没法验证」当成「不存在」
+
+    - 正文**可用且确有**回收章证据 → 报（保持降噪后的真告警）；
+    - 正文**可用且确无**回收章证据 → 静音（84 条 `pf=0` 噪音靠这条消失）；
+    - 正文**取不到**（空库 / 无 Generation 行 / 读取失败）→ **按数值不变式照报**，
+      并在 finding 上置 `evidence_unavailable=True`，让人一眼分出
+      「真超期」与「没法验证」，而不是把这条检查变成恒为 0。
     """
     findings: list[JudgeFinding] = []
     if current_chapter is None:
@@ -400,6 +446,31 @@ def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
                 *_book_cond(KgEvent, novel_id),
             )
         ) or 0
+    # 回收章证据：显式区分「可用」与「取不到」。
+    # `text_available=False` ⇒ 不做正文证据判（只走数值不变式）；
+    # 未显式给出时：调用方传了非空正文就用它，否则自读项目正文。
+    if text_available is False:
+        _evidence_text: str | None = None
+    else:
+        _evidence_text = text if isinstance(text, str) and text.strip() else None
+        if _evidence_text is None:
+            _db_text, _db_ok = _project_written_text(db, project_id)
+            if _db_ok or text_available is True:
+                _evidence_text = _db_text
+    _evidence_unavailable = _evidence_text is None
+
+    def _payoff_of(fs):
+        try:
+            from app.kg.foreshadow_quality import sanitize_payoff_chapter
+
+            # 证据不可用必须传 None（跳过证据判），不能传 ""；
+            # 传 "" 会把所有章号判成「无证据」⇒ 静默丢弃 ⇒ 恒为 0 的检查项。
+            return sanitize_payoff_chapter(
+                fs.planned_payoff_chapter, fs.planted_chapter, _evidence_text
+            )
+        except Exception:  # noqa: BLE001 —— 判不出来就当未知
+            return None
+
     for fs in db.scalars(
         select(KgForeshadow).where(
             KgForeshadow.project_id == project_id,
@@ -407,15 +478,26 @@ def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
             KgForeshadow.planned_payoff_chapter.isnot(None),
         )
     ):
-        if fs.planned_payoff_chapter < current_chapter:
-            overdue = current_chapter - fs.planned_payoff_chapter
+        payoff = _payoff_of(fs)
+        if payoff is None:
+            # 回收章说不通（`0` / 不晚于埋下章 / 正文无证据）⇒ 当未知，不报。
+            continue
+        if payoff < current_chapter:
+            overdue = current_chapter - payoff
+            message = (f"伏笔「{fs.name}」计划第 {payoff} 章回收，"
+                       f"已超期 {overdue} 章仍未揭晓")
+            evidence = [f"planted@{fs.planted_chapter}", f"planned_payoff@{payoff}",
+                        f"now@{current_chapter}"]
+            if _evidence_unavailable:
+                message += "（正文证据不可用：仅按数值不变式判定，待正文补齐后复核）"
+                evidence.append("evidence_unavailable")
             findings.append(JudgeFinding(
                 rule="foreshadow_expiry",
                 severity="warn",
                 entity=fs.name,
-                message=f"伏笔「{fs.name}」计划第 {fs.planned_payoff_chapter} 章回收，"
-                        f"已超期 {overdue} 章仍未揭晓",
-                evidence=[f"planted@{fs.planted_chapter}", f"planned_payoff@{fs.planned_payoff_chapter}", f"now@{current_chapter}"],
+                message=message,
+                evidence=evidence,
+                evidence_unavailable=_evidence_unavailable,
             ))
     return findings
 
@@ -512,6 +594,8 @@ def save_judge_findings(db, project_id: int, findings: list[dict], *,
                 "severity": f.get("severity") or "warn",
                 "message": f.get("message") or "",
                 "evidence": f.get("evidence") or [],
+                # 证据不可用的告警要能被查询侧一眼分辨，不能只写在文案里
+                "evidence_unavailable": bool(f.get("evidence_unavailable")),
                 "segment_no": segment_no,
             },
             source="judge_v3", confidence="high",
@@ -536,6 +620,7 @@ def load_judge_findings(db, project_id: int) -> list[dict]:
         "entity": (r.props or {}).get("entity") or "",
         "message": (r.props or {}).get("message") or "",
         "evidence": (r.props or {}).get("evidence") or [],
+        "evidence_unavailable": bool((r.props or {}).get("evidence_unavailable")),
     } for r in rows]
     out.sort(key=lambda d: (d["segment_no"] or 0), reverse=True)
     return out

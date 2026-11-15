@@ -149,8 +149,11 @@ def patch_extract_batch_with_mock():
             ],
         }
 
-    def mock_extract_batch(provider, items):
+    def mock_extract_batch(provider, items, *, known_foreshadows=None, **kwargs):
         """items: list[(segment_no, text, chapter)]
+
+        签名对齐真实 ``extract_batch``（含 ``known_foreshadows`` 关键字参数）：
+        桩要迁就生产签名，而不是让生产代码给桩做兼容层。
 
         返回 schema 与 normalize_extraction 同款（不分段嵌套，调用方
         _persist_extraction 从顶层读 entities/relations/events/...）。

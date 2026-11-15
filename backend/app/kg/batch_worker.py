@@ -565,6 +565,19 @@ def _run_batches_locked(project_id: int) -> None:
                              project_id, it.segment_no, err)
                 continue
             out[it.segment_no] = row
+        # 认领必须在调用 LLM **之前**落库并释放写锁。
+        # 认领是一条 UPDATE（见 `_claim_row`），此前它和抽取共用一个事务：
+        # 抽取实测 4 分 01 秒，这 4 分钟里本连接一直持 SQLite 的 RESERVED 写锁，
+        # 心跳（另一连接）、启动快照清理、周期扫描、外部写全部 `database is locked`
+        # （实测：心跳只写一次就停摆、worker_alive=true 但 last_sweep 涨到 90s+，
+        #  `BEGIN IMMEDIATE` 连做 3 次全失败；进程被杀后 3/3 成功、db/journal
+        #  mtime 不变）。先 commit ⇒ 抽取期间不持有任何写事务。
+        # 结果落库是另一个短事务（成功 `L732` / 失败 `L761` 那两处 commit）。
+        # 「认领后崩溃」不会把行卡死：行仍是 pending + claim_owner（本机 ID 带 pid），
+        # 下次 `_rows_for` 用 `_claim_orphaned` 判「同机 PID 已消失」即时接管；
+        # 跨机则等 CLAIM_LEASE_MINUTES 租约过期。若行原本是 running，则由启动时的
+        # `reap_stale_runs` 标 failed（可 `requeue_failed` 重捞）。
+        db.commit()
         return out
 
     while True:
@@ -629,6 +642,11 @@ def _run_batches_locked(project_id: int) -> None:
                     "落 %d 条 mention", project_id, len(batch), added)
                 continue
             texts = [(it.segment_no, it.text, it.chapter) for it in batch]
+            # 把账上已有的未回收伏笔名给抽取器，要求**同名复用**。
+            # 落库本来就按名字去重，但抽取器从前看不到已有的名字 ⇒ 每段给同一件事
+            # 重新起说法，账本无界增长（实测 9 段攒出 117 个名字，
+            # 切片把 97 条 active 全渲染进提示词 = 2,639 字）。
+            known_fores = _active_foreshadow_names(db, project_id)
             last_exc: Exception | None = None
             stats: ExtractionStats | None = None
             # 探针：extract_batch 内部不抛异常（避免 KG 拖垮生成主链），失败时
@@ -642,14 +660,15 @@ def _run_batches_locked(project_id: int) -> None:
                 attempts_made += 1
                 try:
                     provider.chat("连通性探针，请回复 ok", "ok")
-                    result = extract_batch(provider, texts)
+                    result = extract_batch(provider, texts, known_foreshadows=known_fores)
                     err = result.get(ERROR_FIELD)
                     if err and str(err).startswith("parse_failed"):
                         # 输出被模型 4096 token 上限截断（长段常见）：加一条输出
                         # 预算约束重抽一次。只压「条数」，不改抽取口径；仍失败
                         # 就按原逻辑记 failed，不无限重试。
                         squeezed = extract_batch(
-                            provider, texts, note=_OUTPUT_BUDGET_NOTE)
+                            provider, texts, note=_OUTPUT_BUDGET_NOTE,
+                            known_foreshadows=known_fores)
                         if not squeezed.get(ERROR_FIELD):
                             result, err = squeezed, None
                     if err:
@@ -874,6 +893,31 @@ def _worker_alive(owner: str, db: Session | None = None) -> bool:
     return (datetime.now(timezone.utc) - last).total_seconds() <= HEARTBEAT_STALE_SECONDS
 
 
+#: 心跳写入的可观测状态。
+#:
+#: 为什么需要：心跳失败以前 `_log.debug` 一条就完事，等于完全不可见。实测 8000
+#: 常驻实例上心跳只写成功一次（随后被批抽那条 4 分钟的写事务挡掉），
+#: `worker_alive` 仍是 true、日志里什么都没有 —— 只能靠外部 `BEGIN IMMEDIATE`
+#: 失败和 `last_sweep_seconds_ago` 涨到 90s+ 才发现。
+#:
+#: 记累计失败数 + 当前连续失败次数 + 最后一次错误，由 `worker_status()` 暴露。
+_heartbeat_stat: dict = {
+    "writes": 0,
+    "failures": 0,
+    "fail_streak": 0,
+    "last_ok_at": None,
+    "last_error": None,
+    "last_error_at": None,
+}
+_heartbeat_stat_lock = threading.Lock()
+
+
+def heartbeat_status() -> dict:
+    """心跳写入状态快照（`worker_status()["heartbeat"]` 的数据源）。"""
+    with _heartbeat_stat_lock:
+        return dict(_heartbeat_stat)
+
+
 def _heartbeat(*, prune: bool = False) -> None:
     """把自己的心跳写进 app_settings（键 ``kg.worker.<WORKER_ID>``）。
 
@@ -882,10 +926,10 @@ def _heartbeat(*, prune: bool = False) -> None:
     """
     from app.db import SessionLocal
 
+    now_s = datetime.now(timezone.utc).isoformat()
     try:
         with SessionLocal() as s:
             key = f"kg.worker.{WORKER_ID}"
-            now_s = datetime.now(timezone.utc).isoformat()
             row = s.get(AppSetting, key)
             if row is None:
                 s.add(AppSetting(key=key, value=now_s))
@@ -898,8 +942,29 @@ def _heartbeat(*, prune: bool = False) -> None:
                         AppSetting.value < cutoff)).all():
                     s.delete(old)
             s.commit()
-    except Exception:  # noqa: BLE001 —— 心跳是增强，失败不影响抽取
-        _log.debug("kg worker 心跳写入失败（忽略）", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 —— 心跳是增强，失败不影响抽取
+        with _heartbeat_stat_lock:
+            _heartbeat_stat["failures"] += 1
+            _heartbeat_stat["fail_streak"] += 1
+            streak = _heartbeat_stat["fail_streak"]
+            _heartbeat_stat["last_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            _heartbeat_stat["last_error_at"] = now_s
+        # 首次失败必须可见（warning）；之后不再每 15 秒刷屏，失败次数可查。
+        if streak == 1:
+            _log.warning(
+                "kg worker 心跳写入失败（首次）：%s —— 之后每 %ss 重试，"
+                "累计/连续失败次数见 worker_status()[heartbeat]",
+                _heartbeat_stat["last_error"], HEARTBEAT_INTERVAL_SECONDS)
+        else:
+            _log.debug("kg worker 心跳写入仍失败（连续 %d 次）", streak, exc_info=True)
+        return
+    with _heartbeat_stat_lock:
+        prev_streak = _heartbeat_stat["fail_streak"]
+        _heartbeat_stat["writes"] += 1
+        _heartbeat_stat["fail_streak"] = 0
+        _heartbeat_stat["last_ok_at"] = now_s
+    if prev_streak:
+        _log.info("kg worker 心跳恢复写入（此前连续失败 %d 次）", prev_streak)
 
 
 _heartbeat_started = False
@@ -1059,6 +1124,53 @@ def _mark_overflow(db: Session, dropped: list[_QueueItem], *, reason: str) -> in
     return marked
 
 
+def reap_stale_runs(db: Session) -> int:
+    """收割被进程重启打断的批抽行（role=kg_batch_extract, status=running）。
+
+    ## 为什么必须有
+
+    批抽跑在**进程内线程**（`WORKER_THREADS = 1`），队列在**内存 deque** 里。
+    进程一重启（uvicorn reload / 多 worker / 服务重启 / 容器被杀），
+    队列没了，但库里的 running 行还在 ⇒ 永远 running。
+    周期扫描（`_sweep_stuck`）只处理超过 `STUCK_MINUTES` 的行，
+    刚重启时这批行要再等 30 分钟才被扫到。
+
+    实测（2026-10-29）：30 条 running，最早 2026-10-20，
+    最新一条是**当天自己跑的那次**（服务被重启了）。
+
+    ## 为什么是 failed 而不是「继续跑」
+
+    后台线程已经没了，没人能接着跑完它；留成 running 等于撒谎。
+    诚实的做法是标记失败 + 说明原因 + 提示「重捞一次即可」。
+
+    ## 只碰 running
+
+    success / failed 是已经结束的结论，覆盖了就再也找不回来。
+    """
+    now = datetime.now(timezone.utc)
+    rows = db.scalars(select(AgentRun).where(
+        AgentRun.role == ROLE_KG_EXTRACT,
+        AgentRun.status == "running",
+    )).all()
+    n = 0
+    for row in rows:
+        started = row.started_at
+        if started is not None and started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        # 本进程启动后入队的行 started_at 一定晚于启动时刻 ⇒ 不得冒
+        if started is not None and started >= now:
+            continue
+        row.status = "failed"
+        row.finished_at = now
+        # interrupted 标记：**这不是"跑了很久才失败"**，是进程重启时队列丢了、它根本没跑完。
+        # 不标的话，前端会用 finished_at - started_at 算出「跑了 3 天」（实测 658822s）。
+        _merge_note(row, {"error": "服务重启时中断（队列已丢失）", "interrupted": True})
+        n += 1
+    if n:
+        db.commit()
+    return n
+
+
 def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> dict:
     """批抽 worker 状态总览（GET /kg-v3/worker/status 的数据源）。
 
@@ -1099,6 +1211,11 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
             note = json.loads(r.note) if r.note else {}
         except (ValueError, TypeError):
             note = {"raw": r.note}
+        # 被「启动收割」标 failed 的行**耗时不给** —— 它根本没跑完。
+        # 否则前端会用「收割时刻 - 开始时刻」算出「跑了 3 天」（实测 658822s）。
+        interrupted = bool(note.get("interrupted"))
+        if interrupted:
+            duration_ms = None
         claim_owner = note.get("claim_owner")
         claim_expired = (_claim_expired(r, now)
                          if r.status == "running" and claim_owner else False)
@@ -1119,6 +1236,7 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
             "stuck": stuck,
             "empty": bool(note.get("empty")),
             "duration_ms": duration_ms,
+            "interrupted": interrupted,
             "batch_stats": note.get("batch_stats"),
             "error": note.get("error"),
             # 失败可见性：原因分类 / 尝试次数 / 上限 / 是否放弃 / 溢出明细
@@ -1148,6 +1266,9 @@ def worker_status(db: Session, project_id: int, *, recent_limit: int = 50) -> di
         ),
         # 入队→认领链路自检：ticks 是否在涨、last error 是什么
         "discover": dict(_discover_stat),
+        # 心跳写入自检：worker_alive=true 也注解不出「心跳写不进去」，
+        # 失败次数与最后一次错误看这里（首次失败同时会打 warning）
+        "heartbeat": heartbeat_status(),
         "summary": summary,
         "recent_runs": items,
     }

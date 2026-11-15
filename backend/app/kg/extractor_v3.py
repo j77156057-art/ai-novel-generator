@@ -486,8 +486,9 @@ _EXTRACT_SYSTEM = (
     '"known_kind": "entity|event|secret", "learned_at_sequence": 1}],\n'
     '  "state_changes": [{"character": "角色名", "state_type": '
     '"location|injury|mood|goal|inventory|alive", "new_value": "变化后的值"}],\n'
-    '  "foreshadows": [{"name": "伏笔名", "status": "planted|developing|paid_off|dropped", '
-    '"planted_chapter": 1, "planned_payoff_chapter": 50}]\n'
+    '  "foreshadows": [{"name": "伏笔名（已在名单里的必须沿用名单原名字）", '
+    '"status": "planted|developing|paid_off|dropped", '
+    '"planted_chapter": <当前章号>, "planned_payoff_chapter": <文本明确说了才填数字，否则 null>}]\n'
     "}\n\n"
     "规则：\n"
     "- 只抽文本中**确实出现**的实体，不推测、不虚构\n"
@@ -602,7 +603,20 @@ _EXTRACT_SYSTEM = (
     "- event_links 用 sequence 引用事件（不要用事件描述），描述本批事件间因果/时序关系；\n"
     "  伏笔回收用 link_type=resolves\n"
     "- entity_knowledge：当文本明确表现某角色**得知**了另一角色/事实（被告知/看到/发现）时抽取，\n"
-    "  learned_at_sequence 指向得知发生的事件 sequence；不臆测角色已知什么"
+    "  learned_at_sequence 指向得知发生的事件 sequence；不臆测角色已知什么\n"
+    # —— foreshadows 的几条（main 2026-10-28 加）——
+    # 加之前**一条规则都没有**，后果是每抽一轮，同一件事就多一个说法：
+    # 实测 9 段正文的账本攒出 **117 个名字**（单段只抽 3~5 条，
+    # 多出来的是后台**反复重抽**每轮攒的一批），
+    # 而落库是**按名字去重**的 ⇒ 名字不收敛，账本就无界增长。
+    "- foreshadows：**只抽本段新埋下的**伏笔（本段第一次出现的悬念），\n"
+    "  不要复述前文已经埋过、这里只是再提一次的线索\n"
+    "- 如果这条线索已经在给你的【已存在的未回收伏笔】名单里，\n"
+    "  **必须一字不差地沿用名单里的原名字**（不要换个说法另起一条），\n"
+    "  需要推进状态时填 status；名单里没有的才用新名字\n"
+    "- planned_payoff_chapter 只在文本**明确写出**回收/揭晓的章号时才填数字，\n"
+    "  否则一律填 null —— **不要照抄上面格式示例里的任何数值**（示例只是占位）\n"
+    "- planted_chapter 填本段所在的章号；不知道就填 null"
 )
 
 # 段落标注前缀：让 LLM 知道当前段落在故事中的位置（批抽时用）
@@ -706,8 +720,54 @@ def attribute_event_segments(out: dict, texts: list[tuple[int, str, int | None]]
     return out
 
 
+def known_foreshadow_block(names: list[str] | None) -> str:
+    """把「已存在的未回收伏笔」渲染成**抽取系统提示**里的一块。
+
+    ## 为什么要把名单给抽取器
+
+    落库是**按名字去重**的（`uq_kg_foreshadow = (project_id, name)`），
+    但抽取器从前**看不到已有的名字** ⇒ 每抽一轮，同一件事就多一个说法，
+    账本就无界增长：实测 9 段正文的账本攒出 **117 个名字**，
+    切片把其中 97 条 active 全渲染进提示词，**2,639 字**。
+
+    ⇒ 把名单给它，并要求**同名复用** —— 同一件事不再新建一条。
+
+    ## 为什么放在 **system** 消息里
+
+    原来放在 user 消息（正文之后）。真跑显示**复用率不够**：
+    同样 6 段重抽一遍，旧做法第二遍又长 **21** 个名字，
+    放 user 里只降到 **8** 个 —— 那 8 个逐条看下来**多数是同一线索换了说法**
+    （「刻有陌生半边姓氏的断刀刀镡」vs「断刀刀镡上的残缺姓氏」）。
+
+    挪到 system 消息后，名单与「必须沿用原名」这条规则在**同一段上下文**里
+    ⇒ 模型的注意力不用在正文和名单之间来回切。
+    （抽取这条路**不走提示缓存**：provider 就是普通 HTTP + JSON，
+    没有 cache_control，所以放 system 没有缓存代价。）
+
+    名单为空（首次抽取）时返回空串 ⇒ 提示词与从前**逐字节相同**。
+    """
+    clean = [str(n).strip() for n in (names or []) if str(n or "").strip()]
+    if not clean:
+        return ""
+    lines = [
+        "",
+        "",
+        "【已存在的未回收伏笔（这些线索已经在账上，**必须沿用下面的原名字**，不要另起说法）】",
+    ]
+    lines += [f"- {n}" for n in clean]
+    lines += [
+        "（规则："
+        "① 本段提到的线索如果**已经在上面名单里**（哪怕描述的角度不同、"
+        "是同一件事），就把 name 写成**名单里那条的原名**；"
+        "② 只输出**本段新埋下**的线索，名单之外的新线索才用新名字；"
+        "③ 一条线索只该有一个名字。）",
+    ]
+    return "\n".join(lines)
+
+
 def extract_segment(provider, text: str, segment_no: int, chapter: int | None = None,
-                    note: str | None = None) -> dict:
+                    note: str | None = None,
+                    *, known_foreshadows: list[str] | None = None) -> dict:
     """单段抽取（LLM）。失败返回**带 `_error` 的空骨架**（不抛异常，不阻塞主链）。
 
     返回 normalize_extraction 后的规范 dict。调用方必须检查 `ERROR_FIELD`：
@@ -715,12 +775,16 @@ def extract_segment(provider, text: str, segment_no: int, chapter: int | None = 
 
     ``note``：追加在 user 末尾的本次调用附加约束（默认 None = 行为不变），
     用于长段输出被模型上限截断时压 JSON 体量。
+
+    ``known_foreshadows``：账上已有的未回收伏笔名（让模型同名复用，
+    见 `known_foreshadow_block`；空名单时提示词与从前逐字节相同）。
     """
     user = _SEGMENT_TEMPLATE.format(segment_no=segment_no, chapter=chapter or "?", text=text)
     if note:
         user = user + "\n\n" + note
+    system = _EXTRACT_SYSTEM + known_foreshadow_block(known_foreshadows)
     try:
-        raw = provider.chat(_EXTRACT_SYSTEM, user)
+        raw = provider.chat(system, user)
     except Exception as exc:  # noqa: BLE001 —— 不抛，但必须留失败标记
         return normalize_extraction({}, error=f"llm_call_failed: {exc}")
     out = _parse_and_normalize(raw)
@@ -731,7 +795,8 @@ def extract_segment(provider, text: str, segment_no: int, chapter: int | None = 
 
 
 def extract_batch(provider, texts: list[tuple[int, str, int | None]],
-                  note: str | None = None) -> dict:
+                  note: str | None = None,
+                  *, known_foreshadows: list[str] | None = None) -> dict:
     """批量抽取（一次抽 N 段合并——省 LLM 调用 + 跨段一致性）。
 
     texts: [(segment_no, text, chapter), ...]
@@ -742,20 +807,25 @@ def extract_batch(provider, texts: list[tuple[int, str, int | None]],
     ``note``：追加在 user 末尾的本次调用附加约束（默认 None = 行为不变）。
     参考语料补建用它压输出预算——3 章窗口不设限时会把 JSON 顶到模型 4096
     输出上限被截断，整窗解析失败。
+
+    ``known_foreshadows``：账上已有的未回收伏笔名（要求同名复用，见
+    `known_foreshadow_block`）。
     """
     if not texts:
         return normalize_extraction({})
     if len(texts) == 1:
         seg_no, text, chapter = texts[0]
-        return extract_segment(provider, text, seg_no, chapter, note=note)
+        return extract_segment(provider, text, seg_no, chapter, note=note,
+                               known_foreshadows=known_foreshadows)
     joined = "\n\n—— 段分隔 ——\n\n".join(
         f"【第{s} 段】\n{t}" for s, t, _c in texts
     )
     user = _BATCH_TEMPLATE.format(n=len(texts), joined=joined)
     if note:
         user = user + "\n\n" + note
+    system = _EXTRACT_SYSTEM + known_foreshadow_block(known_foreshadows)
     try:
-        raw = provider.chat(_EXTRACT_SYSTEM, user)
+        raw = provider.chat(system, user)
     except Exception as exc:  # noqa: BLE001 —— 不抛，但必须留失败标记
         return normalize_extraction({}, error=f"llm_call_failed: {exc}")
     out = _parse_and_normalize(raw)
