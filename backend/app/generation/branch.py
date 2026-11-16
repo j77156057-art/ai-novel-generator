@@ -282,6 +282,8 @@ def attach_branch_to_state(state, branch: "PlotNode", *, chapter_based: bool = F
         seg_counts=dict(state.seg_counts),
         early_done=set(state.early_done),
         branch_current=state.branch_current,
+        completion=dict(state.completion),
+        last_judged_segment=state.last_judged_segment,
     )
     # 锚点选择（**按模式区分**，2026-11-15 定稿）：
     # - 章模式（chapter_based=True）：current_node 永远停在主干上，但防御性归一化

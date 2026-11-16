@@ -72,6 +72,10 @@ class TimelineState:
     #: 章模式下正在并行推进的支线节点。支线可以推进，但**不顶替 current_node**
     #: ——current_node 始终对齐章号所在的主干节点。
     branch_current: str | None = None
+    #: 节点完成判定（三态 + 证据）的结果，按节点 id 存。支线挂载时必须一起带过去。
+    completion: dict[str, dict] = field(default_factory=dict)
+    #: 最近一次完成判定覆盖到的段号（0 = 尚未判定）。支线挂载时同样要保留。
+    last_judged_segment: int = 0
 
 
 def plan_timeline(
