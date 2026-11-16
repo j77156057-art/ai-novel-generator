@@ -2466,3 +2466,140 @@ export interface CharacterCardListResponse {
   characters: CharacterCardItem[];
   voice_collisions: VoiceCollision[];
 }
+
+// ==================================================================
+// 章纲写入/编辑（独立页 /projects/:id/outline）
+// ------------------------------------------------------------------
+// 后端仍存 projects.outline（list[str]，缺失是空串）。这里镜像
+// routers/chapter_outline.py 的返回：状态逐章显式给出，校验回执
+// 固定带 checks / skipped_checks —— 界面不许把它折叠成一句「成功」。
+// ==================================================================
+
+/** 单章在章纲里的状态；已写正文却无章纲时后端报 missing（不是 beyond_end）。 */
+export type ChapterOutlineStatus = "confirmed" | "missing" | "beyond_end";
+
+/** 校验命中的原文位置（硬拦专名/时间标记时带）。 */
+export interface ChapterOutlinePosition {
+  start: number;
+  end: number;
+  snippet: string;
+}
+
+/** 一条校验错误或告警；`term` 是命中的具体词，`position` 是它出现的位置。 */
+export interface ChapterOutlineIssue {
+  code: string;
+  message: string;
+  chapter?: number;
+  term?: string;
+  position?: ChapterOutlinePosition;
+  [key: string]: unknown;
+}
+
+/** 一项校验的结论：checked / skipped / failed。 */
+export interface ChapterOutlineCheck {
+  rule: string;
+  status: "checked" | "skipped" | "failed";
+  detail?: string;
+  reason?: string;
+}
+
+/** 保存/起草共用的校验回执；`skipped_checks` 与 `checks` 里的 skipped 对应。 */
+export interface ChapterOutlineValidation {
+  ok: boolean;
+  errors: ChapterOutlineIssue[];
+  warnings: ChapterOutlineIssue[];
+  checks: ChapterOutlineCheck[];
+  skipped_checks: string[];
+}
+
+/** GET 返回的单章条目。 */
+export interface ChapterOutlineEntry {
+  chapter: number;
+  entry: string | null;
+  status: ChapterOutlineStatus;
+  /** 正文是否已经写到这一章。 */
+  written: boolean;
+  node_id: string | null;
+  node_range: [number, number] | null;
+}
+
+/** GET /projects/{id}/chapter-outline 的响应。 */
+export interface ChapterOutlineListResponse {
+  project_id: number;
+  outline_len: number;
+  written_chapters: number;
+  missing_chapters: number[];
+  first_missing_chapter: number | null;
+  source_fingerprint: string;
+  entries: ChapterOutlineEntry[];
+  checks: ChapterOutlineCheck[];
+  skipped_checks: string[];
+  warnings: ChapterOutlineIssue[];
+}
+
+/** 改章纲对时间线的影响：默认只回执，不重建节点。 */
+export interface ChapterOutlineTimelineImpact {
+  outline_len_before: number;
+  outline_len_after: number;
+  chapter_ranges_recomputed: boolean;
+  node_content_stale: boolean;
+  reset_timeline: boolean;
+  note: string;
+}
+
+/** PUT / apply 的写回执（entry 仅单章保存有）。 */
+export interface ChapterOutlineWriteResponse {
+  project_id: number;
+  from_chapter?: number;
+  to_chapter?: number;
+  entry?: { chapter: number; entry: string | null; status: ChapterOutlineStatus };
+  auto_filled_missing: number[];
+  changed: number[];
+  validation: ChapterOutlineValidation;
+  timeline_impact: ChapterOutlineTimelineImpact;
+  source_fingerprint: string;
+}
+
+/** PUT /projects/{id}/chapter-outline/{chapter} 请求体。 */
+export interface ChapterOutlinePutRequest {
+  entry: string;
+  expected_fingerprint: string;
+  confirm: boolean;
+}
+
+/** apply 的单章条目；`entry: null` 表示显式缺省。 */
+export interface ChapterOutlineEntryInput {
+  chapter: number;
+  entry: string | null;
+}
+
+/** POST /projects/{id}/chapter-outline/apply 请求体。 */
+export interface ChapterOutlineApplyRequest {
+  from_chapter: number;
+  to_chapter: number;
+  entries: ChapterOutlineEntryInput[];
+  expected_fingerprint: string;
+  confirm: boolean;
+  /** 显式 true 才清空时间线（会丢已完成进度）。 */
+  reset_timeline?: boolean;
+}
+
+/** POST /projects/{id}/chapter-outline/draft 请求体（只起草，不落库）。 */
+export interface ChapterOutlineDraftRequest {
+  from_chapter: number;
+  to_chapter: number;
+  direction?: string | null;
+}
+
+/** 起草响应：候选 + 指纹 + 预校验，必须人工确认后再 apply。 */
+export interface ChapterOutlineDraftResponse {
+  project_id: number;
+  status: "draft";
+  from_chapter: number;
+  to_chapter: number;
+  entries: ChapterOutlineEntryInput[];
+  validation: ChapterOutlineValidation;
+  apply_requires_confirm: boolean;
+  source_fingerprint: string;
+}
+

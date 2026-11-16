@@ -40,6 +40,14 @@ const routes = [
     meta: { title: "KG 工作台", idx: "02" },
   },
   {
+    // 章纲写入/编辑：逐章状态（已确认/缺失/超出末章）、校验回执、AI 起草。
+    // 独立页而不是塞进工作台：章纲是长列表，编辑与生成正文的节奏也不同。
+    path: "/projects/:id/outline",
+    name: "chapter-outline",
+    component: () => import("@/views/ChapterOutlineView.vue"),
+    meta: { title: "章纲", idx: "02" },
+  },
+  {
     // 顶层助手入口：自动挑一个项目后 replace 到上面的项目级助手页。
     // 让「助手工作台」导航与首屏都能直达对话，不必先经项目列表。
     path: "/assistant",

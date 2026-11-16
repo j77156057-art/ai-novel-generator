@@ -42,6 +42,12 @@ import type {
   AssistantVersionDiffResponse,
   AssistantVersionListResponse,
   AttachmentCleaningPreview,
+  ChapterOutlineApplyRequest,
+  ChapterOutlineDraftRequest,
+  ChapterOutlineDraftResponse,
+  ChapterOutlineListResponse,
+  ChapterOutlinePutRequest,
+  ChapterOutlineWriteResponse,
   CharacterDetail,
   ChunkOut,
   DistillJob,
@@ -972,5 +978,55 @@ export const api = {
     request<{ messages: RoleplayMessage[] }>(
       `/projects/${projectId}/roleplay/messages` +
         (character ? `?character=${encodeURIComponent(character)}` : ""),
+    ),
+
+  // ---------- 章纲写入/编辑（独立页 /projects/:id/outline） ----------
+
+  /**
+   * 按区间查章纲。缺省 to 由后端取 max(章纲长度, 已写章数)，
+   * 已写却没章纲的章（历史 41–43）会以 status="missing" 显式返回。
+   */
+  listChapterOutline: (
+    projectId: number,
+    fromChapter = 1,
+    toChapter?: number | null,
+  ) => {
+    const p = new URLSearchParams({ from_chapter: String(fromChapter) });
+    if (toChapter != null) p.set("to_chapter", String(toChapter));
+    return request<ChapterOutlineListResponse>(
+      `/projects/${projectId}/chapter-outline?${p}`,
+    );
+  },
+
+  /** 单章保存：必须 confirm=true 且指纹一致，否则 409。 */
+  putChapterOutline: (
+    projectId: number,
+    chapter: number,
+    body: ChapterOutlinePutRequest,
+  ) =>
+    request<ChapterOutlineWriteResponse>(
+      `/projects/${projectId}/chapter-outline/${chapter}`,
+      jsonInit("PUT", body),
+    ),
+
+  /** 显式标记某章缺失（写空串）；需要当前指纹，防止覆盖别人的改动。 */
+  deleteChapterOutline: (projectId: number, chapter: number, fingerprint: string) =>
+    request<ChapterOutlineWriteResponse>(
+      `/projects/${projectId}/chapter-outline/${chapter}?expected_fingerprint=${encodeURIComponent(fingerprint)}`,
+      { method: "DELETE" },
+    ),
+
+  /** 区间保存 / 应用草稿：校验失败整批不落库（422，detail.report 带错误位置）。 */
+  applyChapterOutline: (projectId: number, body: ChapterOutlineApplyRequest) =>
+    request<ChapterOutlineWriteResponse>(
+      `/projects/${projectId}/chapter-outline/apply`,
+      jsonInit("POST", body),
+    ),
+
+  /** AI 起草：只返回候选 + 指纹 + 预校验，不写库；确认后走 apply。 */
+  draftChapterOutline: (projectId: number, body: ChapterOutlineDraftRequest) =>
+    request<ChapterOutlineDraftResponse>(
+      `/projects/${projectId}/chapter-outline/draft`,
+      jsonInit("POST", body),
     ),
 };
