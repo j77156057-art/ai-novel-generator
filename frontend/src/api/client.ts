@@ -2,6 +2,9 @@
 // 走相对路径 /api，由 Vite dev proxy 转发到 FastAPI :8000。
 
 import type {
+  ActionProposalCreateRequest,
+  ActionProposalListResponse,
+  ActionProposalOut,
   AlertsResponse,
   AssistantActionRequest,
   AssistantAnalyzeLogsRequest,
@@ -75,6 +78,9 @@ import type {
   ProjectPatch,
   RegenerateStreamDoneMeta,
   Reminders,
+  RoleplayCharactersResponse,
+  RoleplayChatResult,
+  RoleplayMessage,
   StyleDistillApplyRequest,
   StyleDistillDetail,
   StyleDistillListResponse,
@@ -87,6 +93,7 @@ import type {
   WizardNoticeListResponse,
   WizardMessageListResponse,
   WizardSayResponse,
+  WorkflowState,
   WizardStateResponse,
 } from "./types";
 
@@ -878,5 +885,74 @@ export const api = {
     request<WizardRoleChatResponse>(
       `/assistant/wizard/${projectId}/role-chat`,
       jsonInit("POST", { message, history }),
+    ),
+
+  // ==================================================================
+  // 工序链（批 9 后端已落，前端在批 10 接线）
+  // ==================================================================
+  /** 当前项目的工序链状态（服务端每次重新评估，不是日志）。 */
+  getWorkflow: (projectId: number) =>
+    request<WorkflowState>(`/projects/${projectId}/workflow`),
+
+  /** 单条提案的完整内容（正文修订要给人看「改哪几句」）。 */
+  getProposal: (proposalId: number) =>
+    request<AssistantProposalDetailResponse>(`/assistant/proposals/${proposalId}`),
+
+  rejectProposal: (proposalId: number) =>
+    request<AssistantProposalActionResponse>(
+      `/assistant/proposals/${proposalId}/reject`,
+      jsonInit("POST", { action: "reject" }),
+    ),
+
+  // —— 动作提案：agent 提「做什么事」，人批了才执行 ——
+  listActionProposals: (projectId: number, status?: string | null) =>
+    request<ActionProposalListResponse>(
+      `/assistant/action-proposals?project_id=${projectId}` +
+        (status ? `&status=${encodeURIComponent(status)}` : ""),
+    ),
+
+  /** 创建动作提案（卡片确认后原样回传；这一步只记下，不执行）。 */
+  createActionProposal: (body: ActionProposalCreateRequest) =>
+    request<{ proposal: ActionProposalOut; note: string }>(
+      "/assistant/action-proposals",
+      jsonInit("POST", body),
+    ),
+
+  approveActionProposal: (proposalId: number) =>
+    request<{ proposal: ActionProposalOut; next_action: string; note: string }>(
+      `/assistant/action-proposals/${proposalId}/approve`,
+      jsonInit("POST", { action: "approve" }),
+    ),
+
+  /** 执行动作提案：前提漂移会 409（stale），不会带着旧前提硬跑。 */
+  applyActionProposal: (proposalId: number) =>
+    request<{ proposal: ActionProposalOut; result: Record<string, unknown>; note: string }>(
+      `/assistant/action-proposals/${proposalId}/apply`,
+      jsonInit("POST", { action: "apply" }),
+    ),
+
+  rejectActionProposal: (proposalId: number) =>
+    request<{ proposal: ActionProposalOut; note: string }>(
+      `/assistant/action-proposals/${proposalId}/reject`,
+      jsonInit("POST", { action: "reject" }),
+    ),
+
+  // —— 角色对话（第三板块）：产物是对话记录，不进正文主线 ——
+  roleplayCharacters: (projectId: number) =>
+    request<RoleplayCharactersResponse>(`/projects/${projectId}/roleplay/characters`),
+
+  roleplayChat: (
+    projectId: number,
+    body: { character: string; question: string; novel_ids?: number[]; k?: number },
+  ) =>
+    request<RoleplayChatResult>(
+      `/projects/${projectId}/roleplay/chat`,
+      jsonInit("POST", body),
+    ),
+
+  roleplayMessages: (projectId: number, character?: string) =>
+    request<{ messages: RoleplayMessage[] }>(
+      `/projects/${projectId}/roleplay/messages` +
+        (character ? `?character=${encodeURIComponent(character)}` : ""),
     ),
 };

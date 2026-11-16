@@ -1013,8 +1013,26 @@ export interface AssistantRestoreRequest {
 // （服务端加一个必填字段，前端就会漏传，且漂移表现为运行期 422）。
 // ==================================================================
 
-/** 卡片类型：新建提案 / 调动生成。 */
-export type AssistantPendingActionKind = "proposal" | "invoke_generation";
+/** 卡片类型：新建提案 / 调动生成 / 附件投放 / 局部修订 / **选项** / 动作提案。 */
+export type AssistantPendingActionKind =
+  | "proposal"
+  | "invoke_generation"
+  | "ingest_attachment"
+  | "body_repair"
+  | "choice"
+  /**
+   * 动作提案：agent 提「做什么事」（启动蒸馏 / 规划大纲 / 扩展规划 / 调动生成）。
+   * 确认这一步只是**记下**提案；执行是「批准 → 执行」之后的事。
+   */
+  | "action_proposal";
+
+/** 选择框的一个选项（服务端下发：id/标题/说明 + 对应的请求体补丁）。 */
+export interface AssistantChoiceOption {
+  id: string;
+  label: string;
+  description?: string;
+  body_patch?: Record<string, unknown>;
+}
 
 /**
  * 一张待确认卡片。
@@ -1035,6 +1053,11 @@ export interface AssistantPendingAction {
   method: string;
   /** 完整请求体，原样回传。 */
   body: Record<string, unknown>;
+  /**
+   * 选择框的选项（只有 kind="choice" 时有）。
+   * 选项与后果由服务端成对下发，前端不参与构造。
+   */
+  options?: AssistantChoiceOption[];
 }
 
 // ---------- 工具调用轨迹（function calling 接入） ----------
@@ -2168,6 +2191,190 @@ export interface AssistantApplySelectedResponse {
   blocked: AssistantApplyConflictItem[];
   reason: string;
   proposal_ids?: number[];
+}
+
+// ==================================================================
+// 工序链（助理 agent 编排的全流程）
+// ------------------------------------------------------------------
+// 工序状态是服务端**重新评估**出来的（查库 + 只读规则），
+// 不是日志里的一句话 —— 正文改过、蒸馏重跑过、提案批了，状态都跟着变。
+// ==================================================================
+
+/** 一道工序的状态。 */
+export type WorkflowStepState = "done" | "pending" | "blocked" | "skipped";
+
+/** 一道工序。 */
+export interface WorkflowStep {
+  id: string;
+  title: string;
+  state: WorkflowStepState;
+  /**
+   * 人话状态词（服务端给的）。
+   *
+   * 为什么不自己映射：「没有待批项」和「已完成」在中文里差得很远，
+   * 而映射表写死在两处就会漂；「下一步」更是只有服务端知道。
+   */
+  state_label?: string;
+  reason: string;
+  /** 这一步该调的只读工具（agent 的工具箱里已注册）。 */
+  read_tools: string[];
+  /** 这一步若要写，产出哪一类提案（写操作走审批闸门）。 */
+  write_proposal: string | null;
+  /** 哪条轨："prompt"（提示词）/ "body"（正文）。 */
+  track: string;
+  /** 派给谁做（人话）。 */
+  dispatch: string;
+  note: string;
+}
+
+/** 一条等着你处理的改动（只读清单；批准与写进正文仍走审批闸门）。 */
+export interface WorkflowPendingProposal {
+  id: number;
+  /** 要改哪儿（人话，例如「正文第 3 段」）。 */
+  target: string;
+  /** 为什么改。 */
+  reason: string;
+  /** 改动大小（人话，例如「改动较大」）。 */
+  risk: string;
+  risk_level: string;
+  /** "pending"（等你批）/ "approved"（批了，等你写进正文）。 */
+  status: string;
+  created_at: string | null;
+}
+
+/**
+ * **动作提案**：agent 提「做什么事」，人批了才执行。
+ *
+ * 与文本提案（WorkflowPendingProposal）分开：文本提案回答「改哪些字」，
+ * 动作提案回答「做什么事」（启动蒸馏 / 规划大纲 / 扩展规划 / 调动生成），
+ * 它的过期判据是**前提**变了没有。
+ */
+export interface ActionProposalOut {
+  id: number;
+  project_id: number;
+  run_id: number | null;
+  kind: string;
+  title: string;
+  detail: Record<string, unknown>;
+  endpoint: string;
+  method: string;
+  body: Record<string, unknown>;
+  /** 前提指纹（漂移检测用；界面不显示）。 */
+  precondition_fingerprint: string;
+  /** 人话：这条提案的前提是什么。 */
+  precondition_note: string | null;
+  risk_level: string;
+  status: "pending" | "approved" | "rejected" | "applied" | "stale";
+  created_at: string | null;
+  approved_at: string | null;
+  applied_at: string | null;
+  applied_result: Record<string, unknown> | null;
+}
+
+export interface ActionProposalListResponse {
+  project_id: number;
+  status: string | null;
+  count: number;
+  proposals: ActionProposalOut[];
+}
+
+/** 创建动作提案的请求体（卡片确认后前端原样回传，服务端拼好）。 */
+export interface ActionProposalCreateRequest {
+  project_id: number;
+  kind: string;
+  title: string;
+  detail?: Record<string, unknown>;
+  action_endpoint: string;
+  action_method?: string;
+  action_body?: Record<string, unknown>;
+  params?: Record<string, unknown>;
+  risk_level?: string;
+}
+
+/** 当前需要用户决断的岔路口。 */
+export interface WorkflowDecision {
+  key: string;
+  title: string;
+  question: string;
+  step_id: string;
+}
+
+/** 一个项目的工序链状态。 */
+export interface WorkflowState {
+  project_id: number;
+  status: "active" | "done" | "blocked";
+  current_step: string | null;
+  summary: string;
+  steps: WorkflowStep[];
+  gates: string[];
+  needs_decision: WorkflowDecision | null;
+  /** 等着你处理的改动（待批 + 已批待写进正文）。 */
+  open_proposals: WorkflowPendingProposal[];
+  round: number;
+  updated_at: string | null;
+}
+
+// ==================================================================
+// 角色对话（第三板块）
+// ==================================================================
+
+/** 角色对话：一条带**来源标注**的证据。 */
+export interface RoleplaySource {
+  chunk_id: number;
+  chapter_no: number | null;
+  idx: number | null;
+  /**
+   * 「亲历」= 他自己开过口 / 这件事记在他名下；
+   * 「在场听到」= 别人在说，他在旁边；
+   * 「只是被提到」= 文里写到了他，**不代表他在场、也不代表他知道**。
+   */
+  origin: "亲历" | "在场听到" | "只是被提到";
+  /** 判据说明（人可复核）。 */
+  basis: string;
+  score: number;
+  text: string;
+  /** KG 里明确记着他知道的事。 */
+  known_facts: string[];
+}
+
+/** 角色对话的一条记录。 */
+export interface RoleplayMessage {
+  id: number;
+  character: string;
+  question: string;
+  answer: string;
+  sources: RoleplaySource[];
+  novel_ids: number[];
+  created_at: string | null;
+}
+
+/** GET /projects/{id}/roleplay/characters */
+export interface RoleplayCharactersResponse {
+  /** 两组合并（项目里的在前）。 */
+  characters: string[];
+  /** 这个项目里的角色（剧情圣经 + 项目实体表里的）。数量少，默认展开。 */
+  project: string[];
+  /** 参考书里的角色（叙事档案的声音词典里有一整套）。折叠 + 可搜索。 */
+  reference: string[];
+  /**
+   * 角色的别名（规范名 → 别名列表）。
+   *
+   * 别名**不单独占一格**：「沈砚的父亲」「他爹」这类指代铺开会让清单看着多了一倍角色。
+   */
+  aliases?: Record<string, string[]>;
+  /** 后端当前认定的「被扮演角色」。 */
+  current: string | null;
+}
+
+/** POST /projects/{id}/roleplay/chat */
+export interface RoleplayChatResult {
+  id: number;
+  character: string;
+  question: string;
+  answer: string;
+  sources: RoleplaySource[];
+  has_evidence: boolean;
+  elapsed: number;
 }
 
 // ====================================================================
