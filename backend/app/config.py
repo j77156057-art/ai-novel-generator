@@ -312,6 +312,33 @@ class Settings(BaseSettings):
     #: 文风改写开关（生成三档预设会写这里）：极速档关闭、平衡/高质量档开启。
     #: 项目级 `projects.style_rewrite` 显式设置时以项目为准。
     style_rewrite: bool = True
+    #: 文风改写的成本闸门：开 = 只在偏离参考书「严重」时才多花一次模型调用；
+    #: 关 = 只要 `style_rewrite` 开就一律改写。判据见 `engine._rewrite_gate`。
+    style_rewrite_gate: bool = True
+    #: 改写这一步单独指定模型（空 = 与写手同一个 provider）。
+    #: 渠道不认这个模型 / 没 key / 构建抛错时自动回落写手 provider。
+    style_rewrite_model: str = "MiniMax-M3"
+    #: 形态校正：把对白的组织方式掰到参考书自己的形态（逐单元分布带）。
+    #: 实测提示层挪不动对白形态，只有事后改写能改。
+    style_form_correction: bool = True
+    #: 形态校正的做法：`merge` = 只做确定性并段（零模型调用）；
+    #: `rewrite` = 并段后再调一次模型重写不达标段落。
+    style_form_correction_mode: str = "merge"
+    #: 引语补全：给连续对白段补「XX道：」这类引导语，直到声音归属进带。
+    style_lead_in: bool = True
+    #: 归属校正：把「说话人归属」的写法密度掰到参考书自己的（实测差 5 倍）。
+    style_attribution_correction: bool = True
+    #: 省略号习惯校正：对白结尾省略号密度对齐参考书（机械改动，代价低）。
+    style_ellipsis_correction: bool = True
+    #: beat 插入：连续对白段开头补一句动作/神态叙述。默认关——它**新增**叙述，
+    #: 是唯一会动情节信息量的一道，要显式开。
+    style_beat_insert: bool = False
+    #: 照搬门禁：正文与参考语料逐字重合超过阈值就必须改写，改不掉不落库。
+    style_verbatim_gate: bool = True
+    #: 照搬判定阈值（连续相同字数），与提示里写的一致。
+    style_verbatim_threshold: int = 25
+    #: 照搬回灌的最多改写次数（0 = 只判不改，超标直接判失败）。
+    style_verbatim_max_rewrites: int = 2
     #: 非流式补全（重写轮走的 `complete_message`）的**总时长硬顶**，默认 960s。
     #:
     #: 2026-11-14 新增：`writer_timeout` 只是 socket 每次 recv 的空闲超时，不是

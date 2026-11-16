@@ -4930,6 +4930,14 @@ def generate_next_segment(
         text, names=list(appeared_names or []), spc_cap=merge_cap
     )
 
+    # 批 6：文风形态校正链（改写 → 形态 → 归属 → 省略号 → beat → 照搬）。
+    # 放在并段之后、时代自检之前：它量的是「即将落库的正文」。
+    text, style_fix = _apply_style_corrections(
+        db, project, provider, text, novel_ids=novel_ids)
+    if any((style_fix.get(k) or {}).get("applied") for k in (
+            "rewrite_info", "form_info", "attr_info", "ell_info", "beat_info")):
+        summary = provider.summarize(text)
+
     # 时代越界自检：默认 report（只扫描、落 meta，不改正文）。
     # 显式 rewrite 模式下才可能改 text；改过就重算摘要，避免摘要与正文脱节。
     era_before = text
@@ -4947,6 +4955,8 @@ def generate_next_segment(
     # 这是观测与告警口径，不改正文；是否重写在上面已经决定过了。
     gate_final = generation_gate(text, max_chars)
     quality["style_gate"] = gate_final
+    # 批 6：校正链的逐道留痕（跑没跑、为什么没跑、改了哪些指标）。
+    quality["style_corrections"] = style_fix
     # v15：结构检测（情节点覆盖 / 越章材料 / 人物性别一致），只写留痕、不改正文；
     # 是否阻断由 `structure_guard_mode` 在 `_commit_segment` 决定。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
@@ -5380,6 +5390,13 @@ def generate_next_segment_stream(
         text, names=list(appeared_names or []), spc_cap=merge_cap
     )
 
+    # 批 6：文风形态校正链，与同步版同口径（放在并段之后、时代自检之前）。
+    text, style_fix = _apply_style_corrections(
+        db, project, provider, text, novel_ids=novel_ids)
+    if any((style_fix.get(k) or {}).get("applied") for k in (
+            "rewrite_info", "form_info", "attr_info", "ell_info", "beat_info")):
+        summary = provider.summarize(text)
+
     # 时代越界自检：与同步版同口径；默认 report，不改正文。
     era_before = text
     text, era_meta = _apply_era_guard(
@@ -5395,6 +5412,8 @@ def generate_next_segment_stream(
     # 这是观测与告警口径，不改正文；是否重写在上面已经决定过了。
     gate_final = generation_gate(text, max_chars)
     quality["style_gate"] = gate_final
+    # 批 6：校正链逐道留痕，与同步版同口径。
+    quality["style_corrections"] = style_fix
     # 与同步版同口径：结构检测留痕（是否阻断由 `structure_guard_mode` 决定）。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
     # 与同步版同口径：逐章推进台账（只判不拦，`mode=report`）。
@@ -6165,3 +6184,1093 @@ def generate_loop(
     project.status = "loop_done" if project.status == "generating" else project.status
     db.commit()
     return results
+
+
+# =========================================================================== #
+# 文风形态校正链（批 6：从 freeze/main-cb05a45 的 engine 搬入）
+# =========================================================================== #
+# 这一段是本分支此前完全缺失的「落库前改文本工序」。顺序不可调（main 的
+# `_run_text_chain` 有逐条理由）：文风改写 → 形态校正 → 归属校正 → 省略号
+# 校正 → beat 插入 → 照搬门禁。本分支的主链在 `generate_next_segment`
+# / `..._stream` 里内联，接入点是重写轮与并段之后、质量判定之前
+# （见 `_apply_style_corrections`）。
+#
+# 纪律：只做文本变换 + 只读数据库，不落库（照搬门禁抛 `VerbatimViolation`
+# 由调用方决定，不能静默吞掉）。
+MIN_GAP_TO_ELLIPSIS = 0.05
+
+
+REWRITE_GATE_FEATURES = ("句长均值", "句号密度")
+
+
+def _style_gate(text: str, profile: dict | None) -> dict:
+    """段级文风判定的**唯一出口**（仲裁点）。
+
+    ## 返回什么
+
+    ::
+
+        {
+          "available": bool,       # 有没有规格书可判
+          "items": {key: {...}},   # 逐项落位（value/lo/hi/in_band/deviation）
+          "in_band": [key, ...],   # 在带内的项
+          "out_of_band": [key, ...],  # **区间型**出带 ⇒ 可回灌
+          "warn_only": [key, ...],    # **上限型**出带 ⇒ 只告警
+          "deviations": [str, ...],   # 可回灌的偏差句（给改写流程）
+        }
+
+    ## 三条判定规则（2026-11-01 拍板）
+
+    1. **区间型出带 ⇒ 回灌**：附上偏差量，让执行方自己改。
+    2. **上限型出带 ⇒ 只告警**：比喻/情绪直陈/段尾拔高这类「越少越好」，
+       超出不该回灌（回灌等于让模型去凑指标），也不阻断。
+    3. **没进提示词的项 ⇒ 只记录不判定**：模型看不见它，回灌没有意义。
+
+    ## 为什么不用 `band_check` 单独判
+
+    `band_check` 是「拿档案的带当尺」，`spec_check` 是「拿规格书当尺」，
+    而规格书**由档案导出** ⇒ 同一把尺的两个视图。
+    用规格书当尺的好处是：段级判定与提示词里给模型的区间**逐字同源**，
+    模型收到的指令与验收它的判据不可能对不上。
+
+    ## 降级
+
+    没有档案 / 档案里没有规格书（老档案）⇒ `available=False`，什么都不判。
+    档案是增强，不是生成的前提 —— 判不出来就放行，绝不阻断。
+    """
+    if not profile or not text or not text.strip():
+        return {"available": False, "items": {}, "in_band": [],
+                "out_of_band": [], "warn_only": [], "deviations": []}
+    try:
+        from app.style.spec import spec_check, spec_deviation_lines
+
+        spec = profile.get("spec") or {}
+        if not spec or not spec.get("items"):
+            return {"available": False, "items": {}, "in_band": [],
+                    "out_of_band": [], "warn_only": [], "deviations": []}
+        check = spec_check(text, spec)
+    except Exception:  # noqa: BLE001 —— 判不出来就不判，绝不能阻断生成
+        return {"available": False, "items": {}, "in_band": [],
+                "out_of_band": [], "warn_only": [], "deviations": []}
+
+    items = check.get("items") or {}
+    in_band = [k for k, v in items.items() if v.get("checked") and v.get("in_band")]
+    return {
+        "available": True,
+        "items": items,
+        "in_band": in_band,
+        "out_of_band": list(check.get("out_of_band") or []),
+        "warn_only": list(check.get("warn_only") or []),
+        # 回灌句只给**区间型**出带项（上限型只告警，见规则 2）
+        "deviations": spec_deviation_lines(check),
+        "recorded": list(check.get("recorded") or []),
+    }
+
+
+def _strip_ws(text: str) -> str:
+    """去掉所有空白 —— 用来验证「只改了段落边界（和那一处标点形态）、内容一个字节没动」。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+REWRITE_GATE_MIN_CHARS = 500
+
+
+def _rewrite_gate(text: str, profile: dict | None) -> tuple[bool, list[dict]]:
+    """这段正文离参考书有多远？偏离到「严重」才值得动一次改写。
+
+    ## 尺子 = 项目已落库的文风档案
+
+    就是**真正注入提示词的那一份**（`_style_profile(db, project)`），不是另算一遍。
+    没有档案就没有「像不像」的基准 → 不改写（档案是增强，不是生成的前提）。
+
+    ## 阈值 = 参考书自己的分布，不拍脑袋
+
+    - 「句长均值 < p10」= 比 **90% 的人类样本**还碎；
+    - 「句号密度 > p90」= 比 **90% 的人类样本**还碎。
+
+    分位数来自参考书自己的分布：语料换了尺子也跟着换，不用维护第二套常量。
+
+    ## 与仲裁点 `_style_gate` 的关系（2026-11-01）
+
+    两者的**尺是同一把**：这里的 `band_check` 取的 p10/p90，
+    正是规格书里那两项的 `lo`/`hi`（规格书由档案导出 ⇒ 同源）。
+
+    但**分工不同**，不能合并：
+    - `_style_gate` 判的是「这一段整体像不像（逐项 in/out）」⇒ **报告用**；
+    - `_rewrite_gate` 判的是「值不值得多花一次模型调用改写」⇒ **成本闸门**，
+      只看改写**修得动**的那两项（`REWRITE_GATE_FEATURES`），且要「严重偏离」。
+
+    合并的后果很具体：规格书有 34 项，逐项出带在跨书对照里能出 13 项 ——
+    若「有出带就改写」，每一段都会白花一次模型调用，而改写只修得动断句。
+
+    ## 返回
+
+    `(severe, reasons)` —— reasons 里每条带特征名、实测值、档位边界，
+    便于在日志/接口里说清「为什么这次动了改写」。
+    """
+    if not profile or not text or not text.strip():
+        return False, []
+    if len(text.strip()) < REWRITE_GATE_MIN_CHARS:
+        return False, []
+    try:
+        from app.style.stylometry import band_check
+
+        checks = band_check(text, profile, REWRITE_GATE_FEATURES)
+    except Exception:  # noqa: BLE001 —— 算不出来就不改写，绝不能阻断生成
+        return False, []
+    reasons: list[dict] = []
+    for name in REWRITE_GATE_FEATURES:
+        c = checks.get(name)
+        if not c:
+            continue
+        value = float(c["value"])
+        band = c["band"]
+        if name == "句长均值":
+            bound = float(band.get("p10") or 0.0)
+            if bound and value < bound:
+                reasons.append({"feature": name, "value": round(value, 1),
+                                "bound": round(bound, 1), "direction": "below",
+                                "detail": f"句长 {value:.1f} 字 < 档案 p10 {bound:.1f} 字"})
+        else:
+            bound = float(band.get("p90") or 0.0)
+            if bound and value > bound:
+                reasons.append({"feature": name, "value": round(value, 1),
+                                "bound": round(bound, 1), "direction": "above",
+                                "detail": f"句号密度 {value:.1f}/千字 > 档案 p90 {bound:.1f}"})
+    return bool(reasons), reasons
+
+
+def _rewrite_decision(project: Project, override: bool | None = None) -> str:
+    """这次要不要做文风改写：``always`` / ``never`` / ``gate``。
+
+    优先级（从高到低）：
+
+    1. **单次请求的显式指定**（`override`，来自请求体 ``style_rewrite``）——
+       「这一段别改写」是用户能当场做的决定；
+    2. **项目显式设过**（``projects.style_rewrite = 1``）→ ``always``；
+    3. 全局总开关（``settings.style_rewrite``）关 → ``never``；
+    4. 全局闸门（``settings.style_rewrite_gate``）开 → ``gate``，否则 ``always``。
+
+    ## 为什么要分「闸门」这一档
+
+    改写要**多一次模型调用**（M3 关思考实测 19s/900 字；换成 M3.1-Flash 更慢），
+    而它**只修得动「碎」**。对一段本来就够长的正文动它，纯属白花一次调用
+    （还可能压缩 15-25% 字数）。所以默认改成「偏离严重才动」。
+
+    ## 关于「项目显式关」
+
+    ``projects.style_rewrite`` 是 ``NOT NULL DEFAULT 0``，库里分不出
+    「从没设过」与「明确关掉」——所以 0 = 跟随全局，不是 never。
+    要单次关掉用请求体（override）。
+    """
+    if override is not None:
+        return "always" if override else "never"
+    if getattr(project, "style_rewrite", 0):
+        return "always"
+    try:
+        from app.config import settings as _st
+        if not bool(getattr(_st, "style_rewrite", True)):
+            return "never"
+        return "gate" if bool(getattr(_st, "style_rewrite_gate", True)) else "always"
+    except Exception:  # noqa: BLE001
+        return "never"
+
+
+def _rewrite_provider(writer_provider):
+    """改写这一步用哪个 provider（默认与写手同一个）。
+
+    ## 为什么要能换
+
+    改写要的只是「把碎句合成长句」，**不需要写作模型的推理能力**。实测
+    （真书续写的真实正文，MiniMax-M3.1-Flash 做写手）：
+
+    | 改写模型 | 用时 | 成功率 | 句长 | 纯台词段 |
+    |---|---|---|---|---|
+    | MiniMax-M3 | 6~9s | 3/3 | 21.8 → 36.8 | 42% → 35% |
+    | MiniMax-M3.1-Flash | 159s | 1/3（另两次 603s 超时） | 21.8 → **54.4** | 42% → **6%** |
+
+    Flash 改写效果更好但慢且不稳 —— 把它留给「写」这一步更合适。
+
+    ## 配了但用不了怎么办
+
+    渠道不认这个模型、没有 key、或构建抛错 → **回落到写手的 provider**
+    （记一条 warning）。改写失败绝不能影响已经生成好的正文。
+    """
+    try:
+        from app.config import settings as _st
+        model = str(getattr(_st, "style_rewrite_model", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        model = ""
+    if not model:
+        return writer_provider
+    try:
+        from app.config import settings as _st
+        from app.llm.provider import build_provider
+
+        channel = (str(getattr(_st, "writer_provider", "") or "").strip()
+                   or str(getattr(_st, "llm_provider", "") or "").strip())
+        if not channel:
+            return writer_provider
+        api_key = (str(getattr(_st, "writer_api_key", "") or "").strip()
+                   or str(getattr(_st, f"{channel}_api_key", "") or "").strip())
+        base_url = (str(getattr(_st, "writer_base_url", "") or "").strip()
+                    or str(getattr(_st, f"{channel}_base_url", "") or "").strip())
+        if not api_key:
+            logging.getLogger(__name__).info(
+                "改写模型 %s 不可用（没有 %s 的 key），沿用写手 provider", model, channel
+            )
+            return writer_provider
+        return build_provider(
+            channel, api_key, model, base_url=base_url,
+            max_tokens=int(getattr(_st, "writer_max_tokens", 0) or 0) or None,
+            timeout=int(getattr(_st, "writer_timeout", 0) or 0) or 120,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "改写 provider 构建失败，沿用写手 provider: %s", exc
+        )
+        return writer_provider
+
+
+def _maybe_correct_form(
+    db,
+    project: Project,
+    text: str,
+    provider,
+    *,
+    profile: dict | None,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """形态校正：把正文的对白组织方式掰到**参考书自己的形态**。
+
+    ## 为什么要有（实测）
+
+    两个模型的先验都偏「比参考书更裸台词」（《北荒刀歌》：目标逐单元均值 16.2%，
+    M3 写 58.1%、Flash 写 27.7%）。**提示层挪不动**（四轮实验在噪声内），
+    **事后改写能改**（Flash 改写把纯台词段 42% → 6%）—— 所以这是一次
+    **独立的改写**，不是改提示词。
+
+    ## 闸门
+
+    尺子 = 参考书**自己**的逐单元分布（p10~p90）：这一段的对白形态比 90% 的
+    人类样本还极端，才值得多花一次模型调用去掰。落在带子里 → 不动。
+
+    ## 目标与样例
+
+    目标 = 分布中心（均值）；样例 = **同一本书**里形态正确的原文段落 ——
+    给「形态的正确实例」比给统计数字有用。
+
+    ## 失败策略
+
+    `style/form.correct_form` 内部有四道判据（字数、对白内容、形态是否靠近、
+    是否过冲），任何一道不过就返回原文。这里再兜一层异常。
+    """
+    if not text or not text.strip():
+        return text, {"applied": False, "reason": "空文本"}
+    try:
+        from app.config import settings as _st
+        if not bool(getattr(_st, "style_form_correction", True)):
+            return text, {"applied": False, "reason": "形态校正开关关闭"}
+        mode = str(getattr(_st, "style_form_correction_mode", "merge") or "merge")
+    except Exception:  # noqa: BLE001
+        mode = "merge"
+    try:
+        from app.style.form import (
+            correct_form,
+            form_target,
+            measure_form,
+            pick_form_examples,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("形态校正模块不可用: %s", exc)
+        return text, {"applied": False, "reason": "模块不可用"}
+
+    target = form_target(profile or {})
+    if not target:
+        return text, {"applied": False, "reason": "档案里没有形态目标"}
+
+    measured = measure_form(text)
+    # 闸门用 `band_check`（**同一把尺**）：它把文本侧的长度归一化因子**除掉**，
+    # 再与档案的分布带比。直接用 `measure_form()["unit_ratio"]` 会带着长度因子 ——
+    # 一段 2500 字的正文被缩到 0.95，一段 1800 字的被缩到 0.86 ——
+    # 于是「形态刚好出带」的段会被判成带内（实测：2547 字那段 32.5%→实为 34.4%，
+    # p90 是 33.5%，本来就该校正）。
+    # 档案的带是在 unit 长度上拟的（因子 ≈ 1），所以两边要同一把尺。
+    ratio = measured["unit_ratio"]
+    try:
+        from app.style.stylometry import band_check as _band_check
+
+        _got = (_band_check(text, profile, ["纯台词段占比"]) or {}).get("纯台词段占比")
+        if _got:
+            ratio = float(_got.get("value") or ratio)
+    except Exception:  # noqa: BLE001 —— 量不出来就用原值，闸门放宽总比误判成带内强
+        pass
+    # 落在参考书自己的分布带里 → 不动
+    if target["p10"] <= ratio <= target["p90"]:
+        return text, {"applied": False, "reason": "形态在参考书分布带内",
+                      "measured": measured, "target": target}
+
+    if mode == "llm":
+        # 样例：同一本书里形态正确的段落
+        examples: list[str] = []
+        try:
+            from app.models import NovelChunk
+            from app.style.stylometry import paragraphs
+
+            ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+            if ids:
+                rows = db.query(NovelChunk).filter(NovelChunk.novel_id.in_(ids)).limit(1200).all()
+                pool: list[str] = []
+                for r in rows:
+                    pool.extend(paragraphs(r.text or ""))
+                examples = pick_form_examples(pool, target["target"])
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("形态样例取不到: %s", exc)
+
+        try:
+            return correct_form(text, provider, target_ratio=target["target"], examples=examples)
+        except Exception as exc:  # noqa: BLE001 —— 校正失败绝不能影响正文
+            logging.getLogger(__name__).warning("形态校正异常，保留原文: %s", exc)
+            return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+    # —— 默认：机械校正（只改段落边界；唯一的内容改动是把并接处的句号改成冒号）——
+    try:
+        from app.style.form_merge import merge_bare_dialogue
+        from app.style.stylometry import paragraphs as _paras
+
+        base_paras = _paras(text)
+        work_paras, minfo = merge_bare_dialogue(base_paras, target["target"])
+        sep = "\n\n" if "\n\n" in text else "\n"
+        if minfo.get("merged"):
+            # 守恒检查：**只允许改段落边界 + 把并接处的「。」改成「：」**。
+            # 「把冒号改回去」之后必须与原文逐字相同 —— 这比原来还严：
+            # 它证明除了那一处标点形态修正之外，一个字都没动。
+            revert = minfo.get("revert_paragraphs") or work_paras
+            if _strip_ws(sep.join(revert)) != _strip_ws(text):
+                return text, {"applied": False, "reason": "机械校正改动了内容，拒绝",
+                              "measured": measured, "target": target}
+            after_merge = measure_form(sep.join(work_paras))
+            if abs(after_merge["bare_ratio"] - target["target"]) >= abs(
+                    measured["bare_ratio"] - target["target"]):
+                work_paras = base_paras
+                after_merge = measured
+                minfo = {"merged": 0}
+        else:
+            after_merge = measured
+
+        # —— 第二步：机械路线到顶了 ⇒ 用模型补引导语 ——
+        #
+        # 机械合并只改段落边界，能把裸台词占比拉下来但**到不了目标**
+        # （实测 9 段真实产物：71.5% → 42.2%，参考书 22.7%）。
+        # 剩下的差距只能靠**新增内容**补 —— 而这一步**会新增文字**，
+        # 所以它跟机械合并不是一回事：**闸门相同、判据不同**。
+        #
+        # 三处「按需」（2026-10-27 量着定的，别改成凭感觉）：
+        # 1. **只在裸台词太多时才付这笔钱** —— 低于下沿 p10 时补引导语只会让
+        #    比值更小、离带更远（这道闸以前写成「不在带内」，两个方向都进）；
+        # 2. **补到带的上沿就够，不追均值** —— 目的是「进带」，不是「打到平均」；
+        # 3. **余量 2 处 + 不够就再来一轮**（`fill_lead_ins_until_in_band`）。
+        #    余量是按某个采纳率估的，而**采纳率是模型决定的**：实测换模型后
+        #    采纳率只有 67%~82%，固定余量会漏掉「只差 1 个槽位」的段。
+        #    实测代价：11.7 → 5.6 次模型调用/段（-52%），出带的 5 段全部进带。
+        lead_info = {"applied": False}
+        ratio_now = after_merge["bare_ratio"]
+        try:
+            from app.style.lead_in import should_fill_lead_ins
+
+            want_lead = should_fill_lead_ins(
+                ratio_now, p10=target["p10"], p90=target["p90"],
+            )
+        except Exception:  # noqa: BLE001 —— 判不出来就别花钱
+            want_lead = False
+        if want_lead:
+            try:
+                from app.config import settings as _st2
+                lead_on = bool(getattr(_st2, "style_lead_in", False))
+            except Exception:  # noqa: BLE001
+                lead_on = False
+            if lead_on:
+                try:
+                    from app.style.lead_in import fill_lead_ins_until_in_band
+
+                    work_paras, lead_info = fill_lead_ins_until_in_band(
+                        work_paras, provider,
+                        p10=target["p10"], p90=target["p90"],
+                        proper_nouns=_reference_proper_nouns(db, project, novel_ids),
+                        corpus_text=_reference_corpus_text(db, project, novel_ids) or None,
+                        character_names=_project_character_names(db, project),
+                    )
+                except Exception as exc:  # noqa: BLE001 —— 补写失败绝不能影响正文
+                    logging.getLogger(__name__).warning("引导语补写异常，保留机械结果: %s", exc)
+                    lead_info = {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+        final_text = sep.join(work_paras)
+        after = measure_form(final_text)
+        if abs(after["bare_ratio"] - target["target"]) >= abs(measured["bare_ratio"] - target["target"]):
+            return text, {"applied": False, "reason": "形态校正没逼近目标",
+                          "measured": measured, "target": target}
+        logging.getLogger(__name__).info(
+            "形态校正：纯台词段 %.0f%% → %.0f%%（目标 %.0f%%；机械并 %d 段"
+            "、改了 %d 处标点形态、补引导语 %d 处）",
+            measured["bare_ratio"] * 100, after["bare_ratio"] * 100,
+            target["target"] * 100, minfo.get("merged", 0),
+            int(minfo.get("colon_fixed") or 0), int(lead_info.get("inserted") or 0),
+        )
+        return final_text, {"applied": True, "mode": "merge",
+                            "before": measured, "after": after,
+                            "target": target, "merged": minfo.get("merged", 0),
+                            "colon_fixed": int(minfo.get("colon_fixed") or 0),
+                            "lead_in": lead_info}
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("机械形态校正异常，保留原文: %s", exc)
+        return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+
+def _maybe_correct_attribution(
+    db,
+    project: Project,
+    text: str,
+    provider,
+    *,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """归属校正：把「说话人归属」的写法掰到**参考书自己的写法**。
+
+    ## 为什么要有（实测）
+
+    参考书《道途魔典》**76.6%** 的对白带说话人归属（`X道：“…”`），
+    我们的产出只有 **3.2%**（提示词加了一句口径后 14.2%）⇒ 差 5 倍。
+    而盲评实测：「出现『X道：“…”』的那侧 = 人类侧」这条规则**精确率 100%**
+    ⇒ 这是泄露面，不修就出不了能用的盲评包。
+
+    ## 闸门（为什么要多花一次模型调用）
+
+    只在**离目标够远**时才校正：差得不多就别动（改写本身有风险）。
+    目标与样例都来自**参考书自己** ⇒ 换一本书自动跟着换。
+
+    ## 失败策略
+
+    `style/attribution_fix.correct_attribution` 内部有四道判据
+    （对白内容守恒 / 字数 / 归属率是否靠近 / 不许过冲），
+    任何一道不过就返回原文。这里再兜一层异常。
+    """
+    if not text or not text.strip():
+        return text, {"applied": False, "reason": "空文本"}
+    try:
+        from app.config import settings as _st
+        if not bool(getattr(_st, "style_attribution_correction", True)):
+            return text, {"applied": False, "reason": "归属校正开关关闭"}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.style.attribution_fix import (
+            attribution_rate,
+            attribution_target,
+            correct_attribution,
+        )
+        from app.style.stylometry import paragraphs as _paras
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("归属校正模块不可用: %s", exc)
+        return text, {"applied": False, "reason": "模块不可用"}
+
+    before = attribution_rate(text)
+    if before["quotes"] < 3:
+        return text, {"applied": False, "reason": "对白太少", "before": before}
+
+    # —— 目标与样例：从参考书的段落里量 ——
+    try:
+        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+        target = None
+        if ids:
+            from app.models import NovelChunk
+            rows = db.query(NovelChunk).filter(
+                NovelChunk.novel_id.in_(ids)).limit(1200).all()
+            pool: list[str] = []
+            for r in rows:
+                pool.extend(_paras(r.text or ""))
+            target = attribution_target(pool)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("归属目标取不到: %s", exc)
+        target = None
+    if not target:
+        return text, {"applied": False, "reason": "量不出归属目标", "before": before}
+
+    # —— 闸门：离目标够远才值得花一次调用 ——
+    from app.style.attribution_fix import MIN_GAP_TO_CORRECT, MIN_RATE_TO_CORRECT
+    gap = abs(before["rate"] - target["rate"])
+    if gap < MIN_GAP_TO_CORRECT:
+        return text, {"applied": False, "reason": f"离目标够近（差 {gap:.0%}）",
+                      "before": before, "target": target}
+    if target["rate"] < MIN_RATE_TO_CORRECT:
+        return text, {"applied": False, "reason": "参考书自己就几乎没有归属",
+                      "before": before, "target": target}
+
+    try:
+        return correct_attribution(
+            text, provider,
+            target_rate=target["rate"],
+            convention=target["convention"],
+            examples=target["examples"],
+        )
+    except Exception as exc:  # noqa: BLE001 —— 校正失败绝不能影响正文
+        logging.getLogger(__name__).warning("归属校正异常，保留原文: %s", exc)
+        return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+
+def _maybe_correct_ellipsis(
+    db,
+    project: Project,
+    text: str,
+    provider,
+    *,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """省略号习惯校正：对白里「用省略号」的密度对齐**参考书自己**。
+
+    ## 为什么要有（实测）
+
+    2026-10-31 的盲评包里，「**有省略号的那侧 = 人类侧**」可判 7 对、
+    判对 7 对、**精确率 100%** ⇒ 一条真泄露线。
+    我们 0.068 个/百字 vs 参考书 0.684 个/百字（差 10 倍）。
+
+    ## 闸门
+
+    - 只在**离目标够远**时才动（差得不多就别碰）；
+    - 目标与惯例都来自**参考书自己** ⇒ 换一本书自动跟着换。
+
+    ## 失败策略
+
+    `style/ellipsis_fix.apply_ellipsis_habit` 内部量完直接改（纯机械，
+    不调模型）⇒ 失败极少；这里再兜一层异常。
+    """
+    if not text or not text.strip():
+        return text, {"applied": False, "reason": "空文本"}
+    try:
+        from app.config import settings as _st
+        if not bool(getattr(_st, "style_ellipsis_correction", True)):
+            return text, {"applied": False, "reason": "省略号校正开关关闭"}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.style.ellipsis_fix import (
+            apply_ellipsis_habit,
+            ellipsis_rate,
+            ellipsis_target,
+        )
+        from app.style.stylometry import paragraphs as _paras
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("省略号校正模块不可用: %s", exc)
+        return text, {"applied": False, "reason": "模块不可用"}
+
+    before = ellipsis_rate(text)
+    if before["quotes"] < 5:
+        return text, {"applied": False, "reason": "对白太少", "before": before}
+
+    # —— 目标：从参考书的段落里量 ——
+    try:
+        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+        target = None
+        if ids:
+            from app.models import NovelChunk
+            rows = db.query(NovelChunk).filter(
+                NovelChunk.novel_id.in_(ids)).limit(1200).all()
+            pool: list[str] = []
+            for r in rows:
+                pool.extend(_paras(r.text or ""))
+            target = ellipsis_target(pool)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("省略号目标取不到: %s", exc)
+        target = None
+    if not target:
+        return text, {"applied": False, "reason": "量不出省略号目标", "before": before}
+
+    gap = abs(before["rate"] - target["rate"])
+    if gap < MIN_GAP_TO_ELLIPSIS:
+        return text, {"applied": False, "reason": f"离目标够近（差 {gap:.0%}）",
+                      "before": before, "target": target}
+
+    try:
+        return apply_ellipsis_habit(text, target["rate"])
+    except Exception as exc:  # noqa: BLE001 —— 校正失败绝不能影响正文
+        logging.getLogger(__name__).warning("省略号校正异常，保留原文: %s", exc)
+        return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+
+def _reference_plain_dialogue_ratio(
+    db,
+    project: Project,
+    novel_ids: list[int] | None = None,
+    *,
+    max_chunks: int = 200,
+) -> float | None:
+    """参考书自己的「光台词段」占比（A 类），即 beat 插入的目标。
+
+    取不到（没有参考语料 / 出错）→ None，调用方用默认值。
+
+    ## 为什么目标必须来自参考书
+
+    「纯台词段占比」是**书级特征**，跨书差 4.2 倍：
+    《北荒刀歌》 6% / 豪门夜宴 33% / 《长夜司》 54% / 镜中局 76%（实测，15 本真书）。
+    ⇒ 写死一个常数会把**对话密集型书**改成叙事密集型 —— 那是把书改坏。
+    """
+    try:
+        from app.models import NovelChunk
+        from app.style.beat import is_plain_dialogue
+        from app.style.stylometry import paragraphs as _paras
+
+        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+        if not ids:
+            return None
+        rows = (
+            db.query(NovelChunk)
+            .filter(NovelChunk.novel_id.in_(ids))
+            .order_by(NovelChunk.novel_id, NovelChunk.idx)
+            .limit(max_chunks)
+            .all()
+        )
+        quote = 0
+        plain = 0
+        for r in rows:
+            for p in _paras(r.text or ""):
+                if "“" not in p:
+                    continue
+                quote += 1
+                if is_plain_dialogue(p):
+                    plain += 1
+        if quote < 20:
+            return None
+        return plain / quote
+    except Exception:  # noqa: BLE001 —— 取不到就返回 None
+        return None
+
+
+def _reference_corpus_text(
+    db,
+    project: Project,
+    novel_ids: list[int] | None = None,
+    *,
+    max_chunks: int = 60,
+    max_chars: int = 60000,
+) -> str:
+    """参考书原文（供 beat 判据 3 的语汇白名单用）。
+
+    取不到就返回空串 —— 调用方会退化成「上下文词组」白名单（并在诊断里标明降级）。
+    """
+    try:
+        from app.models import NovelChunk
+
+        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+        if not ids:
+            return ""
+        rows = (
+            db.query(NovelChunk)
+            .filter(NovelChunk.novel_id.in_(ids))
+            .order_by(NovelChunk.novel_id, NovelChunk.idx)
+            .limit(max_chunks)
+            .all()
+        )
+        parts: list[str] = []
+        total = 0
+        for r in rows:
+            t = r.text or ""
+            if not t:
+                continue
+            parts.append(t)
+            total += len(t)
+            if total >= max_chars:
+                break
+        return "".join(parts)[:max_chars]
+    except Exception:  # noqa: BLE001 —— 取不到就退化成上下文白名单
+        return ""
+
+
+def _reference_proper_nouns(db, project: Project, novel_ids: list[int] | None = None) -> set[str]:
+    """参考书的专名表（判据「不能造新事实」用）。
+
+    取不到就返回空集 —— 调用方据此**降级**（判据改成只查模型自报的专名）。
+    """
+    proper_nouns: set[str] = set()
+    try:
+        from app.style.entity_store import ensure_table, entity_entries
+
+        ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+        for nid in ids[:2]:
+            try:
+                proper_nouns |= set(entity_entries(ensure_table(db, nid)))
+            except Exception:  # noqa: BLE001 —— 一本书的表取不到就跳过
+                continue
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("专名表取不到，判据降级: %s", exc)
+    return proper_nouns
+
+
+def _project_character_names(db, project: Project) -> set[str]:
+    """本项目的**角色名表**（判据 7「说话人一致」用）。
+
+    取两处：知识图谱里的 character 实体 + `plot_bible` 里的角色。
+    取不到就返回空集 —— 调用方据此**降级**（判据 7 的第 3/4 条自动失效，
+    只剩模型自报 vs 模型自报那两条）。
+    """
+    names: set[str] = set()
+    try:
+        from app.models import KgEntity
+        from sqlalchemy import select
+
+        rows = db.scalars(
+            select(KgEntity).where(KgEntity.project_id == project.id)
+        ).all()
+        for e in rows:
+            if getattr(e, "kind", "") == "character" and e.canonical_name:
+                names.add(str(e.canonical_name).strip())
+    except Exception as exc:  # noqa: BLE001 —— 取不到就降级，不阻断
+        logging.getLogger(__name__).warning("角色表取不到，说话人判据降级: %s", exc)
+    try:
+        bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+        for item in (bible.get("characters") or []):
+            name = item.get("name") if isinstance(item, dict) else item
+            if name and str(name).strip():
+                names.add(str(name).strip())
+    except Exception:  # noqa: BLE001
+        pass
+    return {n for n in names if n}
+
+
+def _maybe_insert_beats(
+    db,
+    project: Project,
+    text: str,
+    provider,
+    *,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """在连续对白段的开头**插入一句动作/神态叙述**（beat）。
+
+    ## ⚠️ 默认关闭（`settings.style_beat_insert = False`）
+
+    **这条路的参照物曾经是错的，整条方向已被真跑推翻**（清单 AD）：
+
+    最早的判据拿**《北荒刀歌》**（A 类 7%~12%）当标准，得出「模型写的对白戏
+    比参考书密 ⇒ 要加叙述」。但 15 本真书的 A 类占比是
+    **min 7%（北荒刀歌）· p25 64% · 中位 72% · p75 81% · max 88%**
+    ⇒ **北荒刀歌是特例**；我们生成的是 **61%**，**已在真书区间下沿**，
+    不是「差了一倍」。
+
+    真跑的量-效曲线（插 6/12/24/48 处）显示：动作密度升到真书 **5 倍**
+    （=「网球法」），A 类只降到 35%，**采纳率还随量下降**。
+
+    ⇒ 代码与判据**保留**（① 目标比例取自**参考书自己**，对动作密集的书
+    仍有意义；② 它是「局部插入」这条路的实现与判据范例），但**默认不开**。
+
+    ## 机制本身是可靠的
+
+    局部插入（beat）比整段形态改写可靠得多：真跑**采纳 5/6（83%）**，
+    而整段形态改写是 **0/20** —— 任务小、上下文现成、逐段可验收。
+
+    ## 目标比例
+
+    用**参考书自己的** A 类占比（从语料现算），不是写死的常数 ——
+    不同书差别很大（北荒刀歌 7% / 镜中局 76% / 大靖 54%）。
+
+    ## 失败策略
+
+    插入失败绝不能影响正文（整段失败就整段放弃）。详见 `style/beat_insert.py`。
+    """
+    if not text or not text.strip():
+        return text, {"applied": False, "reason": "空文本"}
+    try:
+        from app.config import settings as _st
+        if not bool(getattr(_st, "style_beat_insert", False)):
+            return text, {"applied": False, "reason": "beat 插入开关关闭"}
+    except Exception:  # noqa: BLE001
+        return text, {"applied": False, "reason": "配置读取失败"}
+    try:
+        from app.style.beat import DEFAULT_TARGET_A_RATIO
+        from app.style.beat_insert import _insert_beats
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("beat 模块不可用: %s", exc)
+        return text, {"applied": False, "reason": "模块不可用"}
+
+    # 目标比例 = **参考书自己的** A 类占比（不是写死的常数）。
+    # 不同书差别很大（北荒刀歌 6% / 镜中局 76% / 大靖 54%）⇒ 目标必须随书变。
+    target = DEFAULT_TARGET_A_RATIO
+    ref_ratio = _reference_plain_dialogue_ratio(db, project, novel_ids)
+    if ref_ratio is not None:
+        target = ref_ratio
+
+    # 专名表（判据 3 用）：优先用参考书的专名表
+    proper_nouns = _reference_proper_nouns(db, project, novel_ids)
+
+    try:
+        return _insert_beats(text, provider, target_ratio=target,
+                             proper_nouns=proper_nouns or None,
+                             corpus_text=_reference_corpus_text(db, project, novel_ids) or None)
+    except Exception as exc:  # noqa: BLE001 —— 插入失败绝不能影响正文
+        logging.getLogger(__name__).warning("beat 插入异常，保留原文: %s", exc)
+        return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+
+def _rewrite_targets(text: str, profile: dict | None) -> dict:
+    """改写要用的目标：**参考书自己的句长带**（p10~p90）。
+
+    ## 为什么目标必须来自档案，不能写死
+
+    改写提示词里原先写死「平均每句 45 到 70 个字」，而参考书实测的句长带
+    只有 22~27 字 ⇒ 模型必然把句子拉过头（实测一句冲到 41.2 字）。
+    又因为**句号密度 ≈ 1000 / 句长**（实测 39.1 vs 38.3、24.3 vs 24.5），
+    句长冲过头 ⇒ 句号密度跟着一起出带 ——
+    那正是「产出不像参考书」的头号短板（句号密度 94% 出带）。
+
+    口径与 `band_check` 一致：按文本长度选桶，再取该桶的分布带。
+    """
+    if not profile:
+        return {}
+    try:
+        from app.style.stylometry import pick_bucket
+
+        base_unit = int((profile.get("_meta") or {}).get("base_unit_chars")
+                        or profile.get("unit_chars") or 0)
+        if profile.get("version") == 2 and profile.get("buckets"):
+            bucket_name = pick_bucket(len(text), base_unit)
+            bucket = (profile["buckets"].get(bucket_name)
+                      or profile["buckets"].get("medium") or {})
+        else:
+            bucket = profile
+        feat = bucket.get("feat") or profile.get("feat") or {}
+        band = (feat.get("句长均值") or {})
+        lo, hi = band.get("p10"), band.get("p90")
+        if lo is None or hi is None:
+            return {}
+        return {"sentence_range": (float(lo), float(hi)), "bucket": bucket_name
+                if profile.get("version") == 2 else "v1"}
+    except Exception:  # noqa: BLE001 —— 取不到目标就按「没有目标」走，绝不能阻断生成
+        return {}
+
+
+def _maybe_rewrite_style(
+    project: Project,
+    text: str,
+    provider,
+    *,
+    profile: dict | None = None,
+    override: bool | None = None,
+) -> tuple[str, dict]:
+    """按「偏离严重才动」的口径决定要不要做两段式文风改写。
+
+    ## 为什么必须放在落库之前、去重之后
+
+    顺序有讲究：
+      AI 味重写 → 去重 → **文风改写** → 落库
+    去重在改写之前，是因为复读段落改写后可能「看起来不同」而逃过去重；
+    改写放最后，是因为它要与「最终要落库的文本」一一对应。
+
+    ## 为什么要可选开关而不是默认行为
+
+    改写是**风格增强**，不是正确性修复：
+      - 它压缩 15-25% 字数（实测 3216 → 约 2700）
+      - 它要额外一次调用（M3 关思考实测 19s/900 字）
+      - 没选参考语料时没有「参考断句节奏」可对齐，开了纯浪费
+    所以默认按**闸门**触发：偏离参考书越远的那一段才值得改。
+
+    ## 失败策略
+
+    `rewrite_style` 内部已做三道校验（字数缩水、对白丢失、句长未改善），
+    任何一道不过就返回原文。这里再兜一层异常——改写挂了绝不能影响已经
+    生成好的正文。
+    """
+    decision = _rewrite_decision(project, override)
+    if decision == "never":
+        return text, {"applied": False, "reason": "开关关闭"}
+    gate_info: dict = {"decision": decision}
+    if decision == "gate":
+        severe, reasons = _rewrite_gate(text, profile)
+        gate_info["severe"] = bool(severe)
+        gate_info["reasons"] = reasons
+        if not severe:
+            return text, {"applied": False, "reason": "偏离未达闸门",
+                          "gates": reasons, "gate": gate_info}
+    try:
+        from app.generation.rewrite import rewrite_style
+        targets = _rewrite_targets(text, profile)
+        # 规格书偏差（2026-11-01）：让改写知道**现在差多少**，不只是**该到哪**。
+        # 尺是同一把 —— 与注入提示词的那份 spec 同源。
+        deviations = _style_gate(text, profile).get("deviations") or []
+        new_text, info = rewrite_style(
+            text, _rewrite_provider(provider),
+            target_sentence_range=targets.get("sentence_range"),
+            deviations=deviations,
+        )
+        info["gate"] = gate_info
+        info["targets"] = ({"sentence_range": list(targets["sentence_range"])}
+                           if targets.get("sentence_range") else None)
+        if deviations:
+            info["deviations"] = deviations
+        if info.get("applied"):
+            b, a = info.get("before"), info.get("after")
+            logging.getLogger(__name__).info(
+                "文风改写：句长 %.1f → %.1f，引号 %d → %d，字数 %d → %d",
+                b[0] if b else 0, a[0] if a else 0,
+                b[2] if b else 0, a[2] if a else 0,
+                info.get("chars", (0, 0))[0], info.get("chars", (0, 0))[1],
+            )
+        else:
+            logging.getLogger(__name__).info("文风改写未采纳：%s", info.get("reason"))
+        return new_text, info
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("文风改写异常，保留原文: %s", exc)
+        return text, {"applied": False, "reason": f"异常 {type(exc).__name__}"}
+
+
+_VERBATIM_MIN_LEN_RATIO = 0.60
+
+
+def _maybe_fix_verbatim(
+    db,
+    project: Project,
+    text: str,
+    provider,
+    *,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """照搬门禁：正文里若**逐字搬了**参考语料的原文，改掉；改不掉就不落库。
+
+    ## 为什么放在所有正文改写之后、落库之前
+
+    落库的是最终文本，门禁必须量最终文本 —— 任何在它之前的改写
+    （去重 / 文风改写 / 形态校正 / beat 插入）都可能重新引入原文片段。
+
+    ## 命中之后：回灌自改 → 改不掉就不落库
+
+    与 `plot_structure.CopyViolation` 同一口径：把命中的片段指给模型，
+    让它用自己的措辞重写，比直接报错让用户重做一次改对的概率高得多。
+    仍改不掉 ⇒ 抛 `VerbatimViolation`（可重试失败），由路由层转成
+    明确可读的错误，**这一段不落库**。
+
+    ## 降级一律放行
+
+    没有语料、索引没建好、扫描出错 —— 一律放行并在报告里标注「未执行」。
+    门禁是加分项，不是主链路：索引坏了不能连正文都写不出来。
+    """
+    from app.config import settings
+    from app.generation.verbatim import (
+        VerbatimViolation, load_index, scan_verbatim, warm_index_async,
+    )
+
+    if not settings.style_verbatim_gate:
+        return text, {"enabled": False, "verdict": "disabled"}
+    if not text:
+        return text, {"enabled": True, "verdict": "skipped", "reason": "empty_text"}
+
+    ids = list(novel_ids or (getattr(project, "reference_novel_ids", None) or []))
+    if not ids:
+        return text, {"enabled": True, "verdict": "skipped", "reason": "no_reference_corpus"}
+
+    threshold = int(settings.style_verbatim_threshold or 25)
+    index = load_index(db, ids)
+    if index is None:
+        # 索引还没建（建它要扫全语料，不能卡在请求里）→ 后台建，这一段先放行。
+        warm_index_async(db, ids)
+        return text, {"enabled": True, "verdict": "skipped", "reason": "index_not_ready"}
+
+    report = scan_verbatim(text, index, threshold=threshold)
+    report["enabled"] = True
+    if report["verdict"] != "possible_copy":
+        return text, report
+
+    # —— 回灌自改（有界）——
+    max_rewrites = max(0, int(settings.style_verbatim_max_rewrites or 0))
+    attempts = 0
+    for attempt in range(1, max_rewrites + 1):
+        attempts = attempt
+        hint = VerbatimViolation._build_hint(report["spans"], threshold)
+        try:
+            rewritten = provider.chat(_verbatim_system_prompt(threshold), text + hint)
+        except Exception as exc:  # noqa: BLE001 —— 改写挂了不能连累正文以外的东西
+            logging.getLogger(__name__).warning("照搬回灌失败，保留原文: %s", exc)
+            break
+        rewritten = _strip_thinking(rewritten or "")
+        if not rewritten:
+            break
+        # 改写把内容削掉太多 ⇒ 判为「改坏了」，不采纳（照抄 MIN_LEN_RATIO 的口径：
+        # 改写掉内容比改不掉更糟 —— 宁可这一段不落库，也不能悄悄丢情节）。
+        if len(rewritten) < len(text) * _VERBATIM_MIN_LEN_RATIO:
+            logging.getLogger(__name__).info(
+                "照搬回灌：改写后字数 %d < 原文 %d 的 %.0f%%，判为改坏了，不采纳",
+                len(rewritten), len(text), _VERBATIM_MIN_LEN_RATIO * 100)
+            break
+        again = scan_verbatim(rewritten, index, threshold=threshold)
+        report["last_attempt"] = {"attempt": attempt, "verdict": again["verdict"],
+                                  "match_count": again["match_count"]}
+        if again["verdict"] != "possible_copy":
+            report.update(again)
+            report["rewritten"] = True
+            report["attempts"] = attempts
+            return rewritten, report
+        report = again
+    report["rewritten"] = False
+    report["attempts"] = attempts
+    # 改不掉 ⇒ 这一段不落库（抛可重试失败，让调用方/用户重试）。
+    raise VerbatimViolation(report)
+
+
+def _verbatim_system_prompt(threshold: int = 25) -> str:
+    """回灌改写用的 system prompt。
+
+    刻意只给一条要求：**换掉与参考原文逐字相同的那几处**。
+    不让它「重写整段」—— 那是文风改写的活，两件事混在一起会把情节改丢。
+
+    阈值写进提示里（而不是写死 25）—— 阈值是配置项，提示必须跟它一致。
+    """
+    return (
+        "你是一位中文小说编辑。你的任务只有一件：把下面这段文字里"
+        "**与参考原文逐字相同**的地方改写成你自己的措辞。\n\n"
+        "要求：\n"
+        "1. 情节、人物、对白内容、信息量一律不变；\n"
+        "2. 只改**被指出来的那几处**的句子与用词，其余原样保留；\n"
+        f"3. 改完之后，**不得**再出现任何连续 {threshold} 个字以上与参考原文相同的片段；\n"
+        "4. 长度与原文差不多（上下浮动 10% 以内）。\n\n"
+        "只输出改写后的正文，不要解释。"
+    )
+
+def _apply_style_corrections(
+    db,
+    project: Project,
+    provider,
+    text: str,
+    *,
+    novel_ids: list[int] | None = None,
+) -> tuple[str, dict]:
+    """落库前的文风改文本工序**唯一入口**（批 6）。
+
+    顺序与 main 的 `_run_text_chain` 一致，逐条理由见 `_run_text_chain` 文档：
+    文风改写 → 形态校正 → 归属校正 → 省略号校正 → beat 插入 → 照搬门禁。
+    每一道都受对应 `style_*` 配置键控制（关掉就是空操作），因此本函数
+    在默认配置下也会被调用，但只跑「该跑的那几道」。
+
+    纪律：
+    - **只做文本变换 + 只读库**，不落库（`_maybe_fix_verbatim` 例外：改不掉
+      就抛 `VerbatimViolation`，由调用方决定这一段不落库——不能静默放过）；
+    - 任何一道异常都已在各自函数内兜住（保留原文），不会阻断生成。
+
+    返回 (正文, 诊断)。诊断键名与 main 的 `_run_text_chain` 对齐，
+    只额外把规格书仲裁点叫 `spec_gate`——本分支 `quality["style_gate"]`
+    已被 `generation_gate` 占用，不能撞名。
+    """
+    ids = list(novel_ids if novel_ids is not None
+               else (project.reference_novel_ids or []))
+    profile = _style_profile(db, project)
+    diag: dict = {}
+
+    text, diag["rewrite_info"] = _maybe_rewrite_style(
+        project, text, provider, profile=profile)
+    text, diag["form_info"] = _maybe_correct_form(
+        db, project, text, provider, profile=profile, novel_ids=ids)
+    text, diag["attr_info"] = _maybe_correct_attribution(
+        db, project, text, provider, novel_ids=ids)
+    text, diag["ell_info"] = _maybe_correct_ellipsis(
+        db, project, text, provider, novel_ids=ids)
+    text, diag["beat_info"] = _maybe_insert_beats(
+        db, project, text, provider, novel_ids=ids)
+    text, diag["verbatim_info"] = _maybe_fix_verbatim(
+        db, project, text, provider, novel_ids=ids)
+    diag["spec_gate"] = _style_gate(text, profile)
+    return text, diag

@@ -1270,6 +1270,22 @@ def build_user_prompt(
             "【风格样例（参考语料原文，学习其语气/节奏/段落编排/人物口吻，不要复用其内容）】",
             "\n\n".join(exemplar_lines),
         ]
+        # 批 6：说话人归属的口径（样例 + 一句显式口径要一起给）。
+        # 实测光给样例教不会：3 条样例里已有 29 次「X 道：“…”」，模型照样
+        # 写成「说」字派 ⇒ 口径必须按**这本书自己的样例**量出来，不能写死。
+        from app.style.attribution import attribution_directive
+
+        attr_directive = attribution_directive(
+            [str(ex.get("text") or "") for ex in style_exemplars])
+        if attr_directive:
+            blocks += [
+                "",
+                "【句法样板（照着写）】",
+                "下面是参考书原文的几个片段。它们示范了这个作者的**句子长度、"
+                "断句位置、标点习惯**。",
+                attr_directive,
+                "样板只用来学写法，**不要复用其中的情节与人物**。",
+            ]
     if node_prompt:
         # 时间线模式：节点块约束「写到哪」，但**不能替代本章大纲**——
         # 节点是章节的压缩包（一个点可能覆盖多章），本章的具体事件只在

@@ -1201,3 +1201,108 @@ def band_check(text: str, profile: dict, names: Sequence[str]) -> dict[str, dict
         value = raw / scale if (name in NON_DENSITY_FEATURES and scale) else raw
         out[name] = {"value": value, "band": band, "bucket": bucket_name}
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 对白形态判据 helper（批 6 前置，逐字从 main 搬入）
+# --------------------------------------------------------------------------- #
+# 为什么单独补这几个而不是整份 stylometry 覆盖：
+# `features()` 的字段集与口径决定档案指纹（MEASUREMENT_VERSION），
+# 整份覆盖会把已蒸馏的档案标成「口径失配」并要求重蒸。这里只补
+# 批 6 校正链真正取用的 **纯 helper**，`features()` 一个字不动。
+
+#: 剥掉引号内容后，段尾还剩多少字以内算「裸对白段」
+_BARE_SEG_TAIL_MAX = 6
+
+#: 双字以上的说法动词（长串优先替换，避免「说道」被拆成「说」+「道」）
+_SPEECH_VERBS2 = (
+    "说道", "问道", "答道", "笑道", "喝道", "开口道", "沉声道", "冷声道",
+    "轻声道", "叹道", "怒道", "哑声道", "低声道", "柔声道", "解释道",
+    "补充道", "反问道", "笑问道", "喊道", "喃喃道", "接过话头", "接话道",
+)
+
+#: 单字说法词（只在剥完双字动词后仍剩 ≤12 字时才动，避免吃掉真动作）
+_SPEECH_VERBS1 = "道问答笑喝吼骂叹应叫唤嘟嚷哼"
+
+
+def _first_quote_pos(text: str) -> int:
+    idxs = [text.index(q) for q, _ in _QUOTE_PAIRS if q in text]
+    return min(idxs) if idxs else -1
+
+
+def _strip_quoted(text: str) -> str:
+    """把成对引号及其内容整段去掉，只留下引号外的字。"""
+    out = text
+    for open_q, close_q in _QUOTE_PAIRS:
+        while open_q in out and close_q in out:
+            a = out.index(open_q)
+            b = out.find(close_q, a + 1)
+            if b < 0:
+                out = out.replace(open_q, "")
+            else:
+                out = out[:a] + out[b + 1:]
+    return out
+
+
+def _strip_speech_tag(text: str) -> str:
+    """剥掉引号前的「说话人 + 提示语」，返回剩下的部分。
+
+    「陆崇问道：」→ 「陆崇」
+    「陆长风点头道：」→ 「陆长风点头」
+    「陆崇也不恼怒，乐呵呵道：」→ 「陆崇也不恼怒，乐呵呵」
+    ⇒ 剩下的若还有字，那就是**真动作/神态**。
+    """
+    pos = _first_quote_pos(text)
+    if pos < 0:
+        return ""
+    pre = _strip_quoted(text[:pos]).strip("：:，。！？…、；; \t　")
+    if not pre:
+        return ""
+    rest = pre
+    for v in sorted(_SPEECH_VERBS2, key=len, reverse=True):
+        rest = rest.replace(v, "")
+    if len(rest) <= 12:
+        for ch in _SPEECH_VERBS1:
+            if ch in rest:
+                rest = rest.replace(ch, "")
+                break
+    return rest.strip()
+
+
+def _is_speech_tag_only(text: str) -> bool:
+    """这一段引号外的内容**只是说话人 + 提示语**（没有动作/神态/环境）。
+
+    ⚠️ 不能只看「有没有提示语动词」——「陆崇也不恼怒，乐呵呵道：」也有，
+    但前面还有真动作。判据是「剥掉提示语后剩下的 ≤ 2 字」（只剩人名）。
+    """
+    rest = _strip_speech_tag(text)
+    return len(rest) <= 2
+
+
+def pooled_dialogue_form(texts: Iterable[str]) -> dict:
+    """样本级对白形态汇总：把所有单元里的对白段**汇总起来**再统计。
+
+    返回 ``{"n_segments", "seg_len_median", "seg_len_mean", "bare_ratio"}``。
+
+    为什么必须汇总而不是逐单元算再平均：逐单元等于「均值的均值」，
+    样本少时被超长对白段拉爆（真书实测：逐单元均值 142 / 汇总中位 59）。
+    所以对外展示的「典型对白段长度」取汇总后的中位数。
+    """
+    lens: list[int] = []
+    bare = 0
+    for t in texts:
+        for p in paragraphs(t):
+            if not any(q in p for q, _ in _QUOTE_PAIRS):
+                continue
+            lens.append(len(p))
+            rest = _strip_quoted(p)
+            if len(rest.strip("：:，。！？…、；; \t　")) <= _BARE_SEG_TAIL_MAX:
+                bare += 1
+    if not lens:
+        return {"n_segments": 0, "seg_len_median": 0.0, "seg_len_mean": 0.0, "bare_ratio": 0.0}
+    return {
+        "n_segments": len(lens),
+        "seg_len_median": float(statistics.median(lens)),
+        "seg_len_mean": float(statistics.fmean(lens)),
+        "bare_ratio": bare / len(lens),
+    }
