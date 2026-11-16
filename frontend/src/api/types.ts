@@ -1794,6 +1794,33 @@ export interface KgV3StyleWarningsResponse {
   truncated: boolean;
 }
 
+/** GET /kg-v3/corpus-windows：语料摄取窗口进度（只读聚合）。 */
+export interface KgV3CorpusWindowFailure {
+  window_key: string;
+  chapter_start: number;
+  chapter_end: number;
+  attempts: number;
+  /** 后端按 error 文本做的展示归类；原始 error 见 `error`。 */
+  reason: "parse_failed" | "channel_unavailable" | "other";
+  error: string | null;
+  updated_at: string | null;
+}
+export interface KgV3CorpusWindowsResponse {
+  /** false = 窗口表为空（从未摄取），不是「没有实体」。 */
+  ingested: boolean;
+  total: number;
+  counts: { pending: number; running: number; success: number; failed: number };
+  pending: number;
+  running: number;
+  success: number;
+  failed: number;
+  failed_reasons: { parse_failed: number; channel_unavailable: number; other: number };
+  /** error 里带「离线兜底」的失败窗口数（本质是渠道不可用）。 */
+  suspected_local_fallback: number;
+  failures: KgV3CorpusWindowFailure[];
+  last_run_at: string | null;
+}
+
 // ======================================================================
 // 对话式创作引导（/api/assistant/wizard/*）
 // ======================================================================

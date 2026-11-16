@@ -4,12 +4,14 @@ import { useRoute } from "vue-router";
 import { api } from "@/api/client";
 import type {
   KgV3Character,
+  KgV3CorpusWindowsResponse,
   KgV3EventsResponse,
   KgV3JudgeFinding,
   KgV3JudgeFindingsResponse,
   KgV3Relation,
   KgV3Slice,
 } from "@/api/types";
+import { buildCorpusStatus } from "@/utils/corpusStatus.js";
 
 const route = useRoute();
 const projectId = Number(route.params.id);
@@ -37,6 +39,21 @@ function switchTab(k: TabKey) {
   else if (k === "graph") loadGraphTab();
   else if (k === "worker") loadWorker();
   else if (k === "style") loadStyleWarnings();
+}
+
+// ---------- 语料摄取窗口状态条（只读） ----------
+// failed>0 必须显式显示失败，不能退化成「窗口内无实体」；空表说「尚未摄取」。
+const corpusWindows = ref<KgV3CorpusWindowsResponse | null>(null);
+const corpusWindowsErr = ref<string | null>(null);
+const corpusStatusView = computed(() => buildCorpusStatus(corpusWindows.value));
+
+async function loadCorpusWindows() {
+  corpusWindowsErr.value = null;
+  try {
+    corpusWindows.value = await api.kgV3CorpusWindows(projectId);
+  } catch (e) {
+    corpusWindowsErr.value = e instanceof Error ? e.message : String(e);
+  }
 }
 
 // ---------- Tab 1 切片预览 ----------
@@ -450,6 +467,7 @@ function sevTag(sev: string): string {
 
 onMounted(() => {
   loadSlice();
+  loadCorpusWindows();
 });
 
 // ---------- Tab 7 Style 审计（v2.1） ----------
@@ -503,6 +521,40 @@ function bucketChipStyle(bucket: string): Record<string, string> {
     <h1>知识图谱工作台</h1>
     <p>9 表实时读侧：切片预览 · 人物情报 · 事件时间线 · Judge 一致性告警 · 关系与节奏。</p>
   </header>
+
+  <!-- 语料摄取窗口状态条：failed>0 必须显式报失败，不能退化成「无实体」 -->
+  <div
+    v-if="corpusWindowsErr"
+    class="corpus-status corpus-status--error"
+    role="status"
+  >
+    <span class="corpus-status__label">语料摄取</span>
+    <strong class="corpus-status__text">状态读取失败</strong>
+    <span class="corpus-status__err">{{ corpusWindowsErr }}</span>
+  </div>
+  <div
+    v-else-if="corpusWindows"
+    class="corpus-status"
+    :class="`corpus-status--${corpusStatusView.tone}`"
+    role="status"
+  >
+    <span class="corpus-status__label">语料摄取</span>
+    <strong class="corpus-status__text">{{ corpusStatusView.text }}</strong>
+    <span v-if="corpusStatusView.detail" class="hint">{{ corpusStatusView.detail }}</span>
+    <span v-if="corpusWindows.last_run_at" class="hint">
+      最近运行：{{ corpusWindows.last_run_at }}
+    </span>
+    <details v-if="corpusWindows.failures?.length" class="corpus-failures">
+      <summary>查看失败窗口与原始错误（{{ corpusWindows.failures.length }}）</summary>
+      <ul>
+        <li v-for="f in corpusWindows.failures" :key="f.window_key">
+          <code>{{ f.window_key }}</code>
+          <span class="tag err">{{ f.reason }}</span>
+          <span>{{ f.error }}</span>
+        </li>
+      </ul>
+    </details>
+  </div>
 
   <nav class="tabs" style="margin-bottom: var(--gap-lg)">
     <button
@@ -1070,5 +1122,58 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .tag.info {
   background: var(--info-soft);
   color: var(--info);
+}
+/* 语料摄取状态条：失败态必须一眼可见，不能混在空数据里 */
+.corpus-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 0 0 var(--gap-lg);
+  padding: 10px 14px;
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  font-size: var(--fs-sm);
+}
+.corpus-status__label {
+  font-weight: 700;
+  color: var(--fg-muted);
+}
+.corpus-status--idle {
+  color: var(--fg-muted);
+}
+.corpus-status--ok {
+  background: var(--ok-soft);
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.corpus-status--warn {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.corpus-status--error {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.corpus-status__err {
+  color: var(--danger);
+}
+.corpus-failures {
+  width: 100%;
+  color: var(--fg-muted);
+}
+.corpus-failures summary {
+  cursor: pointer;
+}
+.corpus-failures ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.corpus-failures li {
+  margin-bottom: 4px;
+  word-break: break-all;
 }
 </style>

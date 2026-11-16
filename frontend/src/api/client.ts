@@ -69,6 +69,7 @@ import type {
   KgV3ExemptRequest,
   KgV3JudgeFindingsResponse,
   KgV3StyleWarningsResponse,
+  KgV3CorpusWindowsResponse,
   KgV3EventsResponse,
   KgV3Relation,
   KgV3Slice,
@@ -812,6 +813,14 @@ export const api = {
         started_at: string | null;
       }[];
     }>(`/projects/${projectId}/kg-v3/worker/status`),
+
+  /** 语料摄取窗口进度：状态聚合 + 失败归类 + 原始 error（只读）。 */
+  kgV3CorpusWindows: (projectId: number, novelId?: number | null) => {
+    const q = novelId ? `?novel_id=${novelId}` : "";
+    return request<KgV3CorpusWindowsResponse>(
+      `/projects/${projectId}/kg-v3/corpus-windows${q}`,
+    );
+  },
 
   /** 手动重捞失败的段（按 run id 列表）。 */
   kgV3Requeue: (projectId: number, runIds: number[]) =>

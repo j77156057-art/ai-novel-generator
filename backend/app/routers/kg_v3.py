@@ -397,6 +397,105 @@ def get_worker_status(project_id: int, db: Session = Depends(get_db)) -> dict:
     return worker_status(db, project_id)
 
 
+#: error 文本 → 失败归类。**只是展示用的归类**，原始 error 一律原样返回，
+#: 归类判断错了也不会丢证据。顺序有意义：渠道类标记先判，避免
+#: 「未配置 API Key → 远端返回空 → 解析失败」被误归成纯解析问题。
+_FAILURE_CHANNEL_MARKERS = (
+    "渠道不可用", "未配置", "api key", "apikey", "unauthorized",
+    "401", "403", "connection", "connect error",
+)
+
+
+def _classify_window_failure(error: str | None) -> str:
+    """把窗口 error 归成 parse_failed / channel_unavailable / other。"""
+    text = (error or "").strip()
+    low = text.lower()
+    if not low:
+        return "other"
+    if any(marker in low for marker in _FAILURE_CHANNEL_MARKERS):
+        return "channel_unavailable"
+    if low.startswith("parse_failed") or "无法从模型输出解析" in text:
+        return "parse_failed"
+    return "other"
+
+
+@router.get("/corpus-windows")
+def get_corpus_windows(
+    project_id: int,
+    novel_id: int | None = Query(None, description="只统计某本书；缺省为项目全部书"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """参考语料摄取的窗口进度聚合（只读）。
+
+    ## 为什么需要这个出口
+
+    `kg_corpus_windows` 是 corpus_ingest 的断点续跑账本，此前只有写侧。
+    整批失败（例如没配渠道、本地模板兜底解析不出 JSON）时，KG 页面仍显示
+    「还没有角色 / 窗口内无实体」，用户会误读成「本书没实体」，而不是
+    「摄取根本没跑成」。
+
+    返回口径：
+    - `ingested=False`（窗口表为空）= **尚未摄取**，不是「没有实体」；
+    - `failed>0` 时前端必须渲染失败状态条，不得退化成空数据文案；
+    - `failed_reasons` 是按 error 文本做的展示归类，原始 error 在
+      `failures[].error` 里保留；
+    - `suspected_local_fallback` 统计 error 里带「离线兜底」的窗口数——
+      这类失败本质是渠道不可用，但错误文本是解析失败。
+    """
+    _require_project(db, project_id)
+    from app.models import KgCorpusWindow
+
+    stmt = select(KgCorpusWindow).where(KgCorpusWindow.project_id == project_id)
+    if novel_id is not None:
+        stmt = stmt.where(KgCorpusWindow.novel_id == novel_id)
+    rows = list(db.scalars(stmt.order_by(KgCorpusWindow.chapter_start)))
+
+    counts = {"pending": 0, "running": 0, "success": 0, "failed": 0}
+    failed_reasons = {"parse_failed": 0, "channel_unavailable": 0, "other": 0}
+    failures: list[dict] = []
+    suspected_local_fallback = 0
+    last_run = None
+
+    for row in rows:
+        status = (row.status or "").lower()
+        if status == "done":
+            counts["success"] += 1
+        elif status in ("pending", "running", "failed"):
+            counts[status] += 1
+        if row.status == "failed":
+            reason = _classify_window_failure(row.error)
+            failed_reasons[reason] += 1
+            if "离线兜底" in (row.error or ""):
+                suspected_local_fallback += 1
+            failures.append({
+                "window_key": row.window_key,
+                "chapter_start": row.chapter_start,
+                "chapter_end": row.chapter_end,
+                "attempts": row.attempts,
+                "reason": reason,
+                "error": row.error,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            })
+        stamp = row.updated_at or row.created_at
+        if stamp is not None and (last_run is None or stamp > last_run):
+            last_run = stamp
+
+    return {
+        "ingested": bool(rows),
+        "total": len(rows),
+        "counts": counts,
+        # 顶层冗余一份关键计数，前端状态条不必再往下钻。
+        "pending": counts["pending"],
+        "running": counts["running"],
+        "success": counts["success"],
+        "failed": counts["failed"],
+        "failed_reasons": failed_reasons,
+        "suspected_local_fallback": suspected_local_fallback,
+        "failures": failures[:50],
+        "last_run_at": last_run.isoformat() if last_run else None,
+    }
+
+
 @router.get("/text-gate/no-generation")
 def get_text_gate_no_generation(project_id: int,
                                 db: Session = Depends(get_db)) -> dict:
