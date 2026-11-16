@@ -1154,3 +1154,50 @@ def _fit_single_bucket(
             }
         bucket["holdout"]["feat_abs_z"] = feat_holdout
     return bucket
+
+
+def band_check(text: str, profile: dict, names: Sequence[str]) -> dict[str, dict]:
+    """量一段文本在指定特征上的位置（相对档案自己的分布）。
+
+    返回 ``{特征名: {"value": 实测值, "band": 档案该特征自己的分布, "bucket": 桶名}}``。
+
+    凡是「拿参考书自己的分布当尺子」的地方都要它 —— 诊断规则判「比 90% 的人类
+    样本还碎」、改写闸门判「这段偏离到值得动一次改写」。各写一份就会出现
+    「两处选桶不一样 ⇒ 同一段文字两个结论」。
+
+    长度归一化要**除掉**：`features()` 对非密度特征乘了
+    `exp(-|log(len/unit)|*0.3)`（让跨长度可比），但档案里的分布是在 unit 长度
+    上拟的（缩放 ≈ 1）。一段 1000 字的文本会被缩到 0.72，拿它跟档案的 p10 比，
+    会把「句长本来就够」的长句文本判成「比 90% 的人类样本还碎」。
+    所以这里把文本这一侧的长度因子除掉，两边才是同一把尺。
+    """
+    out: dict[str, dict] = {}
+    if not profile or not text or not text.strip():
+        return out
+    base_unit = int(
+        (profile.get("_meta") or {}).get("base_unit_chars")
+        or profile.get("unit_chars")
+        or 0
+    )
+    if profile.get("version") == 2 and profile.get("buckets"):
+        bucket_name = pick_bucket(cjk_len(text), base_unit)
+        bucket = profile["buckets"].get(bucket_name) or profile["buckets"].get("medium")
+        if not bucket:
+            return out
+    else:
+        bucket_name = "v1"
+        bucket = profile
+    unit = int(bucket.get("unit_chars") or base_unit or 3000)
+    vec = features(text, unit_chars=unit)
+    # 长度因子也用**纯汉字数**（与 `features()` 内部一致）——
+    # 否则「同一段文本只改排版」会让归一化后的读数漂。
+    scale = _length_scale_factor(cjk_len(text), unit)
+    feat = bucket.get("feat") or profile.get("feat") or {}
+    for name in names:
+        band = feat.get(name) or {}
+        if not band:
+            continue
+        raw = float(vec.get(name) or 0.0)
+        value = raw / scale if (name in NON_DENSITY_FEATURES and scale) else raw
+        out[name] = {"value": value, "band": band, "bucket": bucket_name}
+    return out

@@ -762,34 +762,51 @@ def run_distill_job(
         db.commit()
 
         progress = _make_progress_writer(job_id, db)
-        profile = project_narrative(
-            db, project, force=force, tier=tier, progress=progress,
-            content_hash=content_hash,
-            heartbeat=_make_heartbeat_writer(job_id, db),
-            resume=resume and not force,
-        )
-        if not isinstance(profile, dict):
-            raise ValueError("蒸馏未产出档案（可能是档位不合法或语料为空）")
+        if (run.kind or "narrative") == "character_template":
+            # 批 5 前置：人物塑造模板是独立产物（每块一次调用，约 1/8 的量），
+            # 抽它不必重蒸整本档案，旧档案照旧有效。
+            from app.style.narrative import extract_character_template
 
-        rules = profile.get("rules") or {}
-        # 部分块失败（LLM 超时/限流被跳过）：任务算成功，但如实写进 stage——
-        # 「蒸馏完成」和「蒸馏完成（有块被跳过）」对用户是两件事。
-        failed_chunks = int(profile.get("failed_chunks") or 0)
-        if failed_chunks:
-            logger.warning(
-                "蒸馏任务部分块失败 job_id=%s project_id=%s failed_chunks=%s",
-                job_id, project_id, failed_chunks,
+            row = extract_character_template(
+                db, project, list(project.reference_novel_ids or []),
+                tier=tier, progress=progress,
             )
-        run.status = STATUS_SUCCESS
-        run.stage = (
-            "蒸馏完成" if not failed_chunks
-            else f"蒸馏完成（{failed_chunks} 个语料块调用失败，已跳过）"
-        )
-        run.n_chapters = profile.get("n_chapters")
-        run.rejected = profile.get("rejected")
-        run.rule_count = sum(
-            len(v) for v in rules.values() if isinstance(v, list)
-        )
+            rules: dict = {}
+            failed_chunks = 0
+            run.status = STATUS_SUCCESS
+            run.stage = "人物塑造模板已就绪"
+            run.n_chapters = getattr(row, "n_chunks", None)
+            run.rejected = getattr(row, "rejected", None)
+            run.rule_count = len(getattr(row, "rules", None) or [])
+        else:
+            profile = project_narrative(
+                db, project, force=force, tier=tier, progress=progress,
+                content_hash=content_hash,
+                heartbeat=_make_heartbeat_writer(job_id, db),
+                resume=resume and not force,
+            )
+            if not isinstance(profile, dict):
+                raise ValueError("蒸馏未产出档案（可能是档位不合法或语料为空）")
+
+            rules = profile.get("rules") or {}
+            # 部分块失败（LLM 超时/限流被跳过）：任务算成功，但如实写进 stage——
+            # 「蒸馏完成」和「蒸馏完成（有块被跳过）」对用户是两件事。
+            failed_chunks = int(profile.get("failed_chunks") or 0)
+            if failed_chunks:
+                logger.warning(
+                    "蒸馏任务部分块失败 job_id=%s project_id=%s failed_chunks=%s",
+                    job_id, project_id, failed_chunks,
+                )
+            run.status = STATUS_SUCCESS
+            run.stage = (
+                "蒸馏完成" if not failed_chunks
+                else f"蒸馏完成（{failed_chunks} 个语料块调用失败，已跳过）"
+            )
+            run.n_chapters = profile.get("n_chapters")
+            run.rejected = profile.get("rejected")
+            run.rule_count = sum(
+                len(v) for v in rules.values() if isinstance(v, list)
+            )
         # 收尾对齐：命中缓存时进度是 (1,1)，正常跑完时 total 可能大于 current
         # （估算法会把未探明的余量算进去），统一收成 100% 免得显示 97% 却成功。
         if not run.progress_total or run.progress_current < run.progress_total:

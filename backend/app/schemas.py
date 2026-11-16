@@ -143,6 +143,10 @@ class PlotBibleOut(BaseModel):
     conflicts: list[str] = []  # 剧情冲突
     foreshadowing: list[str] = []  # 伏笔
     synopsis: Optional[str] = None  # 完整剧情梗概（quick/expert 构思结果）
+    # 世界背景（作者手写）。**必须显式声明**：PlotBibleOut 走 pydantic，
+    # 未声明的字段会被 model_dump() 静默丢弃 —— 模型给了 background 也会
+    # 在落库前消失，而且不报错（与 StrictRequest 那条同源的坑）。
+    background: Optional[dict] = None
     note: Optional[str] = None  # 降级提示（如模型限流时返回本地模板并说明）
 
 

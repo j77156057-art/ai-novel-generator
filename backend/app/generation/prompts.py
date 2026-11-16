@@ -978,6 +978,7 @@ def build_system_prompt(
         "（以上维度是倾向参考，不要直接翻译成类型套路或标签化文风。）\n"
         f"{_profile_block(style_profile)}\n"
         f"{_narrative_block(style_narrative, style_source_ids, opening=is_opening, mode=narrative_mode, timeline=narrative_timeline)}"
+        f"{_character_profile_block(style_narrative, profile=narrative_mode, character_names=sorted(appeared_names) if appeared_names else None)}"
         f"{_override_section(_OVERRIDE_STYLE_HEADER, style_suffix)}"
         "【文风要求：真人小说感，忌 AI 腔】\n"
         "- 禁止金句化台词：人物不许说出格言式总结或口号（如「不被遗忘本身就是最贵的代价」）；"
@@ -1215,10 +1216,31 @@ def build_user_prompt(
             "表示本节已完整收口。"
         )
 
+    # —— 世界背景（作者手写：这个世界是什么样）——
+    # **时间线模式也注入**（与 plot_bible 的处理相反）：背景组不含走向，
+    # 剔掉只会让模型每段自己现编一套（城名、规则、势力各写各的）。
+    # 没写背景 ⇒ **整块不输出**（空块是负面暗示）。
+    from app.generation.background import render_background
+
+    background_text = render_background(
+        plot_bible.get("background") if isinstance(plot_bible, dict) else None
+    )
+
     blocks = [
         "【前情提要】",
         prior,
         "",
+    ]
+    # —— 世界背景放在「剧情圣经·动态指引」**之前** ——
+    # 背景是恒定设定（每段都一样），动态指引是会变的；先恒定后变化，
+    # 模型读到最后时记忆里最靠前的是背景 ⇒ 不容易随剧情漂移。
+    if background_text:
+        blocks += [
+            "【世界背景（作者设定，全书一致，不得与之矛盾）】",
+            background_text,
+            "",
+        ]
+    blocks += [
         "【剧情圣经·动态指引】",
         bible_block,
     ]
@@ -1319,3 +1341,46 @@ def build_user_prompt(
     if directive_extra:
         blocks += ["", directive_extra.rstrip("\n")]
     return "\n".join(blocks)
+
+
+def _character_profile_block(
+    style_narrative: dict | None,
+    *,
+    profile: str | None,
+    character_names: list[str] | None,
+) -> str:
+    """按生成模式和当前角色清单注入 L2 角色档案。
+
+    批 5 前置：`render_character_profile` 此前零调用（只有定义），这一层把它
+    接到 writer 提示词上。original（原创）模式恒空——档案抽取自参考书角色，
+    塞进原创提示词等于让模型照抄参考书人设。
+    """
+    from app.generation.profiles import normalize_profile
+    mode = normalize_profile(profile)
+    if mode == "original" or not style_narrative:
+        return ""
+    wanted = {str(n).strip() for n in (character_names or []) if str(n).strip()}
+    if not wanted:
+        return ""
+    entries = style_narrative.get("characters") or []
+    if not isinstance(entries, list):
+        return ""
+    from app.style.character_profile import render_character_profile
+    depth = "brief" if mode == "roleplay" else "full"
+    blocks = []
+    for entry in entries:
+        if not isinstance(entry, dict) or str(entry.get("name") or "").strip() not in wanted:
+            continue
+        import os
+        item = dict(entry)
+        relations = item.get("关系网") or {}
+        experimental = os.environ.get("SCENE_CONTRACT_ENABLED") == "1"
+        if experimental:
+            item["关系网"] = {k: v for k, v in relations.items() if k in wanted}
+        blocks.append(render_character_profile(item, relation_depth=depth))
+        if experimental and len(blocks) >= (1 if mode == "roleplay" else 3):
+            break
+    blocks = [block for block in blocks if block]
+    if not blocks:
+        return ""
+    return "【L2角色档案】\n" + "\n".join(f"- {block}" for block in blocks) + "\n"

@@ -921,3 +921,970 @@ def export_txt(project_id: int, db: Session = Depends(get_db)) -> PlainTextRespo
             "Content-Disposition": f'attachment; filename="{ascii_name}.txt"; filename*=UTF-8\'\'{utf_name}'
         },
     )
+
+
+# ====================================================================
+# 批 5 前置：设定层端点（角色模板 / 角色卡 / 战力 / 修炼 / 背景 / 规模）
+# 来源：freeze/main-cb05a45:backend/app/routers/projects.py
+# ====================================================================
+
+# ====================================================================
+# 人物塑造模板（独立产物，按档位分开存放）
+# ====================================================================
+
+
+class CharacterTemplateRequest(StrictRequest):
+    """`POST /api/projects/{id}/character-template` 的请求体。"""
+
+    #: 档位 key（full/balanced/fast）。不给则沿用项目上已存的 `narrative_tier`。
+    tier: str | None = None
+    #: True = 同档位也强制重抽（忽略「库里已有」的复用）。
+    force: bool = False
+
+
+class CharacterTemplateApplyRequest(StrictRequest):
+    """`POST /api/projects/{id}/character-templates/apply` 的请求体。"""
+
+    #: 要应用的模板产物 id（形如 `full:9a3f1166f4e6:1f2a3b4c`，**自带档位**）。
+    template_id: str
+
+
+@router.get("/character-templates")
+def list_character_templates(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> dict:
+    """列出库里的**人物塑造模板**产物（新的在前）。
+
+    每条产物的 `id` 自带档位（`full:9a3f1166f4e6:1f2a3b4c`）：
+    哪一档、哪次档位配置、哪一版语料 —— 一眼就看出来，不用再翻表。
+    """
+    from app.style.character_template import list_templates
+    items = []
+    for row in list_templates(db, limit=limit):
+        items.append({
+            "id": row.id,
+            "tier": row.tier,
+            "tier_signature": row.tier_signature,
+            "source_ids": row.source_ids,
+            "content_hash": row.content_hash,
+            "rule_count": len(row.rules or []),
+            "n_chunks": row.n_chunks,
+            "rejected": row.rejected,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "applied_at": row.applied_at.isoformat() if row.applied_at else None,
+        })
+    return {"items": items}
+
+
+@router.post("/{project_id}/character-template")
+def start_character_template(
+    project_id: int,
+    body: CharacterTemplateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> dict:
+    """提炼**人物塑造模板**：**立即返回** job_id，抽取在后台跑。
+
+    与叙事蒸馏分开的原因：叙事档案一次完整档要 42 分钟，而模板只要每块
+    一次调用（约 1/8 的量）。**抽模板不必重蒸整本档案** —— 旧档案照旧有效。
+
+    库里已有同一档的模板产物时直接复用（`from_cache: True`），不重抽。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    if not (proj.reference_novel_ids or []):
+        raise HTTPException(status_code=409, detail="项目未选参考语料，无法提炼模板")
+
+    from app.style.narrative import resolve_tier
+    try:
+        cfg = resolve_tier(body.tier or getattr(proj, "narrative_tier", None))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 复用预测：库里已有这一档的模板吗？
+    from_cache = False
+    if not body.force:
+        from app.style.narrative import (_source_ids_hash, _tier_signature,
+                                        corpus_content_hash)
+        from app.style.character_template import find_template
+        ids = [int(i) for i in (proj.reference_novel_ids or [])]
+        content_hash = corpus_content_hash(ids, db)
+        existing = find_template(
+            db, tier=cfg.key, tier_signature=_tier_signature(cfg),
+            content_hash=content_hash)
+        from_cache = existing is not None
+
+    if not body.force:
+        active = find_active_run(db, project_id, kind="character_template")
+        if active is not None and active.tier == cfg.key:
+            return {"job_id": active.id, "status": active.status, "tier": active.tier,
+                    "kind": "character_template", "reused": True,
+                    "from_cache": from_cache, "cache_source": "library" if from_cache else None}
+
+    run = create_distill_run(db, project_id, cfg.key, kind="character_template")
+    background_tasks.add_task(run_distill_job, run.id, project_id, cfg.key, body.force)
+    return {
+        "job_id": run.id,
+        "status": run.status,
+        "tier": run.tier,
+        "kind": "character_template",
+        "reused": False,
+        "from_cache": from_cache,
+        "cache_source": "library" if from_cache else None,
+    }
+
+
+@router.post("/{project_id}/character-templates/apply", response_model=ProjectOut)
+def apply_character_template(
+    project_id: int,
+    body: CharacterTemplateApplyRequest,
+    db: Session = Depends(get_db),
+) -> Project:
+    """把库里某条**人物塑造模板**应用到本项目（只记引用，不改正文）。"""
+    from app.models import CharacterTemplate
+    from app.style.character_template import apply_template
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    row = db.get(CharacterTemplate, body.template_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="模板产物不存在")
+    apply_template(db, proj, row)
+    return proj
+
+
+# ====================================================================
+# 角色卡：身份 / 能力（武器·功法·能力）/ 声纹 / 关系（2026-10-29）
+# ====================================================================
+#
+# 用户诉求：「没有记录角色使用的武器、功法、什么能力」+「新建角色时 AI 自动
+# 添加性格、行为、关系、口头禅」+「不要千篇一律」。
+#
+# 纪律（与 persona 一致）：
+# 1. **人写的归人**：用户保存的卡标 `来源=user`，任何自动流程不覆盖；
+# 2. **AI 只建议**：生成结果只返回、不落库，采纳由人点；
+# 3. **不编造**：从正文抽卡时武器/功法/能力的名称必须能在正文里查到。
+
+class CardSaveRequest(StrictRequest):
+    """`POST /api/projects/{id}/character-cards` 的请求体。"""
+
+    name: str
+    card: dict
+
+
+class CardGenerateRequest(StrictRequest):
+    """`POST /api/projects/{id}/character-cards/generate`（单角色补全）的请求体。"""
+
+    name: str
+    card: dict = {}
+    note: str = ""
+
+
+class CardsBatchRequest(StrictRequest):
+    """`POST /api/projects/{id}/character-cards/batch`（批量新建）的请求体。"""
+
+    #: 要新建的角色（名字，或「名字：一句话设定」）。
+    wants: list[str]
+    note: str = ""
+
+
+def _bible_of(proj) -> dict:
+    import json as _json
+
+    bible = proj.plot_bible
+    if isinstance(bible, str):
+        try:
+            bible = _json.loads(bible)
+        except Exception:  # noqa: BLE001
+            bible = {}
+    return bible if isinstance(bible, dict) else {}
+
+
+def _story_of(proj) -> dict:
+    return {
+        "title": proj.title or "",
+        "genre": getattr(proj, "genre", "") or "",
+        "style": getattr(proj, "style", "") or "",
+        "premise": getattr(proj, "premise", "") or "",
+    }
+
+
+def _existing_voices(bible: dict) -> dict:
+    """已有角色的声纹签名（批量生成时用来避让）。"""
+    from app.generation.character_card import voice_signature
+
+    out = {}
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        card = c.get("card")
+        if isinstance(card, dict):
+            sig = voice_signature(card)
+            if sig:
+                out[str(c["name"])] = sig
+    return out
+
+
+@router.get("/{project_id}/character-cards")
+def list_character_cards(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """列出本项目所有角色的卡（含 persona，方便界面一次拿全）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    bible = _bible_of(proj)
+    out = []
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        card = c.get("card") if isinstance(c.get("card"), dict) else {}
+        persona = c.get("persona") if isinstance(c.get("persona"), dict) else {}
+        out.append({
+            "name": c.get("name"),
+            "role": c.get("role") or "",
+            "motivation": c.get("motivation") or "",
+            "card": card,
+            "card_source": card.get("来源") or "",
+            "persona": persona,
+            "persona_source": persona.get("来源") or "",
+        })
+    # 声纹撞车（界面提示「这几个人说话太像」，用来引导用户去改）
+    from app.generation.character_card import voice_collisions
+
+    cards = {item["name"]: item["card"] for item in out if item["card"]}
+    return {"characters": out, "voice_collisions": voice_collisions(cards)}
+
+
+@router.post("/{project_id}/character-cards")
+def save_character_card(
+    project_id: int, body: CardSaveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存**用户编辑过**的角色卡（只动 card，不碰 name/role/motivation/persona）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name 不能为空")
+
+    from app.generation.character_card import SOURCE_USER, normalize_card
+
+    card = normalize_card(body.card or {})
+    card["来源"] = SOURCE_USER  # 人写的，任何自动流程不覆盖
+
+    bible = _bible_of(proj)
+    chars = bible.get("characters")
+    if not isinstance(chars, list):
+        chars = []
+    found = False
+    for c in chars:
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            c["card"] = card
+            found = True
+            break
+    if not found:
+        chars.append({"name": name, "role": "", "motivation": "", "card": card})
+    bible["characters"] = chars
+
+    # JSON 列必须显式标脏（2026-10-28 踩过：赋值后 UPDATE 不一定发出）
+    from sqlalchemy.orm.attributes import flag_modified
+
+    proj.plot_bible = bible
+    flag_modified(proj, "plot_bible")
+    db.commit()
+    return {"ok": True, "name": name, "card": card}
+
+
+@router.post("/{project_id}/character-cards/generate")
+def generate_character_card(
+    project_id: int, body: CardGenerateRequest, db: Session = Depends(get_db)
+) -> dict:
+    """给**一个已有角色**补全卡（AI 只建议，不落库）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name 不能为空")
+
+    from app.generation.character_card_gen import complete_card
+
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    bible = _bible_of(proj)
+    char = {"name": name}
+    for c in (bible.get("characters") or []):
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            char = dict(c)
+            break
+    story = _story_of(proj)
+    char.setdefault("_title", story["title"])
+    char.setdefault("_genre", story["genre"])
+    char.setdefault("_premise", story["premise"])
+
+    result = _model_call(
+        "补全角色卡",
+        lambda: complete_card(provider, char, body.card or char.get("card") or {},
+                              body.note or "", raise_errors=True),
+    )
+    if not result:
+        return {"ok": False, "detail": "AI 没给出可用结果（可重试或改写要求）"}
+    return {
+        "ok": True,
+        "name": name,
+        "补充": result.get("补充") or {},
+        "说明": result.get("说明") or "",
+        "voice_collisions": _collisions_with(result.get("补充") or {}, name, bible),
+    }
+
+
+@router.post("/{project_id}/character-cards/batch")
+def generate_character_cards_batch(
+    project_id: int, body: CardsBatchRequest, db: Session = Depends(get_db)
+) -> dict:
+    """**批量**生成新角色的卡（互相避让；撞了就重写）。
+
+    生成结果**不落库** —— 由用户在界面上逐个采纳。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    wants = [str(w).strip() for w in (body.wants or []) if str(w).strip()]
+    if not wants:
+        raise HTTPException(status_code=400, detail="wants 不能为空")
+
+    from app.generation.character_card_gen import generate_cards
+
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    bible = _bible_of(proj)
+    result = _model_call(
+        "批量生成角色卡",
+        lambda: generate_cards(provider, _story_of(proj), wants,
+                               already=_existing_voices(bible), note=body.note or "",
+                               raise_errors=True),
+    )
+    return {
+        "ok": bool(result.get("角色")),
+        "角色": result.get("角色") or {},
+        "冲突": result.get("冲突") or [],
+        "轮次": result.get("轮次") or 0,
+    }
+
+
+def _collisions_with(card: dict, name: str, bible: dict) -> list:
+    """新卡与既有角色的声纹撞车（只看有卡的那些）。"""
+    from app.generation.character_card import voice_collisions
+
+    cards = {}
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        if str(c["name"]) == name:
+            continue
+        if isinstance(c.get("card"), dict) and c["card"]:
+            cards[str(c["name"])] = c["card"]
+    if not cards or not card:
+        return []
+    cards[name] = card
+    return [x for x in voice_collisions(cards) if name in x.get("人物", [])]
+
+
+def _provider_or_none():
+    """取当前 LLM provider（取不到就 None —— 端点回 503，不抛栈）。
+
+    入口与 persona 端点一致（`app.llm.provider.get_llm_provider`），
+    不另造一套取法（否则提示词/渠道配置会分叉）。
+    """
+    try:
+        from app.llm.provider import get_llm_provider
+
+        return get_llm_provider()
+    except Exception:  # noqa: BLE001 —— 渠道没配只是这个端点不可用
+        return None
+
+#: 渠道失败 → 给人看的话。**判断顺序有意义**：先认限流，再认鉴权，最后才认超时
+#: （「HTTP Error 429」里没有 timeout 字样，但反过来会误伤）。
+_MODEL_FAILURE_HINTS = (
+    ("429", "模型渠道限流或额度已用尽"),
+    ("too many requests", "模型渠道限流或额度已用尽"),
+    ("freeusagelimit", "模型渠道额度已用尽"),
+    ("insufficient", "模型渠道额度已用尽"),
+    ("quota", "模型渠道额度已用尽"),
+    ("401", "模型渠道鉴权失败"),
+    ("403", "模型渠道鉴权失败"),
+    ("unauthorized", "模型渠道鉴权失败"),
+    ("timed out", "模型渠道超时"),
+    ("timeout", "模型渠道超时"),
+)
+
+
+def _model_failure_detail(what: str, exc: BaseException) -> str:
+    """把渠道异常翻成一句**能照着做**的话。
+
+    界面上不放整段栈（看不懂），但也不吞掉原话 —— 原话是判断「重试还是充值」
+    的唯一线索，截到 200 字放进末尾。
+    """
+    raw = " ".join(str(exc or "").split())
+    low = raw.lower()
+    why = next((text for needle, text in _MODEL_FAILURE_HINTS if needle in low), "")
+    if not why:
+        why = "模型渠道调用失败"
+    if len(raw) > 200:
+        raw = raw[:200] + "…"
+    head = f"{what}没做成：{why}。"
+    return head + (f"渠道原话：{raw}" if raw else "")
+
+
+def _model_call(what: str, fn):
+    """跑一次模型调用；渠道异常换成 502 + 可读原因。
+
+    为什么不是 500：500 的含义是「本站写错了」，而渠道限流/超时/欠费是**外部
+    状态**，人应该看到「等会儿再试」还是「去配额度」。`what` 用**这件事的名字**
+    （如「生成修炼体系」），它直接进界面。
+    """
+    try:
+        return fn()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 渠道故障不是本站 bug，要说清原因
+        raise HTTPException(
+            status_code=502, detail=_model_failure_detail(what, exc)
+        ) from exc
+
+
+# ====================================================================
+# 修炼体系 / 档位分层 / 角色修炼档案（2026-10-29）
+# ====================================================================
+#
+# 用户诉求：「涉及到武侠的、修仙的，还有其他乱七八糟的修炼体系的，
+# 那么这个要不要做去角色卡，那么主角目前的境界，以后的境界，
+# 还有中途的修炼等级，还有其他各式各样配角和路人甲的等级……
+# 角色有什么修炼天赋……修炼遇到了叉，掉了境界，或者为了活命燃烧了寿命，
+# 或者是去了什么洞府得到了提升这种动态的路线，怎么规划」
+#
+# 三条纪律（与角色卡一致）：
+# 1. **体系不写死**：用户自己定义阶梯（武侠修仙都能填）；
+# 2. **分层群像**：路人只记档位（「筑基期散修」），主角与主要配角才逐个精确记；
+# 3. **AI 只建议**：体系/路线生成结果不落库，人点采纳才写。
+
+class PowerSystemRequest(StrictRequest):
+    """`POST /api/projects/{id}/power-system` 的请求体。"""
+
+    #: 体系（单个或多个）。空 dict 表示清空。
+    power_system: dict = {}
+    #: 档位分层（群像）。
+    tiers: list = []
+
+
+class PowerSystemGenerateRequest(StrictRequest):
+    """`POST /api/projects/{id}/power-system/generate` 的请求体。"""
+
+    genre: str = ""
+    tone: str = ""
+    note: str = ""
+    #: 作者指定的体系类型（细分型 / 序列型 / 粗放型）；空 = 让 AI 自己定。
+    #:
+    #: 为什么要有：类型一直是**模型自己说的** —— 实测要「粗放型」时，
+    #: 模型给了一套细分阶梯并自判「细分型」。作者能说清要哪种时，
+    #: 就该由作者说了算（不合就带原因重试）。
+    system_type: str = ""
+
+
+class TierGenerateRequest(StrictRequest):
+    """`POST /api/projects/{id}/power-system/tiers/generate` 的请求体。"""
+
+    note: str = ""
+
+
+class CultivationSaveRequest(StrictRequest):
+    """`POST /api/projects/{id}/cultivation` 的请求体。"""
+
+    name: str
+    #: 修炼档案（当前境界/天赋/瓶颈/路线/代价…）。
+    profile: dict = {}
+
+
+class RoutePlanRequest(StrictRequest):
+    """`POST /api/projects/{id}/cultivation/plan` 的请求体。"""
+
+    name: str
+    note: str = ""
+
+
+def _ps_bible(proj) -> dict:
+    import json as _json
+
+    bible = proj.plot_bible
+    if isinstance(bible, str):
+        try:
+            bible = _json.loads(bible)
+        except Exception:  # noqa: BLE001
+            bible = {}
+    return bible if isinstance(bible, dict) else {}
+
+
+def _mark_bible_dirty(proj, bible: dict) -> None:
+    """JSON 列必须显式标脏（2026-10-28 踩过：赋值后 UPDATE 不一定发出）。"""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    proj.plot_bible = bible
+    flag_modified(proj, "plot_bible")
+    db = proj  # noqa: F841 —— 仅示意；实际 commit 由调用方做
+
+
+@router.get("/{project_id}/power-system")
+def get_power_system(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """取本项目的修炼体系与档位分层。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    bible = _ps_bible(proj)
+    from app.generation.cultivation import normalize_tiers
+    from app.generation.power_system import systems_of
+
+    return {
+        "power_system": {"体系": systems_of(bible)},
+        "tiers": normalize_tiers(bible.get("tier_layers") or []),
+    }
+
+
+@router.post("/{project_id}/power-system")
+def save_power_system(
+    project_id: int, body: PowerSystemRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存**用户编辑过**的修炼体系与档位分层。
+
+    档位层里若用了体系里没有的档位名 ⇒ **丢掉那一层**
+    （否则分层群像会出现「体系里没有的档次」，写作时没法对照）。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+
+    from app.generation.cultivation import normalize_tiers
+    from app.generation.power_system import normalize_power_system, systems_of
+
+    bible = _ps_bible(proj)
+    if body.power_system:
+        bible["power_system"] = normalize_power_system(body.power_system)
+    else:
+        bible.pop("power_system", None)
+
+    tiers = normalize_tiers(body.tiers)
+    systems = systems_of(bible)
+    if systems:
+        from app.generation.power_system_gen import filter_tiers_by_bands
+
+        tiers = filter_tiers_by_bands(tiers, systems[0])
+    if tiers:
+        bible["tier_layers"] = tiers
+    else:
+        bible.pop("tier_layers", None)
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    proj.plot_bible = bible
+    flag_modified(proj, "plot_bible")
+    db.commit()
+    return {"ok": True, "power_system": bible.get("power_system") or {},
+            "tiers": bible.get("tier_layers") or []}
+
+
+@router.post("/{project_id}/power-system/generate")
+def generate_power_system(
+    project_id: int, body: PowerSystemGenerateRequest, db: Session = Depends(get_db)
+) -> dict:
+    """AI 生成一套修炼体系（**只建议，不落库**）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    from app.generation.power_system_gen import (
+        _SYSTEM_PROMPT, build_system_prompt, parse_systems, retry_instructions,
+        system_quality_issues, type_mismatch_issues,
+    )
+
+    want_type = (body.system_type or "").strip()
+    prompt = build_system_prompt(body.genre or getattr(proj, "genre", "") or "",
+                                 body.tone or getattr(proj, "style", "") or "",
+                                 body.note or "", want_type)
+    # ⚠️ system 段必须是 `_SYSTEM_PROMPT`（含三型说明、硬要求、输出 JSON 的格式）——
+    # 之前这里只发了一行「你在为一本中文小说设计修炼体系。」，
+    # **那份写着全部要求的提示词定义了却从没发出去** ⇒ 模型不知道要输出 JSON、
+    # 不知道三型怎么选、也不知道档位怎么分层（实测因此回表格、回标题、
+    # 把类型猜错、把细分摊平成 90 行）。
+    raw = _model_call("生成修炼体系", lambda: provider.chat(_SYSTEM_PROMPT, prompt))
+    systems = parse_systems(raw)
+    issues = system_quality_issues(systems)
+    issues += type_mismatch_issues(systems, want_type)
+    if issues:
+        # 解析不出来 **或** 解析出来的不像一套体系 ⇒ 带一句硬要求 + **具体错在哪**
+        # 重试一次。
+        #
+        # 实测同一天多种形态：`#### 1. 开脉境` 标题 + 正文、Markdown 表格、
+        # 有序列表；App 自己的 MiniMax 通道还回过**层级被摊平**的一版
+        # （29 个境界，名字是「初期/中期/大圆满」反复出现）。
+        # 解析器追不完，但**回灌一句硬要求 + 指出上一版错在哪**通常一次就够 ——
+        # 这是「门槛 + 让执行方自己改」，比无限加形态支持稳。
+        raw = _model_call(
+            "生成修炼体系（重试）",
+            lambda: provider.chat(system=_SYSTEM_PROMPT,
+                                  user=prompt + retry_instructions(issues, want_type)),
+        )
+        systems = parse_systems(raw)
+        issues = system_quality_issues(systems)
+        issues += type_mismatch_issues(systems, want_type)
+    if issues:
+        # 失败时把**模型原文**带出去：只说「认不出」等于让人干瞪眼，
+        # 看到原文才知道是模型写歪了、还是解析器没认出来（这两者的修法完全不同）。
+        return {"ok": False,
+                "detail": "AI 回了内容但认不出是一套体系：" + "；".join(issues[:3])
+                          + "（已按格式要求重试一次）",
+                "原文": (raw or "")[:2000]}
+    return {"ok": True, "体系": systems}
+
+
+class BackgroundSaveRequest(StrictRequest):
+    """`POST /api/projects/{id}/background` 的请求体。"""
+
+    #: 作者写的背景组（可空 —— 空表示清空这一块）。
+    background: dict = {}
+
+
+class BackgroundGenerateRequest(StrictRequest):
+    """`POST /api/projects/{id}/background/generate` 的请求体。"""
+
+    #: 作者给 AI 的额外要求（可选，如「硬规则里加上灵石稀缺」）。
+    note: str = ""
+
+
+@router.get("/{project_id}/background")
+def get_background(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """取本项目的世界背景与硬规则。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.generation.background import background_of
+
+    return {"background": background_of(_ps_bible(proj))}
+
+
+@router.post("/{project_id}/background")
+def save_background(
+    project_id: int, body: BackgroundSaveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存**作者写**的世界背景与硬规则。
+
+    写进 `plot_bible["background"]`（与体系/角色卡同一条路：
+    合并进现有 bible 再整体写回 + `flag_modified` 标脏）。
+
+    传空组 ⇒ 清空这一块（提示词里那一整块会消失）。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+
+    from app.generation.background import normalize_background
+    from sqlalchemy.orm.attributes import flag_modified
+
+    bible = _ps_bible(proj)
+    normalized = normalize_background(body.background)
+    if normalized:
+        bible["background"] = normalized
+    else:
+        bible.pop("background", None)
+    proj.plot_bible = bible
+    flag_modified(proj, "plot_bible")
+    db.commit()
+    return {"ok": True, "background": normalized}
+
+
+@router.post("/{project_id}/background/generate")
+def generate_background(
+    project_id: int, body: BackgroundGenerateRequest, db: Session = Depends(get_db)
+) -> dict:
+    """AI 补一份世界背景与硬规则（**只建议，不落库**）。
+
+    纪律与体系、角色卡一致：AI 的东西要人点「采纳」才写进去。
+    老项目（合成圣经时模型没给 background）用这条补上。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    from app.generation.background import normalize_background
+    from app.generation.persona import _safe_json
+
+    bible = _ps_bible(proj)
+    premise = str(proj.premise or "")
+    synopsis = str(bible.get("synopsis") or "")
+    parts = []
+    if proj.genre or proj.style:
+        parts.append(f"类型：{proj.genre or ''}\n风格平台：{proj.style or ''}")
+    if premise:
+        parts.append(f"小说大概内容（用户写的，其中可能混有剧情走向，"
+                     f"**只从中提取世界设定，不要保留走向**）：\n{premise[:800]}")
+    if synopsis:
+        parts.append(f"故事梗概（同样只取其中的世界设定）：\n{synopsis[:600]}")
+    if body.note.strip():
+        parts.append(f"作者的额外要求：\n{body.note.strip()[:400]}")
+    if not parts:
+        return {"ok": False, "detail": "还没有可参考的信息（先填小说大概内容或故事梗概）"}
+
+    sys_p = (
+        "你是网文世界观编辑。根据给的信息，写出这个故事的「世界背景」。\n"
+        "要写的是**世界长什么样**，不是**故事往哪走**。\n"
+        "输出 JSON：\n"
+        '{"一句话世界": "这个世界的根本处境（80字内）", '
+        '"硬规则": ["世界不可违背的规则", "..."], '
+        '"势力与地点": ["名称——它是什么", "..."]}\n'
+        "硬规则给 2-5 条（世界的硬约束：什么不可能、什么有代价、什么稀缺）；"
+        "势力与地点给 2-6 个（已有或可合理存在的关键地点与势力）。\n"
+        "**禁止**写主角命运、剧情走向、结局、章节安排 —— 那些不属于背景。"
+    )
+    raw = _model_call("生成世界背景", lambda: provider.chat(sys_p, "\n\n".join(parts)))
+    parsed = _safe_json(raw)
+    normalized = normalize_background(parsed if isinstance(parsed, dict) else None)
+    # 闸门：一句话世界 + 至少一条硬规则。少了就是「这不是背景组」，
+    # 别让一个空壳子覆盖作者已经写好的内容。
+    if not normalized.get("一句话世界") or not normalized.get("硬规则"):
+        return {"ok": False,
+                "detail": "AI 回了内容但不像一组世界背景（一句话世界 + 硬规则都要有）",
+                "原文": (raw or "")[:2000]}
+    return {"ok": True, "background": normalized}
+
+
+@router.post("/{project_id}/power-system/tiers/generate")
+def generate_tiers(
+    project_id: int, body: TierGenerateRequest, db: Session = Depends(get_db)
+) -> dict:
+    """AI 生成档位分层（群像用；**只建议，不落库**）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    from app.generation.power_system import systems_of
+    from app.generation.power_system_gen import (
+        build_tier_prompt, filter_tiers_by_bands, parse_tiers,
+    )
+
+    bible = _ps_bible(proj)
+    systems = systems_of(bible)
+    if not systems:
+        raise HTTPException(status_code=400, detail="还没有修炼体系，先建体系")
+    prompt = build_tier_prompt(systems[0]) + (f"\n\n{body.note}" if body.note else "")
+    raw = _model_call("生成档位分层", lambda: provider.chat("你为群像设计档位分层。", prompt))
+    tiers = filter_tiers_by_bands(parse_tiers(raw), systems[0])
+    if not tiers:
+        return {"ok": False, "detail": "AI 没给出可用分层（可重试或改要求）"}
+    return {"ok": True, "档位层": tiers}
+
+
+@router.post("/{project_id}/cultivation")
+def save_cultivation(
+    project_id: int, body: CultivationSaveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存某个角色的**修炼档案**（当前境界/天赋/瓶颈/路线/代价）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name 不能为空")
+
+    from app.generation.cultivation import attach_profile, normalize_profile
+    from app.generation.power_system import systems_of
+
+    bible = _ps_bible(proj)
+    chars = bible.get("characters")
+    if not isinstance(chars, list):
+        chars = []
+    found = False
+    for c in chars:
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            c["card"] = attach_profile(c.get("card") or {}, normalize_profile(body.profile))
+            found = True
+            break
+    if not found:
+        chars.append({"name": name, "role": "", "motivation": "",
+                      "card": attach_profile({}, normalize_profile(body.profile))})
+    bible["characters"] = chars
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    proj.plot_bible = bible
+    flag_modified(proj, "plot_bible")
+    db.commit()
+    return {"ok": True, "name": name}
+
+
+@router.post("/{project_id}/cultivation/plan")
+def plan_cultivation_route(
+    project_id: int, body: RoutePlanRequest, db: Session = Depends(get_db)
+) -> dict:
+    """AI 规划某个角色的修炼路线（**只建议，不落库**）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    from app.generation.cultivation import derive_situation, plan_route, profile_of
+    from app.generation.power_system import systems_of
+
+    bible = _ps_bible(proj)
+    systems = systems_of(bible)
+    if not systems:
+        raise HTTPException(status_code=400, detail="还没有修炼体系，先建体系")
+
+    name = (body.name or "").strip()
+    profile = {}
+    for c in (bible.get("characters") or []):
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            profile = profile_of(c.get("card") or {})
+            break
+    if not profile:
+        raise HTTPException(status_code=400, detail="这个角色还没有修炼档案")
+
+    route = _model_call(
+        "规划修炼路线",
+        lambda: plan_route(provider, profile, systems[0], raise_errors=True),
+    )
+    if not route:
+        return {"ok": False, "detail": "AI 没给出可用路线（可重试或改要求）"}
+    merged = {**profile, **route}
+    return {
+        "ok": True,
+        "路线": route,
+        "处境": derive_situation(merged, systems),
+    }
+
+class ScaleSaveRequest(StrictRequest):
+    """`POST /api/projects/{id}/scale` 的请求体。"""
+
+    name: str
+    #: 量级信息（量级档 / 出手规模 / 压制）。
+    scale: dict = {}
+
+
+class ScaleGenerateRequest(StrictRequest):
+    """`POST /api/projects/{id}/scale/generate` 的请求体。"""
+
+    name: str
+    note: str = ""
+
+
+@router.get("/{project_id}/scale")
+def get_scales(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """列出本项目所有角色的量级。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    bible = _ps_bible(proj)
+    from app.generation.power_scale import resolve_scale
+    from app.generation.power_system import systems_of
+
+    systems = systems_of(bible)
+    out = []
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        card = c.get("card") if isinstance(c.get("card"), dict) else {}
+        out.append({
+            "name": c.get("name"),
+            "role": c.get("role") or "",
+            "scale": resolve_scale(card, systems),
+        })
+    return {"characters": out}
+
+
+@router.post("/{project_id}/scale")
+def save_scale(
+    project_id: int, body: ScaleSaveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存某个角色的**量级**（存在角色卡的 `card.量级` 下）。"""
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name 不能为空")
+
+    from app.generation.power_scale import normalize_scale
+
+    bible = _ps_bible(proj)
+    chars = bible.get("characters")
+    if not isinstance(chars, list):
+        chars = []
+    found = False
+    for c in chars:
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            card = c.get("card") if isinstance(c.get("card"), dict) else {}
+            card["量级"] = normalize_scale(body.scale)
+            c["card"] = card
+            found = True
+            break
+    if not found:
+        chars.append({"name": name, "role": "", "motivation": "",
+                      "card": {"量级": normalize_scale(body.scale)}})
+    bible["characters"] = chars
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    proj.plot_bible = bible
+    flag_modified(proj, "plot_bible")
+    db.commit()
+    return {"ok": True, "name": name}
+
+
+@router.post("/{project_id}/scale/generate")
+def generate_scale(
+    project_id: int, body: ScaleGenerateRequest, db: Session = Depends(get_db)
+) -> dict:
+    """AI 帮角色定量级（**只建议，不落库**）。
+
+    量级是**相对标尺**，不是绝对数值：判据是「他出手能造成什么后果」。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    provider = _provider_or_none()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="LLM 渠道未配置")
+
+    from app.generation.power_scale_gen import build_scale_prompt, parse_scale
+
+    bible = _ps_bible(proj)
+    name = (body.name or "").strip()
+    char = {}
+    for c in (bible.get("characters") or []):
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            char = dict(c)
+            break
+    if not char:
+        raise HTTPException(status_code=404, detail="这个角色不存在")
+
+    prompt = build_scale_prompt(char, bible, note=body.note or "")
+    raw = _model_call("给角色定量级",
+                      lambda: provider.chat("你在为小说角色定「量级」。", prompt))
+    scale = parse_scale(raw)
+    if not scale:
+        return {"ok": False, "detail": "AI 没给出可用量级（可重试或改要求）"}
+    return {"ok": True, "量级": scale}
+

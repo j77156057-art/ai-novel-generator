@@ -95,6 +95,67 @@ MIN_SAMPLE_CHARS = 300_000
 #: 每块最少章节数（太少提炼不出模式）
 MIN_CHAPTERS_PER_CHUNK = 5
 
+#: 每个蒸馏块的目标字数（保守兜底值，不含渠道覆盖）。
+#: 按字数而不是章数：不同书章长差 3-5 倍，固定章数会让块大小失真。
+TARGET_BLOCK_CHARS = 20_000
+
+
+def _chapters_per_block(
+    chapters: list[tuple[int, str]], target_chars: int,
+) -> int:
+    """估算「装够 target_chars 字需要多少章」。
+
+    按中位章长算而不是均值——均值会被少数超长章拉高，导致块里装的章数偏少。
+    """
+    lens = sorted(len(t) for _, t in chapters if t)
+    if not lens:
+        return MIN_CHAPTERS_PER_CHUNK
+    median = lens[len(lens) // 2]
+    if median <= 0:
+        return MIN_CHAPTERS_PER_CHUNK
+    return max(MIN_CHAPTERS_PER_CHUNK, target_chars // median)
+
+
+def _resolve_block_chars(provider, requested: int | None = None) -> int:
+    """决定本次蒸馏每个块的目标字数。优先级：显式参数 > 用户配置 > 渠道实测 > 兜底。
+
+    渠道值取 `provider.distill_block_chars`（0 = 该渠道没实测过）。
+    用户可通过 `settings.distill_block_chars` 强行覆盖（0 = 不覆盖）。
+    """
+    if requested and requested > 0:
+        return requested
+    forced = _configured_block_chars()
+    if forced > 0:
+        return forced
+    hint = int(getattr(provider, "distill_block_chars", 0) or 0)
+    return hint if hint > 0 else TARGET_BLOCK_CHARS
+
+
+def _configured_block_chars() -> int:
+    """用户显式配置的块大小覆盖（0 = 不覆盖）。配置不可读时返回 0。"""
+    try:
+        from app.config import settings as _st
+        return int(getattr(_st, "distill_block_chars", 0) or 0)
+    except Exception:  # noqa: BLE001 —— 配置不可读不该让蒸馏失败
+        return 0
+
+
+def _block_chars_for_fingerprint() -> int:
+    """算指纹用的块大小——不构造 provider，但与 `_resolve_block_chars` 同源。
+
+    块大小只有两个来源：① `settings.distill_block_chars`（显式覆盖）；
+    ② 渠道类的 `distill_block_chars`（实测能力）。两者都不依赖实例。
+    """
+    forced = _configured_block_chars()
+    if forced > 0:
+        return forced
+    try:
+        from app.llm.provider import block_chars_for_channel
+    except Exception:  # noqa: BLE001
+        return TARGET_BLOCK_CHARS
+    return block_chars_for_channel() or TARGET_BLOCK_CHARS
+
+
 #: 证据句下限（2026-11-12）。短于 20 字的证据在章内无法唯一定位，只能做两端锚定，
 #: 等于没有锚点。抽取提示词已同步改成「20–60 字，少于 20 字不作为证据」，
 #: 这里再硬卡一次：不足 20 字的规则**不落库**，不靠事后模糊匹配兜。
@@ -7786,3 +7847,142 @@ def describe_narrative(profile: dict | None, max_rules_per_dim: int | None = Non
         parts[idx] = _trim_to_budget(parts[idx], budget)
         text = "\n".join(parts)
     return _trim_to_budget(text, preset.char_limit)
+
+
+def extract_character_template(
+    db: Session,
+    project: Any,
+    novel_ids: list[int],
+    *,
+    tier: str | NarrativeTier | None = None,
+    progress: ProgressCallback | None = None,
+    provider=None,
+) -> Any:
+    """提炼人物塑造模板（独立产物，按档位分开存放）。
+
+    为什么独立：叙事档案一次完整档要 42 分钟，而模板只要每块一次调用
+    （约 1/8 的量）。单独抽、单独存，不需要为了加这一块方法论把整本档案重蒸。
+
+    复用与叙事档案同一套采样与分块（同一档位 → 同一批章节 → 同一档位签名），
+    两条产物的 id 前缀一致，一眼能看出「这档的档案」与「这档的模板」配对。
+
+    存 `character_templates` 表，id = `<档位>:<档位签名>:<正文哈希前 8>`。
+    同一个 (语料, 档位, 档位配置, 正文) 永远只有一行；命中已有就直接应用。
+    """
+    from app.style.character_template import (MAX_TEMPLATE_RULES, apply_template,
+                                             entity_free_rules, find_template,
+                                             parse_character_template, save_template)
+    from app.style.character_template import build_character_template_prompt
+
+    cfg = tier if isinstance(tier, NarrativeTier) else resolve_tier(tier)
+    ids = [int(i) for i in (novel_ids or [])]
+    if not ids:
+        raise ValueError('missing_reference_corpus')
+    content_hash = corpus_content_hash(ids, db)
+    source_ids_hash = _source_ids_hash(ids)
+    tier_sig = _tier_signature(cfg)
+
+    existing = find_template(db, tier=cfg.key, tier_signature=tier_sig,
+                             content_hash=content_hash)
+    if existing is not None:
+        apply_template(db, project, existing)
+        if progress is not None:
+            progress("命中已有的人物塑造模板，无需重抽", 1, 1)
+        return existing
+
+    if provider is None:
+        provider = resolve_distill_provider()
+
+    kept_rules: list[str] = []
+    rejected_total = 0
+    blocks_done = 0
+    blocks_seen = 0
+    books_seen = 0
+    est_total = 0
+    total_books = len(ids)
+
+    for book_idx, nid in enumerate(ids, start=1):
+        chapters = _load_novel_chapters(db, nid)
+        if not chapters:
+            continue
+        sampled = sample_chapters_for_tier(chapters, cfg)
+        # 块大小跟渠道走（与叙事档案同一把尺），见 `_resolve_block_chars`。
+        block_chars = _resolve_block_chars(provider)
+        block_size = max(
+            MIN_CHAPTERS_PER_CHUNK,
+            _chapters_per_block(sampled, block_chars),
+        )
+        chunk_starts = list(range(0, len(sampled), block_size))
+        n_chunks = len(chunk_starts)
+        books_seen += 1
+        blocks_seen += n_chunks
+        avg_chunks = blocks_seen / books_seen if books_seen else float(n_chunks)
+        est_total = max(int(round(blocks_done + n_chunks + (total_books - book_idx) * avg_chunks)),
+                        blocks_done + n_chunks)
+
+        prompts: list[tuple[str, str, dict | None]] = []
+        chunk_texts: list[str] = []
+        for i in chunk_starts:
+            chunk = sampled[i: i + block_size]
+            chunk_text = "\n\n".join(t for _, t in chunk if t)
+            if not chunk_text:
+                continue
+            system, user = build_character_template_prompt(
+                chunk_text, f"语料{nid} 第{chunk[0][0]}-{chunk[-1][0]}章")
+            prompts.append((system, user, None))
+            chunk_texts.append(chunk_text)
+        if not prompts:
+            continue
+
+        try:
+            raws = _gather_chat(provider, prompts)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "人物塑造模板全 chunk 失败 novel_id=%s: %s", nid, exc)
+            raws = [Exception(str(exc))] * len(prompts)
+
+        raw_rules: list[str] = []
+        for raw, chunk_text in zip(raws, chunk_texts):
+            if isinstance(raw, Exception):
+                continue
+            raw_rules.extend(parse_character_template(raw))
+
+        # 专名表过滤（没有表就整块不产 —— 宁可没有，不要泄漏）。
+        entity_names: list[str] = []
+        try:
+            from app.style.entity_store import ensure_table, entity_entries
+            entity_names = entity_entries(ensure_table(db, nid, provider=provider))
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "人物塑造模板：专名表不可用 novel_id=%s（%s），本块不产", nid, exc)
+            entity_names = []
+        if not entity_names:
+            rejected_total += len(raw_rules)
+        else:
+            kept, dropped = entity_free_rules(raw_rules, entity_names)
+            rejected_total += dropped
+            kept_rules.extend(kept)
+
+        blocks_done += n_chunks
+        if progress is not None:
+            progress(f"语料 {book_idx}/{total_books}：提炼人物塑造模板",
+                     blocks_done, est_total)
+
+    # 去重（不同块常给出同一条做法）+ 总量上限（档案不该无限膨胀）。
+    unique: list[str] = []
+    seen: set[str] = set()
+    for rule in kept_rules:
+        if rule in seen:
+            continue
+        seen.add(rule)
+        unique.append(rule)
+    rules = unique[:MAX_TEMPLATE_RULES]
+
+    row = save_template(
+        db, project, tier=cfg.key, tier_signature=tier_sig,
+        content_hash=content_hash, source_ids=ids, source_ids_hash=source_ids_hash,
+        rules=rules, n_chunks=blocks_done, rejected=rejected_total)
+    apply_template(db, project, row)
+    if progress is not None:
+        progress("人物塑造模板已就绪", blocks_done, max(blocks_done, 1))
+    return row

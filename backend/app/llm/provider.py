@@ -1350,6 +1350,34 @@ class OpenCodeGoChatProvider(OpenAICompatibleChatProvider):
         )
 
 
+def block_chars_for_channel(channel: str | None = None) -> int:
+    """查某个渠道的蒸馏块大小能力（字）。**不构造 provider**。
+
+    用途：指纹计算（`narrative._block_chars_for_fingerprint`）需要在没有
+    provider 实例的情况下知道块大小 —— 造实例要 key、要连网络，而算指纹
+    不该有这些副作用。`channel=None` ⇒ 取蒸馏角色当前配置的渠道。
+
+    这里的每个数字都取自对应 provider 类的 `distill_block_chars`（同一张
+    能力表），所以「查表」与「造实例」必然一致。改了某个类的该属性，
+    这张表要同步改，否则指纹算出的块大小与实际蒸馏不同 ⇒ 缓存不命中。
+    """
+    if not channel:
+        try:
+            channel = str(
+                settings.get_provider_config("distiller").get("provider") or ""
+            ).strip()
+        except Exception:  # noqa: BLE001 —— 配置读不到不该让调用方炸
+            channel = ""
+    table = {
+        "zhipu": ZhipuChatProvider,
+        "opencode-go": OpenCodeGoChatProvider,
+    }
+    cls = table.get((channel or "").strip().lower())
+    if cls is None:
+        return 0
+    return int(getattr(cls, "distill_block_chars", 0) or 0)
+
+
 class CommandCodeChatProvider(OpenAICompatibleChatProvider):
     """Command Code Provider API（https://api.commandcode.ai/provider/v1）：OpenAI 兼容网关。
 
