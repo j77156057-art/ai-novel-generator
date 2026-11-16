@@ -407,8 +407,19 @@ PARAGRAPH_FLOOR_FALLBACK_PER_1K = 17.5
 
 
 def hanzi_count(text: str) -> int:
-    """正文汉字数——长度硬闸的唯一口径。"""
+    """正文汉字数。**只用于文风指标**（段均/句长/对白占比等），不参与篇幅判界。"""
     return sum(1 for ch in (text or "") if "\u4e00" <= ch <= "\u9fff")
+
+
+def char_count(text: str) -> int:
+    """正文字符数——篇幅预算的**唯一口径**（`len()` 原样，含标点与换行）。
+
+    2026-11-17 统一：此前上限（120%）比汉字、下限（80%）比字符，同一份稿子
+    两个数（项目 6 实测一章 3,451 字符 / 2,737 汉字，汉字只占 79.3%），
+    上限按汉字量，120% 等效 151% 才拦。现在 `analyze_length` /
+    `generation_gate` / `_rewrite_rounds` / `length_guard` 全部走这一个计数。
+    """
+    return len(text or "")
 
 
 def length_limits(target_chars: int | None = None) -> dict[str, int]:
@@ -1294,8 +1305,10 @@ def generation_gate(
     实测值全部写进 `metrics`/`soft_deviations`，差距按卷看趋势（`volume_gate()`）。
     `段长均值` 自 v8 起也在指纹里，单章偏短不再判违规，只在卷末看趋势。
 
-    长度硬闸（v5）用**汉字数**判：超过 `max_chars ×1.2` 即违规，与文风指标
-    并列进 `violations`、同样触发重写。`max_chars` 为 None 时回退项目默认 3,000。
+    长度硬闸（v5）用**正文字符数**（`char_count`，含标点与换行）判：超过
+    `max_chars ×1.2` 即违规，与文风指标并列进 `violations`、同样触发重写。
+    `max_chars` 为 None 时回退项目默认 3,000。2026-11-17 前上限比汉字、
+    下限比字符，同一份稿子两个数，120% 实际等效 151%，现统一到字符。
 
     `gate_limits` 缺省取 `active_gate_limits()`（由 engine 按参考语料章级分位设置）。
     v22 起 `段数` 下限在这里按 `max_chars` 目标字数现折算（`paragraph_floor_limits`），
@@ -1404,17 +1417,20 @@ def generation_gate(
                 continue
             metrics[key] = value
         metrics["汉字数"] = out["hanzi"]
+        # 篇幅口径（2026-11-17 统一）：预算一律量**字符数**，与下限
+        # （`analyze_length` 的 chars）同一个数。汉字数只作文风指标保留。
+        metrics["正文字数"] = char_count(text)
         out["metrics"] = metrics
-        # 长度硬闸（v5）：汉字数超过目标 ×1.2 直接判违规，与文风指标同一份
+        # 长度硬闸（v5）：正文字数超过目标 ×1.2 直接判违规，与文风指标同一份
         # violations / reasons，因此同样会触发重写。
-        if out["hanzi"] > limit_len["max"]:
+        if metrics["正文字数"] > limit_len["max"]:
             reason = (
-                f"正文汉字数 {out['hanzi']} 高于上限 {limit_len['max']}"
+                f"正文总字数 {metrics['正文字数']} 高于上限 {limit_len['max']}"
                 f"（目标 {limit_len['target']} 字的 {LENGTH_LIMIT_RATIO:g} 倍）"
             )
             out["violations"].append({
-                "metric": "汉字数",
-                "value": out["hanzi"],
+                "metric": "正文字数",
+                "value": metrics["正文字数"],
                 "limit": {"max": limit_len["max"]},
                 "reason": reason,
             })

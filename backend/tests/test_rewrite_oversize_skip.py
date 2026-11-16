@@ -42,7 +42,8 @@ def _prepare(monkeypatch, *, skip_oversize: bool) -> dict[str, int]:
             "kind": "compression",
             "round": "compression",
             "accepted": True,
-            "hanzi_after": 4000,
+            "chars_before": 5000,
+            "chars_after": 4000,
         }
 
     monkeypatch.setattr(engine, "_rewrite_with_evidence", fake_rewrite)

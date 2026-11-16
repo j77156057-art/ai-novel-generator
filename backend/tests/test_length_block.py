@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
-"""生成侧硬判据 2：字数双向拦截的上限一侧。
+"""生成侧硬判据 2：字数双向拦截——上限与下限用**同一个计数**（字符）。
 
-口径：终稿 > 目标 × 120% ⇒ 先由现有 `_rewrite_rounds` 追加一次压缩轮；
-压缩后仍超 ⇒ `_commit_segment` 抛 `LengthBlocked`，不写 Generation 行。
-下限（<80%）保持既有「只留痕」行为，本文件不改变它。
+2026-11-17 修的口径缺口：上限闸（`generation_gate` / `length_guard`）过去比
+`hanzi_count`，下限（`repetition.analyze_length`）比 `char_count`。同一份稿子
+两个数，标点与换行越多差得越大：项目 6 那两章实测 3,451 字符 / 2,737 汉字，
+下限按字符判 79.3%（判短），上限按汉字要到 5,400 才拦——120% 实际等效 151%。
+本文件把两边都钉在字符上，并专门造「汉字少、字符多」的稿子：只要上限还是
+拿汉字比，这些用例必然失败。
 
-锁住四件事：
+锁住五件事：
 
-1. 等于上限放行、超 1 字即拦（严格大于，不是大于等于）；
-2. 上限取 `quality.length_path.limit`（与压缩轮同一把尺），缺省才用项目预算现算；
-3. blocked 明细带段号 / 章标签 / 实测字数 / 上限 / 压缩是否接受；
-4. 压缩未被接受（仍超）与压缩接受但压不够，都一律不落正文。
+1. 上限 = 目标 × 120%，严格大于才拦（等于上限放行）；
+2. 上限与下限读同一个数：同一份稿子，`analyze_length.chars` == 闸门
+   `metrics["正文字数"]` == `char_count(text)`；
+3. 4,000 字符（预算 3,000 的 133%）必须拦，3,500 字符（117%）必须放行——
+   这两个点都在旧口径的「汉字 120%」之外，专门抓 151% 那个洞；
+4. 本项目两章的真实字数 3,451 / 2,728 字符落在放行区；
+5. blocked 明细带段号 / 章标签 / 实测字符数 / 上限 / 压缩是否接受，且不落库。
 """
 from __future__ import annotations
 
@@ -28,8 +34,13 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 import app.generation.engine as engine  # noqa: E402
+from app.generation.repetition import analyze_length  # noqa: E402
 from app.models import Base, Generation, Project  # noqa: E402
-from app.style.consistency import hanzi_count, length_limits  # noqa: E402
+from app.style.consistency import (  # noqa: E402
+    char_count,
+    generation_gate,
+    length_limits,
+)
 
 
 @pytest.fixture()
@@ -57,7 +68,19 @@ def project(db):
 
 
 def _text(n: int) -> str:
+    """n 个汉字——字符数与汉字数 1:1，只用于落库/上限的纯边界值。"""
     return "字" * n
+
+
+def _mixed(n: int) -> str:
+    """n 个字符、汉字只占 3/7 的正文（``他说：“好。”`` 循环）。
+
+    这是抓口径缺口的关键样本：汉字数约为字符数的 43%，按汉字比上限的旧实现
+    会把下面 4,000 字符（汉字约 1,714）判成放行。
+    """
+    unit = "他说：“好。”"
+    assert len(unit) == 7
+    return (unit * (n // len(unit)) + unit)[:n]
 
 
 def test_limit_is_target_times_existing_ratio():
@@ -67,25 +90,93 @@ def test_limit_is_target_times_existing_ratio():
 
 
 def test_exactly_at_limit_passes():
+    text = _mixed(4800)
+    assert char_count(text) == 4800
     ev = engine._length_block_evidence(
-        SimpleNamespace(generation_length=4000), _text(4800),
+        SimpleNamespace(generation_length=4000), text,
         {"length_path": {"path": "compression", "limit": 4800}},
     )
     assert ev is None
 
 
 def test_one_char_over_limit_blocks():
+    text = _mixed(4801)
     ev = engine._length_block_evidence(
-        SimpleNamespace(generation_length=4000), _text(4801),
+        SimpleNamespace(generation_length=4000), text,
         {"length_path": {"path": "compression", "limit": 4800,
                          "compression_accepted": True}},
     )
     assert ev is not None
-    assert ev["hanzi"] == 4801
+    assert ev["chars"] == 4801
+    # 汉字远低于上限：证明判界量的是字符，不是汉字
+    assert ev["hanzi"] < ev["limit"]
     assert ev["limit"] == 4800
     assert ev["path"] == "compression"
     assert ev["compression_accepted"] is True
     assert ev["still_over_limit"] is True
+
+
+def test_4000_chars_at_133_percent_is_blocked():
+    """预算 3,000 的 133%：旧口径下限已是 133%（字符），上限按汉字才 57% 放行。"""
+    budget = 3000
+    text = _mixed(4000)
+    ratio = char_count(text) / budget
+    assert ratio == pytest.approx(1.3333, abs=0.001)
+
+    ev = engine._length_block_evidence(
+        SimpleNamespace(generation_length=budget), text, None)
+    assert ev is not None
+    assert ev["chars"] == 4000
+    assert ev["limit"] == 3600
+    assert ev["hanzi"] < ev["limit"]
+
+
+def test_3500_chars_at_117_percent_passes():
+    """预算 3,000 的 117%：低于 120% 上限，必须放行（不是所有超预算都拦）。"""
+    budget = 3000
+    text = _mixed(3500)
+    ratio = char_count(text) / budget
+    assert ratio == pytest.approx(1.1667, abs=0.001)
+
+    ev = engine._length_block_evidence(
+        SimpleNamespace(generation_length=budget), text, None)
+    assert ev is None
+
+
+def test_real_chapter_lengths_are_inside_band():
+    """本项目两章真实字数：3,451（115.0%）与 2,728（90.9%），都应在放行区。"""
+    budget = 3000
+    for n, want_ratio in ((3451, 1.1503), (2728, 0.9093)):
+        text = _mixed(n)
+        assert char_count(text) == n
+        assert n / budget == pytest.approx(want_ratio, abs=0.001)
+        assert engine._length_block_evidence(
+            SimpleNamespace(generation_length=budget), text, None) is None
+        report = analyze_length(text, budget)
+        assert report.verdict == "ok"
+        assert report.chars == n
+
+
+def test_upper_and_lower_bounds_count_the_same_text():
+    """同一份稿子、同一个计数：下限报告与上限闸读到的字符数必须相等。"""
+    budget = 3000
+    text = _mixed(3451)
+    report = analyze_length(text, budget)
+    gate = generation_gate(text, budget)
+    assert report.chars == gate["metrics"]["正文字数"] == char_count(text) == 3451
+    assert report.verdict == "ok"
+
+
+def test_gate_blocks_4000_chars_with_few_hanzi():
+    """闸门层同一道洞：汉字少、字符多也要按字符判违规。"""
+    gate = generation_gate(_mixed(4000), 3000)
+    assert gate["metrics"]["正文字数"] == 4000
+    assert gate["metrics"]["汉字数"] < gate["length_limit"]["max"]
+    hits = [v for v in gate["violations"] if v["metric"] == "正文字数"]
+    assert len(hits) == 1
+    assert hits[0]["value"] == 4000
+    assert hits[0]["limit"] == {"max": 3600}
+    assert gate["passed"] is False
 
 
 def test_falls_back_to_project_budget_without_length_path():
@@ -114,7 +205,7 @@ def test_commit_raises_and_persists_nothing(db, project):
     assert payload["blocked_by"] == "length_over_limit"
     assert payload["segment_no"] == 1
     assert payload["chapter_label"] == "第24章《夜半敲门》"
-    assert payload["hanzi"] == 6378
+    assert payload["chars"] == 6378
     assert payload["limit"] == 4800
     assert db.scalars(select(Generation)).all() == []
 
@@ -126,5 +217,5 @@ def test_commit_inside_limit_still_writes(db, project):
         chapter_range="第24章《夜半敲门》",
     )
     assert seg == 1
-    assert hanzi_count(gen.text) == 4800
+    assert char_count(gen.text) == 4800
     assert gen.chapter_range == "第24章《夜半敲门》"

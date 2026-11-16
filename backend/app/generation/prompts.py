@@ -463,15 +463,15 @@ def _gate_block() -> str:
 def _length_block(max_chars: int | None = None) -> str:
     """字数硬上限块（v5）：必须出现在首遍 system，不能只靠参数。
 
-    口径与闸门同源：`consistency.hanzi_count` 的汉字数，超过目标 ×1.2 判违规。
-    数字从 `length_limits()` 取，不在这里另抄一份。
+    口径与闸门同源：`consistency.char_count` 的字符数（含标点与换行），超过
+    目标 ×1.2 判违规。数字从 `length_limits()` 取，不在这里另抄一份。
     """
     from app.style.consistency import LENGTH_LIMIT_RATIO, length_limits
 
     lim = length_limits(max_chars)
     return (
         "【字数硬上限（写完必须自查）】\n"
-        f"- 正文**汉字数**（不含标点与空白）上限 {lim['max']} 字，"
+        f"- 正文**总字数**（含标点与换行）上限 {lim['max']} 字，"
         f"目标 {lim['target']} 字；超过 {lim['max']} 字直接判不合格并触发重写。\n"
         f"- 超出时只许压缩、合并、删冗句，不许靠加场景、加人物、加支线来凑长度。\n\n"
     )

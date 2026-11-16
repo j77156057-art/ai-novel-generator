@@ -99,6 +99,7 @@ from app.style.consistency import (
     VOLUME_CHAPTERS,
     active_full_limits,
     active_gate_limits,
+    char_count,
     gate_limits_from_percentiles,
     generation_gate,
     hanzi_count,
@@ -1122,7 +1123,10 @@ def _complete_short_draft(
     """
     limit = length_limits(max_chars)
     target = limit["target"]
-    before = hanzi_count(text)
+    # 与闸门下限同一个数：`char_count`（含标点与换行）。补写比例
+    # （`_archive_rhythm` 的 min_ratio）本来就是按字符章长算的，此前这里
+    # 却量汉字，同一个 3000 字预算下两把尺差约 20%。
+    before = char_count(text)
     mr = (
         float(min_ratio)
         if isinstance(min_ratio, (int, float)) and 0 < float(min_ratio) < 1
@@ -1137,8 +1141,8 @@ def _complete_short_draft(
     info: dict = {
         "triggered": False,
         "target": target,
-        "before_hanzi": before,
-        "after_hanzi": before,
+        "before_chars": before,
+        "after_chars": before,
         "min_ratio": round(mr, 3),
         "stop_ratio": round(sr, 3),
         "max_rounds": max_rounds,
@@ -1157,14 +1161,14 @@ def _complete_short_draft(
         "4. 只输出续写正文，不要任何解释、标题、序号或「续写」字样。"
     )
     for round_no in range(1, max_rounds + 1):
-        cur = hanzi_count(text)
+        cur = char_count(text)
         gap = max(0, target - cur)
         if cur >= target * sr or gap <= 0:
             break
         user = (
             f"【已有正文末尾（仅供衔接）】\n{text[-_COMPLETION_PROMPT_TAIL:]}\n\n"
-            f"【本章目标】约 {target} 个汉字；目前已写 {cur} 个汉字，还差 {gap} 个。"
-            f"请从断点处接着写约 {gap} 个汉字，写完自然收束，不要重复已有内容。"
+            f"【本章目标】约 {target} 个字符（含标点）；目前已写 {cur} 个，还差 {gap} 个。"
+            f"请从断点处接着写约 {gap} 个字符，写完自然收束，不要重复已有内容。"
         )
         try:
             cont = _chat_with_retry(provider, system, user, constraints=constraints)
@@ -1176,12 +1180,12 @@ def _complete_short_draft(
             })
             break
         cont = _strip_thinking(cont or "").strip()
-        added = hanzi_count(cont)
+        added = char_count(cont)
         if added < 50:
-            info["rounds"].append({"round": round_no, "rejected": "too_short", "hanzi": added})
+            info["rounds"].append({"round": round_no, "rejected": "too_short", "chars": added})
             break
         if _echoes_existing(cont, text):
-            info["rounds"].append({"round": round_no, "rejected": "echo", "hanzi": added})
+            info["rounds"].append({"round": round_no, "rejected": "echo", "chars": added})
             break
         candidate = text.rstrip() + "\n\n" + cont
         rep = analyze_repetition(candidate)
@@ -1189,17 +1193,17 @@ def _complete_short_draft(
             info["rounds"].append({
                 "round": round_no,
                 "rejected": "degenerate",
-                "hanzi": added,
+                "chars": added,
                 "reasons": list(getattr(rep, "reasons", ()) or ())[:2],
             })
             break
         text = candidate
         info["rounds"].append({
             "round": round_no,
-            "hanzi_before": cur,
-            "hanzi_after": hanzi_count(text),
+            "chars_before": cur,
+            "chars_after": char_count(text),
         })
-    info["after_hanzi"] = hanzi_count(text)
+    info["after_chars"] = char_count(text)
     return text, info
 
 
@@ -3191,7 +3195,9 @@ _GATE_FMT: dict[str, tuple[str, str, str]] = {
     "对白≥20占比": ("≥20 字对白句", "", "{:.1%}"),
     "对白感叹句占比": ("对白感叹句", "", "{:.1%}"),
     "对白叹词起头占比": ("叹词起头", "", "{:.1%}"),
-    # 长度硬闸（v5）：汉字数上限，值在 violations/limit 里按项目目标算。
+    # 长度硬闸（v5）：正文字符数上限，值在 violations/limit 里按项目目标算。
+    "正文字数": ("正文总字数", " 字", "{:.0f}"),
+    # 汉字数仍渲染（文风指标），但不参与篇幅判界。
     "汉字数": ("正文汉字数", " 字", "{:.0f}"),
 }
 
@@ -3215,7 +3221,7 @@ def _gate_hard_block(gate_info: dict | None) -> str:
     for key, (label, unit, fmt) in _GATE_FMT.items():
         if key not in bad:
             continue
-        if key == "汉字数":
+        if key in ("汉字数", "正文字数"):
             # 长度上限不在 GEN_GATE_LIMITS 里（随项目目标字数变），单独取。
             cap = int((gate_info.get("length_limit") or {}).get("max") or 0)
             cur = int(metrics.get(key) or 0)
@@ -3315,11 +3321,11 @@ def _gate_hard_block(gate_info: dict | None) -> str:
             f"含助词对白句 ≥{_cp['含助词对白句占比']['p25']:.1%}"
             f"（当前 {float(metrics.get('含助词对白句占比') or 0):.1%}）。"
         )
-    if "汉字数" in bad:
+    if "正文字数" in bad:
         lim = gate_info.get("length_limit") or {}
-        cur_h = int(metrics.get("汉字数") or 0)
+        cur_h = int(metrics.get("正文字数") or 0)
         actions.append(
-            f"⑦ 字数：当前 {cur_h} 个汉字，上限 {int(lim.get('max') or 0)} 字"
+            f"⑦ 字数：当前 {cur_h} 个字符（含标点），上限 {int(lim.get('max') or 0)} 字"
             f"（目标 {int(lim.get('target') or 0)} 字）。只许压缩与改写，不许扩写；"
             "删重复、合并同类场景、去掉解释性句子，保留情节与对白，不要靠删情节凑数。"
         )
@@ -3941,11 +3947,11 @@ def _compression_prompt(text: str, max_chars: int | None) -> tuple[str, str]:
     不是「禁止删字抬段均」那个问题），但不允许新增内容、不允许改写成新情节。
     """
     lim = length_limits(max_chars)
-    cur = hanzi_count(text)
+    cur = char_count(text)
     target = int(lim["max"] * 0.95)
     system = (
-        "你是长篇小说的压缩编辑。任务只有一个：把正文压到汉字上限以内。\n"
-        f"当前 {cur} 个汉字，硬上限 {lim['max']} 个汉字，目标约 {target} 个汉字。\n"
+        "你是长篇小说的压缩编辑。任务只有一个：把正文压到字数上限以内。\n"
+        f"当前 {cur} 个字符（含标点），硬上限 {lim['max']} 个字符，目标约 {target} 个。\n"
         "1. 允许删句、删段、删掉可以割舍的过场与次要情节；这是篇幅压缩，不是改写。\n"
         "2. 不允许新增任何内容，不允许扩写、补写、改写成新情节。\n"
         "3. 优先删：重复叙述、无信息量的动作与环境描写、重复的情绪描写、"
@@ -3958,14 +3964,14 @@ def _compression_prompt(text: str, max_chars: int | None) -> tuple[str, str]:
 def _compression_round(provider, text: str, max_chars: int | None) -> tuple[str, dict]:
     """两轮重写仍超限时追加的一次压缩轮；返回 (候选正文或原文, 留痕记录)。
 
-    接受条件只有一条：**汉字数比原文少**。不受 `grew_too_much` 与段均/段数
+    接受条件只有一条：**字符数比原文少**。不受 `grew_too_much` 与段均/段数
     相关规则约束——这一轮的目的就是删，行文结构让位于篇幅。
     """
     limit = length_limits(max_chars)
-    before = hanzi_count(text)
+    before = char_count(text)
     record: dict = {
         "round": "compression", "kind": "compression",
-        "hanzi_before": before, "limit": limit["max"],
+        "chars_before": before, "limit": limit["max"],
     }
     try:
         system, user = _compression_prompt(text, max_chars)
@@ -3974,25 +3980,25 @@ def _compression_round(provider, text: str, max_chars: int | None) -> tuple[str,
     except Exception as exc:  # noqa: BLE001 —— 压缩失败不阻断，保留原文
         record.update({
             "failed": True, "error": f"{type(exc).__name__}: {exc}",
-            "accepted": False, "hanzi_after": before,
+            "accepted": False, "chars_after": before,
             "still_over_limit": before > limit["max"],
         })
         return text, record
     if not rewritten or len(rewritten) < len(text) * 0.3:
         record.update({
             "failed": True, "error": "empty_or_too_short",
-            "accepted": False, "hanzi_after": before,
+            "accepted": False, "chars_after": before,
             "still_over_limit": before > limit["max"],
         })
         return text, record
-    after = hanzi_count(rewritten)
+    after = char_count(rewritten)
     accepted = after < before
     record.update({
-        "candidate_hanzi": after,
+        "candidate_chars": after,
         "accepted": accepted,
         "discarded": not accepted,
         "discard_reasons": [] if accepted else ["no_reduction"],
-        "hanzi_after": after if accepted else before,
+        "chars_after": after if accepted else before,
         "still_over_limit": (after if accepted else before) > limit["max"],
     })
     if accepted:
@@ -4030,7 +4036,7 @@ def _rewrite_rounds(
     max_rounds = _rewrite_max_rounds()
     stop_without_gain = _rewrite_stop_without_gain()
     skip_oversize = _rewrite_skip_oversize()
-    oversize_at_entry = hanzi_count(text) > limit["max"]
+    oversize_at_entry = char_count(text) > limit["max"]
     need, reasons = _should_rewrite(text, forbidden)
     if not gate["passed"]:
         need = True
@@ -4048,7 +4054,7 @@ def _rewrite_rounds(
         if not need:
             break
         gate_before, reasons_in = gate, list(reasons)
-        hanzi_before = hanzi_count(text)
+        length_before = char_count(text)
         rewritten, info = _rewrite_with_evidence(
             db, project, provider, text, reasons, forbidden,
             item_holding_block=ctx.get("item_holding_block") or None,
@@ -4071,17 +4077,18 @@ def _rewrite_rounds(
                 "metrics_before": gate_before.get("metrics"),
             })
             break
-        hanzi_after = hanzi_count(rewritten)
+        length_after = char_count(rewritten)
         # 长度硬闸配套（2026-11-14 收紧）：已超限时，候选必须**严格低于上限且
         # 低于原文**才接受；只「没变长」不再算通过。旧写法只判「是否继续加长」，
         # 第 24 章 R2 候选 6366（仍 > 4800）因此被放行，终稿 6378 超限落库。
-        over_cap_before = hanzi_before > limit["max"]
+        # 2026-11-17：改量与下限同一个数——`char_count`（含标点与换行）。
+        over_cap_before = length_before > limit["max"]
         over_limit = over_cap_before and not (
-            hanzi_after < limit["max"] and hanzi_after < hanzi_before
+            length_after < limit["max"] and length_after < length_before
         )
         # 允许小幅增字（补神态/动作），但不给无限膨胀的口子。上浮比例与跑飞阈值
         # 都是配置项（默认 8% / 16%，手写值、非档案推导）。
-        grew_too_much = hanzi_after > hanzi_before * (
+        grew_too_much = length_after > length_before * (
             1 + _rewrite_growth_reject_ratio()
         )
         # C（2026-11-13）→ 2026-11-14 收窄：struct guard 回到「纯防跑飞 + 防删内容」。
@@ -4109,11 +4116,11 @@ def _rewrite_rounds(
         spc_after = _spc_of(rewritten)
         spc_over = bool(spc_cap and spc_before <= spc_cap and spc_after > spc_cap)
         struct_reject = False
-        # 已超长度硬上限时，「汉字变少」是必须做的压缩，不能再被防删内容护栏否掉：
-        # 旧口径下 oversize + 碎段同时出现时，任何重写都因 hanzi_after<hanzi_before
+        # 已超长度硬上限时，「字数变少」是必须做的压缩，不能再被防删内容护栏否掉：
+        # 旧口径下 oversize + 碎段同时出现时，任何重写都因 length_after<length_before
         # 被整轮回退（第 6/7 章实测两轮全废），两条规则互相封死。超长分支不再用
         # 段结构做否决项——候选是否合格由上方 `over_limit` 的长度条件决定。
-        over_cap = hanzi_before > limit["max"]
+        over_cap = length_before > limit["max"]
         if over_cap:
             # 超长分支只看长度（上方 over_limit）：删句/删段/并段都是压缩手段，
             # 结构规则不再反过来否决候选。
@@ -4121,7 +4128,7 @@ def _rewrite_rounds(
         else:
             # 纯防作弊：不许靠删字、删内容抬指标。不再要求段数下降，
             # 也不以段均是否低于 28.8 作为开关——guard 不对段结构下方向。
-            struct_reject = hanzi_after < hanzi_before
+            struct_reject = length_after < length_before
         # 超长时长度硬闸优先：压缩本身要靠降段数完成，不能再用段均句数把它否掉。
         # `spc_over` 不参与整轮回退：候选照旧交给闸门与长度校验，
         # 只有闸门判不过才会在下一轮继续修。
@@ -4139,10 +4146,10 @@ def _rewrite_rounds(
             if struct_reject:
                 discard_reasons.append("structure")
             # 不再有 "spc_cap"：段均句数 cap 只约束并段，不是整轮拒因。
-        cand_hanzi, cand_paras = hanzi_after, paras_after
+        cand_chars, cand_paras = length_after, paras_after
         if rejected:
             rewritten = text
-            hanzi_after = hanzi_before
+            length_after = length_before
         if rewritten != text:
             summary = provider.summarize(rewritten)
         text = rewritten
@@ -4165,14 +4172,14 @@ def _rewrite_rounds(
         rounds.append({
             "round": round_no,
             "chars": len(rewritten),
-            "hanzi_before": hanzi_before,
-            "hanzi_after": hanzi_after,
+            "chars_before": length_before,
+            "chars_after": length_after,
             "rejected_lengthening": rejected,
             "rejected_growth": grew_too_much,
             "rejected_structure": struct_reject,
             "discarded": rejected,
             "discard_reasons": discard_reasons,
-            "discarded_hanzi": (cand_hanzi - hanzi_before) if rejected else 0,
+            "discarded_chars": (cand_chars - length_before) if rejected else 0,
             "discarded_paras": (cand_paras - paras_before) if rejected else 0,
             "paras_before": paras_before,
             "paras_after": paras_after,
@@ -4206,19 +4213,20 @@ def _rewrite_rounds(
     # 重写轮结束仍超限：追加一次压缩轮（目标只有一个——压进硬上限）。
     # 压缩轮不受 grew_too_much / 段均规则约束；仍超限则如实返回，由落库侧判 failed。
     path = "direct" if not rounds else "rewrite"
-    if hanzi_count(text) > limit["max"]:
+    if char_count(text) > limit["max"]:
         path = "compression"
         compressed, comp_record = _compression_round(provider, text, max_chars)
         rounds.append(comp_record)
         if comp_record.get("accepted"):
             text = compressed
             summary = provider.summarize(text)
-    final_hanzi = hanzi_count(text)
+    final_chars = char_count(text)
     length_path = {
         "path": path,
         "limit": limit["max"],
-        "final_hanzi": final_hanzi,
-        "still_over_limit": final_hanzi > limit["max"],
+        "final_chars": final_chars,
+        "final_hanzi": hanzi_count(text),
+        "still_over_limit": final_chars > limit["max"],
         "rewrite_skipped": rewrite_skipped,
         "compression_accepted": any(
             r.get("kind") == "compression" and r.get("accepted") for r in rounds
@@ -5107,12 +5115,15 @@ def generate_next_segment(
     quality["era_check"] = _era_check_quality(
         era_meta, era_prompt_meta, _era_channel_abuse(db, project, era_meta))
     # 长度路径留痕：走的是 direct（未重写）/ rewrite（重写轮内压回）/ compression
-    # （两轮重写后追加压缩轮）。终稿汉字与是否仍超限按**最终正文**重算（并段可能加字）。
+    # （两轮重写后追加压缩轮）。终稿字数与是否仍超限按**最终正文**重算（并段可能加字）。
+    # 2026-11-17：字数 = `char_count`（字符，含标点），与下限同一个数。
+    _final_chars = char_count(text)
     quality["length_path"] = {
         "path": length_path["path"],
         "limit": length_path["limit"],
+        "final_chars": _final_chars,
         "final_hanzi": gate_final.get("hanzi"),
-        "still_over_limit": (gate_final.get("hanzi") or 0) > length_path["limit"],
+        "still_over_limit": _final_chars > length_path["limit"],
         "compression_accepted": length_path["compression_accepted"],
     }
     # v16：外部素材工具留痕（问了几次/问了什么/拿回多少字/缓存命中几次）。
@@ -5560,12 +5571,15 @@ def generate_next_segment_stream(
         text, gate_final.get("metrics") or {}, gate_limits_meta)
     quality["era_check"] = _era_check_quality(
         era_meta, era_prompt_meta, _era_channel_abuse(db, project, era_meta))
-    # 与同步版同口径：长度路径留痕 + 终稿汉字/是否仍超限按最终正文重算。
+    # 与同步版同口径：长度路径留痕 + 终稿字数/是否仍超限按最终正文重算
+    # （字数 = `char_count`，字符含标点，与下限同一个数）。
+    _final_chars = char_count(text)
     quality["length_path"] = {
         "path": length_path["path"],
         "limit": length_path["limit"],
+        "final_chars": _final_chars,
         "final_hanzi": gate_final.get("hanzi"),
-        "still_over_limit": (gate_final.get("hanzi") or 0) > length_path["limit"],
+        "still_over_limit": _final_chars > length_path["limit"],
         "compression_accepted": length_path["compression_accepted"],
     }
     # 与同步版同口径：外部素材工具留痕（键名沿用 `chapter_stats()`）。

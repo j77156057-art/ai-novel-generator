@@ -115,8 +115,11 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+from app.style.consistency import char_count
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 阈值：常量是「判据」，不是「调参旋钮」；取值依据见模块 docstring 的实测表。
@@ -734,7 +737,8 @@ def analyze_length(
     Returns:
         `LengthReport`，verdict ∈ {ok, short, undetected, not_applicable}。
     """
-    chars = len(text or "")
+    # 与上限闸同一把尺：`char_count` = len(text) 原样（含标点与换行）。
+    chars = char_count(text)
     if is_rewrite:
         return LengthReport(
             verdict=LENGTH_VERDICT_NOT_APPLICABLE,

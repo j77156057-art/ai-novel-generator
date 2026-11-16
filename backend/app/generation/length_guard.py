@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from app.style.consistency import hanzi_count, length_limits
+from app.style.consistency import char_count, hanzi_count, length_limits
 
 
 class LengthBlocked(RuntimeError):
@@ -25,7 +25,7 @@ class LengthBlocked(RuntimeError):
         self.label = label
         self.evidence = evidence
         super().__init__(
-            f"拒绝落库第{segment_no}段（{label}）：终稿 {evidence['hanzi']} 汉字"
+            f"拒绝落库第{segment_no}段（{label}）：终稿 {evidence['chars']} 字符"
             f" > 上限 {evidence['limit']}（路径={evidence.get('path')}，"
             f"压缩已接受={evidence.get('compression_accepted')}）"
         )
@@ -54,11 +54,13 @@ def length_block_evidence(project, text: str,
         if not budget:
             return None
         limit = length_limits(budget)["max"]
-    hanzi = hanzi_count(text)
-    if hanzi <= int(limit):
+    # 与下限同一个数：`char_count` = len(text)，含标点与换行。
+    chars = char_count(text)
+    if chars <= int(limit):
         return None
     return {
-        "hanzi": hanzi,
+        "chars": chars,
+        "hanzi": hanzi_count(text),
         "limit": int(limit),
         "path": path.get("path"),
         "compression_accepted": bool(path.get("compression_accepted")),
