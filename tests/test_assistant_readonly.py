@@ -217,8 +217,18 @@ def test_assistant_qa_endpoint_does_not_touch_writer_singleton(monkeypatch, db_s
 # ====================================================================
 
 
-def test_agent_run_and_evidence_persisted(db_session, project_id):
-    """AssistantQARequest 跑一次 → AgentRun + Evidence 行落库，字段全、语义对。"""
+def test_agent_run_and_evidence_persisted(db_session, project_id, monkeypatch):
+    """AssistantQARequest 跑一次 → AgentRun + Evidence 行落库，字段全、语义对。
+
+    Assistant 强制走本地兜底：本机 `.env` 里有真实智谱 key 时，assistant 会走
+    「模型自主选工具」路径；模型偶尔直接作答、不返回 tool_calls，evidence 就为空，
+    用例随线上模型抖动。这里钉住无 key 环境（CI 默认）的确定性三工具路径。
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "assistant_provider", "local")
+    llm_provider_mod.reset_assistant_provider_cache()
+
     from app.routers.assistant import AssistantQARequest
 
     body = AssistantQARequest(project_id=project_id, query="谁是主角？")
