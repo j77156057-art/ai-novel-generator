@@ -2571,6 +2571,95 @@ def _catalog_skeleton(db, project: Project) -> str | None:
     return skeleton_for_project(db, project)
 
 
+def _roleplay_character_name(project: Project, reminders: dict | None = None) -> str | None:
+    """角色聊天时，被扮演的是哪个角色。
+
+    取值顺序（**每一步都是真实存在的来源**）：
+    1. `plot_bible.roleplay_character` —— 用户在界面上选定的那个；
+    2. `plot_bible.characters` 的第一个 —— 用户自己写进剧情圣经的角色；
+    3. **图谱抽出来的角色**（`reminders["character_constraints"]`）的第一个。
+
+    ## 为什么必须有第 3 步
+
+    之前只查前两步 ⇒ 真跑（北荒刀歌续写验证项目）返回 **None** ⇒
+    **角色定向检索根本没跑**，`rag_items` 0 条 ⇒ 角色「什么都不知道」，
+    只能编。而那个项目的角色（陆长风 / 陆崇 / 老周）明明在界面上的
+    【角色人设约束】里 —— 它们来**图谱抽取**，不在 plot_bible 里。
+    ⇒ 只查 plot_bible 就等于查不到「界面显示存在的角色」。
+
+    取不到返回 None（此时不检索）。
+    """
+    bible = project.plot_bible or {}
+    if isinstance(bible, dict):
+        explicit = bible.get("roleplay_character")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        chars = bible.get("characters") or []
+        if isinstance(chars, (list, tuple)) and chars:
+            first = chars[0]
+            if isinstance(first, dict):
+                nm = first.get("name")
+                if isinstance(nm, str) and nm.strip():
+                    return nm.strip()
+            elif isinstance(first, str) and first.strip():
+                return first.strip()
+    # 兜底：图谱抽出来的角色（与 system 提示的【角色人设约束】同一个来源）
+    for c in ((reminders or {}).get("character_constraints") or []):
+        nm = str((c.get("name") if isinstance(c, dict) else c) or "").strip()
+        if nm:
+            return nm
+    return None
+
+
+def _backfill_character_evidence(db, project: Project, narrative: dict | None) -> dict | None:
+    """给老角色档案回填证据，让它**真的能进提示词**。
+
+    ## 为什么需要
+
+    `render_character_profile` 的门禁要求
+    `evidence_status == "located_extracts_not_semantic_proof"` ——
+    这个字段只有**带 claim 账本的新档案**才有。老档案缺这个键 ⇒
+    默认值 `unverified_legacy` ⇒ **整个角色档案渲染成空串**。
+
+    实测（《北荒刀歌》，8 个角色）：回填前 `render_character_profile` 返回
+    **空字符串**；回填后是 **400 字/角色**（限长后），身份、说话方式、
+    行为倾向、底线、关键经历**全在**，还附上了**原文摘录**（= 配合检索）。
+
+    ## 为什么不是「直接放行」
+
+    门禁的原意是对的：没核过的声明不该进提示词。老档案的字段值是**改写过的总结**，
+    claim 级那道判据（value 必须逐字出现在摘录里）核不了。
+    ⇒ 回填走**字段级事实核验**：字段值里的事件短语能不能在**有他出场的行**里
+    定位到（详见 `style/bio_evidence.py`）。核不上的字段**丢掉**。
+
+    零模型调用；按 (novel_id, 档案指纹) 进程内缓存。
+    """
+    if not isinstance(narrative, dict):
+        return narrative
+    chars = narrative.get("characters") or []
+    if not chars:
+        return narrative
+    # 新档案自带账本 ⇒ 不需要回填
+    if all(c.get("evidence_status") == "located_extracts_not_semantic_proof"
+           for c in chars if isinstance(c, dict)):
+        return narrative
+    novel_ids = list(getattr(project, "reference_novel_ids", None) or [])
+    if not novel_ids:
+        return narrative
+    try:
+        from app.style.bio_evidence import backfill_profiles
+
+        for nid in novel_ids:
+            filled = backfill_profiles(db, nid, chars)
+            if filled:
+                narrative = dict(narrative)
+                narrative["characters"] = filled
+                break
+    except Exception as exc:  # noqa: BLE001 —— 回填失败不该阻断生成
+        logging.getLogger(__name__).warning("角色档案证据回填失败: %s", exc)
+    return narrative
+
+
 def _style_narrative(db, project: Project) -> dict | None:
     """项目级叙事档案（LLM 提炼），按指纹缓存，整轮恒定。
 

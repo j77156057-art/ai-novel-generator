@@ -7143,6 +7143,11 @@ def resolve_render_preset(mode: str | None) -> RenderPreset:
     return preset
 
 
+#: 角色声音条目的「名字：」前缀（`老周：自称多省略…`）。
+#: 角色名册与角色对话按它取「这条是谁的声音」。批 8 前置：`routers/roleplay.py` 直接读它。
+_VOICE_NAME_PREFIX_RE = re.compile(r"^[^\s：:]{1,8}\s*[：:]\s*")
+
+
 def _voice_item_name(item) -> str:
     rule = item.get("rule", "") if isinstance(item, dict) else ""
     if "：" not in rule:
