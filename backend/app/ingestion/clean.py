@@ -422,6 +422,17 @@ def clean_site_residue(text: str) -> tuple[str, dict]:
     }
 
 
+def clean_consumption_text(text: str) -> tuple[str, dict]:
+    """消费态清洗：只删精确区间的站点残留，其余字符（含换行）原样保留。
+
+    与 `clean_site_residue` 是同一套判据（同一组 `_SITE_RESIDUE_PATTERNS`），
+    这里只保留 main 的入口名，供 `retrieval.views` / `retrieval.search` 使用。
+    报告字段与 `clean_site_residue` 一致（样本封顶 + unresolved_count）；
+    清洗后的正文逐字符相同，差异只在诊断样本条数。
+    """
+    return clean_site_residue(text)
+
+
 def detect_marks(text: str, **kwargs) -> list[dict]:
     """检出可疑水印串（`corpus_health.scan_watermarks` 的薄封装，只取 flagged）。
 
