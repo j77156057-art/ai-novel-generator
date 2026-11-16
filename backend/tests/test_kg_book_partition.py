@@ -208,6 +208,7 @@ from app.kg.entity_chapters import (  # noqa: E402
     apply_plan,
     build_plan,
     chapter_of_label,
+    format_chapter_range,
     summarize,
 )
 
@@ -218,6 +219,10 @@ check("章号：段2 不认", chapter_of_label("段2"), None)
 check("章号：空串", chapter_of_label(""), None)
 check("章号：None", chapter_of_label(None), None)
 check("章号：第0章 非法", chapter_of_label("第0章"), None)
+check("展示：区间", format_chapter_range(1, 3137), "第1–3137章")
+check("展示：单章", format_chapter_range(8, 8), "第8章")
+check("展示：未知", format_chapter_range(None, None), "章号未知")
+check("展示：半缺", format_chapter_range(3, None), "章号未知")
 
 chap_path = os.path.join(tmpdir, "chapters.db")
 chap_engine = create_engine(f"sqlite:///{chap_path}", future=True)
@@ -243,7 +248,7 @@ db.add_all([
     # 生成路径：只认显式标签，段1 不计
     KgEntity(id=2, project_id=1, novel_id=None, kind="character",
              canonical_name="生成角色", first_chapter=None, last_chapter=None),
-    # 两条路径都有：取并集
+    # 两条路径都有：带书实体只吃本书语料 → [40,40]，不吃生成的「第5章」
     KgEntity(id=3, project_id=1, novel_id=5, kind="item",
              canonical_name="混合", first_chapter=1, last_chapter=99),
     # 只有段N / 没有 mention：未知
@@ -251,6 +256,9 @@ db.add_all([
              canonical_name="未知实体", first_chapter=None, last_chapter=None),
     KgEntity(id=5, project_id=1, novel_id=None, kind="info",
              canonical_name="无提及", first_chapter=None, last_chapter=None),
+    # 单列缺失：只填缺的那一列
+    KgEntity(id=6, project_id=1, novel_id=5, kind="item",
+             canonical_name="半缺", first_chapter=None, last_chapter=7),
 ])
 db.flush()
 db.add_all([
@@ -262,32 +270,39 @@ db.add_all([
     KgMention(project_id=1, novel_id=5, entity_id=3, generation_id=None, segment_no=40),
     KgMention(project_id=1, novel_id=None, entity_id=3, generation_id=2, segment_no=4),
     KgMention(project_id=1, novel_id=None, entity_id=4, generation_id=3, segment_no=5),
+    KgMention(project_id=1, novel_id=5, entity_id=6, generation_id=None, segment_no=6),
 ])
 db.commit()
 
 plan = {p.entity_id: p for p in build_plan(db).plans}
-check("语料路径按 segment_no 取区间", [plan[1].new_first, plan[1].new_last], [10, 20])
-check("生成路径只认显式章号", [plan[2].new_first, plan[2].new_last], [3, 5])
+check("语料路径按 segment_no 取区间", [plan[1].recomputed_first, plan[1].recomputed_last], [10, 20])
+check("生成路径只认显式章号", [plan[2].recomputed_first, plan[2].recomputed_last], [3, 5])
 check("段N 不计入章号", plan[2].unknown_mentions, 1)
-check("两条路径取并集", [plan[3].new_first, plan[3].new_last], [5, 40])
-check("只有段N → 未知（不回落 1）", [plan[4].new_first, plan[4].new_last], [None, None])
-check("无 mention → 未知", [plan[5].new_first, plan[5].new_last], [None, None])
+check("带书实体不吃生成章号", [plan[3].recomputed_first, plan[3].recomputed_last], [40, 40])
+check("只有段N → 未知（不回落 1）", [plan[4].recomputed_first, plan[4].recomputed_last], [None, None])
+check("无 mention → 未知", [plan[5].recomputed_first, plan[5].recomputed_last], [None, None])
 check("未知实体不漂移", plan[4].drift, False)
-check("NULL → 区间算漂移", plan[1].drift, True)
-check("区间变化算漂移", plan[3].drift, True)
+check("NULL → 区间算可填", plan[1].fillable, True)
+check("已有非 NULL 不算可填", plan[3].fillable, False)
+check("已有非 NULL 且不同 → 漂移", plan[3].drift, True)
+check("漂移方向：收窄", plan[3].drift_direction, "narrow")
+check("单列缺失只填一列", [plan[6].fill_first, plan[6].fill_last], [6, 7])
 
 summary = summarize(build_plan(db))
 check("dry-run：未知 2 个", summary["unknown"], 2)
-check("dry-run：可填 2 个", summary["fillable_now"], 2)
-check("dry-run：漂移 3 个", summary["drift"], 3)
+check("dry-run：可填 3 个（含单列缺失）", summary["fillable_now"], 3)
+check("dry-run：漂移 1 个", summary["drift"], 1)
+check("dry-run：漂移方向分布", summary["drift_directions"], {"narrow": 1, "extend": 0, "both": 0})
 
 written = apply_plan(db, build_plan(db))
 db.commit()
-check("apply 只写漂移行", written, 3)
+check("apply 只写可填行（不覆盖非 NULL）", written, 3)
 rows = {e.id: (e.first_chapter, e.last_chapter) for e in db.query(KgEntity).all()}
 check("apply 后语料区间落库", rows[1], (10, 20))
+check("已有非 NULL 区间原样保留", rows[3], (1, 99))
 check("apply 后未知仍为 NULL", rows[4], (None, None))
 check("apply 后无提及仍为 NULL", rows[5], (None, None))
+check("单列缺失只填一列", rows[6], (6, 7))
 check("apply 幂等：再跑不写", apply_plan(db, build_plan(db)), 0)
 db.close()
 chap_engine.dispose()

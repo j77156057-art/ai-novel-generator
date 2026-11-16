@@ -3,28 +3,31 @@
 
 口径（严格，无最近邻兜底）：
 
-1. **语料路径**：``kg_mentions.generation_id IS NULL`` 且 ``novel_id`` 非空
-   → 章号 = ``segment_no``。依据是 ``corpus_ingest`` 的写入约定：语料摄取直接
-   用章号当段号（见该模块开头的「用章号当 segment_no」）。
-2. **生成路径**：``generation_id`` 非空 → 只认 ``generations.chapter_range`` 里
-   显式的「第 N 章」（``第9章《大勇知道了》`` → 9）。``段1`` / ``段2`` 这类写法
+1. **章号空间按实体所属书切分**：``novel_id`` 非空的实体只用**该书语料**的
+   mention（``generation_id IS NULL`` 且 ``novel_id`` 相同），章号 = ``segment_no``
+   —— 依据 ``corpus_ingest`` 用章号当段号的写入约定。本项目自己生成的内容是
+   另一个章号空间（``第1章`` 是项目正文第 1 章，不是那本书的第 1 章），
+   **不吸收**。
+2. **项目级实体**（``novel_id IS NULL``）只认生成路径：``generations.chapter_range``
+   里显式的「第 N 章」（``第9章《大勇知道了》`` → 9）。``段1`` / ``段2`` 这类写法
    **不认**，也不做「往前找最近一个带章号的 generation」这种推断。
-3. 两条都归不出 → **未知**：保持 NULL，读侧显示「章号未知」，任何路径都不回落
-   到第 1 章。
+3. 归不出 → **未知**：保持 NULL，读侧显示「章号未知」，任何路径都不回落到第 1 章。
 
-为什么不猜：本书 412 个实体的章号历史上是 NULL。硬填成 1 会让切片声称「第 1 章
-就出现了」，比未知更错——读侧将无法区分「真在第 1 章」与「我们不知道」。
+写入口径（2026-11-17 拍板）：**只填 NULL，不覆盖已有非 NULL**。
+历史非 NULL 值与当前 mention 聚合不一致的有数千条，根因是 ``persist_window``
+每轮整窗重写 mention，底数本身会丢信息；拿它去覆盖现有值（尤其收窄）不可逆，
+会让生成侧误判「角色还没出场」而重新介绍。这类不一致只计数、只落漂移清单，
+**不当成已修复**。
 
 用法（默认 dry-run，只读；``--apply`` 才写）::
 
-    python -m app.kg.entity_chapters --db backend/novel_dev.db
+    python -m app.kg.entity_chapters --db backend/novel_dev.db --drift-out reports/kg-chapter-range-drift.csv
     python -m app.kg.entity_chapters --db backend/novel_dev.db --apply
-
-``--apply`` 只写与现值不同的行，并输出漂移清单与实际写入行数；未知的实体不写。
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -53,9 +56,20 @@ def chapter_of_label(label: str | None) -> int | None:
     return n if n >= 1 else None
 
 
+def format_chapter_range(first: int | None, last: int | None) -> str:
+    """把章号区间渲染成读侧唯一两种形态：「第a–b章」或「章号未知」。
+
+    绝不返回 ``None`` / ``""``：调用方（切片、人物列表、前端状态条）拿到的
+    永远是可直接显示的字符串，避免「未知」在各处被各自渲染成空、0 或第 1 章。
+    """
+    if first is None or last is None:
+        return "章号未知"
+    return f"第{first}章" if first == last else f"第{first}–{last}章"
+
+
 @dataclass
 class EntityPlan:
-    """一个实体的章号回填计划（现值 → 新值）。"""
+    """一个实体的章号计划：现值、mention 重算值、待填值、漂移方向。"""
 
     entity_id: int
     project_id: int
@@ -64,24 +78,73 @@ class EntityPlan:
     name: str
     current_first: int | None
     current_last: int | None
-    new_first: int | None
-    new_last: int | None
+    recomputed_first: int | None
+    recomputed_last: int | None
     corpus_mentions: int = 0
     generation_mentions: int = 0
     unknown_mentions: int = 0
+    ignored_generation_mentions: int = 0
 
     @property
     def resolved(self) -> bool:
-        """是否聚合出可确定的章号区间。"""
-        return self.new_first is not None and self.new_last is not None
+        """mention 聚合是否给出可确定区间。"""
+        return self.recomputed_first is not None and self.recomputed_last is not None
+
+    @property
+    def fill_first(self) -> int | None:
+        """该写的 first：现有为 NULL 才填，非 NULL 一律不动。"""
+        return self.current_first if self.current_first is not None else self.recomputed_first
+
+    @property
+    def fill_last(self) -> int | None:
+        return self.current_last if self.current_last is not None else self.recomputed_last
+
+    @property
+    def fillable(self) -> bool:
+        """是否有 NULL 列可以填（``--apply`` 只写这些行）。"""
+        return self.resolved and (self.current_first is None or self.current_last is None)
 
     @property
     def drift(self) -> bool:
-        """是否与现值不同（只有这些行会被 ``--apply`` 写入）。"""
+        """已有值且与 mention 聚合不一致。只计数、不覆盖。"""
         return (
             self.resolved
-            and (self.new_first != self.current_first or self.new_last != self.current_last)
+            and self.current_first is not None
+            and self.current_last is not None
+            and (self.recomputed_first != self.current_first
+                 or self.recomputed_last != self.current_last)
         )
+
+    @property
+    def drift_direction(self) -> str:
+        if not self.drift:
+            return ""
+        narrow = (self.recomputed_first > self.current_first) or (
+            self.recomputed_last < self.current_last
+        )
+        extend = (self.recomputed_first < self.current_first) or (
+            self.recomputed_last > self.current_last
+        )
+        if narrow and extend:
+            return "both"
+        return "narrow" if narrow else "extend"
+
+    def drift_row(self) -> dict:
+        return {
+            "entity_id": self.entity_id,
+            "project_id": self.project_id,
+            "novel_id": "" if self.novel_id is None else self.novel_id,
+            "kind": self.kind,
+            "name": self.name,
+            "current_first": self.current_first,
+            "current_last": self.current_last,
+            "recomputed_first": self.recomputed_first,
+            "recomputed_last": self.recomputed_last,
+            "direction": self.drift_direction,
+            "corpus_mentions": self.corpus_mentions,
+            "generation_mentions": self.generation_mentions,
+            "unknown_mentions": self.unknown_mentions,
+        }
 
     def as_dict(self) -> dict:
         return {
@@ -91,10 +154,9 @@ class EntityPlan:
             "kind": self.kind,
             "name": self.name,
             "current": [self.current_first, self.current_last],
-            "new": [self.new_first, self.new_last],
-            "corpus_mentions": self.corpus_mentions,
-            "generation_mentions": self.generation_mentions,
-            "unknown_mentions": self.unknown_mentions,
+            "recomputed": [self.recomputed_first, self.recomputed_last],
+            "fill": [self.fill_first, self.fill_last] if self.fillable else None,
+            "direction": self.drift_direction,
         }
 
 
@@ -107,29 +169,29 @@ class PlanResult:
     unlabeled_generation_mentions: int = 0
     #: 生成路径 mention 指向的 generation 行已不存在（脏引用）
     dangling_generation_mentions: int = 0
+    #: 带书实体名下、被「章号空间隔离」挡掉的生成路径 mention 数
+    ignored_generation_mentions: int = 0
 
 
-def _corpus_bounds(db) -> dict[int, tuple[int, int, int]]:
-    """语料路径：entity_id → (min_chapter, max_chapter, mention 数)。
+def _corpus_bounds(db) -> dict[tuple[int, int], tuple[int, int, int]]:
+    """语料路径：(entity_id, novel_id) → (min, max, mention 数)。
 
-    只认 ``generation_id IS NULL`` 且 ``novel_id`` 非空的提及；``segment_no``
-    为空的提及无法定章，跳过（不猜）。
+    按书拆键，避免把 A 书实体的章号空间和 B 书 mention 混在一起。
     """
     rows = db.execute(text(
-        "SELECT entity_id, MIN(segment_no), MAX(segment_no), COUNT(*)"
+        "SELECT entity_id, novel_id, MIN(segment_no), MAX(segment_no), COUNT(*)"
         " FROM kg_mentions"
         " WHERE generation_id IS NULL AND novel_id IS NOT NULL"
         "   AND segment_no IS NOT NULL"
-        " GROUP BY entity_id"
+        " GROUP BY entity_id, novel_id"
     )).fetchall()
-    return {int(r[0]): (int(r[1]), int(r[2]), int(r[3])) for r in rows}
+    return {
+        (int(r[0]), int(r[1])): (int(r[2]), int(r[3]), int(r[4])) for r in rows
+    }
 
 
 def _generation_bounds(db, result: PlanResult) -> dict[int, tuple[int, int, int, int]]:
-    """生成路径：entity_id → (min_chapter, max_chapter, 有标签数, 无标签数)。
-
-    ``chapter_range`` 只认显式「第 N 章」；``段N`` 计入无标签，不推断。
-    """
+    """生成路径：entity_id → (min, max, 有标签数, 无标签数)。"""
     rows = db.execute(text(
         "SELECT m.entity_id, g.chapter_range, COUNT(*)"
         " FROM kg_mentions m"
@@ -155,7 +217,7 @@ def _generation_bounds(db, result: PlanResult) -> dict[int, tuple[int, int, int,
 
 
 def build_plan(db, project_id: int | None = None) -> PlanResult:
-    """算出每个实体的章号区间计划（纯读，不写库）。"""
+    """算出每个实体的章号计划（纯读，不写库）。"""
     result = PlanResult()
     result.orphan_mentions = int(db.execute(text(
         "SELECT COUNT(*) FROM kg_mentions"
@@ -174,23 +236,39 @@ def build_plan(db, project_id: int | None = None) -> PlanResult:
 
     for eid, pid, novel_id, kind, name, cur_first, cur_last in entities:
         eid = int(eid)
-        c_min, c_max, c_cnt = corpus.get(eid, (None, None, 0))
-        g_min, g_max, g_cnt, g_bad = generation.get(eid, (None, None, 0, 0))
+        book = None if novel_id is None else int(novel_id)
+        c_min = c_max = None
+        c_cnt = 0
+        g_min = g_max = None
+        g_cnt = g_bad = 0
+        ignored = 0
+        if book is not None:
+            # 章号空间隔离：带书实体只吃本书语料；生成路径的章号属于项目正文，
+            # 混进来会让「手机」因为项目自写第 1 章而声称在书里第 1 章就出现。
+            c_min, c_max, c_cnt = corpus.get((eid, book), (None, None, 0))
+            g_raw = generation.get(eid)
+            if g_raw:
+                g_cnt, g_bad = g_raw[2], g_raw[3]
+                ignored = g_cnt + g_bad
+                result.ignored_generation_mentions += ignored
+        else:
+            g_min, g_max, g_cnt, g_bad = generation.get(eid, (None, None, 0, 0))
         firsts = [x for x in (c_min, g_min) if x is not None]
         lasts = [x for x in (c_max, g_max) if x is not None]
         result.plans.append(EntityPlan(
             entity_id=eid,
             project_id=int(pid),
-            novel_id=None if novel_id is None else int(novel_id),
+            novel_id=book,
             kind=str(kind),
             name=str(name),
             current_first=None if cur_first is None else int(cur_first),
             current_last=None if cur_last is None else int(cur_last),
-            new_first=min(firsts) if firsts else None,
-            new_last=max(lasts) if lasts else None,
+            recomputed_first=min(firsts) if firsts else None,
+            recomputed_last=max(lasts) if lasts else None,
             corpus_mentions=c_cnt,
             generation_mentions=g_cnt,
             unknown_mentions=g_bad,
+            ignored_generation_mentions=ignored,
         ))
     return result
 
@@ -201,54 +279,80 @@ def summarize(result: PlanResult) -> dict:
     for p in result.plans:
         slot = per_project.setdefault(p.project_id, {
             "entities": 0, "resolved": 0, "unknown": 0,
-            "null_chapter_before": 0, "drift": 0,
+            "null_chapter_before": 0, "fillable": 0, "drift": 0,
         })
         slot["entities"] += 1
-        if p.resolved:
-            slot["resolved"] += 1
-        else:
-            slot["unknown"] += 1
-        if p.current_first is None or p.current_last is None:
-            slot["null_chapter_before"] += 1
+        slot["resolved"] += 1 if p.resolved else 0
+        slot["unknown"] += 0 if p.resolved else 1
+        slot["null_chapter_before"] += (
+            1 if p.current_first is None or p.current_last is None else 0
+        )
+        slot["fillable"] += 1 if p.fillable else 0
+        slot["drift"] += 1 if p.drift else 0
+    directions = {"narrow": 0, "extend": 0, "both": 0}
+    for p in result.plans:
         if p.drift:
-            slot["drift"] += 1
-    unknown = [p for p in result.plans if not p.resolved]
+            directions[p.drift_direction] += 1
     return {
         "entities": len(result.plans),
         "resolved": sum(1 for p in result.plans if p.resolved),
-        "unknown": len(unknown),
+        "unknown": sum(1 for p in result.plans if not p.resolved),
         "null_chapter_before": sum(
             1 for p in result.plans if p.current_first is None or p.current_last is None
         ),
-        "fillable_now": sum(
-            1 for p in result.plans
-            if p.resolved and (p.current_first is None or p.current_last is None)
+        "fillable_now": sum(1 for p in result.plans if p.fillable),
+        "already_consistent": sum(
+            1 for p in result.plans if p.resolved and not p.drift and not p.fillable
         ),
-        "already_consistent": sum(1 for p in result.plans if p.resolved and not p.drift),
         "drift": sum(1 for p in result.plans if p.drift),
+        "drift_directions": directions,
         "per_project": dict(sorted(per_project.items())),
-        "unknown_sample": [
-            {"entity_id": p.entity_id, "project_id": p.project_id,
-             "novel_id": p.novel_id, "kind": p.kind, "name": p.name,
-             "corpus_mentions": p.corpus_mentions,
-             "generation_mentions": p.generation_mentions,
-             "unknown_mentions": p.unknown_mentions}
-            for p in unknown[:50]
-        ],
         "orphan_mentions": result.orphan_mentions,
         "unlabeled_generation_mentions": result.unlabeled_generation_mentions,
         "dangling_generation_mentions": result.dangling_generation_mentions,
+        "ignored_generation_mentions": result.ignored_generation_mentions,
     }
 
 
 def apply_plan(db, result: PlanResult) -> int:
-    """只写与现值不同的行；返回实际写入的实体行数。"""
-    rows = [p for p in result.plans if p.drift]
+    """只填 NULL 列；返回实际写入的实体行数（已有非 NULL 的行永不进这里）。"""
+    rows = [p for p in result.plans if p.fillable]
     for p in rows:
+        sets = []
+        params: dict = {"eid": p.entity_id}
+        if p.current_first is None:
+            sets.append("first_chapter = :nf")
+            params["nf"] = p.fill_first
+        if p.current_last is None:
+            sets.append("last_chapter = :nl")
+            params["nl"] = p.fill_last
+        if not sets:
+            continue
         db.execute(text(
-            "UPDATE kg_entities SET first_chapter = :nf, last_chapter = :nl"
-            " WHERE id = :eid"
-        ), {"nf": p.new_first, "nl": p.new_last, "eid": p.entity_id})
+            f"UPDATE kg_entities SET {', '.join(sets)} WHERE id = :eid"
+        ), params)
+    return len(rows)
+
+
+def chapter_range_drift_count(db, project_id: int | None = None) -> int:
+    """与当前 mention 聚合不一致的实体数（含收窄/扩张，**未被修复**）。"""
+    return sum(1 for p in build_plan(db, project_id).plans if p.drift)
+
+
+def write_drift_csv(plans: list[EntityPlan], path: str) -> int:
+    """把漂移明细落成 CSV（按实体可查），返回条数。"""
+    rows = [p.drift_row() for p in plans if p.drift]
+    import os
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [
+            "entity_id", "project_id", "novel_id", "kind", "name",
+            "current_first", "current_last", "recomputed_first", "recomputed_last",
+            "direction", "corpus_mentions", "generation_mentions", "unknown_mentions",
+        ])
+        writer.writeheader()
+        writer.writerows(rows)
     return len(rows)
 
 
@@ -271,17 +375,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db", help="sqlite 库路径；缺省用 settings.database_url")
     ap.add_argument("--project", type=int, help="只处理某个项目")
     ap.add_argument("--apply", action="store_true", help="真的写库（默认只读）")
-    ap.add_argument("--limit", type=int, default=40, help="漂移清单打印条数")
-    ap.add_argument("--json-out", help="把完整报告写到该路径")
+    ap.add_argument("--limit", type=int, default=20, help="漂移清单打印条数")
+    ap.add_argument("--json-out", help="把汇总写到该 JSON 路径")
+    ap.add_argument("--drift-out", help="把漂移明细落成 CSV（按实体可查）")
     args = ap.parse_args(argv)
 
+    eng: Engine | None = None
     if args.db:
-        eng: Engine | None = _make_engine(args.db)
+        eng = _make_engine(args.db)
         session_factory = lambda: Session(eng)  # noqa: E731
     else:
         from app.db import SessionLocal
 
-        eng = None
         session_factory = SessionLocal
 
     db = session_factory()
@@ -289,25 +394,30 @@ def main(argv: list[str] | None = None) -> int:
         result = build_plan(db, project_id=args.project)
         report = summarize(result)
         report["mode"] = "apply" if args.apply else "dry-run"
-        drift = [p.as_dict() for p in result.plans if p.drift]
-        report["drift_rows"] = drift
+        drift_rows = [p.drift_row() for p in result.plans if p.drift]
+        report["drift_rows"] = drift_rows
+        if args.drift_out:
+            report["drift_file"] = args.drift_out
+            report["drift_file_rows"] = write_drift_csv(result.plans, args.drift_out)
         written = 0
         if args.apply:
             written = apply_plan(db, result)
             db.commit()
         report["written"] = written
-        swiped = report["drift_rows"][: args.limit]
         print(f"[{report['mode']}] 实体 {report['entities']} 个："
               f"可定章 {report['resolved']}，未知 {report['unknown']}；"
               f"章号 NULL {report['null_chapter_before']}，可填 {report['fillable_now']}；"
-              f"漂移 {report['drift']}，已写 {written}")
-        for row in swiped:
+              f"漂移 {report['drift']}（{report['drift_directions']}）；已写 {written}")
+        for row in drift_rows[: args.limit]:
             print(f"  #{row['entity_id']} p{row['project_id']} book={row['novel_id']} "
-                  f"{row['kind']}/{row['name']}: {row['current']} → {row['new']}")
+                  f"{row['kind']}/{row['name']}: "
+                  f"[{row['current_first']},{row['current_last']}] → "
+                  f"[{row['recomputed_first']},{row['recomputed_last']}] "
+                  f"{row['direction']}")
         if args.json_out:
             with open(args.json_out, "w", encoding="utf-8") as f:
                 json.dump(report, f, ensure_ascii=False, indent=1)
-            print(f"报告已写：{args.json_out}")
+            print(f"汇总已写：{args.json_out}")
     finally:
         db.close()
         if eng is not None:
