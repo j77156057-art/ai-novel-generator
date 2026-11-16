@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from sqlalchemy import select, func
 
+from app.kg.entity_chapters import format_chapter_range
 from app.kg.book_scope import book_for_project, prompt_scope_book_ids, scope_sql_values
 from app.kg.entity_lookup import resolve_entity_by_name
 from app.models import (
@@ -115,6 +116,9 @@ def slice_for_prompt(
             "kind": ent.kind,
             "context": ent_agg[eid]["context"],
             "mention_count": ent_agg[eid]["count"],
+            # 章号只给「确定区间」或「章号未知」两种字符串，不给 null：
+            # 下游拼 prompt / 前端渲染都不需要再各自决定「空值算什么」。
+            "chapters": format_chapter_range(ent.first_chapter, ent.last_chapter),
         })
 
     # —— 2. 当前角色最新状态（每角色每 state_type 取最新一条）——
@@ -150,14 +154,16 @@ def slice_for_prompt(
                 })
 
     # —— 3. active 伏笔（planted/developing）——
-    # kg_foreshadows 表**没有书维度**，只能按等价口径挡参考书：
-    # 原创项目（无续写/来源书）写到第 N 段时，不可能在自己的正文里埋下
-    # 第 N+ 章才出现的伏笔；planted_chapter 晚于当前进度的行，只可能是
-    # 参考书语料抽出来的，注入就是把别书的后续剧透塞进本章。
-    # 有续写书时不加这道门：那本书的旧章节伏笔对续写是有效上下文。
+    # kg_foreshadows 现在有书维度：按「本书 + 项目级 NULL」过滤，跨书伏笔
+    # （同名跨书撞键的那条）不会因为同名被当成本书伏笔注入。
+    # 另加一道进度门：原创项目（无续写/来源书）写到第 N 段时，不可能在自己的
+    # 正文里埋下第 N+ 章才出现的伏笔；planted_chapter 晚于当前进度的行，只可能
+    # 是参考书语料抽出来的，注入就是把别书的后续剧透塞进本章。有续写书时不加
+    # 这道门：那本书的旧章节伏笔对续写是有效上下文。
     fs_q = select(KgForeshadow).where(
         KgForeshadow.project_id == project_id,
         KgForeshadow.status.in_(["planted", "developing"]),
+        func.coalesce(KgForeshadow.novel_id, -1).in_(scope_sql),
     )
     if own_book is None:
         fs_q = fs_q.where(
@@ -221,9 +227,9 @@ def slice_for_prompt(
         })
 
     # —— 6. 当前段实体之间已发生的关系（kg_relations）——
-    # kg_relations 表本身没有 novel_id，书维度用「两端实体的 novel_id」替代：
-    # 只有两端都在本段实体集合里、且都在本书可见范围内（NULL=通配）才取。
-    # 这样既不会把别书的边（如「镇国剑归镇北王」）注进无关故事，也不会把整张
+    # 两道门同时卡：边自身的 novel_id（现在有了这一列）+ 两端实体都在可见范围。
+    # 只靠端点推导会让「一端项目级 NULL、另一端本书」的边钻进来；只靠边自身
+    # 则挡不住老数据（novel_id 全 NULL）。两道一起才既不注别书的边，也不把整张
     # 关系图铺成人物小传。
     relationships: list[dict] = []
     visible = {
@@ -237,6 +243,7 @@ def slice_for_prompt(
                 KgRelation.project_id == project_id,
                 KgRelation.status == "active",  # 候选边（集合端点门降级）不注入
                 KgRelation.is_current.is_(True),  # 旧版本被重写章否定的边不注入
+                func.coalesce(KgRelation.novel_id, -1).in_(scope_sql),
                 KgRelation.from_id.in_(visible),
                 KgRelation.to_id.in_(visible),
             ).order_by(KgRelation.strength.desc(), KgRelation.id)
@@ -347,18 +354,30 @@ def format_slice_for_prompt(sl: dict) -> str:
 # 8 个产品功能的读侧 API（关系演变曲线 / 节奏分析 / 人物情报追踪等）
 # --------------------------------------------------------------------------- #
 
-def relation_curve(db, project_id: int, from_name: str, to_name: str) -> list[dict]:
-    """关系演变曲线：两角色 rel 的 strength 历史（kg_relation_evolution）。"""
+def relation_curve(db, project_id: int, from_name: str, to_name: str,
+                   project=None) -> list[dict]:
+    """关系演变曲线：两角色 rel 的 strength 历史（kg_relation_evolution）。
+
+    按书过滤两层：实体解析只认本书（+ NULL），边自身也必须落在本书可见范围，
+    否则同名角色在别书的演变曲线会混进本条曲线。
+    """
     from app.models import KgRelation, KgRelationEvolution
 
-    a = resolve_entity_by_name(db, project_id, from_name)
-    b = resolve_entity_by_name(db, project_id, to_name)
+    if project is None:
+        project = db.get(Project, project_id)
+    own_book = book_for_project(project) if project is not None else None
+    scope_sql = (
+        scope_sql_values(prompt_scope_book_ids(project)) if project is not None else (-1,)
+    )
+    a = resolve_entity_by_name(db, project_id, from_name, novel_id=own_book)
+    b = resolve_entity_by_name(db, project_id, to_name, novel_id=own_book)
     if a is None or b is None:
         return []
     rels = db.scalars(select(KgRelation).where(
         KgRelation.project_id == project_id,
         KgRelation.status == "active",  # 候选边（集合端点门降级）不进演变曲线
         KgRelation.is_current.is_(True),  # 同章旧稿关系只留档，不进曲线
+        func.coalesce(KgRelation.novel_id, -1).in_(scope_sql),
         KgRelation.from_id.in_([a.id, b.id]),
         KgRelation.to_id.in_([a.id, b.id]),
     )).all()
@@ -379,7 +398,8 @@ def relation_curve(db, project_id: int, from_name: str, to_name: str) -> list[di
     return curve
 
 
-def can_character_know(db, project_id: int, character_name: str, fact_name: str) -> bool:
+def can_character_know(db, project_id: int, character_name: str, fact_name: str,
+                       project=None) -> bool:
     """人物情报追踪：character 此刻是否知道 fact（已知 → True）。
 
     fact 三种形态（known_kind 三类全消费）：
@@ -389,8 +409,16 @@ def can_character_know(db, project_id: int, character_name: str, fact_name: str)
     """
     from app.kg.knowledge_match import normalize_fact, event_summary_match
 
+    if project is None:
+        project = db.get(Project, project_id)
+    own_book = book_for_project(project) if project is not None else None
+    scope = prompt_scope_book_ids(project) if project is not None else (None,)
+
     # 人物情报的主体是角色，kind 必须限定（同名 item 不能当角色用）。
-    ent = resolve_entity_by_name(db, project_id, character_name, kind="character")
+    # 同时只认本书的角色：别书的同名角色知道什么，与本书无关。
+    ent = resolve_entity_by_name(
+        db, project_id, character_name, kind="character", novel_id=own_book
+    )
     if ent is None:
         return False
     fact = (fact_name or "").strip()
@@ -411,7 +439,7 @@ def can_character_know(db, project_id: int, character_name: str, fact_name: str)
     if kind_hint:
         q = q.where(KgEntityKnowledge.known_kind == kind_hint)
     for k in db.scalars(q):
-        label = _knowledge_label(db, k)
+        label = _knowledge_label(db, k, scope)
         if label is not None and label == fact:
             return True
         # 去掉 "事件：" / "秘密：" 前缀后的文本比对
@@ -431,19 +459,30 @@ def can_character_know(db, project_id: int, character_name: str, fact_name: str)
             summary = ""
             if k.known_entity_id is not None:
                 ev = db.get(KgEvent, k.known_entity_id)
-                summary = (ev.summary or "") if ev else ""
+                if ev is not None and _label_in_scope(ev, scope):
+                    summary = ev.summary or ""
             target = summary or (k.known_text or "")
             if target and event_summary_match(body, target):
                 return True
     return False
 
 
-def rhythm_analysis(db, project_id: int, window: int = 10) -> dict:
-    """节奏分析：每实体在最近 N 段的 mention 分布（谁在唱主角）。"""
+def rhythm_analysis(db, project_id: int, window: int = 10, project=None) -> dict:
+    """节奏分析：每实体在最近 N 段的 mention 分布（谁在唱主角）。
+
+    按书过滤：段号与实体都必须落在本书可见范围，否则两本书的段号会被当成
+    同一条时间轴，主角榜会把别书的高频角色排到前面。
+    """
+    if project is None:
+        project = db.get(Project, project_id)
+    scope_sql = (
+        scope_sql_values(prompt_scope_book_ids(project)) if project is not None else (-1,)
+    )
     segs = db.scalars(
         select(KgMention.segment_no).where(
             KgMention.project_id == project_id,
             KgMention.is_current.is_(True),
+            func.coalesce(KgMention.novel_id, -1).in_(scope_sql),
         ).distinct().order_by(KgMention.segment_no.desc()).limit(window)
     ).all()
     if not segs:
@@ -453,7 +492,9 @@ def rhythm_analysis(db, project_id: int, window: int = 10) -> dict:
         select(KgEntity.canonical_name, KgEntity.kind, func.count(KgMention.id).label("n"))
         .join(KgMention, KgMention.entity_id == KgEntity.id)
         .where(KgMention.project_id == project_id, KgMention.segment_no >= lo,
-               KgMention.is_current.is_(True))
+               KgMention.is_current.is_(True),
+               func.coalesce(KgMention.novel_id, -1).in_(scope_sql),
+               func.coalesce(KgEntity.novel_id, -1).in_(scope_sql))
         .group_by(KgEntity.id)
         .order_by(func.count(KgMention.id).desc())
         .limit(20)

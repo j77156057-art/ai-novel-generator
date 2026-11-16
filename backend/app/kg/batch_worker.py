@@ -2488,7 +2488,8 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
             )
         )
         if rel is None:
-            rel = KgRelation(project_id=project_id, from_id=a_id, to_id=b_id,
+            rel = KgRelation(project_id=project_id, novel_id=book,
+                             from_id=a_id, to_id=b_id,
                              rel_type=r["rel_type"], strength=r.get("strength", 0.5),
                              status=status, since_chapter=rel_ch,
                              description="item_endpoint" if item_endpoint else None,
@@ -2739,8 +2740,20 @@ def _persist_extraction(db: Session, project_id: int, result: dict, batch: list[
                 KgForeshadow.project_id == project_id, KgForeshadow.name == f["name"]
             )
         )
+        if fs is not None and fs.novel_id is not None and book is not None \
+                and fs.novel_id != book:
+            # 同名跨书撞 uq_kg_foreshadow(project_id, name)：不合并、不改写别书行。
+            # 落隔离区留痕（book-scope.foreshadows.cross_book_name_collision 可查），
+            # 不能只 catch 后继续——那等于把「这本书也有同名伏笔」这个事实丢掉。
+            _quarantine(
+                db, project_id=project_id, run_id=None, segment_no=None,
+                kind="foreshadow", reason="cross_book_name_conflict",
+                detail={"name": f["name"], "existing_novel_id": fs.novel_id,
+                        "incoming_novel_id": book, "status": f.get("status")},
+            )
+            continue
         if fs is None:
-            fs = KgForeshadow(project_id=project_id, name=f["name"],
+            fs = KgForeshadow(project_id=project_id, novel_id=book, name=f["name"],
                               status=f.get("status", "planted"),
                               planted_chapter=f.get("planted_chapter"),
                               planned_payoff_chapter=f.get("planned_payoff_chapter"))
@@ -2946,10 +2959,23 @@ def _project_event_facts(db: Session, *, project_id: int,
             fs = db.scalar(select(KgForeshadow).where(
                 KgForeshadow.project_id == project_id,
                 KgForeshadow.name == label))
+            if (fs is not None and fs.novel_id is not None
+                    and ev.novel_id is not None and fs.novel_id != ev.novel_id):
+                # 同名跨书撞唯一键：不合并、不改写别书伏笔，落隔离区留痕。
+                _quarantine(
+                    db, project_id=project_id, run_id=None,
+                    segment_no=ev.segment_no, kind="foreshadow",
+                    reason="cross_book_name_conflict",
+                    detail={"name": label, "existing_novel_id": fs.novel_id,
+                            "incoming_novel_id": ev.novel_id,
+                            "event_type": ev.event_type},
+                )
+                continue
             if ev.event_type == "foreshadow_plant":
                 if fs is None:
                     db.add(KgForeshadow(
-                        project_id=project_id, name=label, status="planted",
+                        project_id=project_id, novel_id=ev.novel_id,
+                        name=label, status="planted",
                         planted_event_id=ev.id, planted_chapter=ev.chapter,
                         description=label[:500]))
                     stats.foreshadows += 1
@@ -2959,7 +2985,8 @@ def _project_event_facts(db: Session, *, project_id: int,
             else:
                 if fs is None:
                     db.add(KgForeshadow(
-                        project_id=project_id, name=label, status="paid_off",
+                        project_id=project_id, novel_id=ev.novel_id,
+                        name=label, status="paid_off",
                         payoff_event_id=ev.id,
                         actual_payoff_chapter=ev.chapter,
                         description=label[:500]))

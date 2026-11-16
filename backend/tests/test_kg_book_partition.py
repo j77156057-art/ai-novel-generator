@@ -309,6 +309,157 @@ chap_engine.dispose()
 
 
 # ====================================================================
+# 2. 写侧盖书 + 同名跨书撞键留痕
+# ====================================================================
+from app.kg.corpus_ingest import persist_window  # noqa: E402
+from app.models import KgEvent, KgIngestQuarantine  # noqa: E402
+
+write_path = os.path.join(tmpdir, "write_side.db")
+write_engine = create_engine(f"sqlite:///{write_path}", future=True)
+Base.metadata.create_all(bind=write_engine)
+W = sessionmaker(bind=write_engine, future=True)
+wdb = W()
+
+payload_a = {
+    "entities": [
+        {"canonical_name": "甲", "kind": "character"},
+        {"canonical_name": "乙", "kind": "character"},
+    ],
+    "relations": [{"from": "甲", "to": "乙", "rel_type": "ally", "strength": 0.8}],
+    "foreshadows": [{"name": "玉佩", "status": "planted", "planted_chapter": 1}],
+}
+persist_window(wdb, project_id=1, novel_id=5, win=[(1, "正文")], payload=payload_a)
+wdb.commit()
+check("写侧关系盖书", wdb.query(KgRelation).filter_by(project_id=1).one().novel_id, 5)
+check("写侧伏笔盖书", wdb.query(KgForeshadow).filter_by(project_id=1).one().novel_id, 5)
+
+payload_b = {
+    "entities": [{"canonical_name": "丙", "kind": "character"}],
+    "foreshadows": [{"name": "玉佩", "status": "planted", "planted_chapter": 2}],
+}
+stats_b = persist_window(wdb, project_id=1, novel_id=6,
+                         win=[(2, "正文")], payload=payload_b)
+wdb.commit()
+check("同名跨书伏笔计入写侧 stats", stats_b["foreshadow_cross_book"], 1)
+check("同名跨书不新增第二行", wdb.query(KgForeshadow).filter_by(project_id=1).count(), 1)
+check("别书伏笔行未被改写",
+      wdb.query(KgForeshadow).filter_by(project_id=1).one().novel_id, 5)
+quar = wdb.query(KgIngestQuarantine).all()
+check("同名跨书落隔离区一条", len(quar), 1)
+check("隔离区 kind/reason", (quar[0].kind, quar[0].reason),
+      ("foreshadow", "cross_book_name_conflict"))
+wdb.close()
+write_engine.dispose()
+
+
+# ====================================================================
+# 4. 读侧按书过滤 + book-scope 计数出口
+# ====================================================================
+from app.routers.kg_v3 import (  # noqa: E402
+    get_book_scope, get_events, list_characters, list_relations,
+)
+
+read_path = os.path.join(tmpdir, "read_side.db")
+read_engine = create_engine(f"sqlite:///{read_path}", future=True)
+Base.metadata.create_all(bind=read_engine)
+R = sessionmaker(bind=read_engine, future=True)
+rdb = R()
+
+rdb.add(Project(id=1, title="读侧", active_novel_id=5))
+rdb.flush()
+rdb.add_all([
+    # 本书角色：区间与 mention 一致
+    KgEntity(id=1, project_id=1, novel_id=5, kind="character",
+             canonical_name="许七安", first_chapter=1, last_chapter=10,
+             mention_count=9),
+    # 别书角色：读侧必须被挡掉
+    KgEntity(id=2, project_id=1, novel_id=6, kind="character",
+             canonical_name="别书角色", first_chapter=1, last_chapter=1,
+             mention_count=50),
+    # 项目级（NULL）：可见，但章号未知
+    KgEntity(id=3, project_id=1, novel_id=None, kind="character",
+             canonical_name="项目级角色", mention_count=1),
+    # 本书角色：现行区间与 mention 聚合不一致（漂移）
+    KgEntity(id=4, project_id=1, novel_id=5, kind="character",
+             canonical_name="漂移角色", first_chapter=1, last_chapter=2,
+             mention_count=2),
+    # 本书角色：无 mention → 章号未知
+    KgEntity(id=5, project_id=1, novel_id=5, kind="character",
+             canonical_name="未知角色", mention_count=1),
+])
+rdb.flush()
+rdb.add_all([
+    KgMention(project_id=1, novel_id=5, entity_id=1, generation_id=None, segment_no=1),
+    KgMention(project_id=1, novel_id=5, entity_id=1, generation_id=None, segment_no=10),
+    KgMention(project_id=1, novel_id=5, entity_id=4, generation_id=None, segment_no=5),
+])
+rdb.add_all([
+    KgRelation(id=1, project_id=1, novel_id=5, from_id=1, to_id=3, rel_type="ally",
+               strength=0.9, status="active", is_current=True, confidence=1.0),
+    # 别书边：边与两端都在书 6（端点 3 是项目级，边自身书已足以挡）
+    KgRelation(id=2, project_id=1, novel_id=6, from_id=2, to_id=3, rel_type="enemy",
+               strength=0.8, status="active", is_current=True, confidence=1.0),
+    # 边自身 NULL、两端同属书 5 → 可推导
+    KgRelation(id=3, project_id=1, novel_id=None, from_id=1, to_id=4, rel_type="friend",
+               strength=0.7, status="active", is_current=True, confidence=1.0),
+    # 边自身 NULL、两端分属书 5 / 书 6 → 真实跨书边，读侧必须挡掉
+    KgRelation(id=4, project_id=1, novel_id=None, from_id=1, to_id=2, rel_type="rival",
+               strength=0.6, status="active", is_current=True, confidence=1.0),
+])
+rdb.add_all([
+    KgForeshadow(project_id=1, novel_id=5, name="玉佩", status="planted", confidence=1.0),
+    KgForeshadow(project_id=1, novel_id=None, name="旧伏笔", status="planted", confidence=1.0),
+    KgForeshadow(project_id=1, novel_id=6, name="别书伏笔", status="planted", confidence=1.0),
+])
+rdb.add_all([
+    KgEvent(project_id=1, novel_id=5, sequence=1001, chapter=1, segment_no=1,
+            event_type="incident", summary="本书事件", confidence=1.0),
+    KgEvent(project_id=1, novel_id=6, sequence=1002, chapter=1, segment_no=1,
+            event_type="incident", summary="别书事件", confidence=1.0),
+    KgEvent(project_id=1, novel_id=None, sequence=1003, chapter=1, segment_no=1,
+            event_type="incident", summary="项目级事件", confidence=1.0),
+])
+rdb.add(KgIngestQuarantine(
+    project_id=1, run_id=None, segment_no=1, kind="foreshadow",
+    reason="cross_book_name_conflict", detail={"name": "玉佩"},
+))
+rdb.commit()
+
+chars = list_characters(1, 200, rdb)["characters"]
+check("读侧角色只含本书 + 项目级",
+      sorted(c["name"] for c in chars),
+      sorted(["许七安", "项目级角色", "漂移角色", "未知角色"]))
+chap_map = {c["name"]: c["chapters"] for c in chars}
+check("角色区间展示", chap_map["许七安"], "第1–10章")
+check("角色章号未知不显示 null", chap_map["未知角色"], "章号未知")
+check("项目级角色章号未知也不显示 null", chap_map["项目级角色"], "章号未知")
+
+rels = list_relations(1, 200, rdb)["relations"]
+check("读侧关系挡掉别书边与跨书边", len(rels), 2)
+
+evs = get_events(1, 50, None, None, rdb)["events"]
+check("读侧事件缺省按当前书",
+      sorted(e["summary"] for e in evs),
+      sorted(["本书事件", "项目级事件"]))
+
+scope = get_book_scope(1, rdb)
+check("book-scope 实体总数", scope["entities"]["total"], 5)
+check("book-scope 实体在范围内", scope["entities"]["in_scope"], 4)
+check("book-scope 别书实体被排除", scope["entities"]["other_books_excluded"], 1)
+check("book-scope 章号未知（含项目级 NULL）", scope["entities"]["chapter_unknown"], 2)
+check("book-scope 区间漂移计数", scope["entities"]["chapter_range_drift"], 1)
+check("book-scope 关系可推导数", scope["relations"]["derived_from_endpoints"], 1)
+check("book-scope 跨书边数", scope["relations"]["cross_book_edges"], 1)
+check("book-scope 伏笔归属不明", scope["foreshadows"]["unattributable"], 1)
+check("book-scope 同名跨书撞键", scope["foreshadows"]["cross_book_name_collision"], 1)
+check("book-scope 事件别书排除", scope["events"]["other_books_excluded"], 1)
+check("book-scope 解析书", scope["book"]["resolved"], 5)
+check("book-scope 作用域", scope["book"]["scope"], [5, None])
+rdb.close()
+read_engine.dispose()
+
+
+# ====================================================================
 # 汇总
 # ====================================================================
 print(f"\n结果：{PASS} 通过, {FAIL} 失败" + (f" -> {FAILED}" if FAILED else ""))

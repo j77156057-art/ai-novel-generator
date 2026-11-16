@@ -38,7 +38,7 @@ from app.db import SessionLocal
 from app.kg.extractor_v3 import ERROR_FIELD, extract_batch, extract_targeted
 from app.models import (
     KgCharacterState, KgCorpusWindow, KgEntity, KgEntityKnowledge, KgEvent,
-    KgEventLink, KgForeshadow, KgMention, KgRelation, NovelChunk,
+    KgEventLink, KgForeshadow, KgIngestQuarantine, KgMention, KgRelation, NovelChunk,
 )
 
 logger = logging.getLogger(__name__)
@@ -359,7 +359,8 @@ def persist_window(db: Session, *, project_id: int, novel_id: int,
     """
     chapters = [no for no, _ in win]
     name_to_ent: dict[str, KgEntity] = {}
-    stats = {"entities": 0, "relations": 0, "events": 0, "foreshadows": 0}
+    stats = {"entities": 0, "relations": 0, "events": 0, "foreshadows": 0,
+             "foreshadow_cross_book": 0}
 
     # —— 1. 实体 ——
     for e in payload.get("entities") or []:
@@ -452,7 +453,8 @@ def persist_window(db: Session, *, project_id: int, novel_id: int,
         strength = float(r.get("strength") or 0.5)
         if exist is None:
             db.add(KgRelation(
-                project_id=project_id, from_id=f.id, to_id=t.id, rel_type=rel_type,
+                project_id=project_id, novel_id=novel_id,
+                from_id=f.id, to_id=t.id, rel_type=rel_type,
                 strength=strength, since_chapter=chapters[0], confidence=0.7,
             ))
             stats["relations"] += 1
@@ -469,9 +471,23 @@ def persist_window(db: Session, *, project_id: int, novel_id: int,
         planted = planted if planted in chapters else chapters[0]
         row = db.scalar(select(KgForeshadow).where(
             KgForeshadow.project_id == project_id, KgForeshadow.name == name))
+        if row is not None and row.novel_id is not None and row.novel_id != novel_id:
+            # 同名跨书撞 uq_kg_foreshadow(project_id, name)：**不合并、不改写
+            # 别书行**。落隔离区留痕，book-scope 的
+            # foreshadows.cross_book_name_collision 可查——静默吞掉等于丢掉
+            # 「这本书有同名伏笔」这个事实。
+            db.add(KgIngestQuarantine(
+                project_id=project_id, run_id=None, segment_no=chapters[0],
+                kind="foreshadow", reason="cross_book_name_conflict",
+                detail={"name": name, "existing_novel_id": row.novel_id,
+                        "incoming_novel_id": novel_id, "status": st,
+                        "planted_chapter": planted},
+            ))
+            stats["foreshadow_cross_book"] += 1
+            continue
         if row is None:
             db.add(KgForeshadow(
-                project_id=project_id, name=name, status=st,
+                project_id=project_id, novel_id=novel_id, name=name, status=st,
                 planted_chapter=planted,
                 planned_payoff_chapter=fo.get("planned_payoff_chapter"),
                 actual_payoff_chapter=(chapters[0] if st == "paid_off" else None),

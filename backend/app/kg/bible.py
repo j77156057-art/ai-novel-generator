@@ -19,6 +19,7 @@ from typing import Any
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
+from app.kg.book_scope import book_for_project
 from app.kg.entity_lookup import resolve_entity_by_name
 from app.models import KgBibleRevision, KgEntity, KgForeshadow, Project
 
@@ -362,7 +363,13 @@ def diff_bible(old: Any, new: Any) -> dict:
     }
 
 
-def detect_conflicts(db: Session, project_id: int, new_bible: Any) -> list[dict]:
+def _book_filter(model, novel_id: int | None) -> list:
+    """书维度过滤：指定书 + 项目级 NULL。``None`` = 不限制（老行为）。"""
+    return [] if novel_id is None else [model.novel_id.in_((novel_id, None))]
+
+
+def detect_conflicts(db: Session, project_id: int, new_bible: Any,
+                     novel_id: int | None = None) -> list[dict]:
     """扫 KG：哪些 fact 与新 bible 字面矛盾？
 
     字段映射（保守，只扫显式三块）：
@@ -394,6 +401,7 @@ def detect_conflicts(db: Session, project_id: int, new_bible: Any) -> list[dict]
                 KgEntity.project_id == project_id,
                 KgEntity.kind == "character",
                 KgEntity.canonical_name == name,
+                *_book_filter(KgEntity, novel_id),
             ))
             if ent is None:
                 continue
@@ -440,8 +448,8 @@ def detect_conflicts(db: Session, project_id: int, new_bible: Any) -> list[dict]
             # 关系端点**不限 kind**：owner→item（owns）与人物关系都合法。
             # 但同名跨 kind 时不能交给 db.scalar 抛 MultipleResultsFound，
             # 统一走确定性的解析（人物优先，其次物品，再按 KIND_ORDER/id）。
-            ea = resolve_entity_by_name(db, project_id, a)
-            eb = resolve_entity_by_name(db, project_id, b)
+            ea = resolve_entity_by_name(db, project_id, a, novel_id=novel_id)
+            eb = resolve_entity_by_name(db, project_id, b, novel_id=novel_id)
             if ea is None or eb is None:
                 continue
             from app.models import KgRelation
@@ -482,6 +490,7 @@ def detect_conflicts(db: Session, project_id: int, new_bible: Any) -> list[dict]
             fs = db.scalar(select(KgForeshadow).where(
                 KgForeshadow.project_id == project_id,
                 KgForeshadow.name == name,
+                *_book_filter(KgForeshadow, novel_id),
             ))
             if fs is None:
                 continue
@@ -527,7 +536,8 @@ def apply_bible_revision(
 
     old_bible = proj.plot_bible
     diff = diff_bible(old_bible, new_bible)
-    conflicts = detect_conflicts(db, project_id, new_bible)
+    conflicts = detect_conflicts(db, project_id, new_bible,
+                                 novel_id=book_for_project(proj))
     warnings = validate_bible_keys(new_bible)
 
     rev_no = _next_revision_no(db, project_id)

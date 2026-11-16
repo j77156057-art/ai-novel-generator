@@ -182,7 +182,8 @@ def check_teleportation(db, project_id: int, text: str, segment_no: int,
     return findings
 
 
-def check_unauthorized_knowledge(db, project_id: int, text: str, segment_no: int) -> list[JudgeFinding]:
+def check_unauthorized_knowledge(db, project_id: int, text: str, segment_no: int,
+                                 novel_id: int | None = None) -> list[JudgeFinding]:
     """预知外挂：角色引用了某事实，但其 knowledge 记录显示尚未学到。
 
     判据（保守）：
@@ -196,18 +197,27 @@ def check_unauthorized_knowledge(db, project_id: int, text: str, segment_no: int
         select(KgMention).where(
             KgMention.project_id == project_id, KgMention.segment_no == segment_no,
             KgMention.is_current.is_(True),
+            *_book_cond(KgMention, novel_id),
         )
     ).all()
     mentioned = {m.entity_id for m in mentions}
     # 秘密实体（attrs.secrets 非空 的 character + 全部 entity 名字）
     secret_entities = db.scalars(
         select(KgEntity).where(
-            KgEntity.project_id == project_id, KgEntity.kind == "character"
+            KgEntity.project_id == project_id, KgEntity.kind == "character",
+            *_book_cond(KgEntity, novel_id),
         )
     ).all()
-    # 已知学习关系：(entity_id -> {known_entity_id})，仅 learned_at ≤ 当前段
+    # 已知学习关系：(entity_id -> {known_entity_id})，仅 learned_at ≤ 当前段。
+    # 知识表没有 novel_id 列，改按「知识归属实体」的书过滤——否则别书的
+    # 学习记录会让本书角色被误判成「已知」，或者相反。
     learned: dict[int, set[int]] = {}
-    for k in db.scalars(select(KgEntityKnowledge).where(KgEntityKnowledge.project_id == project_id)):
+    for k in db.scalars(
+        select(KgEntityKnowledge)
+        .join(KgEntity, KgEntity.id == KgEntityKnowledge.entity_id)
+        .where(KgEntityKnowledge.project_id == project_id,
+               *_book_cond(KgEntity, novel_id))
+    ):
         if (k.learned_at_chapter is None) or True:  # chapter 粒度粗，先全收
             learned.setdefault(k.entity_id, set()).add(k.known_entity_id)
 
@@ -252,7 +262,8 @@ def check_unauthorized_knowledge(db, project_id: int, text: str, segment_no: int
     return findings
 
 
-def check_secret_leak(db, project_id: int, text: str, segment_no: int) -> list[JudgeFinding]:
+def check_secret_leak(db, project_id: int, text: str, segment_no: int,
+                      novel_id: int | None = None) -> list[JudgeFinding]:
     """秘密外泄：kg_entity_knowledge 里 known_kind=secret 的**文本秘密**
     出现在本段说话内容里，但该角色从未被记录学到过这条秘密。
 
@@ -272,16 +283,21 @@ def check_secret_leak(db, project_id: int, text: str, segment_no: int) -> list[J
             select(KgMention).where(
                 KgMention.project_id == project_id, KgMention.segment_no == segment_no,
                 KgMention.is_current.is_(True),
+                *_book_cond(KgMention, novel_id),
             )
         )
     }
     if not mentioned:
         return findings
     # 项目里所有 secret 情报行（known_entity_id=None + known_text 有值）
+    # 按知识归属实体的书过滤：别书的秘密文本不能当成本段的泄密候选。
     secret_rows = db.scalars(
-        select(KgEntityKnowledge).where(
+        select(KgEntityKnowledge)
+        .join(KgEntity, KgEntity.id == KgEntityKnowledge.entity_id)
+        .where(
             KgEntityKnowledge.project_id == project_id,
             KgEntityKnowledge.known_kind == "secret",
+            *_book_cond(KgEntity, novel_id),
         )
     ).all()
     if not secret_rows:
@@ -642,11 +658,13 @@ def judge_segment(db, project_id: int, text: str, segment_no: int,
     except Exception:  # noqa: BLE001 —— 单规则失败不影响其他
         pass
     try:
-        findings += check_unauthorized_knowledge(db, project_id, text, segment_no)
+        findings += check_unauthorized_knowledge(db, project_id, text, segment_no,
+                                                 novel_id=novel_id)
     except Exception:  # noqa: BLE001
         pass
     try:
-        findings += check_secret_leak(db, project_id, text, segment_no)
+        findings += check_secret_leak(db, project_id, text, segment_no,
+                                      novel_id=novel_id)
     except Exception:  # noqa: BLE001
         pass
     try:

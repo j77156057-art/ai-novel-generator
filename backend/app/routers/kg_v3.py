@@ -7,11 +7,16 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, aliased
 
 from app.db import get_db
-from app.models import KgEvent, KgEventLink, Project
+from app.kg.book_scope import book_for_project, prompt_scope_book_ids, scope_sql_values
+from app.kg.entity_chapters import chapter_range_drift_count, format_chapter_range
+from app.models import (
+    KgEntity, KgEvent, KgEventLink, KgForeshadow, KgIngestQuarantine, KgMention,
+    KgRelation, Project,
+)
 
 router = APIRouter(prefix="/api/projects/{project_id}/kg-v3", tags=["kg-v3"])
 
@@ -73,10 +78,11 @@ def get_relation_curve(
     db: Session = Depends(get_db),
 ) -> dict:
     """关系演变曲线（strength 历史）。"""
-    _require_project(db, project_id)
+    proj = _require_project(db, project_id)
     from app.kg.retrieval_v3 import relation_curve
 
-    return {"from": from_name, "to": to_name, "curve": relation_curve(db, project_id, from_name, to_name)}
+    return {"from": from_name, "to": to_name,
+            "curve": relation_curve(db, project_id, from_name, to_name, project=proj)}
 
 
 @router.get("/knowledge")
@@ -87,10 +93,11 @@ def can_character_know(
     db: Session = Depends(get_db),
 ) -> dict:
     """人物情报追踪：character 此刻是否知道 fact。"""
-    _require_project(db, project_id)
+    proj = _require_project(db, project_id)
     from app.kg.retrieval_v3 import can_character_know as _check
 
-    return {"character": character, "fact": fact, "knows": _check(db, project_id, character, fact)}
+    return {"character": character, "fact": fact,
+            "knows": _check(db, project_id, character, fact, project=proj)}
 
 
 @router.get("/rhythm")
@@ -100,10 +107,10 @@ def get_rhythm(
     db: Session = Depends(get_db),
 ) -> dict:
     """节奏分析：最近 N 段每实体的 mention 分布（谁在唱主角）。"""
-    _require_project(db, project_id)
+    proj = _require_project(db, project_id)
     from app.kg.retrieval_v3 import rhythm_analysis
 
-    return rhythm_analysis(db, project_id, window=window)
+    return rhythm_analysis(db, project_id, window=window, project=proj)
 
 
 @router.get("/events")
@@ -116,19 +123,19 @@ def get_events(
 ) -> dict:
     """事件列表（含因果链），按 sequence 降序。
 
-    ``novel_id`` 缺省取项目当前书。事件表按书隔离，项目挂两本书时不能把
-    别书的事件混进前端列表；未指定书（None）时才返回项目全部事件。
+    ``novel_id`` 显式指定时只看「该书 + 项目级 NULL」；缺省用项目当前书
+    （``book_for_project``，续写书优先）。两列都空（原创项目）→ 只认项目级事件。
     """
     proj = _require_project(db, project_id)
     from app.models import KgEventLink
 
-    book = novel_id if novel_id is not None else proj.active_novel_id
+    scope = (novel_id, None) if novel_id is not None else prompt_scope_book_ids(proj)
+    scope_sql = scope_sql_values(scope)
     q = select(KgEvent).where(
         KgEvent.project_id == project_id,
         KgEvent.is_current.is_(True),  # 同章旧稿事件只留档，不进渲染
     )
-    if book is not None:
-        q = q.where(KgEvent.novel_id.in_((book, None)))
+    q = q.where(func.coalesce(KgEvent.novel_id, -1).in_(scope_sql))
     if event_type:
         q = q.where(KgEvent.event_type == event_type)
     events = db.scalars(q.order_by(KgEvent.sequence.desc()).limit(limit)).all()
@@ -318,13 +325,19 @@ def list_characters(
     limit: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> dict:
-    """项目角色清单（人物情报页的左列）。mention 降序。"""
-    _require_project(db, project_id)
-    from app.models import KgEntity
+    """项目角色清单（人物情报页的左列）。mention 降序。
+
+    按「当前书 + 项目级 NULL」过滤：参考书抽出来的角色不混进本书人物列表。
+    ``chapters`` 只有两种取值——「第a–b章」或「章号未知」，绝不返回 null，
+    前端不需要再自己决定空值怎么显示。
+    """
+    proj = _require_project(db, project_id)
+    scope_sql = scope_sql_values(prompt_scope_book_ids(proj))
 
     rows = db.scalars(
         select(KgEntity)
-        .where(KgEntity.project_id == project_id, KgEntity.kind == "character")
+        .where(KgEntity.project_id == project_id, KgEntity.kind == "character",
+               func.coalesce(KgEntity.novel_id, -1).in_(scope_sql))
         .order_by(KgEntity.mention_count.desc())
         .limit(limit)
     ).all()
@@ -333,6 +346,7 @@ def list_characters(
             "id": r.id, "name": r.canonical_name,
             "mention_count": r.mention_count or 0,
             "has_secrets": bool((r.attrs or {}).get("secrets")),
+            "chapters": format_chapter_range(r.first_chapter, r.last_chapter),
         }
         for r in rows
     ]}
@@ -347,15 +361,24 @@ def list_relations(
     """关系清单（关系图/列表数据源）。strength 降序。
 
     边带两端实体名与 kind（画图不用二次查）；自环边（from==to）丢弃。
+
+    书维度两道门同时卡：边自身的 ``novel_id`` 在可见范围 **且** 两端实体都在
+    可见范围。只卡边挡不住老数据（novel_id 全 NULL），只卡端点挡不住
+    「一端本书、一端项目级」的跨书边。
     """
-    _require_project(db, project_id)
-    from app.models import KgEntity, KgRelation
+    proj = _require_project(db, project_id)
+    scope = prompt_scope_book_ids(proj)
+    scope_sql = scope_sql_values(scope)
+
+    def _in_scope(ent: KgEntity | None) -> bool:
+        return ent is not None and (ent.novel_id is None or ent.novel_id in scope)
 
     rows = db.scalars(
         select(KgRelation)
         .where(KgRelation.project_id == project_id,
                KgRelation.status == "active",  # 候选边（集合端点门降级）不进关系图
-               KgRelation.is_current.is_(True))  # 同章旧稿关系只留档，不进图
+               KgRelation.is_current.is_(True),  # 同章旧稿关系只留档，不进图
+               func.coalesce(KgRelation.novel_id, -1).in_(scope_sql))
         .order_by(KgRelation.strength.desc())
         .limit(limit)
     ).all()
@@ -370,7 +393,7 @@ def list_relations(
             ents[r.from_id] = a
         if b is not None:
             ents[r.to_id] = b
-        if a is None or b is None:
+        if not _in_scope(a) or not _in_scope(b):
             continue
         out.append({
             "from": a.canonical_name, "to": b.canonical_name,
@@ -378,6 +401,103 @@ def list_relations(
             "rel_type": r.rel_type, "strength": r.strength,
         })
     return {"relations": out}
+
+
+def _count_rows(db: Session, model, *where) -> int:
+    return int(db.scalar(select(func.count()).select_from(model).where(*where)) or 0)
+
+
+@router.get("/book-scope")
+def get_book_scope(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """书维度现状（只读）：每张表在当前书范围内多少行、多少行属于别书。
+
+    ## 为什么要这个出口
+
+    读侧按「当前书 + 项目级 NULL」过滤之后，别书数据是**不显示**而不是
+    **不存在**。只看页面会以为「没有脏数据」；这里把被过滤掉的行数、归不出
+    书的行数、跨书同名撞键次数都摊开，避免静默。
+
+    ``entities.chapter_range_drift`` 是**现有章号与当前 mention 聚合不一致**
+    的实体数：这批值按拍板不覆盖（mention 底数会丢信息，收窄不可逆），
+    只计数、只落 `reports/` 漂移清单，**不算已修复**。
+    """
+    proj = _require_project(db, project_id)
+    scope = prompt_scope_book_ids(proj)
+    scope_sql = scope_sql_values(scope)
+    own = book_for_project(proj)
+
+    def table_counts(model) -> dict:
+        total = _count_rows(db, model, model.project_id == project_id)
+        in_scope = _count_rows(
+            db, model, model.project_id == project_id,
+            func.coalesce(model.novel_id, -1).in_(scope_sql),
+        )
+        nulls = _count_rows(
+            db, model, model.project_id == project_id, model.novel_id.is_(None),
+        )
+        return {
+            "total": total,
+            "in_scope": in_scope,
+            "project_level_null": nulls,
+            "other_books_excluded": total - in_scope,
+        }
+
+    entities = table_counts(KgEntity)
+    entities["chapter_unknown"] = _count_rows(
+        db, KgEntity,
+        KgEntity.project_id == project_id,
+        func.coalesce(KgEntity.novel_id, -1).in_(scope_sql),
+        (KgEntity.first_chapter.is_(None)) | (KgEntity.last_chapter.is_(None)),
+    )
+    entities["chapter_range_drift"] = chapter_range_drift_count(db, project_id)
+
+    relations = table_counts(KgRelation)
+    from_ent = aliased(KgEntity)
+    to_ent = aliased(KgEntity)
+    edge_rows = db.execute(
+        select(KgRelation.novel_id, from_ent.novel_id, to_ent.novel_id)
+        .join(from_ent, from_ent.id == KgRelation.from_id)
+        .join(to_ent, to_ent.id == KgRelation.to_id)
+        .where(KgRelation.project_id == project_id)
+    ).all()
+    derived = 0
+    cross = 0
+    for edge_book, from_book, to_book in edge_rows:
+        # 边自身没书，但两端同属一本非 NULL 书 → 书维度可从端点推导
+        if edge_book is None and from_book is not None and from_book == to_book:
+            derived += 1
+        # 两端分属不同非 NULL 书 → 真实的跨书边（读侧会被挡掉，但必须可见）
+        if from_book is not None and to_book is not None and from_book != to_book:
+            cross += 1
+    relations["derived_from_endpoints"] = derived
+    relations["cross_book_edges"] = cross
+
+    foreshadows = table_counts(KgForeshadow)
+    # 归不出书的伏笔（老数据）：读侧按项目级通配可见，但无法判断属于哪本书
+    foreshadows["unattributable"] = foreshadows["project_level_null"]
+    # 同名跨书撞 uq_kg_foreshadow(project_id, name)：写侧不合并、不改写，
+    # 转存隔离区；这里数隔离行，而不是假装没发生。
+    foreshadows["cross_book_name_collision"] = _count_rows(
+        db, KgIngestQuarantine,
+        KgIngestQuarantine.project_id == project_id,
+        KgIngestQuarantine.kind == "foreshadow",
+        KgIngestQuarantine.reason == "cross_book_name_conflict",
+    )
+
+    return {
+        "project_id": project_id,
+        "book": {
+            "continuation_novel_id": proj.continuation_novel_id,
+            "active_novel_id": proj.active_novel_id,
+            "resolved": own,
+            "scope": list(scope),
+        },
+        "entities": entities,
+        "relations": relations,
+        "foreshadows": foreshadows,
+        "events": table_counts(KgEvent),
+        "mentions": table_counts(KgMention),
+    }
 
 
 # --------------------------------------------------------------------------- #
