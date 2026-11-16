@@ -1,5 +1,63 @@
 // 与后端 Pydantic schemas 对齐的 TS 类型（手动镜像，改后端时同步此处）。
 
+/** 入库时的语料清洗报告（GET /api/novels 的 clean_report）。 */
+export interface CorpusCleanReport {
+  /** 洗掉的注入水印串（每条含文本与出现次数）。 */
+  marks?: Array<{ text: string; count: number }>;
+  /** 剔除总字数。 */
+  removed_chars?: number;
+  /** 清洗前后字数。 */
+  chars_in?: number;
+  chars_out?: number;
+  /** 清洗是否改动了内容。 */
+  cleaned?: boolean;
+  /** 「混进来的别的书」的体检结论（盗版站的 txt 常把多本书拼在一起）。 */
+  foreign_blocks?: ForeignBlocksReport;
+  /** 其它体检维度（原文缺失等），按后端实际写入的键展示。 */
+  [key: string]: unknown;
+}
+
+/**
+ * 「混进了别的书」的检出结论。
+ *
+ * 命中的是**人物聚集度 + 排他性**（出现集中、且别处见不到的人物名），
+ * 不是风格离群 —— 风格离群会把作者自己的章节也判成外来。
+ */
+export interface ForeignBlocksReport {
+  /** 是否检出。 */
+  detected: boolean;
+  /** 检出块数。 */
+  block_count: number;
+  /** 涉及字数。 */
+  chars: number;
+  /** 占比（0~1）。 */
+  ratio: number;
+  /** 是否已剔除（入库时显式开启过剔除才会为 true）。 */
+  dropped?: boolean;
+  /** 实际剔除字数。 */
+  removed_chars?: number;
+  /** 逐块明细。 */
+  blocks?: Array<{
+    /** 该块的起止字符位置。 */
+    start: number;
+    end: number;
+    /** 该块字数。 */
+    chars: number;
+    /** 该块占全书比例（0~1）。 */
+    ratio: number;
+    /** 该块含几章。 */
+    chapter_count: number;
+    /** 该块的章标题。 */
+    chapter_titles?: string[];
+    /** 该块独占的人物名（判定依据）。 */
+    terms?: string[];
+    /** 独占词集中度（0~1）。 */
+    exclusive_ratio?: number;
+    /** 正文样本（用于人工确认这是不是另一本书）。 */
+    sample?: string;
+  }>;
+}
+
 export interface NovelOut {
   id: number;
   title: string | null;
@@ -7,6 +65,27 @@ export interface NovelOut {
   platform: string | null;
   genre: string | null;
   status: string | null;
+  /**
+   * 这本语料最大的章节号（0 = 还没切出章节）。
+   * 界面上的「故事进行到第几章」输入框靠它定上界 —— 没有它只能等后端 400。
+   */
+  max_chapter_no?: number;
+  /**
+   * 入库时的语料清洗报告（含「混进了别的书」的检出结论）。
+   * 用户要能看到「洗掉了什么」「里面混了什么」。
+   */
+  clean_report?: CorpusCleanReport | null;
+}
+
+/**
+ * 一本参考书的原文边界：故事进行到第 `chapter` 章（含该章）。
+ *
+ * 边界是**用户对「这本书我读到哪了」的回答**：模型只会读到该章为止，
+ * 后面的章节不进入提示词（避免剧透，也避免把后面的剧情带偏）。
+ */
+export interface ReferenceCutoff {
+  novel_id: number;
+  chapter: number;
 }
 
 export interface ChunkOut {
@@ -2089,4 +2168,67 @@ export interface AssistantApplySelectedResponse {
   blocked: AssistantApplyConflictItem[];
   reason: string;
   proposal_ids?: number[];
+}
+
+// ====================================================================
+// 角色卡（2026-10-29）：身份 / 能力（武器·功法·能力）/ 声纹 / 关系
+// ====================================================================
+
+/** 武器/功法/能力的一条。 */
+export interface CardAbilityItem {
+  名称: string;
+  说明?: string;
+}
+
+/** 角色卡的「能力」组。 */
+export interface CardAbility {
+  武器?: CardAbilityItem[];
+  功法?: CardAbilityItem[];
+  能力?: CardAbilityItem[];
+  /** 他做不到什么 —— 防止角色越写越强。 */
+  能力上限?: string[];
+}
+
+/** 角色卡的「声纹」组 —— **可执行锚点**，不是形容词。 */
+export interface CardVoice {
+  自称?: string;
+  称呼他人?: string[];
+  句长?: string;
+  句末?: string;
+  口头禅?: string[];
+  禁用词?: string[];
+  语气底色?: string;
+}
+
+/** 角色卡。 */
+export interface CharacterCard {
+  身份?: Record<string, string>;
+  能力?: CardAbility;
+  声纹?: CardVoice;
+  关系?: Record<string, string>;
+  来源?: string;
+}
+
+/** GET /projects/{id}/character-cards 的一项。 */
+export interface CharacterCardItem {
+  name: string;
+  role: string;
+  motivation: string;
+  card: CharacterCard;
+  card_source: string;
+  persona: Record<string, unknown>;
+  persona_source: string;
+}
+
+/** 声纹撞车（「这几个人说话太像」）。 */
+export interface VoiceCollision {
+  人物: string[];
+  相同: string[];
+  建议: string;
+}
+
+/** GET /projects/{id}/character-cards 的响应。 */
+export interface CharacterCardListResponse {
+  characters: CharacterCardItem[];
+  voice_collisions: VoiceCollision[];
 }
