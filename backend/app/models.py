@@ -305,6 +305,10 @@ class KgRelation(Base):
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    #: 书维度：这条边的事实来自哪本书。NULL = 项目级通配（归不出书 / 老数据）。
+    #: 写侧取「当前书」；老数据**不回填**，读侧按「当前书 + NULL」过滤，
+    #: 计数出口见 GET /api/projects/{id}/kg-v3/book-scope。
+    novel_id = Column(Integer, nullable=True)
     from_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
     to_id = Column(Integer, ForeignKey("kg_entities.id"), nullable=False)
     rel_type = Column(String(32), nullable=False)
@@ -327,6 +331,8 @@ class KgRelation(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "from_id", "to_id", "rel_type", name="uq_kg_relation"),
         Index("ix_kg_relation_project", "project_id"),
+        # 按书取边（切片/关系页/Judge）：WHERE project_id=? AND novel_id IN (?, NULL)
+        Index("ix_kg_relation_project_novel", "project_id", "novel_id"),
     )
 
 
@@ -460,6 +466,10 @@ class KgForeshadow(Base):
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    #: 书维度：这条伏笔来自哪本书。NULL = 项目级通配（归不出书 / 老数据）。
+    #: 注意唯一键仍是 (project_id, name)（本轮不动）：同名跨书撞键时写侧计入
+    #: book-scope 的 cross_book_name_collision，不合并、不静默丢弃。
+    novel_id = Column(Integer, nullable=True)
     name = Column(String(200), nullable=False)
     planted_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
     payoff_event_id = Column(Integer, ForeignKey("kg_events.id"), nullable=True)
@@ -476,6 +486,8 @@ class KgForeshadow(Base):
         UniqueConstraint("project_id", "name", name="uq_kg_foreshadow"),
         # 切片 active 过滤（status IN ('planted','developing')）+ Judge 超期检查
         Index("ix_kg_foreshadow_project_status", "project_id", "status"),
+        # 按书取伏笔（切片 active 伏笔 / Judge 到期检查）
+        Index("ix_kg_foreshadow_project_novel", "project_id", "novel_id"),
     )
 
 

@@ -195,6 +195,13 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("kg_mentions", "novel_id", "INTEGER"),
         # 事件同样要能区分「本项目原创」与「从某本书迁入/借用」；NULL = 项目级通配。
         ("kg_events", "novel_id", "INTEGER"),
+        # —— 关系边/伏笔补书维度（add-only，不回填）——
+        # 此前这两张表没有 novel_id，同一项目下两本书的关系与伏笔混在一张表里。
+        # NULL = 项目级通配 / 老数据；读侧按「当前书 + NULL」过滤，历史 NULL 不猜。
+        # 漏这一项的后果：老库 SELECT kg_relations.* / kg_foreshadows.* 直接
+        # no such column: novel_id，写侧盖书也写不进去。
+        ("kg_relations", "novel_id", "INTEGER"),
+        ("kg_foreshadows", "novel_id", "INTEGER"),
         # —— ADR-2026-10-12 第 5 步第 4 步：EditProposal 补齐提案生命周期字段——
         # 全部 nullable：既有行（第 2/3 步写入的）不该被 NOT NULL 破坏。
         ("edit_proposals", "project_id", "INTEGER"),
@@ -364,6 +371,16 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         conn.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_kg_entity ON kg_entities"
             " (project_id, kind, canonical_name, COALESCE(novel_id, -1))"))
+
+        # 关系边/伏笔的按书索引：加列与建索引同一事务，避免「列有了、索引没建」
+        # 的中间态（老库补列后立刻全表扫）。create_all 已给新库建好，这里幂等兜底。
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS ix_kg_relation_project_novel"
+            " ON kg_relations (project_id, novel_id)",
+            "CREATE INDEX IF NOT EXISTS ix_kg_foreshadow_project_novel"
+            " ON kg_foreshadows (project_id, novel_id)",
+        ):
+            conn.execute(text(stmt))
 
         # —— 重写快照表（generation_snapshots）索引兜底 ——
         # 表本身由 create_all 建（新库/老库都一样），这里只补索引：部分唯一索引
