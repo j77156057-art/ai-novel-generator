@@ -174,13 +174,20 @@ def test_generate_endpoint_refuses_when_the_chain_is_not_ready(api_db, client):
     assert resp.json()['detail']['status'] == 'workflow_pending_repair'
 
 
-# —— 直传文本入口已关闭 ——
+# —— 直传文本入口保留（与 main 的刻意分歧）——
 
-def test_direct_text_upload_is_closed_with_a_pointer_to_the_assistant(api_db, client):
-    """直传文本绕过整条流程 → 明确报错并指向助理 agent（而不是静默 404）。"""
+def test_direct_text_upload_still_works_and_goes_through_cleaning(api_db, client):
+    """直传可用，但**不是绕过清理**：照样过编码识别、清洗与混书检测。
+
+    与 main 的刻意分歧：用户既有工作流依赖「贴文本 → 直接入库」。
+    混书防护由 `drop_foreign_blocks` 承担（默认只报不删）。
+    """
     resp = client.post('/api/novels/upload',
-                        files={'file': ('a.txt', '正文内容。', 'text/plain')})
-    assert resp.status_code == 409, resp.text
-    detail = resp.json()['detail']
-    assert detail['status'] == 'text_submission_moved_to_assistant'
-    assert detail['assistant_endpoint'] == '/api/assistant/attachments'
+                        files={'file': ('a.txt', '第一章 起\n正文内容。', 'text/plain')})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body['novel_id'] > 0
+    assert body['status'] in ('imported', 'imported_review')
+    # 清理路径确实跑了：清洗报告与检出编码都在回执里。
+    assert body['clean_report'] is not None
+    assert body['detected_encoding']

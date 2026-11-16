@@ -23,25 +23,13 @@ def upload(
     drop_foreign_blocks: bool = Form(False),
     db: Session = Depends(get_db),
 ) -> dict:
-    # 已关闭：文本一律交给助理 agent —— 直传这条路**绕过整条流程**
-    # （文本直接入库，不经清洗预览、不经抽检审核、不经蒸馏与审查）。
-    raise HTTPException(
-        status_code=409,
-        detail={
-            'status': 'text_submission_moved_to_assistant',
-            'message': '文本提交已统一到助理 agent：请在助理页上传附件，'
-                       'agent 会带它走清洗、抽检、蒸馏、审查的完整流程。',
-            'assistant_endpoint': '/api/assistant/attachments',
-        },
-    )
-
-
-def _upload_legacy(
-    file: UploadFile = File(...),
-    drop_foreign_blocks: bool = Form(False),
-    db: Session = Depends(get_db),
-) -> dict:
-    # 旧实现（保留供参考，不再挂路由）：直传入库，绕过清洗与抽检。
+    # 直传入口保留（与本项目 main 的**刻意分歧**）：用户的既有工作流依赖
+    # 「贴文本 → 直接入库」。但直传**不走捷径**：下面照样过 decode_text 的
+    # 编码识别、`ingest_text` 的清洗（水印剔除）与混书检测；混书防护由
+    # `drop_foreign_blocks` 承担（默认只报不删 → status=imported_review）。
+    # main 关闭它的理由是「绕过清洗预览/抽检审核/蒸馏审查」，其中清洗与
+    # 混书检测在直传路径里本来就有；抽检与蒸馏属于助理链的后续步骤，
+    # 用户选择直传即选择跳过后续步骤，不是绕过本次入库的清理。
     data = file.file.read(settings.upload_max_bytes + 1)
     if len(data) > settings.upload_max_bytes:
         raise HTTPException(
