@@ -24,6 +24,7 @@ from app.generation import (
     generate_next_segment,
 )
 from app.generation.engine import _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt
+from app.generation.length_guard import LengthBlocked
 from app.generation.outline_notice import build_notice
 from app.generation.prompts import build_system_prompt, build_user_prompt
 from app.generation.repetition import parse_quality
@@ -133,8 +134,9 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
             db, proj, novel_ids=novel_ids, max_chars=body.max_chars,
             chapter_range=plan["label"],
         )
-    except chapter_labels.ChapterIdentityError as exc:
-        # 章身份硬判据：解析失败 → 不落正文，422 带 blocked 明细。
+    except (LengthBlocked, chapter_labels.ChapterIdentityError) as exc:
+        # 两条生成侧硬判据：章身份解析失败 / 压缩后仍超篇幅上限 → 不落正文。
+        # 422 带 blocked 明细（哪一段、原文、实测与上限），不是 500。
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
     except ValueError as exc:
         # 档案预检失败（未蒸馏）等可操作错误：409 + 明确指引，
@@ -186,8 +188,8 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
                 if ev.get("type") == "done":
                     ev = {**ev, "outline": outline_notice}
                 yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
-        except chapter_labels.ChapterIdentityError as exc:
-            # 章身份阻断也按 SSE 事件下发，前端能拿到 blocked 明细。
+        except (LengthBlocked, chapter_labels.ChapterIdentityError) as exc:
+            # 阻断也按 SSE 事件下发：前端能拿到 blocked 明细，而不是只看到断流。
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc), **exc.to_dict()}, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 把异常也作为 SSE 事件下发，前端可提示
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
@@ -278,7 +280,7 @@ def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)
             db, proj, novel_ids=novel_ids, segments=body.segments, max_chars=body.max_chars,
             chapter_labels=[p["label"] for p in plans],
         )
-    except chapter_labels.ChapterIdentityError as exc:
+    except (LengthBlocked, chapter_labels.ChapterIdentityError) as exc:
         # 前几段已按序落库，阻断段不落；回执里带 blocked 明细与段号。
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
     except ValueError as exc:

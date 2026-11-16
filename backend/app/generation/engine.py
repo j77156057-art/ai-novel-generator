@@ -18,6 +18,8 @@ from app.agents.prompt_overrides import PromptKey, resolve_prompt_block
 from app.config import settings
 from app.generation.chapter_labels import commit_meta as _chapter_commit_meta
 from app.generation.chapter_labels import require_label as _require_chapter_label
+from app.generation.length_guard import LengthBlocked
+from app.generation.length_guard import length_block_evidence as _length_block_evidence
 from app.generation.prompts import (
     PROMPT_REVISION,
     build_system_prompt,
@@ -2214,6 +2216,12 @@ def _commit_segment(db, project: Project, text: str, summary: str,
     if structure.get("enforced"):
         raise StructureBlocked(
             "结构检测阻断落库：" + "；".join(structure.get("blocking_reasons") or []))
+    # 篇幅硬上限：压缩轮（`_rewrite_rounds` 末尾）跑完仍超 120% ⇒ 不落正式正文。
+    # 下限（<80%）仍按既有口径只留痕，不在这里拦——本次只补上限这一侧。
+    length_evidence = _length_block_evidence(project, text, quality)
+    if length_evidence is not None:
+        raise LengthBlocked(
+            segment_no=segment_no, label=label, evidence=length_evidence)
     gen = Generation(
         project_id=project.id,
         segment_no=segment_no,

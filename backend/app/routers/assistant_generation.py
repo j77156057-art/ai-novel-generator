@@ -1155,6 +1155,12 @@ def assistant_invoke_generation(
                 detail={"code": exc.code, "message": str(exc),
                         "segment_no": body.segment_no},
             ) from exc
+        # 篇幅硬上限：压缩后仍超 120% → 422 + blocked 明细，正文一行未落。
+        from app.generation.length_guard import LengthBlocked
+
+        if isinstance(exc, LengthBlocked):
+            raise HTTPException(
+                status_code=422, detail=exc.to_dict()) from exc
         raise HTTPException(
             status_code=500, detail=f"助手调动生成失败：{str(exc)[:200]}"
         )
