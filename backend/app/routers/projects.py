@@ -1888,3 +1888,313 @@ def generate_scale(
         return {"ok": False, "detail": "AI 没给出可用量级（可重试或改要求）"}
     return {"ok": True, "量级": scale}
 
+
+
+# =========================================================================== #
+# 叙事档案 · 角色个性 / 禁忌修复（批 6 残部 + 批 7 前置）
+# =========================================================================== #
+# 这 5 条端点是 `style/*` 校正链与 `persona.py` 的生产读点，缺了就会留下一堆
+# 「搬了没人读」的模块。`_narrative_block` 在本分支还没有【角色声音词典】维度，
+# 因此不传 `include_voice`（体检/预览要渲染的是**本分支真会发出去的那份**文本）。
+class StyleNarrativeRepairRequest(StrictRequest):
+    """`POST /api/projects/{id}/style-narrative/repair` 的请求体。
+
+    体检说「档案的禁用词与档案正文自相矛盾」，产品里却没地方让人动手 ——
+    这个请求体就是那个地方。
+
+    继承 `StrictRequest`：拼错字段名立刻 422，而不是静默按默认值改档案。
+    """
+
+    #: 要处理的禁用词（必须是档案禁用清单里的词）。
+    word: str
+    #: 修法：`remove_word`（删词，默认）/ `drop_rule`（删掉那条规则）/ `unban`（从清单里去掉）。
+    mode: str = "remove_word"
+    #: True = 只返回「将要改什么」，**不落库**（前端先给人看）。
+    preview: bool = False
+
+
+# ====================================================================
+# 角色个性：人写 + AI 帮着完善（2026-10-28）
+# ====================================================================
+
+
+class PersonaSaveRequest(StrictRequest):
+    """`POST /api/projects/{id}/style-narrative/personas` 的请求体。"""
+
+    #: 角色名（要改的那个角色）。
+    name: str
+    #: 用户写的个性档案（四个字段的子集；给空串表示清空这个角色的个性）。
+    persona: dict
+
+
+class PersonaCompleteRequest(StrictRequest):
+    """`POST /api/projects/{id}/style-narrative/personas/complete` 的请求体。"""
+
+    #: 角色名。
+    name: str
+    #: 用户已经写好的部分（可选）——AI 只能在它**后面**补充。
+    persona: dict = {}
+    #: 用户的额外要求（可选，如「我想让他更冷一点」）。
+    note: str = ""
+
+
+@router.get("/{project_id}/style-narrative/personas")
+def list_personas(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """列出本项目所有角色的个性档案（含来源标记）。
+
+    来源：`model`=合成圣经时模型给的；`derived`=从已写正文反推的；
+    `user`=用户自己写的（**受保护**：反推不会覆盖它）。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    bible = proj.plot_bible
+    if isinstance(bible, str):
+        try:
+            import json as _json
+
+            bible = _json.loads(bible)
+        except Exception:  # noqa: BLE001
+            bible = {}
+    if not isinstance(bible, dict):
+        bible = {}
+    out = []
+    for c in (bible.get("characters") or []):
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        persona = c.get("persona") if isinstance(c.get("persona"), dict) else {}
+        out.append({
+            "name": c.get("name"),
+            "role": c.get("role"),
+            "motivation": c.get("motivation"),
+            "persona": persona,
+            "source": persona.get("来源") or "",
+        })
+    return {"items": out, "has_bible": bool(bible)}
+
+
+@router.post("/{project_id}/style-narrative/personas")
+def save_persona(
+    project_id: int, body: PersonaSaveRequest, db: Session = Depends(get_db)
+) -> dict:
+    """保存**用户写的**角色个性（只动 persona，不碰 name/role/motivation）。
+
+    落库后标 `来源=user` ⇒ 之后的「从正文反推」不会覆盖它。
+    """
+    from app.generation.persona import save_persona as _save
+
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    saved = _save(db, proj, body.name, body.persona or {})
+    if not saved:
+        raise HTTPException(status_code=404, detail="角色不存在，或没有可保存的内容")
+    return {"ok": True, "name": body.name, "persona": saved}
+
+
+@router.post("/{project_id}/style-narrative/personas/complete")
+def complete_persona(
+    project_id: int, body: PersonaCompleteRequest, db: Session = Depends(get_db)
+) -> dict:
+    """AI 帮着完善角色个性 —— **只返回建议，不落库**。
+
+    人写的内容优先：模型被要求只能在用户已写的内容**后面**补充，不得推翻；
+    要不要采纳由用户在界面上点。采纳时调 `POST .../style-narrative/personas` 落库。
+    """
+    from app.generation.persona import complete_persona as _complete
+    from app.llm.provider import get_llm_provider
+
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    bible = proj.plot_bible
+    if isinstance(bible, str):
+        try:
+            import json as _json
+
+            bible = _json.loads(bible)
+        except Exception:  # noqa: BLE001
+            bible = {}
+    if not isinstance(bible, dict):
+        bible = {}
+    character = None
+    for c in (bible.get("characters") or []):
+        if isinstance(c, dict) and str(c.get("name") or "") == str(body.name or ""):
+            character = c
+            break
+    if character is None:
+        raise HTTPException(status_code=404, detail="角色不存在")
+    provider = get_llm_provider()
+    result = _complete(provider, character, body.persona or {}, body.note or "")
+    if not result:
+        return {"ok": False, "note": "没能给出建议（模型不可用或限流）—— 你写的内容不受影响"}
+    return {"ok": True, "name": body.name, **result}
+
+@router.get("/{project_id}/style-narrative/conflicts")
+def style_narrative_conflicts(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """查这个项目的文风档案里有没有「禁用词与正文自相矛盾」（**只读**）。
+
+    给界面用的轻量版：不调模型、不写库，只把冲突列出来。
+    （体检本身走 `POST /api/assistant/diagnose` 或助理的 `audit_prompt`，
+    那两条都会调模型解释；这里只给「有哪些冲突、修不修」用。）
+
+    返回里的 `can_generate` = 现在生成会不会被体检挡住
+    （挡住的条件：有 **error 级**的冲突 —— 名词性用法的 warn 不挡）。
+    """
+    from app.style.forbidden_usage import analyze
+    from app.style.narrative import FORBIDDEN_SECTION_MARKER
+    from app.generation.prompts import _narrative_block
+
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    narrative = proj.style_narrative
+    if not isinstance(narrative, dict) or not narrative:
+        return {
+            "has_archive": False,
+            "conflicts": [],
+            "attributive": [],
+            "can_generate": True,
+            "note": "这个项目还没有文风档案 —— 先蒸馏一份，或从蒸馏库应用一份。",
+        }
+
+    block = _narrative_block(narrative)
+    rules_text = block.split(FORBIDDEN_SECTION_MARKER, 1)[0]
+    analysis = analyze(narrative, rules_text)
+
+    def _dump(usages: list) -> list[dict]:
+        out = []
+        for u in usages:
+            out.append({
+                "word": u.word,
+                "dimension": u.dimension,
+                "rule_dimension": u.rule_dimension,
+                "context": u.context,
+                "rule_text": u.rule_text,
+            })
+        return out
+
+    conflicts = _dump(analysis.conflicts)
+    attributive = _dump(analysis.attributive)
+    return {
+        "has_archive": True,
+        "conflicts": conflicts,
+        "attributive": attributive,
+        "can_generate": not conflicts,
+        "note": ("档案正文在教模型用禁用清单里的转折词 —— 生成会被挡住。"
+                 if conflicts else
+                 ("档案正文里出现了禁用词，但用的是名词性写法 —— 不挡生成。"
+                  if attributive else "档案干净，没有禁用词冲突。")),
+    }
+
+
+@router.post("/{project_id}/style-narrative/repair")
+def repair_style_narrative(
+    project_id: int,
+    body: StyleNarrativeRepairRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """修文风档案里的禁用词冲突：体检报了，就能当场改。
+
+    ## 为什么要有这个入口
+
+    体检（`agents/prompt_audit.py`）发现「档案的禁用词与档案正文自相矛盾」时，
+    原来的建议是「从档案规则里删掉这些词，或从禁用清单里去掉」——
+    但产品里**没有改档案规则的接口**：只能重蒸馏（一轮 ≈ 42 分钟 LLM）或换档案。
+    「被告知了原因，却没有地方自己动手」—— 这就是「开箱即用」最大的实际卡点。
+
+    ## 改的是谁
+
+    改**项目当前应用的档案**（`projects.style_narrative`），
+    **不动蒸馏库条目** —— 库条目是全局共享的，替别人改档案不是用户该做的事。
+
+    ## 留痕
+
+    改动记进档案的 `repair_history`（模式、词、维度、**改前原文**）。
+    改动是「删除」，所以改前的原文就是回退所需的全部信息 ——
+    不必另存整份档案（几十万字）。
+
+    ## 自证
+
+    落库后**重跑一次体检**并把结果一起返回：修好了就没有 conflict 了，
+    没修好看得出来。不想改只想看 ⇒ `preview=true`（不落库）。
+    """
+    from app.style.forbidden_usage import REPAIR_MODES, plan_repair
+
+    if body.mode not in REPAIR_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"mode 只能是 {' / '.join(REPAIR_MODES)}",
+        )
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    narrative = proj.style_narrative
+    if not isinstance(narrative, dict) or not narrative.get("rules"):
+        raise HTTPException(
+            status_code=400,
+            detail="这个项目还没有文风档案（或档案里没有规则）—— 先蒸馏或从蒸馏库应用一份",
+        )
+
+    plan = plan_repair(narrative, body.word, body.mode)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"档案里找不到「{body.word}」—— 没什么可修（换个词，或先看体检报告）",
+        )
+
+    payload: dict = {
+        "ok": True,
+        "mode": plan.mode,
+        "word": plan.word,
+        "applied": False,
+        "changes": plan.changes,
+    }
+
+    if body.preview:
+        payload["preview"] = True
+        payload["message"] = f"将要改动 {plan.affected} 处（还没落库）"
+        return payload
+
+    repaired = plan.narrative
+    history = repaired.get("repair_history")
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "mode": plan.mode,
+        "word": plan.word,
+        "changes": [{"dimension": c.get("dimension", ""), "before": c.get("before", "")}
+                    for c in plan.changes],
+    })
+    repaired["repair_history"] = history[-20:]  # 只留最近 20 次
+    proj.style_narrative = repaired
+    db.commit()
+    db.refresh(proj)
+
+    payload["applied"] = True
+    payload["message"] = f"已改动 {plan.affected} 处，并重新体检"
+
+    # —— 自证：重跑体检，把结果一起返回 ——
+    try:
+        from app.agents.prompt_audit import run_prompt_audit
+
+        report, _stats = run_prompt_audit(db, proj)
+        issues = []
+        for i in report.issues:
+            issues.append({
+                "id": getattr(i, "id", ""),
+                "severity": getattr(i, "severity", ""),
+                "title": getattr(i, "title", ""),
+                "rule": getattr(i, "rule", ""),
+                "suggestion": getattr(i, "suggestion", ""),
+            })
+        payload["audit"] = {
+            "issues": issues,
+            "errors": sum(1 for i in issues if i["severity"] == "error"),
+            "warnings": sum(1 for i in issues if i["severity"] == "warn"),
+        }
+    except Exception as exc:  # noqa: BLE001 —— 体检失败不该把已落库的修复说成失败
+        payload["audit"] = {"issues": [], "errors": 0, "warnings": 0,
+                            "error": f"体检没跑成：{type(exc).__name__}"}
+    return payload

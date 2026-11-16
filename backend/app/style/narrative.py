@@ -95,6 +95,10 @@ MIN_SAMPLE_CHARS = 300_000
 #: 每块最少章节数（太少提炼不出模式）
 MIN_CHAPTERS_PER_CHUNK = 5
 
+#: 系统提示里「反向禁忌」块的标题前缀（prompt_audit 用它判定这一块是否存在）。
+#: 批 7 前置：`agents/prompt_audit.py` 直接 import 这个名字。
+FORBIDDEN_SECTION_MARKER = "【反向禁忌"
+
 #: 每个蒸馏块的目标字数（保守兜底值，不含渠道覆盖）。
 #: 按字数而不是章数：不同书章长差 3-5 倍，固定章数会让块大小失真。
 TARGET_BLOCK_CHARS = 20_000
