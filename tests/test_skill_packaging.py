@@ -2,11 +2,11 @@
 
 main 原文件里「能力执行」那半段（`read_capability('inspect_text_quality')`、
 `run_diagnostic_task('text_quality_audit')`、registry 的 `_DIAGNOSTIC_PARAMETERS`）
-依赖 feat 侧尚未搬的运行时件：
-- `inspect_text_quality` → `style.scope.resolve_project_scope`
-- `inspect_prompt_health` → `agents.prompt_audit`
-- registry 任务枚举 → 第 2 批 registry
-这三段保留为 strict xfail（搬过来后会自动提醒补测），其余照搬。
+依赖 feat 侧的运行时件，现状：
+- `inspect_text_quality` → `style.scope.resolve_project_scope`：已落盘，正常用例
+- `inspect_prompt_health` → `agents.prompt_audit`：批 7（`0c28828`）已落盘，正常用例
+- registry 任务枚举 → registry 的 `_DIAGNOSTIC_PARAMETERS` 仍未注册：保留 strict xfail
+其余照搬。
 
 清单加载机制（`load_skill` + manifest 校验）的完整矩阵见
 `tests/test_diagnostic_skills_manifest.py`，这里只钉「三份新 skill 的身份与角色」。
@@ -85,8 +85,6 @@ def test_text_quality_capability_reports_issues_and_mechanical_fixes():
         db.close()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "`inspect_prompt_health` 依赖 feat 未搬的 `agents.prompt_audit`（第 7 批）"))
 def test_prompt_health_capability_is_read_only():
     from app.agents.diagnostic import read_capability
     from app.db import Base, SessionLocal, engine
