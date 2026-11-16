@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { api } from "@/api/client";
 import type {
+  KgV3BookScopeResponse,
   KgV3Character,
   KgV3CorpusWindowsResponse,
   KgV3EventsResponse,
@@ -12,6 +13,7 @@ import type {
   KgV3Slice,
 } from "@/api/types";
 import { buildCorpusStatus } from "@/utils/corpusStatus.js";
+import { buildBookScopeStatus, chapterTag } from "@/utils/kgChapter.js";
 
 const route = useRoute();
 const projectId = Number(route.params.id);
@@ -53,6 +55,21 @@ async function loadCorpusWindows() {
     corpusWindows.value = await api.kgV3CorpusWindows(projectId);
   } catch (e) {
     corpusWindowsErr.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+// ---------- 书维度状态条（只读） ----------
+// 「章号未知」与「区间漂移」是两件不同的事实，必须分开显示。
+const bookScope = ref<KgV3BookScopeResponse | null>(null);
+const bookScopeErr = ref<string | null>(null);
+const bookScopeView = computed(() => buildBookScopeStatus(bookScope.value));
+
+async function loadBookScope() {
+  bookScopeErr.value = null;
+  try {
+    bookScope.value = await api.kgV3BookScope(projectId);
+  } catch (e) {
+    bookScopeErr.value = e instanceof Error ? e.message : String(e);
   }
 }
 
@@ -468,6 +485,7 @@ function sevTag(sev: string): string {
 onMounted(() => {
   loadSlice();
   loadCorpusWindows();
+  loadBookScope();
 });
 
 // ---------- Tab 7 Style 审计（v2.1） ----------
@@ -554,6 +572,34 @@ function bucketChipStyle(bucket: string): Record<string, string> {
         </li>
       </ul>
     </details>
+  </div>
+
+  <!-- 书维度状态条：章号未知 / 区间漂移 / 别书排除 分开显示，不合成「部分数据异常」 -->
+  <div
+    v-if="bookScopeErr"
+    class="corpus-status corpus-status--error"
+    role="status"
+  >
+    <span class="corpus-status__label">书维度</span>
+    <strong class="corpus-status__text">状态读取失败</strong>
+    <span class="corpus-status__err">{{ bookScopeErr }}</span>
+  </div>
+  <div
+    v-else-if="bookScope"
+    class="corpus-status"
+    :class="`corpus-status--${bookScopeView.tone}`"
+    role="status"
+  >
+    <span class="corpus-status__label">书维度</span>
+    <span class="corpus-status__book">{{ bookScopeView.bookLabel }}</span>
+    <span class="tag" :class="bookScopeView.unknown > 0 ? 'warn' : ''">
+      {{ bookScopeView.unknownText }}
+    </span>
+    <span class="tag" :class="bookScopeView.drift > 0 ? 'warn' : ''">
+      {{ bookScopeView.driftText }}
+    </span>
+    <span v-if="bookScopeView.excludedText" class="hint">{{ bookScopeView.excludedText }}</span>
+    <span v-if="bookScopeView.detail" class="hint">{{ bookScopeView.detail }}</span>
   </div>
 
   <nav class="tabs" style="margin-bottom: var(--gap-lg)">
@@ -687,9 +733,19 @@ function bucketChipStyle(bucket: string): Record<string, string> {
           >
             <strong>{{ c.name }}</strong>
             <span v-if="c.has_secrets" class="tag warn" style="margin-left: 6px">有秘密</span>
+            <span
+              class="tag"
+              :class="chapterTag(c.chapters).unknown ? 'warn' : ''"
+              style="margin-left: 6px"
+            >{{ chapterTag(c.chapters).text }}</span>
             <span class="faint mono" style="font-size: var(--fs-xs)">提及 {{ c.mention_count }}</span>
           </div>
-          <div v-if="!characters.length" class="empty">项目里还没有角色（先生成几段让批抽数据进来）</div>
+          <div v-if="!characters.length" class="empty">
+            项目里还没有角色（先生成几段让批抽数据进来）
+            <template v-if="bookScopeView.excluded > 0">
+              ；另有 {{ bookScopeView.excluded }} 个实体属于别书，读侧不显示
+            </template>
+          </div>
         </div>
       </div>
       <div>
@@ -1139,6 +1195,10 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .corpus-status__label {
   font-weight: 700;
   color: var(--fg-muted);
+}
+.corpus-status__book {
+  font-family: var(--mono, monospace);
+  font-size: var(--fs-xs);
 }
 .corpus-status--idle {
   color: var(--fg-muted);

@@ -8,7 +8,8 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
-    "test:corpus-status": "node --test tests/corpusStatus.test.mjs"
+    "test:corpus-status": "node --test tests/corpusStatus.test.mjs",
+    "test:kg-chapter": "node --test tests/kgChapter.test.mjs"
   },
   "dependencies": {
     "vue": "^3.5.13",

@@ -65,6 +65,7 @@ import type {
   KgBibleRevisionListItem,
   KgCharacterEditResult,
   KgCharacterRenameResult,
+  KgV3BookScopeResponse,
   KgV3Character,
   KgV3ExemptRequest,
   KgV3JudgeFindingsResponse,
@@ -813,6 +814,10 @@ export const api = {
         started_at: string | null;
       }[];
     }>(`/projects/${projectId}/kg-v3/worker/status`),
+
+  /** 书维度现状：每表在范围内/被排除的行数，章号未知与区间漂移分开计数。 */
+  kgV3BookScope: (projectId: number) =>
+    request<KgV3BookScopeResponse>(`/projects/${projectId}/kg-v3/book-scope`),
 
   /** 语料摄取窗口进度：状态聚合 + 失败归类 + 原始 error（只读）。 */
   kgV3CorpusWindows: (projectId: number, novelId?: number | null) => {

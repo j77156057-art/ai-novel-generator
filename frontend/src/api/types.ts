@@ -1753,6 +1753,8 @@ export interface KgV3Character {
   name: string;
   mention_count: number;
   has_secrets: boolean;
+  /** 「第a–b章」或「章号未知」；后端保证不为 null。 */
+  chapters: string;
 }
 
 /** GET /kg-v3/relations 的单条关系边。 */
@@ -1819,6 +1821,51 @@ export interface KgV3CorpusWindowsResponse {
   suspected_local_fallback: number;
   failures: KgV3CorpusWindowFailure[];
   last_run_at: string | null;
+}
+
+/** GET /kg-v3/book-scope：单表书维度计数。 */
+export interface KgV3TableScope {
+  total: number;
+  in_scope: number;
+  project_level_null: number;
+  /** 被读侧过滤掉的别书行数（不显示 ≠ 不存在）。 */
+  other_books_excluded: number;
+}
+
+export interface KgV3EntityScope extends KgV3TableScope {
+  /** 章号未知（first/last 任一为空）的实体数。 */
+  chapter_unknown: number;
+  /** 现行区间与当前 mention 聚合不一致的实体数（只计数、不覆盖）。 */
+  chapter_range_drift: number;
+}
+
+export interface KgV3RelationScope extends KgV3TableScope {
+  /** 边自身无书、但两端同属一本非 NULL 书 → 书维度可从端点推导。 */
+  derived_from_endpoints: number;
+  /** 两端分属不同非 NULL 书 → 真实跨书边（读侧会挡掉，但必须可见）。 */
+  cross_book_edges: number;
+}
+
+export interface KgV3ForeshadowScope extends KgV3TableScope {
+  /** 归不出书的伏笔（老数据 novel_id 为空）。 */
+  unattributable: number;
+  /** 同名跨书撞 uq_kg_foreshadow(project_id,name)，写侧转存隔离区的次数。 */
+  cross_book_name_collision: number;
+}
+
+export interface KgV3BookScopeResponse {
+  project_id: number;
+  book: {
+    continuation_novel_id: number | null;
+    active_novel_id: number | null;
+    resolved: number | null;
+    scope: (number | null)[];
+  };
+  entities: KgV3EntityScope;
+  relations: KgV3RelationScope;
+  foreshadows: KgV3ForeshadowScope;
+  events: KgV3TableScope;
+  mentions: KgV3TableScope;
 }
 
 // ======================================================================
