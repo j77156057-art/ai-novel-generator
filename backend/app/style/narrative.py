@@ -2149,6 +2149,13 @@ def _normalize_character_name(
     if _is_fake_character(name):
         return None
 
+    # 同一个词能补成好几个人时，「查得到别名」不等于「指的就是那个人」。
+    # 例如语料里同时有「欧阳明」「欧阳青」，把「欧阳」补成任意一个都是猜。
+    if canonical:
+        expansions = {cn for cn, _ in canonical if cn != name and name in cn}
+        if len(expansions) > 1:
+            return None
+
     # 1) 词频自证的截断映射（最可靠）
     if alias and name in alias:
         return alias[name]
