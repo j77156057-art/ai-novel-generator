@@ -42,10 +42,68 @@ _REQUESTED_RE = re.compile(r"^\s*(\d{1,4})\s*(?:[-–—~至]\s*(\d{1,4}))?\s*$"
 _LABEL_RE = re.compile(r"第\s*(\d{1,4})\s*(?:[-–—~]\s*(\d{1,4}))?\s*章")
 #: 条目标题：`第41章《到期》：……`。
 _TITLE_RE = re.compile(r"《([^》]{1,40})》")
+#: 段标签：`段20`（没有章号的段，不是章）。
+_SEGMENT_RE = re.compile(r"^段\s*\d+$")
 
 
 class ChapterRangeError(ValueError):
     """章号入参不合法，或与库内已有章号冲突。路由负责翻成 400。"""
+
+
+class ChapterIdentityError(ValueError):
+    """章标签解析不出「第N章」：写库前拒绝，禁止用段号冒充章号。
+
+    路由只把 :func:`resolve` 的结果交给引擎。引擎一旦收到解析不了的标签，
+    说明调用方绕过了唯一生产者（临时脚本、直连 engine 的新入口）。这里带着
+    段号、原文与原因抛出，由路由翻成 422；**不静默改写**成段号或库内最大章号。
+    """
+
+    def __init__(self, *, label, segment_no=None, where="write", reason=""):
+        self.label = None if label is None else str(label)
+        self.segment_no = segment_no
+        self.where = where
+        self.reason = reason
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        where = f"第{self.segment_no}段" if self.segment_no is not None else "未知段"
+        return (
+            f"拒绝写入{where}：章号无法解析（{self.reason}）；"
+            f"原文={self.label!r}；位置={self.where}；"
+            "章号只能由 chapter_labels.resolve() 产出，禁止回落到段号"
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "status": "blocked",
+            "blocked_by": "chapter_identity",
+            "segment_no": self.segment_no,
+            "label": self.label,
+            "reason": self.reason,
+            "where": self.where,
+        }
+
+
+def require_label(label, *, segment_no=None, where="write") -> tuple[int, int]:
+    """校验标签能产出合法章号，返回 `(起, 止)`；否则抛 `ChapterIdentityError`。
+
+    这是写库前的唯一闸：能解析且章号 ≥ 1 才放行。空标签、`段N`、乱写的标题
+    文本都在这里被拒，**不回落**到「用段号当章号」或「库内最大章号 +1」。
+    """
+    span = label_span(label)
+    if span is not None and span[0] >= 1:
+        return span
+    raw = None if label is None else str(label)
+    if raw is None or not raw.strip():
+        reason = "章标签为空"
+    elif span is not None:
+        reason = f"章号 {span[0]} 小于 1"
+    elif _SEGMENT_RE.match(raw.strip()):
+        reason = "标签是段号（段N），不是章号"
+    else:
+        reason = "未匹配到「第N章」标签"
+    raise ChapterIdentityError(
+        label=label, segment_no=segment_no, where=where, reason=reason)
 
 
 def chapter_number(label: str | None) -> int | None:

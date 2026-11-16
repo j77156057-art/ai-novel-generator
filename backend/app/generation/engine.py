@@ -17,6 +17,7 @@ from sqlalchemy import func, or_, select
 from app.agents.prompt_overrides import PromptKey, resolve_prompt_block
 from app.config import settings
 from app.generation.chapter_labels import commit_meta as _chapter_commit_meta
+from app.generation.chapter_labels import require_label as _require_chapter_label
 from app.generation.prompts import (
     PROMPT_REVISION,
     build_system_prompt,
@@ -2183,9 +2184,18 @@ def _commit_segment(db, project: Project, text: str, summary: str,
 
     `meta` 是纯新增的旁路键（如 `era` / `power` 自检摘要），写进
     `Generation.summary` 的兄弟键，不改 `{"text": ...}` 的既有读法。
+
+    章身份：`chapter_range` 非空时必须是 `chapter_labels.resolve()` 产出的
+    合法标签，否则在写库前抛 `ChapterIdentityError`；`None` 表示调用方明确
+    走段模式（写 `段N`），**不是**「解析失败后用段号顶替」。
     """
     segment_no = _next_segment_no(db, project.id)
-    label = chapter_range or f"段{segment_no}"
+    if chapter_range is None:
+        label = f"段{segment_no}"
+    else:
+        _require_chapter_label(
+            chapter_range, segment_no=segment_no, where="_commit_segment")
+        label = chapter_range
     # 章身份旁路：只有 `第N章` 标签才写 `chapter_meta`（段标签返回 None）。
     # 这是「outline 取不到标题」唯一的可见化出口：`title_source="missing_outline"`
     # 说明该章在 project.outline 里没条目，而不是被悄悄写成无标题章。
@@ -2422,8 +2432,9 @@ def _enqueue_v3_extraction(
     零 LLM、零阻塞：只落一行 pending 入队行，抽取由常驻 worker 认领。
 
     ``chapter``：本段所属**故事章号**，由调用方从 generation.chapter_range 派生
-    （``_chapter_ordinal``），派生不到才回退段号。批抽落事件/状态时以它为准，
-    不再采信模型从正文里猜的章号（同一段会同时出现 1 和 N 两种）。
+    （``_chapter_ordinal``）。派生不到（段标签）时**不再回退段号**：段号不是章号，
+    用它入队会把 `段20` 写成第 20 章，污染事件/状态/伏笔的按章归属。此时按
+    ``chapter=None`` 入队（列可空），只抽不分章；章标签补齐后用 ``rebuild`` 重放。
 
     这里**不启动 worker、也不做超时重捞**：写章进程是短命的（每章一个 CLI
     进程，落库后立刻退出），在这里起 worker 只会「认领一行、还没抽完就随进程
@@ -2436,7 +2447,10 @@ def _enqueue_v3_extraction(
     （随响应下发），并记 error 日志——不再只 warning 一句就吞掉。
     """
     if chapter is None:
-        chapter = _next_segment_no(db, project.id) - 1  # 本段 commit 后 = segment_no
+        # 段模式没有章号：按空章号入队（只抽不分章），绝不把段号当章号。
+        logging.getLogger(__name__).warning(
+            "v3 批抽章号缺失（project %s seg %s）：按 chapter=None 入队，"
+            "不用段号冒充章号", project.id, segment_no)
     out: dict = {"enqueued": False}
     try:
         from app.kg import batch_worker as bw
@@ -5893,7 +5907,11 @@ def regenerate_segment_stream(
     reminders = get_reminders(db, project.id, source="generated")
     # 修复项 2：重生成按目标段的**章号**选节点；重写同一章不推进时间线。
     # 章标签：入参优先，其次目标段原标签——重写不改章号身份，避免同一段被
-    # 悄悄推到未来的章号上。
+    # 悄悄推到未来的章号上。显式传入的标签必须先过唯一生产者校验；保留的
+    # 历史标签（可能是 `段N`）不回溯改写。
+    if chapter_label is not None:
+        _require_chapter_label(
+            chapter_label, segment_no=segment_no, where="regenerate")
     label = chapter_label or target.chapter_range
     timeline_written, chapter_based = _timeline_progress(db, project)
     chapter = _chapter_ordinal(label)
