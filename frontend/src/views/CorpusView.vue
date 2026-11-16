@@ -4,10 +4,12 @@ import { api } from "@/api/client";
 import type {
   AssistantCleanCorpusResponse,
   ChunkOut,
+  ForeignBlocksReport,
   NovelOut,
   SearchHit,
   UploadResult,
 } from "@/api/types";
+import ForeignBlocksNotice from "@/components/ForeignBlocksNotice.vue";
 import { useAsync } from "@/composables/useAsync";
 
 const { data: novels, loading: novelsLoading, error: novelsError, run: reloadNovels } =
@@ -22,6 +24,11 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const dropForeignBlocks = ref(false);
 
 const selected = ref<NovelOut | null>(null);
+
+/** 选中语料的混书体检结论（没检出 → null，界面上不出现这段噪音）。 */
+const foreignReport = computed<ForeignBlocksReport | null>(
+  () => selected.value?.clean_report?.foreign_blocks ?? null,
+);
 const chunks = ref<ChunkOut[]>([]);
 const chunksLoading = ref(false);
 const chunksError = ref<string | null>(null);
@@ -405,6 +412,9 @@ const cleanRuleCounts = computed(() => {
       </div>
     </div>
   </section>
+
+  <!-- 入库时的混书体检结论（只报不删；语料页不给剔除勾选框） -->
+  <ForeignBlocksNotice v-if="foreignReport?.detected" :report="foreignReport" />
 
   <template v-if="selected">
     <section class="card">

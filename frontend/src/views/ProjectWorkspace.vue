@@ -25,9 +25,12 @@ import type {
   NovelOut,
   PlotBible,
   ProjectOut,
+  ReferenceCutoff,
   StyleDistillSummary,
 } from "@/api/types";
 import DistillProgress from "@/components/DistillProgress.vue";
+import RoleplayPanel from "@/components/RoleplayPanel.vue";
+import type { CutoffInputs } from "@/utils/referenceBoundary";
 
 const route = useRoute();
 const router = useRouter();
@@ -78,6 +81,19 @@ const bookSaving = ref(false);
 const bookOptions = computed(() => {
   const ids = new Set(selectedRefs.value);
   return novels.value.filter((n) => ids.has(n.id));
+});
+
+// ===== 角色对话板块 =====
+// 不占向导步骤：它是与「写正文」并列的一件事，产物是对话记录。
+// 与续写共用同一条可见性边界（reference_cutoffs），入口单独开一个开关。
+const roleplayOpen = ref(false);
+// 每本参考书「故事进行到第几章」。角色对话 / 续写共用这份边界。
+const cutoffInputs = ref<CutoffInputs>({});
+// 各本书的章节上限（来自 GET /api/novels 的 max_chapter_no）。
+const novelChapterMax = computed<Record<number, number>>(() => {
+  const map: Record<number, number> = {};
+  for (const n of novels.value) map[n.id] = n.max_chapter_no ?? 0;
+  return map;
 });
 const GENRES = ["科幻", "都市", "悬疑", "言情", "奇幻", "仙侠", "历史", "游戏"];
 const STYLES = ["番茄", "起点", "晋江", "豆瓣阅读", "知乎盐选"];
@@ -475,6 +491,13 @@ async function loadProject() {
       ? String(project.value.active_novel_id) : "";
     continuationNovelChoice.value = project.value.continuation_novel_id != null
       ? String(project.value.continuation_novel_id) : "";
+    const inputs: CutoffInputs = {};
+    for (const item of project.value.reference_cutoffs ?? []) {
+      if (typeof item.novel_id === "number" && typeof item.chapter === "number") {
+        inputs[item.novel_id] = item.chapter;
+      }
+    }
+    cutoffInputs.value = inputs;
     premiseDraft.value = project.value.premise || "";
     generationLength.value = project.value.generation_length || 3000;
     bible.value = (project.value.plot_bible as PlotBible) || null;
@@ -1255,6 +1278,34 @@ async function saveBookScope() {
     showActionError("书设置保存失败", err);
   } finally {
     bookSaving.value = false;
+  }
+}
+
+/**
+ * 角色面板改的原文边界要落库。
+ *
+ * 只提交**填了合法章号且在已选语料内**的条目：空着 = 这本书没有边界，
+ * 服务端语义是「整本挡掉」（fail closed），不能替用户猜一个默认值。
+ * 一条都没有时提交 null（清空边界）。
+ */
+async function saveRoleplayCutoffs(next: CutoffInputs) {
+  actionNotice.value = null;
+  const scope = new Set(selectedRefs.value);
+  const cutoffs: ReferenceCutoff[] = [];
+  for (const [key, raw] of Object.entries(next)) {
+    const nid = Number(key);
+    const chapter = typeof raw === "string" ? Number(raw) : raw;
+    if (!Number.isInteger(nid) || !scope.has(nid)) continue;
+    if (typeof chapter !== "number" || !Number.isInteger(chapter) || chapter < 1) continue;
+    cutoffs.push({ novel_id: nid, chapter });
+  }
+  try {
+    project.value = await api.patchProject(projectId, {
+      reference_cutoffs: cutoffs.length ? cutoffs : null,
+    });
+    cutoffInputs.value = next;
+  } catch (err) {
+    showActionError("原文边界保存失败", err);
   }
 }
 
@@ -2402,6 +2453,16 @@ onUnmounted(stopDistillPolling);
     </button>
   </div>
 
+  <!-- 角色对话：与「写正文」并列的一件事，不占向导步骤，单独开关切换。 -->
+  <div class="row" style="margin-bottom: var(--gap)">
+    <button class="btn" :class="{ primary: roleplayOpen }" @click="roleplayOpen = !roleplayOpen">
+      {{ roleplayOpen ? "← 返回创作向导" : "角色对话" }}
+    </button>
+    <span v-if="roleplayOpen" class="muted" style="font-size: var(--fs-sm)">
+      和书里的角色聊几句：选书 → 选角色 → 设定「故事进行到第几章」→ 提问。
+    </span>
+  </div>
+
   <!-- 蒸馏进度（跨步骤常驻）：蒸馏期间允许用户继续下一步，
        所以进度条不能只挂在步骤①里 —— 一跳步就看不见，等于白做。 -->
   <div v-if="showDistillBanner && distillJob" class="distill-banner">
@@ -2420,7 +2481,7 @@ onUnmounted(stopDistillPolling);
   </div>
 
   <!-- ============ 步骤 1：参考语料 ============ -->
-  <section v-if="step === 1" class="card">
+  <section v-if="!roleplayOpen && step === 1" class="card">
     <div class="card-title">① 参考语料（可选，可多选）</div>
     <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
       选中哪些，生成时<strong>只</strong>抽取这些语料的风格；不选则完全自由生成，不会混入任何语料。
@@ -2622,7 +2683,7 @@ onUnmounted(stopDistillPolling);
   </section>
 
   <!-- ============ 步骤 2：类型 ============ -->
-  <section v-else-if="step === 2" class="card">
+  <section v-else-if="!roleplayOpen && step === 2" class="card">
     <div class="card-title">② 类型</div>
     <div class="chips">
       <button
@@ -2648,7 +2709,7 @@ onUnmounted(stopDistillPolling);
   </section>
 
   <!-- ============ 步骤 3：风格 ============ -->
-  <section v-else-if="step === 3" class="card">
+  <section v-else-if="!roleplayOpen && step === 3" class="card">
     <div class="card-title">③ 风格平台调性</div>
     <div class="chips">
       <button
@@ -2674,7 +2735,7 @@ onUnmounted(stopDistillPolling);
   </section>
 
   <!-- ============ 步骤 4：大概内容 ============ -->
-  <section v-else-if="step === 4" class="card">
+  <section v-else-if="!roleplayOpen && step === 4" class="card">
     <div class="card-title">④ 小说大概内容（可选）</div>
     <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
       不写也没关系：点「让模型出方案」，会基于前面选的类型/风格给出几个设定供你挑选或改写。
@@ -2708,7 +2769,7 @@ onUnmounted(stopDistillPolling);
   </section>
 
   <!-- ============ 步骤 5：构思剧情 ============ -->
-  <section v-else-if="step === 5" class="card">
+  <section v-else-if="!roleplayOpen && step === 5" class="card">
     <div class="card-title">⑤ 构思剧情圣经</div>
     <div class="field" style="margin-bottom: var(--gap)">
       <label>构思方式</label>
@@ -3087,7 +3148,7 @@ onUnmounted(stopDistillPolling);
   </section>
 
   <!-- ============ 步骤 6：生成控制台 ============ -->
-  <section v-else-if="step === 6" class="generation-console">
+  <section v-else-if="!roleplayOpen && step === 6" class="generation-console">
     <div class="generation-heading">
       <div><span class="section-kicker">Production & proof</span><h2>生成与校样</h2></div>
       <span class="edition-mark">已归档 {{ generations.length }} 段</span>
@@ -3932,7 +3993,7 @@ onUnmounted(stopDistillPolling);
   </section>
 
   <!-- ============ 步骤 7：知识图谱（生成后） ============ -->
-  <section v-else class="card">
+  <section v-else-if="!roleplayOpen" class="card">
     <div class="card-title">
       ⑦ 知识图谱（生成后才出现）
       <button class="btn" :disabled="buildingKg" @click="buildGeneratedKg">
@@ -3974,6 +4035,17 @@ onUnmounted(stopDistillPolling);
     <div class="row" style="margin-top: var(--gap)">
       <button class="btn ghost" @click="goStep(6)">← 返回生成</button>
     </div>
+  </section>
+
+  <!-- ============ 角色对话（不占向导步骤） ============ -->
+  <section v-else class="card">
+    <RoleplayPanel
+      :project-id="projectId"
+      :novel-ids="selectedRefs"
+      :novel-chapter-max="novelChapterMax"
+      :cutoffs="cutoffInputs"
+      @update:cutoffs="saveRoleplayCutoffs"
+    />
   </section>
   </template>
 

@@ -105,6 +105,8 @@ class ProjectPatch(StrictRequest):
     # app.generation.engine._book_for_project。校验（书存在 + 在可写范围内）在 router 层。
     active_novel_id: Optional[int] = None
     continuation_novel_id: Optional[int] = None
+    # 原文边界（角色对话/续写共用）。校验（书在已选范围内 + 章节存在）在 router 层。
+    reference_cutoffs: Optional[list[dict]] = None
 
 
 class ProjectOut(BaseModel):
@@ -135,6 +137,9 @@ class ProjectOut(BaseModel):
     # 事实来源书 / 续写书（NULL = 未指定）。前端两个选择器据此回填。
     active_novel_id: Optional[int] = None
     continuation_novel_id: Optional[int] = None
+    # 原文边界（每本书「故事进行到第几章」）：[{"novel_id": 1, "chapter": 40}]。
+    # 角色对话 / 续写共用的可见性边界；缺 = 该书整本挡掉（fail closed）。
+    reference_cutoffs: Optional[list[dict]] = None
 
     model_config = {"from_attributes": True}
 

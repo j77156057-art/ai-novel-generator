@@ -185,6 +185,8 @@ export interface ProjectPatch {
   active_novel_id?: number | null;
   /** 续写书：正在从哪本书往后写；null = 原创/清空。读侧优先级高于事实来源书。 */
   continuation_novel_id?: number | null;
+  /** 原文边界：每本参考书「故事进行到第几章」。null = 清空边界。 */
+  reference_cutoffs?: ReferenceCutoff[] | null;
 }
 
 export interface PlotBible {
@@ -326,6 +328,11 @@ export interface ProjectOut {
   active_novel_id: number | null;
   /** 续写书（NULL = 原创）。 */
   continuation_novel_id: number | null;
+  /**
+   * 原文边界：每本参考书「故事进行到第几章」。
+   * 角色对话 / 续写共用的可见性规则；null = 未设边界。
+   */
+  reference_cutoffs?: ReferenceCutoff[] | null;
 }
 
 export interface KgNode {

@@ -505,6 +505,69 @@ def _normalize_novel_ids(raw) -> set[int]:
     return out
 
 
+def _validate_reference_cutoffs(db: Session, proj: Project, updates: dict) -> None:
+    """校验 PATCH 里的 ``reference_cutoffs``（原文边界）。
+
+    边界是**可见性规则**，写错会直接导致剧透或素材被整本挡掉，所以逐条查：
+
+    1. 形状必须是 ``[{"novel_id": int, "chapter": int}]``，多键/少键/非整数都拒；
+    2. ``chapter >= 1``，同一本书只能出现一次；
+    3. 书必须在本次 PATCH 后的 ``reference_novel_ids`` 内；
+    4. 该章必须真的存在于 ``novel_chunks``（不存在的章 = 边界落在空处）。
+
+    ``None`` = 清空边界（放行）。同一次 PATCH 若也改了 ``reference_novel_ids``，
+    按**新值**判断——与 ``_validate_book_fields`` 同一口径。
+    """
+    from app.models import NovelChunk, RawNovel
+
+    if "reference_cutoffs" not in updates:
+        return
+    cutoffs = updates["reference_cutoffs"]
+    if cutoffs is None:
+        return
+    if not isinstance(cutoffs, list):
+        raise HTTPException(status_code=400, detail="reference_cutoffs 必须是列表")
+    scope = set(_normalize_novel_ids(
+        updates.get("reference_novel_ids", proj.reference_novel_ids)))
+    seen: set[int] = set()
+    for item in cutoffs:
+        if not isinstance(item, dict) or set(item) != {"novel_id", "chapter"}:
+            raise HTTPException(
+                status_code=400,
+                detail="reference_cutoffs 每项必须恰好含 novel_id 与 chapter",
+            )
+        nid, ch = item.get("novel_id"), item.get("chapter")
+        if type(nid) is not int or type(ch) is not int or ch < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="reference_cutoffs 的 novel_id/chapter 必须是正整数",
+            )
+        if nid in seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"reference_cutoffs 同一本书只能有一条边界（#{nid}）",
+            )
+        if db.get(RawNovel, nid) is None:
+            raise HTTPException(status_code=400, detail=f"边界指定的书 #{nid} 不存在")
+        if nid not in scope:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"边界指定的书 #{nid} 不在本项目的参考语料内"
+                        f"（参考语料={sorted(scope) or '空'}）"),
+            )
+        exists = db.scalar(
+            select(NovelChunk.id).where(
+                NovelChunk.novel_id == nid, NovelChunk.chapter_no == ch
+            ).limit(1)
+        )
+        if exists is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"边界指定的书 #{nid} 没有第 {ch} 章",
+            )
+        seen.add(nid)
+
+
 def _validate_book_fields(db: Session, proj: Project, updates: dict) -> None:
     """校验 PATCH 里的 ``active_novel_id`` / ``continuation_novel_id``。
 
@@ -574,6 +637,7 @@ def patch_project(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
     _validate_book_fields(db, proj, updates)
+    _validate_reference_cutoffs(db, proj, updates)
     if isinstance(updates.get("plot_bible"), dict):
         # 老 PATCH 路径也要告警（B2）：ProjectOut 契约不动，告警放响应头。
         # 主编辑路径是 POST /bible/apply（回执里直接带 warnings），这里只是

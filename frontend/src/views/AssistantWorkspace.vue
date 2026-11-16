@@ -33,6 +33,7 @@ import { useRoute, useRouter } from "vue-router";
 import { ApiError, api } from "@/api/client";
 import AssistantIssueList from "@/components/AssistantIssueList.vue";
 import WizardStepCard from "@/components/WizardStepCard.vue";
+import WorkflowStrip from "@/components/WorkflowStrip.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
 import { pendingActionKindLabel, pendingActionRiskMeta, sourceLabel } from "@/utils/assistantDisplay";
 import type {
@@ -1208,6 +1209,9 @@ onMounted(async () => {
       不想走引导，也可以直接问正文、语料或图谱上的问题。
     </p>
   </header>
+
+  <!-- 工序链：全流程走到哪一步、卡在哪、哪条改动等你批（服务端每次重新评估） -->
+  <WorkflowStrip v-if="!badId" :project-id="projectId" />
 
   <section class="card assistant">
     <!-- ==================== 对话流 ==================== -->
