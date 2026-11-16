@@ -122,3 +122,54 @@ def test_declared_columns_report():
         print(f"    + {t}.{c}  {'在清单' if (t, c) in listed else '漏'}")
     print(f"  基线之后新建的表（create_all 负责，无需清单）: {len(new_tables)}"
           f" → {new_tables}")
+
+
+# —— main 独有 schema 的落地护栏（2026-11-16 从 freeze/main-cb05a45 搬入）——
+# 5 张表是「新表」，由 create_all 建，不需要 migrations 清单；
+# 13 个列挂在基线已有的表上，已进上面那条 completeness 断言。
+_MAIN_ONLY_TABLES = {
+    "workflow_runs",
+    "action_proposals",
+    "book_digests",
+    "character_templates",
+    "roleplay_messages",
+}
+
+_MAIN_ONLY_COLUMNS = {
+    "projects": {
+        "style_rewrite", "narrative_scope", "character_template_id",
+        "reference_cutoffs", "story_authority", "continuation_start_chapter",
+    },
+    "distill_runs": {"kind", "scope_json", "novel_id"},
+    "raw_novels": {"source_text", "source_chapters"},
+    "novel_chunks": {"raw_text"},
+    "style_distills": {"product_key"},
+}
+
+
+def test_main_only_tables_and_columns_are_registered():
+    """搬运后的表/列必须真的进 metadata —— 只写迁移清单不算接上。"""
+    assert _MAIN_ONLY_TABLES <= set(Base.metadata.tables)
+    for table, expected in _MAIN_ONLY_COLUMNS.items():
+        actual = {c.name for c in Base.metadata.tables[table].columns}
+        missing = sorted(expected - actual)
+        assert not missing, f"{table} 缺列：{missing}"
+
+
+def test_ensure_schema_creates_main_only_tables(tmp_path):
+    """新库路径：ensure_schema 必须把这 5 张表建出来（不是只存在于模型里）。"""
+    from sqlalchemy import create_engine, inspect
+
+    from app.db import ensure_schema
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'main_schema.db'}")
+    try:
+        ensure_schema(eng)
+        names = set(inspect(eng).get_table_names())
+        assert _MAIN_ONLY_TABLES <= names, sorted(_MAIN_ONLY_TABLES - names)
+        # 老库路径的增列逻辑在同一函数内，跑完后再查一遍列
+        for table, expected in _MAIN_ONLY_COLUMNS.items():
+            actual = {c["name"] for c in inspect(eng).get_columns(table)}
+            assert expected <= actual, f"{table} 缺列：{sorted(expected - actual)}"
+    finally:
+        eng.dispose()

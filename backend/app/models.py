@@ -110,6 +110,31 @@ class Project(Base):
     # 缓存指纹只有 source_ids + version（与 style_narrative 同模式）。
     # 空表示「未蒸馏」——首次生成时回退到默认 5。
     plot_rhythm = Column(JSON, nullable=True)
+    # 两段式文风改写开关（v2.278）：
+    #   0/NULL = 关闭（默认）。一次生成 3000 字，句长会停在 15-18，但出口快、字数饱满。
+    #   1      = 开启。粗稿生成后再调一次「只改断句」的 prompt，句长可到 60 左右，
+    #            代价是每段多一次调用且改写通常压缩 15-25% 字数。
+    style_rewrite = Column(Integer, nullable=False, default=0, server_default="0")
+    # 本项目蒸馏的**范围偏好**（JSON，见 app.style.scope.DistillScope）。
+    # 与 narrative_tier 同理：那是「用哪一档算」的意图，这是「读哪几章」的意图；
+    # 空 = 没设 = 沿用档位自带的采样策略。生成链路核对指纹时带着范围，
+    # 两边口径不一致 ⇒ 每次生成都重蒸一遍。
+    narrative_scope = Column(JSON, nullable=True)
+    # 本项目**应用**的「人物塑造模板」产物 id（character_templates.id，
+    # 形如 full:9a3f1166f4e6:1f2a3b4c）。空 = 还没提炼过；
+    # 档位与项目当前档位不一致时不注入。
+    character_template_id = Column(String(96), nullable=True)
+    # 参考语料的**可见边界**（JSON）：每本书允许被参考到第几章。
+    # 空 = 未设边界（与加列前行为一致）。
+    reference_cutoffs = Column(JSON, nullable=True)
+    # 权威层来源：generated_branch | authored_branch 等（见 app.agents 权威层）。
+    # 非空默认，老库补列即有值，行为不变。
+    story_authority = Column(
+        String(32), nullable=False, default="generated_branch",
+        server_default="generated_branch",
+    )
+    # 续写起始章（legacy 用户偏好）。真正的可见性由 reference_cutoffs 决定。
+    continuation_start_chapter = Column(Integer, nullable=True)
 
 
 class RawNovel(Base):
@@ -132,6 +157,10 @@ class RawNovel(Base):
     # 清洗前后字数。有损清洗的**留痕**，供人复核「洗掉了什么」。经 API 可读。
     # 未检出任何水印时仍写入一份 cleaned=False 的报告（区分「天然干净」与「漏检」）。
     clean_report = Column(JSON, nullable=True)
+    # 上传/采集的原始正文（未切分；切分产物落 novel_chunks）。
+    source_text = Column(Text, nullable=True)
+    # 原始章节结构（[{chapter_no, title, text}] 等），供重新切分与回溯。
+    source_chapters = Column(JSON, nullable=True)
 
 
 class NovelChunk(Base):
@@ -144,6 +173,8 @@ class NovelChunk(Base):
     chapter_no = Column(Integer, nullable=True)
     idx = Column(Integer, nullable=False, default=0)
     text = Column(Text, nullable=False)
+    # 清洗前的原文（保留以便复核清洗有损程度；空 = 未留存）。
+    raw_text = Column(Text, nullable=True)
     embedding = Column(*_EmbeddingCol, nullable=True)  # M2 填充
 
 
@@ -966,6 +997,16 @@ class DistillRun(Base):
     # 项目上的 narrative_tier 是「下次该用哪档」的偏好，会被用户改掉；
     # 这一行记的是「这次实际按哪档算的」，历史任务不该随偏好变化而变化。
     tier = Column(String(16), nullable=True)
+    # 这次跑的是**哪种产物**："narrative"（叙事档案，整本蒸馏）/
+    # "character_template"（人物塑造模板，独立产物）/"book_digest"（全书压缩摘要）。
+    # 三者共用同一张任务表，进度条与轮询逻辑完全一样。
+    kind = Column(String(24), nullable=False, default="narrative")
+    # 本次蒸馏的**范围**（JSON，见 app.style.scope.DistillScope）。
+    # 范围决定「这一轮读的是哪几章」，是任务输入之一；同时是并发防重键的一部分。
+    scope_json = Column(JSON, nullable=True)
+    # 本次任务针对的**语料**（book_digest 这类「按书」的产物用）。
+    # 叙事蒸馏是按项目的（一次蒸多本参考语料），全书摘要是对**一本书**做的。
+    novel_id = Column(Integer, ForeignKey("raw_novels.id"), nullable=True, index=True)
     # pending | running | success | failed
     status = Column(String(16), nullable=False, default="pending")
     # 人话阶段名（如「语料 2/3：提炼第 5/12 块」），直接显示给用户
@@ -1167,6 +1208,9 @@ class StyleDistill(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     # 最近一次被应用到某个项目的时间（命中复用也算）。可空 = 仅入库未被用过。
     applied_at = Column(DateTime, nullable=True)
+    # 可读的档位键（如 "full:9a3f1166f4e6:1f2a3b4c"）—— 列表里一眼看出
+    # 「这是哪一档、哪次配置、正文哪一版」。主键仍是自增整数（不迁移既有行）。
+    product_key = Column(String(96), nullable=True, index=True)
 
 
 class AIFlavorMemory(Base):
@@ -1674,3 +1718,245 @@ class RuleQualityStat(Base):
         Index("uq_rule_quality_novel_rule", "novel_id", "rule_id", unique=True),
         Index("idx_rule_quality_needs_rewrite", "needs_rewrite"),
     )
+
+
+# ── 以下 5 张表自 main（freeze/main-cb05a45）搬入，定义逐字对齐 ──────────────
+# 对应台账「main 独有数据表」5 行：workflow_runs / action_proposals /
+# book_digests / character_templates / roleplay_messages。
+# 新表由 Base.metadata.create_all 建，不需要 db.py 的增列迁移项。
+
+
+class WorkflowRun(Base):
+    """助理 agent 的**工序链**状态行（一个项目一条活跃链）。
+
+    ## 为什么要有这张表
+
+    「把小说交给助理 agent，它自己清洗 → 抽检 → 蒸馏 → 审查 → 修复」这条流程
+    跨多个模型调用与后台作业（蒸馏是分钟级），状态必须落在 DB 里：
+
+    - 进程内的变量在 uvicorn reload / 多 worker 下会丢；
+    - 用户离开页面再回来，要能看到「走到哪一步、卡在哪个审批上」；
+    - 断点续跑：从最后一步继续，而不是从头重跑。
+
+    ## 这里存什么、不存什么
+
+    `steps` 存**推进日志**（谁在什么时候做了哪一步、结论是什么）；
+    但「这一步现在算不算做完」是**每次重新评估**出来的
+    （`app.agents.workflow.evaluate`）—— 正文改过、蒸馏重跑过、提案批了，
+    日志不会自己更新，只有重新评估才不会说「日志说做完了、其实没做完」。
+
+    ## 状态
+
+        active   还在推进
+        done     收敛（全部判据满足）
+        blocked  停在人工审批上（等用户批提案）
+
+    `gates` 是**待人工审批**的提案 id 列表（写操作一律走审批闸门）。
+    """
+
+    __tablename__ = "workflow_runs"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    status = Column(String(16), nullable=False, default="active")
+    current_step = Column(String(32), nullable=True)
+    round = Column(Integer, nullable=False, default=1)
+    steps = Column(JSON, nullable=True)   # 推进日志
+    gates = Column(JSON, nullable=True)   # 待人工审批的提案 id
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class ActionProposal(Base):
+    """**动作提案**：agent 提出的「做什么事」，等人批准后才执行。
+
+    ## 与 `EditProposal` 的分工
+
+    - `EditProposal` 回答「**改哪些字**」：有 before/after、有目标内容的漂移基线
+      （`scope_json.base_content_hash`）；
+    - `ActionProposal` 回答「**做什么事**」：启动蒸馏 / 规划大纲 / 扩展规划 / 调动生成。
+
+    为什么不塞进 EditProposal：那张表的一一对应约束（`type ↔ target_kind`、
+    `write_target` 只认四种内容）是为「改哪儿」设计的；硬塞动作进去，
+    「这个提案到底改哪儿」就得读代码才知道 —— 那正是 `proposals.py` 要防的事。
+
+    ## 漂移语义不同
+
+    动作提案没有「目标内容」，它有「**前提**」：前提变了（语料被清洗过、
+    规划额度用完了、期间又写了段），这条提案就过时 → 置 `stale` + 409，
+    **不静默重算、不覆盖**。「提案过期」这个事实本身要留痕。
+
+    ## 状态
+
+    `pending`（等人批）→ `approved`（批了）→ `applied`（执行了）；
+    `pending` → `rejected`（终态）；`approved` → `stale`（前提变了，终态）。
+    """
+
+    __tablename__ = "action_proposals"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    # 提它的那一轮 agent 运行（审计链）。nullable：管理操作也可预置。
+    run_id = Column(Integer, ForeignKey("agent_runs.id"), nullable=True)
+    # 动作类别：start_distill | plan_outline | extend_plan | invoke_generation
+    kind = Column(String(32), nullable=False)
+    # 一句话说清要做什么（人靠它判断要不要批）。
+    title = Column(String(255), nullable=False)
+    # 给人看的补充（档位、将写进哪、依据…）。
+    detail_json = Column(JSON, nullable=True)
+    # 批准后原样发的请求（服务端拼好，前端不参与构造）。
+    endpoint = Column(String(255), nullable=False)
+    method = Column(String(8), nullable=False, default="POST")
+    body_json = Column(JSON, nullable=True)
+    # 「前提」的指纹 —— 漂移检测用；apply 前重算比对。
+    precondition_fingerprint = Column(String(64), nullable=False)
+    # 人话：这条提案的前提是什么（给人看的，不参与判定）。
+    precondition_note = Column(Text, nullable=True)
+    risk_level = Column(String(16), nullable=False, default="low")
+    # pending | approved | rejected | applied | stale
+    status = Column(String(16), nullable=False, default="pending", index=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    approved_at = Column(DateTime, nullable=True)
+    applied_at = Column(DateTime, nullable=True)
+    # 执行结果（人话摘要 + 机器字段），供界面回显。
+    applied_result_json = Column(JSON, nullable=True)
+
+
+class BookDigest(Base):
+    """一本书的**结构化摘要**（全书压缩产物，P2）。
+
+    ## 它是什么
+
+    三块结构化内容：
+
+    - `timeline`：时间线（按**因果顺序**，不是叙述顺序）；
+    - `characters`：角色生平（身份 / 关系 / 关键经历 / 说话特征）；
+    - `reactions`：情境 → 反应（他面对什么事会说什么、会怎么做）。
+
+    与叙事档案（`StyleDistill`）是**两种不同的东西**，不能混：
+
+    - 叙事档案 = 「**怎么写**」（手法规则，注入生成提示词）；
+    - 全书摘要 = 「**写了什么**」（这本书的内容，替代整本进上下文）。
+
+    ⇒ 分表存，不塞进 `style_narrative`。
+
+    ## 复用键
+
+    `(novel_id, content_hash, digest_version)`：同一本书、同一版正文、同一版结构
+    ⇒ 至多一行 active。语料重新导入/清洗后正文变了（`content_hash` 变）⇒ 旧摘要失效，
+    不会被当成「这本书的摘要」继续用。
+
+    ## 产物里的每一条都必须有证据
+
+    入库前已经过 `app.style.digest.enforce_evidence`：
+    **没证据（章号 + 原文逐字片段）的条目直接丢弃**。
+    这一层不再复查 —— 复查是入库前的职责，表里存的就是「站得住的条目」。
+    """
+
+    __tablename__ = "book_digests"
+
+    id = Column(Integer, primary_key=True)
+    # 这本书（raw_novels.id）。摘要按**书**存，跨项目复用。
+    novel_id = Column(Integer, ForeignKey("raw_novels.id"), nullable=False, index=True)
+    # 产物结构版本（见 app.style.digest.DIGEST_VERSION）。结构变了旧产物失效。
+    digest_version = Column(Integer, nullable=False, default=1)
+    # 抽取档位：whole（整本一次投喂）/ retrieval（切块抽 + 合并）。
+    mode = Column(String(16), nullable=False, default="auto")
+    # 为什么选这一档（人话）。界面上要能看到「为什么是切块抽」。
+    mode_reason = Column(Text, nullable=True)
+    # 语料正文 sha256：正文变了摘要必须重算（与 style_distills 同口径）。
+    content_hash = Column(String(64), nullable=False, index=True)
+    # 三块产物（timeline / characters / reactions）。
+    payload = Column(JSON, nullable=True)
+    # 渲染后的文本（进上下文的就是它；JSON 是存储形态，文本是消费形态）。
+    text = Column(Text, nullable=True)
+    # 摘要字段：输入/输出字数、压缩比、证据留存与丢弃条数。
+    stats_json = Column(JSON, nullable=True)
+    # 三项验收的结论（压缩比 / 主线覆盖 / 角色覆盖 / 证据缺失率）。
+    verify_json = Column(JSON, nullable=True)
+    # active | archived
+    status = Column(String(16), nullable=False, default="active", index=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class CharacterTemplate(Base):
+    """**人物塑造模板库**：按档位分开存放的「怎么塑造一个人物」方法论。
+
+    ## 为什么独立一张表（而不是塞进叙事档案）
+
+    - **它不是叙事档案的一部分**：叙事档案是「这本书怎么写」，人物塑造模板是
+      「怎么塑造一个人物」—— 原创路径要它（那里参考书的角色不可见），续写与
+      角色聊天不要（它们有真实人物与角色声音词典）。
+    - **抽它不必重蒸整本档案**：叙事档案一次完整档要 42 分钟，模板只要每块
+      一次调用（约 1/8 的量）。混在一起就等于「为了加一块模板，重蒸 42 分钟」。
+    - **按档位分开**：不同档位采样不同章节，模板内容也不同 —— 放一起会互相覆盖，
+      用户切回原档位就得重抽。
+
+    ## id 自带档位
+
+    `id` 是**可读字符串**，形如 `full:9a3f1166f4e6:1f2a3b4c`
+    （档位 : 档位配置哈希 : 语料正文哈希前 8 位）。看一眼就知道这条产物
+    是哪一档、哪次配置、哪一版语料 —— 不用再翻表。
+
+    唯一性由 id 本身保证：同一 (语料, 档位, 档位配置, 正文) 永远只有一行。
+    """
+
+    __tablename__ = "character_templates"
+
+    # 可读主键：`<档位>:<档位签名>:<正文哈希前 8>`（见类注释）。
+    id = Column(String(96), primary_key=True)
+    # 档位 key（full / balanced / fast）—— 与 id 第一段一致，单独一列是为了能按它查。
+    tier = Column(String(16), nullable=False, index=True)
+    # 档位配置哈希（采样策略/章数/维度白名单…）：改了配置 → 换了 id → 旧产物不被误用。
+    tier_signature = Column(String(64), nullable=False)
+    # 参考语料 novel_id 列表（与 Project.reference_novel_ids 同口径，排序归一）。
+    source_ids = Column(JSON, nullable=False)
+    # 语料集合哈希 + 语料正文哈希（与叙事档案库同口径，保证两边指向同一份语料）。
+    source_ids_hash = Column(String(64), nullable=False, index=True)
+    content_hash = Column(String(64), nullable=False, index=True)
+    # 模板规则（零专名的方法论短句）。
+    rules = Column(JSON, nullable=False)
+    # 抽自多少块（规模说明）。
+    n_chunks = Column(Integer, nullable=True)
+    # 被专名表过滤掉多少条（**留痕**：滤了多少是质量信号，不是噪音）。
+    rejected = Column(Integer, nullable=True)
+    # 首次抽出这份模板的项目（来源追溯）。
+    created_by_project_id = Column(
+        Integer, ForeignKey("projects.id"), nullable=True
+    )
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    # 最近一次被应用到某个项目的时间。
+    applied_at = Column(DateTime, nullable=True)
+
+
+class RoleplayMessage(Base):
+    """**与角色对话**的一问一答。
+
+    ## 为什么单独一张表，不复用 `generations`
+
+    `generations` 是「写正文」的产物：一段有段号、有摘要、有卷进摘要树的正文。
+    角色对话的产物是**对话记录** —— 问答对，没有段号、不进摘要树、不参与续写。
+    塞进 `generations` 会污染「这个项目写到第几段」这条主线。
+
+    ## 留证据
+
+    `sources_json` 存这一轮检索到的证据**及其来源标注**（亲历 / 在场听到）。
+    留着的意义：回头能核对「他当时凭什么这么答」——
+    真跑抓到的教训是，模型会**编**，只有把证据摊开才看得出它有没有编。
+    """
+
+    __tablename__ = "roleplay_messages"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    #: 被扮演的角色名
+    character = Column(String(64), nullable=False, index=True)
+    #: 提问
+    question = Column(Text, nullable=False)
+    #: 回答
+    answer = Column(Text, nullable=False)
+    #: 这一轮用到的证据（带来源标注）
+    sources_json = Column(JSON, nullable=True)
+    #: 用的哪几本参考书
+    novel_ids_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)

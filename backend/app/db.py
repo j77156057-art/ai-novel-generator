@@ -286,6 +286,27 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # 错位行重标的留痕（见 app/kg/relabel_misplaced.py）：NULL = 未经修复
         ("kg_events", "note", "TEXT"),
         ("kg_character_state", "note", "TEXT"),
+        # —— 2026-11-16 从 main（freeze/main-cb05a45）补齐的 main 独有列 ——
+        # 全部 add-only：nullable，或 NOT NULL 但带 DEFAULT（老行补列即有值）。
+        # 不删列、不改列、不回填历史行；备份 = 升级前复制 novel_dev.db。
+        # 漏项的后果与 style_narrative 相同：老库 SELECT 这些表直接 no such column。
+        ("projects", "style_rewrite", "INTEGER NOT NULL DEFAULT 0"),
+        ("projects", "narrative_scope", "JSON"),
+        ("projects", "character_template_id", "VARCHAR(96)"),
+        ("projects", "reference_cutoffs", "JSON"),
+        ("projects", "story_authority", "VARCHAR(32) NOT NULL DEFAULT 'generated_branch'"),
+        ("projects", "continuation_start_chapter", "INTEGER"),
+        # distill_runs.kind 区分 narrative / character_template / book_digest 三种产物；
+        # 老行补 'narrative' = 与加列前的唯一行为一致（当时只有叙事蒸馏）。
+        ("distill_runs", "kind", "VARCHAR(24) NOT NULL DEFAULT 'narrative'"),
+        ("distill_runs", "scope_json", "JSON"),
+        ("distill_runs", "novel_id", "INTEGER"),
+        # 清洗前原文与上传原始正文：空 = 未留存（不是「清洗无损」）。
+        ("novel_chunks", "raw_text", "TEXT"),
+        ("raw_novels", "source_text", "TEXT"),
+        ("raw_novels", "source_chapters", "JSON"),
+        # 可读档位键（tier:signature:hash8）；老行补 NULL = 未生成过可读键。
+        ("style_distills", "product_key", "VARCHAR(96)"),
     ]
     # v3.0 KG 索引定义（ensure_schema 同步建，_migrate_sqlite_columns 老库补建）
     v30_indexes = [
