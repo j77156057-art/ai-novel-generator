@@ -17,11 +17,9 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.generation.chapter_labels import existing_chapters
 from app.generation.chapter_outline import (
     chapter_status,
     normalize_outline,
@@ -29,9 +27,13 @@ from app.generation.chapter_outline import (
     validate_chapter_range,
     validate_single_chapter,
 )
+from app.generation.outline_notice import (
+    node_windows as _node_windows,
+    validation_kwargs as _validation_kwargs,
+    written_chapters as _written_chapters,
+)
 from app.generation.planning import model_json, source_fingerprint
-from app.kg.book_scope import prompt_scope_book_ids, scope_sql_values
-from app.models import KgEntity, Project
+from app.models import Project
 from app.routers.projects import _model_call, _provider_or_none
 from app.schemas import StrictRequest
 
@@ -86,65 +88,8 @@ def _project_or_404(db: Session, project_id: int) -> Project:
     return proj
 
 
-def _written_chapters(db: Session, project_id: int) -> int:
-    chapters = existing_chapters(db, project_id)
-    return max(chapters) if chapters else 0
-
-
-def _node_windows(project: Project) -> list[dict]:
-    """从存档 ``plot_timeline`` 取节点章区间；没有存档就返回空列表。"""
-    raw = getattr(project, "plot_timeline", None)
-    if not isinstance(raw, dict):
-        return []
-    nodes = raw.get("nodes")
-    if isinstance(nodes, dict):
-        items = nodes.items()
-    elif isinstance(nodes, list):
-        items = ((str(node.get("id") or index), node) for index, node in enumerate(nodes))
-    else:
-        return []
-    windows: list[dict] = []
-    for node_id, node in items:
-        if not isinstance(node, dict):
-            continue
-        windows.append({
-            "node_id": node.get("id") or node_id,
-            "chapter_start": int(node.get("chapter_start") or 0),
-            "chapter_end": int(node.get("chapter_end") or 0),
-            "title": node.get("title") or "",
-            "entry_condition": node.get("entry_condition") or "",
-            "exit_condition": node.get("exit_condition") or "",
-        })
-    return windows
-
-
-def _kg_names(db: Session, project: Project) -> list[str]:
-    """本项目 + 当前书白名单内的实体名/别名，供权威物件字面检查。"""
-    scope = scope_sql_values(prompt_scope_book_ids(project))
-    rows = db.execute(
-        select(KgEntity.canonical_name, KgEntity.aliases).where(
-            KgEntity.project_id == project.id,
-            func.coalesce(KgEntity.novel_id, -1).in_(scope),
-        )
-    ).all()
-    names: list[str] = []
-    for canonical, aliases in rows:
-        if canonical:
-            names.append(str(canonical))
-        if isinstance(aliases, (list, tuple)):
-            names.extend(str(alias) for alias in aliases if alias)
-    return names
-
-
-def _validation_kwargs(db: Session, project: Project) -> dict:
-    return {
-        "outline": normalize_outline(project.outline),
-        "written_chapters": _written_chapters(db, project.id),
-        "premise": project.premise,
-        "bible": project.plot_bible,
-        "kg_names": _kg_names(db, project),
-        "node_windows": _node_windows(project),
-    }
+# 读取辅助（已写章数 / 节点区间 / KG 名 / 校验上下文）统一在
+# app.generation.outline_notice，生成侧回执与本模块共用同一份口径。
 
 
 def _raise_invalid(report: dict) -> None:

@@ -15,6 +15,8 @@ import type {
   AssistantSnapshotGroup,
   DistillJob,
   GeneratePlan,
+  GenerationOutlineChapter,
+  GenerationOutlineNotice,
   Graph,
   KgMergeResult,
   KgRebuildResult,
@@ -1557,6 +1559,7 @@ async function runGenerate() {
   genKgMsg.value = null; // 新一轮开始：清掉上一轮的簿记提示，只反映本轮结果
   genKgLevel.value = "";
   genQuality.value = []; // 质量回执同样按轮算：多段续写时累积，不跨轮堆叠
+  genOutlineNotices.value = []; // 章纲回执同理：只反映本轮提示词实际收到的章纲
   try {
     for (let i = 0; i < chaptersPerGen.value; i++) {
       await api.generateStream(
@@ -1574,6 +1577,7 @@ async function runGenerate() {
           // 续写路径两个信号：已重写留痕（①）与文风偏离告警（③）。
           applyRewriteInfo(meta.rewrite_info, meta.segment_no);
           applyStyleWarning(meta.style_warning, meta.segment_no);
+          applyOutlineNotice(meta.outline);
           await loadGenerations();
           refreshPriorIfOpen(); // 每段生成完前情都变了，面板开着就同步刷新
         },
@@ -1592,6 +1596,7 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
   genKgMsg.value = null; // 同上：本轮重生成的簿记结果覆盖上一轮提示
   genKgLevel.value = "";
   genQuality.value = []; // 同上：一次性动作，回执只反映这一次
+  genOutlineNotices.value = []; // 同上：章纲回执只反映这一次
   try {
     await api.regenerateStream(
       projectId,
@@ -1605,6 +1610,7 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
         applyGenKg(meta.kg);
         // regen 只管 AI 腔告警（形态②）：它不重算文风距离，后端也不发 style_warning。
         applyRewriteInfo(meta.rewrite_info, meta.segment_no);
+        applyOutlineNotice(meta.outline);
         await loadGenerations();
         refreshPriorIfOpen(); // 重生成会重算受影响的卷摘要与主线，前情报告同步刷新
       },
@@ -2185,6 +2191,49 @@ interface QualityNotice {
 
 /** 本轮生成 / 重生成落下的质量回执；每轮开头清空，只反映这一轮的结果。 */
 const genQuality = ref<QualityNotice[]>([]);
+
+/**
+ * 本轮生成 / 重生成落下的章纲回执（S4）。与质量回执分开存：
+ * 前者讲「模型看到的章纲是否完整」，后者讲「写出来的文风/复读」。
+ */
+const genOutlineNotices = ref<{ key: string; notice: GenerationOutlineNotice }[]>([]);
+
+function applyOutlineNotice(notice?: GenerationOutlineNotice | null): void {
+  if (!notice) return; // 旧后端 / 无章号的段：不提示，不编造
+  const key = `outline-${notice.from_chapter}-${notice.to_chapter}`;
+  const idx = genOutlineNotices.value.findIndex((x) => x.key === key);
+  if (idx >= 0) genOutlineNotices.value[idx] = { key, notice };
+  else genOutlineNotices.value.push({ key, notice });
+}
+
+function outlineTagLabel(chapter: GenerationOutlineChapter): string {
+  if (chapter.status === "confirmed") return "已确认";
+  if (chapter.status === "beyond_end") return "超出末章";
+  return chapter.written ? "正文已写·无章纲" : "缺失";
+}
+
+function outlineTagClass(chapter: GenerationOutlineChapter): string {
+  if (chapter.status === "confirmed") return "ok";
+  if (chapter.status === "beyond_end") return "info";
+  return chapter.written ? "err" : "warn";
+}
+
+function outlineLevel(notice: GenerationOutlineNotice): string {
+  return notice.prompt_has_outline && notice.validation.ok ? "ok" : "warn";
+}
+
+/** 校验条目里的「命中词 + 原文位置」；两样都没有就返回空串。 */
+function outlineIssueExtra(item: {
+  term?: string;
+  position?: { start: number; end: number; snippet: string };
+}): string {
+  const parts: string[] = [];
+  if (item.term) parts.push(`命中词「${item.term}」`);
+  if (item.position) {
+    parts.push(`位置 ${item.position.start}–${item.position.end}：「${item.position.snippet}」`);
+  }
+  return parts.join("；");
+}
 
 /** 未知形状的安全读取：类型不符一律回退默认值，绝不把 `undefined` 渲染给用户。 */
 function pickList(
@@ -3248,6 +3297,69 @@ onUnmounted(stopDistillPolling);
             <li v-for="d in q.details" :key="d" class="mono">{{ d }}</li>
           </ul>
         </details>
+      </div>
+    </div>
+
+    <!-- 章纲回执（S4）：这次提示词实际收到了哪一章的章纲、哪些章没有、
+         哪些检查压根没跑。缺纲只提示不阻断——与 /projects/:id/outline 同口径。 -->
+    <div v-if="genOutlineNotices.length" class="list quality-list">
+      <div
+        v-for="item in genOutlineNotices"
+        :key="item.key"
+        class="notice quality-item"
+        :class="outlineLevel(item.notice)"
+      >
+        <div class="quality-head">
+          <b class="quality-title">
+            章纲回执 · 第 {{ item.notice.from_chapter }}–{{ item.notice.to_chapter }} 章
+          </b>
+          <span class="tag" :class="item.notice.prompt_has_outline ? 'ok' : 'warn'">
+            {{ item.notice.prompt_has_outline ? "章纲已注入" : "提示词缺章纲" }}
+          </span>
+          <span
+            v-for="c in item.notice.chapters"
+            :key="c.chapter"
+            class="tag"
+            :class="outlineTagClass(c)"
+          >
+            第 {{ c.chapter }} 章 · {{ outlineTagLabel(c) }}
+          </span>
+        </div>
+        <div class="quality-body">{{ item.notice.note }}</div>
+        <div v-if="item.notice.missing_chapters.length" class="quality-body">
+          无章纲：第 {{ item.notice.missing_chapters.join("、") }} 章；本次生成未被阻断（只提示）。
+        </div>
+        <details class="quality-detail" open>
+          <summary>
+            校验回执（{{ item.notice.validation.errors.length }} 错 /
+            {{ item.notice.validation.warnings.length }} 告警）
+          </summary>
+          <ul>
+            <li
+              v-for="(issue, index) in item.notice.validation.errors"
+              :key="`outline-err-${index}`"
+            >
+              错误 {{ issue.code }}：{{ issue.message }}
+              <template v-if="outlineIssueExtra(issue)">（{{ outlineIssueExtra(issue) }}）</template>
+            </li>
+            <li
+              v-for="(issue, index) in item.notice.validation.warnings"
+              :key="`outline-warn-${index}`"
+            >
+              告警 {{ issue.code }}：{{ issue.message }}
+              <template v-if="outlineIssueExtra(issue)">（{{ outlineIssueExtra(issue) }}）</template>
+            </li>
+            <li v-if="!item.notice.validation.errors.length && !item.notice.validation.warnings.length">
+              无错误、无告警。
+            </li>
+          </ul>
+        </details>
+        <p v-if="item.notice.validation.skipped_checks.length" class="quality-body">
+          被跳过的检查：{{ item.notice.validation.skipped_checks.join("；") }}
+        </p>
+        <p v-else class="quality-body">
+          检查项：{{ item.notice.validation.checks.length }} 项均实际执行。
+        </p>
       </div>
     </div>
 

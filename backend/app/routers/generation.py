@@ -24,6 +24,7 @@ from app.generation import (
     generate_next_segment,
 )
 from app.generation.engine import _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt
+from app.generation.outline_notice import build_notice
 from app.generation.prompts import build_system_prompt, build_user_prompt
 from app.generation.repetition import parse_quality
 from app.models import Generation, Project
@@ -143,6 +144,8 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
         "length": result.get("length"),
         "summary_style": result.get("summary_style"),
         "warnings": result.get("warnings") or [],
+        # 本章实际收到的章纲：缺纲/校验跳过显式回执，blocking 恒为 False。
+        "outline": build_notice(db, proj, plan["chapter"], plan["chapter_end"]),
         "debug": {
             "system_prompt": result["system_prompt"],
             "user_prompt": result["user_prompt"],
@@ -163,6 +166,8 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
     _require_workflow_ready(db, proj)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
     plan = _chapter_plan(db, proj, body.chapter_range)
+    # 在请求线程里先算好：SSE 生成器跑在线程池，不跨线程复用这个 session。
+    outline_notice = build_notice(db, proj, plan["chapter"], plan["chapter_end"])
 
     def event_stream():
         from app.db import SessionLocal
@@ -175,6 +180,8 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
                 sdb, p, novel_ids=novel_ids, max_chars=body.max_chars,
                 chapter_range=plan["label"],
             ):
+                if ev.get("type") == "done":
+                    ev = {**ev, "outline": outline_notice}
                 yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 把异常也作为 SSE 事件下发，前端可提示
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
@@ -207,9 +214,14 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
     if target is None:
         raise HTTPException(status_code=404, detail="段不存在")
     if body.chapter_range:
-        label = _chapter_plan(db, proj, body.chapter_range, allow_existing=True)["label"]
+        plan = _chapter_plan(db, proj, body.chapter_range, allow_existing=True)
+        label = plan["label"]
+        span = (plan["chapter"], plan["chapter_end"])
     else:
         label = None  # 引擎保留原标签
+        span = chapter_labels.label_span(target.chapter_range)
+    # 没有章号（标签是「段N」）就不涉及章纲，回执整个省略，前端按缺省处理。
+    outline_notice = build_notice(db, proj, span[0], span[1]) if span else None
 
     def event_stream():
         from app.db import SessionLocal
@@ -222,6 +234,8 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
                 sdb, p, body.segment_no, novel_ids=novel_ids, max_chars=body.max_chars,
                 chapter_label=label,
             ):
+                if outline_notice is not None and ev.get("type") == "done":
+                    ev = {**ev, "outline": outline_notice}
                 yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 异常也作为 SSE 事件下发
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
@@ -249,6 +263,10 @@ def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)
         plans = chapter_labels.resolve_many(db, proj, body.chapter_range, body.segments)
     except chapter_labels.ChapterRangeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # 在写库前算：回执描述的是「每段生成时实际拿到的章纲」，不是生成后的状态。
+    outline_notices = [
+        build_notice(db, proj, plan["chapter"], plan["chapter_end"]) for plan in plans
+    ]
     try:
         results = generate_loop(
             db, proj, novel_ids=novel_ids, segments=body.segments, max_chars=body.max_chars,
@@ -264,8 +282,9 @@ def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)
              "repetition": r.get("repetition"),
              "length": r.get("length"),
              "summary_style": r.get("summary_style"),
-             "warnings": r.get("warnings") or []}
-            for r in results
+             "warnings": r.get("warnings") or [],
+             "outline": outline_notices[index]}
+            for index, r in enumerate(results)
         ],
         "last_system_prompt": results[-1]["system_prompt"],
         "constraints": results[-1]["constraints"],
@@ -277,6 +296,8 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
     """只组装上下文与提示词，不调用 LLM——生成前漂移预检与人工审阅。"""
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
+    # 预检页展示「下一次生成会拿到哪一章的章纲」；推导规则与真实生成同源。
+    plan = _chapter_plan(db, proj, None)
     ctx = build_context(db, proj, novel_ids=novel_ids)
     profile = _style_profile(db, proj)
     system = build_system_prompt(
@@ -325,6 +346,8 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         # 必须显式说明 `item_owner_conflict` 默认沉默 —— 否则界面看上去像四条都在跑，
         # 用户会以为「没报错=没问题」，而实际是那条规则根本没参与。
         "sentinel": _sentinel_digest(proj),
+        # 先看章纲：缺纲、空条目与被跳过的检查都会在这里，不藏在 prompt 里。
+        "outline": build_notice(db, proj, plan["chapter"], plan["chapter_end"]),
     }
 
 

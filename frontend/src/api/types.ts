@@ -604,6 +604,33 @@ export interface LlmThinkingControl {
   evidence: string;
 }
 
+/**
+ * 生成侧章纲回执（S4）：本次提示词**实际**拿到的章纲与校验状态。
+ *
+ * - `prompt_entry === null` ⇒ 这一章的提示词里没有章纲（缺纲 / 空条目 / 超出末章）；
+ * - `blocking` 恒为 false：只提示、不拦生成，历史 43 章不会被卡住；
+ * - `validation.skipped_checks` 必须展示，否则「没报错」会被读成「检查过了」。
+ */
+export interface GenerationOutlineChapter {
+  chapter: number;
+  status: ChapterOutlineStatus;
+  /** 正文是否已经写到这一章（决定缺失标签是「缺失」还是「正文已写·无章纲」）。 */
+  written: boolean;
+  prompt_entry: string | null;
+}
+
+export interface GenerationOutlineNotice {
+  from_chapter: number;
+  to_chapter: number;
+  chapters: GenerationOutlineChapter[];
+  missing_chapters: number[];
+  first_missing_chapter: number | null;
+  prompt_has_outline: boolean;
+  validation: ChapterOutlineValidation;
+  blocking: false;
+  note: string;
+}
+
 export interface GeneratePlan {
   reminders: Reminders;
   constraints: { characters: string[]; plotholes: string[] };
@@ -683,6 +710,8 @@ export interface GeneratePlan {
    * 用户会把「没报错」读成「没问题」，而实际是那条规则根本没参与判定。
    */
   sentinel: SentinelDigest;
+  /** 本次生成会拿到的章纲回执（缺纲 / 跳过项显式可见）；旧后端不返回 → undefined。 */
+  outline?: GenerationOutlineNotice;
 }
 
 /** 单条哨兵规则的状态。 */
@@ -735,10 +764,16 @@ export interface GenerationDebug {
 
 export interface GenerateResult extends GenerationOut {
   debug: GenerationDebug;
+  /** 本章实际收到的章纲回执；旧后端不返回 → undefined。 */
+  outline?: GenerationOutlineNotice;
 }
 
 export interface GenerateLoopResult {
-  segments: (GenerationOut & { summary: unknown })[];
+  segments: (GenerationOut & {
+    summary: unknown;
+    /** 每段各自的章纲回执；旧后端不返回 → undefined。 */
+    outline?: GenerationOutlineNotice;
+  })[];
   last_system_prompt: string;
   constraints: { characters: string[]; plotholes: string[] };
 }
@@ -853,6 +888,8 @@ export interface GenerateStreamDoneMeta {
    * 旧后端不返回 / 返回 null → undefined / null → 不提示。
    */
   rewrite_info?: Record<string, unknown> | null;
+  /** 本章实际收到的章纲回执（缺纲/跳过项）；旧后端不返回 → undefined。 */
+  outline?: GenerationOutlineNotice;
 }
 
 /**
@@ -878,6 +915,8 @@ export interface RegenerateStreamDoneMeta {
    * 旧后端不返回 → undefined → 不提示（保守，不误报）。
    */
   rewrite_info?: Record<string, unknown> | null;
+  /** 本章实际收到的章纲回执（缺纲/跳过项）；旧后端不返回 → undefined。 */
+  outline?: GenerationOutlineNotice;
 }
 
 // ==================================================================
