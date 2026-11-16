@@ -58,6 +58,22 @@ UNVERIFIED = "unverified"
 FLOOR_THINKS_LESS: tuple[int, int] = (8192, 180)
 FLOOR_FULL: tuple[int, int] = (32768, 300)
 
+#: 角色级思考档位白名单（PUT /api/settings/llm 的 `thinking` 只接受这些值）。
+#: 前五档是强度；`off` = 显式关思考；`default` = 渠道默认（不额外发字段）。
+#: 渠道不认的档位由 `_thinking_kwargs` 忽略，不会静默改写成别的档。
+THINKING_LEVELS: tuple[str, ...] = (
+    "low", "medium", "high", "xhigh", "max", "off", "default",
+)
+#: 思考档默认值。用户原话：「之前经常因为没给高导致撞墙」——默认取高，
+#: 同时地板默认 FULL，两层保证都不会被思考吃光正文预算。
+DEFAULT_THINKING: str = "high"
+
+#: 角色预算的合法区间（PUT 时校验，越界当场 400，不回退）。
+MAX_TOKENS_MIN: int = 1
+MAX_TOKENS_MAX: int = 131072
+TIMEOUT_MIN: int = 1
+TIMEOUT_MAX: int = 3600
+
 
 class ModelThinking(NamedTuple):
     """表里的一行。"""

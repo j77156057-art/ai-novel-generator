@@ -20,6 +20,17 @@ function synthFromLegacy(c: LlmConfig): LlmRoleConfig {
     base_url: "",
     max_tokens: null,
     timeout: null,
+    // 旧后端不认识这两个开关：如实显示「默认档」而不是假装它们生效。
+    thinking: "high",
+    budget_floor: true,
+    thinking_control: {
+      mode: "none",
+      field: null,
+      levels: [],
+      note: "旧后端未返回角色配置，无法确认该模型的思考开关",
+      verification: "unverified",
+      evidence: "",
+    },
     is_fallback: c.effective.is_fallback,
     label: c.effective.label,
   };
@@ -41,6 +52,8 @@ export function sameRoleConfig(a: LlmRoleConfig | null, b: LlmRoleConfig | null)
     a.base_url === b.base_url &&
     a.max_tokens === b.max_tokens &&
     a.timeout === b.timeout &&
+    a.thinking === b.thinking &&
+    a.budget_floor === b.budget_floor &&
     a.has_key === b.has_key &&
     a.api_key_masked === b.api_key_masked &&
     a.is_fallback === b.is_fallback &&

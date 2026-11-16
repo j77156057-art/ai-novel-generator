@@ -3,7 +3,8 @@
  *
  * 为什么单独一个文件而不是散在组件里：
  *   - 后端 PUT /api/settings/llm 对每个角色接受的字段是**fail-loud** 的
- *     （非 writer 传 models → 400；writer 传 max_tokens/timeout → 400）。
+ *     （非 writer 传 models → 400）。三角色的 max_tokens / timeout /
+ *     thinking / budget_floor 已统一可配（红线解除），只有模型链仍限 writer。
  *     前端若各写一份 `role === "writer" ? … : …`，加第三个角色时必然漏一处，
  *     漏一处就是运行时 400。这里集中成一张表，组件只读表。
  *   - SFC 的 `<script setup>` 不能 export 具名常量，所以放普通 .ts。
@@ -26,7 +27,7 @@ export interface LlmRoleMeta {
   savedText: string;
   /** 是否支持候选模型链（限流切换）——仅 writer。 */
   supportsChain: boolean;
-  /** 是否支持改写 max_tokens / timeout——assistant 与 distiller。 */
+  /** 是否支持改写 max_tokens / timeout——三角色统一可配。 */
   supportsLimits: boolean;
 }
 
@@ -38,7 +39,7 @@ export const LLM_ROLE_META: Record<LlmRole, LlmRoleMeta> = {
     saveLabel: "保存生成模型",
     savedText: "生成模型已保存并生效（助手 / 蒸馏模型配置未改动）。",
     supportsChain: true,
-    supportsLimits: false,
+    supportsLimits: true,
   },
   assistant: {
     title: "助手模型（Assistant）",

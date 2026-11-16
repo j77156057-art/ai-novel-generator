@@ -13,8 +13,9 @@
       （dc39bbb 的 `_legacy_channel_field` 不破）；
   (e) 启动加载 `load_persisted_llm_config`：角色键优先、legacy 键兜底、
       writer 键镜像到 legacy 字段（Writer 单例真正热生效）；
-  (f) 红线：Writer 的 max_tokens / timeout 不接受 PUT；assistant 不接受
-      models 候选链；assistant 配置**绝不**镜像 legacy 字段。
+  (f) 三角色统一可配 max_tokens / timeout / thinking / budget_floor；
+      assistant / distiller 不接受 models 候选链；非 writer 配置**绝不**镜像
+      legacy 字段。默认 = 思考 high + 地板 on（FULL 32768/300）。
 
 不依赖真实网络：provider 工厂在空 key 下降级 LocalFallback，测试只断言
 配置落点与缓存失效语义，不断言模型回复。
@@ -69,6 +70,11 @@ _SNAPSHOT_FIELDS: tuple[str, ...] = (
     "distiller_provider", "distiller_api_key", "distiller_base_url",
     "distiller_model", "distiller_max_tokens", "distiller_timeout",
     "openai_api_key", "openai_base_url", "openai_model", "openai_models",
+    # 第 9 步新增：三角色思考档 / 地板开关 + minimax 老键
+    "writer_thinking", "writer_budget_floor",
+    "assistant_thinking", "assistant_budget_floor",
+    "distiller_thinking", "distiller_budget_floor",
+    "minimax_reasoning_effort",
 )
 
 
@@ -119,16 +125,19 @@ def _get(db) -> dict:
 
 
 def test_get_returns_writer_and_assistant_blocks_with_nine_fields(db_session):
-    """GET 出参含 writer / assistant 两个角色对象，九字段齐全。"""
+    """GET 出参含 writer / assistant 两个角色对象，基础字段 + 预算/思考开关齐全。"""
     out = _get(db_session)
     for role in ("writer", "assistant"):
         assert role in out, f"GET 出参缺 {role} 角色对象"
         block = out[role]
         for field in ("provider", "model", "api_key_masked", "has_key",
-                      "base_url", "max_tokens", "timeout", "is_fallback", "label"):
+                      "base_url", "max_tokens", "timeout", "is_fallback", "label",
+                      "thinking", "budget_floor", "thinking_control"):
             assert field in block, f"{role} 对象缺字段 {field}"
         assert isinstance(block["has_key"], bool)
         assert isinstance(block["is_fallback"], bool)
+        assert isinstance(block["budget_floor"], bool)
+        assert block["thinking"], "思考档不能是空串（后端应已解析出默认 high）"
 
 
 def test_get_keeps_all_legacy_top_level_fields(db_session):
@@ -295,35 +304,37 @@ def test_put_writer_role_invalidates_only_writer_cache(db_session):
     assert llm_provider_mod.get_assistant_provider() is assistant_before
 
 
-def test_put_writer_role_rejects_max_tokens_and_timeout(db_session):
-    """b58c763 红线：chat timeout（2026-11-14 起 180）/ stream_timeout=180 不提供改写入口。"""
-    from fastapi import HTTPException
+def test_put_writer_role_accepts_max_tokens_and_timeout(db_session):
+    """红线已解除：writer 的 max_tokens / timeout 可配，并且能热生效。"""
+    _put(db_session, provider="zhipu", role="writer",
+         api_key="k", max_tokens=4096, timeout=240)
 
-    for bad in ({"max_tokens": 4096}, {"timeout": 300}):
-        with pytest.raises(HTTPException) as exc:
-            _put(db_session, provider="zhipu", role="writer",
-                 api_key="k", **bad)
-        assert exc.value.status_code == 400
-        assert "b58c763" in str(exc.value.detail)
+    assert db_session.get(AppSetting, "writer.max_tokens").value == "4096"
+    assert db_session.get(AppSetting, "writer.timeout").value == "240"
+    assert settings.writer_max_tokens == 4096
+    assert settings.writer_timeout == 240
+    # GET 取单例真实值：默认地板 on 会把 4096/240 抬到 FLOOR_FULL。
+    from app.llm.thinking_models import FLOOR_FULL
+
+    block = _get(db_session)["writer"]
+    assert block["max_tokens"] == max(4096, FLOOR_FULL[0])
+    assert block["timeout"] == max(240, FLOOR_FULL[1])
 
 
 def test_put_writer_role_still_reports_singleton_values_on_get(db_session):
-    """红线另一面：PUT 不接受，但 GET 的 writer 对象如实展示单例真实值。"""
+    """GET 的 writer 对象如实展示单例真实值（默认地板会抬到 FULL 32768/300）。"""
     settings.llm_provider = "zhipu"
     settings.zhipu_api_key = "writer-channel-key"
     llm_provider_mod.reset_provider_cache()
     reset_provider_registry()
 
-    block = _get(db_session)["writer"]
-    # 不硬编码具体数字：这条断言的是「GET 如实展示单例配置的真实值」，
-    # 不是「Writer 的 timeout 恰好是某个历史数字」。写死数字后每次调参都要改测试，
-    # 而且会把「接口如实回显」降级成「常量没被改」。
-    # Writer 的 chat/stream timeout 都在 providers.yaml 的 writer 段。
     from app.config import _PROVIDERS_YAML
-    # max_tokens 口径的守卫另有一道：tests/test_finish_reason_truncation.py::
-    # test_writer_max_tokens_leaves_headroom 保证不会被调得低于 3000。
-    assert block["max_tokens"] == _PROVIDERS_YAML["writer"]["max_tokens"]
-    assert block["timeout"] == _PROVIDERS_YAML["writer"]["timeout"]
+    from app.llm.thinking_models import FLOOR_FULL
+
+    block = _get(db_session)["writer"]
+    # 不硬编码历史数字：口径 = yaml 默认值，地板 on 时再抬到 FLOOR_FULL。
+    assert block["max_tokens"] == max(_PROVIDERS_YAML["writer"]["max_tokens"], FLOOR_FULL[0])
+    assert block["timeout"] == max(_PROVIDERS_YAML["writer"]["timeout"], FLOOR_FULL[1])
 
 
 # ====================================================================
@@ -349,11 +360,11 @@ def test_put_legacy_mode_writes_llm_keys_and_hot_reloads(db_session):
 
 
 def test_put_legacy_mode_rejects_role_only_fields(db_session):
-    """legacy 模式携带 base_url / max_tokens / timeout → 400（不静默忽略）。"""
+    """legacy 模式携带角色专属字段 → 400（不静默忽略）。"""
     from fastapi import HTTPException
 
     for bad in ({"base_url": "https://x.example.com"}, {"max_tokens": 100},
-                {"timeout": 30}):
+                {"timeout": 30}, {"thinking": "high"}, {"budget_floor": False}):
         with pytest.raises(HTTPException) as exc:
             _put(db_session, provider="zhipu", api_key="k", **bad)
         assert exc.value.status_code == 400
@@ -808,3 +819,202 @@ def test_default_model_field_points_at_an_existing_settings_field(db_session):
             assert hasattr(settings, field), (
                 f"{mapping_name}[{provider!r}] 指向的 settings 字段 {field!r} 不存在"
             )
+
+
+# ====================================================================
+# (j) 思考档 / 预算地板开关（三角色独立可配，默认「都取高的那一档」）
+# ====================================================================
+
+
+def test_default_thinking_is_high_for_every_role(db_session):
+    """用户原话「之前经常因为没给高导致撞墙」：默认必须取高。"""
+    for role in ("writer", "assistant", "distiller"):
+        assert settings.effective_thinking(role) == "high", (
+            f"{role} 默认思考档不是 high —— 又会撞预算墙"
+        )
+
+
+def test_minimax_legacy_effort_is_fallback_only(db_session):
+    """老键 MINIMAX_REASONING_EFFORT：只对 minimax 兜底，角色显式值优先。"""
+    settings.minimax_reasoning_effort = "low"
+    assert settings.effective_thinking("writer", "minimax") == "low"
+    assert settings.effective_thinking("assistant", "minimax") == "low"
+    # 非 minimax 渠道不读这个老键（否则 zhipu 也会被迫走 low）
+    assert settings.effective_thinking("assistant", "zhipu") == "high"
+
+    settings.assistant_thinking = "medium"
+    assert settings.effective_thinking("assistant", "minimax") == "medium", (
+        "角色显式档位被 MINIMAX_REASONING_EFFORT 盖住了 —— 新键必须优先"
+    )
+
+
+def test_put_role_persists_thinking_and_budget_floor(db_session):
+    _put(db_session, provider="zhipu", role="assistant", api_key="k",
+         thinking="medium", budget_floor=False, max_tokens=2048, timeout=60)
+
+    assert db_session.get(AppSetting, "assistant.thinking").value == "medium"
+    assert db_session.get(AppSetting, "assistant.budget_floor").value == "off"
+    assert settings.assistant_thinking == "medium"
+    assert settings.assistant_budget_floor is False
+
+    block = _get(db_session)["assistant"]
+    assert block["thinking"] == "medium"
+    assert block["budget_floor"] is False
+
+
+def test_put_role_rejects_unknown_thinking_level(db_session):
+    """未知档位当场 400，不回退成默认（静默回退会让人以为选上了）。"""
+    from fastapi import HTTPException
+
+    for bad in ("", "turbo", "very-high"):
+        with pytest.raises(HTTPException) as exc:
+            _put(db_session, provider="zhipu", role="assistant",
+                 api_key="k", thinking=bad)
+        assert exc.value.status_code == 400
+        assert "thinking" in str(exc.value.detail)
+
+
+def test_put_role_rejects_out_of_range_budget(db_session):
+    """越界数字当场 400（0 / 超过上限都不接受）。"""
+    from fastapi import HTTPException
+
+    for bad in ({"max_tokens": 0}, {"max_tokens": 131073},
+                {"timeout": 0}, {"timeout": 3601}):
+        with pytest.raises(HTTPException) as exc:
+            _put(db_session, provider="zhipu", role="assistant", api_key="k", **bad)
+        assert exc.value.status_code == 400
+
+
+def test_put_role_floor_off_requires_both_values(db_session):
+    """关地板 = 严格按用户值：缺任一数字就 400（留空让默认值顶上等于没关）。"""
+    from fastapi import HTTPException
+
+    for bad in ({"budget_floor": False},
+                {"budget_floor": False, "max_tokens": 2048},
+                {"budget_floor": False, "timeout": 60}):
+        with pytest.raises(HTTPException) as exc:
+            _put(db_session, provider="zhipu", role="assistant", api_key="k", **bad)
+        assert exc.value.status_code == 400
+        assert "budget_floor" in str(exc.value.detail)
+
+
+def test_build_role_provider_applies_full_floor_by_default(db_session):
+    """地板 on（默认）：配置 1024/60 也抬到 FLOOR_FULL 32768/300。"""
+    from app.llm.thinking_models import FLOOR_FULL
+
+    settings.assistant_provider = "zhipu"
+    settings.assistant_api_key = "k"
+    settings.assistant_model = "glm-4-flash"
+    settings.assistant_max_tokens = 1024
+    settings.assistant_timeout = 60
+    settings.assistant_budget_floor = True
+    llm_provider_mod.reset_assistant_provider_cache()
+
+    provider = llm_provider_mod.build_assistant_provider()
+    assert provider.max_tokens == FLOOR_FULL[0]
+    assert provider.timeout == FLOOR_FULL[1]
+    assert provider.stream_timeout == FLOOR_FULL[1]
+
+
+def test_build_role_provider_floor_off_keeps_user_values(db_session):
+    """地板 off：2048/60 原样保留，一个数字都不抬。"""
+    settings.assistant_provider = "zhipu"
+    settings.assistant_api_key = "k"
+    settings.assistant_model = "glm-4-flash"
+    settings.assistant_max_tokens = 2048
+    settings.assistant_timeout = 60
+    settings.assistant_budget_floor = False
+    llm_provider_mod.reset_assistant_provider_cache()
+
+    provider = llm_provider_mod.build_assistant_provider()
+    assert provider.max_tokens == 2048
+    assert provider.timeout == 60
+    assert provider.stream_timeout == 60
+
+
+def test_minimax_provider_internal_floor_respects_switch(db_session):
+    """地板 off 时 MiniMax 内部也不抬；思考档仍然生效（reasoning_effort=high）。"""
+    settings.assistant_provider = "minimax"
+    settings.assistant_api_key = "k"
+    settings.assistant_model = "MiniMax-M3.1-Flash-Preview"
+    settings.assistant_max_tokens = 2048
+    settings.assistant_timeout = 60
+    settings.assistant_budget_floor = False
+    llm_provider_mod.reset_assistant_provider_cache()
+
+    provider = llm_provider_mod.build_assistant_provider()
+    assert provider.max_tokens == 2048
+    assert provider.timeout == 60
+    assert provider.extra_body.get("reasoning_effort") == "high"
+
+
+def test_writer_singleton_applies_full_floor_by_default(db_session):
+    """Writer 默认路径同样吃地板：2048/60 → 32768/300。"""
+    from app.llm.thinking_models import FLOOR_FULL
+
+    provider = _writer_singleton_after(
+        llm_provider="zhipu", zhipu_api_key="zk", zhipu_model="glm-4-flash",
+        writer_max_tokens=2048, writer_timeout=60, writer_budget_floor=True,
+    )
+    assert provider.max_tokens == FLOOR_FULL[0]
+    assert provider.timeout == FLOOR_FULL[1]
+    assert provider.stream_timeout == FLOOR_FULL[1]
+
+
+def test_writer_singleton_floor_off_keeps_user_values(db_session):
+    provider = _writer_singleton_after(
+        llm_provider="zhipu", zhipu_api_key="zk", zhipu_model="glm-4-flash",
+        writer_max_tokens=2048, writer_timeout=60, writer_budget_floor=False,
+    )
+    assert provider.max_tokens == 2048
+    assert provider.timeout == 60
+    # stream_timeout 是独立字段（writer_stream_timeout），不跟 timeout 联动
+    assert provider.stream_timeout == settings.writer_stream_timeout
+
+
+def test_writer_minimax_thinking_reaches_provider(db_session):
+    """Writer 的 thinking 以前从不接线：high 必须真的进请求体。"""
+    provider = _writer_singleton_after(
+        llm_provider="minimax",
+        minimax_api_key="mk",
+        minimax_model="MiniMax-M3.1-Flash-Preview",
+    )
+    assert provider.extra_body.get("reasoning_effort") == "high"
+
+
+def test_get_role_block_exposes_thinking_control(db_session):
+    """只读控件也拿到契约：前端下拉直接用 levels，不在界面上重写渠道知识。"""
+    settings.assistant_provider = "minimax"
+    settings.assistant_api_key = "k"
+    settings.assistant_model = "MiniMax-M3.1-Flash-Preview"
+    llm_provider_mod.reset_assistant_provider_cache()
+    reset_provider_registry()
+
+    ctl = _get(db_session)["assistant"]["thinking_control"]
+    assert ctl["mode"] == "effort"
+    assert ctl["field"] == "reasoning_effort"
+    assert "high" in ctl["levels"]
+
+
+def test_load_persisted_config_applies_budget_switches(db_session):
+    """重启后地板开关与思考档必须恢复（否则等于每次重启都回到默认高档）。"""
+    _seed_setting(db_session, "writer.budget_floor", "off")
+    _seed_setting(db_session, "assistant.thinking", "low")
+    db_session.commit()
+
+    settings_router.load_persisted_llm_config(db_session)
+
+    assert settings.writer_budget_floor is False
+    assert settings.assistant_thinking == "low"
+
+
+def test_load_persisted_config_ignores_dirty_budget_values(db_session):
+    """脏值（maybe / 未知档位）跳过，保持 yaml/env 默认。"""
+    _seed_setting(db_session, "assistant.budget_floor", "maybe")
+    _seed_setting(db_session, "distiller.thinking", "ultra")
+    db_session.commit()
+
+    settings_router.load_persisted_llm_config(db_session)
+
+    assert settings.assistant_budget_floor is True
+    assert settings.distiller_thinking == ""

@@ -1241,12 +1241,13 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
 
     def __init__(self, api_key: str, base_url: str, model: str,
                  models: list[str] | None = None,
-                 reasoning_effort: str | None = None, **kwargs) -> None:
+                 reasoning_effort: str | None = None,
+                 floor_enabled: bool = True, **kwargs) -> None:
         extra: dict = {}
         if model.startswith(self._ADAPTIVE_THINKING_MODELS):
             # 自适应思考模型：只能调档，关不掉（传 disabled 直接 400）。
-            # 显式给了档位才把档位写进请求体，并按实测预算地板抬下限；
-            # 没给 = 一个字段都不多发（Writer 既有预算/超时保持不变）。
+            # 显式给了档位才把档位写进请求体；
+            # 预算地板受 `floor_enabled` 控制：off = 严格按调用方的预算，一点都不抬。
             effort = (reasoning_effort or "").strip().lower()
             if effort:
                 from app.llm.thinking_models import budget_floor
@@ -1258,13 +1259,14 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
                         "MiniMax %s 不认档位 %r（可选 low/medium/high），已忽略",
                         model, effort,
                     )
-                floor = budget_floor("minimax", model, effort=effort)
-                if floor:
-                    kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), floor[0])
-                    kwargs["timeout"] = max(int(kwargs.get("timeout") or 0), floor[1])
-                    kwargs["stream_timeout"] = max(
-                        int(kwargs.get("stream_timeout") or 0), floor[1]
-                    )
+                if floor_enabled:
+                    floor = budget_floor("minimax", model, effort=effort)
+                    if floor:
+                        kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), floor[0])
+                        kwargs["timeout"] = max(int(kwargs.get("timeout") or 0), floor[1])
+                        kwargs["stream_timeout"] = max(
+                            int(kwargs.get("stream_timeout") or 0), floor[1]
+                        )
         else:
             # 老模型（M3/M2.x）会吐思维链，能关则关；关不掉由 _strip_thinking 兜底
             extra["thinking"] = {"type": "disabled"}
@@ -1294,7 +1296,8 @@ class OpenCodeGoChatProvider(OpenAICompatibleChatProvider):
     def __init__(self, api_key: str, base_url: str | None = None, model: str | None = None,
                  session_id: str | None = None,
                  models: list[str] | None = None,
-                 thinking_off: bool | None = None, **kwargs) -> None:
+                 thinking_off: bool | None = None,
+                 floor_enabled: bool = True, **kwargs) -> None:
         headers = {
             "User-Agent": self._BROWSER_UA,
             "x-opencode-session": session_id or f"novel-{uuid.uuid4().hex}",
@@ -1303,7 +1306,7 @@ class OpenCodeGoChatProvider(OpenAICompatibleChatProvider):
         # 与正文共用 max_tokens，不关就没有正文）；True/False = 用户显式选择。
         off = True if thinking_off is None else bool(thinking_off)
         extra: dict = {"thinking": {"type": "disabled"}} if off else {}
-        if not off:
+        if not off and floor_enabled:
             # 显式开思考：按实测「最坏情况」抬预算下限，否则正文会被思考吃光。
             from app.llm.thinking_models import budget_floor
 
@@ -1587,9 +1590,10 @@ def _build_channel_provider(
 ) -> LLMProvider:
     """按 settings 构造渠道 provider（不缓存、不读写单例）。
 
-    `provider` 为 None 时渠道取 `settings.llm_provider`——**默认路径逐字节等价**
-    （Writer 与改造前完全一致）。显式传值只给 `kg_extract.provider` 用：让 KG 抽取
-    走一条与写正文不同的渠道（当前只支持配置成与主渠道同名的已知渠道）。
+    `provider` 为 None 时渠道取 `settings.llm_provider`，并额外应用 Writer 的
+    预算地板与思考档（`writer_budget_floor` / `effective_thinking("writer", …)`）。
+    显式传值只给 `kg_extract.provider` 用：让 KG 抽取走一条与写正文不同的渠道，
+    且**完全不读** writer 的地板开关与思考档（预算由 kg_extract_* 独立控制）。
 
     渠道选择与模型链和历史实现逐字节一致。`total_timeout` / `first_byte_timeout`
     为 None 时**不覆盖**：总预算仍由 `settings.writer_total_timeout` 兜底、首字节
@@ -1607,13 +1611,36 @@ def _build_channel_provider(
         _timeouts["total_timeout"] = int(total_timeout)
     if first_byte_timeout is not None:
         _timeouts["first_byte_timeout"] = int(first_byte_timeout)
+    # ---- Writer 角色的预算地板 + 思考档（仅默认路径；KG 抽取路径逐字节不变）----
+    #
+    # 为什么限定 `provider is None`：显式传 provider 的调用方是 KG 批抽，它的
+    # 预算由 kg_extract_* 独立控制，不读 writer 的地板开关与思考档。
+    is_writer = provider is None
+    floor_on = bool(settings.writer_budget_floor) if is_writer else True
+    max_tokens = settings.writer_max_tokens
+    if is_writer and floor_on:
+        from app.llm.thinking_models import FLOOR_FULL
+
+        max_tokens = max(int(max_tokens or 0), FLOOR_FULL[0])
+        _timeouts["timeout"] = max(int(_timeouts["timeout"] or 0), FLOOR_FULL[1])
+        _timeouts["stream_timeout"] = max(
+            int(_timeouts["stream_timeout"] or 0), FLOOR_FULL[1]
+        )
+
+    def _writer_think(model_name: str) -> dict:
+        """Writer 的思考档翻译；KG 抽取路径不注入（返回空 dict）。"""
+        if not is_writer:
+            return {}
+        return _thinking_kwargs(
+            channel, model_name, settings.effective_thinking("writer", channel)
+        )
     if channel == "openrouter" and settings.openrouter_api_key:
         return OpenRouterChatProvider(
             settings.openrouter_api_key,
             settings.openrouter_base_url,
             settings.openrouter_model,
             models=settings.openrouter_model_list,
-            max_tokens=settings.writer_max_tokens,
+            max_tokens=max_tokens,
             **_timeouts,
         )
     elif channel == "zhipu" and settings.zhipu_api_key:
@@ -1627,7 +1654,7 @@ def _build_channel_provider(
             settings.zhipu_base_url,
             zhipu_primary,
             models=zhipu_models,
-            max_tokens=settings.writer_max_tokens,
+            max_tokens=max_tokens,
             **_timeouts,
         )
     elif channel == "siliconflow" and settings.siliconflow_api_key:
@@ -1636,16 +1663,19 @@ def _build_channel_provider(
             settings.siliconflow_base_url,
             settings.siliconflow_model,
             models=settings.siliconflow_model_list,
-            max_tokens=settings.writer_max_tokens,
+            max_tokens=max_tokens,
             **_timeouts,
         )
     elif channel == "minimax" and settings.minimax_api_key:
+        _think = _writer_think(settings.minimax_model)
         return MiniMaxChatProvider(
             settings.minimax_api_key,
             settings.minimax_base_url,
             settings.minimax_model,
             models=settings.minimax_model_list,
-            max_tokens=settings.writer_max_tokens,
+            reasoning_effort=_think.get("reasoning_effort"),
+            floor_enabled=floor_on,
+            max_tokens=max_tokens,
             **_timeouts,
         )
     # ------------------------------------------------------------------
@@ -1667,19 +1697,21 @@ def _build_channel_provider(
     # 模型链：读该渠道的 CSV（settings.openai_models），与 zhipu 等分支同口径。
     # ------------------------------------------------------------------
     elif channel == "openai" and settings.openai_api_key:
+        _think = _writer_think(settings.openai_model)
         return GenericOpenAIChatProvider(
             settings.openai_api_key,
             settings.llm_base_url or settings.openai_base_url,
             settings.openai_model,
             models=settings.openai_model_list,
-            max_tokens=settings.writer_max_tokens,
+            thinking_off=bool(_think.get("thinking_off")),
+            max_tokens=max_tokens,
             **_timeouts,
         )
     elif channel == "dashscope" and settings.dashscope_api_key:
         base = settings.llm_base_url or settings.dashscope_base_url
         return DashScopeChatProvider(
             settings.dashscope_api_key, base, settings.llm_model,
-            max_tokens=settings.writer_max_tokens,
+            max_tokens=max_tokens,
             **_timeouts,
         )
     else:
@@ -1931,6 +1963,9 @@ def _thinking_kwargs(provider: str, model: str, thinking: str) -> dict:
         # 其它渠道的 "default" 保持原样（不传任何参数 ⇒ 渠道默认不变）。
         if prov == "opencode-go":
             return {"thinking_off": False}
+    if prov == "opencode-go" and value in ("low", "medium", "high", "xhigh", "max"):
+        # 档位语义 = 开思考（该渠道只认 reasoning_effort，关/开由 thinking_off 决定）。
+        return {"thinking_off": False}
     return {}
 
 
@@ -1938,7 +1973,9 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
                    max_tokens: int | None = None, timeout: int | None = None,
                    stream_timeout: int | None = None,
                    total_timeout: int | None = None,
-                   thinking_off: bool | None = None) -> LLMProvider:
+                   thinking_off: bool | None = None,
+                   reasoning_effort: str | None = None,
+                   floor_enabled: bool | None = None) -> LLMProvider:
     """按渠道名直接构造 provider 实例（测试端点用，不走缓存/单例）。
 
     max_tokens / timeout / stream_timeout 是 ADR-2026-10-12 新增字段：
@@ -1946,6 +1983,10 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
     - 其它调用方（settings.py 的连通性测试）不传 → 取 `settings.llm_probe_timeout`
       / `llm_stream_timeout`（默认 120 / 180 = 与 b58c763 逐秒一致，
       stream_timeout=180 是关键，不能与 chat 共用 120）。
+
+    `reasoning_effort` / `floor_enabled` 由角色工厂（`build_role_provider`）传入：
+    前者只对 MiniMax 自适应思考模型有意义，后者控制渠道内部是否抬预算地板；
+    未传时与改造前逐字节一致。
     """
     if timeout is None or not isinstance(timeout, int) or timeout <= 0:
         timeout = settings.llm_probe_timeout
@@ -1977,6 +2018,8 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
     if provider == "minimax":
         url = base_url or settings.minimax_base_url
         return MiniMaxChatProvider(api_key, url, model, models=[model],
+                                    reasoning_effort=reasoning_effort,
+                                    floor_enabled=True if floor_enabled is None else bool(floor_enabled),
                                     max_tokens=max_tokens, timeout=timeout,
                                     stream_timeout=stream_timeout,
                                     total_timeout=total_timeout)
@@ -1991,6 +2034,7 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
         # x-opencode-session），这里只需要把三态 `thinking_off` 透传下去。
         return OpenCodeGoChatProvider(api_key, base_url or None, model, models=[model],
                                       thinking_off=thinking_off,
+                                      floor_enabled=True if floor_enabled is None else bool(floor_enabled),
                                       max_tokens=max_tokens, timeout=timeout,
                                       stream_timeout=stream_timeout,
                                       total_timeout=total_timeout)
@@ -2074,9 +2118,21 @@ def build_role_provider(role: str, stream_timeout: int = 60) -> LLMProvider:
     # stream_timeout 暂时不分配置项（这两个角色都不走流式）但显式传值，
     # 防御未来子类把默认改成别的值。
     kwargs["stream_timeout"] = stream_timeout
+    # 预算地板（默认 on）：不足 FLOOR_FULL 一律抬到 32768/300，避免思考 token
+    # 把正文/JSON 预算吃光；off = 严格按用户值，一个数字都不改。
+    floor_on = bool(cfg.get("budget_floor", True))
+    if floor_on:
+        from app.llm.thinking_models import FLOOR_FULL
+
+        kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), FLOOR_FULL[0])
+        kwargs["timeout"] = max(int(kwargs.get("timeout") or 0), FLOOR_FULL[1])
+        kwargs["stream_timeout"] = max(
+            int(kwargs.get("stream_timeout") or 0), FLOOR_FULL[1]
+        )
     # 角色级思考档位：翻译成 reasoning_effort / thinking_off；空串 = 不加任何键。
     kwargs.update(_thinking_kwargs(provider, model, str(cfg.get("thinking") or "")))
-    return build_provider(provider, api_key, model, base_url, **kwargs)
+    return build_provider(provider, api_key, model, base_url,
+                          floor_enabled=floor_on, **kwargs)
 
 
 def build_assistant_provider() -> LLMProvider:

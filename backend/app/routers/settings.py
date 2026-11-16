@@ -232,11 +232,15 @@ _DB_KEY_KG_EXTRACT_MODELS = "kg_extract.models"
 #: 角色配置的字段（与 `Settings.get_provider_config` 的返回契约一致）。
 _ROLE_FIELDS: tuple[str, ...] = (
     "provider", "api_key", "base_url", "model", "max_tokens", "timeout",
-    # 思考档位：空串 = 不传任何字段（行为与加开关之前一致）。
+    # 思考档位：low/medium/high/xhigh/max/off/default，空 = 由 effective_thinking 解析。
     "thinking",
+    # 预算地板开关：on = 不足 FLOOR_FULL(32768/300) 自动抬高；off = 严格按用户值。
+    "budget_floor",
 )
 #: 其中取整数的字段（AppSetting 里按字符串存，读回时转 int）。
 _ROLE_INT_FIELDS: frozenset[str] = frozenset({"max_tokens", "timeout"})
+#: 其中取布尔值的字段（持久化成 "on"/"off"，读回时解析）。
+_ROLE_BOOL_FIELDS: frozenset[str] = frozenset({"budget_floor"})
 
 #: 合法 role 集合（与 `app.llm.registry._VALID_ROLES` 同源，避免两处漂移）。
 _ROLES: tuple[str, ...] = (WRITER_ROLE, ASSISTANT_ROLE, DISTILLER_ROLE)
@@ -252,6 +256,16 @@ def _mask(key: str) -> str:
     if len(key) <= 8:
         return "***"
     return f"{key[:4]}***{key[-4:]}"
+
+
+def _parse_bool_setting(raw: str) -> bool | None:
+    """把 AppSetting 里的布尔串解析成 bool；脏值返回 None（调用方跳过）。"""
+    v = (raw or "").strip().lower()
+    if v in {"on", "true", "1", "yes"}:
+        return True
+    if v in {"off", "false", "0", "no"}:
+        return False
+    return None
 
 
 def _legacy_effective_config() -> dict[str, Any]:
@@ -274,6 +288,10 @@ def _legacy_effective_config() -> dict[str, Any]:
         "model": str(getattr(settings, model_field, "") or "").strip() if model_field else "local-template",
         "max_tokens": settings.writer_max_tokens,
         "timeout": settings.writer_timeout,
+        # legacy 路径也读角色级开关（writer_thinking 留空时由 effective_thinking
+        # 解析成 MINIMAX_REASONING_EFFORT 或默认 high）。
+        "thinking": settings.effective_thinking("writer", provider),
+        "budget_floor": bool(settings.writer_budget_floor),
     }
 
 
@@ -299,6 +317,8 @@ def _resolve_role_config(role: str) -> dict[str, Any]:
                 "model": settings.writer_model or "",
                 "max_tokens": settings.writer_max_tokens,
                 "timeout": settings.writer_timeout,
+                "thinking": settings.effective_thinking("writer", settings.writer_provider),
+                "budget_floor": bool(settings.writer_budget_floor),
             }
         return _legacy_effective_config()
     raise ValueError(f"未知 role: {role!r}（应为 {_ROLES} 之一）")
@@ -327,6 +347,8 @@ def _role_block(role: str) -> dict[str, Any]:
       `is_fallback` / `label` **优先取生效单例上的真实值**——单例才是
       真正在跑的那一个，配置字段可能因 mixed 状态（env 手改）而与
       单例不一致，那种时候「实际在用什么」比「配置写了什么」重要。
+    - `thinking` / `budget_floor` / `thinking_control` 取**配置解析**结果：
+      单例不记录这两项，只有配置层知道用户选了什么。
     """
     cfg = _resolve_role_config(role)
     try:
@@ -364,6 +386,11 @@ def _role_block(role: str) -> dict[str, Any]:
         "base_url": base_url,
         "max_tokens": max_tokens,
         "timeout": timeout,
+        # 思考档与地板开关是「配置口径」（单例不记录它们），直接取解析结果。
+        "thinking": str(cfg.get("thinking") or ""),
+        "budget_floor": bool(cfg.get("budget_floor", True)),
+        # 前端下拉直接用：mode/levels/note 一张表，不在界面上重复渠道知识。
+        "thinking_control": thinking_control_for(provider, model),
         "is_fallback": is_fallback,
         "label": label,
     }
@@ -533,13 +560,15 @@ class LlmConfigIn(StrictRequest):
 
     `role` 缺省 → legacy 模式（与第 6 步完全一致：`provider` 必填，
     只写传入的字段，`api_key` 空则保留原值）。
-    `role` 给定 → 角色模式：写该角色的六个字段（持久化到
-    `writer.*` / `assistant.*` 键），只重置该角色的 provider 缓存。
+    `role` 给定 → 角色模式：写该角色的独立字段（持久化到
+    `writer.*` / `assistant.*` / `distiller.*` 键），只重置该角色的 provider
+    缓存。三角色的 provider/model/key/base_url/max_tokens/timeout/thinking/
+    budget_floor 均可配（默认思考 high + 地板 on）。
     `kg_extract` 给定 → KG 抽取模式：写 `kg_extract.*` 键，只重置抽取单例。
 
-    `base_url` / `max_tokens` / `timeout` 是角色模式的新字段；legacy
-    模式下携带它们 → 400（legacy 路径从不接受这三个字段，静默忽略
-    会造成「以为生效了」的假象，故 fail loud）。
+    `base_url` / `max_tokens` / `timeout` / `thinking` / `budget_floor` 是角色
+    模式的新字段；legacy 模式下携带它们 → 400（legacy 路径从不接受这些字段，
+    静默忽略会造成「以为生效了」的假象，故 fail loud）。
     """
 
     #: legacy / 角色模式必填；`kg_extract` 模式下不需要（由 kg_extract 决定渠道）。
@@ -550,6 +579,10 @@ class LlmConfigIn(StrictRequest):
     base_url: str | None = None
     max_tokens: int | None = None
     timeout: int | None = None
+    #: 思考档位（low/medium/high/xhigh/max/off/default）；None = 不改。
+    thinking: str | None = None
+    #: 预算地板开关；None = 不改。False 时必须同时给出 max_tokens 与 timeout。
+    budget_floor: bool | None = None
     role: Literal["writer", "assistant", "distiller"] | None = None
     #: KG 抽取独立渠道 + 模型链（只影响抽取；不碰 writer 的渠道与预算）。
     kg_extract: KgExtractIn | None = None
@@ -579,16 +612,23 @@ def _set(db: Session, key: str, value: str) -> None:
 def _put_legacy(body: LlmConfigIn, provider: str, db: Session) -> dict:
     """legacy 模式：第 6 步行为的逐字保留（写 llm.* 键 + 全量热生效）。
 
-    角色模式专属字段（base_url / max_tokens / timeout）在此出现即 400：
-    这三个字段在第 6 步的协议里不存在（会 422），静默接受会让调用方
-    以为配置生效了——而 legacy 路径的 Writer 单例根本不读它们。
+    角色模式专属字段（base_url / max_tokens / timeout / thinking /
+    budget_floor）在此出现即 400：这些字段在第 6 步的协议里不存在（会 422），
+    静默接受会让调用方以为配置生效了——而 legacy 路径的 Writer 单例
+    根本不读它们（预算/思考开关只走角色键）。
     """
-    if body.base_url is not None or body.max_tokens is not None or body.timeout is not None:
+    if (
+        body.base_url is not None
+        or body.max_tokens is not None
+        or body.timeout is not None
+        or body.thinking is not None
+        or body.budget_floor is not None
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "base_url / max_tokens / timeout 仅在 role 模式下有效；"
-                "legacy 模式（不带 role）不接受这三个字段"
+                "base_url / max_tokens / timeout / thinking / budget_floor "
+                "仅在 role 模式下有效；legacy 模式（不带 role）不接受这些字段"
             ),
         )
 
@@ -636,8 +676,10 @@ def _put_role(body: LlmConfigIn, provider: str, role: str, db: Session) -> dict:
 
     字段守卫（fail-loud，与前端 RoleModelPanel 的能力开关一一对应）：
     - `models`              ：仅 writer 接受（限流切换链），其余角色带 → 400；
-    - `max_tokens`/`timeout`：writer 带 → 400（基线固定）；
-      assistant / distiller 接受——蒸馏是长任务，timeout 必须能调大。
+    - `max_tokens`/`timeout`：三角色统一可配（红线已解除），越界 → 400；
+    - `thinking`            ：必须在 `THINKING_LEVELS` 里，未知档位 → 400；
+    - `budget_floor=False`  ：必须同时给出 max_tokens 与 timeout（关地板就是
+      「严格按用户值」，留空让默认值顶上等于关了个寂寞，故拒绝）。
     """
     if body.models is not None and role != WRITER_ROLE:
         raise HTTPException(
@@ -647,23 +689,73 @@ def _put_role(body: LlmConfigIn, provider: str, role: str, db: Session) -> dict:
                 "（限流切换链仅 Writer 路径有）"
             ),
         )
-    if role == WRITER_ROLE and (body.max_tokens is not None or body.timeout is not None):
+
+    from app.llm.thinking_models import (
+        MAX_TOKENS_MAX,
+        MAX_TOKENS_MIN,
+        THINKING_LEVELS,
+        TIMEOUT_MAX,
+        TIMEOUT_MIN,
+    )
+
+    if body.max_tokens is not None and not (
+        MAX_TOKENS_MIN <= body.max_tokens <= MAX_TOKENS_MAX
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Writer 的 max_tokens / timeout 由 b58c763 基线固定"
-                "（chat timeout=120 / stream_timeout=180），本端点不提供改写入口；"
-                "GET 的 writer 对象仍会如实展示单例上的真实值"
+                f"max_tokens 必须在 {MAX_TOKENS_MIN}..{MAX_TOKENS_MAX} 之间"
+                f"（收到 {body.max_tokens}）"
             ),
         )
-    if body.max_tokens is not None and body.max_tokens <= 0:
-        raise HTTPException(status_code=400, detail="max_tokens 必须为正整数")
-    if body.timeout is not None and body.timeout <= 0:
-        raise HTTPException(status_code=400, detail="timeout 必须为正整数")
+    if body.timeout is not None and not (TIMEOUT_MIN <= body.timeout <= TIMEOUT_MAX):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"timeout 必须在 {TIMEOUT_MIN}..{TIMEOUT_MAX} 秒之间"
+                f"（收到 {body.timeout}）"
+            ),
+        )
+    thinking = None
+    if body.thinking is not None:
+        thinking = body.thinking.strip().lower()
+        if thinking not in THINKING_LEVELS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"thinking 必须是 {'/'.join(THINKING_LEVELS)} 之一"
+                    f"（收到 {body.thinking!r}）"
+                ),
+            )
+    if body.budget_floor is False and (
+        body.max_tokens is None or body.timeout is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "budget_floor=off 时必须同时给出 max_tokens 与 timeout："
+                "关闭地板意味着严格按用户值执行，两项留空会让默认值顶上，"
+                "等同于没关。"
+            ),
+        )
 
     # ---- 1) 持久化角色键（只写传入的字段；api_key 空则保留原值）----
     _set(db, f"{role}.provider", provider)
     overrides: dict[str, Any] = {f"{role}_provider": provider}
+
+    # 预算 / 思考 / 地板：三角色统一口径（writer 也允许改，红线已解除）。
+    if body.max_tokens is not None:
+        _set(db, f"{role}.max_tokens", str(body.max_tokens))
+        overrides[f"{role}_max_tokens"] = body.max_tokens
+    if body.timeout is not None:
+        _set(db, f"{role}.timeout", str(body.timeout))
+        overrides[f"{role}_timeout"] = body.timeout
+    if thinking is not None:
+        _set(db, f"{role}.thinking", thinking)
+        overrides[f"{role}_thinking"] = thinking
+    if body.budget_floor is not None:
+        _set(db, f"{role}.budget_floor", "on" if body.budget_floor else "off")
+        overrides[f"{role}_budget_floor"] = bool(body.budget_floor)
 
     if body.model:
         model = body.model.strip()
@@ -688,17 +780,7 @@ def _put_role(body: LlmConfigIn, provider: str, role: str, db: Session) -> dict:
             _set(db, f"{role}.base_url", base_url)
             overrides[f"{role}_base_url"] = base_url
 
-    if role != WRITER_ROLE:
-        # Assistant / Distiller：max_tokens / timeout 都允许改。
-        # 蒸馏是长任务（一次读几十段语料），timeout 尤其要给得开——
-        # 所以这里**不做**「只有 assistant 能改」的二元判断。
-        if body.max_tokens is not None:
-            _set(db, f"{role}.max_tokens", str(body.max_tokens))
-            overrides[f"{role}_max_tokens"] = body.max_tokens
-        if body.timeout is not None:
-            _set(db, f"{role}.timeout", str(body.timeout))
-            overrides[f"{role}_timeout"] = body.timeout
-    else:
+    if role == WRITER_ROLE:
         # ---- Writer：镜像到 legacy 字段，让 b58c763 单例真正热生效 ----
         _set(db, _DB_KEY_PROVIDER, provider)
         overrides["llm_provider"] = provider
@@ -807,6 +889,8 @@ def put_llm_config(body: LlmConfigIn, db: Session = Depends(get_db)) -> dict:
             or body.base_url is not None
             or body.max_tokens is not None
             or body.timeout is not None
+            or body.thinking is not None
+            or body.budget_floor is not None
         )
         if mixed:
             raise HTTPException(
@@ -814,7 +898,7 @@ def put_llm_config(body: LlmConfigIn, db: Session = Depends(get_db)) -> dict:
                 detail=(
                     "kg_extract 模式只接受 kg_extract 字段；不得与 "
                     "provider / role / api_key / model / models / base_url / "
-                    "max_tokens / timeout 混用"
+                    "max_tokens / timeout / thinking / budget_floor 混用"
                 ),
             )
         return _put_kg_extract(body.kg_extract, db)
@@ -1045,6 +1129,8 @@ def load_persisted_llm_config(db: Session) -> None:
     stored = {r.key: r.value for r in rows}
     if not stored:
         return
+    from app.llm.thinking_models import THINKING_LEVELS
+
     overrides: dict[str, Any] = {}
 
     # ---- 1) 角色键（显式角色配置，优先级最高）----
@@ -1058,6 +1144,16 @@ def load_persisted_llm_config(db: Session) -> None:
                     overrides[f"{role}_{field}"] = int(raw)
                 except ValueError:
                     continue  # 脏数据不当成配置，保持 yaml/env 默认
+            elif field in _ROLE_BOOL_FIELDS:
+                parsed = _parse_bool_setting(raw)
+                if parsed is not None:
+                    overrides[f"{role}_{field}"] = parsed
+                continue  # 脏值跳过（与脏 int 同策略）
+            elif field == "thinking":
+                level = raw.strip().lower()
+                if level in THINKING_LEVELS:
+                    overrides[f"{role}_{field}"] = level
+                continue  # 未知档位跳过，保持 yaml/env 默认
             else:
                 overrides[f"{role}_{field}"] = raw
 

@@ -77,6 +77,10 @@ interface RoleFormState {
   baseUrl: string;
   maxTokens: string;
   timeout: string;
+  /** 思考档位（low/medium/high/xhigh/max/off/default）；空串 = 不改已存值。 */
+  thinking: string;
+  /** 预算地板：开 = 不足 32768/300 自动抬高；关 = 严格按用户值。 */
+  budgetFloor: boolean;
   showKey: boolean;
 }
 
@@ -89,6 +93,8 @@ function createForm(): RoleFormState {
     baseUrl: "",
     maxTokens: "",
     timeout: "",
+    thinking: "",
+    budgetFloor: true,
     showKey: false,
   };
 }
@@ -112,6 +118,8 @@ function applyConfig(c: LlmRoleConfig | null): void {
   form.baseUrl = c.base_url ?? "";
   form.maxTokens = c.max_tokens != null ? String(c.max_tokens) : "";
   form.timeout = c.timeout != null ? String(c.timeout) : "";
+  form.thinking = c.thinking ?? "";
+  form.budgetFloor = c.budget_floor !== false;
   // GET 不返回已存切换链：用该渠道默认链填充（与旧版模型设置页一致，
   // 用户可在高级区改；保存时按文本原样提交）。
   form.chainText = (props.providers[form.provider]?.default_models ?? []).join(", ");
@@ -140,6 +148,8 @@ function sameRole(c: LlmRoleConfig): boolean {
     s.base_url === c.base_url &&
     s.max_tokens === c.max_tokens &&
     s.timeout === c.timeout &&
+    s.thinking === c.thinking &&
+    s.budget_floor === c.budget_floor &&
     s.has_key === c.has_key &&
     s.api_key_masked === c.api_key_masked &&
     s.is_fallback === c.is_fallback &&
@@ -161,6 +171,8 @@ function switchProvider(p: string): void {
   // 端点也不跨渠道复用：换回需要自定义端点的渠道时让用户重新填，
   // 否则会拿着 A 渠道的地址去打 B 渠道（表现为莫名其妙的 404）。
   form.baseUrl = "";
+  // 思考档位与渠道强弱相关：换渠道后回到「默认 high」（不拿 A 渠道的档位去打 B）。
+  form.thinking = "high";
   localError.value = null;
 }
 
@@ -190,6 +202,27 @@ const modelOptions = computed(() => {
   return [...opts];
 });
 
+/** 该渠道+模型可选的思考档位（后端实测表下发，前端不重复渠道知识）。 */
+const thinkingControl = computed(() => props.config?.thinking_control ?? null);
+const thinkingOptions = computed(() => {
+  // mode=none：该渠道没有可用的思考开关，不给下拉（避免「选了但没效果」的假象）。
+  if (!thinkingControl.value || thinkingControl.value.mode === "none") return [];
+  const levels = [...(thinkingControl.value.levels ?? [])];
+  // 已保存的档位若不在实测表里（例如换过模型），也要能显示出来而不是变成空白。
+  if (form.thinking && !levels.includes(form.thinking)) levels.unshift(form.thinking);
+  return levels;
+});
+const thinkingNote = computed(() => {
+  const c = thinkingControl.value;
+  if (!c) return "";
+  if (c.mode === "none") {
+    return c.verification === "verified"
+      ? `${c.note || "该模型没有思考开关"}（当前记录 ${form.thinking || "high"}，不会发给模型）`
+      : `${c.note || "该模型没有思考开关（未验证）"}（当前记录 ${form.thinking || "high"}，不会发给模型）`;
+  }
+  return c.note;
+});
+
 /** 有未保存修改：与同步基线比较（key 输入框非空即视为待保存）。 */
 const dirty = computed(() => {
   const s = synced.value;
@@ -207,6 +240,8 @@ const dirty = computed(() => {
   if (supportsLimits.value) {
     if (form.maxTokens.trim() !== (s?.max_tokens != null ? String(s.max_tokens) : "")) return true;
     if (form.timeout.trim() !== (s?.timeout != null ? String(s.timeout) : "")) return true;
+    if (form.thinking !== (s?.thinking ?? "")) return true;
+    if (form.budgetFloor !== (s?.budget_floor !== false)) return true;
   }
   if (showBaseUrl.value && form.baseUrl.trim() !== (s?.base_url ?? "")) return true;
   return false;
@@ -240,8 +275,16 @@ function submitSave(): void {
       localError.value = "timeout 必须是正整数（秒；留空 = 不改变）。";
       return;
     }
+    // 关地板 = 严格按用户值执行：两项都必须是明确数字，否则后端也会 400。
+    if (!form.budgetFloor && (maxTokens === null || timeout === null)) {
+      localError.value =
+        "关闭预算地板时必须同时填写 max_tokens 与 timeout（严格按你的值执行，不再兜底）。";
+      return;
+    }
     payload.max_tokens = maxTokens;
     payload.timeout = timeout;
+    payload.thinking = form.thinking.trim() || null;
+    payload.budget_floor = form.budgetFloor;
   }
   emit("save", payload);
 }
@@ -276,6 +319,7 @@ function submitTest(): void {
         <span class="mono effective-line">{{ config.label }} · {{ config.model }}</span>
         <span class="faint effective-line">
           max_tokens {{ config.max_tokens ?? "—" }} · timeout {{ config.timeout ?? "—" }}s
+          · 思考 {{ config.thinking || "high" }} · 地板 {{ config.budget_floor ? "开" : "关" }}
         </span>
         <span v-if="config.base_url" class="faint effective-line">
           端点 <span class="mono">{{ config.base_url }}</span>
@@ -373,7 +417,7 @@ function submitTest(): void {
       </p>
     </div>
 
-    <!-- max_tokens / timeout：助手 / 蒸馏可改；Writer 两项由生成基线固定（只读展示） -->
+    <!-- max_tokens / timeout：三角色统一可改（默认地板会兜住过小的值） -->
     <div class="grid-2">
       <div class="field">
         <label :for="`${uid}-maxtok`">max_tokens{{ supportsLimits ? "（留空 = 不改变）" : "" }}</label>
@@ -387,7 +431,7 @@ function submitTest(): void {
         />
         <input v-else :id="`${uid}-maxtok`" class="input" :value="form.maxTokens" disabled />
         <span v-if="!supportsLimits" class="faint limit-note">
-          Writer 的 max_tokens / timeout 由生成基线固定，不在此改写；此处显示单例真实值。
+          该角色不支持改写预算，此处显示生效值。
         </span>
       </div>
       <div class="field">
@@ -402,11 +446,45 @@ function submitTest(): void {
         />
         <input v-else :id="`${uid}-timeout`" class="input" :value="form.timeout" disabled />
         <span v-if="!supportsLimits" class="faint limit-note">
-          基线值（chat 120s / stream 180s），只读。
+          该角色不支持改写超时，此处显示生效值。
         </span>
         <span v-else-if="role === 'distiller'" class="faint limit-note">
           蒸馏是长任务：语料越多越慢，建议 ≥180s。
         </span>
+      </div>
+    </div>
+
+    <!-- 思考强度 + 预算地板：三角色统一可配，默认都是「高的那一档」 -->
+    <div class="grid-2">
+      <div class="field">
+        <label :for="`${uid}-thinking`">思考强度 thinking</label>
+        <select
+          v-if="thinkingOptions.length"
+          :id="`${uid}-thinking`"
+          class="input"
+          v-model="form.thinking"
+        >
+          <option v-for="l in thinkingOptions" :key="l" :value="l">{{ l }}</option>
+        </select>
+        <input
+          v-else
+          :id="`${uid}-thinking`"
+          class="input"
+          :value="form.thinking || 'high'"
+          disabled
+        />
+        <p class="faint limit-note">{{ thinkingNote }}</p>
+      </div>
+      <div class="field">
+        <label :for="`${uid}-floor`">预算地板 budget_floor</label>
+        <label class="floor-toggle" :for="`${uid}-floor`">
+          <input :id="`${uid}-floor`" v-model="form.budgetFloor" type="checkbox" />
+          <span>{{ form.budgetFloor ? "开：不足 32768/300 自动抬高" : "关：严格按你填的值" }}</span>
+        </label>
+        <p class="faint limit-note">
+          默认开（避免思考 token 把正文预算吃光）。关闭时 max_tokens 与 timeout
+          必须都填，否则保存会被拒绝。
+        </p>
       </div>
     </div>
 
@@ -531,6 +609,13 @@ function submitTest(): void {
   font-size: var(--fs-xs);
   margin: 0;
   line-height: 1.6;
+}
+.floor-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-sm);
+  cursor: pointer;
 }
 .role-actions {
   margin-top: 2px;

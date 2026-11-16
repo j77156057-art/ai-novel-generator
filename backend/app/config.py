@@ -253,6 +253,10 @@ class Settings(BaseSettings):
     minimax_base_url: str = "https://api.minimaxi.com/v1"
     minimax_model: str = "MiniMax-M3.1-Flash-Preview"
     minimax_models: str = "MiniMax-M3.1-Flash-Preview"
+    #: 老键兜底：角色级 `*_thinking` 留空且渠道是 minimax 时，取本值当思考档
+    #: （env `MINIMAX_REASONING_EFFORT`）。仍为空则回落 `DEFAULT_THINKING`（high）。
+    #: 角色级显式值优先于本键——新键优先、老键继续可用。
+    minimax_reasoning_effort: str = ""
 
     # 阿里百炼 DashScope（兼容 OpenAI 协议）
     dashscope_models: str = "qwen-plus,qwen-max,qwen-turbo,qwen-flash"
@@ -300,8 +304,11 @@ class Settings(BaseSettings):
     #: 只能改代码；现与 `writer_timeout` 成对配置（默认 180 = 现网值）。
     writer_stream_timeout: int = int(_WRITER_DEFAULTS.get("stream_timeout", 180))
     #: Writer 角色的思考档位（`_thinking_kwargs` 翻译成 provider 构造参数）。
-    #: 空 = 不传任何字段，行为与加这个开关之前一致。
+    #: 空 = 走 `effective_thinking()` 的解析（MINIMAX_REASONING_EFFORT 老键 → high）。
     writer_thinking: str = ""
+    #: 预算地板开关：on（默认）时不足 FLOOR_FULL(32768/300) 自动抬高；
+    #: off 时严格按 `writer_max_tokens` / `writer_timeout` 执行，不做任何抬升。
+    writer_budget_floor: bool = bool(_WRITER_DEFAULTS.get("budget_floor", True))
     #: 文风改写开关（生成三档预设会写这里）：极速档关闭、平衡/高质量档开启。
     #: 项目级 `projects.style_rewrite` 显式设置时以项目为准。
     style_rewrite: bool = True
@@ -500,8 +507,10 @@ class Settings(BaseSettings):
     assistant_model: str = _ASSISTANT_DEFAULTS.get("model", "glm-4-flash")
     assistant_max_tokens: int = int(_ASSISTANT_DEFAULTS.get("max_tokens", 1024))
     assistant_timeout: int = int(_ASSISTANT_DEFAULTS.get("timeout", 60))
-    #: Assistant 角色的思考档位（空 = 不传，保持渠道默认）。
+    #: Assistant 角色的思考档位（空 = 走 `effective_thinking()` 解析）。
     assistant_thinking: str = ""
+    #: 预算地板开关（默认 on）：不足 FLOOR_FULL(32768/300) 自动抬高；off 严格按用户值。
+    assistant_budget_floor: bool = bool(_ASSISTANT_DEFAULTS.get("budget_floor", True))
     #: 实测**不可用**于 function calling 的模型名单（逗号分隔，env 可覆盖）。
     #:
     #: 来源：2026-11-14 最小探针（`%TEMP%\tool_probe\probe*.py`，同一套线上渠道
@@ -537,8 +546,10 @@ class Settings(BaseSettings):
     #: 兜底值与 config/providers.yaml 的 distiller.max_tokens 保持一致。
     distiller_max_tokens: int = int(_DISTILLER_DEFAULTS.get("max_tokens", 32768))
     distiller_timeout: int = int(_DISTILLER_DEFAULTS.get("timeout", 180))
-    #: Distiller 角色的思考档位（空 = 不传，保持渠道默认）。
+    #: Distiller 角色的思考档位（空 = 走 `effective_thinking()` 解析）。
     distiller_thinking: str = ""
+    #: 预算地板开关（默认 on）：不足 FLOOR_FULL(32768/300) 自动抬高；off 严格按用户值。
+    distiller_budget_floor: bool = bool(_DISTILLER_DEFAULTS.get("budget_floor", True))
 
     # ------------------------------------------------------------------
     # 量级与体系护栏（power_guard，独立区块）
@@ -621,6 +632,31 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # 按 role 返回 6 字段独立 config 的工厂（ADR-2026-10-12 第 2 步 / 第 5 步第 1 步）。
     # ------------------------------------------------------------------
+    def effective_thinking(self, role: str, provider: str = "") -> str:
+        """解析某个角色**当前生效**的思考档位（空串已不可能：总有默认）。
+
+        优先级：角色显式值 > `minimax_reasoning_effort`（仅 minimax 渠道的老键）
+        > `DEFAULT_THINKING`（high）。
+
+        `provider` 留空时按角色推断实际渠道：writer 看 `writer_provider`，
+        为空则回落到它委托的 legacy 渠道 `llm_provider`；其余角色看 `<role>_provider`。
+        """
+        from app.llm.thinking_models import DEFAULT_THINKING
+
+        explicit = str(getattr(self, f"{role}_thinking", "") or "").strip().lower()
+        if explicit:
+            return explicit
+        channel = (provider or "").strip().lower()
+        if not channel:
+            if role == "writer":
+                channel = str(self.writer_provider or self.llm_provider or "").strip().lower()
+            else:
+                channel = str(getattr(self, f"{role}_provider", "") or "").strip().lower()
+        legacy = str(self.minimax_reasoning_effort or "").strip().lower()
+        if channel == "minimax" and legacy:
+            return legacy
+        return DEFAULT_THINKING
+
     def get_provider_config(self, role: str) -> dict[str, object]:
         """按 role 读取 writer / assistant / distiller 的独立配置块。
 
@@ -636,8 +672,9 @@ class Settings(BaseSettings):
         渠道 "openai" 也在这张表里——通用 OpenAI 兼容接口的端点默认来自
         `openai_base_url`，用户可覆盖。
 
-        返回 dict 字段稳定：provider / api_key / base_url / model / max_tokens / timeout，
-        这是 ProviderRegistry 与 build_*_provider() 的唯一契约。
+        返回 dict 字段稳定：provider / api_key / base_url / model / max_tokens /
+        timeout / thinking / budget_floor，这是 ProviderRegistry 与
+        build_*_provider() 的唯一契约。
 
         抛出 ValueError 当 role 不是已知值（让上层立刻 fail-fast）。
         """
@@ -649,8 +686,10 @@ class Settings(BaseSettings):
                 "model": self.writer_model,
                 "max_tokens": self.writer_max_tokens,
                 "timeout": self.writer_timeout,
-                # 思考档位（空串 = 不传；非空由 llm/provider._thinking_kwargs 翻译）
-                "thinking": self.writer_thinking,
+                # 思考档位：显式角色值 > MINIMAX_REASONING_EFFORT（仅 minimax）> high
+                "thinking": self.effective_thinking("writer", self.writer_provider),
+                # 预算地板开关：on = 不足 FLOOR_FULL 自动抬高；off = 严格按用户值
+                "budget_floor": bool(self.writer_budget_floor),
                 # 标记：writer 空 provider 时由工厂委托给原 Writer 单例
                 "_fallback_to_legacy": not bool(self.writer_provider),
             }
@@ -676,7 +715,8 @@ class Settings(BaseSettings):
                 "model": str(getattr(self, f"{role}_model") or "").strip(),
                 "max_tokens": getattr(self, f"{role}_max_tokens"),
                 "timeout": getattr(self, f"{role}_timeout"),
-                "thinking": str(getattr(self, f"{role}_thinking") or "").strip(),
+                "thinking": self.effective_thinking(role, provider),
+                "budget_floor": bool(getattr(self, f"{role}_budget_floor")),
                 "_fallback_to_legacy": False,
             }
         raise ValueError(f"未知 role: {role!r}（应为 'writer' / 'assistant' / 'distiller'）")

@@ -418,6 +418,10 @@ export interface LlmConfigIn {
   base_url?: string | null;
   max_tokens?: number | null;
   timeout?: number | null;
+  /** 思考档位：low/medium/high/xhigh/max/off（后端白名单校验，未知档位 400）。 */
+  thinking?: string | null;
+  /** 预算地板开关：false 时必须同时给出 max_tokens 与 timeout（后端 400）。 */
+  budget_floor?: boolean | null;
   /** KG 抽取模式：只写抽取渠道 / 模型链，不得与上面的字段混用（后端 400）。 */
   kg_extract?: LlmKgExtractSavePayload | null;
 }
@@ -434,11 +438,9 @@ export interface LlmTestIn {
  * 前端「分角色保存」载荷（RoleModelPanel → LlmSettings 视图 → api）。
  *
  * 按角色只带该角色接受的字段（后端按角色 fail-loud，多带 = 400）：
- *   - writer：带 models（限流切换链）；**不带** max_tokens / timeout
- *     （Writer 的 chat/stream timeout 由生成基线固定，后端不提供改写入口，
- *     GET 的 writer 对象仍如实展示单例真实值）；
- *   - assistant：带 max_tokens / timeout；**不带** models（助手是单模型
- *     配置，没有限流切换链）。
+ *   - writer：带 models（限流切换链）；max_tokens / timeout / thinking /
+ *     budget_floor 三角色统一可配（红线已解除）；
+ *   - assistant / distiller：不带 models（单模型配置，没有限流切换链）。
  */
 export interface LlmRoleSavePayload {
   role: LlmRole;
@@ -453,9 +455,13 @@ export interface LlmRoleSavePayload {
   base_url?: string | null;
   /** 仅 writer：候选模型链（限流切换用）。 */
   models?: string[] | null;
-  /** 仅 assistant：助手模型的 max_tokens / timeout。 */
+  /** 三角色：max_tokens / timeout（null = 不改）。 */
   max_tokens?: number | null;
   timeout?: number | null;
+  /** 思考档位（恒传当前档位；null = 不改）。 */
+  thinking?: string | null;
+  /** 预算地板开关（null = 不改；false 必须同时给 max_tokens 与 timeout）。 */
+  budget_floor?: boolean | null;
 }
 
 /** 前端「分角色测试连接」载荷（只测指定角色这一个配置）。 */
@@ -489,8 +495,27 @@ export interface LlmRoleConfig {
   base_url: string;
   max_tokens: number | null;
   timeout: number | null;
+  /** 当前思考档位（后端已解析出默认值，空串不会出现）。 */
+  thinking: string;
+  /** 预算地板开关：on = 不足 32768/300 自动抬高；off = 严格按用户值。 */
+  budget_floor: boolean;
+  /** 该渠道+模型的思考控制能力（下拉选项 / 说明 / 实测依据）。 */
+  thinking_control: LlmThinkingControl;
   is_fallback: boolean;
   label: string;
+}
+
+/** 思考控制契约（后端 `thinking_control_for` 的翻译结果）。 */
+export interface LlmThinkingControl {
+  /** effort = 可调档；disable = 只能开关；none = 没有可用的思考开关。 */
+  mode: "effort" | "disable" | "none";
+  /** 请求体里对应的字段名（展示用）；none 时为 null。 */
+  field: string | null;
+  /** 可选档位；none 时为空数组。 */
+  levels: string[];
+  note: string;
+  verification: "verified" | "unverified";
+  evidence: string;
 }
 
 export interface GeneratePlan {

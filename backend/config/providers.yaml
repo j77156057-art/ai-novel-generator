@@ -44,6 +44,11 @@ writer:
   # 一次生成就要 180s+（第 4 章流式首包 150s、正文 180s 才到齐），120s 的
   # 同步入口在长篇幅下属先天不可用：MiniMax 连续两次读到超时、零产出。
   timeout: 180
+  # 预算地板开关（默认 on）：配置值不足 32768 token / 300s 时自动抬到
+  # FLOOR_FULL（32768/300），避免思考 token 把正文预算吃成空串。
+  # off = 完全不抬，严格按上面的 max_tokens / timeout 执行。
+  # 运行时可在「模型设置」页按角色切换，也可用 WRITER_BUDGET_FLOOR 覆盖默认。
+  budget_floor: true
 
 assistant:
   provider: "zhipu"      # 默认走智谱 GLM（中文诊断 / 检索增强）
@@ -52,6 +57,8 @@ assistant:
   model: "glm-4-flash"   # GLM-4-Flash 永久免费不限 token，国内低延迟
   max_tokens: 1024       # 诊断/检索回答通常比正文短
   timeout: 60            # 诊断路径必须快速失败，不允许长等
+  # 预算地板（默认 on）：不足 32768/300 抬到 FLOOR_FULL；off 严格按上面的值。
+  budget_floor: true
   # 实测**不可用**于 function calling 的模型（逗号分隔）。
   # 来源：2026-11-14 最小探针（同一套线上渠道配置）。glm-z1-flash 在
   # `tool_choice=required + max_tokens=4096` 下返回 finish_reason=tool_calls
@@ -80,6 +87,8 @@ distiller:
   # 长任务：一次读几十段语料再压缩，60s 会频繁超时。
   # 180s 是「能跑完一整卷」的量级；配 :free 档仍嫌慢就再往上调。
   timeout: 180
+  # 预算地板（默认 on）：不足 32768/300 抬到 FLOOR_FULL；off 严格按上面的值。
+  budget_floor: true
 
 # ---------------------------------------------------------------------------
 # opencode go（按量计费网关，OpenAI 兼容）

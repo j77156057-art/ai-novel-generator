@@ -350,11 +350,11 @@ def test_qa_endpoint_really_reaches_assistant_chat(monkeypatch):
 
 
 def test_writer_config_unchanged_by_assistant_fix():
-    """get_provider_config('writer') 返回的字段集合（含 `_fallback_to_legacy` 标记）。
+    """get_provider_config('writer') 的字段集合（三角色契约同形）。
 
-    契约在 2026-10-26 **有意**扩了一个字段：`thinking`（思考档位）。
-    它不算破坏「Writer 行为不变」这条红线：新增的可选字段默认空串 ⇒
-    `_thinking_kwargs()` 返回 `{}`，请求体一个字段都不多发（下面最后一条断言钉住）。
+    契约在 2026-10-26 扩了 `thinking`；2026-11-16 又扩了 `budget_floor`
+    （三角色预算/思考开关）。默认思考档 high、地板 on —— 这是用户明确
+    拍板的「默认先按高的来」，不是副作用。
     """
     settings.llm_provider = "zhipu"
     settings.zhipu_api_key = "zhipu-legacy-key"
@@ -363,23 +363,28 @@ def test_writer_config_unchanged_by_assistant_fix():
 
     assert set(cfg) == {
         "provider", "api_key", "base_url", "model",
-        "max_tokens", "timeout", "thinking", "_fallback_to_legacy",
+        "max_tokens", "timeout", "thinking", "budget_floor",
+        "_fallback_to_legacy",
     }
     # writer_* 默认全空 → 委托标记必须为 True（工厂据此走 get_llm_provider() 单例）
     assert cfg["_fallback_to_legacy"] is True
-    # 新增字段默认空 ⇒ 不往请求体加任何东西（行为不变的关键）
-    assert cfg["thinking"] == ""
+    # 思考档默认 high、地板默认 on（用户要求「默认高」）
+    assert cfg["thinking"] == "high"
+    assert cfg["budget_floor"] is True
 
 
 def test_writer_singleton_keeps_its_own_key_and_timeouts():
-    """硬红线：Writer 单例仍用 llm_provider 渠道的 key，chat=180 / stream=180 不变。
+    """硬红线：Writer 单例仍用 llm_provider 渠道的 key；两侧预算各按各的配置。
 
-    注：chat 超时在 2026-11-14 由 120 提到 180（与 stream_timeout 同档，长章
-    实测一次生成需 180s 上下）；本断言随之更新，不是本次 tool-calling 改动。
+    超时口径（2026-11-16 起）：三角色默认地板 on，不足 FLOOR_FULL(32768/300)
+    会抬到 300s。所以这里断言的是「两侧各自吃自己的地板」，而不是旧的
+    180 / 60 —— 它们不得互相串味（Assistant 的配置不能改 Writer 的超时）。
 
     对照组意义：Assistant 借用 legacy **字段**读 key，不得反过来把 Writer 的
-    单例、key 或超时改成 Assistant 的 60 / 60。
+    单例、key 或超时改成 Assistant 的配置。
     """
+    from app.llm.thinking_models import FLOOR_FULL
+
     settings.llm_provider = "zhipu"
     settings.zhipu_api_key = "writer-channel-key"
     settings.zhipu_model = "glm-4-flash"
@@ -392,13 +397,14 @@ def test_writer_singleton_keeps_its_own_key_and_timeouts():
 
     assert isinstance(writer, ZhipuChatProvider)
     assert writer.api_key == "writer-channel-key"
-    assert writer.timeout == 180
-    assert writer.stream_timeout == 180
+    assert writer.timeout == max(settings.writer_timeout, FLOOR_FULL[1])
+    assert writer.stream_timeout == max(settings.writer_stream_timeout, FLOOR_FULL[1])
 
     assert isinstance(assistant, ZhipuChatProvider)
     assert assistant.api_key == "explicit-assistant-key"
-    assert assistant.timeout == 60
-    assert assistant.stream_timeout == 60
+    assert assistant.timeout == max(settings.assistant_timeout, FLOOR_FULL[1])
+    # assistant 没有独立的 stream_timeout 配置项，工厂固定传 60 → 地板抬到 300
+    assert assistant.stream_timeout == FLOOR_FULL[1]
 
     # 双侧实例互相独立（不是同一个对象）
     assert writer is not assistant
