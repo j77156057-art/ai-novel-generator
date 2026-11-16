@@ -202,6 +202,98 @@ check("uq_kg_foreshadow 仍是 (project_id, name)", list(_uq.columns.keys()), ["
 
 
 # ====================================================================
+# 3. 实体章号严格聚合：只认 segment_no（语料）/ 显式「第 N 章」（生成）
+# ====================================================================
+from app.kg.entity_chapters import (  # noqa: E402
+    apply_plan,
+    build_plan,
+    chapter_of_label,
+    summarize,
+)
+
+check("章号：第9章《大勇知道了》", chapter_of_label("第9章《大勇知道了》"), 9)
+check("章号：第 12 章", chapter_of_label("第 12 章"), 12)
+check("章号：段1 不认", chapter_of_label("段1"), None)
+check("章号：段2 不认", chapter_of_label("段2"), None)
+check("章号：空串", chapter_of_label(""), None)
+check("章号：None", chapter_of_label(None), None)
+check("章号：第0章 非法", chapter_of_label("第0章"), None)
+
+chap_path = os.path.join(tmpdir, "chapters.db")
+chap_engine = create_engine(f"sqlite:///{chap_path}", future=True)
+Base.metadata.create_all(bind=chap_engine)
+Session = sessionmaker(bind=chap_engine, future=True)
+db = Session()
+
+from app.models import (  # noqa: E402
+    Generation, KgEntity, KgMention, Project,
+)
+
+db.add(Project(id=1, title="章号测试"))
+db.add_all([
+    Generation(id=1, project_id=1, segment_no=1, chapter_range="第3章《甲》"),
+    Generation(id=2, project_id=1, segment_no=2, chapter_range="第5章"),
+    Generation(id=3, project_id=1, segment_no=3, chapter_range="段1"),
+])
+db.flush()
+db.add_all([
+    # 语料路径：段号即章号
+    KgEntity(id=1, project_id=1, novel_id=5, kind="character",
+             canonical_name="语料角色", first_chapter=None, last_chapter=None),
+    # 生成路径：只认显式标签，段1 不计
+    KgEntity(id=2, project_id=1, novel_id=None, kind="character",
+             canonical_name="生成角色", first_chapter=None, last_chapter=None),
+    # 两条路径都有：取并集
+    KgEntity(id=3, project_id=1, novel_id=5, kind="item",
+             canonical_name="混合", first_chapter=1, last_chapter=99),
+    # 只有段N / 没有 mention：未知
+    KgEntity(id=4, project_id=1, novel_id=None, kind="info",
+             canonical_name="未知实体", first_chapter=None, last_chapter=None),
+    KgEntity(id=5, project_id=1, novel_id=None, kind="info",
+             canonical_name="无提及", first_chapter=None, last_chapter=None),
+])
+db.flush()
+db.add_all([
+    KgMention(project_id=1, novel_id=5, entity_id=1, generation_id=None, segment_no=10),
+    KgMention(project_id=1, novel_id=5, entity_id=1, generation_id=None, segment_no=20),
+    KgMention(project_id=1, novel_id=None, entity_id=2, generation_id=1, segment_no=1),
+    KgMention(project_id=1, novel_id=None, entity_id=2, generation_id=2, segment_no=2),
+    KgMention(project_id=1, novel_id=None, entity_id=2, generation_id=3, segment_no=3),
+    KgMention(project_id=1, novel_id=5, entity_id=3, generation_id=None, segment_no=40),
+    KgMention(project_id=1, novel_id=None, entity_id=3, generation_id=2, segment_no=4),
+    KgMention(project_id=1, novel_id=None, entity_id=4, generation_id=3, segment_no=5),
+])
+db.commit()
+
+plan = {p.entity_id: p for p in build_plan(db).plans}
+check("语料路径按 segment_no 取区间", [plan[1].new_first, plan[1].new_last], [10, 20])
+check("生成路径只认显式章号", [plan[2].new_first, plan[2].new_last], [3, 5])
+check("段N 不计入章号", plan[2].unknown_mentions, 1)
+check("两条路径取并集", [plan[3].new_first, plan[3].new_last], [5, 40])
+check("只有段N → 未知（不回落 1）", [plan[4].new_first, plan[4].new_last], [None, None])
+check("无 mention → 未知", [plan[5].new_first, plan[5].new_last], [None, None])
+check("未知实体不漂移", plan[4].drift, False)
+check("NULL → 区间算漂移", plan[1].drift, True)
+check("区间变化算漂移", plan[3].drift, True)
+
+summary = summarize(build_plan(db))
+check("dry-run：未知 2 个", summary["unknown"], 2)
+check("dry-run：可填 2 个", summary["fillable_now"], 2)
+check("dry-run：漂移 3 个", summary["drift"], 3)
+
+written = apply_plan(db, build_plan(db))
+db.commit()
+check("apply 只写漂移行", written, 3)
+rows = {e.id: (e.first_chapter, e.last_chapter) for e in db.query(KgEntity).all()}
+check("apply 后语料区间落库", rows[1], (10, 20))
+check("apply 后未知仍为 NULL", rows[4], (None, None))
+check("apply 后无提及仍为 NULL", rows[5], (None, None))
+check("apply 幂等：再跑不写", apply_plan(db, build_plan(db)), 0)
+db.close()
+chap_engine.dispose()
+
+
+# ====================================================================
 # 汇总
 # ====================================================================
 print(f"\n结果：{PASS} 通过, {FAIL} 失败" + (f" -> {FAILED}" if FAILED else ""))
