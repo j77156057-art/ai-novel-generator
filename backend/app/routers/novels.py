@@ -1,7 +1,7 @@
 """小说/语料相关路由：上传、种子、列表、分片查看。"""
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -65,8 +65,26 @@ def seed(db: Session = Depends(get_db)) -> list[dict]:
 
 
 @router.get("", response_model=list[NovelOut])
-def list_novels(db: Session = Depends(get_db)) -> list[RawNovel]:
-    return db.scalars(select(RawNovel).order_by(RawNovel.id)).all()
+def list_novels(db: Session = Depends(get_db)) -> list[NovelOut]:
+    """语料列表。带出每本的**最大章节号**。
+
+    界面上的「原文边界」要回答「故事进行到第几章」，用户得先知道这本书
+    一共有多少章；没有这个数，输入框就没有上界（只能等后端 400 才知道填错）。
+    """
+    novels = db.scalars(select(RawNovel).order_by(RawNovel.id)).all()
+    maxes = dict(
+        db.execute(
+            select(NovelChunk.novel_id, func.max(NovelChunk.chapter_no)).group_by(
+                NovelChunk.novel_id
+            )
+        ).all()
+    )
+    out: list[NovelOut] = []
+    for novel in novels:
+        item = NovelOut.model_validate(novel)
+        item.max_chapter_no = int(maxes.get(novel.id) or 0)
+        out.append(item)
+    return out
 
 
 @router.get("/{novel_id}/chunks", response_model=list[ChunkOut])

@@ -29,6 +29,9 @@ class NovelOut(BaseModel):
     # 导入时的语料清洗报告（第 8 步）。用户要能看到「洗掉了什么」：
     # 检出串列表 / 各串次数 / 剔除总字数 / 清洗前后字数 / 原文样本。
     clean_report: Optional[dict] = None
+    # 这本语料**最大的章节号**（0 = 还没有切分出任何章节）。
+    # 「原文边界」输入框靠它定上界，见 routers/novels.py::list_novels。
+    max_chapter_no: int = 0
 
     model_config = {"from_attributes": True}
 
