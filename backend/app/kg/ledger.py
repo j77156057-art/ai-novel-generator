@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
+from app.kg.build import _segment_pairs, extract_from_text
 from app.kg.extractor import _GLUE_TAIL_CHARS
 from app.models import Fact, KgEdge, KgNode
 
@@ -53,6 +54,12 @@ from app.models import Fact, KgEdge, KgNode
 T_CHARACTER = "character"
 T_PLOTHOLE = "plothole"
 T_RELATIONSHIP = "relationship"
+
+#: 只有这几类事实是**由正文抽取**得出的，可以在正文修订后重建（批 9 前置）。
+#: 其余类型（作者豁免、哨兵写下的角色状态、逐段告警）不由正文决定，不得随重建抹掉。
+REBUILDABLE_FACT_TYPES: frozenset[str] = frozenset({
+    T_CHARACTER, T_PLOTHOLE, T_RELATIONSHIP,
+})
 
 # 权威档位：数值越大越优先（Q6 的分层裁决：作者意图 > 高置信抽取 > 低置信抽取）
 AUTHORITY = {"user": 3, "bible": 2, "generated": 1, "novel": 0}
@@ -127,12 +134,15 @@ def facts_from_extraction(result, segment_no: int) -> list[dict]:
 
 
 def upsert_facts(
-    db, project_id: int, facts: list[dict], source: str = "generated"
+    db, project_id: int, facts: list[dict], source: str = "generated", *,
+    commit: bool = True,
 ) -> dict:
     """增量 upsert。语义：同名累加计数/扩段范围，不清空、不重建。
 
     `source` 参与键：同一 project 下参考语料侧与生成侧是两套事实，
     绝不能因为名字相同就把参考语料角色的统计并进生成侧（P0-1 的隔离纪律）。
+
+    `commit=False` 时只 flush 不提交——给「先清后写」的重建原语用（批 9 前置）。
     """
     if not facts:
         return {"upserted": 0, "created": 0, "updated": 0}
@@ -200,8 +210,84 @@ def upsert_facts(
                 )
         n_upd += 1
 
-    db.commit()
+    db.commit() if commit else db.flush()
     return {"upserted": n_new + n_upd, "created": n_new, "updated": n_upd}
+
+
+def rebuild_facts(
+    db,
+    project_id: int,
+    *,
+    source: str = "generated",
+    segments=None,
+    commit: bool = True,
+) -> dict:
+    """按当前正文重建某一 source 的事实账本（全量替换，不是增量）。
+
+    `segments`：当前生成分支的正文段列表 `[(segment_no, text), ...]`，必须非空。
+
+    语义：
+      1. 删除该 project + source 下**由正文抽取得出的**事实行（`REBUILDABLE_FACT_TYPES`）；
+         作者豁免、哨兵写下的角色状态、逐段告警**一律保留** —— 它们不由正文决定，
+         抹掉等于替作者改主意、或让「已死」的角色复活。
+      2. 逐段 `extract_from_text` → `upsert_facts`，与生成期增量路径同口径。
+      3. `resolve_aliases` 归一别名。
+      4. 提交并返回统计。
+
+    `commit=False` 时只 flush——供 `derived_rebuild` 把「清图 + 重写账本 + 写派生状态」
+    收进同一个事务，失败时整体回滚，不留半重建的账本（批 9 前置）。
+    """
+    pairs = _segment_pairs(segments)
+    if not pairs:
+        raise ValueError("segments_required")
+
+    rows = db.scalars(
+        select(Fact).where(Fact.project_id == project_id, Fact.source == source)
+    ).all()
+    deleted = 0
+    for row in rows:
+        # 只重建**由正文抽取**得出的那几类事实。其它类型不能跟着正文重建：
+        #   - `exemption` 是作者自己的裁决（routers/kg_v3.py 写入），抹掉等于替作者改主意；
+        #   - `state`（角色生死/持有物）由哨兵在生成时写下，正文里**推不出来**，
+        #     删掉等于让「已死」的角色复活，反过来污染后续诊断；
+        #   - `alert` 是哨兵/判官的逐段告警，要重算得重跑哨兵，不能靠正文重建。
+        if row.type not in REBUILDABLE_FACT_TYPES:
+            continue
+        db.delete(row)
+        deleted += 1
+    db.flush()
+
+    n_new = n_upd = n_upserted = 0
+    for segment_no, text in pairs:
+        if not text.strip():
+            continue
+        result, _ = extract_from_text(text, segment_no)
+        stats = upsert_facts(
+            db,
+            project_id,
+            facts_from_extraction(result, segment_no),
+            source=source,
+            commit=False,
+        )
+        n_new += stats["created"]
+        n_upd += stats["updated"]
+        n_upserted += stats["upserted"]
+    resolve_aliases(db, project_id, source=source, commit=False)
+
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    kept = db.scalars(
+        select(Fact).where(Fact.project_id == project_id, Fact.type == "exemption")
+    ).all()
+    return {
+        "deleted": deleted,
+        "created": n_new,
+        "updated": n_upd,
+        "upserted": n_upserted,
+        "exemptions_kept": len(kept),
+    }
 
 
 def get_facts(
@@ -382,11 +468,16 @@ def plan_alias_merges(char_facts: list[dict], source: str = "generated") -> dict
     return {"auto": auto, "review": review}
 
 
-def apply_merges(db, project_id: int, merges: list[dict], source: str = "generated") -> dict:
+def apply_merges(
+    db, project_id: int, merges: list[dict], source: str = "generated", *,
+    commit: bool = True,
+) -> dict:
     """应用合并：账本记别名 + 图谱按规范名改写（重指向边、去重、删被吸收节点）。
 
     图谱改写是「实体分裂」的真正修复动作：不这么做的话，别名只活在账本里，
     `get_reminders` 仍会把同一人的两个名字当成两个不同的锁定角色注入提示词。
+
+    `commit=False` 时只 flush——供重建原语把整段重建收进一个事务（批 9 前置）。
     """
     if not merges:
         return {"merged": 0, "nodes_removed": 0, "edges_dropped": 0}
@@ -553,7 +644,7 @@ def apply_merges(db, project_id: int, merges: list[dict], source: str = "generat
                 db.add(fresh)
                 by_key[new_key] = fresh
 
-    db.commit()
+    db.commit() if commit else db.flush()
     return {
         "merged": n_merged,
         "nodes_removed": n_removed,
@@ -561,7 +652,9 @@ def apply_merges(db, project_id: int, merges: list[dict], source: str = "generat
     }
 
 
-def resolve_aliases(db, project_id: int, source: str = "generated") -> dict:
+def resolve_aliases(
+    db, project_id: int, source: str = "generated", *, commit: bool = True
+) -> dict:
     """一步到位：读账本 → 规划 → 应用自动档。返回统计与待裁决提案。
 
     待裁决项**不写库、不改图**，原样返回给调用方展示——自动档之外一律不动，
@@ -569,7 +662,7 @@ def resolve_aliases(db, project_id: int, source: str = "generated") -> dict:
     """
     chars = get_facts(db, project_id, type_=T_CHARACTER, source=source)
     plan = plan_alias_merges(chars, source=source)
-    stats = apply_merges(db, project_id, plan["auto"], source=source)
+    stats = apply_merges(db, project_id, plan["auto"], source=source, commit=commit)
     return {
         "auto": plan["auto"],
         "review": plan["review"],

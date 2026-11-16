@@ -23,7 +23,26 @@ def upload(
     drop_foreign_blocks: bool = Form(False),
     db: Session = Depends(get_db),
 ) -> dict:
-    data = file.file.read()
+    # 已关闭：文本一律交给助理 agent —— 直传这条路**绕过整条流程**
+    # （文本直接入库，不经清洗预览、不经抽检审核、不经蒸馏与审查）。
+    raise HTTPException(
+        status_code=409,
+        detail={
+            'status': 'text_submission_moved_to_assistant',
+            'message': '文本提交已统一到助理 agent：请在助理页上传附件，'
+                       'agent 会带它走清洗、抽检、蒸馏、审查的完整流程。',
+            'assistant_endpoint': '/api/assistant/attachments',
+        },
+    )
+
+
+def _upload_legacy(
+    file: UploadFile = File(...),
+    drop_foreign_blocks: bool = Form(False),
+    db: Session = Depends(get_db),
+) -> dict:
+    # 旧实现（保留供参考，不再挂路由）：直传入库，绕过清洗与抽检。
+    data = file.file.read(settings.upload_max_bytes + 1)
     if len(data) > settings.upload_max_bytes:
         raise HTTPException(
             status_code=413,

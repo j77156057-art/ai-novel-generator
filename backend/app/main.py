@@ -25,6 +25,8 @@ from app.routers import assistant_probe as assistant_probe_router
 from app.routers import kg_v3 as kg_v3_router
 from app.routers import digest as digest_router
 from app.routers import roleplay as roleplay_router
+from app.routers import assistant_action_proposals as assistant_action_proposals_router
+from app.routers import assistant_attachments as assistant_attachments_router
 
 
 @asynccontextmanager
@@ -151,6 +153,10 @@ app.include_router(assistant_probe_router.router)
 app.include_router(digest_router.router)
 # 角色扮演：一问一答 + 角色名册 + 证据（批 8）。
 app.include_router(roleplay_router.router)
+# 助理动作提案审批（批 9）：/api/assistant/action-proposals/*。
+app.include_router(assistant_action_proposals_router.router)
+# 助理附件：/api/assistant/attachments/*（上传解析后交给附件对话）。
+app.include_router(assistant_attachments_router.router)
 
 
 @app.get("/health")

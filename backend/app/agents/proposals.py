@@ -560,11 +560,21 @@ def read_target(db: Any, project_id: int, target_kind: str,
 
 
 def write_target(db: Any, project_id: int, target_kind: str, target_id: str,
-                 new_content: str) -> None:
+                 new_content: str, repair_context: dict[str, Any] | None = None) -> None:
     """把新内容写入目标（**不 commit** —— 事务边界由调用方掌握）。
 
-    只改一列，不碰其它字段：写 `generations.text` 不会顺手覆盖 summary，
-    写 `plot_bible` 不会动 title / outline。提案的爆炸半径就是 patch 说清的那一处。
+    只改目标那一列，不顺手覆盖别的字段：写 `generations.text` 不会动
+    title / outline，写 `plot_bible` 不动正文。
+
+    **例外（改正文才有的连锁）**：正文变了，它的摘要、项目摘要树就都过期了；
+    派生 KG / 事实必须重建（`derived_state=pending_rebuild`），
+    在重建完成前必须挡住生成（`body_revision_requires_review`）。
+    不写这个守卫的话，「改了正文 → 派生状态待重建」这条链根本不会启动 ——
+    实测踩过：重建入口永远回 `rebuild_requires_body_revision`。
+
+    `repair_context`：受控修复的全局验收义务（`global_acceptance_state`）。
+    传入时把未解决义务**重新绑定**到新正文哈希，写进 `plot_timeline['pending_acceptance']`——
+    义务不删除、不缩小，只是换了它所针对的正文版本。
     """
     if target_kind == "generation_text":
         from app.models import Generation
@@ -574,6 +584,48 @@ def write_target(db: Any, project_id: int, target_kind: str, target_id: str,
         if gen is None or int(gen.project_id) != int(project_id):
             raise TargetMissing(f"generations.id={target_id} 不存在或不属于本项目")
         gen.text = new_content
+        gen.summary = None
+        from app.models import Project
+
+        project = db.get(Project, project_id)
+        if project is not None:
+            project.summary = None
+            project.summary_tree = None
+            timeline = dict(project.plot_timeline or {})
+            new_hash = content_hash(new_content)
+            timeline.update(
+                completion={}, done=[], last_judged_segment=0,
+                body_revision_requires_review={
+                    'generation_id': gen.id, 'segment_no': gen.segment_no,
+                    'content_hash': new_hash,
+                },
+            )
+            timeline.pop('derived_rebuild', None)
+            timeline['derived_state'] = {
+                'kg': 'pending_rebuild', 'facts': 'pending_rebuild',
+                'changed_generation_id': gen.id, 'body_hash': new_hash,
+            }
+            if repair_context:
+                from app.agents.body_acceptance import (
+                    body_fingerprint,
+                    merge_pending_acceptance,
+                )
+                pending = merge_pending_acceptance(
+                    timeline.get('pending_acceptance'),
+                    repair_context.get('global_acceptance_state'),
+                    bound_body_hash=new_hash)
+                # 验收义务绑定的是**正文指纹**（不含冻结契约）——与整段验收用的是同一把尺。
+                rows = db.query(Generation).filter_by(project_id=project_id) \
+                           .order_by(Generation.segment_no, Generation.id).all()
+                pending['bound_body_hash'] = body_fingerprint(list(rows))
+                pending['diagnostic_run_id'] = (repair_context.get('diagnostic_run_id')
+                                                or pending.get('diagnostic_run_id'))
+                timeline['pending_acceptance'] = pending
+                timeline['body_revision_requires_review']['pending_acceptance'] = {
+                    'unresolved_count': len(pending['unresolved']),
+                    'bound_body_hash': pending['bound_body_hash'],
+                    'diagnostic_run_id': repair_context.get('diagnostic_run_id')}
+            project.plot_timeline = timeline
         return
 
     if target_kind == "project_plot_bible":

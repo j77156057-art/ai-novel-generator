@@ -501,6 +501,72 @@ def rebuild_generated_kg(
         }
 
 
+def rebuild_generated_graph(db, project_id: int, segments, *, commit: bool = True) -> dict:
+    """按**当前分支的正文段**全量重建生成侧图谱（source='generated'）。
+
+    `segments`：`[(segment_no, text), ...]`。
+
+    与 `rebuild_generated_kg` 的分工：那条路从 `Generation` 行取正文（库里有哪些段就重建哪些），
+    这条路吃**调用方给的段列表**（来自时间线/快照的当前分支，可能还没落 Generation），
+    是 `agents/derived_rebuild.py` 的重建原语之一。两条路都逐段抽取，章节号 = 段号。
+
+    只清 `source='generated'` 的图，参考语料图（`novel:{id}`）不受影响。
+    `commit=False` 时只 flush——供 derived_rebuild 把整段重建收进一个事务（批 9 前置）。
+    """
+    pairs = _segment_pairs(segments)
+    _clear_graph_by_source(db, project_id, "generated")
+    for segment_no, text in pairs:
+        if not text.strip():
+            continue
+        result, _ = extract_from_text(text, segment_no)
+        merge_result_into_graph(
+            db, project_id, result, "generated", segment_no, commit=False
+        )
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+
+    nodes = db.scalars(
+        select(KgNode).where(KgNode.project_id == project_id, KgNode.source == "generated")
+    ).all()
+    node_ids = [n.id for n in nodes]
+    edges = (
+        db.scalars(
+            select(KgEdge).where(
+                (KgEdge.from_id.in_(node_ids)) & (KgEdge.to_id.in_(node_ids))
+            )
+        ).all()
+        if node_ids
+        else []
+    )
+    return {
+        "project_id": project_id,
+        "source": "generated",
+        "characters": sum(1 for n in nodes if n.type == "character"),
+        "plotholes": sum(1 for n in nodes if n.type == "plothole"),
+        "relationships": len(edges),
+        "segments": len(pairs),
+    }
+
+
+def _segment_pairs(segments) -> list[tuple[int, str]]:
+    """校验正文段列表形状：必须是 `(int 段号, str 正文)` 的序列。"""
+    if segments is None or not isinstance(segments, (list, tuple)):
+        raise ValueError("segments_required")
+    pairs: list[tuple[int, str]] = []
+    for item in segments:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("invalid_segments")
+        segment_no, text = item
+        if isinstance(segment_no, bool) or not isinstance(segment_no, int):
+            raise ValueError("invalid_segments")
+        if not isinstance(text, str):
+            raise ValueError("invalid_segments")
+        pairs.append((segment_no, text))
+    return pairs
+
+
 def _hole_detection_key(props: dict) -> str:
     """取坑节点的「结算检测键」；取不到可用值返回空串（调用方跳过该坑）。
 
@@ -522,7 +588,7 @@ def _hole_detection_key(props: dict) -> str:
 
 def merge_result_into_graph(
     db, project_id: int, result, source: str = "generated", segment_no: int = 1,
-    text: str = "",
+    text: str = "", *, commit: bool = True,
 ) -> dict:
     """把已抽取好的结果写进图谱（增量 upsert，不清空）。
 
@@ -666,7 +732,7 @@ def merge_result_into_graph(
         )
         n_new_rel += 1
 
-    db.commit()
+    db.commit() if commit else db.flush()
     return {
         "merged": True,
         "project_id": project_id,

@@ -80,6 +80,23 @@ def _resolve_novel_ids(proj: Project, override: list[int] | None) -> list[int]:
     return list(proj.reference_novel_ids or [])
 
 
+def _require_workflow_ready(db: Session, proj: Project) -> None:
+    """生成前的**工序链闸门**：流程没过就别生成（别绕过流程）。
+
+    拦的是具体缺口（不是「项目没资料」那种自由生成）：
+
+    - 有待批的写回建议 → 正文要改完才能继续生成；
+    - 文风档案没真进到提示词里（提示词体检有 error）→ 生成出来也是白写。
+
+    自由生成（没选参考语料、没有文风档案）一律放行 ——
+    闸门拦的是「流程没走完」，不是「用户没准备」。
+    """
+    from app.agents.workflow import generation_block
+    block = generation_block(db, proj)
+    if block:
+        raise HTTPException(status_code=409, detail=block)
+
+
 def _chapter_plan(
     db: Session, proj: Project, raw: str | None, *, allow_existing: bool = False
 ) -> dict:
@@ -106,6 +123,7 @@ def _to_generation_out(gen: Generation) -> dict:
 @router.post("/generate")
 def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
     proj = _require_project(db, body.project_id)
+    _require_workflow_ready(db, proj)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
     # 章号：入参优先，缺省推导；冲突/越界在调模型前就 400（不烧额度）
     plan = _chapter_plan(db, proj, body.chapter_range)
@@ -142,6 +160,7 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
     依赖注入的 session（SQLAlchemy Session 非线程安全）。
     """
     proj = _require_project(db, body.project_id)
+    _require_workflow_ready(db, proj)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
     plan = _chapter_plan(db, proj, body.chapter_range)
 
@@ -223,6 +242,7 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
 @router.post("/generate-loop")
 def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)) -> dict:
     proj = _require_project(db, body.project_id)
+    _require_workflow_ready(db, proj)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
     # 逐段章标签：一次解析完整段（区间入参按段展开），引擎只收标签不推导章号
     try:

@@ -673,3 +673,32 @@ def prompts_versions(project_id: int, db: Session = Depends(get_db)) -> dict:
         "count": len(rows),
         "overrides": rows,
     }
+
+
+class DerivedRebuildRequest(StrictRequest):
+    project_id: int
+    base_fingerprint: str
+    action: Literal['rebuild', 'unlock']
+
+
+@router.post('/derived-rebuilds')
+def rebuild_project_derived(req: DerivedRebuildRequest, db: Session = Depends(get_db)):
+    """`rebuild`：重建摘要/completion/KG/事实，**不**解除生成守卫。
+
+    `unlock`：仅当重建全部成功且回读通过后，才解除守卫放行生成。
+    """
+    from app.agents.derived_rebuild import rebuild_derived, unlock_generation
+    try:
+        if req.action == 'unlock':
+            return unlock_generation(db, req.project_id, base_fingerprint=req.base_fingerprint)
+        return rebuild_derived(db, req.project_id, base_fingerprint=req.base_fingerprint)
+    except PermissionError as exc:
+        raise HTTPException(403, detail=str(exc)) from exc
+    except ValueError as exc:
+        code = str(exc)
+        if code == 'project_not_found':
+            raise HTTPException(404, detail=code) from exc
+        # unlock 的每一个失败码都表示「还没准备好」，不是「请求写错了」。
+        if req.action == 'unlock' or code.startswith('stale'):
+            raise HTTPException(409, detail=code) from exc
+        raise HTTPException(422, detail=code) from exc

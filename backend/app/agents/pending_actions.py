@@ -55,21 +55,34 @@ from typing import Any, Callable, Mapping
 # ====================================================================
 
 #: 卡片 `kind` 的合法取值。前端按此分派渲染；新增类型必须同时补端点表。
-PENDING_ACTION_KINDS: tuple[str, ...] = ("proposal", "invoke_generation")
+#:
+#: `choice`（选择框）由决策点注册表 `app.agents.decision_points` 直接构造，
+#: 端点由决策点自己给出，所以它不在下面的 kind→端点表里 —— 端点仍然只由
+#: 服务端给出，前端不参与构造。
+PENDING_ACTION_KINDS: tuple[str, ...] = (
+    "proposal", "invoke_generation", "ingest_attachment", "choice",
+    "action_proposal",
+)
 
 #: kind → 用户确认后前端实际调用的端点。
 #:
 #: 唯一真源。卡片里的 `endpoint` 只能从这里取，不接受调用方传入——
 #: 否则「agent 说要提案、前端打到 /invoke-generation」这类漂移无从发现。
 _ENDPOINT_BY_KIND: Mapping[str, str] = {
+    "ingest_attachment": "/api/assistant/attachments/ingest",
     "proposal": "/api/assistant/proposals",
     "invoke_generation": "/api/assistant/invoke-generation",
+    # 动作提案：确认后**创建**一条待批的动作提案行（不是执行它）——
+    # 执行仍然是人再点一次「批准 / 执行」之后的事。
+    "action_proposal": "/api/assistant/action-proposals",
 }
 
-#: kind → HTTP 方法。本轮两类都是 POST（都创建新资源，不改既有资源）。
+#: kind → HTTP 方法。各类都是 POST（都创建新资源，不改既有资源）。
 _METHOD_BY_KIND: Mapping[str, str] = {
+    "ingest_attachment": "POST",
     "proposal": "POST",
     "invoke_generation": "POST",
+    "action_proposal": "POST",
 }
 
 
@@ -256,6 +269,152 @@ def extract_segment_no(query: str) -> int | None:
         if value is not None:
             found.append(value)
     return min(found) if found else None
+
+
+def collect_text_edit_cards(tool_results: Mapping[str, Any] | None,
+                            project_id: int) -> list[dict[str, Any]]:
+    """从工具结果里把「改写」卡收进对话流（只收**可信**的那些）。
+
+    与 `collect_body_repair_cards` 同一套口径：只认产出改写卡的工具
+    （`propose_text_edit` / `propose_text_fix` —— 两者都只**构造**卡，不落库）、
+    端点必须是提案创建端点、body 里的 project_id 必须是本项目
+    —— 跨项目的卡一律不收（提一张必然失败的卡 = 骗用户点一次）。
+
+    ## 为什么按「工具名前缀」收而不是写死一个名字
+
+    起草改写的工具有两个（自己起草 / 按规则修标点），它们产出的是**同一种卡**。
+    写死名字的话，agent 换用另一个工具，这张卡就**静默丢了** ——
+    实测踩过：agent 调了 `propose_text_fix`，卡生成了，用户却什么也没看见
+    （对话里说「请在待确认卡中确认」，而界面上没有卡）。
+    """
+    cards: list[dict[str, Any]] = []
+    for key, value in (tool_results or {}).items():
+        name = str(key).split(':', 1)[0]
+        if not name.startswith('propose_') or not isinstance(value, dict):
+            continue
+        action = value.get('pending_action')
+        if (isinstance(action, dict) and action.get('kind') == 'proposal'
+                and action.get('endpoint') == '/api/assistant/proposals'
+                and action.get('method') == 'POST'
+                and (action.get('body') or {}).get('project_id') == project_id):
+            cards.append(action)
+    return cards
+
+
+def build_text_edit_proposal_action(
+    *,
+    project_id: int,
+    proposal_type: str,
+    target_kind: str,
+    target_id: str,
+    draft: str,
+    reason: str = "",
+    risk_level: str | None = None,
+    from_issue: str | None = None,
+    evidence: list[Mapping[str, Any]] | None = None,
+    target_chars: int = 0,
+) -> dict[str, Any]:
+    """组装一张「改写」待确认卡（**不落库**），带一份**可编辑的草稿**。
+
+    ## 为什么有草稿
+
+    提案的 `after_text` **必须由用户填写** —— 服务端替用户写新正文就是越权。
+    但 agent 能起草「改哪儿、改成什么」的大致样子，把它给用户当**草稿**，
+    用户在卡上改或原样确认 —— 落库的是**用户确认时看到的那一版**，不是 agent 的原版。
+
+    `detail.draft_field` 告诉前端「body 里哪个字段是可编辑的草稿」——
+    前端只覆盖**用户输入的那一个字段**，协议字段仍由服务端下发。
+    """
+    if not (draft or "").strip():
+        raise ValueError('草稿不能为空：改写提案要说明改成什么')
+    body: dict[str, Any] = {
+        "project_id": int(project_id),
+        "type": str(proposal_type),
+        "target_kind": str(target_kind),
+        "target_id": str(target_id),
+        "after_text": str(draft),
+        "reason": str(reason or ""),
+    }
+    if risk_level:
+        body["risk_level"] = str(risk_level)
+    if from_issue:
+        # 关联的诊断结论：服务端已经按 issue id 取好了建议与证据，
+        # 这里只把引用带上（写路径会用它再核一遍）。
+        body["from_issue"] = str(from_issue)
+    if evidence:
+        body["evidence"] = [dict(e) for e in evidence]
+    return build_pending_action(
+        kind="proposal",
+        title="改写一段内容（草稿可以先改）",
+        detail={
+            "type": str(proposal_type),
+            "target_kind": str(target_kind),
+            "target_id": str(target_id),
+            "draft_field": "after_text",
+            "draft_editable": True,
+            "draft_notice": "这是助手的草稿，可以直接改；确认后才会存成待批提案。",
+            "requires_confirmation": True,
+            "from_issue": str(from_issue) if from_issue else "",
+            # 原文多长：用户要能一眼看出「这一改是不是把大半段删了」。
+            "target_chars": int(target_chars or 0),
+        },
+        body=body,
+    )
+
+
+def build_action_proposal_action(
+    *,
+    project_id: int,
+    kind: str,
+    title: str,
+    detail: Mapping[str, Any] | None = None,
+    action_endpoint: str,
+    action_method: str = "POST",
+    action_body: Mapping[str, Any] | None = None,
+    params: Mapping[str, Any] | None = None,
+    risk_level: str = "low",
+    options: list[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """组装一张「动作提案」待确认卡（**不落库**）。
+
+    这张卡的语义是「要不要提这个动作」：用户点确认 → 前端把 body 原样发给
+    `/api/assistant/action-proposals` → 服务端**创建**一条 pending 的动作提案行。
+    执行那个动作是**再点一次**的事（批准 → 执行），仍然不合成一键。
+
+    为什么要「提」和「做」分成两次点击：审批是人的判断，执行是系统的动作；
+    合成一次就取消了「先看清楚要做什么再决定」这一步。
+
+    `options`：**需要用户决断的参数**（蒸馏用哪一档…）做成选项，跟这张卡
+    合在一起而不是弹两张卡 —— 两张卡要人来对应，顺序一错就批错动作。
+    每个选项的 `body_patch` 必须是**嵌好的**（作用在请求体的哪个位置由服务端
+    决定），前端只做「合并 + 发送」，不参与构造。
+    """
+    body = {
+        "project_id": int(project_id),
+        "kind": str(kind),
+        "title": str(title),
+        "detail": dict(detail or {}),
+        "action_endpoint": str(action_endpoint),
+        "action_method": str(action_method),
+        "action_body": dict(action_body or {}),
+        "params": dict(params or {}),
+        "risk_level": str(risk_level),
+    }
+    card_detail: dict[str, Any] = {
+        "action_kind": kind,
+        "risk_level": risk_level,
+        "action_endpoint": action_endpoint,
+        "requires_confirmation": True,
+        **dict(detail or {}),
+    }
+    if options:
+        card_detail["options"] = [dict(o) for o in options]
+    return build_pending_action(
+        kind="action_proposal",
+        title=title,
+        detail=card_detail,
+        body=body,
+    )
 
 
 def propose_invoke_generation(

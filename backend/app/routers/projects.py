@@ -2198,3 +2198,56 @@ def repair_style_narrative(
         payload["audit"] = {"issues": [], "errors": 0, "warnings": 0,
                             "error": f"体检没跑成：{type(exc).__name__}"}
     return payload
+
+
+# ====================================================================
+# 工序链（批 9）：状态随时重新评估 + 推进留痕
+# ====================================================================
+
+
+class WorkflowLogRequest(BaseModel):
+    """POST /api/projects/{id}/workflow/log 请求体。"""
+
+    step_id: str
+    action: str
+    detail: str = ""
+    proposal_id: int | None = None
+
+
+@router.get("/{project_id}/workflow")
+def get_workflow(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """工序链状态：助理 agent 现在到哪一步、该做什么、卡在哪儿。
+
+    状态是**每次重新评估**出来的（查库 + 跑只读规则），不是日志里的一句话 ——
+    正文改过、蒸馏重跑过、提案批了，状态都会跟着变。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.agents.workflow import get_or_create_run, state_to_dict
+
+    run = get_or_create_run(db, proj)
+    return state_to_dict(db, proj, run)
+
+
+@router.post("/{project_id}/workflow/log")
+def log_workflow(
+    project_id: int,
+    body: WorkflowLogRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """记一笔工序推进（agent 做完一步读工序、或提出了一条待批提案时调用）。
+
+    **它不执行任何写操作** —— 写动作一律走 proposal 审批闸门；
+    这里只留痕，好让「走到哪一步」可追溯、可断点续跑。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    from app.agents.workflow import STEP_BY_ID, record, state_to_dict
+
+    if body.step_id not in STEP_BY_ID:
+        raise HTTPException(status_code=422, detail=f"未知工序：{body.step_id}")
+    run = record(db, proj, step_id=body.step_id, action=body.action,
+                 detail=body.detail, proposal_id=body.proposal_id)
+    return state_to_dict(db, proj, run)

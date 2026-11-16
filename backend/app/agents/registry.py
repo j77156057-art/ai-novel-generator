@@ -101,6 +101,15 @@ ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
     # 操作」，让助手自己判断能不能做、该在哪做。目录本体在
     # `app.agents.action_catalog`，本工具只读它、不执行任何操作。
     "list_actions",
+    # 工序链 / 提案卡（批 9）：状态只读；四个 propose_* 与 record_workflow_step
+    # **只构造待确认卡 / 只写工序链自己的留痕账**，不写正文、语料、档案。
+    # 真正的写动作仍全部由 `/api/assistant/action-proposals` 的审批闸门掌管
+    # —— 这条边界不能为了方便破例（写工具依然进不了这张表）。
+    "get_workflow_state",
+    "record_workflow_step",
+    "propose_action",
+    "propose_text_edit",
+    "propose_text_fix",
 )
 
 
@@ -1000,6 +1009,266 @@ def _impl_list_actions(*, db: Any, project_id: int,
 
 
 # ====================================================================
+# 工序链 / 提案卡工具（批 9）
+# ====================================================================
+#
+# 这五个工具**都不写业务数据**：四个只构造待确认卡（卡由前端展示，用户点了
+# 确认才会创建提案行），一个只读工序状态，一个只写工序链自己的留痕账。
+# 写动作仍然全部由 `/api/assistant/action-proposals` 的审批闸门掌管。
+
+
+def _impl_get_workflow_state(*, db: Any, project_id: int) -> dict:
+    """工序链状态：agent 用它判断「现在到哪一步、该做什么」。
+
+    **只读**：不建行、不写库 —— 工序状态是每次**重新评估**出来的
+    （查库 + 跑既有只读规则），不是日志里的一句话。
+    """
+    from app.agents.workflow import evaluate
+    from app.models import Project
+
+    project = db.get(Project, project_id)
+    if project is None:
+        return {"found": False, "note": f"项目 {project_id} 不存在"}
+    state = evaluate(db, project)
+    return {
+        "found": True,
+        "status": state["status"],
+        "current_step": state["current_step"],
+        "summary": state["summary"],
+        "gates": state["gates"],
+        "steps": [
+            {"id": s["id"], "title": s["title"], "state": s["state"],
+             "reason": s["reason"], "read_tools": s["read_tools"],
+             "write_proposal": s["write_proposal"],
+             "write_actions": s.get("write_actions") or []}
+            for s in state["steps"]
+        ],
+    }
+
+
+def _impl_record_workflow_step(*, db: Any, project_id: int, step_id: str,
+                               action: str, detail: str = "",
+                               proposal_id: int | None = None) -> dict:
+    """记一笔工序推进（派发留痕）：只写工序链自己的账，不动业务数据。
+
+    它**不能**宣布工序完成 —— 工序状态是重新评估出来的。
+    """
+    from app.agents.workflow import STEP_BY_ID, record, state_to_dict
+    from app.models import Project
+
+    project = db.get(Project, project_id)
+    if project is None:
+        return {"ok": False, "note": f"项目 {project_id} 不存在"}
+    if step_id not in STEP_BY_ID:
+        return {"ok": False, "note": f"未知工序：{step_id}",
+                "known": sorted(STEP_BY_ID)}
+    run = record(db, project, step_id=step_id, action=action, detail=detail,
+                 proposal_id=proposal_id)
+    return {"ok": True, "workflow": state_to_dict(db, project, run)}
+
+
+def _impl_propose_action(*, db: Any, project_id: int, kind: str, title: str,
+                         detail: dict | None = None, tier: str | None = None,
+                         outline: list | None = None, count: int | None = None,
+                         instruction: str | None = None,
+                         risk_level: str = "low",
+                         diagnostic_run_id: int | None = None,
+                         generation_id: int | None = None,
+                         start: int | None = None, end: int | None = None,
+                         objective: str | None = None,
+                         preserve_source_ids: list | None = None,
+                         conflict_source_id: str | None = None) -> dict:
+    """构造一张「动作提案」待确认卡（**只构造，不落库**）。
+
+    两条纪律：
+    1. **只能提当前这一步允许的动作类型**（工序链的 `STEP_WRITE_KINDS`）——
+       agent 不自己发明动作；端点与请求体由服务端按 kind 拼。
+    2. **只构造卡**：本工具不写库、不执行。
+    """
+    from app.agents.action_proposals import ACTION_ENDPOINTS, build_action_body
+    from app.agents.pending_actions import build_action_proposal_action
+    from app.agents.workflow import STEP_WRITE_KINDS, evaluate
+    from app.models import Project
+
+    project = db.get(Project, project_id)
+    if project is None:
+        return {"ok": False, "note": f"项目 {project_id} 不存在"}
+    state = evaluate(db, project)
+    current = state.get("current_step") or ""
+    allowed = STEP_WRITE_KINDS.get(current, ())
+    if kind not in allowed:
+        return {
+            "ok": False,
+            "current_step": current,
+            "note": (f"当前这一步「{current}」不能提 {kind!r} 动作；"
+                     f"这里能提的是：{list(allowed) or '无（这一步没有可提的动作）'}"),
+        }
+    try:
+        repair = None
+        if kind == "apply_body_repair":
+            repair = {
+                "diagnostic_run_id": diagnostic_run_id,
+                "generation_id": generation_id,
+                "start": start,
+                "end": end,
+                "objective": objective,
+                "preserve_source_ids": list(preserve_source_ids or []),
+                "conflict_source_id": conflict_source_id,
+            }
+        body = build_action_body(kind, project_id, tier=tier, outline=outline,
+                                 count=count, instruction=instruction,
+                                 db=db, project=project, repair=repair)
+    except Exception as exc:  # noqa: BLE001 —— 提卡失败要说清原因，不抛给整次问答
+        return {"ok": False, "note": str(exc)}
+    endpoint = ACTION_ENDPOINTS[kind].format(project_id=project_id)
+    question, options = _action_options(kind, body)
+    card_detail = dict(detail or {})
+    if question:
+        card_detail["question"] = question
+    card = build_action_proposal_action(
+        project_id=project_id, kind=kind, title=title, detail=card_detail,
+        action_endpoint=endpoint, action_body=body, risk_level=risk_level,
+        options=options)
+    return {
+        "ok": True,
+        "current_step": current,
+        "pending_action": card,
+        "note": "已构造待确认卡；用户点确认后才会创建提案行，批准并执行后才会真的发生。",
+    }
+
+
+def _action_options(kind: str, action_body: dict[str, Any]
+                    ) -> tuple[str, list[dict[str, Any]]]:
+    """某类动作里**需要用户决断**的参数 →（问题，选项）；补丁已嵌好。
+
+    只有「蒸馏档位」这一处：档位直接决定提炼多少语料（几十分钟 vs 几小时），
+    猜错的代价远大于多问一句 —— 既有决策点注册表里已经有它，选项与端点
+    都从那儿来，不在这里另造一套。
+
+    补丁里放的是**完整**的动作体：前端做的是浅合并，只放增量会把动作体里
+    其它字段一起换掉。
+    """
+    if kind != "start_distill":
+        return "", []
+    from app.agents.decision_points import DISTILL_TIER
+
+    out: list[dict[str, Any]] = []
+    for option in DISTILL_TIER.options:
+        out.append({
+            "id": option.id,
+            "label": option.label,
+            "description": option.description,
+            "body_patch": {"action_body": {**action_body, **dict(option.body_patch)}},
+        })
+    return DISTILL_TIER.question, out
+
+
+def _impl_propose_text_edit(*, db: Any, project_id: int, type: str,
+                            target_kind: str, target_id: str, draft: str,
+                            reason: str = "",
+                            risk_level: str | None = None,
+                            from_issue: str | None = None) -> dict:
+    """起草一处**改写**，构造待确认卡（**只构造，不落库**）。
+
+    红线：提案的 `after_text` 必须由用户填写 —— 服务端替用户写新正文就是越权。
+    所以这里给的是**草稿**：用户在卡上改或原样确认，落库的是他确认的那一版。
+
+    「改正文某段」是**整段替换**：草稿明显短于原文就拒绝（模型常常只读了
+    前半段就起草，真落库会静默删掉后半段）。
+    """
+    from app.agents.pending_actions import build_text_edit_proposal_action
+    from app.models import Project
+
+    project = db.get(Project, project_id)
+    if project is None:
+        return {"ok": False, "note": f"项目 {project_id} 不存在"}
+    evidence: list[dict] = []
+    if from_issue:
+        from app.routers.assistant_proposals import _collect_issue_material
+
+        try:
+            issue_reason, issue_evidence = _collect_issue_material(
+                db, project, from_issue)
+        except Exception as exc:  # noqa: BLE001 —— issue 找不到就说清，不静默丢证据
+            return {"ok": False, "note": f"诊断 issue {from_issue!r} 取不到：{exc}"}
+        if not reason:
+            reason = issue_reason
+        evidence = list(issue_evidence)
+    target_chars = 0
+    if type == "text_edit" and target_kind == "generation_text":
+        from app.models import Generation
+
+        try:
+            gen = db.get(Generation, int(target_id))
+        except (TypeError, ValueError):
+            gen = None
+        if gen is not None and (gen.text or "").strip():
+            original = gen.text or ""
+            target_chars = len(original)
+            ratio = len(draft) / max(len(original), 1)
+            if ratio < TEXT_EDIT_MIN_RATIO:
+                return {
+                    "ok": False,
+                    "note": (
+                        f"草稿只有原文的 {ratio:.0%}（{len(draft)} / {target_chars} 字）—— "
+                        "这看起来是**没读完整段就起草**的。改正文某段 = 整段替换，"
+                        "草稿必须是这一段的完整新正文；"
+                        "请先用 read_generation_segments 读全这一段再起草。"
+                    ),
+                }
+    try:
+        card = build_text_edit_proposal_action(
+            project_id=project_id, proposal_type=type, target_kind=target_kind,
+            target_id=target_id, draft=draft, reason=reason,
+            risk_level=risk_level, from_issue=from_issue, evidence=evidence or None,
+            target_chars=target_chars)
+    except Exception as exc:  # noqa: BLE001 —— 提卡失败要说清原因
+        return {"ok": False, "note": str(exc)}
+    return {
+        "ok": True,
+        "pending_action": card,
+        "note": "已构造待确认卡；用户确认（或先改草稿再确认）后才会存成待批提案。",
+    }
+
+
+def _impl_propose_text_fix(*, db: Any, project_id: int,
+                           generation_id: int) -> dict:
+    """把某段的**标点事故**改对，构造待确认卡（**只构造，不落库**）。
+
+    修法是机械唯一的（半角→全角、重复标点收成一个），所以由规则算出
+    「改后应该长什么样」，模型只负责**提出**。
+    """
+    from app.agents.pending_actions import build_text_edit_proposal_action
+    from app.agents.text_quality import suggest_punctuation_fixes
+    from app.models import Project
+
+    project = db.get(Project, project_id)
+    if project is None:
+        return {"ok": False, "note": f"项目 {project_id} 不存在"}
+    fixes = suggest_punctuation_fixes(db, project)
+    target = next((f for f in fixes if int(f['generation_id']) == int(generation_id)), None)
+    if target is None:
+        return {
+            "ok": False,
+            "note": ("这一段没有可自动修正的标点问题"
+                     "（外来英文词要人来判断，机器不替人改）"),
+        }
+    card = build_text_edit_proposal_action(
+        project_id=project_id, proposal_type='text_edit',
+        target_kind='generation_text', target_id=str(generation_id),
+        draft=target['after'],
+        reason=f"标点修正：第 {target['segment_no']} 段有 {target['changes']} 处标点事故"
+               "（半角换全角 / 重复标点收成一个）",
+    )
+    return {
+        "ok": True,
+        "pending_action": card,
+        "changes": target['changes'],
+        "note": "已构造待确认卡；用户在卡上确认（或再改）后才会存成待批提案。",
+    }
+
+
+# ====================================================================
 # 模型可见工具的参数 schema
 # ====================================================================
 #
@@ -1078,7 +1347,78 @@ _MODEL_TOOL_PARAMETERS: dict[str, dict] = {
             "segment_no": {"type": "integer", "minimum": 1},
         }
     ),
+    # —— 批 9：工序链 / 提案卡（都只构造卡或只读，不写业务数据）——
+    "get_workflow_state": _obj(),
+    "record_workflow_step": _obj(
+        {
+            "step_id": {"type": "string"},
+            "action": {"type": "string"},
+            "detail": {"type": "string"},
+            "proposal_id": {"type": "integer"},
+        },
+        ["step_id", "action"],
+    ),
+    "propose_action": _obj(
+        {
+            "kind": {
+                "type": "string",
+                "enum": ["start_distill", "plan_outline", "extend_plan",
+                         "invoke_generation", "close_acceptance",
+                         "apply_body_repair", "derived_rebuild",
+                         "unlock_generation"],
+                "description": "要做的动作。只能提当前这一步允许的那几种。",
+            },
+            "title": {"type": "string",
+                      "description": "一句话说清要做什么（人靠它判断要不要批）"},
+            "detail": {"type": "object",
+                       "description": "补充说明（人话）：为什么现在要做这件事"},
+            "tier": {"type": "string", "enum": ["full", "balanced", "fast"],
+                     "description": "start_distill 用：蒸馏档位"},
+            "outline": {"type": "array", "items": {"type": "string"},
+                        "description": "plan_outline 用：剧情大纲，每条一个剧情点"},
+            "count": {"type": "integer", "minimum": 1,
+                      "description": "extend_plan 用：追加几个剧情点"},
+            "instruction": {"type": "string",
+                            "description": "invoke_generation 用：写什么（用户原话）"},
+            "risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
+            "diagnostic_run_id": {"type": "integer"},
+            "generation_id": {"type": "integer"},
+            "start": {"type": "integer", "minimum": 0},
+            "end": {"type": "integer", "minimum": 1},
+            "objective": {"type": "string"},
+            "preserve_source_ids": {"type": "array", "items": {"type": "string"}},
+            "conflict_source_id": {"type": "string"},
+        },
+        ["kind", "title"],
+    ),
+    "propose_text_edit": _obj(
+        {
+            "type": {"type": "string",
+                     "enum": ["text_edit", "prompt_edit", "fact_resolution",
+                              "corpus_text_edit"]},
+            "target_kind": {"type": "string",
+                            "enum": ["generation_text", "project_plot_bible",
+                                     "prompt_override", "novel_chunk_text"]},
+            "target_id": {"type": "string"},
+            "draft": {"type": "string",
+                      "description": "改写后的草稿（用户会在卡上改或原样确认）"},
+            "reason": {"type": "string", "description": "为什么要改（人话）"},
+            "from_issue": {"type": "string",
+                           "description": "依据哪条诊断结论（issue id）"},
+            "risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
+        },
+        ["type", "target_kind", "target_id", "draft"],
+    ),
+    "propose_text_fix": _obj(
+        {"generation_id": {"type": "integer", "minimum": 1,
+                           "description": "要修正的正文段 id"}},
+        ["generation_id"],
+    ),
 }
+
+#: 改写草稿不得明显短于原文（「改正文某段」= 整段替换）。
+#: 低于这个比例就拒绝：模型多半只读了前半段就起草，真落库会静默删掉后半段。
+TEXT_EDIT_MIN_RATIO = 0.6
 
 
 _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
@@ -1267,6 +1607,64 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         ),
         read_only=True,
         callable=_impl_list_actions,
+    ),
+    ToolSpec(
+        name="get_workflow_state",
+        description=(
+            "工序链状态：这个项目现在到哪一步、该做什么、卡在哪儿。"
+            "每一步的判据都是查库的确定性规则（不让模型自己判断做完了没）。只读。"
+        ),
+        read_only=True,
+        callable=_impl_get_workflow_state,
+        parameters=_MODEL_TOOL_PARAMETERS["get_workflow_state"],
+    ),
+    ToolSpec(
+        name="record_workflow_step",
+        description=(
+            "记一笔工序推进（派发留痕）：把某道工序派给了谁、做了什么、"
+            "提了哪条提案写进工序链的账。只写链自己的账，不动正文/语料/档案；"
+            "也不能宣布工序完成（工序状态由重新评估得出）。"
+        ),
+        read_only=True,
+        callable=_impl_record_workflow_step,
+        parameters=_MODEL_TOOL_PARAMETERS["record_workflow_step"],
+    ),
+    ToolSpec(
+        name="propose_action",
+        description=(
+            "提出一个「动作提案」（只构造待确认卡，不落库、不执行）："
+            "启动文风蒸馏 / 规划剧情大纲 / 扩展规划 / 调动生成。"
+            "只能提**当前这一步**允许的动作（看 get_workflow_state 的 write_actions）。"
+            "用户点确认后才会创建提案行，批准并执行后才会真的发生。"
+        ),
+        read_only=True,
+        callable=_impl_propose_action,
+        parameters=_MODEL_TOOL_PARAMETERS["propose_action"],
+    ),
+    ToolSpec(
+        name="propose_text_edit",
+        description=(
+            "起草一处**改写**（只构造待确认卡，不落库）：改正文某段 / 改提示词 / "
+            "改设定 / 改语料。给的是**草稿**——用户会在卡上改或原样确认，"
+            "确认后存成待批提案（批准 → 应用后才会生效）。"
+            "**改正文某段 = 整段替换**：草稿必须是这一段的**完整新正文**，"
+            "不是补丁——先用 read_generation_segments 读全这一段再起草。"
+            "from_issue 给诊断结论的 issue id，那条结论的建议与证据由服务端带进提案。"
+        ),
+        read_only=True,
+        callable=_impl_propose_text_edit,
+        parameters=_MODEL_TOOL_PARAMETERS["propose_text_edit"],
+    ),
+    ToolSpec(
+        name="propose_text_fix",
+        description=(
+            "把某段的**标点事故**改对（只构造待确认卡，不落库）："
+            "半角标点换全角、重复标点收成一个。改法由规则算出来，"
+            "用户在卡上确认或再改，确认后才存成待批提案。"
+        ),
+        read_only=True,
+        callable=_impl_propose_text_fix,
+        parameters=_MODEL_TOOL_PARAMETERS["propose_text_fix"],
     ),
 )
 

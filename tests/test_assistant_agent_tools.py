@@ -600,7 +600,9 @@ def test_card_fields_complete_and_endpoint_derived_from_kind():
     assert proposal_card["endpoint"] == "/api/assistant/proposals"
     # 两类动作不得串端点
     assert proposal_card["endpoint"] != card["endpoint"]
-    assert set(PENDING_ACTION_KINDS) == {"proposal", "invoke_generation"}
+    assert set(PENDING_ACTION_KINDS) == {
+        "proposal", "invoke_generation", "ingest_attachment", "choice",
+        "action_proposal"}
 
 
 def test_build_pending_action_validates_inputs():

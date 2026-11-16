@@ -69,6 +69,34 @@ def body_fingerprint(rows):
     return digest({'bodies': [(g.id, g.segment_no, text_hash(g.text or '')) for g in rows]})
 
 
+def merge_pending_acceptance(old, new_state, *, bound_body_hash):
+    """把「受控修复后的验收义务」并到上一版上（批 9 前置：write_target 用它）。
+
+    合并规则：
+    - 已关闭的检查 id 取并集 —— 每一个都由独立复验**以证据**关闭，不是被删掉；
+    - 未解决义务取并集后**减去**已关闭的那些：后一次修复每次都从原诊断报告重算
+      未解决列表，不减去就会把先前已关闭的义务重新挂回去；
+    - `bound_body_hash` 换成新正文哈希 —— 验收义务从此针对**这一版正文**。
+    """
+    old = old or {}
+    new_state = new_state or {}
+    closed = set(old.get('closed_check_ids') or []) | set(new_state.get('closed_check_ids') or [])
+    unresolved = set(old.get('unresolved') or []) | set(new_state.get('unresolved') or [])
+    # 未解决清单里的检查项带 `original_check:` 前缀，关闭清单里是裸 id —— 对齐后再相减。
+    closed_entries = set(closed) | {'original_check:' + cid for cid in closed}
+    unresolved -= closed_entries
+    return {
+        'state': 'carried_forward',
+        'unresolved': sorted(unresolved),
+        'closed_check_ids': sorted(closed),
+        'acceptance': new_state.get('acceptance') or old.get('acceptance') or [],
+        'inventory_fingerprint': new_state.get('inventory_fingerprint') or old.get('inventory_fingerprint'),
+        'source_run_id': new_state.get('source_run_id') or old.get('source_run_id'),
+        'diagnostic_run_id': new_state.get('diagnostic_run_id') or old.get('diagnostic_run_id'),
+        'bound_body_hash': bound_body_hash,
+    }
+
+
 def _inventory_report(report):
     """从一条诊断报告里取出封闭清单 observation。"""
     for obs in report.get('observations', []):

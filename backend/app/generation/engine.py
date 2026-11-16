@@ -2290,7 +2290,26 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None,
     novel_ids 缺省时取 project.reference_novel_ids（用户选定的参考语料）。
     只检索「选定」的语料，绝不混入整库其他语料——这是防混库的第一道闸。
     多本语料各自独立 RAG，结果合并进 rag_context（纯文本检索，不污染图谱隔离）。
+
+    ## 正文修订闸门（批 9 接线）
+
+    正文被改过（提案写入 `generations.text`）⇒ 摘要链、时间线完成证据、
+    派生 KG / 事实**全部失效**。在 `agents/derived_rebuild.rebuild_derived()`
+    重建并复核完之前，这里必须挡住生成（409），否则新正文会和旧派生状态
+    一起喂进提示词——那是「越改越乱」的来源。
+
+    闸门**只在 `body_revision_requires_review` 存在时生效**：
+    没有改过正文的项目行为与之前逐字节一致（fail open 到旧路径）。
     """
+    if (project.plot_timeline or {}).get("body_revision_requires_review"):
+        from fastapi import HTTPException
+
+        raise HTTPException(409, detail={
+            "status": "needs_review",
+            "message": "正文已修订，摘要与时间线完成证据已失效，须复核后再生成",
+            "revision": project.plot_timeline["body_revision_requires_review"],
+        })
+
     # 只取「用户自己小说」的图谱（generated），杜绝参考语料角色混入事实约束
     if fresh_start:
         reminders = {"unresolved_plotholes": [], "character_constraints": []}

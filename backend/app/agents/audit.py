@@ -598,11 +598,60 @@ def run_corpus_audit(
         lambda: issues.extend(rule_corpus_chunks_without_embedding(chunks_by_novel, taken)),
     )
 
+    # —— 切分质量（v2.285）——
+    # 这是最容易漏的一类问题：语料「有内容」，其它规则全不报，
+    # 但 85% 的 chunk 是从半句话开始的，所有下游产物都建立在不完整信息上。
+    # 复用的是 `scan_chunks` 纯函数，不复制判据。
+    chunk_notes: dict[str, Any] = {}
+
+    def _chunk_boundary() -> None:
+        nonlocal chunk_notes
+        from app.agents.audit_chunk import (
+            rule_chunk_boundary_damage,
+            scan_chunks,
+        )
+
+        scope = list(novels.keys()) or None
+        issues.extend(rule_chunk_boundary_damage(db, novel_ids=scope, taken=taken)[0])
+        # 逐本的切分指标（给 agent 看「哪本语料切得最差」）。
+        # 用本函数已经查好的 chunks_by_novel，不重复查库。
+        per: dict[str, Any] = {}
+        agg = {"n": 0, "tail_broken": 0, "head_broken": 0, "unbalanced": 0}
+        for nid, clist in chunks_by_novel.items():
+            if not clist:
+                continue
+            s = scan_chunks([c.text or "" for c in clist])
+            per[str(nid)] = {
+                "title": novels[nid].title if nid in novels else f"novel:{nid}",
+                "chunks": s["n"],
+                "tail_pct": s["tail_pct"],
+                "head_pct": s["head_pct"],
+                "unbalanced_pct": s["unbalanced_pct"],
+            }
+            agg["n"] += s["n"]
+            agg["tail_broken"] += s["tail_broken"]
+            agg["head_broken"] += s["head_broken"]
+            agg["unbalanced"] += s["unbalanced"]
+
+        n = max(agg["n"], 1)
+        chunk_notes = {
+            "novels_scanned": len(per),
+            "chunks_scanned": agg["n"],
+            "tail_pct": round(agg["tail_broken"] / n * 100, 1),
+            "head_pct": round(agg["head_broken"] / n * 100, 1),
+            "unbalanced_pct": round(agg["unbalanced"] / n * 100, 1),
+            "per_novel": per,
+            "threshold_pct": 10.0,
+        }
+
+    _run("chunk_boundary_damage", _chunk_boundary)
+
     stats = {
         "novels_audited": len(novels),
         "chunks_audited": sum(len(v) for v in chunks_by_novel.values()),
         "watermark_scan": watermark_notes,
         "foreign_block_scan": foreign_notes,
+        "chunk_quality": chunk_notes,
         "rule_errors": rule_errors,
     }
     report = DiagnosticReport(
@@ -616,6 +665,7 @@ def run_corpus_audit(
             "foreign_book_blocks",
             "missing_style_profile",
             "chunks_without_embedding",
+            "chunk_boundary_damage",
         ],
     )
     return report, stats
