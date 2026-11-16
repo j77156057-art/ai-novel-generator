@@ -57,6 +57,8 @@ class UploadResult(BaseModel):
     clean_report: Optional[dict] = None
     # 实际检出的文件编码（utf-8-sig / utf-8 / gb18030）；seed 等内部路径可为空。
     detected_encoding: Optional[str] = None
+    # 助理附件投放的体检结论：sample_reviewed / review_required / blocked（后者不入库）。
+    check_status: Optional[str] = None
 
 
 class SearchHit(BaseModel):

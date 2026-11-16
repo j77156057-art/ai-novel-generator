@@ -35,12 +35,14 @@ import AssistantIssueList from "@/components/AssistantIssueList.vue";
 import WizardStepCard from "@/components/WizardStepCard.vue";
 import WorkflowStrip from "@/components/WorkflowStrip.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
+import { createAttachmentDraft } from "@/utils/assistantAttachments";
 import { pendingActionKindLabel, pendingActionRiskMeta, sourceLabel } from "@/utils/assistantDisplay";
 import type {
   AssistantEvidence,
   AssistantIssue,
   AssistantPendingAction,
   AssistantToolTraceItem,
+  AttachmentCleaningPreview,
   DistillJob,
   ProjectOut,
   WizardActionEcho,
@@ -96,6 +98,8 @@ interface Turn {
   key: string;
   role: "user" | "assistant";
   text: string;
+  /** user 侧：这条消息带上的附件（只回显文件名，不参与请求构造）。 */
+  attachments?: { key: number; filename: string }[];
   /** assistant 侧：本次调用的出参（user 消息为 null）。 */
   answer: string;
   evidence: AssistantEvidence[];
@@ -155,6 +159,64 @@ const query = ref("");
 /** 请求进行中禁止重复提交；卡片执行中的按钮单独由各自 state 控制。 */
 const sending = ref(false);
 const streamEl = ref<HTMLElement | null>(null);
+
+/**
+ * 附件草稿区。
+ *
+ * 上传只落到项目暂存区（`POST /api/assistant/attachments`），**不写库**；
+ * 真正的「投放」必须由问答返回的待确认卡在用户点确认后触发 —— 本组件
+ * 从不直接调投放端点，也不替用户决定「剔除混书」。
+ */
+const fileInput = ref<HTMLInputElement | null>(null);
+const draft = reactive(createAttachmentDraft(api.uploadAssistantAttachment, textOf));
+const canSend = computed(
+  () => !sending.value && !badId && draft.request(query.value) !== null,
+);
+
+interface PreviewState {
+  loading: boolean;
+  error: string;
+  data: AttachmentCleaningPreview | null;
+}
+const EMPTY_PREVIEW: PreviewState = { loading: false, error: "", data: null };
+/** 每张草稿的清洗预览（按 attachment_id 缓存；只读，不落库）。 */
+const previews = reactive<Record<string, PreviewState>>({});
+
+function previewOf(attachmentId: string): PreviewState {
+  return previews[attachmentId] ?? EMPTY_PREVIEW;
+}
+
+function addFiles(files: File[]): void {
+  if (sending.value || badId) return;
+  void draft.add(files);
+}
+
+function onFilesSelected(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  addFiles(Array.from(input.files ?? []));
+  input.value = "";
+}
+
+/** 展开 / 收起清洗预览：展开时才请求（避免每次上传都跑一遍扫描）。 */
+async function togglePreview(attachmentId: string): Promise<void> {
+  if (previews[attachmentId]?.loading) return;
+  if (previews[attachmentId]?.data) {
+    delete previews[attachmentId];
+    return;
+  }
+  previews[attachmentId] = { loading: true, error: "", data: null };
+  try {
+    const data = await api.previewAssistantAttachment(projectId, attachmentId);
+    if (previews[attachmentId]) previews[attachmentId] = { loading: false, error: "", data };
+  } catch (err) {
+    if (previews[attachmentId]) previews[attachmentId] = { loading: false, error: textOf(err), data: null };
+  }
+}
+
+function resetAttachments(): void {
+  draft.items = [];
+  for (const id of Object.keys(previews)) delete previews[id];
+}
 
 let seq = 0;
 function nextKey(prefix: string): string {
@@ -381,6 +443,7 @@ async function resumeDistill(turn: Turn): Promise<void> {
 onUnmounted(() => {
   pageAlive = false;
   if (distillTimer) clearTimeout(distillTimer);
+  draft.reset(0);
 });
 
 
@@ -817,7 +880,22 @@ async function send(): Promise<void> {
 
   // 先把 user 气泡插进去，assistant 占位气泡同时置 loading：
   // 否则「提问 → 等待 → 出结果」之间界面是空的，用户会以为没点上。
-  turns.value.push(makeUserTurn(q));
+  // 附件只随**普通问答**走；上传中/失败的草稿绝不能被静默丢掉。
+  const body = draft.request(q);
+  if (draft.items.length && !body) {
+    const notice = makeAssistantTurn();
+    notice.loading = false;
+    notice.answer = "附件还在上传中或上传失败，请先处理附件草稿再发送。";
+    turns.value.push(notice);
+    await scrollToBottom();
+    return;
+  }
+  const userTurn = makeUserTurn(q);
+  userTurn.attachments = draft.items.map((item) => ({
+    key: item.key,
+    filename: item.metadata!.filename,
+  }));
+  turns.value.push(userTurn);
   const turn = makeAssistantTurn();
   turns.value.push(turn);
   query.value = "";
@@ -832,7 +910,7 @@ async function send(): Promise<void> {
       turn.loading = false;
       return;
     }
-    const res = await api.assistantQa({ project_id: projectId, query: q });
+    const res = await api.assistantQa(body ?? { project_id: projectId, query: q });
     turn.answer = res.answer || "";
     turn.evidence = res.evidence ?? [];
     turn.confidence = res.confidence;
@@ -855,6 +933,9 @@ async function send(): Promise<void> {
       result: null,
     }));
     turn.loading = false;
+    // 请求已把附件 id 交给后端（答疑/提卡都在服务端完成），草稿可以清空；
+    // 真正的写库仍要用户在上方卡片上点确认。
+    resetAttachments();
   } catch (err) {
     turn.error = `问答失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
     turn.loading = false;
@@ -1141,6 +1222,8 @@ const lastWizardTurnKey = computed(() => {
 
 onMounted(async () => {
   if (badId) return;
+  // 附件草稿按项目隔离：路由里的项目 id 就是暂存区的 scope。
+  draft.reset(projectId);
   await loadLlm();
   // 项目名用于页头；取不到不阻塞助手功能（徽标与提示里都有兜底文案）。
   try {
@@ -1238,7 +1321,12 @@ onMounted(async () => {
       <div v-for="turn in turns" :key="turn.key" class="turn" :class="turn.role">
         <!-- 用户气泡 -->
         <div v-if="turn.role === 'user'" class="bubble user">
-          {{ turn.text }}
+          <div>{{ turn.text }}</div>
+          <div v-if="turn.attachments?.length" class="file-list sent">
+            <span v-for="file in turn.attachments" :key="file.key" class="file-chip">
+              {{ file.filename }}
+            </span>
+          </div>
         </div>
 
         <!-- 助手气泡：创作引导（解释正文 + 卡片 / 结果） -->
@@ -1651,6 +1739,110 @@ onMounted(async () => {
         正在与「{{ roleMode.character }}」对话 · 情境：{{ roleMode.scene }}
         <button type="button" class="link-btn" @click="exitRole">结束对话</button>
       </div>
+
+      <!-- 附件草稿区：上传只进项目暂存区；投放必须由上方卡片确认后触发。 -->
+      <div v-if="draft.items.length" class="file-list" aria-live="polite">
+        <div
+          v-for="file in draft.items"
+          :key="file.key"
+          class="file-chip"
+          :class="{ failed: file.state === 'failed' }"
+        >
+          <div class="file-row">
+            <span class="file-name">{{ file.file.name }}</span>
+            <span class="faint">{{
+              file.state === "uploading"
+                ? "上传中…"
+                : file.state === "ready"
+                  ? "已就绪（仅暂存，未投放）"
+                  : "上传失败"
+            }}</span>
+            <button
+              v-if="file.state === 'ready' && file.metadata"
+              class="link-btn"
+              type="button"
+              :disabled="sending"
+              @click="togglePreview(file.metadata.attachment_id)"
+            >
+              {{ previewOf(file.metadata.attachment_id).data ? "收起清洗预览" : "清洗预览" }}
+            </button>
+            <button
+              v-if="file.state === 'failed'"
+              class="link-btn"
+              type="button"
+              :disabled="sending"
+              @click="draft.retry(file.key)"
+            >
+              重试
+            </button>
+            <button
+              class="link-btn"
+              type="button"
+              :disabled="sending"
+              :aria-label="`移除 ${file.file.name}`"
+              @click="draft.remove(file.key)"
+            >
+              移除
+            </button>
+          </div>
+          <span v-if="file.error" class="file-error" role="alert">{{ file.error }}</span>
+          <div
+            v-if="file.metadata && (previewOf(file.metadata.attachment_id).loading || previewOf(file.metadata.attachment_id).error || previewOf(file.metadata.attachment_id).data)"
+            class="file-preview"
+          >
+            <span v-if="previewOf(file.metadata.attachment_id).loading" class="faint">
+              正在读取清洗预览…
+            </span>
+            <span
+              v-else-if="previewOf(file.metadata.attachment_id).error"
+              class="file-error"
+              role="alert"
+            >
+              {{ previewOf(file.metadata.attachment_id).error }}
+            </span>
+            <template v-else>
+              <p class="faint">
+                清洗后 {{ previewOf(file.metadata.attachment_id).data?.chapters }} 章 ·
+                待复核残留 {{ previewOf(file.metadata.attachment_id).data?.unresolved_count }} 处
+              </p>
+              <ul v-if="previewOf(file.metadata.attachment_id).data?.changes.length" class="file-changes">
+                <li v-for="(change, i) in previewOf(file.metadata.attachment_id).data?.changes ?? []" :key="i">
+                  <span class="mono">{{ change.kind }}</span> 第 {{ change.chapter_no ?? "?" }} 章 ·
+                  删 {{ change.removed_chars }} 字
+                  <div class="file-diff">
+                    <del>{{ change.before || "（空）" }}</del>
+                    <ins>{{ change.after || "（空）" }}</ins>
+                  </div>
+                </li>
+              </ul>
+              <p v-else class="faint">没有检出需要删除的站点残留。</p>
+            </template>
+          </div>
+        </div>
+      </div>
+      <div class="row tight">
+        <input
+          ref="fileInput"
+          type="file"
+          accept=".txt,.md,text/plain,text/markdown"
+          multiple
+          hidden
+          :disabled="badId || sending"
+          @change="onFilesSelected"
+        />
+        <button
+          class="btn"
+          type="button"
+          :disabled="badId || sending"
+          @click="fileInput?.click()"
+        >
+          添加文本附件
+        </button>
+        <span class="faint" style="font-size: var(--fs-xs)">
+          .txt / .md；上传只暂存，不会写库 —— 点卡片确认才投放。
+        </span>
+      </div>
+
       <textarea
         v-model="query"
         class="input"
@@ -1666,11 +1858,11 @@ onMounted(async () => {
         @keydown="onKeydown"
       ></textarea>
       <div class="row tight" style="align-items: center">
-        <button class="btn primary" type="submit" :disabled="sending || badId || !query.trim()">
+        <button class="btn primary" type="submit" :disabled="!canSend">
           {{ sending ? "思考中…" : "提问" }}
         </button>
         <span class="faint" style="font-size: var(--fs-xs)">
-          Enter 发送 · Shift+Enter 换行。写操作只限本项目配置与会话状态，每次改动都有审计、可撤销。
+          Enter 发送 · Shift+Enter 换行。附件投放只在卡片确认后发生；写操作都留审计、可撤销。
         </span>
       </div>
     </form>
@@ -1896,6 +2088,43 @@ onMounted(async () => {
 }
 .composer .input { background: var(--bg-elev); border-color: var(--border-strong); min-height: 84px; }
 .composer .input::placeholder { color: var(--fg-faint); }
+
+/* ---- 附件草稿 / 清洗预览 ---- */
+.file-list { display: flex; flex-direction: column; gap: 6px; }
+.file-list.sent { flex-direction: row; flex-wrap: wrap; margin-top: 6px; }
+.file-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  font-size: var(--fs-xs);
+}
+.file-list.sent .file-chip { padding: 2px 8px; }
+.file-chip.failed { border-color: var(--danger); }
+.file-row { display: flex; align-items: center; gap: var(--gap-sm); flex-wrap: wrap; }
+.file-name { font-weight: 600; }
+.file-error { color: var(--danger); }
+.file-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+.file-changes { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
+.file-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.file-diff del { color: var(--danger); }
+.file-diff ins { color: var(--ok); text-decoration: none; }
 
 /* ---- 创作引导 ---- */
 .asst-intro {

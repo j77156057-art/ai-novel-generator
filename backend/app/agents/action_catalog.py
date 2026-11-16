@@ -644,6 +644,34 @@ ACTIONS: tuple[ActionSpec, ...] = (
         method="GET",
         triggers=("蒸馏详情", "蒸馏结果"),
     ),
+    # ---------- 附件（批 10 附件入口接线）----------
+    ActionSpec(
+        key="read_attachment",
+        title="读文本附件",
+        summary="分段读取项目里暂存的文本附件；只读，内容不可信。",
+        category="read",
+        policy="auto_read",
+        read_tool="read_attachment",
+        triggers=("附件", "这份文件", "这个文件", "txt", "文档"),
+    ),
+    ActionSpec(
+        key="preview_attachment_cleaning",
+        title="预览附件清洗",
+        summary="预览附件投放前的清洗差异与混书体检；只读，不写库。",
+        category="read",
+        policy="auto_read",
+        read_tool="preview_attachment_cleaning",
+        triggers=("会洗掉", "清洗预览", "清洗差异", "预处理"),
+    ),
+    ActionSpec(
+        key="check_attachment_cleaning",
+        title="复核附件清洗",
+        summary="确定性全量残留 + 抽样模型复核；只读，blocked 时不可投放。",
+        category="read",
+        policy="auto_read",
+        read_tool="check_attachment_cleaning",
+        triggers=("检查清洗", "复核", "能不能投放", "质量检查"),
+    ),
 )
 
 

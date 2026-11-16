@@ -963,6 +963,26 @@ export interface AssistantQaRequest {
   query: string;
   scope?: string | null;
   version_id?: number | null;
+  /** 本轮带的文本附件（`/assistant/attachments` 上传后得到的 id）。 */
+  attachment_ids?: string[];
+}
+
+/** GET /api/assistant/attachments/{id}/preview —— 投放前的清洗预览（只读）。 */
+export interface AttachmentCleaningPreview {
+  attachment_id: string;
+  chapters: number;
+  report: Record<string, unknown>;
+  changes: {
+    chapter_no: number | null;
+    kind: string;
+    before: string;
+    after: string;
+    removed_chars: number;
+    added_chars?: number;
+    chapter_index?: number;
+  }[];
+  unresolved_count: number;
+  untrusted: boolean;
 }
 
 /** POST /api/assistant/diagnose —— scope 必填，query 可选。 */

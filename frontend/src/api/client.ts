@@ -41,6 +41,7 @@ import type {
   AssistantSnapshotListResponse,
   AssistantVersionDiffResponse,
   AssistantVersionListResponse,
+  AttachmentCleaningPreview,
   CharacterDetail,
   ChunkOut,
   DistillJob,
@@ -560,6 +561,23 @@ export const api = {
   /** 1. 问答：只读检索 + Assistant 模型回答，返回 evidence 与 confidence。 */
   assistantQa: (body: AssistantQaRequest) =>
     request<AssistantQaResponse>("/assistant/qa", jsonInit("POST", body)),
+
+  /** 上传文本附件到项目暂存区（只暂存，不写库；投放必须另点确认卡）。 */
+  uploadAssistantAttachment: (projectId: number, file: File) => {
+    const form = new FormData();
+    form.append("project_id", String(projectId));
+    form.append("file", file);
+    return request<import("@/utils/assistantAttachments").AttachmentMetadata>(
+      "/assistant/attachments",
+      { method: "POST", body: form },
+    );
+  },
+
+  /** 投放前的清洗预览（只读）：会删什么、还剩什么没解决。 */
+  previewAssistantAttachment: (projectId: number, attachmentId: string) =>
+    request<AttachmentCleaningPreview>(
+      `/assistant/attachments/${encodeURIComponent(attachmentId)}/preview?project_id=${projectId}`,
+    ),
 
   // 诊断 / 提案 / 版本 / 提示词 / 运行日志 / 三类审核的封装已从前端收起：
   // 能力改由助手按后端动作目录（app/agents/action_catalog.py）发现，读走工具、
