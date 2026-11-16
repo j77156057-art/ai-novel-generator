@@ -299,6 +299,12 @@ class Settings(BaseSettings):
     #: 流式续写的读超时。此前写死在 provider 函数的默认参数里，换机器/换模型
     #: 只能改代码；现与 `writer_timeout` 成对配置（默认 180 = 现网值）。
     writer_stream_timeout: int = int(_WRITER_DEFAULTS.get("stream_timeout", 180))
+    #: Writer 角色的思考档位（`_thinking_kwargs` 翻译成 provider 构造参数）。
+    #: 空 = 不传任何字段，行为与加这个开关之前一致。
+    writer_thinking: str = ""
+    #: 文风改写开关（生成三档预设会写这里）：极速档关闭、平衡/高质量档开启。
+    #: 项目级 `projects.style_rewrite` 显式设置时以项目为准。
+    style_rewrite: bool = True
     #: 非流式补全（重写轮走的 `complete_message`）的**总时长硬顶**，默认 960s。
     #:
     #: 2026-11-14 新增：`writer_timeout` 只是 socket 每次 recv 的空闲超时，不是
@@ -494,6 +500,8 @@ class Settings(BaseSettings):
     assistant_model: str = _ASSISTANT_DEFAULTS.get("model", "glm-4-flash")
     assistant_max_tokens: int = int(_ASSISTANT_DEFAULTS.get("max_tokens", 1024))
     assistant_timeout: int = int(_ASSISTANT_DEFAULTS.get("timeout", 60))
+    #: Assistant 角色的思考档位（空 = 不传，保持渠道默认）。
+    assistant_thinking: str = ""
     #: 实测**不可用**于 function calling 的模型名单（逗号分隔，env 可覆盖）。
     #:
     #: 来源：2026-11-14 最小探针（`%TEMP%\tool_probe\probe*.py`，同一套线上渠道
@@ -529,6 +537,8 @@ class Settings(BaseSettings):
     #: 兜底值与 config/providers.yaml 的 distiller.max_tokens 保持一致。
     distiller_max_tokens: int = int(_DISTILLER_DEFAULTS.get("max_tokens", 32768))
     distiller_timeout: int = int(_DISTILLER_DEFAULTS.get("timeout", 180))
+    #: Distiller 角色的思考档位（空 = 不传，保持渠道默认）。
+    distiller_thinking: str = ""
 
     # ------------------------------------------------------------------
     # 量级与体系护栏（power_guard，独立区块）
@@ -639,6 +649,8 @@ class Settings(BaseSettings):
                 "model": self.writer_model,
                 "max_tokens": self.writer_max_tokens,
                 "timeout": self.writer_timeout,
+                # 思考档位（空串 = 不传；非空由 llm/provider._thinking_kwargs 翻译）
+                "thinking": self.writer_thinking,
                 # 标记：writer 空 provider 时由工厂委托给原 Writer 单例
                 "_fallback_to_legacy": not bool(self.writer_provider),
             }
@@ -664,6 +676,7 @@ class Settings(BaseSettings):
                 "model": str(getattr(self, f"{role}_model") or "").strip(),
                 "max_tokens": getattr(self, f"{role}_max_tokens"),
                 "timeout": getattr(self, f"{role}_timeout"),
+                "thinking": str(getattr(self, f"{role}_thinking") or "").strip(),
                 "_fallback_to_legacy": False,
             }
         raise ValueError(f"未知 role: {role!r}（应为 'writer' / 'assistant' / 'distiller'）")

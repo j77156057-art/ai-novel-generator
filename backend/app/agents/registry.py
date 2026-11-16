@@ -884,6 +884,55 @@ def _impl_query_ai_flavor_memory(*, db: Any, project_id: int,
 
 
 # ====================================================================
+# 模型能力探测：目标解析（assistant_probe 两个端点与将来的 agent 工具共用）
+# ====================================================================
+
+
+def _resolve_probe_target(
+    db: Any, project_id: int, provider: str | None, model: str | None,
+) -> dict[str, Any]:
+    """决定探测哪个端点：显式参数 > 项目配置 > distiller 角色 > writer。
+
+    返回 {provider, base_url, api_key, model, source}；缺 key 时 api_key 为空，
+    由调用方决定怎么报错（不在这里抛，好让 agent 看到「缺哪个配置」）。
+    """
+    from app.config import settings
+
+    prov = (provider or "").strip()
+    mdl = (model or "").strip()
+    source = "explicit"
+
+    if not prov:
+        # 优先用 distiller 角色（蒸馏链路用它），否则 writer
+        try:
+            cfg = settings.get_provider_config("distiller")
+            prov = str(cfg.get("provider") or "").strip()
+            if prov and prov != "local":
+                source = "distiller"
+                if not mdl:
+                    mdl = str(cfg.get("model") or "").strip()
+        except Exception:  # noqa: BLE001
+            pass
+    if not prov:
+        prov = str(getattr(settings, "llm_provider", "") or "").strip()
+        source = "writer"
+        if not mdl:
+            mdl = str(getattr(settings, "zhipu_model", "") or "").strip()
+
+    if not prov or prov == "local":
+        return {"provider": prov or "local", "base_url": "", "api_key": "",
+                "model": mdl, "source": source}
+
+    # base_url / api_key / 默认 model 按渠道取
+    base_url = str(getattr(settings, f"{prov}_base_url", "") or "").strip()
+    api_key = str(getattr(settings, f"{prov}_api_key", "") or "").strip()
+    if not mdl:
+        mdl = str(getattr(settings, f"{prov}_model", "") or "").strip()
+    return {"provider": prov, "base_url": base_url, "api_key": api_key,
+            "model": mdl, "source": source}
+
+
+# ====================================================================
 # 五级目录：五个只读工具（与作者 agent 共用 app.retrieval.tools）
 # ====================================================================
 #

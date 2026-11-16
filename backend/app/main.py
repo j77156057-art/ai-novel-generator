@@ -21,6 +21,7 @@ from app.routers import assistant_generation as assistant_generation_router
 from app.routers import assistant_clean as assistant_clean_router
 from app.routers import assistant_wizard as assistant_wizard_router
 from app.routers import assistant_snapshot as assistant_snapshot_router
+from app.routers import assistant_probe as assistant_probe_router
 from app.routers import kg_v3 as kg_v3_router
 
 
@@ -141,6 +142,8 @@ app.include_router(assistant_clean_router.router)
 app.include_router(assistant_wizard_router.router)
 # 重写快照的撤销入口：/api/assistant/snapshots/*（列表 / 单段回滚 / 整批回滚）。
 app.include_router(assistant_snapshot_router.router)
+# 模型能力实测：/api/assistant/probe-thinking + /probe-concurrency（只读，仅耗额度）。
+app.include_router(assistant_probe_router.router)
 
 
 @app.get("/health")

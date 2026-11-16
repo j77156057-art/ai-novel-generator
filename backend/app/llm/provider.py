@@ -341,6 +341,17 @@ class LLMProvider:
         """
         yield self.chat(system, user, constraints=constraints)
 
+    def variant(self, *, thinking_off: bool = False, max_tokens: int | None = None):
+        """返回一个「关思考 / 换输出预算」的变体 provider。
+
+        机械改写不需要思考，但思考会吃掉同一份 token 预算（实测会整块返回空）。
+        provider 是单例，不能原地改请求体，所以真正的实现（OpenAI 兼容层）
+        用浅拷贝：只换 `extra_body` 与 `max_tokens`，其余共享。
+
+        基类原样返回自己——不支持的渠道就当没要求变体。
+        """
+        return self
+
     def set_stop_sequences(self, sequences: list[str] | None) -> None:
         """v2.6：设置下一次 chat/stream_chat 的 stop token 列表。
 
@@ -537,6 +548,23 @@ class OpenAICompatibleChatProvider(LLMProvider):
         参数传值（每次调用独立），不用这个 setter。
         """
         self._stop_sequences = list(sequences) if sequences else None
+
+    def variant(self, *, thinking_off: bool = False, max_tokens: int | None = None):
+        """变体：浅拷贝，只换 `extra_body` 与 `max_tokens`（不换身份）。
+
+        关思考的发法：请求体加 `thinking: {"type": "disabled"}`；不认这个字段
+        的厂商会静默忽略（最坏是没关上，不会报错）。
+        """
+        import copy as _copy
+
+        new = _copy.copy(self)
+        extra = dict(self.extra_body or {})
+        if thinking_off:
+            extra["thinking"] = {"type": "disabled"}
+        new.extra_body = extra
+        if max_tokens is not None:
+            new.max_tokens = max_tokens
+        return new
 
     def _model_chain(self) -> list[str]:
         return self._models
@@ -1208,10 +1236,36 @@ class MiniMaxChatProvider(OpenAICompatibleChatProvider):
     #: 只裁这一个模型，M3.1-Flash 仍需 65536 给 adaptive thinking 留余量。
     _MODEL_MAX_TOKENS = {"MiniMax-Text-01": 40000}
 
+    #: M3.1 自适应思考认的档位（与 `llm/thinking_models.py` 的表同源）。
+    _EFFORT_LEVELS = ("low", "medium", "high")
+
     def __init__(self, api_key: str, base_url: str, model: str,
-                 models: list[str] | None = None, **kwargs) -> None:
+                 models: list[str] | None = None,
+                 reasoning_effort: str | None = None, **kwargs) -> None:
         extra: dict = {}
-        if not model.startswith(self._ADAPTIVE_THINKING_MODELS):
+        if model.startswith(self._ADAPTIVE_THINKING_MODELS):
+            # 自适应思考模型：只能调档，关不掉（传 disabled 直接 400）。
+            # 显式给了档位才把档位写进请求体，并按实测预算地板抬下限；
+            # 没给 = 一个字段都不多发（Writer 既有预算/超时保持不变）。
+            effort = (reasoning_effort or "").strip().lower()
+            if effort:
+                from app.llm.thinking_models import budget_floor
+
+                if effort in self._EFFORT_LEVELS:
+                    extra["reasoning_effort"] = effort
+                else:
+                    logging.getLogger(__name__).warning(
+                        "MiniMax %s 不认档位 %r（可选 low/medium/high），已忽略",
+                        model, effort,
+                    )
+                floor = budget_floor("minimax", model, effort=effort)
+                if floor:
+                    kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), floor[0])
+                    kwargs["timeout"] = max(int(kwargs.get("timeout") or 0), floor[1])
+                    kwargs["stream_timeout"] = max(
+                        int(kwargs.get("stream_timeout") or 0), floor[1]
+                    )
+        else:
             # 老模型（M3/M2.x）会吐思维链，能关则关；关不掉由 _strip_thinking 兜底
             extra["thinking"] = {"type": "disabled"}
         super().__init__(api_key, base_url, model, extra_body=extra, models=models, **kwargs)
@@ -1239,15 +1293,32 @@ class OpenCodeGoChatProvider(OpenAICompatibleChatProvider):
 
     def __init__(self, api_key: str, base_url: str | None = None, model: str | None = None,
                  session_id: str | None = None,
-                 models: list[str] | None = None, **kwargs) -> None:
+                 models: list[str] | None = None,
+                 thinking_off: bool | None = None, **kwargs) -> None:
         headers = {
             "User-Agent": self._BROWSER_UA,
             "x-opencode-session": session_id or f"novel-{uuid.uuid4().hex}",
         }
+        # 三态：None = 用渠道默认（本渠道默认**关**思考——deepseek 的思考 token
+        # 与正文共用 max_tokens，不关就没有正文）；True/False = 用户显式选择。
+        off = True if thinking_off is None else bool(thinking_off)
+        extra: dict = {"thinking": {"type": "disabled"}} if off else {}
+        if not off:
+            # 显式开思考：按实测「最坏情况」抬预算下限，否则正文会被思考吃光。
+            from app.llm.thinking_models import budget_floor
+
+            floor = budget_floor("opencode-go", model or self.DEFAULT_MODEL)
+            if floor:
+                kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), floor[0])
+                kwargs["timeout"] = max(int(kwargs.get("timeout") or 0), floor[1])
+                kwargs["stream_timeout"] = max(
+                    int(kwargs.get("stream_timeout") or 0), floor[1]
+                )
         super().__init__(
             api_key,
             base_url or self.DEFAULT_BASE_URL,
             model or self.DEFAULT_MODEL,
+            extra_body=extra,
             models=models,
             extra_headers=headers,
             **kwargs,
@@ -1312,6 +1383,15 @@ class GenericOpenAIChatProvider(OpenAICompatibleChatProvider):
     """
 
     label = "OpenAI"
+
+    def __init__(self, api_key: str, base_url: str, model: str,
+                 models: list[str] | None = None,
+                 thinking_off: bool = False, **kwargs) -> None:
+        # DeepSeek 等通用兼容端点吃 `thinking: {"type": "disabled"}`；
+        # 默认不发（`bool(None) == False`，与加开关之前逐字节一致）。
+        extra: dict = {"thinking": {"type": "disabled"}} if thinking_off else {}
+        super().__init__(api_key, base_url, model, extra_body=extra or None,
+                         models=models, **kwargs)
 
 
 class LocalFallbackLLMProvider(LLMProvider):
@@ -1817,10 +1897,48 @@ def apply_runtime_config(overrides: dict[str, str | None]) -> None:
         reset_distiller_provider_cache()
 
 
+def _thinking_kwargs(provider: str, model: str, thinking: str) -> dict:
+    """把角色级的「思考档位」翻译成 provider 构造参数。
+
+    返回的 dict 直接 `**kwargs` 给构造器：`reasoning_effort` 或 `thinking_off`。
+    拿不准就不返回任何键（保持官方默认，行为与加这个开关之前一致）。
+    """
+    value = (thinking or "").strip().lower()
+    if not value:
+        return {}
+    prov = (provider or "").strip().lower()
+    name = (model or "").strip()
+
+    if prov == "minimax" and name.startswith("MiniMax-M3.1"):
+        # M3.1：只能调档，关不掉
+        if value == "off":
+            logging.getLogger(__name__).info(
+                "MiniMax M3.1 关不掉思考，已降级为最低档 low（而不是忽略这个设置）"
+            )
+            return {"reasoning_effort": "low"}
+        if value in ("low", "medium", "high", "xhigh", "max"):
+            return {"reasoning_effort": value}
+        return {}
+
+    if value == "off":
+        # 能关的：老 M3（类里本来默认就关）与通用兼容渠道（DeepSeek）。
+        # opencode-go 也收进来：它渠道层默认就关，显式「off」应得到同一结果，
+        # 而不是被静默忽略（返回 {} 后靠默认值兜底，看起来对、读代码的人会误解）。
+        if prov in ("minimax", "openai", "opencode-go"):
+            return {"thinking_off": True}
+    if value == "default":
+        # 「开思考」= 显式不关。只对 opencode-go 显式处理（渠道层默认关），
+        # 其它渠道的 "default" 保持原样（不传任何参数 ⇒ 渠道默认不变）。
+        if prov == "opencode-go":
+            return {"thinking_off": False}
+    return {}
+
+
 def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
                    max_tokens: int | None = None, timeout: int | None = None,
                    stream_timeout: int | None = None,
-                   total_timeout: int | None = None) -> LLMProvider:
+                   total_timeout: int | None = None,
+                   thinking_off: bool | None = None) -> LLMProvider:
     """按渠道名直接构造 provider 实例（测试端点用，不走缓存/单例）。
 
     max_tokens / timeout / stream_timeout 是 ADR-2026-10-12 新增字段：
@@ -1868,6 +1986,14 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
                                       max_tokens=max_tokens, timeout=timeout,
                                       stream_timeout=stream_timeout,
                                       total_timeout=total_timeout)
+    if provider == "opencode-go":
+        # opencode Go 订阅通道：类里有默认端点与必需请求头（浏览器 UA +
+        # x-opencode-session），这里只需要把三态 `thinking_off` 透传下去。
+        return OpenCodeGoChatProvider(api_key, base_url or None, model, models=[model],
+                                      thinking_off=thinking_off,
+                                      max_tokens=max_tokens, timeout=timeout,
+                                      stream_timeout=stream_timeout,
+                                      total_timeout=total_timeout)
     if provider == "openai":
         # 通用 OpenAI 兼容渠道：任何实现了 /chat/completions + Bearer 鉴权的端点
         # （官方 / one-api / vLLM / LM Studio / 中转站…）。端点优先取调用方给的
@@ -1877,6 +2003,7 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
         # 「配了但一直在用离线模板」，是极难排查的静默失效。
         url = base_url or settings.openai_base_url
         return GenericOpenAIChatProvider(api_key, url, model, models=[model],
+                                         thinking_off=bool(thinking_off),
                                          max_tokens=max_tokens, timeout=timeout,
                                          stream_timeout=stream_timeout,
                                          total_timeout=total_timeout)
@@ -1905,6 +2032,7 @@ def _default_model_for(provider: str) -> str:
         "minimax": "MiniMax-M3.1-Flash-Preview",
         "dashscope": "qwen-plus",
         "openai": "gpt-4o-mini",
+        "opencode-go": "deepseek-v4.1-flash",
     }.get(provider, "")
 
 
@@ -1946,6 +2074,8 @@ def build_role_provider(role: str, stream_timeout: int = 60) -> LLMProvider:
     # stream_timeout 暂时不分配置项（这两个角色都不走流式）但显式传值，
     # 防御未来子类把默认改成别的值。
     kwargs["stream_timeout"] = stream_timeout
+    # 角色级思考档位：翻译成 reasoning_effort / thinking_off；空串 = 不加任何键。
+    kwargs.update(_thinking_kwargs(provider, model, str(cfg.get("thinking") or "")))
     return build_provider(provider, api_key, model, base_url, **kwargs)
 
 

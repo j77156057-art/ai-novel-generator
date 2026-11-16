@@ -81,6 +81,39 @@ from app.schemas import StrictRequest
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 # 渠道元数据：供前端下拉与说明（key 获取地址 / 免费政策 / 默认候选模型）
+#
+# ⚠️ 「各渠道/模型的思考控制方式」不写在这里，统一查
+# `app/llm/thinking_models.py` 的实测表（`thinking_control_for` 只负责翻译成
+# 界面契约）。同一件事散在多处，新加渠道漏一处就是静默失效。
+def thinking_control_for(provider: str, model: str = "") -> dict:
+    """这个渠道 + 这个模型能用哪种思考控制？拿不准就返回 `mode="none"`。
+
+    三道问题（是不是思考型 / 关不关得掉 / 预算地板给多少）都查同一张实测表；
+    本函数只把表**翻译成界面契约**。`mode="none"` 有两种含义，靠
+    `verification` 区分：`verified`（模型本来就不思考）与 `unverified`（没测过）。
+    """
+    from app.llm.thinking_models import THINK_OFF_CAPABLE, THINK_TUNABLE, lookup
+
+    row = lookup(provider, model)
+    mode = "none"
+    field = None
+    if row.thinking == THINK_TUNABLE:
+        mode, field = "effort", "reasoning_effort"
+    elif row.thinking == THINK_OFF_CAPABLE:
+        mode, field = "disable", "thinking"
+
+    return {
+        "mode": mode,
+        "field": field,
+        "levels": row.levels if mode != "none" else (),
+        "note": row.note,
+        # 界面据此决定「没有开关」这句话怎么说。
+        "verification": "verified" if row.thinking != "unverified" else "unverified",
+        # 实测依据跟着能力一起下发：界面上能答「你凭什么是这样」。
+        "evidence": row.evidence,
+    }
+
+
 PROVIDER_META: dict[str, dict] = {
     "zhipu": {
         "label": "智谱 GLM",
@@ -196,9 +229,11 @@ _DB_KEY_KG_EXTRACT_MODELS = "kg_extract.models"
 # 角色（role）配置：settings 字段名与 AppSetting 键的映射
 # ------------------------------------------------------------------
 
-#: 角色配置的六个字段（与 `Settings.get_provider_config` 的返回契约一致）。
+#: 角色配置的字段（与 `Settings.get_provider_config` 的返回契约一致）。
 _ROLE_FIELDS: tuple[str, ...] = (
     "provider", "api_key", "base_url", "model", "max_tokens", "timeout",
+    # 思考档位：空串 = 不传任何字段（行为与加开关之前一致）。
+    "thinking",
 )
 #: 其中取整数的字段（AppSetting 里按字符串存，读回时转 int）。
 _ROLE_INT_FIELDS: frozenset[str] = frozenset({"max_tokens", "timeout"})
@@ -459,6 +494,12 @@ def _current(db: Session) -> dict:
         "model": model,
         "keys": keys_status,
         "providers": PROVIDER_META,
+        # 每个渠道 + 当前模型能用的思考档位（拿不准就是 mode=none，
+        # 界面上不给按了没反应的开关）。
+        "thinking_options": {
+            name: thinking_control_for(name, (meta.get("default_models") or [""])[0])
+            for name, meta in PROVIDER_META.items()
+        },
         "effective": effective,
         # 第 7 步：分角色视图（前端「模型设置」页的数据基础）。
         # 三个角色各一块，键名与前端 LlmConfig 的字段一一对应。
@@ -814,6 +855,99 @@ def _local_test(model: str, role: str | None) -> dict:
     if role:
         out["role"] = role
     return out
+
+
+class GenerationTierIn(StrictRequest):
+    """POST /api/settings/generation-tier 请求体。
+
+    档位是「设置」不是「每次请求的参数」——放进 generate-loop 的请求体，
+    用户会在不知道烧多少 token 的情况下随手传 premium。
+    """
+
+    tier: str
+
+
+@router.get("/generation-tiers")
+def list_generation_tiers() -> dict:
+    """列出三档生成配置（前端选档用），并标出当前生效的是哪一档。
+
+    当前档位是**反查**出来的：拿 settings 里生效的 provider + model + style_rewrite
+    去匹配档位定义。即使用户绕过档位接口手改了模型，也能显示真实归属
+    （匹配不上就返回 None，前端显示「自定义」）。
+    """
+    from app.generation.tiers import list_tiers
+
+    tiers = list_tiers()
+    cur_provider = (settings.llm_provider or "").strip().lower()
+    cur_model = ""
+    for attr in ("zhipu_model", "minimax_model", "openrouter_model",
+                 "dashscope_model", "siliconflow_model", "openai_model"):
+        if cur_provider in attr:
+            cur_model = str(getattr(settings, attr, "") or "").strip()
+            break
+    # 反查当前档位：provider + model + style_rewrite 三者全匹配才算。
+    # 只看 provider/model 会把「极速」和「平衡」判成同一档——它们同模型，
+    # 唯一区别就是 style_rewrite。
+    cur_rewrite = bool(getattr(settings, "style_rewrite", True))
+    matched = None
+    for t in tiers:
+        if (t["provider"] == cur_provider and t["model"] == cur_model
+                and bool(t["style_rewrite"]) == cur_rewrite):
+            matched = t["key"]
+            break
+    return {
+        "tiers": tiers,
+        "current": matched,
+        "current_provider": cur_provider,
+        "current_model": cur_model,
+        "current_style_rewrite": cur_rewrite,
+    }
+
+
+@router.post("/generation-tier")
+def set_generation_tier(body: GenerationTierIn, db: Session = Depends(get_db)) -> dict:
+    """切换到指定档位：把 provider / model / max_tokens 写进 settings 并热生效。
+
+    未知档位**报错不静默退回默认**——用户传错档位名却悄悄用免费模型，
+    比直接报错更糟：他会以为自己在用高质量档。
+    """
+    from app.generation.tiers import resolve_tier, tier_settings_patch
+
+    try:
+        tier = resolve_tier(body.tier)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    patch = tier_settings_patch(tier)
+
+    # 1) 持久化：写 llm.provider / llm.max_tokens / llm.<渠道>_model / llm.style_rewrite
+    #
+    # 布尔必须存成 "1"/"0" 而不是 "True"/"False"：`_hydrate_settings` 读回来时
+    # 按 pydantic 字段类型解析，而 `bool("False") == True` 会让关闭档悄悄变成开启档。
+    def _store(v):
+        return ("1" if v else "0") if isinstance(v, bool) else str(v)
+
+    _set(db, _DB_KEY_PROVIDER, tier.provider)
+    for field, value in patch.items():
+        if field == "llm_provider":
+            continue
+        _set(db, f"llm.{field}", _store(value))
+    db.commit()
+
+    # 2) 热生效（复用既有机制，重置 provider 单例缓存）
+    #    同样不能 str(False) —— apply_runtime_config 直接 setattr，
+    #    字符串 "False" 在布尔字段上是真值，会让 rewrite 永远开着。
+    overrides: dict = {"llm_provider": tier.provider}
+    for field, value in patch.items():
+        if field == "llm_provider":
+            continue
+        overrides[field] = value
+    apply_runtime_config(overrides)
+
+    return {
+        "tier": tier.to_public_dict(),
+        "applied": patch,
+    }
 
 
 @router.post("/llm/test")

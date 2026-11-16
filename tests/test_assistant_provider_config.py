@@ -350,7 +350,12 @@ def test_qa_endpoint_really_reaches_assistant_chat(monkeypatch):
 
 
 def test_writer_config_unchanged_by_assistant_fix():
-    """get_provider_config('writer') 返回值（含 _fallback_to_legacy 标记）保持原样。"""
+    """get_provider_config('writer') 返回的字段集合（含 `_fallback_to_legacy` 标记）。
+
+    契约在 2026-10-26 **有意**扩了一个字段：`thinking`（思考档位）。
+    它不算破坏「Writer 行为不变」这条红线：新增的可选字段默认空串 ⇒
+    `_thinking_kwargs()` 返回 `{}`，请求体一个字段都不多发（下面最后一条断言钉住）。
+    """
     settings.llm_provider = "zhipu"
     settings.zhipu_api_key = "zhipu-legacy-key"
 
@@ -358,10 +363,12 @@ def test_writer_config_unchanged_by_assistant_fix():
 
     assert set(cfg) == {
         "provider", "api_key", "base_url", "model",
-        "max_tokens", "timeout", "_fallback_to_legacy",
+        "max_tokens", "timeout", "thinking", "_fallback_to_legacy",
     }
     # writer_* 默认全空 → 委托标记必须为 True（工厂据此走 get_llm_provider() 单例）
     assert cfg["_fallback_to_legacy"] is True
+    # 新增字段默认空 ⇒ 不往请求体加任何东西（行为不变的关键）
+    assert cfg["thinking"] == ""
 
 
 def test_writer_singleton_keeps_its_own_key_and_timeouts():
