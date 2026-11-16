@@ -33,6 +33,7 @@ from app.generation.outline_notice import (
     written_chapters as _written_chapters,
 )
 from app.generation.planning import model_json, source_fingerprint
+from app.llm.provider import LocalFallbackLLMProvider
 from app.models import Project
 from app.routers.projects import _model_call, _provider_or_none
 from app.schemas import StrictRequest
@@ -41,6 +42,14 @@ router = APIRouter(prefix="/api/projects", tags=["chapter-outline"])
 
 #: 一次 AI 起草最多覆盖多少章。超过就让人拆批，避免一次提示塞进整本书。
 MAX_DRAFT_CHAPTERS = 20
+
+#: 起草端「没有真渠道」的拒绝文案：说清原因（无 key / 渠道不可用）和去哪配。
+#: 不写死具体渠道名——`llm_provider` 可能被配置成任意值，原因统一是「取不到可用渠道」。
+DRAFT_NO_CHANNEL = (
+    "未配置可用的模型渠道：当前没有可用的 API Key，或所选渠道不可用。"
+    "请到「模型设置」页选择渠道并填写 API Key 后重试；"
+    "本地模板兜底只用于离线开发，不会用来起草章纲。"
+)
 
 
 class ChapterOutlineEntryIn(StrictRequest):
@@ -376,8 +385,11 @@ def draft_chapter_outline(
         )
 
     provider = _provider_or_none()
-    if provider is None:
-        raise HTTPException(status_code=503, detail="未配置可用的模型渠道")
+    # `get_llm_provider()` 在没配 key 时不会返回 None——它兜底
+    # `LocalFallbackLLMProvider`（确定性模板）。模板能回 JSON，但不是章纲，
+    # 放它进来等于「界面看着起草成功、实际是占位文案」。所以两种都按不可用拒绝。
+    if provider is None or isinstance(provider, LocalFallbackLLMProvider):
+        raise HTTPException(status_code=503, detail=DRAFT_NO_CHANNEL)
 
     outline = normalize_outline(project.outline)
     prior_start = max(1, body.from_chapter - 30)

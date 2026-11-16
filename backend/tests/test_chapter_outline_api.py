@@ -336,14 +336,39 @@ def test_draft_does_not_write_and_can_be_applied(db, monkeypatch):
     assert len(project.outline) == 45
 
 
-def test_draft_without_provider_is_503(db, monkeypatch):
+def test_draft_without_channel_is_503(db, monkeypatch):
+    """真实构造路径：没有可用渠道时 503，不允许模板兜底产出章纲。
+
+    不 fake `_provider_or_none`：把 settings 置成「local + 全部 key 为空」后调
+    `get_llm_provider()`，走的就是线上同一条 `_build_channel_provider` 分支，
+    拿到的必须是 `LocalFallbackLLMProvider`。
+    """
+    from app.config import settings
+    from app.llm import provider as llm_provider_mod
+
     project = _seed(db)
-    monkeypatch.setattr("app.routers.chapter_outline._provider_or_none", lambda: None)
+    monkeypatch.setattr(settings, "llm_provider", "local")
+    for key in (
+        "zhipu_api_key",
+        "openrouter_api_key",
+        "siliconflow_api_key",
+        "minimax_api_key",
+        "openai_api_key",
+        "dashscope_api_key",
+    ):
+        monkeypatch.setattr(settings, key, "")
+    monkeypatch.setattr(llm_provider_mod, "_PROVIDER", None)
+
+    provider = llm_provider_mod.get_llm_provider()
+    assert isinstance(provider, llm_provider_mod.LocalFallbackLLMProvider)
+
     with pytest.raises(HTTPException) as exc:
         draft_chapter_outline(
             project.id, ChapterOutlineDraft(from_chapter=44, to_chapter=45), db=db,
         )
     assert exc.value.status_code == 503
+    assert "模型设置" in exc.value.detail
+    assert "不会用来起草章纲" in exc.value.detail
 
 
 def test_draft_range_too_large_is_422(db, monkeypatch):
