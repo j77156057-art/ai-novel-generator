@@ -250,6 +250,15 @@ SENTENCE_METRIC_SCOPE = "hanzi-only.v2"
 _HANZI = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 
+def cjk_len(text: str) -> int:
+    """纯汉字数（标点、空格、换行不算）—— 全仓库唯一口径。
+
+    章长统计（`style.chapter_stats`）按这个口径量「一章多少字」，
+    与 `sentence_lens` 的 hanzi-only 口径同源，避免两处各数各的。
+    """
+    return len(_HANZI.findall(text or ""))
+
+
 def sentence_lens(text: str) -> list[int]:
     """句长（含句末标点），只保留至少含一个汉字的句子。
 

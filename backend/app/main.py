@@ -23,6 +23,7 @@ from app.routers import assistant_wizard as assistant_wizard_router
 from app.routers import assistant_snapshot as assistant_snapshot_router
 from app.routers import assistant_probe as assistant_probe_router
 from app.routers import kg_v3 as kg_v3_router
+from app.routers import digest as digest_router
 
 
 @asynccontextmanager
@@ -144,6 +145,9 @@ app.include_router(assistant_wizard_router.router)
 app.include_router(assistant_snapshot_router.router)
 # 模型能力实测：/api/assistant/probe-thinking + /probe-concurrency（只读，仅耗额度）。
 app.include_router(assistant_probe_router.router)
+# 全书摘要：项目级提交（POST /projects/{id}/digests）+ 书级查询/验收
+# （GET /books/{novel_id}/digest[/verify]）。产物按书存，任务复用 distill_runs。
+app.include_router(digest_router.router)
 
 
 @app.get("/health")

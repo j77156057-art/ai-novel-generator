@@ -280,6 +280,15 @@ def tools_unsupported_models() -> set[str]:
 
 
 class LLMProvider:
+    #: 蒸馏/摘要的块大小（字）：**实测能安全吃下且产出不劣化**的量级。
+    #: 0 = 未声明 ⇒ 调用方用保守默认（20 万字以下按块切）。
+    distill_block_chars: int = 0
+
+    #: 单次请求能**收下**的正文上限（字）：与 `distill_block_chars` 是两回事 ——
+    #: 后者是「产出不劣化」的块大小，这里是渠道侧「能收下」的硬上限。
+    #: 0 = 未声明 ⇒ 全书摘要不敢整本投喂（fail closed，退回切块抽取）。
+    max_context_chars: int = 0
+
     def chat(self, system: str, user: str, constraints: dict | None = None) -> str:
         raise NotImplementedError  # pragma: no cover - 接口
 
@@ -1195,6 +1204,13 @@ class ZhipuChatProvider(OpenAICompatibleChatProvider):
     #: （第 4 章只出 1,167 字符）。按模型裁到 16384，两条路都不会再 400/截断。
     _MODEL_MAX_TOKENS = {"glm-4-flash-250414": 16384}
 
+    #: 蒸馏/摘要的块大小：2 万字。
+    #:
+    #: ⚠️ 这里**不是** context window 的限制（GLM-4-Flash 是 128K token），
+    #: 而是免费档约 28K TPM 的配额：块一大，单次请求就超过一分钟配额 ⇒ 429。
+    #: 放大块只会把 429 变多，不会更快。
+    distill_block_chars = 20_000
+
 
 class SiliconFlowChatProvider(OpenAICompatibleChatProvider):
     """硅基流动 SiliconFlow（api.siliconflow.cn）：国产开源模型最全，国内低延迟。
@@ -1285,6 +1301,12 @@ class OpenCodeGoChatProvider(OpenAICompatibleChatProvider):
     """
 
     label = "OpenCodeGo"
+
+    #: 蒸馏/摘要块大小：5 万字（本渠道实测能吃下 1M token 上下文，块可以开大）。
+    distill_block_chars = 50_000
+    #: 单次请求能收下的正文上限：实测 context window 1,000,000 token，
+    #: 中文按 1 字≈1.5 token 折算保守取 150 万字；低于此数才敢整本投喂。
+    max_context_chars = 1_500_000
 
     DEFAULT_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
     DEFAULT_MODEL = "deepseek-v4.1-flash"
