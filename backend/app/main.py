@@ -27,6 +27,7 @@ from app.routers import digest as digest_router
 from app.routers import roleplay as roleplay_router
 from app.routers import assistant_action_proposals as assistant_action_proposals_router
 from app.routers import assistant_attachments as assistant_attachments_router
+from app.routers import chapter_outline as chapter_outline_router
 
 
 @asynccontextmanager
@@ -157,6 +158,8 @@ app.include_router(roleplay_router.router)
 app.include_router(assistant_action_proposals_router.router)
 # 助理附件：/api/assistant/attachments/*（上传解析后交给附件对话）。
 app.include_router(assistant_attachments_router.router)
+# 章纲写入/编辑：/api/projects/{id}/chapter-outline/*。
+app.include_router(chapter_outline_router.router)
 
 
 @app.get("/health")
