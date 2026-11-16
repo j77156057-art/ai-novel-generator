@@ -46,6 +46,30 @@ from app.models import AgentRun, Project  # noqa: E402
 ROLE = "kg_batch_extract"
 
 
+@pytest.fixture(autouse=True)
+def _clean_heartbeat_stat():
+    """每个用例前重置心跳统计（进程级全局状态，不重置会跨用例串味）。
+
+    `batch_worker._heartbeat_stat` 与 `_heartbeat_started` 都是模块级状态：
+    全量跑时前面的用例（或 app lifespan 起的心跳线程）若已让 `fail_streak` > 0，
+    本文件的「首次失败记一次 warning」就再也不触发（warning 只在 streak == 1 时打），
+    出现 `len([]) == 0` 的假失败。这里按用例快照/还原，等价于隔离该模块状态。
+    """
+    from app.kg import batch_worker as bw
+
+    defaults = {"writes": 0, "failures": 0, "fail_streak": 0,
+                "last_ok_at": None, "last_error": None, "last_error_at": None}
+    with bw._heartbeat_stat_lock:
+        saved = dict(bw._heartbeat_stat)
+        bw._heartbeat_stat.update(defaults)
+    try:
+        yield
+    finally:
+        with bw._heartbeat_stat_lock:
+            bw._heartbeat_stat.clear()
+            bw._heartbeat_stat.update(saved)
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     """**文件库**（不是内存库）：要验证跨连接的可见性与锁，内存库测不出来。"""
