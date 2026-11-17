@@ -4,7 +4,7 @@
 
 - 基准：feat = `feat/resume-push-2026-10`（当前工作区）；main = `freeze/main-cb05a45`（`cb05a45`，只读 worktree `<temp>\mwt-main3`）
 - 方法：`git grep` 全仓检索 + `ast` 符号级 diff（main-only 符号 / 同名实现差异）+ 逐个查 feat 等价物；不按文件名推断。
-- 关联：`reports/2026-11-15-main-coverage-ledger.md` / `.csv`
+- 关联：模块级覆盖台账（内部交接文档，在仓库外，由维护者另给）
 
 ## 一、`wizard.py` 4 个大纲端点：调用方仲裁
 
