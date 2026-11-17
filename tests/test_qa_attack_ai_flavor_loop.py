@@ -943,6 +943,19 @@ def test_e1_byte_identical_without_override_vs_pre_change(tmp_path):
         "- 避免堆叠四字格：连续使用四字成语/对仗句会显得机械、像 AI 生成的「金句段」；\n"
         "人物对话和叙事以自然口语/长短句为主，四字格用一处即止。\n"
     )
+    #: c312c17（2026-11-17）登记的**第四处**基线变更：篇幅口径统一到字符。
+    #: 此前上限闸比汉字、下限比字符，120% 等效 151%；c312c17 把上下限统一到
+    #: `consistency.char_count`（含标点与换行），于是注入文本里【字数硬上限
+    #: （写完必须自查）】块的首句由「正文**汉字数**（不含标点与空白）」改成
+    #: 「正文**总字数**（含标点与换行）」。它不影响其他注入段落。
+    #: 先折回 v17 措辞，再由下面的 v17 ② 把整块扣掉——两步都是为了对齐
+    #: `4227c73^`，断言本身仍是逐字节相等，没有放宽。
+    c312c17_length_delta = (
+        "- 正文**总字数**（含标点与换行）上限 4800 字，目标 4000 字；"
+        "超过 4800 字直接判不合格并触发重写。\n",
+        "- 正文**汉字数**（不含标点与空白）上限 4800 字，目标 4000 字；"
+        "超过 4800 字直接判不合格并触发重写。\n",
+    )
     #: prompts v17（2026-11-15 定稿）的三处基线变更。逐条显式扣除后**仍要求与
     #: `4227c73^` 逐字节相同**——证明的仍然是「未设置 override 时零额外字符」，
     #: 只是把基线变更记录在案，不是放宽断言。
@@ -980,10 +993,14 @@ def test_e1_byte_identical_without_override_vs_pre_change(tmp_path):
                     "测试项目", reminders, dims, bible, None, None,
                     style_suffix=None, constraint_note=None)
                 normalized = new_sys.replace(master_additions, "")
+                # 第四处登记变更先折回 v17 措辞，再由 v17 ② 整块扣除。
+                normalized = normalized.replace(
+                    c312c17_length_delta[0], c312c17_length_delta[1])
                 for new_frag, old_frag in v17_deltas:
                     normalized = normalized.replace(new_frag, old_frag)
                 assert normalized == old_sys, (
-                    "除 master 的 2 条 AI 腔禁忌与 prompts v17 的三处基线变更外，"
+                    "除 master 的 2 条 AI 腔禁忌、prompts v17 的三处基线变更"
+                    "与 c312c17 的篇幅口径统一（字数硬上限块改「总字数」）外，"
                     "无覆写时 system prompt 必须与 4227c73^ 逐字节相同"
                 )
                 new_sys_empty = prompts_new.build_system_prompt(
