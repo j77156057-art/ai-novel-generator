@@ -38,7 +38,8 @@ backend\venv\Scripts\python.exe -m pytest -p no:cacheprovider --junitxml="$env:T
 ```
 
 - **不要**用终端最后一行、`$LASTEXITCODE`、或管道（`Tee-Object`）后的返回码当证据——管道会让退出码变成管道末端命令的。
-- 结论必须带数字，例如「tests=1969 failures=0 errors=0 skipped=22」。没有 XML 数字就不许说「全过」。
+- 结论必须带数字，例如「tests=2641 failures=0 errors=0 skipped=23」。没有 XML 数字就不许说「全过」。
+- **门禁口径是 2641**（自 2026-11-17 `fe45334` 起，`testpaths = tests backend/tests`）。报数必须说「2641 口径」；拿 1969 对比会得出错误结论——差的不是回归，是收集范围，依据见交接文档 §8.1。全量产物要说明覆盖到哪个 HEAD（最后一次 2641 全绿只到 `fe45334`）。
 - 定向测试绿了不等于全量绿；批次收口必须跑一次完整门禁（教训见交接文档 §7.3 第 9 条）。
 
 ## 3. 不许做的事
