@@ -115,15 +115,27 @@ def _gather_chapter_texts(db, novel_id: int) -> list[tuple[int, str]]:
     )
 
 
-def label_chapters_in_novel(db, novel_id: int, provider) -> list[str]:
-    """v2.4：扫一个 novel 的所有 chapter，依次调 LLM 标情绪。
+def _sample_chapter_indices(n: int, k: int | None) -> list[int]:
+    """从 n 章里等距取 k 章的下标（k 为空/越界时全取）。"""
+    if k is None or k <= 0 or k >= n:
+        return list(range(n))
+    step = n / k
+    return sorted({min(n - 1, int(i * step)) for i in range(k)})
 
-    返回按 chapter_no 升序的标签列表（与 _gather_chapter_texts 顺序一致）。
-    失败章节的标签回退为"日常"（不计入高潮，蒸馏时不会拉高密度）。
+
+def label_chapters_in_novel(
+    db, novel_id: int, provider, *, max_chapters: int | None = None
+) -> list[str]:
+    """v2.4：扫一个 novel 的章节，依次调 LLM 标情绪。
+
+    `max_chapters`：等距采样上限（成本护栏）。None = 全量标注。
+    返回按章号升序的标签列表。失败章节的标签回退为"日常"（不计入高潮，
+    蒸馏时不会拉高密度）。
     """
     chapters = _gather_chapter_texts(db, novel_id)
     out: list[str] = []
-    for _cn, text in chapters:
+    for idx in _sample_chapter_indices(len(chapters), max_chapters):
+        _cn, text = chapters[idx]
         emo = classify_chapter_emotion(provider, text)
         out.append(emo or "日常")
     return out
@@ -163,9 +175,12 @@ def distill_avg_node_segments(
 
 
 def compute_plot_rhythm(
-    db, project, novel_ids: list[int], provider
+    db, project, novel_ids: list[int], provider, *, max_chapters: int | None = None
 ) -> dict:
     """v2.4：组合多本 novel 的章节情绪，蒸馏 + 落库 plot_rhythm。
+
+    每章一次 LLM 调用，成本随章数线性增长。`max_chapters` 给每本书设
+    等距采样上限（端点默认不限制；大语料由调用方显式传值控成本）。
 
     返回 dict（含 source_ids + version + chapter_emotions + avg_node_segments
     + branch_ratio + distilled_at），调用方写回 project.plot_rhythm。
@@ -183,7 +198,7 @@ def compute_plot_rhythm(
     all_emotions: list[str] = []
     per_novel_count: dict[int, int] = {}
     for nid in novel_ids:
-        emos = label_chapters_in_novel(db, nid, provider)
+        emos = label_chapters_in_novel(db, nid, provider, max_chapters=max_chapters)
         all_emotions.extend(emos)
         per_novel_count[nid] = len(emos)
 
@@ -200,6 +215,8 @@ def compute_plot_rhythm(
         "source_ids": list(novel_ids),
         "chapter_emotions": all_emotions,  # 落库便于审计/复用
         "chapter_count_per_novel": per_novel_count,
+        "sampled_chapters": len(all_emotions),
+        "max_chapters": max_chapters,
         "avg_node_segments": avg,
         "branch_ratio": br,
         "distilled_at": __import__("time").time(),

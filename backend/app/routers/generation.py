@@ -76,6 +76,29 @@ def _require_project(db: Session, project_id: int) -> Project:
     return proj
 
 
+def _begin_generation(project_id: int) -> None:
+    """同一项目禁止并发生成（B4）：拿不到租约就 409，不静默排队。
+
+    段模式没有章号可去重，双击「生成」会各起一次模型调用并各落一段；
+    流式入口的请求早已返回 200，更拦不住。租约在 finally 里释放，
+    残留租约按 TTL 过期（见 `app.generation.inflight`）。
+    """
+    from app.generation.inflight import try_begin
+
+    if not try_begin(project_id):
+        raise HTTPException(
+            status_code=409,
+            detail="该项目已有生成在进行中；请等当前生成结束后再试"
+                   "（同一项目不允许并发生成）",
+        )
+
+
+def _end_generation(project_id: int) -> None:
+    from app.generation.inflight import end
+
+    end(project_id)
+
+
 def _resolve_novel_ids(proj: Project, override: list[int] | None) -> list[int]:
     if override:
         return override
@@ -129,6 +152,7 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
     # 章号：入参优先，缺省推导；冲突/越界在调模型前就 400（不烧额度）
     plan = _chapter_plan(db, proj, body.chapter_range)
+    _begin_generation(proj.id)
     try:
         result = generate_next_segment(
             db, proj, novel_ids=novel_ids, max_chars=body.max_chars,
@@ -142,6 +166,8 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
         # 档案预检失败（未蒸馏）等可操作错误：409 + 明确指引，
         # 而不是 500 或把请求挂死在同步蒸馏上
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        _end_generation(proj.id)
     return {
         **_to_generation_out(_last_generation(db, proj.id)),
         # 落库仍是 200：复读只标记不拒绝（D7）。
@@ -173,6 +199,7 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
     plan = _chapter_plan(db, proj, body.chapter_range)
     # 在请求线程里先算好：SSE 生成器跑在线程池，不跨线程复用这个 session。
     outline_notice = build_notice(db, proj, plan["chapter"], plan["chapter_end"])
+    _begin_generation(proj.id)
 
     def event_stream():
         from app.db import SessionLocal
@@ -195,16 +222,21 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
             sdb.close()
+            _end_generation(proj.id)
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
+    try:
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+    except Exception:
+        _end_generation(proj.id)
+        raise
 
 
 @router.post("/regenerate-stream")
@@ -230,6 +262,7 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
         span = chapter_labels.label_span(target.chapter_range)
     # 没有章号（标签是「段N」）就不涉及章纲，回执整个省略，前端按缺省处理。
     outline_notice = build_notice(db, proj, span[0], span[1]) if span else None
+    _begin_generation(proj.id)
 
     def event_stream():
         from app.db import SessionLocal
@@ -249,16 +282,21 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
             sdb.close()
+            _end_generation(proj.id)
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
+    try:
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+    except Exception:
+        _end_generation(proj.id)
+        raise
 
 
 @router.post("/generate-loop")
@@ -275,6 +313,7 @@ def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)
     outline_notices = [
         build_notice(db, proj, plan["chapter"], plan["chapter_end"]) for plan in plans
     ]
+    _begin_generation(proj.id)
     try:
         results = generate_loop(
             db, proj, novel_ids=novel_ids, segments=body.segments, max_chars=body.max_chars,
@@ -286,6 +325,8 @@ def generate_loop_endpoint(body: GenerateLoopBody, db: Session = Depends(get_db)
     except ValueError as exc:
         # 档案预检失败（未蒸馏）→ 409 + 指引，不挂死、不 500
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        _end_generation(proj.id)
     return {
         "segments": [
             {**_to_generation_out(_generation_by_no(db, proj.id, r["segment_no"])),

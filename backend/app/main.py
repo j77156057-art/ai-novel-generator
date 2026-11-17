@@ -28,6 +28,8 @@ from app.routers import roleplay as roleplay_router
 from app.routers import assistant_action_proposals as assistant_action_proposals_router
 from app.routers import assistant_attachments as assistant_attachments_router
 from app.routers import chapter_outline as chapter_outline_router
+from app.routers import rhythm as rhythm_router
+from app.routers import timeline as timeline_router
 
 
 @asynccontextmanager
@@ -174,6 +176,10 @@ app.include_router(assistant_action_proposals_router.router)
 app.include_router(assistant_attachments_router.router)
 # 章纲写入/编辑：/api/projects/{id}/chapter-outline/*。
 app.include_router(chapter_outline_router.router)
+# 时间线节点（B2）：/api/projects/{id}/timeline*。
+app.include_router(timeline_router.router)
+# 高潮密度蒸馏（B6）：/api/projects/{id}/rhythm/distill。
+app.include_router(rhythm_router.router)
 
 
 @app.get("/health")
