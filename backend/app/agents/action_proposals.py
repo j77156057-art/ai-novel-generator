@@ -420,6 +420,7 @@ def _exec_invoke_generation(db: Any, project: Any, proposal: Any, *,
                             background_tasks: Any = None) -> dict[str, Any]:
     """调动生成：写下一段正文（引擎那一套，不另起逻辑）。"""
     from app.agents.workflow import generation_block
+    from app.generation import chapter_labels
     from app.generation.engine import generate_next_segment
     # **动作提案不是后门**：生成同样要过工序链闸门。
     # 少了这一步，「有未批的修改 / 提示词体检不过 / 没有大纲」这些拦截
@@ -430,7 +431,11 @@ def _exec_invoke_generation(db: Any, project: Any, proposal: Any, *,
             'generation_blocked',
             str(block.get('message') or '工序链还没走完，先把上面的问题处理掉。'))
     body = proposal.body_json if isinstance(proposal.body_json, dict) else {}
-    result = generate_next_segment(db, project, max_chars=body.get('max_chars'))
+    # 与助手入口同口径：先分配章号，再写正文；解析失败直接抛，不回落段号。
+    plan = chapter_labels.resolve(db, project, None)
+    result = generate_next_segment(
+        db, project, max_chars=body.get('max_chars'),
+        chapter_range=plan['label'])
     return {
         'segment_no': result.get('segment_no'),
         'chars': len(result.get('text') or ''),

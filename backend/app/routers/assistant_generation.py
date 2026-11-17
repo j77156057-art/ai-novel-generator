@@ -73,6 +73,7 @@ from app.agents.prompt_overrides import (
     set_active_override,
 )
 from app.db import get_db
+from app.generation import chapter_labels
 from app.generation.engine import (
     _detect_ai_flavor,
     _should_rewrite,
@@ -790,6 +791,18 @@ def _run_clarification(
 # ====================================================================
 
 
+def _generate_next_with_chapter(db: Session, project: Project,
+                                max_chars: int | None) -> dict:
+    """助手入口写下一段前先分配章号。
+
+    只做「下一章 = 库内最大章号 + 1」的分配，**不做任何段号推断**：
+    `resolve` 失败就把异常抛出去，绝不回落到 `段N`。
+    """
+    plan = chapter_labels.resolve(db, project, None)
+    return generate_next_segment(
+        db, project, max_chars=max_chars, chapter_range=plan["label"])
+
+
 @router.post("/invoke-generation", response_model=None)
 def assistant_invoke_generation(
     body: AssistantInvokeGenerationRequest, db: Session = Depends(get_db)
@@ -966,9 +979,7 @@ def assistant_invoke_generation(
     writer_model = ""
     try:
         if body.action == "generate_next":
-            result = generate_next_segment(
-                db, project, max_chars=body.max_chars
-            )
+            result = _generate_next_with_chapter(db, project, body.max_chars)
             gen = db.scalars(
                 select(Generation)
                 .where(
