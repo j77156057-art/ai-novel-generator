@@ -5,7 +5,7 @@ main 原文件里「能力执行」那半段（`read_capability('inspect_text_qu
 依赖 feat 侧的运行时件，现状：
 - `inspect_text_quality` → `style.scope.resolve_project_scope`：已落盘，正常用例
 - `inspect_prompt_health` → `agents.prompt_audit`：批 7（`0c28828`）已落盘，正常用例
-- registry 任务枚举 → registry 的 `_DIAGNOSTIC_PARAMETERS` 仍未注册：保留 strict xfail
+- registry 任务枚举 → registry 的 `_DIAGNOSTIC_PARAMETERS` 已注册（2026-11-17）
 其余照搬。
 
 清单加载机制（`load_skill` + manifest 校验）的完整矩阵见
@@ -103,8 +103,6 @@ def test_prompt_health_capability_is_read_only():
         db.close()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "feat 的 agents.registry 尚未注册 `_DIAGNOSTIC_PARAMETERS`（第 2 批）"))
 def test_the_assistant_can_ask_for_the_new_tasks():
     from app.agents.registry import _DIAGNOSTIC_PARAMETERS
     enum = _DIAGNOSTIC_PARAMETERS["properties"]["task_type"]["enum"]

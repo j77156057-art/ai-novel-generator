@@ -101,15 +101,6 @@ def mem_session():
         db.close()
 
 
-_SKIP_REASON = (
-    "feat 的叙事档案维度表里没有「语序编排」（那是 main 的维度分类），"
-    "describe_narrative 会把这类规则整条丢弃 ⇒ 体检拿不到规则正文。"
-    "判据本身（classify_occurrence / analyze / plan_repair）已由本文件其余用例覆盖，"
-    "体检集成待档案维度对齐后打开。"
-)
-
-
-@pytest.mark.skip(reason=_SKIP_REASON)
 @pytest.mark.parametrize("word", TURN_WORDS)
 def test_连词用法在体检里是error(word, mem_session):
     """真冲突 ⇒ `error` ⇒ 仍然挡住生成。"""
@@ -173,7 +164,6 @@ def test_模型看不见的词不判冲突():
     assert analysis.conflicts == [], "模型看不见的词不该判成冲突"
 
 
-@pytest.mark.skip(reason=_SKIP_REASON)
 def test_名词性用法在体检里是warn(mem_session):
     """名词性用法 ⇒ `warn`：不挡生成，但**不隐藏**。"""
     from app.agents.prompt_audit import run_prompt_audit

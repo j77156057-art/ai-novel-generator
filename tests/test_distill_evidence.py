@@ -1,9 +1,9 @@
 """蒸馏取证：人名歧义、证据定位、主语归属、内心独白不进台词。
 
-搬自 main（批 11b）。一条差异：`test_candidate_requires_person_evidence_and_disambiguation`
-依赖 `narrative._l2_candidate_reason`，它是 main 独有的 L2 角色档案抽取链的一环；
-feat 没有这条链（`_extract_character_profiles` 不存在），该函数搬过来也没有生产调用方，
-所以这里显式条件跳过，而不是造链路或 mock 通过。将来若补上这条链，跳过会自动失效。
+搬自 main（批 11b）。`test_candidate_requires_person_evidence_and_disambiguation`
+依赖 `narrative._l2_candidate_reason` —— 它是 L2 角色档案抽取链的准入判据，
+2026-11-18 已随 `_extract_character_profiles` 一起移植（产物落在档案顶层
+`characters`，供 writer 提示词与角色扮演消费）。
 """
 import sys
 from pathlib import Path
@@ -24,10 +24,6 @@ def test_ambiguous_alias_never_picks_arbitrary_full_name():
     assert n._normalize_character_name('欧阳', [('欧阳明', 8), ('欧阳青', 5)], {'欧阳': '欧阳明'}) is None
 
 
-@pytest.mark.skipif(
-    not hasattr(n, '_l2_candidate_reason'),
-    reason='feat 无 L2 角色档案抽取链（_extract_character_profiles / _l2_candidate_reason 未移植）',
-)
 def test_candidate_requires_person_evidence_and_disambiguation():
     chapters = [(1, '欧阳明说道：“走吧。”欧阳青摇头。欧阳家族齐聚。')]
     assert n._l2_candidate_reason('欧阳', chapters, ['欧阳明', '欧阳青']) == 'ambiguous_reference'

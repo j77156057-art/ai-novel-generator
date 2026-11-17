@@ -140,9 +140,6 @@ def test_production_repair_is_pending_and_requires_independent_acceptance(db):
     assert result["verification"]["checks"][0]["status"] == "contradicted"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "feat 的 apply_proposal 尚未搬 repair_write_allowed 守卫"
-    "（台账已把 merge_pending_acceptance / repair_write_allowed 列为第 2 批待搬）"))
 def test_apply_refuses_repair_without_independent_acceptance(db):
     db, project = fixture(db)
     g = Generation(project_id=project.id, segment_no=1, text="前文。错误。后文。")
@@ -242,9 +239,6 @@ def test_an_explicit_range_still_wins_over_the_resolved_one(db):
     assert (body["start"], body["end"]) == (start, end)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "feat 的 proposals.build_proposal 尚未搬 fixed_range/fixed_ranges 守卫"
-    "（main 侧在此处拒绝范围外改动）；属第 2 批 proposals 收尾，本批不越界改"))
 def test_proposal_rejects_outside_fixed_range_changes(db):
     db, project = fixture(db)
     g = Generation(project_id=project.id, segment_no=1, text="前文。错误。后文。")

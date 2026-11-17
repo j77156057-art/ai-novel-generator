@@ -207,6 +207,12 @@ NARRATIVE_DIMENSIONS = [
     "潜台词模式",
 ]
 
+#: 本版不再蒸馏、但历史/跨版本档案里存在的维度（来自 main 的标签体系）。
+#: 渲染时**保留**它们：规则已经花过蒸馏额度，静默丢弃会让体检与生成
+#: 都看不见这些规则（`describe_narrative` 只遍历白名单，未知维度直接跳过）。
+#: 注意：它们**不进** `NARRATIVE_DIMENSIONS`，不改变档位维度数与蒸馏口径。
+RENDERABLE_LEGACY_DIMENSIONS = ("语序编排",)
+
 #: 角色声音提取：从图谱取高频角色名，单独分析说话风格。
 #: 这些角色的「口头禅/自称/敬语/句长」直接影响生成时角色是否「像本人」。
 CHARACTER_VOICE_DIMENSION = "角色声音词典"
@@ -2883,6 +2889,132 @@ def _build_character_voice_prompt(
     return system, user
 
 
+def _l2_candidate_reason(
+    name: str, chapters: list[tuple[int, str]], names: list[str]
+) -> str | None:
+    """L2 角色档案的候选准入：返回拒绝原因，`None` 表示可以抽。
+
+    - `ambiguous_reference`：语料里存在多个以该名为前缀的更长的候选名
+      （「欧阳」既可能是欧阳明也可能是欧阳青）——**不许**凭姓氏猜身份。
+    - `no_person_evidence`：该名在语料里没有任何「说话/动作」上下文
+      （「苍山」这类地名、门派名不该被当成人抽档案）。
+    """
+    text = "\n".join(t for _, t in chapters)
+    longer = {n for n in names if n != name and name in n and n in text}
+    # 语料里的完整名可能不在图谱索引里：按「名 + 说话/动作动词」再兜一层。
+    if name in _COMPOUND_SURNAMES:
+        longer.update(re.findall(
+            re.escape(name) + r"[\u4e00-\u9fff]{1,2}(?=说道|说|问|笑|摇头|点头|走|看)",
+            text,
+        ))
+    if len(longer) > 1:
+        return "ambiguous_reference"
+    person = re.compile(
+        re.escape(name)
+        + r"(?:[，,]?)(?:说道|说|问|笑|摇头|点头|走|看|拿|站|坐|抬|低|转|望|心想|伸|叹|皱|轻声|沉声|冷声)"
+    )
+    if not person.search(text):
+        return "no_person_evidence"
+    return None
+
+
+def _extract_character_profiles(
+    provider,
+    chapters: list[tuple[int, str]],
+    char_names: list[str],
+    *,
+    novel_id: int,
+    novel_title: str = "",
+    max_characters: int = MAX_VOICE_CHARACTERS,
+    audit: list[dict] | None = None,
+) -> list[dict]:
+    """逐角色抽取并规范化 L2 characters 档案。
+
+    这是 `extract_narrative_profile` 的 L2 接线点，不依赖图谱角色节点：
+    `char_names` 已由同一轮角色声音索引清洗/归一化得到，避免 L2 和
+    `角色声音词典` 各自维护两套候选名。
+
+    每个角色单独一次调用，原因是把 20-30 个角色塞进一个 prompt 会让
+    每个角色只剩一句空话；单角色 prompt 才能完整填行为倾向、底线、关系网。
+    单个角色失败只跳过该角色，不阻断整本书的文风蒸馏。
+    """
+    from app.style.character_profile import (
+        build_character_profile_prompt,
+        normalize_character_profile,
+    )
+
+    out: list[dict] = []
+    names = [n.strip() for n in char_names if isinstance(n, str) and n.strip()]
+    eligible: list[str] = []
+    for name in names:
+        reason = _l2_candidate_reason(name, chapters, names)
+        if reason is None:
+            eligible.append(name)
+        elif audit is not None:
+            audit.append({"name": name, "novel_id": novel_id,
+                          "status": "rejected", "reason": reason})
+    for name in eligible[:max_characters]:
+        selected = _find_character_chapters(chapters, name, max_chapters=6)
+        # 避免把整章（长章可达数万字）全部塞进单角色 prompt；取命中角色
+        # 附近的局部窗口，最多六段、总计约 6K 字，仍保留章号作来源依据。
+        excerpts: list[str] = []
+        source_windows: list[dict] = []
+        chapter_numbers: list[int] = []
+        budget = 6000
+        for chapter_no, text in selected:
+            pos = text.find(name)
+            if pos < 0 or budget <= 0:
+                continue
+            left = max(0, pos - 450)
+            right = min(len(text), pos + 750)
+            excerpt = text[left:right]
+            if len(excerpt) > budget:
+                excerpt = excerpt[:budget]
+            if excerpt:
+                excerpts.append(f"[第{chapter_no}章]\n{excerpt}")
+                source_windows.append({"chapter": int(chapter_no), "start": left,
+                                       "end": left + len(excerpt), "quote": excerpt})
+                chapter_numbers.append(int(chapter_no))
+                budget -= len(excerpt)
+        if not excerpts:
+            continue
+        try:
+            system, user = build_character_profile_prompt(
+                name, excerpts, novel_title=novel_title
+            )
+            raw = provider.chat(system, user)
+            parsed = _parse_extract_result(raw)
+            if not isinstance(parsed, dict):
+                continue
+            # Prompt 顶层对象直接为档案；兼容模型包一层 characters/name 对象。
+            if isinstance(parsed.get("characters"), list):
+                parsed = next((item for item in parsed["characters"]
+                               if isinstance(item, dict) and item.get("name") == name), {})
+            elif isinstance(parsed.get(name), dict):
+                parsed = parsed[name]
+                parsed.setdefault("name", name)
+            profile = normalize_character_profile(parsed, name, sources=[
+                (ch, excerpt.split("\n", 1)[1])
+                for ch, excerpt in zip(chapter_numbers, excerpts)
+            ])
+            profile["novel_id"] = novel_id
+            profile["source_windows"] = source_windows
+            profile["source_chapters"] = chapter_numbers
+            out.append(profile)
+            if audit is not None:
+                audit.append({"name": name, "novel_id": novel_id,
+                              "status": "extracted", **profile["evidence_summary"]})
+        except Exception as exc:  # noqa: BLE001 - 单角色失败不阻断整本书
+            if audit is not None:
+                audit.append({"name": name, "novel_id": novel_id,
+                              "status": "failed", "error_type": type(exc).__name__})
+            logging.getLogger(__name__).warning(
+                "L2 角色档案提取失败 novel_id=%s name=%s: %s",
+                novel_id, name, exc,
+            )
+    return out
+
+
 def _find_character_chapters(
     chapters: list[tuple[int, str]], char_name: str, max_chapters: int = 8
 ) -> list[tuple[int, str]]:
@@ -3833,6 +3965,10 @@ def extract_narrative_profile(
         dim: [] for dim in tier_dims + ["文风漂移分析"]
     }
     all_forbidden: dict[str, list[str]] = {dim: [] for dim in FORBIDDEN_DIMENSIONS}
+    #: L2 主要角色写作档案（`characters` 顶层字段）与抽取审计。
+    #: 消费方：`generation/prompts._character_profile_block` 与角色扮演对话。
+    character_profiles: list[dict] = []
+    l2_audit: list[dict] = []
     #: 块级附加字段（场景标签 / 章节摘要 / 人物别名）与 KG 事件。
     #: 逐字段容错：某个字段解析失败只记 field_missing，不影响规则落库。
     all_chunk_meta: list[dict] = []
@@ -4457,6 +4593,39 @@ def extract_narrative_profile(
                 "角色声音提取失败 novel_id=%s: %s", nid, exc
             )
 
+        # —— L2：主要角色写作档案（独立于角色声音维度）——
+        # 使用同一轮清洗后的 canonical 名称，但每个角色单独调用，避免角色
+        # 在一个大 prompt 中互相稀释。L2 失败只影响该角色，不影响整本书其余维度。
+        if progress is not None:
+            progress(
+                f"语料 {book_idx}/{total_books}：提取 L2 角色档案",
+                blocks_done,
+                est_total,
+            )
+        try:
+            # canonical 可能因角色声音阶段异常而未赋值，L2 必须自带兜底，
+            # 否则一个维度失败会连带跳过角色档案。
+            l2_canonical = canonical if isinstance(canonical, list) else []
+            if not l2_canonical:
+                l2_canonical, _ = _build_character_name_index(
+                    db, project, nid, corpus_text="",
+                    cleaning=cfg.fake_character_cleaning,
+                )
+            l2_names = [n for n, _ in l2_canonical if not _is_fake_character(n)]
+            character_profiles.extend(_extract_character_profiles(
+                provider,
+                chapters,
+                l2_names,
+                novel_id=nid,
+                novel_title=getattr(project, "title", "") or "",
+                max_characters=VOICE_MAIN_CHARACTERS,
+                audit=l2_audit,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "L2 角色档案提取失败 novel_id=%s: %s", nid, exc
+            )
+
         # —— v3：文风漂移分析（第三轮，对比早晚期）——
         if progress is not None:
             progress(
@@ -4600,6 +4769,11 @@ def extract_narrative_profile(
         "kg_events": all_kg_events,
         # 逐字段容错账本：某个字段缺了多少次。全 0 表示 5 个字段全齐。
         "field_missing": field_missing,
+        # L2 主要角色写作档案：生成与角色扮演按需取用（见 §L2 接线注释）。
+        # 旧档案（`NARRATIVE_VERSION=7` 之前本次移植）没有这个键，消费方按
+        # 字段存在性判空——刻意不 bump 版本，避免整库重蒸。
+        "characters": character_profiles,
+        "l2_audit": l2_audit,
     }
 
 
@@ -7764,7 +7938,8 @@ def describe_narrative(profile: dict | None, max_rules_per_dim: int | None = Non
     # 短段锚点（「一两句短段 X%」）同上：全程不注入，其余硬锚保留。
     audit_block = _render_audit_block(rules, include_short_para=False)
     lines: list[str] = []
-    all_dims = NARRATIVE_DIMENSIONS + ["文风漂移分析"]
+    all_dims = (NARRATIVE_DIMENSIONS + list(RENDERABLE_LEGACY_DIMENSIONS)
+                + ["文风漂移分析"])
     voice_stats = profile.get("voice_stats") or {}
     for dim in all_dims:
         if dim == "文笔量化审计":
@@ -7808,6 +7983,11 @@ def describe_narrative(profile: dict | None, max_rules_per_dim: int | None = Non
                 items, limit, mode=mode,
                 allowed_novel_ids=allowed_novel_ids, profile=profile,
             )
+        elif dim in RENDERABLE_LEGACY_DIMENSIONS:
+            # 旧标签体系的维度本版不再蒸馏，规则里没有本版的证据/打分字段，
+            # 四层选条会以「无证据」把它们整维硬过滤掉。这里按原序截断保留，
+            # 避免已存规则被静默丢弃（体检与生成共用这份渲染）。
+            selected = items[:limit]
         else:
             selected, _ = select_rules_with_audit(
                 items, limit, dim=dim, profile=profile

@@ -122,9 +122,6 @@ def test_a_model_code_is_not_reported(db, project):
     assert stats["foreign_latin_hits"] == 0
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "feat 的 agents.registry 尚未注册 audit_text_quality / propose_text_fix"
-    "（main 的 registry 属第 2 批，未搬）"))
 def test_the_agent_can_run_the_text_quality_audit(db, project):
     from app.agents.registry import get_tool_registry
     _seed(db, project, "“Already惹了。”陆长风捂着后脑退回老周身边。")

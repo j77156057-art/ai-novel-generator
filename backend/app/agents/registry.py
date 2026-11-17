@@ -82,6 +82,7 @@ ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
     "audit_corpus",
     "audit_kg",
     "audit_generation",
+    "audit_text_quality",
     "analyze_logs",
     # AI 腔记忆库查询（只读）：助手问「这个 AI 腔问题以前是怎么治的」走这里。
     # 命中即复用历史微调方法、未命中才现场规划——规划与沉淀的写操作发生在
@@ -802,6 +803,50 @@ def _impl_audit_generation(*, db: Any, project_id: int) -> dict[str, Any]:
     return _report_to_tool_result(report, stats)
 
 
+def _impl_audit_text_quality(*, db: Any, project_id: int,
+                             check_facts: bool = True) -> dict:
+    """正文的**文字质量**审核（只读）：标点事故、外来英文词、事实自洽。
+
+    与别的审核分工：封闭清单审**越界**，整段验收审与**保存权威**一致，
+    这个审**文字本身**。error 级（标点）会挡住工序链，warn 级（外来词、
+    事实矛盾）只报。
+
+    `check_facts` 为真时会调模型核「同一实体属性是否自相矛盾」——
+    这是**显式动作**（像整段验收），不放在工序链的读路径上，
+    否则面板每刷新一次就烧一次额度。
+    """
+    from app.agents.text_quality import run_text_quality_audit
+    from app.models import Project
+
+    project = db.get(Project, project_id)
+    if project is None:
+        return {"found": False, "note": f"项目 {project_id} 不存在"}
+    provider = None
+    if check_facts:
+        try:
+            from app.llm.registry import get_provider_registry
+
+            provider = get_provider_registry().get("assistant")
+        except Exception:  # noqa: BLE001 - 取不到渠道就只跑确定性规则
+            provider = None
+    report, stats = run_text_quality_audit(db, project, provider=provider)
+    issues = list(report.issues)
+    return {
+        "found": True,
+        "stats": stats,
+        "errors": sum(1 for i in issues if getattr(i, "severity", None) == "error"),
+        "warnings": sum(1 for i in issues if getattr(i, "severity", None) == "warn"),
+        "issues": [
+            {"id": getattr(i, "id", ""), "severity": getattr(i, "severity", ""),
+             "title": getattr(i, "title", ""), "claim": getattr(i, "claim", ""),
+             "suggestion": getattr(i, "suggestion", ""),
+             "rule": getattr(i, "rule", ""),
+             "evidence": [getattr(e, "snippet", "") for e in (i.evidence or ())]}
+            for i in issues
+        ],
+    }
+
+
 def _impl_analyze_logs(*, db: Any, project_id: int, status: str | None = None,
                        limit: int = 100) -> dict[str, Any]:
     """日志分析（只读）：复用 `run_log_audit_rules` 的 5 条规则。
@@ -1404,6 +1449,15 @@ _MODEL_TOOL_PARAMETERS: dict[str, dict] = {
     ),
     "audit_kg": _obj(),
     "audit_generation": _obj(),
+    "audit_text_quality": _obj(
+        {
+            "check_facts": {
+                "type": "boolean",
+                "description": "是否调模型核「同一实体属性是否自相矛盾」"
+                               "（默认要核；只想跑免费的确定性规则就传 false）",
+            },
+        }
+    ),
     "analyze_logs": _obj(
         {
             "status": {"type": "string", "enum": ["running", "success", "failed"]},
@@ -1551,6 +1605,49 @@ _MODEL_TOOL_PARAMETERS: dict[str, dict] = {
     ),
 }
 
+#: 独立诊断任务（`run_diagnostic_task`）的参数 schema —— 任务枚举是模型选
+#: 任务类型的唯一来源。三项文字/提示词体检（`text_quality_audit` /
+#: `text_quality_repair` / `prompt_health_audit`）由 `app.agents.skills` 下的
+#: v1.json 声明，执行侧见 `app.agents.diagnostic`。
+_DIAGNOSTIC_PARAMETERS = {
+    "type": "object", "additionalProperties": False, "required": [],
+    "properties": {
+        "task_type": {"type": "string", "enum": [
+            "foundation_diagnosis", "timeline_review", "binding_review",
+            "claim_review", "planning_review", "body_consistency",
+            "repair_verification", "text_quality_audit",
+            "text_quality_repair", "prompt_health_audit"]},
+        "question": {"type": "string"},
+        "novel_ids": {"type": "array", "items": {"type": "integer"}},
+        "character": {"type": "string"},
+        "cursor": {"type": "integer"},
+        "limit": {"type": "integer"},
+        "segment_nos": {"type": "array",
+                        "items": {"type": "integer", "minimum": 1},
+                        "minItems": 1, "maxItems": 10, "uniqueItems": True},
+        "allow_experimental": {
+            "type": "boolean",
+            "description": "要使用实验性技能就置 true —— 这是你的**请求**，"
+                           "是否放行由服务端按用户的明确授权决定；"
+                           "没有授权会被拒并告诉你该请用户怎么说"},
+        "skill_id": {"type": "string"},
+        "skill_version": {"type": "integer"},
+        "inventory_kinds": {"type": "array",
+                            "items": {"type": "string",
+                                      "enum": ["person", "place", "object"]},
+                            "minItems": 1, "maxItems": 3, "uniqueItems": True,
+                            "description": "closed_inventory v2 分维度范围；"
+                                           "未选维度保持 unknown"},
+        "inventory_verdict_source_ids": {
+            "type": "array", "items": {"type": "string"},
+            "minItems": 1, "maxItems": 10, "uniqueItems": True,
+            "description": "有界裁决来源；与 previous_run_id 复用同输入提及，"
+                           "其他候选明确待判"},
+        "parent_run_id": {"type": "integer"},
+        "previous_run_id": {"type": "integer"},
+    },
+}
+
 #: 改写草稿不得明显短于原文（「改正文某段」= 整段替换）。
 #: 低于这个比例就拒绝：模型多半只读了前半段就起草，真落库会静默删掉后半段。
 TEXT_EDIT_MIN_RATIO = 0.6
@@ -1645,6 +1742,17 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         read_only=True,
         callable=_impl_audit_generation,
         parameters=_MODEL_TOOL_PARAMETERS["audit_generation"],
+    ),
+    ToolSpec(
+        name="audit_text_quality",
+        description=(
+            "正文文字质量审核（只读，按项目）：标点事故（error）、外来英文词与"
+            "实体属性自相矛盾（warn）。check_facts=false 只看确定性规则。"
+            "用户问「正文文字有没有硬伤」时调用。"
+        ),
+        read_only=True,
+        callable=_impl_audit_text_quality,
+        parameters=_MODEL_TOOL_PARAMETERS["audit_text_quality"],
     ),
     ToolSpec(
         name="analyze_logs",

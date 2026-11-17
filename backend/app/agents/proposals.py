@@ -559,6 +559,27 @@ def read_target(db: Any, project_id: int, target_kind: str,
     raise PatchRejected(f"未知 target_kind={target_kind!r}")
 
 
+def repair_write_allowed(scope: dict[str, Any]) -> str | None:
+    """受控修复的写回准入：返回 `'global'` / `'local'` / `None`。
+
+    - `'global'`：整段验收已通过（`semantic_accepted`），全局义务已关闭。
+    - `'local'` ：局部修复已被独立复验授权（`local_apply_authorized`）—— 目标违例已解决、
+      范围外逐字不变、保留事实未被改动；全局验收义务被重新绑定到 apply 后的新正文上
+      （见 `merge_pending_acceptance`），生成守卫继续拦截。
+    - `None`   ：两者都不满足 → 拒绝写回。
+
+    这条局部通道是「解除 apply 死锁」的关键：原实现的闸门只认 `semantic_accepted`，
+    而它依赖 `unresolved` 为空，`unresolved` 里的 `inventory_partial_coverage` 与
+    `full_scope_acceptance_unverified` 恒定读自**原诊断**的 inventory（正文修订不改变它），
+    于是任何修复都永远无法落地 —— 修不好就无法验收，不修就无法验收。
+    """
+    if scope.get("semantic_accepted") is True:
+        return "global"
+    if scope.get("local_apply_authorized") is True:
+        return "local"
+    return None
+
+
 def write_target(db: Any, project_id: int, target_kind: str, target_id: str,
                  new_content: str, repair_context: dict[str, Any] | None = None) -> None:
     """把新内容写入目标（**不 commit** —— 事务边界由调用方掌握）。
@@ -744,6 +765,39 @@ def build_proposal(
 
     before = read_target(db, project_id, target_kind, target_id)
     after = _coerce_after_content(proposal_type, after_text)
+    if isinstance(scope, dict) and "fixed_range" in scope:
+        from app.agents.body_consistency import build_body_candidate
+
+        r = scope["fixed_range"]
+        try:
+            candidate = build_body_candidate(
+                before.content, r["start"], r["end"], r["replacement"],
+                allow_delete=r["replacement"] == "")
+            if target_kind != "generation_text" or candidate["after_text"] != after:
+                raise ValueError("outside_fixed_range")
+            if (r.get("range_hash", candidate["fixed_range"]["range_hash"])
+                    != candidate["fixed_range"]["range_hash"]):
+                raise ValueError("stale_range")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise PatchRejected("invalid_fixed_range:" + str(exc)) from exc
+    if isinstance(scope, dict) and scope.get("fixed_ranges"):
+        # 链式多区间修订：范围外必须逐字不变，服务端按区间重建并比对 after_text。
+        from app.agents.body_consistency import build_body_candidate_multi
+
+        ranges = scope["fixed_ranges"]
+        try:
+            candidate = build_body_candidate_multi(
+                before.content,
+                [{"start": r["start"], "end": r["end"], "replacement": r["replacement"]}
+                 for r in ranges],
+                allow_delete=any(r["replacement"] == "" for r in ranges))
+            if target_kind != "generation_text" or candidate["after_text"] != after:
+                raise ValueError("outside_fixed_ranges")
+            for r, built in zip(ranges, candidate["fixed_ranges"]):
+                if r.get("range_hash", built["range_hash"]) != built["range_hash"]:
+                    raise ValueError("stale_range")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise PatchRejected("invalid_fixed_ranges:" + str(exc)) from exc
     if content_hash(after) == before.hash:
         raise PatchRejected(
             "after_text 与目标当前内容完全一致（无变化）；"
@@ -964,6 +1018,10 @@ def _apply_one_no_commit(
     避免同一次批量里对同一目标重复 SELECT。
     """
     validate_action(proposal.status, "apply")
+    repair_scope = proposal.scope_json or {}
+    if (repair_scope.get("independent_verification_required")
+            and repair_write_allowed(repair_scope) is None):
+        raise InvalidTransition(proposal.status, "repair_semantic_acceptance_required")
     if prechecked is not None:
         current = prechecked
     else:
