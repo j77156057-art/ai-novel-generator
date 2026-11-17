@@ -120,7 +120,21 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:  # noqa: BLE001 —— 收割是增强，不是启动的前提
         logging.getLogger(__name__).warning("重写快照启动收割失败（已忽略）：%s", exc)
-    yield
+    try:
+        yield
+    finally:
+        # —— 停掉 KG 批抽线程 ——
+        # 这三条线程（worker / 扫描 / 心跳）常驻，以前只起不停：同一进程里每进出
+        # 一次 lifespan（服务重启、测试里的 `with TestClient(app)`）就多留一组
+        # 消费者，持续从进程级内存队列取批，把别处刚排进去的队列抽空。停止放在
+        # finally：启动期任何一步出错也不能把线程漏在后台。
+        try:
+            from app.kg.batch_worker import stop_worker
+
+            stop_worker()
+        except Exception as exc:  # noqa: BLE001 —— 停线程失败不掩盖退出本身
+            logging.getLogger(__name__).warning(
+                "停止 KG 批抽线程失败（已忽略）：%s", exc)
 
 
 app = FastAPI(title="AI 小说生成器 · M1–M4", lifespan=lifespan)

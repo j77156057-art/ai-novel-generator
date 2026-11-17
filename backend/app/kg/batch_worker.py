@@ -131,6 +131,9 @@ class _BatchQueue:
         self._queues: dict[int, deque[_QueueItem]] = {}
         self._flush_event = threading.Event()
         self._stop = False
+        #: 停止信号。`_stop` 给循环条件用，`_stop_event` 给「可打断的等待」用：
+        #: 扫描线程原本用 `time.sleep(interval)`（缺省 120s），停止时要能立刻醒。
+        self._stop_event = threading.Event()
 
     def put(self, item: _QueueItem) -> list[_QueueItem]:
         """入队；超过上限时丢最旧的段并**返回被丢的段**。
@@ -179,8 +182,22 @@ class _BatchQueue:
         self._flush_event.clear()
 
     def stop(self) -> None:
+        """请求所有后台循环退出（幂等，可重复调用）。"""
         self._stop = True
+        self._stop_event.set()
         self.signal_flush()
+
+    def resume(self) -> None:
+        """重新启动前复位停止标记（`stop()` 之后还能再 `ensure_worker()`）。"""
+        self._stop = False
+        self._stop_event.clear()
+
+    def wait_stop(self, timeout: float) -> bool:
+        """等停止信号或超时（替代 `time.sleep`，让停止立刻生效）。
+
+        返回 True 表示已要求停止，调用方应直接退出循环。
+        """
+        return self._stop_event.wait(timeout)
 
 
 _queue = _BatchQueue()
@@ -280,10 +297,27 @@ _worker_thread: threading.Thread | None = None
 _sweep_thread: threading.Thread | None = None
 
 
+def _alive(thread: threading.Thread | None) -> bool:
+    return bool(thread is not None and thread.is_alive())
+
+
 def ensure_worker() -> None:
-    """确保后台 worker 与扫描线程在跑（幂等）。顺带启动心跳（多进程判活用）。"""
+    """确保后台 worker 与扫描线程在跑（幂等）。顺带启动心跳（多进程判活用）。
+
+    幂等性靠锁内判 `_worker_started`：二十处 `TestClient` 各调一次也只起一组
+    线程。两种情况需要复位后重起——线程意外死掉（标记仍是 True），以及上一轮
+    `stop_worker()` 之后再次进入 lifespan。复位时**必须**同时 `_queue.resume()`，
+    否则新线程起手看到 `_stop=True` 就直接退出了。
+    """
     global _worker_started, _worker_thread, _sweep_thread
-    _ensure_heartbeat()
+    with _worker_lock:
+        if _worker_started and _alive(_worker_thread) and _alive(_sweep_thread):
+            return
+        _queue.resume()
+        _worker_started = False
+        _worker_thread = None
+        _sweep_thread = None
+    _ensure_heartbeat()  # 内部自己拿 _worker_lock，必须在锁外调用
     with _worker_lock:
         if _worker_started:
             return
@@ -294,6 +328,36 @@ def ensure_worker() -> None:
         s.start()
         _sweep_thread = s
         _worker_started = True
+
+
+def stop_worker(timeout: float = 10.0) -> None:
+    """停止 worker / 扫描 / 心跳三条线程；幂等，可重复调用。
+
+    给 lifespan 的 shutdown 用。此前这三条线程**只起不停**：同一进程里每进出
+    一次 lifespan（测试里的 `with TestClient(app)`）就多留一组常驻消费者，它们
+    会持续从进程级 `_queue` 取批，把别处刚排进去的队列抽空——门禁里
+    `backend/tests/test_batch_worker_claim.py` 两条红就是这个泄漏的表现，不是
+    测试问题。
+
+    `timeout` 是**总**等待上限：批抽正在跑 LLM 时不可能立刻退出，线程是 daemon，
+    超时就放手，不阻塞服务退出。
+    """
+    global _worker_started, _worker_thread, _sweep_thread
+    global _heartbeat_started, _heartbeat_thread
+    with _worker_lock:
+        _queue.stop()
+        threads = [t for t in (_worker_thread, _sweep_thread, _heartbeat_thread)
+                   if t is not None]
+        _worker_thread = None
+        _sweep_thread = None
+        _heartbeat_thread = None
+        _worker_started = False
+        _heartbeat_started = False
+    deadline = time.monotonic() + timeout
+    for t in threads:
+        if t is threading.current_thread():
+            continue
+        t.join(max(0.0, deadline - time.monotonic()))
 
 
 def worker_alive() -> bool:
@@ -427,14 +491,16 @@ def _sweep_loop() -> None:
     while not _queue._stop:
         interval = _sweep_interval()
         if interval <= 0:
-            time.sleep(10.0)
+            if _queue.wait_stop(10.0):
+                return
             continue
         try:
             _sweep_stuck()
             _last_sweep_at = time.monotonic()
         except Exception:  # noqa: BLE001 —— 扫描失败不影响正常批抽
             _log.warning("kg 批抽周期扫描失败（忽略，下轮再试）", exc_info=True)
-        time.sleep(interval)
+        if _queue.wait_stop(interval):
+            return
 
 
 def _sweep_interval() -> float:
@@ -988,12 +1054,14 @@ def _heartbeat(*, prune: bool = False) -> None:
 
 
 _heartbeat_started = False
+#: 心跳线程引用（`stop_worker` 要能 join 到它，否则起停之后就数不干净线程）
+_heartbeat_thread: threading.Thread | None = None
 
 
 def _ensure_heartbeat() -> None:
     """启动心跳：先立刻写一次（恢复前别的进程就能看到本进程活着），再每
     HEARTBEAT_INTERVAL_SECONDS 续一次。幂等。"""
-    global _heartbeat_started
+    global _heartbeat_started, _heartbeat_thread
     with _worker_lock:
         if _heartbeat_started:
             return
@@ -1002,10 +1070,15 @@ def _ensure_heartbeat() -> None:
 
     def _beat() -> None:
         while not _queue._stop:
-            threading.Event().wait(HEARTBEAT_INTERVAL_SECONDS)
+            # 用 wait_stop 而不是死等：stop_worker() 时立刻醒，不必等满一个心跳周期
+            if _queue.wait_stop(HEARTBEAT_INTERVAL_SECONDS):
+                return
             _heartbeat()
 
-    threading.Thread(target=_beat, daemon=True, name="kg-worker-heartbeat").start()
+    t = threading.Thread(target=_beat, daemon=True, name="kg-worker-heartbeat")
+    t.start()
+    with _worker_lock:
+        _heartbeat_thread = t
 
 
 def _claim_execute(db: Session, sql: str, params: dict):
