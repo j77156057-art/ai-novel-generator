@@ -310,7 +310,8 @@ def check_structure(
     """三项检测一次算完，返回可直接写 `quality_json` 的 dict。
 
     任何一项的输入缺失（无大纲/无章节号/无角色卡）都只把该项标 `skipped`，
-    不让检测本身变成新的失败点。所有阈值都来自调用方传入的配置。
+    不让检测本身变成新的失败点；但 `skipped` 必须带 `reason`（code + message），
+    说清是哪一类缺失、该去补什么。所有阈值都来自调用方传入的配置。
     """
     result: dict[str, Any] = {
         "mode": mode,
@@ -321,53 +322,85 @@ def check_structure(
         "blocking": False,
         "blocking_reasons": [],
     }
-    if not text or chapter is None or not isinstance(outline, (list, tuple)):
+
+    def _skip(check: dict, code: str, message: str) -> None:
+        """跳过的原因必须能照着补：code 供程序判别，message 给人看。"""
+        check["status"] = "skipped"
+        check["reason"] = {"code": code, "message": message}
+
+    if not text:
+        message = "正文为空，结构检查没有可检查的文本。"
+        for key in ("beat", "premature", "gender"):
+            _skip(result[key], "no_text", message)
         return result
-    entries = [str(x) for x in outline]
-    if not (1 <= chapter <= len(entries)):
-        return result
+
+    entries = [str(x) for x in outline] if isinstance(outline, (list, tuple)) else []
+    chapter_in_outline = (chapter is not None and bool(entries)
+                          and 1 <= chapter <= len(entries))
+    if not entries:
+        for key in ("beat", "premature"):
+            _skip(result[key], "outline_entry_empty",
+                  "项目章纲为空，情节点与越章检查没有比对物；请先补章纲。")
+    elif chapter is None:
+        for key in ("beat", "premature"):
+            _skip(result[key], "no_chapter_label",
+                  "本段没有章号（标签是「段N」），无法定位章纲条目；"
+                  "请先给本段分配章号。")
+    elif chapter < 1 or chapter > len(entries):
+        for key in ("beat", "premature"):
+            _skip(result[key], "chapter_beyond_outline",
+                  f"第{chapter}章不在章纲范围内（共{len(entries)}条），"
+                  f"请先补第{chapter}章章纲。")
+    elif not entries[chapter - 1].strip():
+        _skip(result["beat"], "outline_entry_empty",
+              f"第{chapter}章章纲条目为空，请先填写本章章纲。")
     text_bigrams = _bigrams(text)
 
     # —— 1. 本章情节点覆盖 ——
-    beats, split_level = _beats(entries[chapter - 1], beat_min_units)
-    if beats:
-        rows = _beat_coverage(beats, text_bigrams)
-        sufficient = len(beats) >= beat_min_units
-        covered = [r for r in rows if r["coverage"] >= beat_min_coverage]
-        result["beat"] = {
-            "status": "checked",
-            "total": len(rows),
-            "units": len(beats),
-            "min_units": beat_min_units,
-            "split_level": split_level,
-            "min_coverage": beat_min_coverage,
-            # 条数不足时单元覆盖率不具区分度（1/1 恒 1.00、1/2 只有 0/0.5/1
-            # 三档）：原始值照常给出，但改由 `fallback_term_coverage` 判。
-            "discrimination": "sufficient" if sufficient else "insufficient",
-            # 判据自本次起固定计入：条数够时用单元覆盖率，不够时切到
-            # `fallback_term_coverage`；`basis` 明确告诉读者这一章按哪把尺判。
-            "basis": "beat_units" if sufficient else "fallback_term_coverage",
-            "counted": True,
-            "covered": len(covered) if sufficient else None,
-            "coverage": (round(len(covered) / len(rows), 3)
-                         if sufficient and rows else None),
-            "missing": [r["beat"] for r in rows
-                        if r["coverage"] < beat_min_coverage] if sufficient else [],
-        }
-        if not sufficient:
-            # 方案 B 兜底：本章大纲独有词三元组作分母（与越章检测同源）。
-            fallback = _beat_fallback(
-                entries, chapter - 1, text, beat_min_coverage)
-            result["beat"]["fallback"] = fallback
-            # 升为正式判据后，与 beat_missing 同权进入阻断理由；
-            # `report` 模式仍只标记、不拦落库。词项为空（skipped）不判。
-            if fallback.get("status") == "checked" and not fallback.get("passed"):
-                result["blocking_reasons"].append("beat_fallback_low")
-        elif len(covered) < len(rows):
-            result["blocking_reasons"].append("beat_missing")
+    if chapter_in_outline and entries[chapter - 1].strip():
+        beats, split_level = _beats(entries[chapter - 1], beat_min_units)
+        if beats:
+            rows = _beat_coverage(beats, text_bigrams)
+            sufficient = len(beats) >= beat_min_units
+            covered = [r for r in rows if r["coverage"] >= beat_min_coverage]
+            result["beat"] = {
+                "status": "checked",
+                "total": len(rows),
+                "units": len(beats),
+                "min_units": beat_min_units,
+                "split_level": split_level,
+                "min_coverage": beat_min_coverage,
+                # 条数不足时单元覆盖率不具区分度（1/1 恒 1.00、1/2 只有 0/0.5/1
+                # 三档）：原始值照常给出，但改由 `fallback_term_coverage` 判。
+                "discrimination": "sufficient" if sufficient else "insufficient",
+                # 判据自本次起固定计入：条数够时用单元覆盖率，不够时切到
+                # `fallback_term_coverage`；`basis` 明确告诉读者这一章按哪把尺判。
+                "basis": "beat_units" if sufficient else "fallback_term_coverage",
+                "counted": True,
+                "covered": len(covered) if sufficient else None,
+                "coverage": (round(len(covered) / len(rows), 3)
+                             if sufficient and rows else None),
+                "missing": [r["beat"] for r in rows
+                            if r["coverage"] < beat_min_coverage] if sufficient else [],
+            }
+            if not sufficient:
+                # 方案 B 兜底：本章大纲独有词三元组作分母（与越章检测同源）。
+                fallback = _beat_fallback(
+                    entries, chapter - 1, text, beat_min_coverage)
+                result["beat"]["fallback"] = fallback
+                # 升为正式判据后，与 beat_missing 同权进入阻断理由；
+                # `report` 模式仍只标记、不拦落库。词项为空（skipped）不判。
+                if fallback.get("status") == "checked" and not fallback.get("passed"):
+                    result["blocking_reasons"].append("beat_fallback_low")
+            elif len(covered) < len(rows):
+                result["blocking_reasons"].append("beat_missing")
+        else:
+            _skip(result["beat"], "outline_entry_empty",
+                  f"第{chapter}章章纲条目切不出至少 {beat_min_units} 个情节点，"
+                  "请把本章章纲写成可执行的短句（用「；」或句号分隔）。")
 
     # —— 2. 越章材料（后续章独有词项命中）——
-    if premature_lookahead > 0:
+    if chapter_in_outline and premature_lookahead > 0:
         allowed: set[str] = set()
         for entry in entries[:chapter]:
             allowed |= _future_terms(entry)
@@ -400,6 +433,9 @@ def check_structure(
         }
         if len(hits) > premature_max_hits:
             result["blocking_reasons"].append("premature_material")
+    elif chapter_in_outline:
+        _skip(result["premature"], "disabled",
+              "越章检查已关闭（premature_lookahead=0），本次不比对后续章材料。")
 
     # —— 3. 人物性别一致性 ——
     if character_cards:
@@ -415,6 +451,9 @@ def check_structure(
         }
         if len(mismatches) > gender_max_mismatches:
             result["blocking_reasons"].append("gender_mismatch")
+    else:
+        _skip(result["gender"], "no_character_cards",
+              "没有可用的人物卡，性别一致性没有检查对象。")
 
     result["blocking"] = bool(result["blocking_reasons"])
     # `block` 模式才真拦；`report` 只标记，落库照旧。

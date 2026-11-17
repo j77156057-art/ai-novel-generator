@@ -5329,6 +5329,9 @@ def generate_next_segment(
         "repetition": repetition,
         "length": (quality or {}).get("length"),
         "summary_style": (quality or {}).get("summary_style"),
+        # 结构检查（beat / premature / gender）连同每项的 skipped 原因一起回传，
+        # 前端不再需要自己猜「为什么没检查」。
+        "structure_check": (quality or {}).get("structure_check"),
         "warnings": warnings,
     }
 
@@ -5759,6 +5762,7 @@ def generate_next_segment_stream(
         "repetition": repetition,
         "length": (quality or {}).get("length"),
         "summary_style": (quality or {}).get("summary_style"),
+        "structure_check": (quality or {}).get("structure_check"),
         "warnings": warnings,
     }
 

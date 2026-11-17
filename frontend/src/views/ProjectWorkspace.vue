@@ -33,6 +33,8 @@ import type {
 import DistillProgress from "@/components/DistillProgress.vue";
 import RoleplayPanel from "@/components/RoleplayPanel.vue";
 import type { CutoffInputs } from "@/utils/referenceBoundary";
+import { buildStructureNotices } from "@/utils/structureStatus.js";
+import type { StructureNotice } from "@/utils/structureStatus.js";
 
 const route = useRoute();
 const router = useRouter();
@@ -1560,6 +1562,7 @@ async function runGenerate() {
   genKgLevel.value = "";
   genQuality.value = []; // 质量回执同样按轮算：多段续写时累积，不跨轮堆叠
   genOutlineNotices.value = []; // 章纲回执同理：只反映本轮提示词实际收到的章纲
+  genStructureNotices.value = []; // 结构检查回执同理：只反映本轮实际跑出来的三项
   try {
     for (let i = 0; i < chaptersPerGen.value; i++) {
       await api.generateStream(
@@ -1578,6 +1581,7 @@ async function runGenerate() {
           applyRewriteInfo(meta.rewrite_info, meta.segment_no);
           applyStyleWarning(meta.style_warning, meta.segment_no);
           applyOutlineNotice(meta.outline);
+          applyStructureCheck(meta.structure_check, meta.segment_no);
           await loadGenerations();
           refreshPriorIfOpen(); // 每段生成完前情都变了，面板开着就同步刷新
         },
@@ -1597,6 +1601,7 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
   genKgLevel.value = "";
   genQuality.value = []; // 同上：一次性动作，回执只反映这一次
   genOutlineNotices.value = []; // 同上：章纲回执只反映这一次
+  genStructureNotices.value = []; // 同上：结构检查回执只反映这一次
   try {
     await api.regenerateStream(
       projectId,
@@ -1611,6 +1616,8 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
         // regen 只管 AI 腔告警（形态②）：它不重算文风距离，后端也不发 style_warning。
         applyRewriteInfo(meta.rewrite_info, meta.segment_no);
         applyOutlineNotice(meta.outline);
+        // 重生成不重算结构检查（后端 regen 路径不发射 structure_check），
+        // 这里不塞旧值、也不编造一行「跳过」。
         await loadGenerations();
         refreshPriorIfOpen(); // 重生成会重算受影响的卷摘要与主线，前情报告同步刷新
       },
@@ -2204,6 +2211,34 @@ function applyOutlineNotice(notice?: GenerationOutlineNotice | null): void {
   const idx = genOutlineNotices.value.findIndex((x) => x.key === key);
   if (idx >= 0) genOutlineNotices.value[idx] = { key, notice };
   else genOutlineNotices.value.push({ key, notice });
+}
+
+/**
+ * 本轮的结构检查回执：beat / premature / gender 三项各自的状态。
+ *
+ * 文案全部来自后端 `structure_check`（含每项 skipped 的 reason.message），
+ * 前端只做分行与分级；没有数据就不渲染，绝不写死「段模式不跑」这类判断。
+ */
+const genStructureNotices = ref<{
+  key: number;
+  segment_no: number;
+  rows: StructureNotice[];
+}[]>([]);
+
+function applyStructureCheck(structureCheck: unknown, segmentNo?: number): void {
+  const rows = buildStructureNotices(structureCheck);
+  if (!rows.length) return; // 旧后端没下发：保持空白，不编造
+  const key = Number(segmentNo ?? 0);
+  const idx = genStructureNotices.value.findIndex((x) => x.key === key);
+  const entry = { key, segment_no: key, rows };
+  if (idx >= 0) genStructureNotices.value[idx] = entry;
+  else genStructureNotices.value.push(entry);
+}
+
+function structureLevel(entry: { rows: StructureNotice[] }): string {
+  if (entry.rows.some((r) => r.tone === "warn")) return "warn";
+  if (entry.rows.every((r) => r.status === "skipped")) return "info";
+  return "ok";
 }
 
 function outlineTagLabel(chapter: GenerationOutlineChapter): string {
@@ -3360,6 +3395,37 @@ onUnmounted(stopDistillPolling);
         <p v-else class="quality-body">
           检查项：{{ item.notice.validation.checks.length }} 项均实际执行。
         </p>
+      </div>
+    </div>
+
+    <!-- 结构检查回执：beat / premature / gender 三项各自的状态与原因。
+         跳过项直接显示后端 reason.message；前端不写死「段模式不跑」，
+         否则检查真跑起来时界面会留下一条新的假状态。 -->
+    <div v-if="genStructureNotices.length" class="list quality-list">
+      <div
+        v-for="item in genStructureNotices"
+        :key="item.key"
+        class="notice quality-item"
+        :class="structureLevel(item)"
+      >
+        <div class="quality-head">
+          <b class="quality-title">结构检查 · 第 {{ item.segment_no }} 段</b>
+          <span
+            v-for="row in item.rows"
+            :key="`tag-${row.key}`"
+            class="tag"
+            :class="row.tone === 'ok' ? 'ok' : row.tone === 'warn' ? 'warn' : 'info'"
+          >
+            {{ row.label }} · {{ row.statusLabel }}
+          </span>
+        </div>
+        <div
+          v-for="row in item.rows"
+          :key="`body-${row.key}`"
+          class="quality-body"
+        >
+          <b>{{ row.label }}</b>：{{ row.text }}
+        </div>
       </div>
     </div>
 

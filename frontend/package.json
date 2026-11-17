@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
     "test:corpus-status": "node --test tests/corpusStatus.test.mjs",
-    "test:kg-chapter": "node --test tests/kgChapter.test.mjs"
+    "test:kg-chapter": "node --test tests/kgChapter.test.mjs",
+    "test:structure-status": "node --test tests/structureStatus.test.mjs"
   },
   "dependencies": {
     "vue": "^3.5.13",

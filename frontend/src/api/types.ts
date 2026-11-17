@@ -890,6 +890,11 @@ export interface GenerateStreamDoneMeta {
   rewrite_info?: Record<string, unknown> | null;
   /** 本章实际收到的章纲回执（缺纲/跳过项）；旧后端不返回 → undefined。 */
   outline?: GenerationOutlineNotice;
+  /**
+   * 结构检查结果（后端 `done` 实际发射的 `structure_check`，dict | None）。
+   * 旧后端不返回 → undefined；前端只在拿到值时渲染，不写死兜底文案。
+   */
+  structure_check?: Record<string, unknown> | null;
 }
 
 /**
