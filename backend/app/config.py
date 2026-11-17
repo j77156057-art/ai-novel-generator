@@ -540,7 +540,7 @@ class Settings(BaseSettings):
     assistant_budget_floor: bool = bool(_ASSISTANT_DEFAULTS.get("budget_floor", True))
     #: 实测**不可用**于 function calling 的模型名单（逗号分隔，env 可覆盖）。
     #:
-    #: 来源：2026-11-14 最小探针（`%TEMP%\tool_probe\probe*.py`，同一套线上渠道
+    #: 来源：2026-11-14 最小探针（`<temp>\tool_probe\probe*.py`，同一套线上渠道
     #: 配置，四段请求：控制组 / tool_choice=auto / required / 工具结果回传）。
     #: `glm-z1-flash`：auto 下 `finish_reason=length`（预算全被 `<think>` 吃掉）；
     #: `max_tokens=4096 + tool_choice=required` 时 `finish_reason=tool_calls` 但

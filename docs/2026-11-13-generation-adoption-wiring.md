@@ -116,7 +116,7 @@ def backfill_adoption(db, research, text, *, weights=None):
   `app.agents.registry` 确认无循环导入。
 - 旧函数无引用残留：`rg "_ENTITY_WORDS|_rewrite_evidence|_bigrams" backend/app/generation`。
 
-### 项目 6 实跑（脚本放 `D:\Temp`，不进仓库）
+### 项目 6 实跑（脚本放 `<temp>`，不进仓库）
 1. 进程级临时开启：启动脚本前设 `$env:AUTHOR_RESEARCH_ENABLED="true"`（不改
    `.env`；新进程默认仍为 `False`，结束后自然恢复）。
 2. 取项目 6 最新一段正文（当前为段 19，5404 字）与 `generation_gate(text, len(text))`；

@@ -1,6 +1,6 @@
 # 物品持有注入 · 机制层验收（p1 真实生成）
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 - 日期：2026-11-10
 - 项目：p1（`Assistant 测试项目`，id=1），既有数据，未新建项目、未造数据
@@ -191,8 +191,8 @@ if not ids:
 
 ## 7. 复现材料
 
-- 执行脚本：`D:\Temp\run_inject_acceptance.py`（provider 薄代理，只记录不改请求）
-- 捕获产物：`D:\Temp\inject_acceptance_capture.json`（含完整 user prompt、块原文、偏移、逐次调用耗时）
+- 执行脚本：`<temp>\run_inject_acceptance.py`（provider 薄代理，只记录不改请求）
+- 捕获产物：`<temp>\inject_acceptance_capture.json`（含完整 user prompt、块原文、偏移、逐次调用耗时）
 - 关键代码位置：
   - 块生成：`backend/app/generation/engine.py` `_item_holding_text` / `_active_item_entries`
   - 块拼接：`backend/app/generation/prompts.py` `build_user_prompt`
@@ -251,7 +251,7 @@ if not ids:
 
 结论：**同一次生成里，重写前（主调用）与重写后（重写调用）的 prompt 都拿到了同一份块；且落库正文来自带块的重写调用。** §5.1 的缺陷不复现。
 
-复现材料：执行脚本 `D:\Temp\run_inject_acceptance2.py`，捕获产物 `D:\Temp\inject_acceptance_capture2.json`（完整 system/user、块原文与偏移、逐次耗时、`rewrite_info`、落库正文），重建校验脚本 `D:\Temp\recheck_rewrite_prompt3.py`。
+复现材料：执行脚本 `<temp>\run_inject_acceptance2.py`，捕获产物 `<temp>\inject_acceptance_capture2.json`（完整 system/user、块原文与偏移、逐次耗时、`rewrite_info`、落库正文），重建校验脚本 `<temp>\recheck_rewrite_prompt3.py`。
 
 ### 8.1.5 测试
 

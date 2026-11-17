@@ -5,7 +5,7 @@
 - 分支 B：`origin/main`（审核/修复路线）——下文简称 **main**
 - 合并基：`git merge-base feat/resume-push-2026-10 origin/main` **无输出**（无共同祖先，两棵树是平行历史，不能 rebase/merge，只能按功能挑选）
 - 规模：feat 264 commits / main 134 commits
-- 本次为**只读盘点**：未提交、未推送、未改动 main、未切换主工作区分支。main 侧检视通过临时 worktree（`%TEMP%\mwt-main-20261115`，detached HEAD）完成，结束后清理。
+- 本次为**只读盘点**：未提交、未推送、未改动 main、未切换主工作区分支。main 侧检视通过临时 worktree（`<temp>\mwt-main-20261115`，detached HEAD）完成，结束后清理。
 
 ## 0. 口径与证据方法
 

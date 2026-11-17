@@ -1,6 +1,6 @@
 # 物品持有注入：真实库 held 行验证（2026-11-10）
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 > 范围：只做前半（真实库新建项目 → 两段生成 → 取证）。**未改任何守卫、注入代码或产品逻辑**，未手工写 `kg_mentions`。
 > 结论先行：**held 行没有出现，块是 `no_record`；但卡点不是 mentions，而是物品分组按 `project_id` 隔离。**
@@ -169,6 +169,6 @@ DELETE FROM projects     WHERE id IN (6,7);
 
 ## 11. 复现材料
 
-- 第 2 次执行：`D:\Temp\run_held_verify2.py`，捕获 `D:\Temp\held_verify_capture2.json`（12 次调用全文、块偏移、`rewrite_info`、落库正文）
-- 第 1 次（无效）：`D:\Temp\run_held_verify.py`，捕获 `D:\Temp\held_verify_capture.json`
-- 对照/清理取证：`D:\Temp\collect_held_evidence.py`、`D:\Temp\probe_cleanup_tables.py`
+- 第 2 次执行：`<temp>\run_held_verify2.py`，捕获 `<temp>\held_verify_capture2.json`（12 次调用全文、块偏移、`rewrite_info`、落库正文）
+- 第 1 次（无效）：`<temp>\run_held_verify.py`，捕获 `<temp>\held_verify_capture.json`
+- 对照/清理取证：`<temp>\collect_held_evidence.py`、`<temp>\probe_cleanup_tables.py`

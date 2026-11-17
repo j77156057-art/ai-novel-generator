@@ -1,6 +1,6 @@
 # 第二批历史数据审计：规范名本身即泛称的组
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 日期：2026-11-10  
 范围：`backend/data/generated.db` 的 `kg_item_group`（53 个组）中，`canonical_name` 命中 `app/kg/item_generic.py` 泛称判据的组。  
@@ -156,7 +156,7 @@
 
 ## 4. 副本降级模拟（证明「降了会丢事实」）
 
-只在副本 `D:\Temp\gen_sim.db` 上把 `gid=33` 改成 `status='generic', generic_members='[]'`，真实库未改。
+只在副本 `<temp>\gen_sim.db` 上把 `gid=33` 改成 `status='generic', generic_members='[]'`，真实库未改。
 
 | | 内容 |
 |---|---|
@@ -203,7 +203,7 @@
 | p1 seg1 块 | `- 笔：无持有记录（no_record；本层不提供持有约束，不要写成「已确认无主」）`（42 字符） |
 | p1 seg2 块 | `- 笔、咖啡、手机、电脑：均无持有记录（no_record；本层不提供持有约束，不要写成「已确认无主」）`（52 字符） |
 
-- 本轮对真实库只执行了 SELECT（生成库用 `mode=ro` 连接，应用库走普通会话但无写语句）；唯一的 UPDATE 落在副本 `D:\Temp\gen_sim.db`。
+- 本轮对真实库只执行了 SELECT（生成库用 `mode=ro` 连接，应用库走普通会话但无写语句）；唯一的 UPDATE 落在副本 `<temp>\gen_sim.db`。
 - `backend/data/generated.db` 大小 196,608 字节，未被修改；未新建任何快照/备份（没有可回滚的写入）。
 
 ---

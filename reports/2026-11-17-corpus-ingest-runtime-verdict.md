@@ -6,16 +6,16 @@
 
 ## 1. 配置实核（先打印，再动手）
 
-临时目录 `D:\Temp\kg-ingest-check-20261117-031419`，以 **CWD=临时目录 + PYTHONPATH=backend** 启动，
+临时目录 `<temp>\kg-ingest-check-20261117-031419`，以 **CWD=临时目录 + PYTHONPATH=backend** 启动，
 `backend/.env` 不参与加载（`Settings` 的 `env_file=".env"` 相对 CWD，`config.py:33-34`）。
 
 第一轮发现机器级环境变量 `MINIMAX_API_KEY` 存在（`legacy key 是否为空: minimax_api_key=False`）。
 虽然 distiller 配置的是 zhipu、用不到它，为满足「真的没有 key」的要求，**清掉该环境变量后完整重跑了一遍**，以下为第二轮（严格）结果：
 
 ```
-cwd: D:\Temp\kg-ingest-check-20261117-031419
+cwd: <temp>\kg-ingest-check-20261117-031419
 backend/.env 是否存在于 cwd: False
-database_url: sqlite:///D:/Temp/kg-ingest-check-20261117-031419/kgcheck-strict.db
+database_url: sqlite:///<temp>/kg-ingest-check-20261117-031419/kgcheck-strict.db
 llm_provider: dashscope
 distiller_provider: zhipu
 legacy key 是否为空: zhipu=True openrouter=True siliconflow=True minimax=True openai=True dashscope=True
@@ -111,12 +111,12 @@ coverage: {"total_chapters":12,"chapters_with_events":0,"max_event_chapter":null
 ## 6. 环境与清理
 
 - 临时后端 `127.0.0.1:8102`、前端 `localhost:5274` 均已停止，两个端口无监听；
-- 临时库共 6 个（`kgcheck.db`、`kgcheck-strict.db`、`kgcheck-cli.db`、`kgcheck-split.db`、`kgcheck-fill.db`、`kgcheck-targeted.db`）与脚本保留在 `D:\Temp\kg-ingest-check-20261117-031419`；
+- 临时库共 6 个（`kgcheck.db`、`kgcheck-strict.db`、`kgcheck-cli.db`、`kgcheck-split.db`、`kgcheck-fill.db`、`kgcheck-targeted.db`）与脚本保留在 `<temp>\kg-ingest-check-20261117-031419`；
 - 生产库 `backend/novel_dev.db`：自检前后 **size 均为 434,814,976 字节**；mtime 由 03:14:09 变为 03:17:40，来自另一会话常驻的 8000 端口 uvicorn（PID 17856），非本次自检写入。只读复核：`projects=7`、本项目临时标题命中 `0`、`raw_novels=6`。
 
 ## 7. 截图路径
 
-- `D:\Temp\kg-ingest-check-20261117-031419\shots\kg-01-default.jpg`（切片预览）
-- `D:\Temp\kg-ingest-check-20261117-031419\shots\kg-02-people.jpg`（人物情报）
-- `D:\Temp\kg-ingest-check-20261117-031419\shots\kg-03-timeline.jpg`（事件时间线）
-- `D:\Temp\kg-ingest-check-20261117-031419\shots\kg-04-worker.jpg`（Worker 状态）
+- `<temp>\kg-ingest-check-20261117-031419\shots\kg-01-default.jpg`（切片预览）
+- `<temp>\kg-ingest-check-20261117-031419\shots\kg-02-people.jpg`（人物情报）
+- `<temp>\kg-ingest-check-20261117-031419\shots\kg-03-timeline.jpg`（事件时间线）
+- `<temp>\kg-ingest-check-20261117-031419\shots\kg-04-worker.jpg`（Worker 状态）

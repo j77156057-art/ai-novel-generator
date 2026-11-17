@@ -85,6 +85,10 @@ backend/data/brief_library/
 # sqlite 旁支（主库 *.db 已被上面的规则忽略）
 *.db-shm
 *.db-wal
+*.db-journal
+
+# 运行期缓存（检索实体/逐字缓存、临时 junit 等）
+.cache/
 
 # 备份目录（约 6GB）与迁移前数据快照
 backend/backups/

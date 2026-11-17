@@ -1,9 +1,9 @@
 # 第23–32章生成耗时分级报告（只读测量）
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 - 测量日期：2026-11-15
-- 范围：项目 6（`backend/novel_dev.db`）第 23–32 章，共 10 章；模型 MiniMax-M3.1-Flash；生成入口 `D:\Temp\p6_write_chapter.py`
+- 范围：项目 6（`backend/novel_dev.db`）第 23–32 章，共 10 章；模型 MiniMax-M3.1-Flash；生成入口 `<temp>\p6_write_chapter.py`
 - 约束：本轮只测不改。未修改 `engine.py` / `consistency.py`，未提交、未推送，未重新生成任何章节。
 - 结论口径：文中「总耗时」= 生成日志里的 `elapsed`（从发起初稿调用到 generation done），不含脚本落盘、边界检查等 8–26 秒的测量侧开销，也不含用户两章之间的空档。
 
@@ -28,10 +28,10 @@
 
 | 类型 | 位置 | 用途 |
 |---|---|---|
-| 生成日志 | `D:\Temp\p18_ch23.log`、`p25_ch24.log`、`p28_ch25.log`、`p32_ch26.log`、`p35_ch27.log`、`p36_ch28.log`、`p44_ch29.log`、`p51_ch30.txt`、`p59_ch31.txt`、`p59_ch32.txt` | 总耗时 `elapsed`、provider、首字 tick、初稿/终稿指标、轮次与失败原因 |
+| 生成日志 | `<temp>\p18_ch23.log`、`p25_ch24.log`、`p28_ch25.log`、`p32_ch26.log`、`p35_ch27.log`、`p36_ch28.log`、`p44_ch29.log`、`p51_ch30.txt`、`p59_ch31.txt`、`p59_ch32.txt` | 总耗时 `elapsed`、provider、首字 tick、初稿/终稿指标、轮次与失败原因 |
 | 生成质量记录 | `backend/novel_dev.db` → `generations.quality_json`（id 47–56） | `draft_completion`、`rewrite_rounds`、`style_gate`、`structure_check`、`brief_tool`、`checked_at` |
 | 章节完成时间 | `novel_dev.db` → `style_checks.created_at` | 每章完成时刻（UTC，已换算本机 UTC+8） |
-| 文件落盘时刻 | `D:\Temp\p6_ch{23..32}_draft.md` / `_final.md` 的 mtime | 切分「初稿阶段」与「重写/压缩尾段」 |
+| 文件落盘时刻 | `<temp>\p6_ch{23..32}_draft.md` / `_final.md` 的 mtime | 切分「初稿阶段」与「重写/压缩尾段」 |
 | 历史重写基准 | 既有探针结果 `p6_rewrite_latency.py`（章 1–22 的 run log） | 单轮重写耗时上界：p50 约 294 秒、p90 约 464 秒 |
 
 ### 1.2 三个可测桶
@@ -186,9 +186,9 @@
 ## 7. 证据索引
 
 - 逐章总耗时、首字 tick、初稿/终稿指标、轮次：
-  - `D:\Temp\p18_ch23.log`、`p25_ch24.log`、`p28_ch25.log`、`p32_ch26.log`、`p35_ch27.log`、`p36_ch28.log`、`p44_ch29.log`、`p51_ch30.txt`、`p59_ch31.txt`、`p59_ch32.txt`
-- 第 31 章截断与失败重写：`D:\Temp\p59_ch31.txt` 第 22–27 行
-- 第 32 章补完轮：`D:\Temp\p59_ch32.txt` 第 26 行
+  - `<temp>\p18_ch23.log`、`p25_ch24.log`、`p28_ch25.log`、`p32_ch26.log`、`p35_ch27.log`、`p36_ch28.log`、`p44_ch29.log`、`p51_ch30.txt`、`p59_ch31.txt`、`p59_ch32.txt`
+- 第 31 章截断与失败重写：`<temp>\p59_ch31.txt` 第 22–27 行
+- 第 32 章补完轮：`<temp>\p59_ch32.txt` 第 26 行
 - 质量记录：`backend/novel_dev.db` → `generations.quality_json`（id 47–56）、`style_checks.created_at`
 - 代码依据：
   - 初稿后摘要：[engine.py](backend/app/generation/engine.py#L4775)

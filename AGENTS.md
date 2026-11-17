@@ -49,7 +49,7 @@ backend\venv\Scripts\python.exe -m pytest -p no:cacheprovider --junitxml="$env:T
 - 不伪造状态或数据让测试变绿；不为变绿放宽断言、加 `skip`、把 `xfail` 改成非严格。过期的 `strict xfail` 要删标记，不是放宽。
 - 不动别的会话在途的 `M` / `??` 文件；不 stash、不格式化、不「顺手清理」。
 - 不删、不改、不迁移只读库：`novel_dev.db`、`kg_vol1.db`、`kg_new.db`。新产物只写 `experiments/` 下的新目录。
-- 不把路径写死到 `D:\Temp`；临时文件用 `tmp_path` / `tempfile`。
+- 不把路径写死到 `<temp>`；临时文件用 `tmp_path` / `tempfile`。
 - **迁移有运行副作用**：`backend/app/models.py`、`backend/app/db.py` 一旦保存，8000 端口的守护进程在服务重启时会执行 `init_db()` / `_migrate_sqlite_columns()`，DDL 会直接落到生产库 `backend/novel_dev.db`。动这两个文件前，先停守护（顺序：先 uvicorn、后 venv shim），或先在副本上验证；做备份前先确认 8000 无监听，再复制/`VACUUM INTO`，再算 sha256。
 
 ## 4. 怎么判断「这是别人的文件」

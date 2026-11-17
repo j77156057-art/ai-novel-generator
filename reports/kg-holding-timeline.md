@@ -179,7 +179,7 @@ record_story_segment(con, item_name, hold_type, owner_name, chapter, *,
 
 ## 7. 小样结果（临时副本，不推广）
 
-副本：`%TEMP%\kg_story_axis_copy.db`（真实库只读复制，**未入库**）。
+副本：`<temp>\kg_story_axis_copy.db`（真实库只读复制，**未入库**）。
 
 ### 7.1 神剑
 

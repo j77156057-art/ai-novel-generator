@@ -1,6 +1,6 @@
 # 测试红灯分诊（2026-11-15，只读）
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 > 范围：项目根 `pytest`（`testpaths = tests`，共收集 **1126** 项，三段执行合计 1127 项次，含参数化）。
 > 约束：不改被测代码、不改配置、不 commit。本文只做归因与动作建议。
@@ -130,10 +130,10 @@
 
 ```
 # 停在 worker 空闲时，单会话整轮跑（约 16 min，建议放到不让别的会话生成的时间窗）
-python -m pytest -q --tb=line -p no:cacheprovider --junitxml=D:/Temp/jfull.xml
+python -m pytest -q --tb=line -p no:cacheprovider --junitxml=<temp>/jfull.xml
 ```
 
-跑完把 `D:/Temp/jfull.xml` 与本文 §2 对差：多出来的就是分段跑漏掉的，按「是否落在 §2 的同一模块」并入对应类别即可（大概率仍落在 A/C 两类的同一批模块上）。
+跑完把 `<temp>/jfull.xml` 与本文 §2 对差：多出来的就是分段跑漏掉的，按「是否落在 §2 的同一模块」并入对应类别即可（大概率仍落在 A/C 两类的同一批模块上）。
 
 ## 7. 复现命令
 
@@ -142,7 +142,7 @@ python -m pytest -q --tb=line -p no:cacheprovider --junitxml=D:/Temp/jfull.xml
 python -m pytest "tests/test_reasoning_wiring.py::test_chat_strips_reasoning" -q --tb=short
 
 # 老脚本单跑（与门禁同口径）
-$env:DATABASE_URL="sqlite:///D:/Temp/x.db"; $env:PYTHONPATH="<repo>\backend"
+$env:DATABASE_URL="sqlite:///<temp>/x.db"; $env:PYTHONPATH="<repo>\backend"
 & "<repo>\backend\venv\Scripts\python.exe" "<repo>\backend\test_m4_api.py"
 
 # 主库写入归因（静默期应不变；有 worker 时每 15 s 变一次）
@@ -155,10 +155,10 @@ $env:DATABASE_URL="sqlite:///D:/Temp/x.db"; $env:PYTHONPATH="<repo>\backend"
 
 | 项 | 值 |
 |---|---|
-| 命令 | `python -m pytest -q > D:\Temp\full_retest.log 2>&1`（单会话、根目录、门禁口径） |
+| 命令 | `python -m pytest -q > <temp>\full_retest.log 2>&1`（单会话、根目录、门禁口径） |
 | commit | `cd321ad`（2026-11-12 02:40:38 +0800，`docs(generation): 复读闸门接线方案稿（定稿）`） |
 | 工作区 | **脏**：223 项（197 个 tracked 改动，其中 183 已 staged；26 个 untracked） |
-| 日志 | `D:\Temp\full_retest.log`，228,717 B / 3,704 行，07:11:10 创建 → 07:30:26 最后写入，**19.3 min** |
+| 日志 | `<temp>\full_retest.log`，228,717 B / 3,704 行，07:11:10 创建 → 07:30:26 最后写入，**19.3 min** |
 | 开跑前关键模块已停手 | `engine.py` 06:38、`provider.py` 05:28、`prompts.py` 05:25、`narrative.py` 01:44、`branch.py` 11-14 06:11 —— 均早于 07:11，**本次结果是一个稳定快照**（§0 里「engine 还在改」的漂移风险已消失） |
 | 跑完后又被改、**不在本次结果内** | `backend/app/retrieval/brief/{render,settings,tool}.py`（11:06–11:08）、`backend/app/kg/quality_report.py`（07:40） |
 
@@ -222,10 +222,10 @@ $env:DATABASE_URL="sqlite:///D:/Temp/x.db"; $env:PYTHONPATH="<repo>\backend"
 
 | 项 | 值 |
 |---|---|
-| 命令 | `python -m pytest -o addopts="-ra" --junitxml=D:\Temp\full_retest_rerun.xml 2>&1 \| Tee-Object -FilePath D:\Temp\full_retest2.log -Append` |
+| 命令 | `python -m pytest -o addopts="-ra" --junitxml=<temp>\full_retest_rerun.xml 2>&1 \| Tee-Object -FilePath <temp>\full_retest2.log -Append` |
 | commit | `989abce`（14:41 首轮跑测后，另一会话把 230 项改动提交了；首轮快照是 `563666b` + 230 项脏） |
 | 工作区 | **干净**：DIRTY=0 / STAGED=0 / UNTRACKED=0（开跑时记录） |
-| 日志 | `D:\Temp\full_retest2.log` 追加段，15:19:39 → 15:39:15，**19 min 32 s** |
+| 日志 | `<temp>\full_retest2.log` 追加段，15:19:39 → 15:39:15，**19 min 32 s** |
 | 收集 | **1130 items**（`testpaths=tests`，与首轮一致） |
 
 **汇总行原文**
@@ -244,7 +244,7 @@ $env:DATABASE_URL="sqlite:///D:/Temp/x.db"; $env:PYTHONPATH="<repo>\backend"
 
 **关于「末尾计数行」**：`pytest.ini` 的 `addopts = -ra -q`，pytest 8.3.4 在 `-q` 下不输出末尾 tally 行。已用 7 条的小样本复现：`-q` 无末行；`-o addopts=""` 输出 `7 passed in 10.50s`。因此本次重跑用 `-o addopts="-ra"`（测试集不变）让汇总行落盘；§8.2 的「收尾丢写」归因据此更正。
 
-**兜底解析**：`D:\Temp\full_retest_rerun.xml` 已生成（日志中 `generated xml file:` 一行），可作为失败/通过数的机器可读兜底。
+**兜底解析**：`<temp>\full_retest_rerun.xml` 已生成（日志中 `generated xml file:` 一行），可作为失败/通过数的机器可读兜底。
 
 ## 9. 修复落地（2026-11-15 11:xx–12:xx，未 commit）
 

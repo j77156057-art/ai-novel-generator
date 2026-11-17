@@ -54,7 +54,7 @@ python -m playwright install chromium
 | 项 | 实际 | 备注 |
 | --- | --- | --- |
 | `playwright` wheel | 42.7MB | 原预估 3–5MB |
-| Chromium 完整版 | 452MB | 落在用户级缓存（`%LOCALAPPDATA%\ms-playwright`） |
+| Chromium 完整版 | 452MB | 落在用户级缓存（`<localappdata>\ms-playwright`） |
 | Chromium headless shell | 287MB | 同上，二者合计约 739MB |
 | 新增占盘合计 | 约 854MB | 原预估 150–180MB |
 

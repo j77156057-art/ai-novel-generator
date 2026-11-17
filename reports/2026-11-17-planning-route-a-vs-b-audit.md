@@ -35,7 +35,7 @@
 
 #### 数据结构
 
-`PlotNode` 与 `TimelineState` 定义在 [timeline.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/timeline.py#L33-L74)：
+`PlotNode` 与 `TimelineState` 定义在 [timeline.py](backend/app/generation/timeline.py#L33-L74)：
 
 - `PlotNode.id / kind("main"|"branch") / title / emotion`
 - `entry_condition`（起点状态，注入提示）
@@ -62,16 +62,16 @@
 生成一章前：
 
 - 由 `_timeline_progress(db, project)` 推当前章号，再用 `current_node_prompt(project, written, chapter=..., chapter_based=True)` 选节点（`engine.py:4776-4810`）。
-- `chapter_outline_entry(project.outline, chapter)` 取**本章那一条**章纲；提示词里同时放“本章大纲”和“当前剧情进度”，并明确“本章大纲的具体事件优先，剧情进度只约束节奏与停笔点”（[prompts.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/prompts.py#L1291-L1301)）。
+- `chapter_outline_entry(project.outline, chapter)` 取**本章那一条**章纲；提示词里同时放“本章大纲”和“当前剧情进度”，并明确“本章大纲的具体事件优先，剧情进度只约束节奏与停笔点”（[prompts.py](backend/app/generation/prompts.py#L1291-L1301)）。
 - `build_node_prompt` 注入：覆盖章节区间、“只写这个区间内的事件，不得提前用后面章节的材料”、entry/exit、当前 beat、主线进度、三条硬约束（不提前用后续节点、不引入章纲/entry/exit/可用角色表之外的角色、不写结局）。【事实】
 - `filter_available_characters` 按“已出场 + 本章大纲 + 角色卡首次出场章”过滤角色；`_advance_block` 把台账里的推进要求挂进提示（`engine.py:1888`）。【事实】
 
-一个容易漏掉的诊断缺口：`/api/generate-plan` 的注释说“预检页必须与真实生成同源”，但它调用 `current_node_prompt(proj, written, provider, db=db)` 时**没有传 `chapter=`**（[generation.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/routers/generation.py#L301-L303)）。因此章模式下预检拿到的节点/章纲可能与实际生成不是同一份；同时它传了 `provider` 和 `db`，预检本身可能触发建图并持久化。这是“预检所见 ≠ 实际下发”的具体来源。【事实 + 推断】
+一个容易漏掉的诊断缺口：`/api/generate-plan` 的注释说“预检页必须与真实生成同源”，但它调用 `current_node_prompt(proj, written, provider, db=db)` 时**没有传 `chapter=`**（[generation.py](backend/app/routers/generation.py#L301-L303)）。因此章模式下预检拿到的节点/章纲可能与实际生成不是同一份；同时它传了 `provider` 和 `db`，预检本身可能触发建图并持久化。这是“预检所见 ≠ 实际下发”的具体来源。【事实 + 推断】
 
 生成一章后：
 
 - `_judge_and_advance(..., chapter_based=True)`：章号不变时直接 `skipped_reason="rewrite_same_chapter"`；章号前进才 `sync_node_for_chapter`，并用 `judge_node_completion` 判 exit（只返回 `true/false`，最多看最近 1200 字），`true` 只记 `early_done`，不切走 `current_node`（`engine.py:4719-4747`）。
-- `_run_structure_check`：检查情节点覆盖、越章材料（后续章关键词命中）、人物性别一致；`structure_guard_mode` 默认 `report`，可配 `block`（`engine.py:1765-1795`、`5069`、`5525`）。覆盖判定有一个自带的退化条件：本章大纲切出的单元太少（典型是卷纲一句一章）时，`discrimination="insufficient"`，覆盖率不参与判据，只输出兜底值、不拦截（[structure_check.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/structure_check.py#L8-L32)）。【事实】
+- `_run_structure_check`：检查情节点覆盖、越章材料（后续章关键词命中）、人物性别一致；`structure_guard_mode` 默认 `report`，可配 `block`（`engine.py:1765-1795`、`5069`、`5525`）。覆盖判定有一个自带的退化条件：本章大纲切出的单元太少（典型是卷纲一句一章）时，`discrimination="insufficient"`，覆盖率不参与判据，只输出兜底值、不拦截（[structure_check.py](backend/app/generation/structure_check.py#L8-L32)）。【事实】
 - `_run_progress_ledger` 与 `_coherence_report` 生成质量回执，默认也是报告/可选重写，不是硬闸。【事实】
 
 #### A 的关键设计判断
@@ -335,18 +335,18 @@ B 的注释自己记录了两次实测事故，值得原样保留：
 
 ### A.1 当前分支（可点开）
 
-- [timeline.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/timeline.py#L33-L74)：PlotNode/TimelineState；`chapter_start/end`
-- [timeline.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/timeline.py#L330-L397)：schema v1、节点序列化、均分章区间
-- [timeline.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/timeline.py#L410-L477)：`node_for_chapter`、`sync_node_for_chapter`
-- [timeline.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/timeline.py#L600-L733)：`plan_nodes_with_llm`、bool judge
-- [engine.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L1765-L1795)：`_run_structure_check` 与默认 report
-- [engine.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L4569-L4640)：`_timeline_state_for` 的章同步与建图
-- [engine.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L4719-L4747)：章模式 judge/`rewrite_same_chapter`
-- [engine.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/engine.py#L4776-L4815)：`current_node_prompt`
-- [prompts.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/prompts.py#L1291-L1306)：章纲与节点块同时注入
-- [generation.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/routers/generation.py#L277-L304)：`/api/generate-plan`（预检不带 chapter）
-- [models.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/models.py#L122-L137)：main 的 4 个权威列已在当前模型
-- [models.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/models.py#L609-L623)：`Generation` 无 prompt 字段
+- [timeline.py](backend/app/generation/timeline.py#L33-L74)：PlotNode/TimelineState；`chapter_start/end`
+- [timeline.py](backend/app/generation/timeline.py#L330-L397)：schema v1、节点序列化、均分章区间
+- [timeline.py](backend/app/generation/timeline.py#L410-L477)：`node_for_chapter`、`sync_node_for_chapter`
+- [timeline.py](backend/app/generation/timeline.py#L600-L733)：`plan_nodes_with_llm`、bool judge
+- [engine.py](backend/app/generation/engine.py#L1765-L1795)：`_run_structure_check` 与默认 report
+- [engine.py](backend/app/generation/engine.py#L4569-L4640)：`_timeline_state_for` 的章同步与建图
+- [engine.py](backend/app/generation/engine.py#L4719-L4747)：章模式 judge/`rewrite_same_chapter`
+- [engine.py](backend/app/generation/engine.py#L4776-L4815)：`current_node_prompt`
+- [prompts.py](backend/app/generation/prompts.py#L1291-L1306)：章纲与节点块同时注入
+- [generation.py](backend/app/routers/generation.py#L277-L304)：`/api/generate-plan`（预检不带 chapter）
+- [models.py](backend/app/models.py#L122-L137)：main 的 4 个权威列已在当前模型
+- [models.py](backend/app/models.py#L609-L623)：`Generation` 无 prompt 字段
 
 ### A.2 main 分支（未检出，按 `origin/main:` 引用）
 

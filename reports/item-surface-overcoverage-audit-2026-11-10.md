@@ -1,6 +1,6 @@
 # Surface 层「写法比组名更泛」审计
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 日期：2026-11-10  
 范围：`backend/data/generated.db` 的 `kg_item_surface`（只统计 `status='approved'`），覆盖度按 `novel_chunks(novel_id=5)` 的**独立章数**算。  
@@ -25,7 +25,7 @@
 1. **覆盖章数**：该写法出现在多少个不同 `chapter_no` 里（同一章多个 chunk 只算 1 章）。
 2. **摘除后组覆盖**：把该 surface 从 approved 集合拿掉后，该组剩下所有写法（含规范名）的章号并集。
 3. **真归属**：按句子切分，只有句子里同时出现组内证据词（银器/黑金/半块/周旻/灵龙…）才算「真该归本组」；这是估算，用于判断多算比例，不作为写库依据。
-4. **读通道**：在副本 `D:\Temp\gen_sim2.db` 上把这 11 条 surface 置 `pending`，用真实应用库调 `current_item_holdings`，观察每种写法的 `status / group_id / via`。
+4. **读通道**：在副本 `<temp>\gen_sim2.db` 上把这 11 条 surface 置 `pending`，用真实应用库调 `current_item_holdings`，观察每种写法的 `status / group_id / via`。
 
 ---
 

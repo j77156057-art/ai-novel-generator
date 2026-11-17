@@ -1,11 +1,11 @@
 # 物品治理：要改哪几行、会撞什么（只读核对清单）
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 - 日期：2026-11-10
 - 方式：**全程只读**。所有连接均以 `file:...?mode=ro&uri=true` 打开，未执行任何 INSERT/UPDATE/DELETE，未生成备份（因为没有写入）。
 - 库：`backend/data/generated.db`（组/写法/持有段）+ `backend/novel_dev.db`（实体/提及）
-- 相关脚本（临时，未入库）：`D:\Temp\audit_schema.py`、`audit_dump.py`、`audit_targeted.py`、`audit_sidebar.py`、`audit_gaps.py`、`audit_detail.py`、`audit_ddl.py`、`audit_scan.py`、`audit_ent.py`、`audit_read.py`、`audit_spear.py`、`audit_evidence.py`、`audit_mention2.py`
+- 相关脚本（临时，未入库）：`<temp>\audit_schema.py`、`audit_dump.py`、`audit_targeted.py`、`audit_sidebar.py`、`audit_gaps.py`、`audit_detail.py`、`audit_ddl.py`、`audit_scan.py`、`audit_ent.py`、`audit_read.py`、`audit_spear.py`、`audit_evidence.py`、`audit_mention2.py`
 
 ## 0. 现状基线（先给坐标，后面所有行号都落在这张表上）
 

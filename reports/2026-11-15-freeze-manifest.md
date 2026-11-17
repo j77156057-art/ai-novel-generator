@@ -1,6 +1,6 @@
 # 两分支冻结快照清单（2026-11-15）
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 > 本文件仅本地留存，不提交、不推送。
 
@@ -68,7 +68,7 @@
 | `worktrees/registry-r5` | `fix/registry-r5-whitelist` | 未跟踪 1 项（`nul`） |
 | `worktrees/style-distill` | `feat/style-distillation` | 未跟踪 3 项 |
 | `worktrees/timeline-pacing` | `feat/timeline-pacing` | 修改 1 项 + 未跟踪 2 项 |
-| 其余 7 个（含 `D:/Temp/mwt-main-20261115`、`D:/Temp/wt-detail-backend`，均 detached 于 `cb05a45`） | — | 干净 |
+| 其余 7 个（含 `<temp>/mwt-main-20261115`、`<temp>/wt-detail-backend`，均 detached 于 `cb05a45`） | — | 干净 |
 
 ## 7. 如何用这个快照复现某次比对
 

@@ -1,6 +1,6 @@
 # 物品持有注入块：真实数据验收报告
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 - 日期：2026-11-10
 - 范围：`settings.kg_item_holding_inject` → `_item_holding_text` → `build_user_prompt` 的整条注入链
@@ -30,8 +30,8 @@
 
 - 纯只读：`sqlite3` 以 `mode=ro` 打开，SQLAlchemy 只做 `select`；`_active_item_entries`/`_item_holding_text` 直接调用生产函数。
 - 未执行任何生成，未修改任何库。
-- 临时脚本（不入库）：`D:\Temp\verify_chain.py`、`D:\Temp\verify_narrative.py`、`D:\Temp\verify_fingerprint.py`、`D:\Temp\verify_timeline.py`、`D:\Temp\bench_rrf.py`、`D:\Temp\bench_hybrid.py`。
-- 机制验证副本：`D:\Temp\diag_inject_copy.py`（复制 `novel_dev.db` 后补 1 条 mention，**仅证明渲染器可用，明确不作为生产证据**）。
+- 临时脚本（不入库）：`<temp>\verify_chain.py`、`<temp>\verify_narrative.py`、`<temp>\verify_fingerprint.py`、`<temp>\verify_timeline.py`、`<temp>\bench_rrf.py`、`<temp>\bench_hybrid.py`。
+- 机制验证副本：`<temp>\diag_inject_copy.py`（复制 `novel_dev.db` 后补 1 条 mention，**仅证明渲染器可用，明确不作为生产证据**）。
 
 ---
 

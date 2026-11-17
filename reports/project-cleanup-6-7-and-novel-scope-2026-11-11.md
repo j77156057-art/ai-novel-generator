@@ -1,6 +1,6 @@
 # 项目 6/7 清理与 `kg_item_group.novel_id` 只读评估
 
-> 说明：下文出现的 `D:\Temp` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
+> 说明：下文出现的 `<temp>` 路径是当时本机临时脚本 / 副本 / 日志的位置，**这些脚本未入库**，仅作取证记录保留，不可直接复跑。
 
 日期：2026-11-11  
 范围：`backend/novel_dev.db`（应用库，已改）、`backend/data/generated.db`（生成库，未改）  
@@ -231,7 +231,7 @@
 
 ### D.6 回滚实测（库副本）
 
-副本 `D:\Temp\rb_copy.db`（200704 bytes）→ `ALTER TABLE kg_item_group DROP COLUMN novel_id`：
+副本 `<temp>\rb_copy.db`（200704 bytes）→ `ALTER TABLE kg_item_group DROP COLUMN novel_id`：
 
 | 项 | 结果 |
 |---|---|
@@ -394,7 +394,7 @@ kg_item_surface  (project_id, COALESCE(novel_id, -1), surface)
 
 ### E.7 验收数字、测试与仍然留着的缺口
 
-改后逐项复核（`D:\Temp\d3_verify.py`，cwd=backend）：
+改后逐项复核（`<temp>\d3_verify.py`，cwd=backend）：
 
 - `coverage_gid45 = 125`；
 - 六个探针：`暗金色长刀`/`太平刀`/`黑金长刀`/`刀胚`/`黑金刀` → `held / gid45 / via=surface / lines=2 / md5 617c601c…`，`镇国剑` → `held / gid100 / via=surface / lines=2 / md5 24e7c486…`，与改前逐字一致；
@@ -529,7 +529,7 @@ kg_item_surface  (project_id, COALESCE(novel_id, -1), surface)
 
 **ORM 与幂等**：`Project` 查询 5 行正常，`active_novel_id` 读出 `None/None/None/None/5`；`ensure_schema()` 二次调用不报错（列已存在则跳过）。
 
-**回滚实测（库副本）**：`Copy-Item novel_dev.db → D:\Temp\copy_active.db` → `--apply`（23→24 列、5 行不变）→ `--rollback` → 与生产原库逐项比对：**DDL 归一后逐字一致、索引一致、23 列一致、5 行数据一致**。即回滚能把库还原到加列前，不是「只把值清空」。
+**回滚实测（库副本）**：`Copy-Item novel_dev.db → <temp>\copy_active.db` → `--apply`（23→24 列、5 行不变）→ `--rollback` → 与生产原库逐项比对：**DDL 归一后逐字一致、索引一致、23 列一致、5 行数据一致**。即回滚能把库还原到加列前，不是「只把值清空」。
 
 ### F.6 仍然留着的缺口
 
@@ -913,7 +913,7 @@ out-scope : 400 续写书指定的书 #2 不在本项目的可写范围内（参
 
 ### I.8 回滚实测（库副本，不是嘴上说）
 
-在 `D:\Temp\kgbk` 的 `novel_dev.db` / `generated.db` 副本上先 `--apply` 再 `--rollback`：
+在 `<temp>\kgbk` 的 `novel_dev.db` / `generated.db` 副本上先 `--apply` 再 `--rollback`：
 
 - 结构：`kg_entities` 回到原来的表级 `UNIQUE(project_id, kind, canonical_name)`（`sqlite_master`
   逐条比对），`kg_mentions.novel_id` 删除；
@@ -942,7 +942,7 @@ out-scope : 400 续写书指定的书 #2 不在本项目的可写范围内（参
 
 ## J. 写侧 / 提及层流程断点（只读诊断）
 
-> 本轮**不改代码、不改数据**。所有写操作都发生在 `D:\Temp\diag\run\` 的库副本上；
+> 本轮**不改代码、不改数据**。所有写操作都发生在 `<temp>\diag\run\` 的库副本上；
 > 真实库两个文件的 mtime 停在 `generated.db 00:49:13` / `novel_dev.db 01:38:54`，
 > 本次诊断跑在 `01:45–01:52`，可以据此证明没被污染。
 
@@ -1024,7 +1024,7 @@ v3.0 抽取链路只写 `novel_dev.db` 的九张表；库里 60 条持有行、1
 
 ### J.6 单答二：现在写一章正文，跑完抽取后 `generated.db` 会多出什么（实测）
 
-环境：`novel_dev.db`（131 MB）+ `data/generated.db`（246 KB）复制到 `D:\Temp\diag\run\`，
+环境：`novel_dev.db`（131 MB）+ `data/generated.db`（246 KB）复制到 `<temp>\diag\run\`，
 `DATABASE_URL` / `KG_GENERATED_DB` 指向副本；project 5（`active_novel_id=5`）。
 三个阶段分别跑「真实 provider 全链」「provider 不可用降级」「完美抽取直接打落库层」：
 
@@ -1115,7 +1115,7 @@ v3.0 抽取链路只写 `novel_dev.db` 的九张表；库里 60 条持有行、1
 
 ### K.4 库副本真跑一章：新增明细
 
-副本：`backend/novel_dev.db` + `backend/data/generated.db` 先回到跑前快照（`D:\Temp\d4\copy_backup`），`DATABASE_URL` / `KG_GENERATED_DB` 指向副本；project 5、novel 5 的前 5 个 chunk（第 1–2 章，约 5.7k 字）；真实 provider；`enqueue_segment ×5 → flush_project(5)`。
+副本：`backend/novel_dev.db` + `backend/data/generated.db` 先回到跑前快照（`<temp>\d4\copy_backup`），`DATABASE_URL` / `KG_GENERATED_DB` 指向副本；project 5、novel 5 的前 5 个 chunk（第 1–2 章，约 5.7k 字）；真实 provider；`enqueue_segment ×5 → flush_project(5)`。
 
 | 表 | 跑前 | 跑后 | 新增 |
 |---|---:|---:|---:|
@@ -1136,7 +1136,7 @@ v3.0 抽取链路只写 `novel_dev.db` 的九张表；库里 60 条持有行、1
 - 持有投影：组 `103 税银`（novel 5, active）、写法 `282 税银 → 103 approved`、持有 `66 税银 → 许平志`（`owner_state=held, valid_from=2, reason_code=attr_held_by, confidence=0.6`）、故事旁注 `5 → holding 66 / forward / chapter 2`。
 - 5 行 `AgentRun` 全部 `success`；投影统计 `{"pairs":1,"groups_created":1,"surfaces_created":1,"holdings":{"inserted":1},"story_segments":1,"surface_conflicts":[],"errors":[]}`。
 
-**真实库同验证（跑前已备份到 `D:\Temp\d4\real_backup`）**：
+**真实库同验证（跑前已备份到 `<temp>\d4\real_backup`）**：
 
 | 表 | 跑前 | 跑后 | 新增 |
 |---|---:|---:|---:|

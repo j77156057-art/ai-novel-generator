@@ -1,7 +1,7 @@
 """E 任务验收：抽取器 3 字名 / 噪声护栏回归。
 
 8 个 fixture 全部 PASS = 任务完成。失败回退：把 fail 的 fixture + 当前 3 字段
-值/反例给 WorkBuddy 收口人，不要硬塞。
+值/反例给收口人，不要硬塞。
 """
 import json
 import pathlib

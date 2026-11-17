@@ -562,7 +562,7 @@ UPDATE generation_snapshots
 | CAS 失败 | 心跳新鲜时 `takeover=True` → 409「这段正由另一个进程写入……未能接管」，pending 仍只有原来那条 |
 | 心跳开销 | 1000 次节流判断 **0.78 ms**（单次 0.0008 ms，零写库）；真实心跳写库 10 次 avg **9.31 ms**（min 8.01 / max 10.51）。按 20s 一次摊薄，写入放大可忽略 |
 
-迁移演练：在 `D:\Temp\snapshot-rehearsal\novel_dev_copy_v2.db` 上插入一条
+迁移演练：在 `<temp>\snapshot-rehearsal\novel_dev_copy_v2.db` 上插入一条
 **无租约的存量 pending** → `--apply` 后三列存在且该行三列仍为 `NULL`（未被
 伪造租约）→ 再 `--apply` 幂等 → `--rollback` 后表删除、回滚前备份中该行
 仍在 → 再 `--apply` 恢复。真实库 `novel_dev.db` 已 apply（列已加，0 行）。

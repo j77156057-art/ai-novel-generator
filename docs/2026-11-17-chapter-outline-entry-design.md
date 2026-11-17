@@ -9,15 +9,15 @@
 ## 0. 先说三条事实校正（影响方案选型）
 
 1. **今天没有章纲编辑入口，但不是完全没有写入点。**
-   - 创建项目时写一次：[projects.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/routers/projects.py#L59-L65) `outline=body.outline`。
-   - `PATCH /projects/{id}` **不能**改 outline：[schemas.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/schemas.py#L90-L111) 的 `ProjectPatch` 没有 `outline` 字段；`patch_project` 只按 `model_dump(exclude_unset=True)` 的已知字段 `setattr`（[projects.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/routers/projects.py#L605-L662)）。`outline` 出现在 `ProjectOut`（[schemas.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/schemas.py#L114-L121)），是**只读返回**。
+   - 创建项目时写一次：[projects.py](backend/app/routers/projects.py#L59-L65) `outline=body.outline`。
+   - `PATCH /projects/{id}` **不能**改 outline：[schemas.py](backend/app/schemas.py#L90-L111) 的 `ProjectPatch` 没有 `outline` 字段；`patch_project` 只按 `model_dump(exclude_unset=True)` 的已知字段 `setattr`（[projects.py](backend/app/routers/projects.py#L605-L662)）。`outline` 出现在 `ProjectOut`（[schemas.py](backend/app/schemas.py#L114-L121)），是**只读返回**。
    - 结论：除创建时外，当前没有任何受校验的章纲写入路径。
 
 2. **前端没有章纲/大纲 UI。** `ProjectWorkspace.vue` 全文件对 `outline|大纲|章纲` 零命中；`views/` 下也没有独立大纲页。
 
 3. **章区间不是手工字段，而是按 outline 长度均分出来的。**
-   - `state_from_dict(..., total_chapters=len(outline))` 每次恢复都会 `assign_chapter_ranges`（[timeline.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/timeline.py#L514-L577)）。
-   - `_balanced_chapter_ranges` 按大纲条数均分（[timeline.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/timeline.py#L360-L398)）。
+   - `state_from_dict(..., total_chapters=len(outline))` 每次恢复都会 `assign_chapter_ranges`（[timeline.py](backend/app/generation/timeline.py#L514-L577)）。
+   - `_balanced_chapter_ranges` 按大纲条数均分（[timeline.py](backend/app/generation/timeline.py#L360-L398)）。
    - 因此**改 outline 长度 = 改所有节点的章区间**；这一点必须在保存回执和界面上显式告知，不能静默。
 
 ---
@@ -30,7 +30,7 @@
 |---|---|---|
 | 复用 `project.outline`（`list[str]`，下标=章号-1） | **采用** | 零 schema 迁移；`chapter_outline_entry`、`_outline_entries`、`plan_nodes_with_llm` 已经按这个形态读；第 44 章以后追加即可生效 |
 | 新表 `chapter_outlines` | 不采用（本阶段） | 需要建表/迁移；且要让生成链路读到，仍得同步回 `project.outline` 或改 `prompts.py`/`engine.py`（共享文件） |
-| 把条目改成 `list[dict]`（带 title/status） | 不采用 | `chapter_outline_entry` 对每条做 `str(x)`（[prompts.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/prompts.py#L795-L813)），dict 会被渲染成字面量，必须改共享文件 |
+| 把条目改成 `list[dict]`（带 title/status） | 不采用 | `chapter_outline_entry` 对每条做 `str(x)`（[prompts.py](backend/app/generation/prompts.py#L795-L813)），dict 会被渲染成字面量，必须改共享文件 |
 | 复用 `CausalNode`（`generation/planning.py`） | 不采用为章纲载体 | `CausalNode` 是 3–12 个**场景级**因果节点，不是 40+ 条章级提纲；它适合以后做「规划扩展」，不适合一章一条 |
 
 ### 1.2 存储约定（关键细节）
@@ -263,7 +263,7 @@
 
 ## 6. 与生成链路的衔接（不静默的落点）
 
-- **消费端已经存在**：`chapter_outline_entry(project.outline, chapter)` 在生成提示里取本章条目（[prompts.py](file:///c:/Users/h'h'h/WorkBuddy/2026-10-12-11-59-30/ai-novel-generator/backend/app/generation/prompts.py#L795-L813)）。所以只要把 44 章写进 `outline`，下一次生成就能读到，**本阶段不需要改生成引擎**。
+- **消费端已经存在**：`chapter_outline_entry(project.outline, chapter)` 在生成提示里取本章条目（[prompts.py](backend/app/generation/prompts.py#L795-L813)）。所以只要把 44 章写进 `outline`，下一次生成就能读到，**本阶段不需要改生成引擎**。
 - **但「缺章纲」目前在生成侧是静默的**：`chapter_outline_entry` 返回 `None` 后，提示里就没有「本章大纲」块，调用方不记录。要满足「界面可见」，需要 S4：
   - `routers/generation.py` 的 `/generate-plan` 响应加 `outline_status`（`confirmed|missing|beyond_end` + `missing_chapters`）；
   - `generate_next_segment` / 流式回执的 meta 同步带同一字段；
