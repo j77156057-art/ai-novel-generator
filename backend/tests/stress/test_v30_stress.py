@@ -62,6 +62,10 @@ def check_true(label: str, cond) -> None:
 
 
 DB_PATH = str(Path(tempfile.gettempdir()) / "step6_stress.db")
+# 每次重跑都从空库开始：`create_all` 只补缺表、不改已有表结构，沿用上次的库文件
+# 会在 schema 加列后报「table generations has no column named quality_json」。
+if os.path.exists(DB_PATH):
+    os.unlink(DB_PATH)
 engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine, future=True)

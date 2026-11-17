@@ -26,11 +26,12 @@ from sqlalchemy.orm import Session  # noqa: E402
 
 import pytest  # noqa: E402
 
+from app.db import Base  # noqa: E402
 from app.kg import batch_worker as bw  # noqa: E402
 from app.kg import generated_store as store  # noqa: E402
 from app.kg.extractor_v3 import attribute_event_segments  # noqa: E402
 from app.kg.holding_projection import project_holdings  # noqa: E402
-from app.models import Generation, KgEntity, KgEvent, KgMention  # noqa: E402
+from app.models import KgEntity, KgEvent, KgMention  # noqa: E402
 
 _PROJECT = 7
 _BOOK = 5
@@ -413,13 +414,15 @@ def test_event_segments_degenerate_all_first_segment():
 # ---------------------------------------------------------------------------
 # 6. 成功路径补 item 提及（库里已有物品 + 正文命中）
 # ---------------------------------------------------------------------------
-_TABLES = (KgEntity, KgEvent, Generation, KgMention)
-
-
 def _session(tmp_path) -> Session:
+    """按全量 schema 建库。
+
+    只建本文件直接用到的几张表会随被测代码新增读取而漏（`_persist_extraction`
+    现在要经 `book_for_project` 读 `projects`），因此与项目里其他测试一致，
+    直接建 `Base.metadata`。
+    """
     engine = create_engine(f"sqlite:///{pathlib.Path(tmp_path) / 'app.db'}")
-    for model in _TABLES:
-        model.__table__.create(bind=engine)
+    Base.metadata.create_all(bind=engine)
     return Session(engine)
 
 
