@@ -35,6 +35,28 @@ _TRANSFER_VERBS = (
     "归还", "还回", "赠", "送出", "偷走", "抢走", "缴获", "掉落", "遗失", "丢掉",
 )
 
+#: 持有动词与物件名之间允许的最大字符距离。同句共现不等于同一动作
+#: （「举起手机……附件页码一并拍下」里的「举起」作用在手机上，不是附件）。
+_VERB_WINDOW = 12
+
+#: 分句符：持有动词必须和物件在**同一分句**里才算同一动作。
+_CLAUSE_SPLIT = re.compile(r"[，,、；;]")
+
+
+def _clause_bounds(sent: str, pos: int) -> tuple[int, int]:
+    """返回 `pos` 所在分句的 [start, end)。"""
+    start = 0
+    for m in _CLAUSE_SPLIT.finditer(sent):
+        if m.start() < pos:
+            start = m.end()
+        else:
+            return start, m.start()
+    return start, len(sent)
+
+
+#: 紧跟在这些字后面的物件名属于另一个词（「记录」→「记录单/记录本」）。
+_COMPOUND_SUFFIX = frozenset("单本页表册簿")
+
 #: 死亡语境豁免：回忆/梦境/遗物里的提及不算「出场」。
 _MEMORY_MARKERS = (
     "回忆", "回想", "梦境", "梦见", "想起", "遗物", "替身", "复活",
@@ -52,9 +74,17 @@ _SPEAKER_RE = re.compile(
 #: K3 的代词/泛称黑名单（不是人名）。
 _NOT_NAMES = {
     "他们", "她们", "我们", "你们", "众人", "有人", "那人", "此人", "对方",
-    "大家", "所有人", "自己", "两人", "三人", "一人", "旁人", "旁人", "男人",
-    "女人", "老者", "少年", "少女", "声音", "众人", "半晌", "片刻",
+    "大家", "所有人", "自己", "两人", "三人", "一人", "旁人", "男人",
+    "女人", "老者", "少年", "少女", "声音", "半晌", "片刻",
 }
+
+#: K3 的姓氏闸：说话人候选必须以常见姓氏开头，否则「我知/不知/没有回」这类
+#: 短语会被当成名字（影子跑实测：不加闸时 52 条命中里几乎全是短语）。
+_SURNAMES = set(
+    "王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田"
+    "董袁潘于蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白"
+    "邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤"
+)
 
 #: K5 的通用词（不能当剧透证据）。
 _TOKEN_STOP = {
@@ -96,8 +126,35 @@ def _entities(db, project_id: int) -> dict[int, KgEntity]:
     return {e.id: e for e in rows if e.novel_id is None}
 
 
+def _holder_as_of(edges: list[tuple[int, int, KgEntity]],
+                  chapter: int | None) -> KgEntity | None:
+    """按 `since_chapter` 取「截至本章」的持有者；并列或未知返回 None。
+
+    影子跑实测：同一物件常有多个 active 持有边（先后属于不同角色），
+    全部当成「当前持有者」会让每个后来的持有者都变成越界。只认
+    `since_chapter` 最大且 ≤ 本章的那条；同一章有多个持有者说明 KG 自身冲突，
+    不判（宁缺勿错）。
+    """
+    if chapter is None:
+        # 章号未知时无法按时间线取持有者：多个持有者一律视为冲突，不判。
+        owners = {holder.id for _since, _eid, holder in edges}
+        return edges[0][2] if len(owners) == 1 else None
+    usable = [
+        (since or 0, eid, holder) for since, eid, holder in edges
+        if (since or 0) <= chapter
+    ]
+    if not usable:
+        return None
+    top = max(since for since, _eid, _holder in usable)
+    owners = {holder.id for since, _eid, holder in usable if since == top}
+    if len(owners) > 1:
+        return None
+    return next(holder for since, _eid, holder in usable if since == top)
+
+
 def _check_holdings(db, project_id: int, entities: dict[int, KgEntity],
-                    text: str, limit: int = 5) -> list[dict]:
+                    text: str, chapter: int | None = None,
+                    limit: int = 5) -> list[dict]:
     """K1：段内有明确持有句，但 KG 当前持有者是别人（definite）。"""
     rels = db.scalars(
         select(KgRelation).where(
@@ -107,16 +164,40 @@ def _check_holdings(db, project_id: int, entities: dict[int, KgEntity],
             KgRelation.novel_id.is_(None),
         )
     ).all()
-    pairs: list[tuple[KgEntity, KgEntity]] = []
+    by_item: dict[int, list[tuple[int, int, KgEntity]]] = {}
+    item_entities: dict[int, KgEntity] = {}
     for r in rels:
         item, holder = entities.get(r.to_id), entities.get(r.from_id)
-        if item is not None and holder is not None and item.kind == "item":
-            if holder.kind == "character":
-                pairs.append((item, holder))
+        if item is None or holder is None or item.kind != "item":
+            continue
+        if holder.kind != "character":
+            continue
+        by_item.setdefault(item.id, []).append(
+            (int(r.since_chapter or 0), int(r.id), holder)
+        )
+        item_entities[item.id] = item
+    pairs: list[tuple[KgEntity, KgEntity]] = []
+    for item_id, edges in by_item.items():
+        holder = _holder_as_of(edges, chapter)
+        if holder is not None:
+            pairs.append((item_entities[item_id], holder))
     if not pairs:
         return []
 
     chars = [e for e in entities.values() if e.kind == "character"]
+    char_names = {a for c in chars for a in _aliases(c)}
+    # 别名冲突：同一个别名被多个物件实体共用（如「手机」同时属于旧手机/录像手机）
+    # 时，它无法定位具体物件——整条别名剔除，否则一句话会产出多条互相矛盾的命中。
+    # 必须按**全部物件实体**统计，而不是只看有持有者的那些：某个物件因为持有者
+    # 冲突被剔除后，它的别名不能改由另一个物件独占。
+    alias_owner: dict[str, set[int]] = {}
+    for item in entities.values():
+        if item.kind != "item":
+            continue
+        for alias in _aliases(item):
+            alias_owner.setdefault(alias, set()).add(item.id)
+    shared = {a for a, owners in alias_owner.items() if len(owners) > 1}
+
     findings: list[dict] = []
     seen: set[tuple[int, str]] = set()
     for pi, para in enumerate(split_paragraphs(text or ""), 1):
@@ -126,43 +207,71 @@ def _check_holdings(db, project_id: int, entities: dict[int, KgEntity],
             owners_here = [c for c in chars if any(a in sent for a in _aliases(c))]
             if not owners_here:
                 continue
+            # 同一句里多个物件命中时只取「最长别名」那条，避免别名包含关系重复报
+            best: tuple[int, KgEntity, KgEntity, str, str, KgEntity] | None = None
             for item, holder in pairs:
                 if any(a in sent for a in _aliases(holder)):
                     continue  # 持有者本人就在句子里，不判
-                if not any(a in sent for a in _aliases(item)):
+                matched = [a for a in _aliases(item) if a in sent and a not in shared]
+                if not matched:
                     continue
-                verb = next((v for v in _OWN_VERBS if v in sent), None)
-                if verb is None:
+                alias = max(matched, key=len)
+                # 「某某的旧手机」这类别名自带物主，按它判持有者只会自相矛盾
+                if any(n in alias for n in char_names):
+                    continue
+                alias_pos = sent.find(alias)
+                # 「拿出自己的旧手机」：正文已声明归属，不算越界
+                if "自己的" in sent[max(0, alias_pos - 3):alias_pos]:
+                    continue
+                # 「记录」后面紧跟「单/本/页」时是另一个词（记录单/记录本），不是该物件
+                tail_pos = alias_pos + len(alias)
+                if sent[tail_pos:tail_pos + 1] in _COMPOUND_SUFFIX:
+                    continue
+                c_start, c_end = _clause_bounds(sent, alias_pos)
+                verbs = [
+                    (p, v) for v in _OWN_VERBS
+                    if (p := sent.find(v)) != -1 and c_start <= p <= c_end
+                ]
+                if not verbs:
                     continue
                 if any(v in sent for v in _TRANSFER_VERBS):
+                    continue
+                verb_pos, verb = min(verbs, key=lambda pv: abs(pv[0] - alias_pos))
+                # 同句共现 ≠ 同一动作：动词必须作用在这个物件附近
+                if abs(verb_pos - alias_pos) > _VERB_WINDOW:
                     continue
                 others = [c for c in owners_here if c.id != holder.id]
                 if not others:
                     continue
                 other = others[0]
                 # 人物出现在持有动词之前，才更像「他在拿」
-                if sent.find(other.canonical_name) > sent.find(verb):
+                if sent.find(other.canonical_name) > verb_pos:
                     continue
-                key = (pi, item.canonical_name)
-                if key in seen:
-                    continue
-                seen.add(key)
-                findings.append(_finding(
-                    "authority_holding",
-                    "definite",
-                    pi,
-                    f"「{other.canonical_name}」{verb}了「{item.canonical_name}」，"
-                    f"但 KG 当前持有者是「{holder.canonical_name}」",
-                    sent,
-                    [{
-                        "item": item.canonical_name,
-                        "expected_holder": holder.canonical_name,
-                        "mentioned_holder": other.canonical_name,
-                        "verb": verb,
-                    }],
-                ))
-                if len(findings) >= limit:
-                    return findings
+                if best is None or len(alias) > len(best[3]):
+                    best = (pi, item, holder, alias, sent, other)
+            if best is None:
+                continue
+            pi2, item, holder, alias, sent2, other = best
+            key = (pi2, item.canonical_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(_finding(
+                "authority_holding",
+                "definite",
+                pi2,
+                f"「{other.canonical_name}」使用了「{alias}」，"
+                f"但 KG 里「{item.canonical_name}」的持有者是「{holder.canonical_name}」",
+                sent2,
+                [{
+                    "item": item.canonical_name,
+                    "matched_alias": alias,
+                    "expected_holder": holder.canonical_name,
+                    "mentioned_holder": other.canonical_name,
+                }],
+            ))
+            if len(findings) >= limit:
+                return findings
     return findings
 
 
@@ -253,6 +362,9 @@ def _check_unknown_speakers(entities: dict[int, KgEntity], plot_bible: dict | No
         name = match.group(1)
         if name in _NOT_NAMES or any(name in k for k in known):
             continue
+        # 姓氏闸：不姓「我/不/没/通/电」的候选一律不是人名
+        if len(name) < 2 or name[0] not in _SURNAMES:
+            continue
         counts[name] = counts.get(name, 0) + 1
     findings: list[dict] = []
     for name, count in sorted(counts.items(), key=lambda kv: -kv[1]):
@@ -327,38 +439,44 @@ def _check_abilities(plot_bible: dict | None, text: str,
     return findings, []
 
 
-def _ngrams(text: str, sizes=(2, 3, 4)) -> set[str]:
-    """按 2–4 字滑窗取候选词：outline 没有分词，整段匹配会漏。"""
-    out: set[str] = set()
-    for size in sizes:
-        for i in range(0, max(len(text) - size + 1, 0)):
-            token = text[i:i + size]
-            if token.strip() and token not in _TOKEN_STOP:
-                out.add(token)
-    return out
-
-
-def _check_outline_spoiler(outline: list | None, chapter: int | None, text: str,
+def _check_outline_spoiler(entities: dict[int, KgEntity], outline: list | None,
+                           chapter: int | None, text: str,
                            limit: int = 2) -> list[dict]:
-    """K5：本段出现下一章大纲的关键词（suspected）。"""
+    """K5：下一章才登场的人物，本章已出场（suspected）。
+
+    影子跑两轮修正后的判据（60 段样本）：
+
+    - 不按字面滑窗取词：标点/虚词会被当成关键词，大面积误报；
+    - 不认物件/地点：药盒、楼道、手机这类场景名词提前出现是正常铺垫，
+      30 段样本里几乎全是误报；
+    - 必须**首次登场**：名字在更早任何一章的章纲里出现过，就不算「提前」，
+      否则主角名会每章都命中。
+    """
     entries = list(outline or [])
     if not chapter or chapter >= len(entries) or chapter < 1:
         return []
+    prior = " ".join(str(e) for e in entries[:chapter])
     nxt = str(entries[chapter])
-    cur = str(entries[chapter - 1])
-    tokens = {t for t in _ngrams(nxt) if t not in cur}
-    hit = [t for t in tokens if t in (text or "")]
-    # 去掉被更长命中词包含的短词，避免一条证据顶三条计数
-    strong = [t for t in hit if not any(t != o and t in o for o in hit)]
-    if len({t for t in hit if len(t) >= 2}) < 3 or not strong:
+    hit: list[str] = []
+    for ent in entities.values():
+        if ent.kind != "character":
+            continue
+        matched = [a for a in _aliases(ent) if a in nxt and a not in prior]
+        if not matched:
+            continue
+        alias = max(matched, key=len)
+        if alias in (text or ""):
+            hit.append(alias)
+    if len(hit) < 2:
         return []
+    hit = sorted(set(hit))
     return [_finding(
         "authority_outline_spoiler",
         "suspected",
         1,
-        f"本段出现下一章章纲的关键词 {strong[:5]}，可能提前写了后续剧情",
+        f"本段出现下一章才登场的人物 {hit[:5]}，可能提前写了后续剧情",
         "",
-        [{"chapter": chapter + 1, "tokens": strong[:5]}],
+        [{"chapter": chapter + 1, "tokens": hit[:5]}],
     )][:limit]
 
 
@@ -368,7 +486,7 @@ def run_authority_checks(db, project, text: str, chapter: int | None) -> dict:
     notes: list[dict] = []
     try:
         entities = _entities(db, project.id)
-        findings += _check_holdings(db, project.id, entities, text)
+        findings += _check_holdings(db, project.id, entities, text, chapter)
         findings += _check_dead_characters(db, project.id, entities, text)
         findings += _check_unknown_speakers(
             entities, project.plot_bible, text, chapter, project.outline
@@ -379,7 +497,7 @@ def run_authority_checks(db, project, text: str, chapter: int | None) -> dict:
             {"check": "authority_ability", "reason": reason}
             for reason in ability_notes
         ]
-        findings += _check_outline_spoiler(project.outline, chapter, text)
+        findings += _check_outline_spoiler(entities, project.outline, chapter, text)
     except Exception as exc:  # noqa: BLE001 —— 检测器故障不能拖垮生成
         return {
             "version": CHECK_VERSION,
