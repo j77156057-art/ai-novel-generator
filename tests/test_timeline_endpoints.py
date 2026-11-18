@@ -19,10 +19,31 @@ import app.models  # noqa: F401,E402
 from app.models import Project  # noqa: E402
 from app.routers.timeline import (  # noqa: E402
     TimelineNodeIn,
+    TimelinePlanIn,
     append_node,
     assign_ranges,
     get_timeline,
+    replan_timeline,
 )
+from app.routers import timeline as timeline_router  # noqa: E402
+
+
+class _FakeProvider:
+    """返回 12 个可用节点（plan_nodes_with_llm 会按 n_main 截取）。"""
+
+    label = "fake"
+
+    def __init__(self, payload: str | None = None):
+        self.payload = payload
+
+    def chat(self, system, user):
+        if self.payload is not None:
+            return self.payload
+        items = ", ".join(
+            f'{{"title": "模型节点{i + 1}", "emotion": "爽", "beats": ["开场", "冲突"]}}'
+            for i in range(12)
+        )
+        return '{"nodes": [' + items + "]}"
 
 
 @pytest.fixture()
@@ -117,3 +138,59 @@ def test_append_rejects_bad_emotion(db):
     with pytest.raises(HTTPException) as err:
         append_node(proj.id, TimelineNodeIn(title="x", emotion="离谱"), db)
     assert err.value.status_code == 400
+
+
+def test_append_marks_planning_placeholder(db):
+    proj = _project(db, chapters=10)
+    out = append_node(proj.id, TimelineNodeIn(title="人工节点"), db)
+
+    assert out["created"]["source"] == "user"
+    assert out["timeline"]["planning_status"] == "placeholder"
+    assert out["timeline"]["planning_incomplete"] is True
+    assert out["timeline"]["planning_reason"]
+
+
+def test_replan_rejects_without_channel(db, monkeypatch):
+    proj = _project(db, chapters=10)
+    append_node(proj.id, TimelineNodeIn(title="人工节点"), db)
+    monkeypatch.setattr(timeline_router, "_provider_or_none", lambda: None)
+
+    with pytest.raises(HTTPException) as err:
+        replan_timeline(proj.id, TimelinePlanIn(), db)
+    assert err.value.status_code == 503
+
+
+def test_replan_fills_placeholders_and_keeps_user_nodes(db, monkeypatch):
+    proj = _project(db, chapters=10)
+    appended = append_node(proj.id, TimelineNodeIn(title="人工节点"), db)
+    user_id = appended["created"]["id"]
+    monkeypatch.setattr(timeline_router, "_provider_or_none", lambda: _FakeProvider())
+
+    out = replan_timeline(proj.id, TimelinePlanIn(), db)
+
+    timeline = out["timeline"]
+    assert timeline["planning_status"] == "llm"
+    assert timeline["planning_incomplete"] is False
+    assert out["replaced"] >= 1
+    by_id = {n["id"]: n for n in timeline["nodes"]}
+    assert by_id[user_id]["source"] == "user"
+    assert by_id[user_id]["title"] == "人工节点"
+    others = [n for n in timeline["nodes"] if n["id"] != user_id]
+    assert others and all(n["source"] == "llm" for n in others)
+    # 区间仍连续覆盖整条章纲
+    assert timeline["nodes"][0]["chapter_start"] == 1
+    assert timeline["nodes"][-1]["chapter_end"] == 10
+
+
+def test_replan_failure_does_not_touch_store(db, monkeypatch):
+    proj = _project(db, chapters=10)
+    append_node(proj.id, TimelineNodeIn(title="人工节点"), db)
+    before = {k: v for k, v in proj.plot_timeline.items()}
+    monkeypatch.setattr(
+        timeline_router, "_provider_or_none", lambda: _FakeProvider("不是 JSON")
+    )
+
+    with pytest.raises(HTTPException) as err:
+        replan_timeline(proj.id, TimelinePlanIn(), db)
+    assert err.value.status_code == 502
+    assert proj.plot_timeline == before

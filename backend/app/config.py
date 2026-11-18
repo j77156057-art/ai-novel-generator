@@ -125,6 +125,16 @@ class Settings(BaseSettings):
     coherence_guard_mode: str = "report"  # report | rewrite | off
 
     # ------------------------------------------------------------------
+    # 权威越界检查 K1–K5（第三刀）：默认只报告，不改正文。
+    #
+    # 改写开关单独一层：即使 COHERENCE_GUARD_MODE=rewrite，权威类命中也要
+    # AUTHORITY_REWRITE_ENABLED=1 才进重写——先过「抽 ≥30 条命中、单类精度
+    # ≥90%」的标注闸，再打开。
+    # ------------------------------------------------------------------
+    authority_guard_enabled: bool = True
+    authority_rewrite_enabled: bool = False
+
+    # ------------------------------------------------------------------
     # canon 词表来源（KG_CANON_SOURCE，纯增量开关，默认行为不变）
     #
     # legacy：仓库里原来那套 canon —— 从主库已有节点筛出来的约 300 条 v2 词表，

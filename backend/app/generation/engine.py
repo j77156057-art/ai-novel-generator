@@ -6,6 +6,7 @@
 """
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -1737,7 +1738,7 @@ def _coherence_report(db, project: Project, text: str,
             ).all()
             if name
         ]
-        return run_coherence(
+        report = run_coherence(
             text,
             plot_bible=project.plot_bible,
             outline=project.outline,
@@ -1745,6 +1746,19 @@ def _coherence_report(db, project: Project, text: str,
             prior_chapters=prior,
             entity_names=entities,
         )
+        # 第三刀：权威越界 K1–K5。默认只报告（authority_rewrite_enabled=False），
+        # 结果并入同一份 quality_json["coherence"]，同时在 authority 键留原始摘要。
+        if getattr(settings, "authority_guard_enabled", True):
+            from app.coherence_authority import run_authority_checks
+
+            authority = run_authority_checks(db, project, text, chapter)
+            report["findings"] = list(report.get("findings") or []) + authority["findings"]
+            counts = report.setdefault("counts", {})
+            counts["definite"] = int(counts.get("definite") or 0) + authority["counts"]["definite"]
+            counts["suspected"] = int(counts.get("suspected") or 0) + authority["counts"]["suspected"]
+            report["notes"] = list(report.get("notes") or []) + authority["notes"]
+            report["authority"] = authority
+        return report
     except Exception:  # noqa: BLE001 —— 一致性层故障不影响正文落库
         logging.getLogger(__name__).warning("coherence check skipped", exc_info=True)
         return None
@@ -1762,10 +1776,13 @@ def _coherence_reasons(db, project: Project, text: str,
     report = _coherence_report(db, project, text, chapter_range)
     if not report:
         return []
+    # 权威类命中要先过 90% 精度标注闸：默认不进重写，即使 mode=rewrite。
+    allow_authority = bool(getattr(settings, "authority_rewrite_enabled", False))
     return [
         f"一致性（{f['check']}，第{f['paragraph']}段）：{f['message']}"
         for f in report.get("findings") or []
         if f.get("level") == "definite"
+        and (allow_authority or f.get("category") != "authority")
     ]
 
 
@@ -2178,10 +2195,80 @@ def _era_check_quality(era_meta: dict, prompt_meta: dict, abuse: dict | None = N
     }
 
 
+_SNAPSHOT_VERSION = 1
+#: 单段提示词快照上限（字符）。超长截断并标 `truncated`，但 sha256 仍按全文算，
+#: 所以「当时用的是不是同一份提示词」仍可比对。
+_SNAPSHOT_MAX_CHARS = 400_000
+
+
+def _sha_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _prompt_snapshot(system: str, user: str) -> str:
+    """初稿实际提示词快照（JSON 文本），写进 `generations.prompt_json`。"""
+    full = system + "\n\n" + user
+    truncated = len(full) > _SNAPSHOT_MAX_CHARS
+    return json.dumps(
+        {
+            "version": _SNAPSHOT_VERSION,
+            "system": system if not truncated else system[:_SNAPSHOT_MAX_CHARS],
+            "user": user if not truncated else "",
+            "chars": len(full),
+            "truncated": truncated,
+            "sha256": _sha_text(full),
+            "captured_at": time.time(),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _authority_snapshot(project: Project, ctx: dict, chapter_range: str | None) -> str:
+    """当次权威输入快照（JSON 文本），写进 `generations.authority_json`。
+
+    存「能回答当时看到哪一版权威」的最小集合：plot_bible 全文（体量小）、
+    outline/premise/叙事档案的哈希与长度、以及进入上下文的角色名单。
+    不复制 outline 全文——它在 user 提示词快照里已有摘录，重复存会撑大库。
+    """
+    narrative = project.style_narrative if isinstance(project.style_narrative, dict) else {}
+    outline = project.outline or []
+    constraints = ctx.get("constraints") or {}
+    characters = narrative.get("characters") or []
+    return json.dumps(
+        {
+            "version": _SNAPSHOT_VERSION,
+            "chapter_range": chapter_range,
+            "plot_bible": project.plot_bible,
+            "premise": project.premise,
+            "premise_sha256": _sha_text(project.premise or ""),
+            "outline_len": len(outline),
+            "outline_sha256": _sha_text(json.dumps(outline, ensure_ascii=False)),
+            "narrative": {
+                "version": narrative.get("version"),
+                "sha256": _sha_text(
+                    json.dumps(narrative, ensure_ascii=False, sort_keys=True)
+                ),
+                "character_names": [
+                    c.get("name")
+                    for c in characters
+                    if isinstance(c, dict) and c.get("name")
+                ][:40],
+            },
+            "style_source_ids": sorted(_style_source_ids(project) or []),
+            "constraint_keys": sorted(constraints.keys()),
+            "characters_in_context": list(constraints.get("characters") or [])[:40],
+            "captured_at": time.time(),
+        },
+        ensure_ascii=False,
+    )
+
+
 def _commit_segment(db, project: Project, text: str, summary: str,
                     meta: dict | None = None,
                     quality: dict | None = None,
-                    chapter_range: str | None = None) -> tuple[Generation, int]:
+                    chapter_range: str | None = None,
+                    prompt_json: str | None = None,
+                    authority_json: str | None = None) -> tuple[Generation, int]:
     """落库一段：写 Generation + 追加 L1 到摘要树 + 同步扁平归档。
 
     `project.summary` **继续维护**，但它已从「注入源」退为「L1 无损归档」：
@@ -2233,6 +2320,8 @@ def _commit_segment(db, project: Project, text: str, summary: str,
         text=text,
         summary={"text": summary, **(meta or {})},
         quality_json=_quality_json(quality),
+        prompt_json=prompt_json,
+        authority_json=authority_json,
     )
     db.add(gen)
 
@@ -4644,6 +4733,21 @@ def _timeline_state_for(
                     if node.id in st.nodes:
                         node.segment_budget = st.nodes[node.id].segment_budget
                         st.nodes[node.id] = node
+                st.planning_status = "llm"
+            else:
+                # 规划不完整要显式记录：占位节点照用（不阻断生成），但状态
+                # 必须能让调用方/端点一眼看出「这不是模型规划的结果」。
+                st.planning_status = "placeholder"
+                st.planning_reason = (
+                    "模型规划失败（超时或返回的节点解析不出），已回退占位节点；"
+                    "可调用 POST /api/projects/{id}/timeline/plan 重试"
+                )
+        else:
+            st.planning_status = "placeholder"
+            st.planning_reason = (
+                "未配置可用模型渠道，使用占位节点（标题/节拍为空）；"
+                "配置渠道后可调用 POST /api/projects/{id}/timeline/plan 重规划"
+            )
         # 无 LLM / 规划失败时，占位节点也要有章节区间，保证「章 → 点」映射存在。
         if total_chapters:
             assign_chapter_ranges(st, total_chapters)
@@ -5218,6 +5322,8 @@ def generate_next_segment(
         meta={"era": {**era_prompt_meta, **era_meta}, "power": power_meta},
         quality=quality,
         chapter_range=chapter_range,
+        prompt_json=_prompt_snapshot(system, draft_user),
+        authority_json=_authority_snapshot(project, ctx, chapter_range),
     )
 
     # —— v2.1：exit_condition LLM 判定 → 必要时提前切节点（§13 待定项落地）——
@@ -5671,6 +5777,8 @@ def generate_next_segment_stream(
         meta={"era": {**era_prompt_meta, **era_meta}, "power": power_meta},
         quality=quality,
         chapter_range=chapter_range,
+        prompt_json=_prompt_snapshot(system, draft_user),
+        authority_json=_authority_snapshot(project, ctx, chapter_range),
     )
     # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
     node_judge = _judge_and_advance(

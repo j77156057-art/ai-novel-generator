@@ -633,6 +633,12 @@ class Generation(Base):
     # 接线前写入），**不是**「正常」；读取侧由 parse_quality 映射成
     # verdict="undetected"。契约见 docs/repetition-gate-insertion.md §3.1 / §3.4。
     quality_json = Column(Text, nullable=True)
+    #: 当次初稿实际使用的提示词快照（JSON 文本）：system/user 全文 + sha256。
+    #: NULL = 本列落地前生成的历史行（不是「没用提示词」）。
+    prompt_json = Column(Text, nullable=True)
+    #: 当次权威输入快照（JSON 文本）：plot_bible、outline/叙事档案哈希、
+    #: 章区间等。用于回答「当时模型看到的是哪一版权威」。
+    authority_json = Column(Text, nullable=True)
 
 
 class GenerationSnapshot(Base):

@@ -187,6 +187,10 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # —— 复读闸门标记：NULL = 未检测（历史行 / 回滚恢复行），不是「正常」——
         # 漏这一项的后果：老库 INSERT 含 quality_json 直接炸，生成整条链失败。
         ("generations", "quality_json", "TEXT"),
+        # —— 2026-11-18 B 子系统第二刀：当次 prompt/权威快照 ——
+        # 只加列不回填：NULL = 该行生成于本列落地前（不是「没有提示词」）。
+        ("generations", "prompt_json", "TEXT"),
+        ("generations", "authority_json", "TEXT"),
         ("kg_nodes", "source", "VARCHAR(64)"),
         # —— v3.0 KG 书维度：实体/提及归属哪本书 ——
         # NULL = 项目级通配（归不出书的行 / 老数据），读侧与加列前完全一致。

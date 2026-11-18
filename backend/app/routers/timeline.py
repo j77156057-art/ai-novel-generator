@@ -26,14 +26,23 @@ from app.generation.timeline import (
     TimelineState,
     assign_chapter_ranges,
     has_chapter_ranges,
+    plan_nodes_with_llm,
     plan_timeline,
     state_from_dict,
     state_to_dict,
 )
+from app.llm.provider import LocalFallbackLLMProvider
 from app.models import Project
+from app.routers.projects import _provider_or_none
 from app.schemas import StrictRequest
 
 router = APIRouter(prefix="/api/projects", tags=["timeline"])
+
+#: 重规划需要可用的模型渠道（占位节点再规划还是占位，没有意义）。
+TIMELINE_NO_CHANNEL = (
+    "未配置可用的模型渠道：无法把占位节点重规划成真实剧情点。"
+    "请到「模型设置」页选择渠道并填写 API Key 后重试。"
+)
 
 #: 节点情绪与 `generation/timeline.PlotNode.emotion` 的口径一致。
 NODE_EMOTIONS = ("爽", "虐", "甜", "怒", "悬疑", "日常", "过渡")
@@ -52,6 +61,12 @@ class TimelineNodeIn(StrictRequest):
     beats: list[str] = []
     segment_budget: int | None = None
     re_assign: bool = True
+
+
+class TimelinePlanIn(StrictRequest):
+    """重规划：用模型把占位节点填实；默认保留人工追加的节点。"""
+
+    keep_user_nodes: bool = True
 
 
 def _require_project(db: Session, project_id: int) -> Project:
@@ -111,6 +126,7 @@ def _node_out(node: PlotNode) -> dict:
         "children": list(node.children),
         "chapter_start": node.chapter_start,
         "chapter_end": node.chapter_end,
+        "source": node.source,
     }
 
 
@@ -128,6 +144,9 @@ def _state_out(proj: Project, state: TimelineState | None) -> dict:
             "early_done": [],
             "branch_used": 0,
             "has_chapter_ranges": False,
+            "planning_status": "",
+            "planning_incomplete": True,
+            "planning_reason": "时间线尚未规划：首次生成或追加节点时才会建立骨架",
         }
     return {
         "exists": True,
@@ -140,6 +159,9 @@ def _state_out(proj: Project, state: TimelineState | None) -> dict:
         "early_done": sorted(state.early_done),
         "branch_used": state.branch_used,
         "has_chapter_ranges": has_chapter_ranges(state),
+        "planning_status": state.planning_status,
+        "planning_incomplete": state.planning_status in ("", "placeholder"),
+        "planning_reason": state.planning_reason,
     }
 
 
@@ -202,6 +224,11 @@ def append_node(
             branch_ratio=_branch_ratio(proj),
         )
         assign_chapter_ranges(state, len(entries))
+        state.planning_status = "placeholder"
+        state.planning_reason = (
+            "时间线由人工追加节点建立，其余节点仍是占位；"
+            "可调用 POST /api/projects/{id}/timeline/plan 让模型补全"
+        )
 
     # 新 id 取「现有主干序号最大值 + 1」，避免和占位节点 n1..n12 撞名。
     existing = {nid for nid in state.nodes if nid.startswith("n") and nid[1:].isdigit()}
@@ -227,6 +254,7 @@ def append_node(
         segment_budget=budget,
         parent=None,
         children=[],
+        source="user",
     )
     state.nodes[new_id] = node
     state.order.append(new_id)
@@ -242,3 +270,55 @@ def append_node(
         "created": _node_out(node),
         "timeline": _state_out(proj, state),
     }
+
+
+@router.post("/{project_id}/timeline/plan")
+def replan_timeline(
+    project_id: int, body: TimelinePlanIn, db: Session = Depends(get_db)
+) -> dict:
+    """用模型把占位节点重规划成真实剧情点（B 子系统第一刀）。
+
+    - 没有模型渠道 → 503（占位再规划还是占位，不假装成功）；
+    - 模型返回不可用节点 → 502，**不改存档**；
+    - 成功 → 只覆盖非 `user` 节点，进度字段（done/current/seg_counts）原样保留。
+    """
+    proj = _require_project(db, project_id)
+    entries = _outline_entries(proj)
+    if not entries:
+        raise HTTPException(status_code=400, detail="项目还没有章纲：先写 outline 再重规划")
+
+    provider = _provider_or_none()
+    if provider is None or isinstance(provider, LocalFallbackLLMProvider):
+        raise HTTPException(status_code=503, detail=TIMELINE_NO_CHANNEL)
+
+    state = _state(proj)
+    if state is None:
+        state = plan_timeline(
+            total_segments=_total_segments(proj),
+            avg_node_segments=_avg_node_segments(proj),
+            branch_ratio=_branch_ratio(proj),
+        )
+
+    filled = plan_nodes_with_llm(provider, entries, proj.plot_bible, state.total_main)
+    if not filled:
+        raise HTTPException(
+            status_code=502,
+            detail="模型没有返回可用的剧情点（超时或解析失败），时间线保持原状；请稍后重试",
+        )
+
+    replaced = 0
+    for node in filled:
+        old = state.nodes.get(node.id)
+        if old is not None and body.keep_user_nodes and old.source == "user":
+            continue
+        if old is not None:
+            node.segment_budget = old.segment_budget or node.segment_budget
+        state.nodes[node.id] = node
+        replaced += 1
+
+    state.planning_status = "llm"
+    state.planning_reason = ""
+    assign_chapter_ranges(state, len(entries))
+    _save(db, proj, state)
+
+    return {"replaced": replaced, "timeline": _state_out(proj, state)}

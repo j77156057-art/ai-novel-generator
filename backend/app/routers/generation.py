@@ -6,6 +6,7 @@
 - POST /api/generate-stream     流式续写（SSE，长文首字即显）
 - POST /api/generate-plan       仅组装上下文与提示词（不调 LLM），供生成前漂移预检
 - GET  /api/generations/{pid}   列出某项目已生成的全部段落
+- GET  /api/projects/{pid}/segments/{no}/snapshot  取某段生成时的提示词/权威快照
 """
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -520,3 +521,38 @@ def _generation_by_no(db: Session, project_id: int, segment_no: int) -> Generati
             Generation.project_id == project_id, Generation.segment_no == segment_no
         )
     ).first()
+
+
+def _load_snapshot(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        value = _json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+@router.get("/projects/{project_id}/segments/{segment_no}/snapshot")
+def get_segment_snapshot(
+    project_id: int, segment_no: int, db: Session = Depends(get_db)
+) -> dict:
+    """返回某段生成时的提示词与权威快照（B 子系统第二刀）。
+
+    历史行（快照列落地前生成）返回 `prompt: null` 并在 `note` 说明原因，
+    不伪造内容、不拿当前项目状态回填。
+    """
+    gen = _generation_by_no(db, project_id, segment_no)
+    if gen is None:
+        raise HTTPException(status_code=404, detail="该段不存在")
+
+    prompt = _load_snapshot(gen.prompt_json)
+    return {
+        "project_id": project_id,
+        "segment_no": segment_no,
+        "chapter_range": gen.chapter_range,
+        "prompt": prompt,
+        "authority": _load_snapshot(gen.authority_json),
+        "prompt_sha256": (prompt or {}).get("sha256"),
+        "note": None if prompt else "该段生成于快照列落地前，没有提示词快照",
+    }

@@ -50,6 +50,9 @@ class PlotNode:
     # 不再按 Generation 行数推进——重写/换版本不会把大纲往后推。
     chapter_start: int = 0
     chapter_end: int = 0
+    #: 节点内容来源："llm"（模型填实）| "placeholder"（骨架占位）| "user"（端点追加）。
+    #: 重规划只覆盖非 "user" 节点，保证人工追加的剧情点不被冲掉。
+    source: str = "llm"
 
 
 @dataclass
@@ -76,6 +79,11 @@ class TimelineState:
     completion: dict[str, dict] = field(default_factory=dict)
     #: 最近一次完成判定覆盖到的段号（0 = 尚未判定）。支线挂载时同样要保留。
     last_judged_segment: int = 0
+    #: 节点内容是怎么来的："" 未尝试 | "llm" 模型填实 | "placeholder" 占位。
+    #: 「规划不完整」不能只体现在节点标题是「主干节点3」——接手方需要一个
+    #: 可直接断言的显式状态 + 原因（为什么退化成占位）。
+    planning_status: str = ""
+    planning_reason: str = ""
 
 
 def plan_timeline(
@@ -111,7 +119,7 @@ def plan_timeline(
             id=nid, kind="main", title=f"主干节点{i + 1}",
             emotion="爽", entry_condition="", exit_condition="",
             beats=[], opens=[], closes=[], segment_budget=seg_budget,
-            parent=None, children=[],
+            parent=None, children=[], source="placeholder",
         )
         order.append(nid)
 
@@ -344,6 +352,7 @@ def _node_to_dict(node: PlotNode) -> dict:
         "children": list(node.children),
         "chapter_start": int(node.chapter_start or 0),
         "chapter_end": int(node.chapter_end or 0),
+        "source": node.source,
     }
 
 
@@ -358,6 +367,7 @@ def _node_from_dict(d: dict) -> PlotNode:
         parent=d.get("parent"), children=list(d.get("children") or []),
         chapter_start=int(d.get("chapter_start") or 0),
         chapter_end=int(d.get("chapter_end") or 0),
+        source=str(d.get("source") or ""),
     )
 
 
@@ -440,6 +450,8 @@ def _clone_state(state: TimelineState) -> TimelineState:
         seg_counts=dict(state.seg_counts),
         early_done=set(state.early_done),
         branch_current=state.branch_current,
+        planning_status=state.planning_status,
+        planning_reason=state.planning_reason,
     )
 
 
@@ -497,14 +509,18 @@ def sync_node_for_chapter(state: TimelineState, chapter: int | None) -> Timeline
 def state_to_dict(state: TimelineState) -> dict:
     """TimelineState → JSON 字典（§11.3 落库用）。
 
-    只存推进相关字段：nodes（含已填实内容）、done、current_node、current_beat、
-    branch_used、seg_counts，以及 early_done / branch_current（章模式下支线与
-    提前完成是显式状态，不能靠复算还原）。order/total_main/branch_budget 从
-    outline/项目参数复算，不存——避免 outline 改后状态和骨架对不上。
+    存推进相关字段：nodes（含已填实内容）、order、done、current_node、
+    current_beat、branch_used、seg_counts，以及 early_done / branch_current
+    / planning_*（这些是显式状态，不能靠复算还原）。
+
+    `order` 必须存：人工追加的主干节点不在 plan_timeline 复算出的骨架里，
+    不存就会被下一次恢复丢掉（B2 追加节点的已知坑）。total_main/
+    branch_budget 仍从 outline/项目参数复算，order 只做「主干顺序」的权威。
     """
     return {
         "version": TIMELINE_SCHEMA_VERSION,
         "nodes": {nid: _node_to_dict(n) for nid, n in state.nodes.items()},
+        "order": list(state.order),
         "done": sorted(state.done),  # set → list，JSON 友好
         "current_node": state.current_node,
         "current_beat": state.current_beat,
@@ -512,6 +528,8 @@ def state_to_dict(state: TimelineState) -> dict:
         "seg_counts": dict(state.seg_counts),
         "early_done": sorted(state.early_done),
         "branch_current": state.branch_current,
+        "planning_status": state.planning_status,
+        "planning_reason": state.planning_reason,
     }
 
 
@@ -566,6 +584,17 @@ def state_from_dict(
         skeleton.current_node = cn
     skeleton.current_beat = int(d.get("current_beat") or 0)
     skeleton.branch_used = int(d.get("branch_used") or 0)
+    # 主干顺序：存档优先（人工追加的节点不在复算骨架里）；旧存档没有 order
+    # 时退回骨架顺序，再把存档里多出来的主干节点补到末尾。
+    order_raw = d.get("order")
+    if isinstance(order_raw, list):
+        ids = [x for x in order_raw if isinstance(x, str) and x in skeleton.nodes]
+        if ids:
+            skeleton.order = ids
+    for nid in list(skeleton.nodes):
+        if nid not in skeleton.order and skeleton.nodes[nid].kind == "main":
+            skeleton.order.append(nid)
+    skeleton.total_main = len(skeleton.order)
     # 提前完成是显式状态：只认存档里仍存在的节点（outline 改短时不引入幽灵 id）
     early_raw = d.get("early_done") or []
     if isinstance(early_raw, list):
@@ -578,6 +607,12 @@ def state_from_dict(
         skeleton.seg_counts = {k: int(v) for k, v in sc.items() if isinstance(v, (int, float))}
     if total_chapters is not None:
         assign_chapter_ranges(skeleton, total_chapters)
+    status = d.get("planning_status")
+    if status in ("llm", "placeholder"):
+        skeleton.planning_status = status
+    reason = d.get("planning_reason")
+    if isinstance(reason, str):
+        skeleton.planning_reason = reason
     return skeleton
 
 
