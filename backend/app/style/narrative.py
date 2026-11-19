@@ -121,7 +121,7 @@ def _chapters_per_block(
 
 
 def _resolve_block_chars(provider, requested: int | None = None) -> int:
-    """决定本次蒸馏每个块的目标字数。优先级：显式参数 > 用户配置 > 渠道实测 > 兜底。
+    """决定本次提炼每个块的目标字数。优先级：显式参数 > 用户配置 > 渠道实测 > 兜底。
 
     渠道值取 `provider.distill_block_chars`（0 = 该渠道没实测过）。
     用户可通过 `settings.distill_block_chars` 强行覆盖（0 = 不覆盖）。
@@ -140,7 +140,7 @@ def _configured_block_chars() -> int:
     try:
         from app.config import settings as _st
         return int(getattr(_st, "distill_block_chars", 0) or 0)
-    except Exception:  # noqa: BLE001 —— 配置不可读不该让蒸馏失败
+    except Exception:  # noqa: BLE001 —— 配置不可读不该让提炼失败
         return 0
 
 
@@ -291,7 +291,7 @@ DEFAULT_TIER = TIER_FULL
 #: 键是档位 key，新增档位时必须在这里补一项，否则 `to_public_dict` 会抛 KeyError
 #: ——宁可响亮地失败，也不要静默给错提示。
 _COST_HINTS: dict[str, str] = {
-    TIER_FULL: "最高（完整蒸馏：读全本、全维度、含角色名归一化）",
+    TIER_FULL: "最高（完整提炼：读全本、全维度、含角色名归一化）",
     TIER_BALANCED: "中等（固定 30 章，维度齐全，省掉角色名归一化）",
     TIER_FAST: "最低（固定 30 章 + 精简维度，只验证管线）",
 }
@@ -299,7 +299,7 @@ _COST_HINTS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class NarrativeTier:
-    """一个蒸馏档位的完整配置。
+    """一个提炼档位的完整配置。
 
     刻意做成**显式注册表**而不是散落的 if/else 常量：档位是要展示给用户选的
     （前端拿 name + description 直接渲染），也是要被测试逐项断言的
@@ -434,7 +434,7 @@ def resolve_tier(tier: str | None) -> NarrativeTier:
     key = str(tier).strip().lower()
     if key not in TIER_REGISTRY:
         valid = "、".join(sorted(TIER_REGISTRY))
-        raise ValueError(f"未知蒸馏档位 {tier!r}，可选：{valid}")
+        raise ValueError(f"未知提炼档位 {tier!r}，可选：{valid}")
     return TIER_REGISTRY[key]
 
 
@@ -442,7 +442,7 @@ def tier_with_sampling(tier: NarrativeTier, sample_cap: int | None) -> Narrative
     """给档位叠加「采样章数覆盖」。
 
     ``sample_cap`` 语义：``0`` = 全本（整本语料全部灌进去）；``N > 0`` = 最多
-    取 N 章；``None`` = 不改。覆盖值会进指纹，改完必须重跑蒸馏才会生效。
+    取 N 章；``None`` = 不改。覆盖值会进指纹，改完必须重跑提炼才会生效。
     """
     if sample_cap is None:
         return tier
@@ -488,7 +488,7 @@ _AUX_KEY_PREFIX = "aux_"
 def distill_resume_scope(
     source_ids: list[int], cfg: NarrativeTier, max_chapters: int = 180
 ) -> str:
-    """一次蒸馏断点的作用域哈希（只有 scope 相同才允许复用已完成块）。"""
+    """一次提炼断点的作用域哈希（只有 scope 相同才允许复用已完成块）。"""
     blob = json.dumps(
         {
             "source_ids": sorted(int(i) for i in source_ids),
@@ -526,7 +526,7 @@ def _load_done_chunks(db: Session, project_id: int, scope: str) -> dict[str, dic
         return {str(r.chunk_key): (r.payload or {}) for r in rows}
     except Exception as exc:  # noqa: BLE001 —— 断点读不到就退化成全新跑
         logging.getLogger(__name__).warning(
-            "读取蒸馏断点失败 project_id=%s: %s", project_id, exc
+            "读取提炼断点失败 project_id=%s: %s", project_id, exc
         )
         return {}
 
@@ -567,7 +567,7 @@ def _save_done_chunk(
 ) -> None:
     """落一个块的完成标记（幂等 upsert）。
 
-    失败只记日志：存断点是增强，不能因为存断点失败就把整次蒸馏搞挂。
+    失败只记日志：存断点是增强，不能因为存断点失败就把整次提炼搞挂。
 
     `provider` / `endpoint` 记录「这块是谁产的」：同 scope 下可能跨 provider 续跑，
     没有这两列就分不清哪些块来自旧网关。老行保持 NULL，不回填。
@@ -607,7 +607,7 @@ def _save_done_chunk(
         db.commit()
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
-            "写入蒸馏断点失败 key=%s: %s", chunk_key, exc
+            "写入提炼断点失败 key=%s: %s", chunk_key, exc
         )
         try:
             db.rollback()
@@ -626,7 +626,7 @@ def _clear_scope_chunks(db: Session, project_id: int, scope: str) -> None:
         db.commit()
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
-            "清理蒸馏断点失败 project_id=%s: %s", project_id, exc
+            "清理提炼断点失败 project_id=%s: %s", project_id, exc
         )
         try:
             db.rollback()
@@ -651,12 +651,12 @@ def _clear_stale_scope_chunks(db: Session, project_id: int, keep_scope: str) -> 
         db.commit()
         if n:
             logging.getLogger(__name__).info(
-                "清理换档残留蒸馏断点 project_id=%s keep=%s 删除=%s",
+                "清理换档残留提炼断点 project_id=%s keep=%s 删除=%s",
                 project_id, keep_scope, n)
         return n
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
-            "清理换档残留蒸馏断点失败 project_id=%s: %s", project_id, exc)
+            "清理换档残留提炼断点失败 project_id=%s: %s", project_id, exc)
         try:
             db.rollback()
         except Exception:  # noqa: BLE001
@@ -763,7 +763,7 @@ def _sample_chapters(
 def build_deterministic_features(chunk_text: str) -> dict:
     """v2.230：零 LLM 的确定性文体指标。
 
-    这些数字 L1 stylometry 在整本书上算过一遍（20 个特征），但叙事蒸馏
+    这些数字 L1 stylometry 在整本书上算过一遍（20 个特征），但叙事提炼
     分块跑时手上没有块级数字，只能让 LLM「读一遍再描述风格」。结果是
     LLM 用形容词复述本来可以精确计算的东西（「句子长短交错」「对白较多」）。
 
@@ -2936,7 +2936,7 @@ def _extract_character_profiles(
 
     每个角色单独一次调用，原因是把 20-30 个角色塞进一个 prompt 会让
     每个角色只剩一句空话；单角色 prompt 才能完整填行为倾向、底线、关系网。
-    单个角色失败只跳过该角色，不阻断整本书的文风蒸馏。
+    单个角色失败只跳过该角色，不阻断整本书的文风提炼。
     """
     from app.style.character_profile import (
         build_character_profile_prompt,
@@ -3143,7 +3143,7 @@ def _extract_character_voices(
             "single_batch"（快速档，一次调用搞定，对应 docs 的 v3「单批浅层」）。
         cleaning: 传给 _build_character_name_index 的清洗强度。
         on_done: 心跳回调 `(已完成, 本批总数)`，透传给内部 `_gather_chat`。
-            这一批是 8+4=12 个并发调用，是整条蒸馏里除主提炼外唯一可能连续
+            这一批是 8+4=12 个并发调用，是整条提炼里除主提炼外唯一可能连续
             十几分钟没有进度写入的段落——不传心跳就会被看护误判成卡住。
             单批模式（快速档）只有 1 次调用，不需要心跳。
     """
@@ -3337,20 +3337,20 @@ def _format_drift_metrics(early_feats: dict, late_feats: dict) -> str:
 
 
 def resolve_distill_provider():
-    """蒸馏链路用哪个 provider：**优先 distiller 角色**，没配则回落 Writer。
+    """提炼链路用哪个 provider：**优先 distiller 角色**，没配则回落 Writer。
 
     ## 为什么优先 distiller
 
-    用户在「模型设置」里给蒸馏单独配了一个角色（第三条轨道），意图是
-    「提炼文风用一个更便宜/更适合长文的模型，生成用另一个」。但蒸馏链路之前
+    用户在「模型设置」里给提炼单独配了一个角色（第三条轨道），意图是
+    「提炼文风用一个更便宜/更适合长文的模型，生成用另一个」。但提炼链路之前
     取的是 Writer 的 `get_llm_provider()` —— 那个 distiller 角色配了等于没配，
-    界面上的「蒸馏模型」是个摆设。这里把它接上。
+    界面上的「提炼模型」是个摆设。这里把它接上。
 
     ## 为什么必须有回落（老用户行为零变化）
 
     `build_distiller_provider()` 在**两种**情况下会返回 `LocalFallbackLLMProvider`：
     没填 provider、或没填 api_key。而从未配过 distiller 的用户就落在这两种里。
-    这时若直接用兜底模型去蒸馏，产出会从「用户配的 Writer 模型」退化成
+    这时若直接用兜底模型去提炼，产出会从「用户配的 Writer 模型」退化成
     本地模板 —— 一个**静默的质量倒退**（不报错，只是结果变差）。
 
     所以判定条件是「解析出来的是不是 LocalFallback」：是 → 说明用户压根没配
@@ -3368,7 +3368,7 @@ def resolve_distill_provider():
 
     try:
         candidate = get_distiller_provider()
-    except Exception as exc:  # noqa: BLE001 —— 配置异常不该让蒸馏链路整个炸掉
+    except Exception as exc:  # noqa: BLE001 —— 配置异常不该让提炼链路整个炸掉
         logging.getLogger(__name__).warning(
             "distiller provider 解析失败，回落 Writer provider：%s: %s",
             type(exc).__name__, exc,
@@ -3416,7 +3416,7 @@ _FAILURE_LABELS: dict[str, str] = {
 #: 失败桶 → 可执行的下一步（报错里逐条附上，不再让用户猜）。
 _FAILURE_NEXT_STEPS: dict[str, str] = {
     "no_key": "在 .env 配置 WRITER_API_KEY 或 DISTILLER_API_KEY，或在「模型设置」里"
-              "给蒸馏单独选一个模型；本地兜底模板只产出占位文本，不产出蒸馏规则。",
+              "给提炼单独选一个模型；本地兜底模板只产出占位文本，不产出提炼规则。",
     "auth": "核对 distiller / writer 的 api_key 与 base_url 是否配套（换渠道后 key "
             "也要换），并确认该 key 未被禁用。",
     "rate_limit": "稍后重试或换一个模型 / 账号；免费档的日限额按账号计，"
@@ -3514,7 +3514,7 @@ def _format_distill_failure(
     failed: int, reasons: dict[str, int], provider=None
 ) -> str:
     """把「N 块全失败」渲染成按原因分组的报错文本。"""
-    lines = [f"蒸馏失败：{failed} 个语料块全部未产出任何规则。"]
+    lines = [f"提炼失败：{failed} 个语料块全部未产出任何规则。"]
     for key in _FAILURE_ORDER:
         count = reasons.get(key, 0)
         if not count:
@@ -3523,7 +3523,7 @@ def _format_distill_failure(
             f"- {_FAILURE_LABELS[key]}：{count} 块。下一步：{_FAILURE_NEXT_STEPS[key]}"
         )
     if provider is not None:
-        lines.append(f"本次使用的蒸馏模型：{_describe_provider(provider)}")
+        lines.append(f"本次使用的提炼模型：{_describe_provider(provider)}")
     return "\n".join(lines)
 
 
@@ -3564,7 +3564,7 @@ async def _gather_chat_async(
                 if on_done is not None:
                     try:
                         on_done(done, total)
-                    except Exception:  # noqa: BLE001 —— 心跳失败不阻断蒸馏
+                    except Exception:  # noqa: BLE001 —— 心跳失败不阻断提炼
                         pass
 
     tasks = [_one(s, u, c) for s, u, c in prompts]
@@ -3660,7 +3660,7 @@ async def _stream_chunks_async(
                 if on_done is not None:
                     try:
                         on_done(done, total)
-                    except Exception:  # noqa: BLE001 —— 心跳失败不阻断蒸馏
+                    except Exception:  # noqa: BLE001 —— 心跳失败不阻断提炼
                         pass
 
     async def _one_chunk(spec: dict):
@@ -3670,7 +3670,7 @@ async def _stream_chunks_async(
                 on_chunk(spec, list(raws))
             except Exception as exc:  # noqa: BLE001 —— 单块解析/落库失败不阻断其余块
                 logging.getLogger(__name__).warning(
-                    "蒸馏块处理失败 novel_id=%s range=%s: %s",
+                    "提炼块处理失败 novel_id=%s range=%s: %s",
                     spec.get("nid"), spec.get("cr"), exc,
                 )
 
@@ -3685,10 +3685,10 @@ def _ensure_reference_graphs(
 ) -> dict[int, int]:
     """v2.228：确保参考语料图谱存在，缺哪本建哪本。
 
-    为什么必须在蒸馏入口做：`_build_character_name_index` 的唯一数据源是
+    为什么必须在提炼入口做：`_build_character_name_index` 的唯一数据源是
     `KgNode(type="character", source=f"novel:{nid}")`。这张图来自
     `kg/build.py::build_graph`（纯规则抽取，零 LLM）。若用户没点过「建图」
-    就直接蒸馏，候选池为空 → 角色声音维度静默产出 0 条，而其余 13 个维度
+    就直接提炼，候选池为空 → 角色声音维度静默产出 0 条，而其余 13 个维度
     正常产出 —— 故障无声无息，只能靠人肉发现「角色声音那栏是空的」。
 
     幂等性：已有 character 节点的语料直接跳过，不重建（避免覆盖用户在
@@ -3702,7 +3702,7 @@ def _ensure_reference_graphs(
 
     Raises:
         不抛：建图失败只记 warning，交给后续维度各自兜底（参考语料图谱是
-        角色声音维度的增强，不该让整轮蒸馏因为一本语料的分片异常而失败）。
+        角色声音维度的增强，不该让整轮提炼因为一本语料的分片异常而失败）。
     """
     from app.models import KgNode
 
@@ -3739,7 +3739,7 @@ def _ensure_reference_graphs(
                 logger.warning(
                     "参考语料 %s 建图成功但抽出 0 个角色（语料可能无对白）", nid
                 )
-        except Exception as exc:  # noqa: BLE001 —— 建图失败不阻断蒸馏
+        except Exception as exc:  # noqa: BLE001 —— 建图失败不阻断提炼
             logger.warning("参考语料 %s 建图失败: %s", nid, exc)
             stats[nid] = 0
 
@@ -3916,7 +3916,7 @@ def extract_narrative_profile(
         tier: 档位 key（"full"/"balanced"/"fast"）或 NarrativeTier 对象。
             None →默认完整档（与引入档位之前行为逐字节一致）。
         progress: 可选的进度回调 `progress(stage, current, total)`，用于后台
-            蒸馏任务的进度条。**None 时行为与加进度之前完全一致**——采样、
+            提炼任务的进度条。**None 时行为与加进度之前完全一致**——采样、
             维度、provider 选择、返回结构一项都不变。
             单位是「块（chunk）」：一本语料切成若干块，每块一次 `provider.chat`，
             这就是用户能感知到的天然粒度。
@@ -4732,7 +4732,7 @@ def extract_narrative_profile(
     # key 问题还是限流，比直接失败难排查得多。
     if total_chapters == 0:
         raise ValueError(
-            "参考语料没有可蒸馏的章节（语料为空或尚未导入完成），未产出任何规则"
+            "参考语料没有可提炼的章节（语料为空或尚未导入完成），未产出任何规则"
         )
     if chunks_attempted and failed_chunks == chunks_attempted:
         raise ValueError(_format_distill_failure(failed_chunks, failed_reasons, provider))
@@ -4805,7 +4805,7 @@ def narrative_fingerprint(
 
 
 def _source_ids_hash(source_ids: list[int]) -> str:
-    """参考语料集合的稳定哈希（顺序归一），用于蒸馏库的复用查找键。"""
+    """参考语料集合的稳定哈希（顺序归一），用于文风档案库的复用查找键。"""
     import hashlib
 
     return hashlib.sha256(
@@ -4814,14 +4814,14 @@ def _source_ids_hash(source_ids: list[int]) -> str:
 
 
 def corpus_content_hash(source_ids: list[int], db: Session) -> str:
-    """语料**正文内容**的稳定 sha256 —— 蒸馏库复用判据的最后一块拼图。
+    """语料**正文内容**的稳定 sha256 —— 文风档案库复用判据的最后一块拼图。
 
     ## 为什么需要它（defect-C 回归修复）
 
-    蒸馏库若只按 `source_ids` 复用，会有个隐蔽 bug：同一本语料被重新导入 / 清洗后
+    文风档案库若只按 `source_ids` 复用，会有个隐蔽 bug：同一本语料被重新导入 / 清洗后
     **正文变了**，但 novel_id 没变，于是复用查找仍会命中旧档案 → 产出 stale 文风、
     且**没有任何报错**。把正文内容也揉进哈希，正文没变才命中，正文变了就当未命中
-    → 重新蒸馏，这正是 defect-C 要防的静默退化。
+    → 重新提炼，这正是 defect-C 要防的静默退化。
 
     ## 归一方式
 
@@ -4847,9 +4847,9 @@ def find_style_distill(
     tier_signature: str,
     content_hash: str,
 ) -> "StyleDistillType | None":
-    """在蒸馏库里找一条**可复用**的档案（active 态，四键全中）。
+    """在文风档案库里找一条**可复用**的档案（active 态，四键全中）。
 
-    命中即代表「同样语料 + 同样档位 + 同样正文」曾经蒸馏过，可以直接复用，
+    命中即代表「同样语料 + 同样档位 + 同样正文」曾经提炼过，可以直接复用，
     省掉一次分钟级 LLM。未命中（None）才需要真正提炼。
     """
     from app.models import StyleDistill
@@ -4873,12 +4873,12 @@ def _persist_style_distill(
     content_hash: str,
     profile: dict,
 ) -> None:
-    """把一次蒸馏产物写进「蒸馏库」。
+    """把一次提炼产物写进「文风档案库」。
 
     幂等 upsert：**同输入（source_ids + tier + tier_signature + content_hash）在 active
     态下至多一行**。先按四键查已有 active 行：
 
-    - 有 → 原地更新 `style_narrative` 与各摘要字段（force 重蒸馏时就是「覆盖旧档」，
+    - 有 → 原地更新 `style_narrative` 与各摘要字段（force 重新提炼时就是「覆盖旧档」，
       不会又长出一行重复档案）；
     - 无 → 插入新行。
 
@@ -4939,7 +4939,7 @@ def _usable_narrative(profile) -> bool:
 def _covers_sources(archive_ids, want_ids) -> bool:
     """档案来源是否覆盖当前参考书（相等或超集）。
 
-    只放行「项目收窄参考书」：档案按 [5, 6] 蒸馏、项目现在只读 [5]，渲染侧
+    只放行「项目收窄参考书」：档案按 [5, 6] 提炼、项目现在只读 [5]，渲染侧
     `filter_rules_by_source` 会把书 6 的条目滤掉，档案仍然可用。
     反向（项目新增了书、档案没覆盖）不放行——那会静默少一本书的规则。
     """
@@ -4950,7 +4950,7 @@ def _covers_sources(archive_ids, want_ids) -> bool:
 
 def reusable_narrative(db: Session, project, ids=None, cfg=None,
                        cached=None) -> dict | None:
-    """生成路径**不蒸馏**就能用上的档案；判据只有这一份。
+    """生成路径**不提炼**就能用上的档案；判据只有这一份。
 
     预检（`generation/engine._require_distill_ready`）与取档
     （`project_narrative`）都调它。此前两边各写一套：取档侧已放宽到「超集可
@@ -4960,7 +4960,7 @@ def reusable_narrative(db: Session, project, ids=None, cfg=None,
     取档顺序（全部只读）：
     1. 项目缓存：指纹完全相等 → 原样复用（与旧行为一致，空壳档案也算就绪）。
     2. 项目缓存：来源覆盖当前参考书且内容可用 → 复用（渲染侧按当前参考书过滤）。
-    3. 蒸馏库：来源覆盖当前参考书、active、且**按档案自己的 source_ids** 重算的
+    3. 文风档案库：来源覆盖当前参考书、active、且**按档案自己的 source_ids** 重算的
        正文 hash 与库里记录一致 → 复用。
     4. 都没有 → None（调用方按「不注入」处理）。
 
@@ -4970,7 +4970,7 @@ def reusable_narrative(db: Session, project, ids=None, cfg=None,
     `[5, 6]` → `5a3437…`。项目收窄到 `[5]` 后若拿 `corpus_content_hash([5])`
     （`b36a30…`）去比，永远不相等——那不是「语料变了」，而是「比错了集合」。
     正确口径是 `corpus_content_hash(row.source_ids) == row.content_hash`：
-    它验证的是「这一行当初蒸馏的语料正文至今没变」，与项目现在读几本书无关。
+    它验证的是「这一行当初提炼的语料正文至今没变」，与项目现在读几本书无关。
     多出来的那本书由渲染侧来源过滤处理。
     这笔 hash 只在**项目缓存不可用**时才付（约 1 秒/来源集合，只读）。
     """
@@ -4995,13 +4995,13 @@ def reusable_narrative(db: Session, project, ids=None, cfg=None,
 
 def _degraded_narrative(db: Session, project, ids: list[int], cfg,
                         want: dict, cached) -> dict | None:
-    """`reusable_narrative` 的降级取档部分：**绝不**同步蒸馏。
+    """`reusable_narrative` 的降级取档部分：**绝不**同步提炼。
 
-    修的是「tier 与缓存指纹不匹配就静默起一次几十分钟全量蒸馏」：
-    生成请求里没有等蒸馏的预算，静默起蒸馏只会把请求挂到超时。
+    修的是「tier 与缓存指纹不匹配就静默起一次几十分钟全量提炼」：
+    生成请求里没有等提炼的预算，静默起提炼只会把请求挂到超时。
 
     判据见 `reusable_narrative`（唯一一份）；这里只负责具体查找与 WARN。
-    每次降级都 WARN 写明「期望档位 / 实际档位 / 未触发蒸馏」，不静默。
+    每次降级都 WARN 写明「期望档位 / 实际档位 / 未触发提炼」，不静默。
     """
     log = logging.getLogger(__name__)
     if _usable_narrative(cached):
@@ -5016,7 +5016,7 @@ def _degraded_narrative(db: Session, project, ids: list[int], cfg,
             log.warning(
                 "生成路径叙事档案降级：项目 %s 期望 tier=%s（指纹 %s），"
                 "实际使用项目缓存 tier=%s（指纹 %s，来源 %s）；按当前参考书 %s "
-                "做渲染侧来源过滤，未触发同步蒸馏。"
+                "做渲染侧来源过滤，未触发同步提炼。"
                 "如需目标档位请先 POST /api/projects/%s/distill。",
                 getattr(project, "id", None), cfg.key, want.get("tier_signature"),
                 fp.get("tier"), fp.get("tier_signature"), cached_ids, ids,
@@ -5048,8 +5048,8 @@ def _degraded_narrative(db: Session, project, ids: list[int], cfg,
         if row.content_hash != hashes[key]:
             continue
         log.warning(
-            "生成路径叙事档案降级：项目 %s 期望 tier=%s，蒸馏库命中 tier=%s"
-            "（来源 %s）；未触发同步蒸馏。如需目标档位请先 "
+            "生成路径叙事档案降级：项目 %s 期望 tier=%s，文风档案库命中 tier=%s"
+            "（来源 %s）；未触发同步提炼。如需目标档位请先 "
             "POST /api/projects/%s/distill。",
             getattr(project, "id", None), cfg.key, row.tier, row_ids,
             getattr(project, "id", None),
@@ -5082,8 +5082,8 @@ def project_narrative(
 
     Args:
         progress: 可选的进度回调，原样透传给 `extract_narrative_profile`
-            （后台蒸馏任务的进度条用）。None 时行为与加进度之前完全一致。
-        persist_library: 是否把产物落进全局蒸馏库（幂等 upsert）。
+            （后台提炼任务的进度条用）。None 时行为与加进度之前完全一致。
+        persist_library: 是否把产物落进全局文风档案库（幂等 upsert）。
             **False = 生成路径专用**：命中项目缓存时纯读返回——不算
             `corpus_content_hash`（全语料加载+sha256）、不写库。生成链路
             每次请求会调 3 次（engine.build_context + generate_next_segment
@@ -5133,7 +5133,7 @@ def project_narrative(
     if not force and isinstance(cached, dict) and cached.get("fingerprint") == want:
         # 命中项目缓存：一次 LLM 都不会调，进度条直接 100%，并把「没重算」写进 stage。
         if progress is not None:
-            progress("命中缓存，本次无需重新蒸馏", 1, 1)
+            progress("命中缓存，本次无需重新提炼", 1, 1)
         if not persist_library:
             # 生成路径：纯读。不算 content_hash（全量加载语料+sha256）、
             # 不碰蒸馏库——档案没变，重复落库除了刷新 applied_at 没有任何意义。
@@ -5159,9 +5159,9 @@ def project_narrative(
             profile = reusable_narrative(db, project, ids, cfg, cached=cached)
             if profile is None:
                 logging.getLogger(__name__).warning(
-                    "生成路径拒绝同步蒸馏：项目 %s 期望 tier=%s（指纹 %s），"
-                    "项目缓存与蒸馏库都没有可用档案。请先调用 "
-                    "POST /api/projects/%s/distill 完成蒸馏后再生成。",
+                    "生成路径拒绝同步提炼：项目 %s 期望 tier=%s（指纹 %s），"
+                    "项目缓存与文风档案库都没有可用档案。请先调用 "
+                    "POST /api/projects/%s/distill 完成提炼后再生成。",
                     getattr(project, "id", None), cfg.key,
                     want["tier_signature"], getattr(project, "id", None),
                 )
@@ -5182,7 +5182,7 @@ def project_narrative(
                 existing.applied_at = datetime.now(timezone.utc)
                 db.commit()
                 if progress is not None:
-                    progress("命中蒸馏库，直接复用", 1, 1)
+                    progress("命中文风档案库，直接复用", 1, 1)
                 profile = reused
                 # 命中的库行已存在，下面统一 upsert 仅刷新 applied_at，无副作用。
         if profile is None:
@@ -5219,7 +5219,7 @@ def project_narrative(
             db.commit()
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning(
-                "蒸馏库落库失败（档案仍返回，不丢本次产出）: %s", exc
+                "文风档案库落库失败（档案仍返回，不丢本次产出）: %s", exc
             )
     return profile
 
@@ -5239,7 +5239,7 @@ def project_narrative_safe(
     绝不能让整次生成失败。
 
     `progress` 只是透传（生成链路默认不传，即 None）：加这个参数**不改**生成路径
-    的任何行为，纯粹为了让后台蒸馏任务能复用同一个函数并拿到进度。
+    的任何行为，纯粹为了让后台提炼任务能复用同一个函数并拿到进度。
     `persist_library` / `content_hash` 同理透传给 `project_narrative`。
     """
     try:
@@ -5378,7 +5378,7 @@ def _voice_name_reject_reason(name: str, names: list[str],
     5. **截断**：与同一份词典里另一个更长的名字构成前缀关系
        （楚元→楚元缜）。后缀同形不判截断——「仙子」「前辈」这类
        书名/称谓本身可能就是独立指代（如「仙子」与「六修仙子」）。
-       词典里没有全名时这条抓不到——那需要蒸馏阶段落库的别名映射，
+       词典里没有全名时这条抓不到——那需要提炼阶段落库的别名映射，
        见 `_normalize_character_name`。
     """
     if not _is_valid_voice_char_name(name):
@@ -5923,7 +5923,7 @@ _EVIDENCE_JOIN_RE = re.compile(
 def _evidence_segments(evidence: str) -> list[str]:
     """把拼接证据切成可单独定位的引文段，长的在前。
 
-    新蒸馏要求证据是**一段连续原文**，正常不会走到这里；但 LLM 偶尔仍会输出
+    新提炼要求证据是**一段连续原文**，正常不会走到这里；但 LLM 偶尔仍会输出
     「引文 A + 转述 + 引文 B」，整串匹配必然失败。切段后只认长度 ≥12 字的段，
     并保证每个段仍是原文的子串——宁可锚到其中一段，也不写一个假 chunk_id。
     """
@@ -5948,7 +5948,7 @@ def _resolve_evidence_anchor(
 
     2026-11-12：档案里必须写 `chunk_id`（真实 `novel_chunks.id`）和
     `evidence_chapter_no`（证据实际所在章）。旧档案把 `chapter_no` 写成
-    「蒸馏块的起始章」，导致证据最多偏 4 章，事后只能靠 5 章窗口硬找。
+    「提炼块的起始章」，导致证据最多偏 4 章，事后只能靠 5 章窗口硬找。
 
     Args:
         evidence: `证据：` 后面的原文引文。
@@ -6002,7 +6002,7 @@ def _resolve_evidence_anchor(
 def _load_block_chunk_rows(
     db: Session, novel_id: int, chapter_nos: list[int]
 ) -> tuple[list[tuple[int, int, str]], list[tuple[int, str]]]:
-    """取本蒸馏块的 `novel_chunks` 行与整章文本，供证据定位。
+    """取本提炼块的 `novel_chunks` 行与整章文本，供证据定位。
 
     只在本块处理时查一次：块内每条规则复用，不按规则发查询。
     """
@@ -6443,7 +6443,7 @@ def build_rule_score_cache(profile: dict, control_profile: dict | None = None,
 
 
 def ensure_rule_scores(db, profile: dict | None, source_ids=None) -> dict | None:
-    """确保档案带当前版本的四层选条缓存（蒸馏收尾时调用一次）。
+    """确保档案带当前版本的四层选条缓存（提炼收尾时调用一次）。
 
     对照组取**另一套 source_ids** 的 active 档案（书 5/6 之于书 7）。找不到
     对照组也照样建缓存——区分度按 0.5 中性处理，但硬过滤/可执行/证据/可验证
@@ -6997,7 +6997,7 @@ def build_beat_terms(db, profile: dict | None = None, source_ids=None) -> dict:
 
 def ensure_beat_skeletons(db, profile: dict | None, source_ids=None, *,
                           rewriter=None) -> dict | None:
-    """确保档案带当前版本的节拍骨架缓存（蒸馏收尾时调用一次）。
+    """确保档案带当前版本的节拍骨架缓存（提炼收尾时调用一次）。
 
     与 `ensure_rule_scores` 分开：打分缓存和骨架缓存各有版本，改其中一个
     不必让另一个重算。没有超长节拍时不写任何字段，档案形状保持不变。
@@ -8048,6 +8048,39 @@ def describe_narrative(profile: dict | None, max_rules_per_dim: int | None = Non
         parts[idx] = _trim_to_budget(parts[idx], budget)
         text = "\n".join(parts)
     return _trim_to_budget(text, preset.char_limit)
+
+
+def narrative_digest(
+    profile: dict | None,
+    *,
+    max_chars: int = 2400,
+    allowed_novel_ids: set[int] | list[int] | None = None,
+    mode: str = RENDER_MODE_ORIGINAL,
+    per_dim: int = 1,
+) -> str:
+    """把叙事档案压成一段短摘要，供剧情圣经 / 章纲等「非正文」生成参考。
+
+    与 `describe_narrative` 的区别：不追求正文生成的全部配额，只取每个维度
+    最有代表性的一两条；空档案返回 `""`，调用方据此整块不输出。
+    生成正文仍走 `describe_narrative` 的完整档，本函数只服务构思阶段。
+    """
+    if not profile:
+        return ""
+    try:
+        text = describe_narrative(
+            profile,
+            max_rules_per_dim=per_dim,
+            allowed_novel_ids=allowed_novel_ids,
+            mode=mode,
+        )
+    except Exception:  # noqa: BLE001 —— 档案脏数据不该阻断构思
+        return ""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
 
 
 def extract_character_template(

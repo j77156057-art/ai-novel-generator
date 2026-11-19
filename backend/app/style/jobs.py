@@ -1,15 +1,15 @@
-"""文风蒸馏后台任务（`DistillRun`）的**执行层**。
+"""文风提炼后台任务（`DistillRun`）的**执行层**。
 
 ## 为什么要有这一层
 
-蒸馏是**分钟级**的长任务（833 章语料跑完整档实测 42 分钟，见
+提炼是**分钟级**的长任务（833 章语料跑完整档实测 42 分钟，见
 `app.style.narrative` 档位注释里的唯一那处计时）。HTTP 请求挂不了这么久：
 代理会超时、前端会白屏、用户刷新一下页面就什么都没了。
 
-所以蒸馏拆成三步：
+所以提炼拆成三步：
 
 - `POST /api/projects/{id}/distill` 只**登记一条 `DistillRun`** 并立刻返回 job_id；
-- 真正的蒸馏跑在 FastAPI `BackgroundTasks` 的线程池里（`run_distill_job`）；
+- 真正的提炼跑在 FastAPI `BackgroundTasks` 的线程池里（`run_distill_job`）；
 - 前端按 `GET .../distill/jobs/{job_id}` 轮询看进度，离开页面再回来也能续上
   （`GET .../distill/jobs` 拉最近一条）。
 
@@ -21,9 +21,9 @@
 2. **异常必须落库**：任何抛错都写 `status=failed` + `error`，绝不让任务永远
    停在 `running`。停在 running 的表现是「进度条一直转但不报错」，比失败更
    难排查，所以 `finally` 里还会兜一层 finished_at。
-3. **进度回调只报进度，不碰蒸馏逻辑**：`progress(stage, current, total)` 只写
+3. **进度回调只报进度，不碰提炼逻辑**：`progress(stage, current, total)` 只写
    `stage/progress_current/progress_total` 三列，不改采样、不改维度、不改
-   provider 选择 —— 蒸馏产出必须与加进度之前逐字节一致。
+   provider 选择 —— 提炼产出必须与加进度之前逐字节一致。
 """
 from __future__ import annotations
 
@@ -97,8 +97,8 @@ _MAX_ERROR_LEN = 4000
 #: 用户看到自己的蒸馏挂了，第一反应是「是不是我的语料有问题 / 模型配错了」；
 #: 真正的原因是进程没了，重跑一次即可。写错原因会让人去查根本不存在的配置问题。
 REAPED_ERROR = (
-    "服务重启中断：蒸馏跑在进程内的后台线程里，服务重启/重载后不会自动续跑。"
-    "任务本身没有失败，已完成的块已保留——点「继续蒸馏」从断点接着跑。"
+    "服务重启中断：提炼跑在进程内的后台线程里，服务重启/重载后不会自动续跑。"
+    "任务本身没有失败，已完成的块已保留——点「继续提炼」从断点接着跑。"
 )
 
 
@@ -194,7 +194,7 @@ def distill_health(
             # find_active_run 复用成同一个任务，重新提交等于没提交。
             # 真正的出口是重启后端 → 该任务被 reap 成「中断」→ 回执上再续跑。
             f"建议再等 {STALL_RUNNING_MINUTES} 分钟；仍不动就重启后端，"
-            "重启后点「中断」回执上的「继续蒸馏」接着跑。",
+            "重启后点「中断」回执上的「继续提炼」接着跑。",
         )
 
     if expected > 0:
@@ -205,7 +205,7 @@ def distill_health(
                 f"已跑 {int(elapsed)} 分钟，超过预计 {expected} 分钟的 "
                 f"{OVERRUN_FACTOR} 倍阈值（{int(limit)} 分钟）。"
                 "预计值本身是按字数外推、不是实测；建议再等一会，仍不动就重启后端，"
-                "在「中断」回执上点「继续蒸馏」续跑（已完成的块不会重跑）。",
+                "在「中断」回执上点「继续提炼」续跑（已完成的块不会重跑）。",
             )
 
     note = "刚启动" if elapsed < 1 else f"已运行 {int(elapsed)} 分钟"
@@ -262,14 +262,14 @@ def create_distill_run(db: Session, project_id: int, tier: str,
                        kind: str = "narrative",
                        scope: dict | None = None,
                        novel_id: int | None = None) -> DistillRun:
-    """登记一条蒸馏任务（pending），返回已 flush 的行（拿到 id）。
+    """登记一条提炼任务（pending），返回已 flush 的行（拿到 id）。
 
     只登记、不开工：开工由调用方把 `run_distill_job` 丢进 BackgroundTasks，
     这样 `POST /distill` 才能在毫秒级返回 job_id。
 
     `kind` 区分产物种类（narrative / book_digest）：两者共用同一张任务表，
     进度与轮询逻辑完全一样。`novel_id` 是「按书」的产物针对的那本书；
-    叙事蒸馏一次蒸多本参考语料，没有单本书 ⇒ 留空。
+    叙事提炼一次蒸多本参考语料，没有单本书 ⇒ 留空。
     """
     run = DistillRun(
         project_id=project_id,
@@ -293,8 +293,8 @@ def find_active_run(db: Session, project_id: int,
                     kind: str = "narrative") -> DistillRun | None:
     """取该项目最近一条**未终态**任务（pending/running），没有则 None。
 
-    用于「并发防重」：用户连点两次「开始蒸馏」不该烧两遍 LLM 钱。
-    按 `kind` 分开防重：全书摘要与叙事蒸馏是两种产物，互不阻塞。
+    用于「并发防重」：用户连点两次「开始提炼」不该烧两遍 LLM 钱。
+    按 `kind` 分开防重：全书摘要与叙事提炼是两种产物，互不阻塞。
     """
     return db.scalar(
         select(DistillRun)
@@ -310,7 +310,7 @@ def find_active_run(db: Session, project_id: int,
 def find_active_book_run(db: Session, novel_id: int) -> DistillRun | None:
     """取这本书最近一条**未终态**的全书摘要任务（没有则 None）。
 
-    与 `find_active_run` 分开：叙事蒸馏按项目防重，
+    与 `find_active_run` 分开：叙事提炼按项目防重，
     全书摘要按**书**防重（同一本书在两个项目里各跑一次是纯浪费）。
     """
     return db.scalar(
@@ -327,11 +327,11 @@ def find_active_book_run(db: Session, novel_id: int) -> DistillRun | None:
 def _make_progress_writer(job_id: int, db: Session) -> ProgressCallback:
     """造一个写回 `DistillRun` 的进度回调。
 
-    用的是**任务自己的 session**（与蒸馏共用同一条连接），于是进度写入与档案
+    用的是**任务自己的 session**（与提炼共用同一条连接），于是进度写入与档案
     落库在同一个事务节奏里，不会出现「进度显示 100% 但档案没写进去」的撕裂。
 
     回调内部**吞掉一切异常**：进度写失败（锁冲突/连接闪断）最多是进度条慢一拍，
-    绝不能因此中断一次已经跑了半小时的蒸馏。
+    绝不能因此中断一次已经跑了半小时的提炼。
     """
 
     def _write(stage: str, current: int, total: int) -> None:
@@ -346,8 +346,8 @@ def _make_progress_writer(job_id: int, db: Session) -> ProgressCallback:
             # 必须在**每次**回调都刷新，否则进度明明在动也会被判成卡住。
             run.progress_at = _utcnow()
             db.commit()
-        except Exception as exc:  # noqa: BLE001 —— 进度写失败不阻断蒸馏
-            logger.warning("蒸馏进度写入失败 job_id=%s: %s", job_id, exc)
+        except Exception as exc:  # noqa: BLE001 —— 进度写失败不阻断提炼
+            logger.warning("提炼进度写入失败 job_id=%s: %s", job_id, exc)
             try:
                 db.rollback()
             except Exception:  # noqa: BLE001
@@ -376,7 +376,7 @@ def _make_heartbeat_writer(
       收尾保证不会停在「已完成 80/92」这种少一截的数字上（随后块级进度
       写入会接着把 stage 改成「提炼第 n/n 块」，不会卡住）。
 
-    心跳失败一律吞掉：它只是观测，绝不能因为写库失败中断一次已经跑了半小时的蒸馏。
+    心跳失败一律吞掉：它只是观测，绝不能因为写库失败中断一次已经跑了半小时的提炼。
     """
     # 上次写 stage 文本的时刻（None = 还没写过）。只活在这次任务的进程内，
     # 不需要落库——重启后任务本来就会被收割（reap），不存在跨进程续用。
@@ -402,7 +402,7 @@ def _make_heartbeat_writer(
                 run.stage = f"{prefix}（已完成 {done}/{total}）"[:255]
                 last_stage_at = now
             db.commit()
-        except Exception:  # noqa: BLE001 —— 心跳失败不阻断蒸馏
+        except Exception:  # noqa: BLE001 —— 心跳失败不阻断提炼
             try:
                 db.rollback()
             except Exception:  # noqa: BLE001
@@ -540,7 +540,7 @@ def _terminal_payload(
             bits.append(f"拒伪 {int(run.rejected)} 条")
         bits.append(f"失败块 {int(failed_chunks)} 个")
         bits.append(f"实际用时 {elapsed_text}")
-        head = "蒸馏完成" if not failed_chunks else "蒸馏完成（部分块失败）"
+        head = "提炼完成" if not failed_chunks else "提炼完成（部分块失败）"
         payload["message"] = f"{head}：" + "，".join(bits) + "。"
     elif interrupted:
         # 中断要**留痕**（用户必须知道这次没跑完），但留痕不等于作废：已完成的
@@ -552,20 +552,20 @@ def _terminal_payload(
         payload["resumable"] = done > 0
         if done and total:
             keep = (
-                f"已保留 {done}/{total} 块，可从这里继续——点「继续蒸馏」接着跑，"
+                f"已保留 {done}/{total} 块，可从这里继续——点「继续提炼」接着跑，"
                 "已完成的块不会重跑。"
             )
         elif done:
-            keep = f"已保留 {done} 块，可从这里继续——点「继续蒸馏」接着跑。"
+            keep = f"已保留 {done} 块，可从这里继续——点「继续提炼」接着跑。"
         else:
             keep = "这次还没跑完任何块，重新提交一次即可。"
         payload["message"] = (
-            "蒸馏被服务重启中断：后台线程随进程一起没了，任务没有跑完。"
+            "提炼被服务重启中断：后台线程随进程一起没了，任务没有跑完。"
             f"中断前已跑 {elapsed_text}。{keep}"
         )
     else:
         err = (run.error or "未知错误").strip()
-        payload["message"] = f"蒸馏失败：{err}。已用时 {elapsed_text}。"
+        payload["message"] = f"提炼失败：{err}。已用时 {elapsed_text}。"
 
     payload["next"] = _next_prompt(db, run.project_id)
     return payload
@@ -616,7 +616,7 @@ def emit_notice(
             logger.warning("通知同步进对话历史失败 notice_id=%s", row.id)
         return row
     except Exception:  # noqa: BLE001 —— 通知写失败不该让任务本身失败
-        logger.exception("蒸馏通知写入失败 job_id=%s kind=%s", run.id, kind)
+        logger.exception("提炼通知写入失败 job_id=%s kind=%s", run.id, kind)
         try:
             db.rollback()
         except Exception:  # noqa: BLE001
@@ -635,11 +635,11 @@ def _mark_failed(db: Session, job_id: int, exc: BaseException) -> None:
         if run is None:
             return
         run.status = STATUS_FAILED
-        run.stage = "蒸馏失败"
+        run.stage = "提炼失败"
         run.error = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_LEN]
         db.commit()
     except Exception:  # noqa: BLE001
-        logger.exception("蒸馏失败状态写回也失败了 job_id=%s", job_id)
+        logger.exception("提炼失败状态写回也失败了 job_id=%s", job_id)
 
 
 def reap_stale_runs(db: Session) -> int:
@@ -647,7 +647,7 @@ def reap_stale_runs(db: Session) -> int:
 
     ## 为什么必须有这一步
 
-    蒸馏跑在 FastAPI `BackgroundTasks` 的线程池里 —— 那是**进程内**的线程。
+    提炼跑在 FastAPI `BackgroundTasks` 的线程池里 —— 那是**进程内**的线程。
     uvicorn reload、多 worker、服务重启、容器被杀，都会让执行线程凭空消失，
     而它登记的 `DistillRun` 行还留在库里、状态还是 `running`。
 
@@ -663,7 +663,7 @@ def reap_stale_runs(db: Session) -> int:
     ## 只碰未终态
 
     `status in (pending, running)` 是**唯一**的筛选条件：已 success / failed 的
-    行绝不能被改写 —— 那是用户上一次蒸馏的结论，覆盖了就再也找不回来。
+    行绝不能被改写 —— 那是用户上一次提炼的结论，覆盖了就再也找不回来。
 
     Args:
         db: 调用方的 session（lifespan 里传独立 `SessionLocal()`）。
@@ -705,7 +705,7 @@ def reap_stale_runs(db: Session) -> int:
         )
 
     count = len(stale)
-    logger.info("启动时收割了 %s 条被中断的蒸馏任务（服务重启导致）", count)
+    logger.info("启动时收割了 %s 条被中断的提炼任务（服务重启导致）", count)
     return count
 
 
@@ -713,7 +713,7 @@ def run_distill_job(
     job_id: int, project_id: int, tier: str, force: bool = False,
     content_hash: str | None = None, resume: bool = True,
 ) -> None:
-    """后台蒸馏的执行体（跑在 FastAPI BackgroundTasks 的线程池里）。
+    """后台提炼的执行体（跑在 FastAPI BackgroundTasks 的线程池里）。
 
     Args:
         job_id: `DistillRun.id`（已登记为 pending）。
@@ -724,7 +724,7 @@ def run_distill_job(
             `corpus_content_hash`。None 时由 `project_narrative` 自行计算——
             同一条提交链路里重复全量加载语料算哈希是纯浪费。
         resume: 是否复用 `distill_chunks` 里已完成的块（断点续跑）。默认 True：
-            重新提交与「继续蒸馏」走同一条路，能复用就复用——同 scope 的块
+            重新提交与「继续提炼」走同一条路，能复用就复用——同 scope 的块
             是同一份计算的中间结果，复用它不会改变结论。`force=True` 时强制关闭。
 
     成功：写 `status=success` + 摘要字段（n_chapters / rule_count / rejected）。
@@ -737,7 +737,7 @@ def run_distill_job(
     try:
         run = db.get(DistillRun, job_id)
         if run is None:
-            logger.error("蒸馏任务行不存在 job_id=%s", job_id)
+            logger.error("提炼任务行不存在 job_id=%s", job_id)
             return
 
         run.status = STATUS_RUNNING
@@ -755,7 +755,7 @@ def run_distill_job(
         if project is None:
             raise ValueError(f"project {project_id} 不存在")
         if not (project.reference_novel_ids or []):
-            raise ValueError("项目未选参考语料，无法蒸馏（请先选语料或走自由生成）")
+            raise ValueError("项目未选参考语料，无法提炼（请先选语料或走自由生成）")
 
         # 预计耗时：仅用于「超时倍数」判据，界面上必须标注「非实测」。
         run.expected_minutes = _estimate_expected_minutes(db, project, tier)
@@ -786,7 +786,7 @@ def run_distill_job(
                 resume=resume and not force,
             )
             if not isinstance(profile, dict):
-                raise ValueError("蒸馏未产出档案（可能是档位不合法或语料为空）")
+                raise ValueError("提炼未产出档案（可能是档位不合法或语料为空）")
 
             rules = profile.get("rules") or {}
             # 部分块失败（LLM 超时/限流被跳过）：任务算成功，但如实写进 stage——
@@ -794,13 +794,13 @@ def run_distill_job(
             failed_chunks = int(profile.get("failed_chunks") or 0)
             if failed_chunks:
                 logger.warning(
-                    "蒸馏任务部分块失败 job_id=%s project_id=%s failed_chunks=%s",
+                    "提炼任务部分块失败 job_id=%s project_id=%s failed_chunks=%s",
                     job_id, project_id, failed_chunks,
                 )
             run.status = STATUS_SUCCESS
             run.stage = (
-                "蒸馏完成" if not failed_chunks
-                else f"蒸馏完成（{failed_chunks} 个语料块调用失败，已跳过）"
+                "提炼完成" if not failed_chunks
+                else f"提炼完成（{failed_chunks} 个语料块调用失败，已跳过）"
             )
             run.n_chapters = profile.get("n_chapters")
             run.rejected = profile.get("rejected")
@@ -838,7 +838,7 @@ def run_distill_job(
         )
     except Exception as exc:  # noqa: BLE001 —— 后台任务不得往外抛
         logger.exception(
-            "蒸馏任务失败 job_id=%s project_id=%s tier=%s", job_id, project_id, tier
+            "提炼任务失败 job_id=%s project_id=%s tier=%s", job_id, project_id, tier
         )
         _mark_failed(db, job_id, exc)
         run = db.get(DistillRun, job_id)
@@ -856,7 +856,7 @@ def run_distill_job(
                 run.finished_at = _utcnow()
                 db.commit()
         except Exception:  # noqa: BLE001
-            logger.exception("蒸馏任务收尾时间戳写入失败 job_id=%s", job_id)
+            logger.exception("提炼任务收尾时间戳写入失败 job_id=%s", job_id)
         finally:
             db.close()
 

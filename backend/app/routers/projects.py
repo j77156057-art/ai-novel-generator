@@ -34,7 +34,7 @@ class DistillStartRequest(StrictRequest):
     """`POST /api/projects/{id}/distill` 的请求体。
 
     继承 `StrictRequest`（未知字段 422）：拼错 `tier` 写成 `tiers` 会被立刻拒掉，
-    而不是静默按默认档位跑一整套 40 分钟的蒸馏——那是最贵的一种「静默无效」。
+    而不是静默按默认档位跑一整套 40 分钟的提炼——那是最贵的一种「静默无效」。
     """
 
     #: 档位 key（full/balanced/fast）。不给则沿用项目上已存的 `narrative_tier`，
@@ -47,7 +47,7 @@ class DistillStartRequest(StrictRequest):
 class StyleDistillApplyRequest(StrictRequest):
     """`POST /api/projects/{id}/style-distills/apply` 的请求体。
 
-    把蒸馏库里某条已蒸馏档案**应用到本项目**。继承 `StrictRequest`：拼错字段名会被
+    把文风档案库里某条已提炼档案**应用到本项目**。继承 `StrictRequest`：拼错字段名会被
     立刻 422，而不是静默当成「空 body」把 distill_id 当 0 去查。
     """
 
@@ -89,7 +89,7 @@ def list_projects(db: Session = Depends(get_db)) -> list[Project]:
 
 @router.get("/narrative-tiers")
 def narrative_tiers() -> dict:
-    """列出全部蒸馏档位（前端选档用）。
+    """列出全部提炼档位（前端选档用）。
 
     静态元数据，不碰 DB。
 
@@ -123,10 +123,10 @@ def start_distill(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> dict:
-    """提交一次文风蒸馏：**立即返回** job_id，蒸馏在后台跑。
+    """提交一次文风提炼：**立即返回** job_id，提炼在后台跑。
 
     前端拿 job_id 轮询 `GET .../distill/jobs/{job_id}` 看进度。这样即便用户
-    关掉页面、刷新、切到别的步骤，蒸馏也不中断、进度也不丢。
+    关掉页面、刷新、切到别的步骤，提炼也不中断、进度也不丢。
 
     并发防重：项目上已有 pending/running 任务且不 force 时，直接复用那条
     （返回它的 job_id，`reused: True`），不重复烧一遍 LLM。**不分档位**——
@@ -134,9 +134,9 @@ def start_distill(
     盖掉先完成的，可能旧档盖新档）且争抢 SQLite 写锁；想换档位重算，
     等当前任务终态后再提交（或对旧任务无感知时直接重提，force 另算）。
 
-    缓存命中预测：不 force 时若本次会直接复用「项目已存档案」或「蒸馏库」，
+    缓存命中预测：不 force 时若本次会直接复用「项目已存档案」或「文风档案库」，
     返回 `from_cache: True` 与 `cache_source`（"project" / "library"）。
-    前端据此如实提示「秒级复用、未重新调用模型」，避免「一秒蒸馏完却没解释」。
+    前端据此如实提示「秒级复用、未重新调用模型」，避免「一秒提炼完却没解释」。
     预测时算出的 `content_hash` 会传给后台任务，同一条链路不重复全量加语料。
     """
     proj = db.get(Project, project_id)
@@ -227,7 +227,7 @@ def resume_distill(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> dict:
-    """从断点继续一次被中断的蒸馏（**不自动续跑**，由用户点「继续蒸馏」触发）。
+    """从断点继续一次被中断的提炼（**不自动续跑**，由用户点「继续提炼」触发）。
 
     与 `POST /{id}/distill` 的差别只有两点：
 
@@ -285,10 +285,10 @@ def list_distill_jobs(
     limit: int = Query(default=5, ge=1, le=50),
     db: Session = Depends(get_db),
 ) -> dict:
-    """列出该项目最近的蒸馏任务（id 降序），供前端「回到页面续上进度」。
+    """列出该项目最近的提炼任务（id 降序），供前端「回到页面续上进度」。
 
     前端进工作台时拉最近一条：若它还是 pending/running，就接着轮询，
-    用户于是看到「刚才那次蒸馏还在跑、跑到第几块」，而不是一条空白。
+    用户于是看到「刚才那次提炼还在跑、跑到第几块」，而不是一条空白。
     """
     if db.get(Project, project_id) is None:
         raise HTTPException(status_code=404, detail="project 不存在")
@@ -308,13 +308,13 @@ def list_distill_jobs(
 def get_distill_job(
     project_id: int, job_id: int, db: Session = Depends(get_db)
 ) -> dict:
-    """单条蒸馏任务的状态（进度条轮询的就是它）。
+    """单条提炼任务的状态（进度条轮询的就是它）。
 
     `project_id` 参与校验：job_id 猜错不该看到别的项目在跑什么。
     """
     run = db.get(DistillRun, job_id)
     if run is None or run.project_id != project_id:
-        raise HTTPException(status_code=404, detail="蒸馏任务不存在")
+        raise HTTPException(status_code=404, detail="提炼任务不存在")
     return distill_run_to_dict(run)
 
 
@@ -331,7 +331,7 @@ def get_distill_job(
 
 
 def _tier_name(key: str | None) -> str | None:
-    """档位 key → 可读名（完整 / 平衡 / 快速），用于蒸馏库里「标清楚蒸馏程度」。
+    """档位 key → 可读名（完整 / 平衡 / 快速），用于文风档案库里「标清楚提炼档位」。
 
     库行只存 tier key，展示时再解析；解析失败（未知 key）回落原 key，不报错。
     """
@@ -346,7 +346,7 @@ def _tier_name(key: str | None) -> str | None:
 
 
 def _sd_summary(row: StyleDistill) -> dict:
-    """蒸馏库条目 → 列表用的摘要（**不含** style_narrative 全文与 rules）。"""
+    """文风档案库条目 → 列表用的摘要（**不含** style_narrative 全文与 rules）。"""
     return {
         "id": row.id,
         "source_ids": row.source_ids,
@@ -367,7 +367,7 @@ def _sd_summary(row: StyleDistill) -> dict:
 
 
 def _sd_detail(row: StyleDistill) -> dict:
-    """蒸馏库条目 → 详情（含 style_narrative 全文）。"""
+    """文风档案库条目 → 详情（含 style_narrative 全文）。"""
     d = _sd_summary(row)
     d["style_narrative"] = row.style_narrative
     return d
@@ -379,10 +379,10 @@ def list_style_distills(
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
 ) -> dict:
-    """列出蒸馏库里**可复用**的文风档案（默认只给 active）。
+    """列出文风档案库里**可复用**的文风档案（默认只给 active）。
 
     列表**省略** style_narrative 全文与 rules：那份 JSON 有几万字符，列表场景用不到，
-    只在 `GET /style-distills/{id}` 详情里返回。前端据此渲染「已有蒸馏档案」列表 + 应用按钮。
+    只在 `GET /style-distills/{id}` 详情里返回。前端据此渲染「已有提炼档案」列表 + 应用按钮。
     """
     stmt = select(StyleDistill)
     if status == "active":
@@ -397,22 +397,22 @@ def list_style_distills(
 
 @router.get("/style-distills/{distill_id}")
 def get_style_distill(distill_id: int, db: Session = Depends(get_db)) -> dict:
-    """单条蒸馏库条目详情（含 style_narrative 全文）。"""
+    """单条文风档案库条目详情（含 style_narrative 全文）。"""
     row = db.get(StyleDistill, distill_id)
     if row is None:
-        raise HTTPException(status_code=404, detail="蒸馏库条目不存在")
+        raise HTTPException(status_code=404, detail="文风档案库条目不存在")
     return _sd_detail(row)
 
 
 @router.post("/style-distills/{distill_id}/archive")
 def archive_style_distill(distill_id: int, db: Session = Depends(get_db)) -> dict:
-    """归档一条蒸馏库条目：不再出现在「可复用」列表，但保留供历史查阅。
+    """归档一条文风档案库条目：不再出现在「可复用」列表，但保留供历史查阅。
 
-    归档后同输入再蒸馏会新建一行（而非悄悄覆盖），保证用户「我想重新蒸馏」的意图生效。
+    归档后同输入再提炼会新建一行（而非悄悄覆盖），保证用户「我想重新提炼」的意图生效。
     """
     row = db.get(StyleDistill, distill_id)
     if row is None:
-        raise HTTPException(status_code=404, detail="蒸馏库条目不存在")
+        raise HTTPException(status_code=404, detail="文风档案库条目不存在")
     if row.status == "archived":
         return _sd_summary(row)  # 幂等：已是 archived 直接返回
     row.status = "archived"
@@ -426,13 +426,13 @@ def apply_style_distill(
     body: StyleDistillApplyRequest,
     db: Session = Depends(get_db),
 ) -> Project:
-    """把蒸馏库里某条已蒸馏档案**应用到本项目**。
+    """把文风档案库里某条已提炼档案**应用到本项目**。
 
     应用 = 把条目的 style_narrative 复制进 `project.style_narrative`（生成链路用的单槽缓存），
     并把项目的 `narrative_tier` 同步成该条目所用档位，使「指纹」对齐、应用后不会立刻被
     `project_narrative` 当成失效而重写。条目的 `applied_at` 同步刷新（命中复用也算一次使用）。
 
-    这是「蒸馏一次、多个项目复用」的落点：项目 A 蒸馏完入库，项目 B 在「蒸馏库」里点一下
+    这是「提炼一次、多个项目复用」的落点：项目 A 提炼完入库，项目 B 在「文风档案库」里点一下
     应用，立刻拿到 A 的文风档案，省掉 B 自己的 42 分钟 LLM。
     """
     proj = db.get(Project, project_id)
@@ -440,7 +440,7 @@ def apply_style_distill(
         raise HTTPException(status_code=404, detail="project 不存在")
     entry = db.get(StyleDistill, body.distill_id)
     if entry is None or entry.status != "active":
-        raise HTTPException(status_code=404, detail="蒸馏库条目不存在或已归档")
+        raise HTTPException(status_code=404, detail="文风档案库条目不存在或已归档")
 
     from app.style.narrative import narrative_fingerprint, resolve_tier
 
@@ -475,7 +475,7 @@ def get_style_profile_fingerprint(project_id: int, db: Session = Depends(get_db)
     """文体档案的「量尺/规格书」对齐状态（只读，不重蒸）。
 
     `state=stale` 表示档案来自旧版测量口径，**仍然可用**，只是数值与新尺不可比；
-    要不要重蒸由用户决定（重蒸走既有的蒸馏/apply 端点，不在这里自动发生）。
+    要不要重蒸由用户决定（重蒸走既有的提炼/apply 端点，不在这里自动发生）。
     """
     from app.style.pipeline import profile_fingerprint_state
 
@@ -612,11 +612,11 @@ def patch_project(
     """分步更新项目字段（向导每步调一次）。
 
     `narrative_tier` 在这里做校验（而不是靠 pydantic），有两个原因：
-    1. 想回**400 + 中文可读文案**（"未知蒸馏档位 'xxx'，可选：…"），
+    1. 想回**400 + 中文可读文案**（"未知提炼档位 'xxx'，可选：…"），
        pydantic 的 Literal/validator 只会给 422 + 英文结构化错误；
     2. 这是**唯一会写入非法档位的入口**（`build-narrative` 那条路自己已经校验过）。
        漏在这里的后果：项目被存成不存在的档位，当场不报错，要等到之后
-       蒸馏时才炸，那时已经无从追溯是谁写进去的。
+       提炼时才炸，那时已经无从追溯是谁写进去的。
 
     校验放在 setattr **之前**，所以非法档位时整条 patch 都不落库——不部分写入。
     """
@@ -856,7 +856,7 @@ def build_narrative(
     幂等：已存且指纹一致（source_ids + narrative_version + **tier**）则直接返回缓存。
 
     Args:
-        tier: 蒸馏档位（full/balanced/fast）。不给则沿用项目上存的
+        tier: 提炼档位（full/balanced/fast）。不给则沿用项目上存的
             `narrative_tier`；那也没有则用默认完整档。
             显式传入合法档位会**顺带存进项目**（项目级偏好，见下）。
 
@@ -1050,7 +1050,7 @@ def start_character_template(
 ) -> dict:
     """提炼**人物塑造模板**：**立即返回** job_id，抽取在后台跑。
 
-    与叙事蒸馏分开的原因：叙事档案一次完整档要 42 分钟，而模板只要每块
+    与叙事提炼分开的原因：叙事档案一次完整档要 42 分钟，而模板只要每块
     一次调用（约 1/8 的量）。**抽模板不必重蒸整本档案** —— 旧档案照旧有效。
 
     库里已有同一档的模板产物时直接复用（`from_cache: True`），不重抽。
@@ -1272,7 +1272,7 @@ def generate_character_card(
     if not name:
         raise HTTPException(status_code=400, detail="name 不能为空")
 
-    from app.generation.character_card_gen import complete_card
+    from app.generation.character_card_gen import complete_card, style_reference
 
     provider = _provider_or_none()
     if provider is None:
@@ -1292,7 +1292,9 @@ def generate_character_card(
     result = _model_call(
         "补全角色卡",
         lambda: complete_card(provider, char, body.card or char.get("card") or {},
-                              body.note or "", raise_errors=True),
+                              body.note or "", raise_errors=True,
+                              style_ref=style_reference(
+                                  getattr(proj, "style_narrative", None))),
     )
     if not result:
         return {"ok": False, "detail": "AI 没给出可用结果（可重试或改写要求）"}
@@ -1320,7 +1322,7 @@ def generate_character_cards_batch(
     if not wants:
         raise HTTPException(status_code=400, detail="wants 不能为空")
 
-    from app.generation.character_card_gen import generate_cards
+    from app.generation.character_card_gen import generate_cards, style_reference
 
     provider = _provider_or_none()
     if provider is None:
@@ -1331,6 +1333,8 @@ def generate_character_cards_batch(
         "批量生成角色卡",
         lambda: generate_cards(provider, _story_of(proj), wants,
                                already=_existing_voices(bible), note=body.note or "",
+                               style_ref=style_reference(
+                                   getattr(proj, "style_narrative", None)),
                                raise_errors=True),
     )
     return {
@@ -2119,7 +2123,7 @@ def style_narrative_conflicts(project_id: int, db: Session = Depends(get_db)) ->
             "conflicts": [],
             "attributive": [],
             "can_generate": True,
-            "note": "这个项目还没有文风档案 —— 先蒸馏一份，或从蒸馏库应用一份。",
+            "note": "这个项目还没有文风档案 —— 先提炼一份，或从文风档案库应用一份。",
         }
 
     block = _narrative_block(narrative)
@@ -2164,7 +2168,7 @@ def repair_style_narrative(
 
     体检（`agents/prompt_audit.py`）发现「档案的禁用词与档案正文自相矛盾」时，
     原来的建议是「从档案规则里删掉这些词，或从禁用清单里去掉」——
-    但产品里**没有改档案规则的接口**：只能重蒸馏（一轮 ≈ 42 分钟 LLM）或换档案。
+    但产品里**没有改档案规则的接口**：只能重新提炼（一轮 ≈ 42 分钟 LLM）或换档案。
     「被告知了原因，却没有地方自己动手」—— 这就是「开箱即用」最大的实际卡点。
 
     ## 改的是谁
@@ -2197,7 +2201,7 @@ def repair_style_narrative(
     if not isinstance(narrative, dict) or not narrative.get("rules"):
         raise HTTPException(
             status_code=400,
-            detail="这个项目还没有文风档案（或档案里没有规则）—— 先蒸馏或从蒸馏库应用一份",
+            detail="这个项目还没有文风档案（或档案里没有规则）—— 先提炼或从文风档案库应用一份",
         )
 
     plan = plan_repair(narrative, body.word, body.mode)
@@ -2283,7 +2287,7 @@ def get_workflow(project_id: int, db: Session = Depends(get_db)) -> dict:
     """工序链状态：助理 agent 现在到哪一步、该做什么、卡在哪儿。
 
     状态是**每次重新评估**出来的（查库 + 跑只读规则），不是日志里的一句话 ——
-    正文改过、蒸馏重跑过、提案批了，状态都会跟着变。
+    正文改过、提炼重跑过、提案批了，状态都会跟着变。
     """
     proj = db.get(Project, project_id)
     if proj is None:

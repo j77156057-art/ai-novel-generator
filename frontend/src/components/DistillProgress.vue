@@ -103,7 +103,7 @@ const summary = computed(() => {
         <span v-if="active" class="spinner" aria-hidden="true"></span>
         {{ meta.label }}
       </span>
-      <span class="distill-title">文风蒸馏</span>
+      <span class="distill-title">文风提炼</span>
       <span v-if="tierName" class="distill-tier">档位：{{ tierName }}</span>
       <span v-if="timeHint" class="faint distill-time">{{ timeHint }}</span>
     </div>
@@ -114,7 +114,7 @@ const summary = computed(() => {
       :aria-valuemin="0"
       :aria-valuemax="indeterminate ? undefined : 100"
       :aria-valuenow="indeterminate ? undefined : percent"
-      :aria-label="`文风蒸馏：${stageText}`"
+      :aria-label="`文风提炼：${stageText}`"
     >
       <div
         v-if="!indeterminate"
@@ -133,10 +133,10 @@ const summary = computed(() => {
 
     <!-- 失败必须给出原因：进度条转半天然后什么都不说，是最难自查的一种失败 -->
     <div v-if="job.status === 'failed'" class="notice err distill-error">
-      <strong>蒸馏失败</strong>
+      <strong>提炼失败</strong>
       <div class="distill-error-body">{{ job.error || "（服务端未返回原因）" }}</div>
       <div class="faint">
-        常见原因：未配置蒸馏用的模型密钥、模型返回超时、参考语料为空。修好后重新点「开始蒸馏」即可。
+        常见原因：未配置提炼用的模型密钥、模型返回超时、参考语料为空。修好后重新点「开始提炼」即可。
       </div>
     </div>
 
@@ -148,7 +148,7 @@ const summary = computed(() => {
     </div>
 
     <div v-else-if="job.status === 'pending'" class="faint distill-tip">
-      任务已提交，正在等待后台线程接手。可以放心继续下一步 —— 蒸馏在后台跑，进度不会丢。
+      任务已提交，正在等待后台线程接手。可以放心继续下一步 —— 提炼在后台跑，进度不会丢。
     </div>
   </div>
 </template>
