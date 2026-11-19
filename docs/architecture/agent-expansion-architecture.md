@@ -29,6 +29,8 @@
 ## 3. 框架选型边界
 
 - **LangGraph**：仅承载 Assistant 内部的"审批 / 诊断状态机"子图（states: `retrieve → diagnose → propose → await_approval → commit/rollback`），不接管 Writer 主图。
+  - **已落地（2026-11）**：审批转移部分在 `backend/app/agents/approval_graph.py`，只包 `approve / reject / apply` 三种单条动作；状态判定仍由 `app/agents/proposals.py` 的 `ALLOWED_TRANSITIONS` 决定，批量应用与版本回滚不经子图。
+  - 诊断流（`retrieve → diagnose → propose`）仍由现有只读工具 + 显式代码完成，未搬进图。
 - **Deep Agents**：本轮**暂缓**；如未来需要多步工具编排，再以独立 ADR 评估，不在 P0 范围内。
 - **FastAPI 工具层复用**：Assistant 直接复用既有 `app/api/v1/*` 检索/草稿查询/节拍查询端点，不再造平行 HTTP 层，降低回归成本。
 
