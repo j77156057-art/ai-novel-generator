@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.kg.era_convert import extract_era_name, parse_story_time
 from app.kg.knowledge_match import normalize_fact
@@ -96,14 +96,21 @@ RULES: dict[str, tuple[str, str]] = {
 # --------------------------------------------------------------------------- #
 
 def _book_cond(model, novel_id: int | None) -> list:
-    """事件表的书维度过滤：指定书 + 项目级（novel_id IS NULL）。
+    """事件/实体的书维度过滤：指定书 + 项目级（novel_id IS NULL）。
 
     项目挂两本书时，若只按 project_id 取事件，会把别书的历史事件混进本段的
     巡检（瞬移/年号倒序/伏笔超期都会误报）。
+
+    `novel_id is None` 表示本项目当前没有指定书（原创 / 未设续写书）——
+    这时**只审项目级事实**（`novel_id IS NULL`）。不能让 None 变成「不过滤」：
+    续写项目的 KG 里同时躺着参考书的几万条实体与伏笔，不过滤会把
+    《修真聊天群》的伏笔当成这本书的伏笔报警（项目 6 实测超期 3123 章）。
     """
     if novel_id is None:
-        return []
-    return [model.novel_id.in_((novel_id, None))]
+        return [model.novel_id.is_(None)]
+    # 注意：不能用 `IN (novel_id, None)`——SQL 里 `IN (..., NULL)` 不会命中
+    # `novel_id IS NULL` 的项目级行，必须显式 OR。
+    return [or_(model.novel_id == novel_id, model.novel_id.is_(None))]
 
 
 def check_teleportation(db, project_id: int, text: str, segment_no: int,
@@ -492,6 +499,7 @@ def check_foreshadow_expiry(db, project_id: int, text: str, segment_no: int,
             KgForeshadow.project_id == project_id,
             KgForeshadow.status.in_(["planted", "developing"]),
             KgForeshadow.planned_payoff_chapter.isnot(None),
+            *_book_cond(KgForeshadow, novel_id),
         )
     ):
         payoff = _payoff_of(fs)
@@ -580,7 +588,8 @@ T_JUDGE_ALERT = "kg_judge"
 
 
 def save_judge_findings(db, project_id: int, findings: list[dict], *,
-                        segment_no: int) -> int:
+                        segment_no: int,
+                        novel_id: int | None = None) -> int:
     """把本段 Judge findings 落进事实表（哨兵 save_findings 同款语义）。
 
     findings 是 judge_segment 返回的已序列化 dict 列表。
@@ -613,6 +622,9 @@ def save_judge_findings(db, project_id: int, findings: list[dict], *,
                 # 证据不可用的告警要能被查询侧一眼分辨，不能只写在文案里
                 "evidence_unavailable": bool(f.get("evidence_unavailable")),
                 "segment_no": segment_no,
+                # 记下这条告警属于哪本书：读侧据此过滤别书的历史告警
+                # （NULL = 项目级 / 加列前的旧行）。
+                "novel_id": novel_id,
             },
             source="judge_v3", confidence="high",
             first_segment=segment_no, last_segment=segment_no,
@@ -637,6 +649,7 @@ def load_judge_findings(db, project_id: int) -> list[dict]:
         "message": (r.props or {}).get("message") or "",
         "evidence": (r.props or {}).get("evidence") or [],
         "evidence_unavailable": bool((r.props or {}).get("evidence_unavailable")),
+        "novel_id": (r.props or {}).get("novel_id"),
     } for r in rows]
     out.sort(key=lambda d: (d["segment_no"] or 0), reverse=True)
     return out

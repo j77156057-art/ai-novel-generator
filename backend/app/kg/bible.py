@@ -203,16 +203,33 @@ def _cn_number(s: str) -> int | None:
 
 
 def character_gender(card: Any) -> str:
-    """角色卡性别，归一为「男 / 女 / 其他」；没写或认不出返回空串（不猜）。"""
+    """角色卡性别，归一为「男 / 女 / 其他」；没写或认不出返回空串（不猜）。
+
+    兼容三种落点：
+    - 平铺：`{"性别": "女"}` / `{"gender": "female"}`
+    - 角色卡分组：`{"身份": {"性别": "女"}}`
+    - 圣经角色条目：`{"card": {"身份": {"性别": "女"}}}`
+    """
     if not isinstance(card, dict):
         return ""
-    for key in _GENDER_KEYS:
-        raw = card.get(key)
-        if raw in (None, ""):
-            continue
-        text = str(raw).strip().lower()
-        if text in _GENDER_ALIASES:
-            return _GENDER_ALIASES[text]
+    sources: list[dict] = [card]
+    ident = card.get("身份")
+    if isinstance(ident, dict):
+        sources.append(ident)
+    nested = card.get("card")
+    if isinstance(nested, dict):
+        sources.append(nested)
+        nested_ident = nested.get("身份")
+        if isinstance(nested_ident, dict):
+            sources.append(nested_ident)
+    for src in sources:
+        for key in _GENDER_KEYS:
+            raw = src.get(key)
+            if raw in (None, ""):
+                continue
+            text = str(raw).strip().lower()
+            if text in _GENDER_ALIASES:
+                return _GENDER_ALIASES[text]
     return ""
 
 

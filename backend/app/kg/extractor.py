@@ -123,6 +123,55 @@ _NAME_WORD_STOP = {
     #   「青年」56 次（"青年年龄在二十左右" / "英俊的青年"）。
     "中年人",
 }
+# 常见词硬停表：这些词形态上可能通过「姓首字 + 1 字」的 2 字分支，
+# 但它们是时间/空间/抽象名词或高频动词，不是人名。
+# 实测项目 6 的提示词角色约束里混进了 时间/空间/平台/费用/后台/毕竟/边上/上车/后来/
+# 索性/东侧/石碑/长生/诸天/金丹/黄山——它们都满足旧 2 字名判据。
+# 只列**已实测入图**与高频时间/空间词，不做无限扩张；新增词必须附原句证据。
+_COMMON_WORD_STOP = {
+    "时间", "空间", "世界", "天地", "天下", "长生", "诸天", "金丹", "元婴",
+    "黄山", "青山", "空中", "地下", "地上", "天上", "人间", "世上", "身上",
+    "心中", "心里", "眼里", "手里", "眼前", "身后", "身边", "旁边", "周围",
+    "四周", "远处", "近处", "前面", "后面", "左边", "右边", "上方", "下方",
+    "中间", "对方", "双方", "大家", "众人", "人们", "自己", "别人", "有人",
+    "没人", "什么", "怎么", "因为", "所以", "但是", "而且", "然后", "于是",
+    "现在", "已经", "开始", "结束", "继续", "终于", "突然", "渐渐", "慢慢",
+    "马上", "立刻", "顿时", "依然", "仍然", "果然", "竟然", "居然", "当然",
+    "其实", "确实", "可能", "应该", "必须", "需要", "可以", "能够", "愿意",
+    "想要", "觉得", "认为", "知道", "看到", "听见", "发现", "感觉", "希望",
+    "担心", "害怕", "喜欢", "讨厌", "记得", "忘记", "明白", "理解", "同意",
+    "反对", "决定", "选择", "准备", "打算", "计划", "安排", "处理", "解决",
+    "完成", "成功", "失败", "问题", "原因", "结果", "情况", "状态", "过程",
+    "阶段", "方面", "部分", "内容", "意义", "价值", "作用", "影响", "关系",
+    "条件", "机会", "现实", "理想", "目标", "方案", "措施", "行动", "行为",
+    "现象", "本质", "特征", "特点", "性质", "规律", "原则", "系统", "机制",
+    "结构", "模式", "框架", "体系", "领域", "范围", "环境", "背景", "局面",
+    "形势", "趋势", "方向", "道路", "途径", "渠道", "资源", "要素", "基础",
+    "核心", "关键", "重点", "难点", "热点", "焦点", "亮点", "起点", "终点",
+    "节点", "拐点", "里程碑", "标志", "象征", "代表", "体现", "反映", "表明",
+    "显示", "说明", "证明", "揭示", "展示", "呈现", "表现", "表达", "传达",
+    "传递", "传播", "推广", "普及", "应用", "使用", "利用", "发挥", "实现",
+    "达到", "取得", "获得", "形成", "建立", "构建", "创造", "产生", "出现",
+    "发生", "发展", "变化", "改进", "改善", "提高", "提升", "增强", "加强",
+    "扩大", "缩小", "增加", "减少", "降低", "控制", "管理", "应对", "面对",
+    "迎接", "挑战", "风险", "危机", "困难", "障碍", "矛盾", "冲突", "合作",
+    "竞争", "交流", "沟通", "协调", "配合", "支持", "帮助", "服务", "保障",
+    "维护", "保护", "促进", "推动", "引导", "指导", "领导", "组织", "实施",
+    "开展", "进行", "执行", "运行", "操作", "工作", "学习", "研究", "探索",
+    "调查", "分析", "评估", "评价", "测试", "实验", "验证", "检查", "审查",
+    "监督", "监管", "规范", "法律", "平台", "费用", "后台", "毕竟", "边上",
+    "上车", "后来", "索性", "东侧", "石碑", "康复中", "空口", "别拿", "能接",
+    "通下", "周叔知", "万界修",
+    # 项目 6 真实正文离线复跑（62 段）后仍在 top 50 的普通名词/动词。
+    # 与上面同一条纪律：只收**实测入图**的词，新增必须附原句证据。
+    "权限", "封条", "公告", "通知", "终端", "任务", "印件", "空白", "申请",
+    "关联", "单子", "黑布", "东门", "长乐", "临江", "养老院", "康复",
+    "清楚", "证明", "能证明", "边缘", "养老", "封口", "通话", "别碰",
+    "印机", "扶手", "花盆", "别点", "红点", "金额", "别接", "印纸",
+    "红章", "边角", "平台不", "平台回", "别加戏", "别替我", "别开灯",
+    "别让他", "东西都", "任何人", "后三页", "封存件", "印出来", "印机吐",
+    "听明白", "木门", "旧清", "成功", "项目",
+}
 _DESC_STOP = set(
     "女生男生孩子老人男人女人先生小姐姑娘少爷夫人大人家伙东西事情地方"
     "声音眼神手指巷口胸口霓虹视网膜警报灯管选择天亮本能地下代价名字"
@@ -200,7 +249,7 @@ _TIME_WORD_STOP = frozenset(
 _SPEAK_VERBS = "说道问答笑"
 # 宾语位粘连体首字集合 = 说话动词 + 「听」（「听说」是转述动词短语，
 # 「叫宝玉听说」的宾语位会切出「宝玉听」——只列说话动词会漏掉这一类）。
-_GLUE_VERB_LEADS = set(_SPEAK_VERBS) | {"听"}
+_GLUE_VERB_LEADS = set(_SPEAK_VERBS) | {"听", "知"}
 # R2 归并排斥集：2 字名 + 后一字归并成 3 字名时，后一字不得是
 #   ① 说话动词或「听」（_GLUE_VERB_LEADS）——挡住「宝玉笑道」→「宝玉笑」、
 #      「林夜说道」→「林夜说」、「宝玉听说」→「宝玉听」这类复活；
@@ -215,7 +264,7 @@ _SPEAK_ADV_LEAD_CHARS = frozenset(
 )
 _SPEAK_MERGE_BLOCK_CHARS = frozenset(_GLUE_VERB_LEADS) | _SPEAK_ADV_LEAD_CHARS
 # 粘连尾巴集合：名末字命中且前缀本身是已入图角色时，末字应判为粘连（对话桥接纠偏用）。
-_GLUE_TAIL_CHARS = set("说道问答笑听") | set("又便因都也却竟忙遂乃复再方才只就即已曾忽急正先后仍尚")
+_GLUE_TAIL_CHARS = set("说道问答笑听知") | set("又便因都也却竟忙遂乃复再方才只就即已曾忽急正先后仍尚")
 # 换行续行归一：源文本（公版书扫描档）按行硬折行，人名会被换行切成两半
 # （实测「林黛⏎玉」17 次，占「林黛」全部出现的 5%；断点后的「玉冷笑道」还会被
 # _SPEAK_RE 归因成新名字「玉冷」）。折行只可能在**前后都是汉字**时出现；
@@ -244,7 +293,7 @@ _SEG_RE = re.compile(r"[^。！？!?；;，,]+[。！？!?；;，,]?[”\"'’]?
 # （百家姓确有「方/都/应/贾/秦」等），但真实人名不会以这些字开头成词。
 _NAME_LEAD_STOP = set(
     "才方都应就还又再但却则使令把将为以于向从到跟同和便即另各每某"
-    "很太最更再又才常每另各某极颇稍略挺蛮颇"
+    "很太最更再又才常每另各某极颇稍略挺蛮颇别后"
 )
 # 宾语位触发词：其后紧邻的 2–3 字词若是人名，即为宾语（「拉住苏晚」「问宝玉」）
 _OBJ_TRIGGER_RE = re.compile(
@@ -256,6 +305,31 @@ _OBJ_TRIGGER_RE = re.compile(
 _LEAD_RE = re.compile(r"([一-鿿]{2,3})")
 # 单字虚词（切分主语时会黏在名字尾部，需剥除）
 _TAIL_PARTICLE = set("又便就也而则遂乃复还且或但却则使令把将")
+# 「3 字候选末字其实是动作词首字」的集合：周叔知|道 = 周叔 + 知道，
+# 不是复姓/三字名。命中时优先回退到 2 字前缀，而不是把动词吃进名字。
+_VERB_TAIL_CHARS = set(
+    "知看听想说道问答笑走站坐抬转伸拿握推拉皱点低沉冷淡把将给让被做用来去"
+    "接递望闻哭喊叫扶抱抓收放提背穿戴跑跳停等找救帮打杀吃喝睡醒躺跪趴靠躲藏"
+    "冲退进出回开关摇挥拍敲踢踩跨绕追赶逃奔爬滚翻愣怔呆叹怒喜悲骂瞪盯瞥扫瞄瞧"
+    "上下起过在是有无没"
+)
+# 3 字姓氏候选被 _NAME_CHARS 拒绝时，只有后接明确动作/虚词/标点才按 3 字名放行。
+# 典型：宋书航看了 / 白前辈说道 / 陈小满把那块 / 顾青梧没有接。
+_LEAD_SIGNAL_CHARS = _VERB_TAIL_CHARS | _TAIL_PARTICLE | set(
+    "没不又便就也却正仍尚已曾忽急先后才即复再方只"
+) | set("，。！？；：、,.!?;:")
+# 2 字称呼的合法尾字：叔/哥/爷/姐/母 这类昵称/亲属称谓不在名用字表里，
+# 但它们是真实称呼（周叔/满哥/贾母/凤姐）。入图门槛用它做弱证据的第二字校验。
+_NICKNAME_TAIL_CHARS = set(
+    "叔伯爷奶哥姐弟妹婶姨舅嫂父母公婆总少老小大二三四五六七八九十"
+)
+# 3/4 字候选若以功能词收尾，几乎都是「动词短语 + 虚词」被切成的伪名
+# （谈之前 / 连中间 / 能耗更 / 充电没 / 严格来 / 周爷都）。
+# 人名的末字极少落在这些虚词上；高置信路径也不放行，除非在作者白名单里。
+_FUNC_TAIL_CHARS = set(
+    "之前后中间时更没来都也就才还而且或但则所以为被把将给让对向从到于由因"
+    "如若虽然且很最不是有在和与及只午你您调字"
+)
 # 需要剥除的包裹符号（引号/括号/冒号/破折号等）
 _WRAP = """"'"'"「」『』“”‘’()（）:：—-；;，,。！？!?"""
 
@@ -378,13 +452,24 @@ class ExtractionResult:
     relationships: dict = field(default_factory=dict)  # (a, b) -> Relationship
 
 
-def _passes_entry_gate(c: Character) -> bool:
+def _passes_entry_gate(
+    c: Character,
+    *,
+    known_names: frozenset[str] = frozenset(),
+) -> bool:
     """Pass 2 入图资格——抽出来做**单一事实来源**，避免判据在多处漂移。
 
     三条通路任一成立即入图：
       named     经「叫X」显式命名获得；
       speaking  有说话归属证据；
       mentions≥2 且跨≥2 章 —— 多章复现是「不是一次性噪声」的最低证据。
+
+    2026-11-19 补两条护栏：
+    - 作者声明的角色（剧情圣经/设定卡）无条件入图；
+    - 纯 2 字名走「弱证据」时，第二字必须是名用字或称呼尾字（叔/哥/母/姐…）。
+      否则「养老/封口/通话/扶手/花盆」这类普通词只要跨两章出现两次就能入图，
+      进而进 top-50 提示词约束。说话/命名两条强证据不受此限。
+
     注意这条门槛**只用于入图**，不要拿它去约束 Pass 1.7 的覆盖者选取：
     实测那样做是净负面（详见 _drop_shadowed_prefixes 的实测决策段）。
 
@@ -393,7 +478,17 @@ def _passes_entry_gate(c: Character) -> bool:
     故回滚到原 3 通路设计。
     G1b 红得对的修复路径在**别处**——让 named/speaking 通路把角色"养"进图。
     """
-    return bool(c.named or c.speaking or (c.mentions >= 2 and len(c.chapters) >= 2))
+    if c.name in known_names:
+        return True
+    if c.named or c.speaking:
+        return True
+    if (
+        len(c.name) == 2
+        and c.name[1] not in _NAME_CHARS
+        and c.name[1] not in _NICKNAME_TAIL_CHARS
+    ):
+        return False
+    return c.mentions >= 2 and len(c.chapters) >= 2
 
 
 class KGExtractor:
@@ -401,7 +496,12 @@ class KGExtractor:
         raise NotImplementedError
 
 
-def _valid_name(w: str) -> bool:
+def _valid_name(
+    w: str,
+    *,
+    allow_unknown_tail: bool = False,
+    known_names: frozenset[str] = frozenset(),
+) -> bool:
     """人名合法性：黑名单 + **正向形态**双重把关。
 
     正向形态是必须的：单靠黑名单时，文言虚词（故/撰/忽/一说/因曾…）几乎
@@ -411,6 +511,14 @@ def _valid_name(w: str) -> bool:
     只认姓氏会把红楼梦这类真实角色整片拦掉。因此规则是
     「姓首字」或「名字用字组合」皆可，但命中后仍须过 _NAME_WORD_STOP 护栏，
     否则「不知/不能/东西/都是」这类常用词会被当成名字。
+
+    ``known_names``：作者在剧情圣经/设定卡里显式声明的角色名与别名。
+    这些名字**跳过形态判据**——「陈小满」「顾青梧」「冯保国」的末字不在人工
+    维护的 _NAME_CHARS 里，但它们是作者亲自确认过的人名，必须优先放行。
+
+    ``allow_unknown_tail``：高置信场景（说话归属 / 叫X / 动作宾语 / 句首后接
+    明确动作）下，3 字名允许末字不在 _NAME_CHARS。4 字名仍要求末字过表——
+    4 字更可能是「万界修士」这类名词短语被截断。
 
     长度必须 ≥2：中文人名极少单字，而「人」「可」「然」「小」这类单字
     恰好在姓氏表内（百家姓确有「人」「可」等），放行会造出
@@ -422,30 +530,56 @@ def _valid_name(w: str) -> bool:
     # 把句号吃进名字（实测造出「苏晚。」这种伪角色）。
     if not all("一" <= c <= "鿿" for c in w):
         return False
+    # 作者声明的角色优先于一切形态判据（但仍要求是 2–4 个汉字）
+    if w in known_names:
+        return True
     if w in _CHAR_STOP or w in _DESC_STOP or w in _FUNC_STOP:
         return False
-    if w in _NAME_WORD_STOP or w in _SURNAME_WORD_STOP:
+    if w in _NAME_WORD_STOP or w in _SURNAME_WORD_STOP or w in _COMMON_WORD_STOP:
+        return False
+    # 「时间不 / 平台回」这类「2 字常见词 + 1 字」整体也不是人名
+    if len(w) == 3 and w[:2] in _COMMON_WORD_STOP:
+        return False
+    # 3/4 字候选以功能词收尾：动词短语被截断，不是人名
+    if len(w) >= 3 and w[-1] in _FUNC_TAIL_CHARS:
         return False
     if w[0] in "那这哪每各该":
         return False
     if w[0] in _NAME_LEAD_STOP:
         return False
-    if any(c in "的一了着过吗呢吧啊哦呀呐" for c in w):
+    # 「一」是高频人名用字（张一鸣/李一凡），不能一刀切禁用；
+    # 仍保留「的/了/着/过/吗/呢/吧/啊/哦/呀/呐」这些几乎不会进人名的字。
+    if any(c in "的了着过吗呢吧啊哦呀呐" for c in w):
         return False
     if len(set(w)) != len(w):
         return False
     # 正向：首字是常见姓氏，或每个字都在人名用字集合内
     if w[0] in _SURNAME_CHARS:
-        # E-任务：3 字名「姓+2字」的兜底过宽，会把「林深坐/林夜说/凤姐笑/房间里」错认。
+        # 3 字名「姓+2字」的兜底过宽，会把「林深坐/林夜说/凤姐笑/房间里」错认。
         # 3 字名要求末字必须是名字用字（人名的「名」常用字），不允许落在普通动词/方位/代词上。
-        # 2 字名「姓+1字」不走此约束（首字是姓 + 1 字本来就要灵活，1 字名空间小，过严会漏）。
-        if len(w) == 3 and w[-1] not in _NAME_CHARS:
-            return False
+        # 高置信场景（allow_unknown_tail）对 3 字名放行；4 字名仍要求末字过表。
+        if len(w) in (3, 4) and w[-1] not in _NAME_CHARS:
+            if len(w) == 4 or not allow_unknown_tail:
+                return False
         return True
     return all(c in _NAME_CHARS for c in w)
 
 
-def _leading_name(sentence: str) -> str | None:
+def _lead_has_signal(sentence: str, name: str) -> bool:
+    """3 字候选后面是否紧跟明确动作/虚词/标点。
+
+    用于区分「宋书航看了」与「万界修士」：前者后接动词，按 3 字名放行；
+    后者后接「士」，更像四字名词短语，宁可漏抽也不造伪角色。
+    """
+    after = sentence[len(name): len(name) + 1]
+    return not after or after in _LEAD_SIGNAL_CHARS
+
+
+def _leading_name(
+    sentence: str,
+    *,
+    known_names: frozenset[str] = frozenset(),
+) -> str | None:
     """取分句首 N 字作主语候选；尾部虚字（又/便/就/也/而…）需剥除。
 
     E-任务：原实现只取 2 字（3 字名被截成 2 字丢失信息）。改为：
@@ -454,9 +588,10 @@ def _leading_name(sentence: str) -> str | None:
     3) 还不行再试 2 字（剥尾虚字同理）。
     这样 3 字名「安小落/林深/秦九歌」不丢，2 字名「林夜/陆见」也保。
 
-    「宝玉又拉住黛玉的手」直接取前 2 字会得到「宝玉」是对的，
-    但「林夜便说」会取到「林夜」之外还可能切进虚词（「宝玉又」），
-    故按需剥离尾部的单字虚词后再取候选。
+    **不截断纪律（2026-11-19）**：3 字候选以姓氏开头、且末字不是虚词/动词首字时，
+    如果它没过 _NAME_CHARS 而是因为末字不在表内，**绝不回退成 2 字前缀**——
+    「宋书航」不能变成「宋书」、「白前辈」不能变成「白前」。只有后接明确动作/
+    标点时，才用 allow_unknown_tail 把 3 字名放行；否则返回 None，交给其它通路。
     """
     # 分句正则会保留配对引号；引号后可能还有源文本硬折行/空白，
     # 需在剥 wrapper 后再清一次空白，否则「”\n秦九歌点头」无法识别句首人名。
@@ -467,22 +602,54 @@ def _leading_name(sentence: str) -> str | None:
     raw = m.group(1)  # 2-3 字（_LEAD_RE 模式 [一-鿿]{2,3}）
     # 关键纪律：先 3 后 2。**不能**先 2 后 3——否则 2 字真名会截胡 3 字真名
     # （「安小」命中后函数立即 return，永远试不到「安小落」）。
-    for n in (3, 2):
-        if len(raw) < n:
-            continue
-        tok = raw[:n]
-        if _valid_name(tok):
+    if len(raw) >= 3:
+        tok = raw[:3]
+        # 「时间不/费用是/平台上」这类「2 字常见词 + 1 字」不是 3 字人名
+        if tok[:2] in _COMMON_WORD_STOP:
+            return None
+        # 3 字候选末字是动作词首字、且后面还有字（周叔知|道 / 陆见问|道）：
+        # 这不是 3 字名，而是 2 字名 + 动词，先走 2 字路径。
+        # 「李浩微|笑」是 2 字名 + 双字动词 微笑，单独识别，避免把 微 全局当尾字。
+        verb_glued = bool(s[3:4]) and (
+            tok[-1] in _VERB_TAIL_CHARS
+            or (tok[-1] == "微" and s[3:4] == "笑")
+        )
+        if not verb_glued and _valid_name(tok, known_names=known_names):
             return tok
         # 退一步：剥掉尾部单字虚字再试（「宝玉又」→「宝玉」）
-        if len(tok) >= 2 and tok[-1] in _TAIL_PARTICLE:
+        if tok[-1] in _TAIL_PARTICLE:
             alt = tok[:-1]
-            if len(alt) >= 2 and _valid_name(alt):
+            if len(alt) >= 2 and _valid_name(alt, known_names=known_names):
                 return alt
+        if verb_glued or tok[-1] in _TAIL_PARTICLE:
+            # 2 字名 + 虚词/动词首字（宝玉又 / 陆见问 / 周叔知）
+            pass
+        elif tok[0] in _SURNAME_CHARS:
+            # 姓氏开头的 3 字候选：后接明确动作/标点时按 3 字名放行；
+            # 否则宁可返回 None，绝不回退成 2 字前缀。
+            if _lead_has_signal(s, tok) and _valid_name(
+                tok, allow_unknown_tail=True, known_names=known_names
+            ):
+                return tok
+            return None
+    tok = raw[:2]
+    if _valid_name(tok, known_names=known_names):
+        return tok
+    # 退一步：剥掉尾部单字虚字再试（「宝玉又」→「宝玉」）
+    if tok[-1] in _TAIL_PARTICLE:
+        alt = tok[:-1]
+        if len(alt) >= 2 and _valid_name(alt, known_names=known_names):
+            return alt
     return None
 
 
 class RuleBasedExtractor(KGExtractor):
-    def extract(self, chunks: list) -> ExtractionResult:
+    def extract(
+        self,
+        chunks: list,
+        *,
+        known_names: frozenset[str] = frozenset(),
+    ) -> ExtractionResult:
         res = ExtractionResult()
 
         # —— Pass 1：高精信号统一注册候选角色 + 坑线索 ——
@@ -501,11 +668,14 @@ class RuleBasedExtractor(KGExtractor):
                 # 「听」不在说话动词「说道问答笑」里，只查后者会让「宝玉听」照旧入图。
                 if len(name) == 3 and name[-1] in _GLUE_VERB_LEADS:
                     pair = name[2] + text[m.end(): m.end() + 1]
-                    if pair in ("说道", "问道", "答道", "笑道", "听说"):
+                    if pair in ("说道", "问道", "答道", "笑道", "听说", "知道"):
                         shorter = name[:2]
-                        if _valid_name(shorter):
+                        if _valid_name(shorter, known_names=known_names):
                             name = shorter
-                if _valid_name(name):
+                # 「叫X」是作者级强证据：3 字名允许末字不在 _NAME_CHARS
+                if _valid_name(
+                    name, allow_unknown_tail=True, known_names=known_names
+                ):
                     c = res.characters.setdefault(name, Character(name=name))
                     c.mentions += 1
                     c.chapters.add(ch_no)
@@ -513,7 +683,7 @@ class RuleBasedExtractor(KGExtractor):
 
             # ② 分句主语（句首 / 逗号后）+ ③ 说话归属
             for sent in _SEG_RE.findall(text):
-                lead = _leading_name(sent)
+                lead = _leading_name(sent, known_names=known_names)
                 if lead:
                     c = res.characters.setdefault(lead, Character(name=lead))
                     c.mentions += 1
@@ -527,13 +697,18 @@ class RuleBasedExtractor(KGExtractor):
                 # 收紧纪律：归并的前提是 2 字片段**本身**就已通过 _valid_name。
                 # 不收紧会让「终于知道」→「终于知」（「终于」被 _NAME_WORD_STOP 拒收，
                 # 归并后却借「知」起死回生），凭空造出伪角色。
-                if len(name) == 2 and _valid_name(name):
+                if len(name) == 2 and _valid_name(name, known_names=known_names):
                     nxt = m.group(0)[len(name):len(name) + 1]
                     if nxt and nxt not in _SPEAK_MERGE_BLOCK_CHARS:
                         merged = name + nxt
-                        if _valid_name(merged):
+                        # 说话归属是强证据：归并出的 3 字名允许末字不在 _NAME_CHARS
+                        if _valid_name(
+                            merged, allow_unknown_tail=True, known_names=known_names
+                        ):
                             name = merged
-                if not _valid_name(name):
+                if not _valid_name(
+                    name, allow_unknown_tail=True, known_names=known_names
+                ):
                     continue
                 # 时间词停用护栏（见 _TIME_WORD_STOP 注释）：整词命中即跳过，
                 # 连 mentions/chapters 一并跳过——恢复 62609a5 之前的计量口径
@@ -579,7 +754,7 @@ class RuleBasedExtractor(KGExtractor):
         # 于是「林夜拉住苏晚」这条明确交互建不出关系边（实测）。
         # 补一条宾语位线索：动作词/介词紧邻的 2–4 字词，若通过人名校验，
         # 视为候选角色。仍走 Pass 2 的入图门槛，不会引入噪声。
-        self._collect_object_names(res, chunks)
+        self._collect_object_names(res, chunks, known_names=known_names)
 
         # —— Pass 1.6：粘连体归一（实体消解的规则版）——
         # 「凤姐道」「陆见说」「贾母又」这类「候选角色名 + 说话动词/副词」的粘连体，
@@ -603,7 +778,10 @@ class RuleBasedExtractor(KGExtractor):
         self._drop_shadowed_prefixes(res, chunks)
 
         # —— Pass 2：入图资格 ——
-        final_names = [n for n, c in res.characters.items() if _passes_entry_gate(c)]
+        final_names = [
+            n for n, c in res.characters.items()
+            if _passes_entry_gate(c, known_names=known_names)
+        ]
         final_set = set(final_names)
 
         # —— Pass 3：共现计数 ——
@@ -723,7 +901,12 @@ class RuleBasedExtractor(KGExtractor):
                 del res.characters[p]
 
     @staticmethod
-    def _collect_object_names(res: ExtractionResult, chunks: list) -> None:
+    def _collect_object_names(
+        res: ExtractionResult,
+        chunks: list,
+        *,
+        known_names: frozenset[str] = frozenset(),
+    ) -> None:
         """宾语位人名兜底：动作词/关系词紧邻的 2–4 字词，通过校验即登记候选。
 
         只登记候选，不直接入图——入图仍由 Pass 2 的门槛决定，
@@ -754,7 +937,7 @@ class RuleBasedExtractor(KGExtractor):
                     #      已是 Pass 1 建立的角色**（凤姐 ✓ / 王守 ✗ 保留原名）。
                     if len(cand) == 3 and cand[-1] in _GLUE_VERB_LEADS:
                         after = tail[3:4]
-                        if (cand[2] + after) in ("说道", "问道", "答道", "笑道", "听说"):
+                        if (cand[2] + after) in ("说道", "问道", "答道", "笑道", "听说", "知道"):
                             glued = True
                         elif after in ("：", ":") and cand[:2] in res.characters:
                             glued = True
@@ -762,9 +945,29 @@ class RuleBasedExtractor(KGExtractor):
                             glued = False
                         if glued:
                             shorter = cand[:2]
-                            if _valid_name(shorter):
+                            if _valid_name(shorter, known_names=known_names):
                                 cand = shorter
-                    if _valid_name(cand):
+                    # 宾语位也会切出「2 字名 + 动词首字」：李浩回|头 / 李浩微|笑。
+                    # 与 _leading_name 同一判据，避免宾语位置再生成一次截断名。
+                    # **例外**：触发词是「叫」时是作者显式命名——「他叫王守道：」
+                    # 里的「道」是名字的一部分，不是说话动词；按动词尾再砍一刀会
+                    # 把真名截成「王守」。粘连场景「叫陆见说道」由上面的强证据
+                    # （末字+后一字=说道）先剥，不依赖这一条。
+                    if len(cand) == 3 and m.group(0) != "叫":
+                        glued_verb = cand[-1] in _VERB_TAIL_CHARS or (
+                            cand[-1] == "微" and tail[3:4] == "笑"
+                        )
+                        if glued_verb:
+                            shorter = cand[:2]
+                            if _valid_name(shorter, known_names=known_names):
+                                cand = shorter
+                    # 宾语位是动作词之后的强位置：3 字名允许末字不在 _NAME_CHARS；
+                    # 4 字名仍要求末字过表，防止把「万界修士」整段当人名。
+                    if _valid_name(
+                        cand,
+                        allow_unknown_tail=(len(cand) == 3),
+                        known_names=known_names,
+                    ):
                         c = res.characters.setdefault(
                             cand, Character(name=cand)
                         )

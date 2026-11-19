@@ -8,13 +8,23 @@
 每张图按 source 幂等重建（只清该 source 的旧图再写新图），互不污染。
 """
 
+import re
 import threading
 from contextlib import contextmanager
 
 from sqlalchemy import select
 
 from app.kg.extractor import _RESOLVE_CUES, RuleBasedExtractor, resolve_plotholes
-from app.models import Fact, Generation, KgEdge, KgNode, NovelChunk, Project, RawNovel
+from app.models import (
+    Fact,
+    Generation,
+    KgEdge,
+    KgNode,
+    NovelChunk,
+    Project,
+    RawNovel,
+    StoryCard,
+)
 
 # 坑节点 props 里占位 cue 的值：extractor 对「直问句但无线索词」的坑写 cue="?"。
 # 拿它当检测键等于匹配所有文本，必须在结算检测里跳过。
@@ -69,8 +79,60 @@ def _clear_graph_by_source(db, project_id: int, source: str) -> None:
         db.flush()
 
 
-def _extract_from_chunks(chunks: list) -> object:
-    result = RuleBasedExtractor().extract(chunks)
+def _known_character_names(db, project_id: int) -> frozenset[str]:
+    """作者显式声明的角色名/别名：剧情圣经 characters + 人物设定卡。
+
+    为什么需要：规则抽取靠「姓首字 + 名用字表」判人名，天然会漏掉
+    「陈小满」「顾青梧」「冯保国」这类末字不在人工表里的真名。作者已经在
+    剧情圣经/设定卡里确认过的名字，必须跳过形态判据直接放行。
+
+    取不到时返回空集合——名称白名单是召回增强，绝不能因此挡住抽取主链。
+    """
+    try:
+        proj = db.get(Project, project_id)
+        names: set[str] = set()
+        bible = proj.plot_bible if proj and isinstance(proj.plot_bible, dict) else {}
+        for item in bible.get("characters") or []:
+            if isinstance(item, str):
+                name = item.strip()
+                if name:
+                    names.add(name)
+                continue
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+            for alias in item.get("aliases") or []:
+                if isinstance(alias, str) and alias.strip():
+                    names.add(alias.strip())
+        cards = db.scalars(
+            select(StoryCard).where(
+                StoryCard.project_id == project_id,
+                StoryCard.kind == "character",
+            )
+        ).all()
+        for card in cards:
+            if card.title and card.title.strip():
+                names.add(card.title.strip())
+            alias_text = (card.fields or {}).get("alias")
+            if isinstance(alias_text, str):
+                names.update(
+                    part.strip()
+                    for part in re.split(r"[、,，/／;；\s]+", alias_text)
+                    if part.strip()
+                )
+        return frozenset(n for n in names if len(n) >= 2)
+    except Exception:  # noqa: BLE001 —— 白名单失败不该阻断抽取
+        return frozenset()
+
+
+def _extract_from_chunks(
+    chunks: list,
+    *,
+    known_names: frozenset[str] = frozenset(),
+) -> object:
+    result = RuleBasedExtractor().extract(chunks, known_names=known_names)
     resolve_plotholes(result, chunks)
     return result
 
@@ -227,28 +289,43 @@ def build_graph_from_text(
     if not text or not text.strip():
         return {"error": "无生成文本可建图"}
     chunks = _split_text_to_chunks(text)
-    result = _extract_from_chunks(chunks)
+    result = _extract_from_chunks(
+        chunks, known_names=_known_character_names(db, project_id)
+    )
     _clear_graph_by_source(db, project_id, source)
     stats = _write_result(db, project_id, result, source)
     stats["chunks"] = len(chunks)
     return stats
 
 
-def extract_from_text(text: str, segment_no: int = 1):
+def extract_from_text(
+    text: str,
+    segment_no: int = 1,
+    *,
+    known_names: frozenset[str] = frozenset(),
+):
     """把「一段文本」切成 chunk 并跑规则抽取，返回 (ExtractionResult, chunks)。
 
     抽出来做公共入口，是为了让**图谱写入与账本写入共用同一次抽取**：
     两者吃的是同一份 ExtractionResult，跑两遍纯属浪费（真实语料单次抽取约 16s，
     虽然单段文本很小，但这是不该存在的重复计算，也会让两条链路的结果漂移）。
+
+    ``known_names``：剧情圣经/设定卡里的作者确认角色名，作为人名校验白名单。
     """
     chunks = _split_text_to_chunks(text)
     for c in chunks:
         c.chapter_no = segment_no
-    return _extract_from_chunks(chunks), chunks
+    return _extract_from_chunks(chunks, known_names=known_names), chunks
 
 
 def merge_segment_into_kg(
-    db, project_id: int, text: str, segment_no: int, source: str = "generated"
+    db,
+    project_id: int,
+    text: str,
+    segment_no: int,
+    source: str = "generated",
+    *,
+    known_names: frozenset[str] | None = None,
 ) -> dict:
     """把「新生成的一段」**完整**并入 KG：图谱 + 事实账本 + 别名归一 + 规则哨兵。
 
@@ -290,12 +367,19 @@ def merge_segment_into_kg(
     """
     with _project_kg_lock(project_id):
         return _merge_segment_into_kg_locked(
-            db, project_id, text, segment_no, source=source
+            db, project_id, text, segment_no, source=source,
+            known_names=known_names,
         )
 
 
 def _merge_segment_into_kg_locked(
-    db, project_id: int, text: str, segment_no: int, source: str = "generated"
+    db,
+    project_id: int,
+    text: str,
+    segment_no: int,
+    source: str = "generated",
+    *,
+    known_names: frozenset[str] | None = None,
 ) -> dict:
     """`merge_segment_into_kg` 的实际实现（调用方已持 per-project 锁）。
 
@@ -309,9 +393,15 @@ def _merge_segment_into_kg_locked(
         upsert_facts,
     )
 
+    # 白名单只在本函数缺省时加载；rebuild 路径会传入一次算好的集合，避免逐段查库。
+    if known_names is None:
+        known_names = _known_character_names(db, project_id)
+
     # 1) 图谱（含本段结算旧坑：text 一并传入，ExtractionResult 不带原文）
     try:
-        result, _ = extract_from_text(text, segment_no)
+        result, _ = extract_from_text(
+            text, segment_no, known_names=known_names
+        )
         stats = dict(
             merge_result_into_graph(
                 db, project_id, result, source=source, segment_no=segment_no,
@@ -475,11 +565,13 @@ def rebuild_generated_kg(
         db.commit()
 
         replayed, failed = 0, []
+        known_names = _known_character_names(db, project_id)
         for g in gens:
             if not (g.text or "").strip():
                 continue
             st = merge_segment_into_kg(
-                db, project_id, g.text, g.segment_no, source=source
+                db, project_id, g.text, g.segment_no, source=source,
+                known_names=known_names,
             )
             replayed += 1
             if st.get("merged") is False or st.get("partial"):
@@ -515,10 +607,13 @@ def rebuild_generated_graph(db, project_id: int, segments, *, commit: bool = Tru
     """
     pairs = _segment_pairs(segments)
     _clear_graph_by_source(db, project_id, "generated")
+    known_names = _known_character_names(db, project_id)
     for segment_no, text in pairs:
         if not text.strip():
             continue
-        result, _ = extract_from_text(text, segment_no)
+        result, _ = extract_from_text(
+            text, segment_no, known_names=known_names
+        )
         merge_result_into_graph(
             db, project_id, result, "generated", segment_no, commit=False
         )

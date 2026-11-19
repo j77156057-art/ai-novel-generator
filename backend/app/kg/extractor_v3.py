@@ -98,6 +98,71 @@ VALID_REL_TYPES = {
 #: 通用亲属词 → 落库归一值。长幼不明时不许猜，统一落 sibling。
 _GENERIC_KINSHIP = {"sister": "sibling", "brother": "sibling", "sibling": "sibling"}
 
+#: character 名字的后置过滤（2026-11-19）。
+#: LLM 容易把描述性短语、量词短语、复数集合写成角色名，实测项目 6 的 1939 个
+#: character 实体里约 300 个属于这类。这里只拦 **明确的非人名形态**；
+#: 「林悠然的父/父亲」这类亲属描述是实体解析的合法输入，必须保留。
+_KINSHIP_TAILS = (
+    "父亲", "母亲", "爸爸", "妈妈", "爹", "娘", "父", "母",
+    "爷爷", "奶奶", "外公", "外婆", "哥哥", "弟弟", "姐姐", "妹妹",
+    "儿子", "女儿", "夫人", "妻子", "丈夫", "师父", "师傅", "老师", "妻", "夫",
+)
+#: 纯泛称/身份词：**整名完全相等**才拦。「王侍卫」「陈府尹」这类姓+身份是
+#: 合法指代，不能按后缀误杀。
+_GENERIC_ROLE_WORDS = frozenset({
+    "男子", "女子", "老者", "青年", "少年", "修士", "乘客", "众人", "人们",
+    "家伙", "东西", "仆人", "属下", "成员", "手下", "弟子", "走狗", "喽啰", "随从",
+    "文员", "侍卫", "路人", "散修", "门人", "二人", "三人", "一人",
+    # 职业/身份泛称（项目 6 参考语料实测：医生/警察/护士 被当成 character）
+    "医生", "大夫", "警察", "护士", "病人", "患者", "记者", "队长", "司机",
+    "出租车司机", "老师", "学生", "律师", "保安", "店员", "老板", "经理",
+    "主管", "组长", "主任", "服务员", "快递员", "外卖员", "保洁", "护工",
+})
+#: 明确的物件名：LLM 偶尔会把它们写成 character（银票/手机/快递车…）。
+#: 只做**整名相等**判断，「赤霄剑」这类带修饰的物件交给提示词判 kind。
+_GENERIC_OBJECT_WORDS = frozenset({
+    "银票", "飞剑", "丹药", "手机", "电脑", "快递车", "出租车",
+    "法器", "法宝", "灵器", "神器",
+})
+#: 量词短语判据：数量词 + 量词（一名/三个/两人/数名…）。
+#: 不能只看首字是不是数量词——「万」「全」「那」也是真实姓氏
+#: （万天明、全冠清），必须要求第二个字是量词才拦。
+_QUANTIFIER_CHARS = set("一二三四五六七八九十百千万亿两几数")
+_MEASURE_WORDS = set("个名位只群批队件条张些人户家间座把匹头支棵员")
+#: 多字集合前缀（按整词匹配，避免误伤单字姓氏）。
+_COLLECTIVE_PREFIXES = (
+    "众多", "各种", "那些", "这些", "每个", "某个", "某些", "所有",
+    "一群", "一批", "一堆", "若干", "众位", "诸位",
+)
+
+
+def _character_name_reject_reason(name: str) -> str | None:
+    """character 名明显不是人名的形态判据；返回 None 表示保留。"""
+    if len(name) > 10:
+        return "too_long"
+    if any(c.isdigit() for c in name):
+        return "digit"
+    if any(c in "“”‘’\"'「」『』" for c in name):
+        return "quote"
+    if "们" in name or "等" in name:
+        return "plural"
+    if "的" in name and not name.endswith(_KINSHIP_TAILS):
+        return "descriptive"
+    if name in _GENERIC_ROLE_WORDS:
+        return "generic_role"
+    if name in _GENERIC_OBJECT_WORDS:
+        return "generic_object"
+    if name.startswith(_COLLECTIVE_PREFIXES):
+        return "quantifier_prefix"
+    if len(name) >= 2 and name[0] in _QUANTIFIER_CHARS and name[1] in _MEASURE_WORDS:
+        return "quantifier_prefix"
+    if len(name) > 6 and any(c in name for c in "和与及、，"):
+        return "compound"
+    if any(c.isascii() and c.isalnum() for c in name):
+        return "ascii"
+    return None
+
+
 #: 细分亲属称谓 → 原文中能支撑该称谓的说法（命中任一即算有依据）。
 #: 用于「原文称谓校验」：证据句里找不到对应说法就降级，避免把「妹妹」写成 daughter。
 _KINSHIP_EVIDENCE = {
@@ -241,6 +306,18 @@ def normalize_extraction(raw: dict, *, error: str | None = None) -> dict:
             continue
         if not name or len(name) > 128:
             continue
+        # character 名字后置过滤：描述短语/量词/复数/数字/引号不进 kg_entities。
+        # 保留 rejected 证据，便于统计模型漂移；不静默丢。
+        if kind == "character":
+            reason = _character_name_reject_reason(name)
+            if reason:
+                out["rejected"].append({
+                    "stage": "entity",
+                    "reason": f"character_name_{reason}",
+                    "name": name,
+                    "raw": e,
+                })
+                continue
         aliases = [_as_str(a) for a in _as_list(_pick(e, _ENTITY_ALIASES["aliases"])) if _as_str(a)]
         attrs = _pick(e, _ENTITY_ALIASES["attrs"])
         out["entities"].append({
@@ -505,6 +582,15 @@ _EXTRACT_SYSTEM = (
     "  人物弧光 / 当前目标 / 秘密写进 attrs 的 arc / current_goal / secrets；"
     "这三个键**只属于 character**，其它 kind 一律不得使用。\n"
     "  不要因为带官职就判成 faction，也不要把纯官衔单独建节点（本 schema 没有官职档）。\n"
+    "  character 的 canonical_name 必须是**可被人物的名字**：不超过 10 个汉字。\n"
+    "  以下形态一律不算 character，命中了就别输出（宁缺勿错）：\n"
+    "    · 描述性短语：一脸不爽的男子、三个微胖的文员、穿黑衣的少女\n"
+    "    · 量词/数量短语：66只金属圣猿、七修尊者的仆人们、一名弟子\n"
+    "    · 复数集合：修士们、乘客们、众人、二人\n"
+    "    · 带数字或引号的称谓：3号护卫、‘先生’、\"刀客\"\n"
+    "    · 纯泛称/身份词：文员、侍卫、路人\n"
+    "  人物在原文只有描述性称呼时，要么不输出（宁缺勿错），要么归并到已出现过的主指称"
+    "并把它放 aliases。**不要**自己发明名字。\n"
     "- item = 具体的物件/实物：刀、丹药、法器、银钱、凭证、秘籍实物。\n"
     "  是：镇北王刀、炼金术秘籍、税银。\n"
     "  不是：炼金术（术法体系）、望气术（能力）、大奉律法（成文规则）。\n"

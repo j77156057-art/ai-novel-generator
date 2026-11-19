@@ -142,7 +142,7 @@ def _resolve_distill_id(db: Session, ctx: ToolContext) -> int:
                 ids = []
         if int(novel_id) in [int(x) for x in ids]:
             return int(distill_id)
-    raise ValueError(f"novel_id={novel_id} 没有 active 蒸馏档案")
+    raise ValueError(f"novel_id={novel_id} 没有 active 的文风档案")
 
 
 def _catalog(db: Session, ctx: ToolContext) -> Catalog:

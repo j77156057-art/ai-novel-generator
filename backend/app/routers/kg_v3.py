@@ -295,14 +295,49 @@ def list_judge_findings(project_id: int, db: Session = Depends(get_db)) -> dict:
 
     与哨兵 /alerts 同形状：items + by_severity + rules 清单——
     只看告警列表会以为「没告警=没问题」，实际有规则可能沉默。
+
+    **按当前书过滤**：续写项目的 KG 里同时存着参考书的实体与伏笔，
+    历史告警若不筛书，就会把《修真聊天群》的伏笔超期报成这本书的问题。
+    新行有 `props.novel_id`；加列前的旧行没有书标记，只能按实体名判断
+    「这个名字是否只出现在别书」。
     """
-    _require_project(db, project_id)
+    project = _require_project(db, project_id)
     from app.kg.judge import RULES, load_judge_findings
 
     items = load_judge_findings(db, project_id)
-    # 已豁免的 (rule, entity) 单独标出——历史清单里能看到「这条曾被豁免」
-    from app.models import Fact
 
+    from sqlalchemy import func
+
+    from app.kg.book_scope import prompt_scope_book_ids, scope_sql_values
+    from app.models import Fact, KgEntity, KgForeshadow
+
+    scope = set(scope_sql_values(prompt_scope_book_ids(project)))
+    in_scope = lambda col: func.coalesce(col, -1).in_(scope)  # noqa: E731
+    scoped_names = set(db.scalars(select(KgForeshadow.name).where(
+        KgForeshadow.project_id == project_id, in_scope(KgForeshadow.novel_id),
+    )).all())
+    scoped_names |= set(db.scalars(select(KgEntity.canonical_name).where(
+        KgEntity.project_id == project_id, in_scope(KgEntity.novel_id),
+    )).all())
+    other_names = set(db.scalars(select(KgForeshadow.name).where(
+        KgForeshadow.project_id == project_id, ~in_scope(KgForeshadow.novel_id),
+    )).all())
+    other_names |= set(db.scalars(select(KgEntity.canonical_name).where(
+        KgEntity.project_id == project_id, ~in_scope(KgEntity.novel_id),
+    )).all())
+    other_names -= scoped_names
+
+    def _keep(item: dict) -> bool:
+        novel_id = item.get("novel_id")
+        if novel_id is not None:
+            return novel_id in scope
+        # 旧行没有书标记：实体名只出现在别书 ⇒ 是别书的历史告警，不展示。
+        entity = item.get("entity") or ""
+        return not entity or entity not in other_names
+
+    items = [item for item in items if _keep(item)]
+
+    # 已豁免的 (rule, entity) 单独标出——历史清单里能看到「这条曾被豁免」
     exempt_rows = db.scalars(select(Fact).where(
         Fact.project_id == project_id, Fact.type == "exemption"
     )).all()
