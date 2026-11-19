@@ -6,17 +6,21 @@
 - POST /api/generate-stream     流式续写（SSE，长文首字即显）
 - POST /api/generate-plan       仅组装上下文与提示词（不调 LLM），供生成前漂移预检
 - GET  /api/generations/{pid}   列出某项目已生成的全部段落
+- PATCH /api/generations/{pid}/{generation_id}  手动改一段正文并重算总结/图谱
+- GET  /api/projects/{pid}/generation-status  轻量进度（段数/最新段·章/是否在生成）
 - GET  /api/projects/{pid}/segments/{no}/snapshot  取某段生成时的提示词/权威快照
 """
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel  # noqa: F401 - 供类型标注/未来扩展保留
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 import json as _json
+import logging
 
+from app.config import settings
 from app.db import get_db
 from app.generation import chapter_labels
 from app.generation import (
@@ -29,10 +33,12 @@ from app.generation.length_guard import LengthBlocked
 from app.generation.outline_notice import build_notice
 from app.generation.prompts import build_system_prompt, build_user_prompt
 from app.generation.repetition import parse_quality
+from app.generation.story_cards import render_for_project as _render_story_cards
 from app.models import Generation, Project
 from app.schemas import StrictRequest
 
 router = APIRouter(prefix="/api", tags=["generation"])
+_logger = logging.getLogger(__name__)
 
 
 class GenerateBody(StrictRequest):
@@ -68,6 +74,12 @@ class RegenerateBody(StrictRequest):
     max_chars: int | None = None
     # 只是「改标签」：重写不改章号，所以这里允许指向已存在的章。
     chapter_range: str | None = None
+
+
+class UpdateGenerationTextBody(StrictRequest):
+    """手动改正文：只收 text，段号/章身份不允许经这里改。"""
+
+    text: str
 
 
 def _require_project(db: Session, project_id: int) -> Project:
@@ -106,6 +118,28 @@ def _resolve_novel_ids(proj: Project, override: list[int] | None) -> list[int]:
     return list(proj.reference_novel_ids or [])
 
 
+def _planning_notice(proj: Project) -> dict | None:
+    """预检用的规划缺口（不受 `planning_guard_mode` 影响，始终只报告）。"""
+    from app.generation.planning_guard import planning_block
+
+    return planning_block(proj)
+
+
+def _require_planning_ready(proj: Project) -> None:
+    """规划就绪闸（P0）：`block` 模式下规划不完整直接 409。
+
+    `report`（默认）不拦，缺口通过 `/generate-plan` 的 `planning` 字段暴露。
+    """
+    mode = str(getattr(settings, "planning_guard_mode", "report") or "report").lower()
+    if mode != "block":
+        return
+    from app.generation.planning_guard import planning_block
+
+    block = planning_block(proj)
+    if block:
+        raise HTTPException(status_code=409, detail=block)
+
+
 def _require_workflow_ready(db: Session, proj: Project) -> None:
     """生成前的**工序链闸门**：流程没过就别生成（别绕过流程）。
 
@@ -117,6 +151,7 @@ def _require_workflow_ready(db: Session, proj: Project) -> None:
     自由生成（没选参考语料、没有文风档案）一律放行 ——
     闸门拦的是「流程没走完」，不是「用户没准备」。
     """
+    _require_planning_ready(proj)
     from app.agents.workflow import generation_block
     block = generation_block(db, proj)
     if block:
@@ -375,6 +410,9 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         node_prompt=current_node_prompt(
             proj, _next_segment_no(db, body.project_id) - 1, get_llm_provider(), db=db
         ),
+        # 预检必须与真实生成同源：设定卡的增删改要能在这里直接看到效果。
+        story_cards_block=_render_story_cards(db, proj.id),
+        foreshadow_block=ctx.get("foreshadow_block"),
     )
     return {
         "reminders": ctx["reminders"],
@@ -401,6 +439,9 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         "sentinel": _sentinel_digest(proj),
         # 先看章纲：缺纲、空条目与被跳过的检查都会在这里，不藏在 prompt 里。
         "outline": build_notice(db, proj, plan["chapter"], plan["chapter_end"]),
+        # 预检页同时暴露规划缺口（占位节点/上次规划失败），
+        # 即使 `planning_guard_mode=report` 也能提前看到「这一章没有真实剧情点」。
+        "planning": _planning_notice(proj),
     }
 
 
@@ -503,6 +544,209 @@ def list_generations(project_id: int, db: Session = Depends(get_db)) -> list[dic
         .order_by(Generation.segment_no)
     ).all()
     return [_to_generation_out(g) for g in gens]
+
+
+@router.patch("/generations/{project_id}/{generation_id}")
+def update_generation_text(
+    project_id: int,
+    generation_id: int,
+    body: UpdateGenerationTextBody,
+    db: Session = Depends(get_db),
+) -> dict:
+    """用户手动编辑一段正文（不调模型改字，但会重算配套数据）。
+
+    语义边界：
+    - 只改 `text`。段号 / 章身份都不动：改字不应改变「这是第几段、对应
+      哪一章」的身份。
+    - `quality_json` 清空：复读、文风、结构结论都是对**旧正文**算的，
+      改完必须回到「未检测」，不能把旧结论冒充成新正文的结论。
+    - 正文落库后立即做配套重算（见 `_resync_after_manual_edit`）：
+      剧情总结、L1/L2/L3 摘要树、v2.6 KG replay、v3 批抽重入队。
+      任何一步失败都不回滚正文，但会把失败原因随响应带回，界面可见。
+    """
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    gen = db.get(Generation, generation_id)
+    if gen is None or gen.project_id != project_id:
+        raise HTTPException(status_code=404, detail="generation 不存在")
+    text = (body.text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="正文不能为空")
+    if len(text) > 200_000:
+        raise HTTPException(status_code=400, detail="正文过长（上限 200000 字）")
+    old_text = (gen.text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if text == old_text:
+        # 没改动就不重算：省一次摘要调用，也不把已有 quality 结论清掉
+        return {
+            **_to_generation_out(gen),
+            "cascade": {
+                "skipped": True,
+                "summary": True,
+                "tree": True,
+                "kg": True,
+                "v3_enqueued": False,
+                "errors": [],
+            },
+        }
+    gen.text = text
+    gen.quality_json = None
+    db.commit()
+    db.refresh(gen)
+
+    cascade = _resync_after_manual_edit(db, project, gen, text)
+    return {**_to_generation_out(gen), "cascade": cascade}
+
+
+def _resync_after_manual_edit(db: Session, project: Project, gen: Generation, text: str) -> dict:
+    """手动改字后的配套重算：剧情总结 → 摘要树 → KG（v2.6 + v3）。
+
+    顺序不能换：KG replay 与摘要树都从 `Generation` 表读正文/摘要，
+    所以正文必须先 commit（本函数只在 commit 之后调用）。
+
+    每一步独立兜底：正文已经落库，任何配套步骤失败都不能把保存变成失败。
+    失败原因收进 `errors[]` 随响应下发，前端如实展示。
+    """
+    out: dict = {
+        "skipped": False,
+        "summary": False,
+        "tree": False,
+        "kg": False,
+        "kg_stats": None,
+        "v3_enqueued": False,
+        "v3_pending": None,
+        "errors": [],
+    }
+
+    # —— 1. 剧情总结（L1）——
+    # 摘要由模型重写；超长段先做首尾截断（模型上下文/超时都不该被一段吃掉）。
+    # 模型失败时退回确定性的截断摘要，保证新正文至少有一份对应的摘要；
+    # 只有在连兜底都失败时才保留旧摘要并跳过摘要树重建。
+    provider = None
+    try:
+        from app.llm.provider import LLMProvider, get_llm_provider
+
+        provider = get_llm_provider()
+        #: 送给摘要模型的最大字符数（首尾各一半，中间省略）。
+        limit = 24_000
+        if len(text) > limit:
+            half = limit // 2
+            summary_input = text[:half] + "\n……（中间省略）……\n" + text[-half:]
+        else:
+            summary_input = text
+        try:
+            summary_text = (provider.summarize(summary_input) or "").strip()
+        except Exception as exc:  # noqa: BLE001 —— 模型超时/限流：退回本地截断
+            summary_text = (LLMProvider.summarize(provider, summary_input) or "").strip()
+            out["errors"].append(f"剧情总结模型调用失败，已用截断兜底：{str(exc)[:80]}")
+            _logger.warning("手动改正文后摘要模型失败，改用截断兜底: %s", exc)
+        if not summary_text:
+            raise ValueError("模型返回了空摘要")
+        merged = dict(gen.summary or {})
+        merged["text"] = summary_text
+        gen.summary = merged
+        db.commit()
+        db.refresh(gen)
+        out["summary"] = True
+    except Exception as exc:  # noqa: BLE001 —— 配套失败不阻断正文保存
+        db.rollback()
+        provider = None
+        out["errors"].append(f"剧情总结重算失败：{str(exc)[:120]}")
+        _logger.warning("手动改正文后重算摘要失败: %s", exc)
+
+    # —— 2. 摘要树（L2 卷 / L3 主线都基于 L1，必须整棵重建）——
+    if provider is not None:
+        try:
+            from app.generation.engine import rebuild_summary_tree
+
+            rebuild_summary_tree(db, project, provider)
+            out["tree"] = True
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            out["errors"].append(f"摘要树重建失败：{str(exc)[:120]}")
+            _logger.warning("手动改正文后重建摘要树失败: %s", exc)
+
+    # —— 3. v2.6 KG：清空 generated 侧 + 按段 replay ——
+    # 增量不可行（mentions 是累加值、坑状态是覆盖值），只能全量重放，
+    # 与「重新生成」走同一个入口，避免两套口径。
+    try:
+        from app.kg.build import rebuild_generated_kg
+
+        kg_stats = rebuild_generated_kg(db, project.id)
+        out["kg"] = bool(kg_stats.get("complete", True))
+        out["kg_stats"] = {
+            "segments": kg_stats.get("segments"),
+            "replayed": kg_stats.get("replayed"),
+            "complete": kg_stats.get("complete"),
+            "failed": kg_stats.get("failed") or [],
+        }
+        if not out["kg"]:
+            out["errors"].append("图谱重建存在失败段")
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        out["errors"].append(f"图谱重建失败：{str(exc)[:120]}")
+        _logger.warning("手动改正文后重建图谱失败: %s", exc)
+
+    # —— 4. v3 KG：本段按新正文重新入队（异步 worker 落库，旧版本保留可回溯）——
+    try:
+        from app.generation.engine import _chapter_ordinal, _enqueue_v3_extraction
+
+        queued = _enqueue_v3_extraction(
+            db,
+            project,
+            gen.segment_no,
+            text,
+            chapter=_chapter_ordinal(gen.chapter_range),
+            rebuild=True,
+        )
+        out["v3_enqueued"] = bool(queued.get("enqueued"))
+        out["v3_pending"] = queued.get("pending")
+        if not out["v3_enqueued"]:
+            out["errors"].append(f"v3 批抽入队失败：{queued.get('error') or '未知原因'}")
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        out["errors"].append(f"v3 批抽入队失败：{str(exc)[:120]}")
+        _logger.warning("手动改正文后 v3 批抽入队失败: %s", exc)
+
+    return out
+
+
+@router.get("/projects/{project_id}/generation-status")
+def generation_status(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """生成进度（前端轮询用）：段数 / 最新段与章 / 是否正在生成。
+
+    为什么单独开一个端点而不是复用 `/generations/{pid}`：后者会把全部段落
+    正文一起返回（长篇 40+ 段、几百 KB），每 2 秒轮询一次等于反复搬整本
+    书。这里只回对账需要的四个字段，让卡片能显示「已确认 → 已落库 → 完成」
+    的轨迹，而不是干等一句「执行中…」。
+
+    `running` 来自进程内租约（`app.generation.inflight`），只反映
+    `/generate` 等**走租约**的入口；助手同步调用没有租约，前端不能把它当成
+    「没在写」的判据。
+    """
+    if db.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+
+    from app.generation.inflight import is_in_flight
+
+    last = _last_generation(db, project_id)
+    count = db.scalar(
+        select(func.count())
+        .select_from(Generation)
+        .where(Generation.project_id == project_id)
+    )
+    total_chars = db.scalar(
+        select(func.coalesce(func.sum(func.length(Generation.text)), 0))
+        .where(Generation.project_id == project_id)
+    )
+    return {
+        "project_id": project_id,
+        "count": int(count or 0),
+        "total_chars": int(total_chars or 0),
+        "last_segment_no": last.segment_no if last is not None else None,
+        "last_chapter": last.chapter_range if last is not None else None,
+        "running": is_in_flight(project_id),
+    }
 
 
 # --- 内部小工具：从库中取回刚写入的 Generation，保证响应与落库一致 ---

@@ -79,6 +79,10 @@ class TimelineState:
     completion: dict[str, dict] = field(default_factory=dict)
     #: 最近一次完成判定覆盖到的段号（0 = 尚未判定）。支线挂载时同样要保留。
     last_judged_segment: int = 0
+    #: 段号 → 段契约。每段落库时冻结「当时的节点 + 权威」，
+    #: 供正文验收/重判读取，避免拿今天的计划审过去的正文。
+    #: 落库位置：`plot_timeline["planning"]["segment_contracts"]`。
+    segment_contracts: dict[str, dict] = field(default_factory=dict)
     #: 节点内容是怎么来的："" 未尝试 | "llm" 模型填实 | "placeholder" 占位。
     #: 「规划不完整」不能只体现在节点标题是「主干节点3」——接手方需要一个
     #: 可直接断言的显式状态 + 原因（为什么退化成占位）。
@@ -450,6 +454,9 @@ def _clone_state(state: TimelineState) -> TimelineState:
         seg_counts=dict(state.seg_counts),
         early_done=set(state.early_done),
         branch_current=state.branch_current,
+        completion=dict(state.completion),
+        last_judged_segment=state.last_judged_segment,
+        segment_contracts=dict(state.segment_contracts),
         planning_status=state.planning_status,
         planning_reason=state.planning_reason,
     )
@@ -528,6 +535,13 @@ def state_to_dict(state: TimelineState) -> dict:
         "seg_counts": dict(state.seg_counts),
         "early_done": sorted(state.early_done),
         "branch_current": state.branch_current,
+        # 证据化完成判定：谁（节点）在判、凭什么（reason/source_ids/text_hash）。
+        # 与 B 子系统的读取口径一致（`plot_timeline["completion"]`）。
+        "completion": dict(state.completion),
+        "last_judged_segment": int(state.last_judged_segment or 0),
+        # 段契约放在 `planning` 下，与 B 子系统的读取口径一致
+        # （body_consistency / derived_rebuild / workflow 都读这个路径）。
+        "planning": {"segment_contracts": dict(state.segment_contracts)},
         "planning_status": state.planning_status,
         "planning_reason": state.planning_reason,
     }
@@ -613,6 +627,23 @@ def state_from_dict(
     reason = d.get("planning_reason")
     if isinstance(reason, str):
         skeleton.planning_reason = reason
+    # 段契约：旧存档没有这一层时保持空 dict；有则原样恢复（键是段号字符串）。
+    planning = d.get("planning")
+    contracts = planning.get("segment_contracts") if isinstance(planning, dict) else None
+    if isinstance(contracts, dict):
+        skeleton.segment_contracts = {
+            str(k): v for k, v in contracts.items() if isinstance(v, dict)
+        }
+    # 证据化判定结果：节点 id → {verdict, reason, sources, audit}
+    comp = d.get("completion")
+    if isinstance(comp, dict):
+        skeleton.completion = {
+            str(k): v for k, v in comp.items() if isinstance(v, dict)
+        }
+    try:
+        skeleton.last_judged_segment = int(d.get("last_judged_segment") or 0)
+    except (TypeError, ValueError):
+        skeleton.last_judged_segment = 0
     return skeleton
 
 
@@ -824,9 +855,10 @@ def judge_node_completion_with_evidence(
         "sources": [],
         "audit": audit,
     }
-    if (not node.entry_condition.strip() or not node.exit_condition.strip()
-            or not recent_text.strip()):
-        return dict(unknown, reason="missing_conditions_or_text")
+    # 只要求退出条件与正文：entry_condition 不参与本判定的提示词，
+    # 老存档/占位节点常为空，拿它当门槛会让判定永远退化成 unknown。
+    if not node.exit_condition.strip() or not recent_text.strip():
+        return dict(unknown, reason="missing_exit_condition_or_text")
     user = (
         f"【当前剧情点】{node.title}\n【退出条件】{node.exit_condition}\n"
         f"【source_id】{source_id}\n【正文】\n{recent_text}\n【可选段落ID】\n"

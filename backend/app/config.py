@@ -493,6 +493,16 @@ class Settings(BaseSettings):
     #: 结构约束检测（v15）：`report` 只告警落库 / `block` 阻断落库。
     #: 检测口径全部来自 `project.outline` 与角色卡，不含任何写死的词表。
     structure_guard_mode: str = "report"
+    #: `report` 模式下**单独升级为阻断**的结构 reason code（默认空 = 只报告）。
+    #: 支持的 code：`outline_missing`（章纲缺失）、`premature_material`（越章材料）、
+    #: `character_early`（角色提前出场）、`beat_missing` / `beat_fallback_low`、
+    #: `gender_mismatch`。`structure_guard_mode="block"` 时忽略本项、全量阻断。
+    structure_block_reasons: list[str] | None = None
+    #: 规划就绪闸（P0）：`report` 只在预检/回执里暴露规划缺口；
+    #: `block` 让生成入口在「规划失败或仍是占位节点」时直接 409
+    #: `needs_planning`，避免拿空节点继续写。重试入口是
+    #: `POST /api/projects/{id}/timeline/plan`。
+    planning_guard_mode: str = "report"
     #: 本章情节点「覆盖」判据：该事件的中文二元组有这么多比例出现在正文里。
     #: 条数不足 `structure_beat_min_units` 时，同一阈值改判「本章大纲独有词
     #: 三元组覆盖率」（`basis=fallback_term_coverage`），并与其他项同权进入

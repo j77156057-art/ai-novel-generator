@@ -48,7 +48,9 @@ def check(label: str, got, want) -> None:
 class FakeStreamingProvider:
     """流式 + 非流式都能用的假 provider。"""
 
-    def __init__(self, reply: str = "流式生成的内容", judge_reply: str = '{"done": false}'):
+    def __init__(self, reply: str = "流式生成的内容",
+                 judge_reply: str = '{"verdict": "contradicted", '
+                                     '"reason": "仍在铺垫", "source_ids": ["P001"]}'):
         self.reply = reply
         self.judge_reply = judge_reply
         self.chat_calls = []  # [(system, user, kwargs)]
@@ -59,8 +61,8 @@ class FakeStreamingProvider:
         self._judge_mode = False
 
     def _maybe_split_judge(self, system: str, user: str):
-        """判定是否是 judge_node_completion 调用（捕获用于断言）。"""
-        if "退出条件" in user and ("判断" in user or "达成" in user):
+        """判定是否是证据化 judge 调用（捕获用于断言）。"""
+        if "【可选段落ID】" in user:
             self._judge_mode = True
             self.judge_calls.append((system, user))
             return True
@@ -68,7 +70,7 @@ class FakeStreamingProvider:
 
     def chat(self, system: str, user: str, constraints=None) -> str:
         # 先看是不是 judge 调用
-        if "退出条件" in user and "判断" in user:
+        if "【可选段落ID】" in user:
             self.judge_calls.append((system, user))
             return self.judge_reply
         self.chat_calls.append((system, user, constraints))

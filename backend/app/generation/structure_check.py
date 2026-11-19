@@ -2,7 +2,7 @@
 
 ## 为什么单独一个模块
 
-三项检测都只读**已有档案**（`project.outline` / 角色卡），不新增人工清单，
+四项检测都只读**已有档案**（`project.outline` / 角色卡），不新增人工清单，
 也不依赖 LLM 二次调用：
 
 1. **本章情节点有没有写进去**——把本章大纲条目按三级切分成并列事件
@@ -19,14 +19,17 @@
    判据不是某个词表，而是**本章与后续章的差集**，换书自动跟着换。
 3. **人物属性与设定卡是否一致**——对每张写了性别的角色卡，在名字后一个短窗口
    内找「他/她」，与设定卡性别比对。窗口内的代词是模型指代该角色最直接的信号。
+4. **角色是否提前出场**——角色卡写了首次出场章，正文却在本章就出现该名字。
 
 ## 拦截策略
 
-检测结果写进 `quality_json.structure_check`。是否阻断落库由
-`settings.structure_guard_mode` 决定：
+检测结果写进 `quality_json.structure_check`。是否阻断落库由两项配置决定：
 
-- `report`（默认）：告警落库，`structure_check.blocking=True` 只标记、不阻断；
-- `block`：`_commit_segment` 在写库前抛 `StructureBlocked`，本章不落库。
+- `structure_guard_mode`：`report`（默认）只标记、不阻断；`block` 全量阻断；
+- `structure_block_reasons`：`report` 模式下**只对这些 reason code 阻断**
+  （如 `["outline_missing", "premature_material", "character_early"]`）。
+
+`_commit_segment` 在 `enforced=True` 时抛 `StructureBlocked`，本章不落库。
 
 不做「自动重写」：结构问题（漏拍/越章/性别）不是局部替换能稳定修好的，
 重写轮预算已经用在文风与篇幅上；硬拦 + 人工/下一章修正比假装修好更可靠。
@@ -35,6 +38,8 @@ from __future__ import annotations
 
 import re
 from typing import Any
+
+from app.kg.bible import character_first_chapter
 
 #: 拆「并列事件」的第一、二级分隔符：先分号、再句号/换行。
 #: 只切标点，不认剧情词——换书不受影响。
@@ -306,12 +311,16 @@ def check_structure(
     gender_max_mismatches: int = 0,
     gender_window: int = 12,
     mode: str = "report",
+    block_reasons: list[str] | None = None,
 ) -> dict:
-    """三项检测一次算完，返回可直接写 `quality_json` 的 dict。
+    """四项检测一次算完，返回可直接写 `quality_json` 的 dict。
 
     任何一项的输入缺失（无大纲/无章节号/无角色卡）都只把该项标 `skipped`，
     不让检测本身变成新的失败点；但 `skipped` 必须带 `reason`（code + message），
     说清是哪一类缺失、该去补什么。所有阈值都来自调用方传入的配置。
+
+    `block_reasons` 只影响 `report` 模式：列出的 reason code 会单独升级为阻断；
+    `block` 模式忽略它、全量阻断（保持旧口径）。
     """
     result: dict[str, Any] = {
         "mode": mode,
@@ -319,8 +328,10 @@ def check_structure(
         "beat": {"status": "skipped"},
         "premature": {"status": "skipped"},
         "gender": {"status": "skipped"},
+        "character": {"status": "skipped"},
         "blocking": False,
         "blocking_reasons": [],
+        "enforced_reasons": [],
     }
 
     def _skip(check: dict, code: str, message: str) -> None:
@@ -338,20 +349,24 @@ def check_structure(
     chapter_in_outline = (chapter is not None and bool(entries)
                           and 1 <= chapter <= len(entries))
     if not entries:
+        result["blocking_reasons"].append("outline_missing")
         for key in ("beat", "premature"):
             _skip(result[key], "outline_entry_empty",
                   "项目章纲为空，情节点与越章检查没有比对物；请先补章纲。")
     elif chapter is None:
+        result["blocking_reasons"].append("outline_missing")
         for key in ("beat", "premature"):
             _skip(result[key], "no_chapter_label",
                   "本段没有章号（标签是「段N」），无法定位章纲条目；"
                   "请先给本段分配章号。")
     elif chapter < 1 or chapter > len(entries):
+        result["blocking_reasons"].append("outline_missing")
         for key in ("beat", "premature"):
             _skip(result[key], "chapter_beyond_outline",
                   f"第{chapter}章不在章纲范围内（共{len(entries)}条），"
                   f"请先补第{chapter}章章纲。")
     elif not entries[chapter - 1].strip():
+        result["blocking_reasons"].append("outline_missing")
         _skip(result["beat"], "outline_entry_empty",
               f"第{chapter}章章纲条目为空，请先填写本章章纲。")
     text_bigrams = _bigrams(text)
@@ -455,7 +470,39 @@ def check_structure(
         _skip(result["gender"], "no_character_cards",
               "没有可用的人物卡，性别一致性没有检查对象。")
 
+    # —— 4. 角色提前出场（首次出场章 > 当前章）——
+    if not character_cards:
+        _skip(result["character"], "no_character_cards",
+              "没有可用的人物卡，提前出场没有比对对象。")
+    elif chapter is None:
+        _skip(result["character"], "no_chapter_label",
+              "本段没有章号，无法与角色卡的首次出场章比对。")
+    else:
+        early = []
+        for card in character_cards:
+            if not isinstance(card, dict):
+                continue
+            name = str(card.get("name") or "").strip()
+            first = character_first_chapter(card)
+            if name and first is not None and chapter < first and name in text:
+                early.append({"name": name, "first_chapter": first})
+        result["character"] = {
+            "status": "checked",
+            "chapter": chapter,
+            "hits": early,
+            "count": len(early),
+        }
+        if early:
+            result["blocking_reasons"].append("character_early")
+
     result["blocking"] = bool(result["blocking_reasons"])
-    # `block` 模式才真拦；`report` 只标记，落库照旧。
-    result["enforced"] = bool(result["blocking"] and str(mode).lower() == "block")
+    # `block` 模式全拦；`report` 只拦显式列出的 reason code（默认一个都不拦）。
+    blocking = set(result["blocking_reasons"])
+    if str(mode).lower() == "block":
+        enforced = blocking
+    else:
+        allowed = {str(x) for x in (block_reasons or []) if str(x).strip()}
+        enforced = blocking & allowed
+    result["enforced_reasons"] = sorted(enforced)
+    result["enforced"] = bool(enforced)
     return result

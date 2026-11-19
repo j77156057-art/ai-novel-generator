@@ -186,7 +186,12 @@ def merged_constraint_items(
     raw_chars = bible.get("characters") if bible else []
     bible_chars = raw_chars if isinstance(raw_chars, list) else []
     kg_chars = reminders.get("character_constraints") or []
-    bible_fores = (bible.get("foreshadowing") or []) if bible else []
+    # 作者侧台账优先：`reminders["foreshadow_ledger"]` 一旦由引擎写入（哪怕是空
+    # 列表，表示「台账存在但都回收了」），就不再读旧字符串字段，避免双权威。
+    if "foreshadow_ledger" in reminders:
+        bible_fores = list(reminders.get("foreshadow_ledger") or [])
+    else:
+        bible_fores = (bible.get("foreshadowing") or []) if bible else []
     kg_fores = [h.get("question") for h in (reminders.get("unresolved_plotholes") or [])]
     if has_roster:
         declared: set[str] = {
@@ -850,6 +855,17 @@ def _char_line(card: dict, *, opening: bool = False) -> str:
     samples = _as_text_list(card.get("sample_lines"))[:3]
     if samples:
         bits.append("台词参考：" + " / ".join(f"“{x}”" for x in samples))
+    # 角色卡（身份/能力/声纹/关系 分组结构）是 persona 之外的结构化补充。
+    # 老数据没有 card 或 card 是 persona 形状时 render_card 返回空串，
+    # 输出与旧版逐字节相同；有卡时才追加一条压缩的人话。
+    grouped = card.get("card") if isinstance(card.get("card"), dict) else card
+    if isinstance(grouped, dict):
+        from app.generation.character_card import render_card
+
+        # 性别已在上面的「性别：女（用她指代）」里写过，卡里不再重复一遍。
+        detail = render_card(grouped, skip_fields=("性别",) if gender else ())
+        if detail:
+            bits.append(detail)
     return f"  · {card.get('name')}（{'；'.join(bits)}）"
 
 
@@ -1027,6 +1043,8 @@ def build_user_prompt(
     chapter_outline: str | None = None,
     min_chars: int | None = None,
     advance_block: str | None = None,
+    story_cards_block: str | None = None,
+    foreshadow_block: str | None = None,
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -1136,7 +1154,7 @@ def build_user_prompt(
             direction = plot_bible.get("direction")
             conflicts = plot_bible.get("conflicts") or []
             relationships = plot_bible.get("relationships") or []
-            fores = plot_bible.get("foreshadowing") or []
+            fores = [] if foreshadow_block else (plot_bible.get("foreshadowing") or [])
             if synopsis:
                 bible_lines.append(f"整体梗概：{synopsis}")
             if direction:
@@ -1157,6 +1175,10 @@ def build_user_prompt(
                     "持续伏笔（本节最多推进一条，其余留待后续）："
                     + "；".join(str(f) for f in fores)
                 )
+    # 作者侧台账（只含未回收项）：与旧 plot_bible.foreshadowing 二选一。
+    # 首段与时间线节点模式同样不给，避免模型把整条线一次演完。
+    if foreshadow_block and not is_opening and not node_prompt:
+        bible_lines.append(foreshadow_block)
     if bible_lines:
         bible_block = "\n".join(bible_lines)
     elif is_opening and plot_bible and not node_prompt:
@@ -1238,6 +1260,20 @@ def build_user_prompt(
         blocks += [
             "【世界背景（作者设定，全书一致，不得与之矛盾）】",
             background_text,
+            "",
+        ]
+    # 设定卡（人物 / 场景 / 道具）：作者亲手写下的意图，与【世界背景】同区——
+    # 先恒定设定、后剧情走向。空块（项目没建卡）不追加任何字符，
+    # 保证与旧版提示逐字节一致。
+    if story_cards_block:
+        blocks += [
+            "【设定卡（作者亲手维护；本段出现的人物 / 势力 / 场景 / 道具 / 规则须与之一致）】",
+            story_cards_block,
+            "（人物卡里的「性格」「动机」「禁忌」「说话方式」是**行为硬约束**："
+            "本段人物的关键选择、动作与对白都要能追溯到这些设定，"
+            "不要只推进情节、把人物写成没有性格的功能性角色。"
+            "与【世界观事实】【物品持有事实】冲突时，以本块与【剧情圣经】为准；"
+            "不得静默改动卡片里的设定。）",
             "",
         ]
     blocks += [

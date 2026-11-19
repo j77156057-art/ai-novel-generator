@@ -147,10 +147,11 @@ def test_stream_v25_integration():
             self.chat_calls = []
             self.judge_calls = []
         def chat(self, system, user, constraints=None):
-            # judge_node_completion 调 chat 时 user 含"判断"和"退出条件"
-            if "退出条件" in user and ("判断" in user or "本段写作" in user):
+            # 证据化 judge 调 chat 时 user 含【可选段落ID】
+            if "【可选段落ID】" in user:
                 self.judge_calls.append(user[:50])
-                return '{"done": false}'
+                return ('{"verdict": "contradicted", "reason": "仍在铺垫", '
+                        '"source_ids": ["P001"]}')
             self.chat_calls.append(user[:80])
             return "流式段内容"  # v2.5 测试用更"现实"的文本：含角色+钩子
         def stream_chat(self, system, user, constraints=None, stop_sequences=None, **kw):

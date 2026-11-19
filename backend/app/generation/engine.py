@@ -41,6 +41,7 @@ from app.generation.scope_guard import (
     detect_length_drop,
     detect_scope_mismatch,
 )
+from app.generation.story_cards import render_for_project as _render_story_cards
 from app.generation.structure_check import StructureBlocked, check_structure
 from app.generation.timeline import (
     TimelineState,
@@ -49,7 +50,7 @@ from app.generation.timeline import (
     build_node_prompt,
     force_complete_current,
     has_chapter_ranges,
-    judge_node_completion,
+    judge_node_completion_with_evidence,
     node_for_chapter,
     plan_nodes_with_llm,
     plan_timeline,
@@ -1470,6 +1471,23 @@ def _constraints_from(reminders: dict, project: Project) -> dict:
     }
 
 
+def _foreshadow_ledger_block(
+    db, project_id: int
+) -> tuple[str | None, list[str] | None]:
+    """作者侧伏笔台账 → (提示词块, constraints 短句)。
+
+    项目还没有任何台账行时返回 `(None, None)`：调用方据此保留旧
+    `plot_bible.foreshadowing` 的回退行为（老项目零迁移）。
+    台账存在但全部结案时返回 `("", [])` —— 显式空列表压掉旧字段，避免双权威。
+    """
+    from app.foreshadow_ledger import entries_of, open_lines, render_open_block
+
+    entries = entries_of(db, project_id)
+    if not entries:
+        return None, None
+    return render_open_block(entries), open_lines(entries)
+
+
 def _era_guard_block(project: Project) -> tuple[str, dict]:
     """算时代越界的静态约束块。
 
@@ -1588,7 +1606,8 @@ def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -
         # 就永远丢了，事后无法复核。落库失败不阻断生成。
         try:
             save_judge_findings(db, project_id, judge_res.get("findings", []),
-                                segment_no=segment_no)
+                                segment_no=segment_no,
+                                novel_id=(proj.active_novel_id if proj else None))
         except Exception:  # noqa: BLE001
             pass
         stats["judge"] = judge_res
@@ -1601,9 +1620,9 @@ def _merge_segment_into_graph(db, project_id: int, text: str, segment_no: int) -
 def _require_distill_ready(db, project) -> None:
     """生成前档案预检（2026-10-17，修 live 验证复现的挂起洞）。
 
-    项目有参考语料、但叙事档案既不在项目缓存也不在蒸馏库时，**明确 raise**
+    项目有参考语料、但叙事档案既不在项目缓存也不在文风档案库时，**明确 raise**
     而不是让生成链路走到 `_style_narrative → project_narrative → extract`：
-    那条路会**同步**触发全量蒸馏（分钟级），HTTP 请求 240s 必超时，
+    那条路会**同步**触发全量提炼（分钟级），HTTP 请求 240s 必超时，
     用户看到的是无限转圈、无从判断是卡死还是在跑（live 实测复现）。
 
     判据**不在本函数里**：直接问 `reusable_narrative`——与取档路径同一份规则。
@@ -1612,10 +1631,10 @@ def _require_distill_ready(db, project) -> None:
     预检先 raise，放宽的代码永远走不到，项目 5 收窄到 [5] 后真实生成 500。
 
     无参考语料的自由生成不受影响（project_narrative 对它返回 None，
-    本来就不蒸馏）。
+    本来就不提炼）。
 
     Raises:
-        ValueError: 需要先蒸馏。消息带明确可操作的下一步（端点路径）。
+        ValueError: 需要先提炼。消息带明确可操作的下一步（端点路径）。
     """
     ids = [int(i) for i in (project.reference_novel_ids or [])]
     if not ids:
@@ -1624,11 +1643,11 @@ def _require_distill_ready(db, project) -> None:
 
     cfg = resolve_tier(getattr(project, "narrative_tier", None))
     if reusable_narrative(db, project, ids, cfg) is not None:
-        return  # 项目缓存（含来源超集）或蒸馏库命中；生成链路会直接复用
+        return  # 项目缓存（含来源超集）或文风档案库命中；生成链路会直接复用
     raise ValueError(
-        f"项目尚未蒸馏文风档案（当前档位：{cfg.name}）。请先调用 "
-        f"POST /api/projects/{project.id}/distill 完成蒸馏后再生成——"
-        "直接生成会同步触发分钟级蒸馏，请求必然超时。"
+        f"项目尚未提炼文风档案（当前档位：{cfg.name}）。请先调用 "
+        f"POST /api/projects/{project.id}/distill 完成提炼后再生成——"
+        "直接生成会同步触发分钟级提炼，请求必然超时。"
     )
 
 
@@ -1813,6 +1832,7 @@ def _run_structure_check(project: Project, text: str, chapter: int | None,
                 settings, "structure_gender_max_mismatches", 0)),
             gender_window=int(getattr(settings, "structure_gender_window", 12)),
             mode=str(getattr(settings, "structure_guard_mode", "report")),
+            block_reasons=getattr(settings, "structure_block_reasons", None),
         )
     except Exception:  # noqa: BLE001 —— 检测器故障不影响生成
         logging.getLogger(__name__).warning(
@@ -2263,6 +2283,64 @@ def _authority_snapshot(project: Project, ctx: dict, chapter_range: str | None) 
     )
 
 
+def _record_segment_contract(
+    project: Project,
+    segment_no: int,
+    label: str,
+    prompt_json: str | None,
+    authority_json: str | None,
+    generation_id: int,
+) -> dict | None:
+    """把本段「当时的节点 + 权威」冻结成段契约，写进 `plot_timeline.planning`。
+
+    与 `generations.prompt_json / authority_json` 的分工：
+
+    - 那两列存**完整输入**（用于回放「当时模型看到了什么」）；
+    - 这里只存验收/重判需要的轻量指针：节点快照、权威 premise、prompt 哈希、
+      `generation_id`。不复制 prompt 全文，避免 `plot_timeline` 随章节线性膨胀。
+
+    冻结的是**落库这一刻**的节点字段（title/entry_condition/exit_condition/
+    beats…），之后重规划不会改写到历史段契约——这正是
+    `body_consistency` / `derived_rebuild` 读取 `segment_contracts` 的前提。
+
+    没有时间线（未规划、旧项目）时返回 None，不阻断生成。
+    """
+    saved = project.plot_timeline if isinstance(project.plot_timeline, dict) else None
+    if not saved:
+        return None
+    st = state_from_dict(
+        saved,
+        total_segments=_total_segments(project),
+        total_chapters=len(_outline_entries(project)) or None,
+    )
+    if st is None:
+        return None
+    chapter = _chapter_ordinal(label)
+    node_id = (node_for_chapter(st, chapter) if chapter else None) or st.current_node
+    if not node_id or node_id not in st.nodes:
+        return None
+
+    frozen = state_to_dict(st)["nodes"][node_id]
+    contract = {
+        "node_id": node_id,
+        "generation_id": generation_id,
+        "chapter_range": label,
+        # 完整 prompt 在 generations.prompt_json；这里只留可校验的指纹。
+        "prompt_sha256": _sha_text(prompt_json) if prompt_json else None,
+        "authority_sha256": _sha_text(authority_json) if authority_json else None,
+        "authority": {
+            "premise": project.premise,
+            "causal_node": frozen,
+        },
+        "captured_at": time.time(),
+    }
+    contracts = dict(st.segment_contracts)
+    contracts[str(segment_no)] = contract
+    st.segment_contracts = contracts
+    project.plot_timeline = state_to_dict(st)
+    return contract
+
+
 def _commit_segment(db, project: Project, text: str, summary: str,
                     meta: dict | None = None,
                     quality: dict | None = None,
@@ -2306,7 +2384,11 @@ def _commit_segment(db, project: Project, text: str, summary: str,
     structure = (quality or {}).get("structure_check") or {}
     if structure.get("enforced"):
         raise StructureBlocked(
-            "结构检测阻断落库：" + "；".join(structure.get("blocking_reasons") or []))
+            "结构检测阻断落库：" + "；".join(
+                structure.get("enforced_reasons")
+                or structure.get("blocking_reasons")
+                or []
+            ))
     # 篇幅硬上限：压缩轮（`_rewrite_rounds` 末尾）跑完仍超 120% ⇒ 不落正式正文。
     # 下限（<80%）仍按既有口径只留痕，不在这里拦——本次只补上限这一侧。
     length_evidence = _length_block_evidence(project, text, quality)
@@ -2324,6 +2406,14 @@ def _commit_segment(db, project: Project, text: str, summary: str,
         authority_json=authority_json,
     )
     db.add(gen)
+    # flush 拿 generation_id 写段契约；契约失败不能拖垮已完成的正文落库。
+    db.flush()
+    try:
+        _record_segment_contract(
+            project, segment_no, label, prompt_json, authority_json, gen.id
+        )
+    except Exception:  # noqa: BLE001 —— 契约是旁路，生成主流程不能被它拖垮
+        logging.getLogger(__name__).warning("segment contract skipped", exc_info=True)
 
     tree = _summary_tree(project)
     record_l1(tree, segment_no, summary)
@@ -2431,6 +2521,11 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None,
         prior = _prior_summaries(project)
         tree = _summary_tree(project)
 
+    # 作者侧伏笔台账：存在即接管旧 foreshadowing（口径见 prompts.merged_constraint_items）。
+    foreshadow_block, ledger_lines = _foreshadow_ledger_block(db, project.id)
+    if ledger_lines is not None:
+        reminders["foreshadow_ledger"] = ledger_lines
+
     # 前情块**有界**：分层 + 预算裁剪，且带覆盖证明（report["uncovered"] 恒空）。
     # 预算随单段正文长度走——正文越长，前情允许多占一点，但比例固定，不随段数漂移。
     prior_blocks, prior_report = compose_prior(
@@ -2493,6 +2588,8 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None,
         "rag_query": rag_query,
         "style_exemplars": style_exemplars,
         "rag_has_forbidden": rag_has_forbidden,
+        # 作者侧伏笔块：None = 项目还没有台账（保留旧 foreshadowing 回退）。
+        "foreshadow_block": foreshadow_block,
         "novel_ids": novel_ids,
         "constraints": constraints,
         # v3.0 KG 切片：按当前剧情点动态取的近期实体/状态/伏笔/情报/事件。
@@ -2803,7 +2900,7 @@ def _style_narrative(db, project: Project) -> dict | None:
     `persist_library=False`（P1-1 修复）：生成链路每次请求会调本函数 3 次
     （build_context + generate_next_segment/stream 各 2 次），命中缓存时
     只读返回即可——不算 corpus_content_hash（全量加载语料+sha256）、
-    不写蒸馏库。落库是蒸馏提交路径（POST /distill）的职责。
+    不写文风档案库。落库是提炼提交路径（POST /distill）的职责。
     """
     from app.style.narrative import attach_rule_weights, project_narrative_safe
 
@@ -3133,7 +3230,7 @@ def _selfcheck_enabled(project) -> bool:
     """生成自检开关（Phase 0 原型）。
 
     **这里的判据是暂借 `project.narrative_tier`，语义上并不等价**：
-    narrative_tier 的本义是「蒸馏档位」（full/balanced/fast），与「是否开启生成期
+    narrative_tier 的本义是「提炼档位」（full/balanced/fast），与「是否开启生成期
     自检」是两件事。之所以暂借，是为了 Phase 0 不新增字段、不做 schema 迁移：
     完整档才开自检，其余档位（含 narrative_tier 为 None）行为与现在逐字节一致。
     独立化为独立开关（新增列或项目设置项）留待后续——届时只需改本函数的判据，
@@ -4825,6 +4922,36 @@ def _load_timeline_state_for_branch(db, project: Project, written_segments: int)
     )
 
 
+#: 证据化 judge 只看正文末尾这么多字符：退出条件通常在后半段落实，
+#: 全章塞进去会让一次判定多出数千字符的段落坐标表；超出部分不影响结论。
+_JUDGE_TEXT_CHARS = 2000
+
+
+def _judge_verdict(judge: dict) -> bool | None:
+    """三态证据判定 → 旧布尔契约。
+
+    `supported` 才算完成；`contradicted` 明确未完；`unknown`（含解析失败、
+    证据不足）保持 None，继续走段数预算兜底。
+    """
+    return {"supported": True, "contradicted": False}.get(judge.get("verdict"))
+
+
+def _judge_evidence(judge: dict) -> dict:
+    """给接口/质量回执的证据摘要；只留指纹与来源 ID，不复制正文。"""
+    audit = judge.get("audit") or {}
+    return {
+        "verdict": judge.get("verdict"),
+        "reason": judge.get("reason"),
+        "source_ids": [
+            s.get("paragraph_id") for s in (judge.get("sources") or [])
+            if s.get("paragraph_id")
+        ],
+        "text_hash": audit.get("text_hash"),
+        "plan_hash": audit.get("plan_hash"),
+        "error_category": audit.get("error_category"),
+    }
+
+
 def _judge_and_advance(
     db,
     project: Project,
@@ -4849,6 +4976,10 @@ def _judge_and_advance(
     out = {"called": False, "judge": None, "forced": False, "advanced": False, "skipped": True}
     if not project.outline:
         return out
+    judge_text = (
+        recent_text[-_JUDGE_TEXT_CHARS:]
+        if len(recent_text) > _JUDGE_TEXT_CHARS else recent_text
+    )
 
     if chapter_based:
         progress_after, _ = _timeline_progress(db, project)
@@ -4868,7 +4999,14 @@ def _judge_and_advance(
         cur_id = st.current_node
         cur_node = st.nodes[cur_id]
         if cur_node.exit_condition:
-            out["judge"] = judge_node_completion(provider, cur_node, recent_text)
+            judge = judge_node_completion_with_evidence(
+                provider, cur_node, judge_text,
+                source_id=f"segment:{progress_after}",
+            )
+            st.completion[cur_id] = judge
+            st.last_judged_segment = progress_after
+            out["judge"] = _judge_verdict(judge)
+            out["evidence"] = _judge_evidence(judge)
             if out["judge"] is True:
                 # 章模式：提前完成只记成显式状态（done + early_done），
                 # current_node 不提前切走——注入点必须继续与章号对齐；
@@ -4895,7 +5033,14 @@ def _judge_and_advance(
     # 2) 调 LLM 判定——但只在「advance 之后该节点还未 done」时调
     # （如果 advance 已让它 done，就没必要再让 LLM 重复判定）
     if cur_id not in st.done and cur_node.exit_condition:
-        out["judge"] = judge_node_completion(provider, cur_node, recent_text)
+        judged_segment = max(1, written_segments + 1)
+        judge = judge_node_completion_with_evidence(
+            provider, cur_node, judge_text, source_id=f"segment:{judged_segment}",
+        )
+        st.completion[cur_id] = judge
+        st.last_judged_segment = judged_segment
+        out["judge"] = _judge_verdict(judge)
+        out["evidence"] = _judge_evidence(judge)
         if out["judge"] is True:
             st = force_complete_current(st)
             out["forced"] = True
@@ -5075,6 +5220,8 @@ def generate_next_segment(
         chapter_outline=chapter_outline,
         min_chars=prompt_min_chars,
         advance_block=_advance_block(db, project, chapter),
+        story_cards_block=_render_story_cards(db, project.id),
+        foreshadow_block=ctx.get("foreshadow_block"),
     )
 
     from app.generation.author_research import (
@@ -5548,6 +5695,8 @@ def generate_next_segment_stream(
         chapter_outline=chapter_outline,
         min_chars=prompt_min_chars,
         advance_block=_advance_block(db, project, chapter),
+        story_cards_block=_render_story_cards(db, project.id),
+        foreshadow_block=ctx.get("foreshadow_block"),
     )
 
     # —— 写后自查（与同步版同口径：缺口驱动，只查不过的项）——
@@ -5918,6 +6067,11 @@ def _build_generation_prompts(
     if reminders is None:
         reminders = get_reminders(db, project.id, source="generated")
 
+    # 与续写同口径：台账存在即接管旧 foreshadowing（重生成也不该漏掉未回收线）。
+    foreshadow_block, ledger_lines = _foreshadow_ledger_block(db, project.id)
+    if ledger_lines is not None:
+        reminders["foreshadow_ledger"] = ledger_lines
+
     overrides = _prompt_overrides(db, project.id)
 
     tree = _summary_tree(project)
@@ -5971,6 +6125,8 @@ def _build_generation_prompts(
         rewrite_before_chars=rewrite_before_chars,
         chapter_outline=chapter_outline,
         min_chars=prompt_min_chars,
+        story_cards_block=_render_story_cards(db, project.id),
+        foreshadow_block=foreshadow_block,
     )
     return system, user, max_chars
 

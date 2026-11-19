@@ -399,14 +399,34 @@ def draft_chapter_outline(
         if index <= len(outline) and outline[index - 1].strip()
     ]
     bible_text = json.dumps(project.plot_bible or {}, ensure_ascii=False)[:5000]
-    user = "\n".join([
+    # 蒸馏档案：只借叙事节奏与对白手法，不让模型照搬参考书的情节/人名。
+    digest = ""
+    try:
+        from app.style.narrative import narrative_digest
+
+        digest = narrative_digest(
+            getattr(project, "style_narrative", None),
+            max_chars=2000,
+            allowed_novel_ids=project.reference_novel_ids,
+        )
+    except Exception:  # noqa: BLE001 —— 档案不可用不阻断起草
+        digest = ""
+    parts = [
         f"作品前提：{project.premise or '（未填写）'}",
         f"剧情圣经：{bible_text}",
+    ]
+    if digest:
+        parts.append(
+            "—— 蒸馏文风档案（学叙事节奏与对白手法，不要照搬情节、人名、专名） ——\n"
+            + digest
+        )
+    parts.extend([
         "前文章纲：",
         "\n".join(prior_lines) or "（无）",
         f"请写第{body.from_chapter}–{body.to_chapter}章，共 {count} 条。",
         f"方向：{body.direction.strip()}" if body.direction and body.direction.strip() else "方向：顺承前文。",
     ])
+    user = "\n".join(parts)
 
     def call():
         return model_json(provider, _DRAFT_SYSTEM, user,

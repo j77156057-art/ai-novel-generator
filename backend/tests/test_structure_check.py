@@ -143,3 +143,64 @@ def test_min_units_is_configurable():
     assert beat["discrimination"] == "sufficient"
     assert beat["counted"] is True
     assert beat["coverage"] == 1.0
+
+
+# ─── 角色提前出场 + 分类阻断 ──────────────────────────────────────────────
+
+_ENTRY = "第1章《测试》：林川打开了旧铁门；他数了数铜牌；苏禾走进来。"
+
+
+def test_character_early_appearance_is_reported():
+    cards = [{"name": "林川", "first_chapter": 5}]
+    result = check_structure(
+        "林川推门进来。", outline=[_ENTRY], chapter=1, character_cards=cards)
+
+    assert result["character"]["status"] == "checked"
+    assert result["character"]["hits"] == [{"name": "林川", "first_chapter": 5}]
+    assert "character_early" in result["blocking_reasons"]
+    # 默认 report：只标记，不阻断
+    assert result["enforced"] is False
+
+
+def test_character_not_early_when_chapter_reached():
+    cards = [{"name": "林川", "first_chapter": 1}]
+    result = check_structure(
+        "林川推门进来。", outline=[_ENTRY], chapter=1, character_cards=cards)
+    assert result["character"]["hits"] == []
+    assert "character_early" not in result["blocking_reasons"]
+
+
+def test_report_mode_blocks_only_configured_reasons():
+    cards = [{"name": "林川", "gender": "女"}]
+    text = "林川是个男人。"
+
+    allowed_other = check_structure(
+        text, outline=[_ENTRY], chapter=1, character_cards=cards,
+        block_reasons=["character_early"])
+    assert "gender_mismatch" in allowed_other["blocking_reasons"]
+    assert allowed_other["enforced"] is False
+
+    allowed_gender = check_structure(
+        text, outline=[_ENTRY], chapter=1, character_cards=cards,
+        block_reasons=["gender_mismatch"])
+    assert allowed_gender["enforced"] is True
+    assert allowed_gender["enforced_reasons"] == ["gender_mismatch"]
+
+
+def test_block_mode_ignores_allowlist():
+    cards = [{"name": "林川", "gender": "女"}]
+    result = check_structure(
+        "林川是个男人。", outline=[_ENTRY], chapter=1, character_cards=cards,
+        mode="block", block_reasons=[])
+    assert result["enforced"] is True
+
+
+def test_missing_outline_is_a_blocking_reason():
+    result = check_structure("正文", outline=[], chapter=1)
+    assert "outline_missing" in result["blocking_reasons"]
+    assert result["enforced"] is False
+
+    enforced = check_structure(
+        "正文", outline=[], chapter=1, block_reasons=["outline_missing"])
+    assert enforced["enforced"] is True
+    assert enforced["enforced_reasons"] == ["outline_missing"]

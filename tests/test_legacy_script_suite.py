@@ -48,7 +48,12 @@ _REAL_DBS = ("novel_demo.db", "novel_dev.db")
 #: 已由根 pytest 真正收集的 backend/tests 文件。它们是 pytest 风格，被当子进程
 #: 直跑只会 import 后 exit 0（假绿），所以这里排除、由 pytest.ini 的 testpaths
 #: 负责执行断言。新增同类文件时两边同步。
-_PYTEST_COLLECTED = {"test_kg_entity_book_scope.py"}
+_PYTEST_COLLECTED = {
+    "test_kg_entity_book_scope.py",
+    "test_structure_check_reasons.py",
+    "test_segment_chapter_assignment.py",
+    "test_generation_status.py",
+}
 
 #: 已知有缺陷的老脚本：**仍然跑**（让真实库守卫覆盖到它），但不作为通过条件。
 #: `concurrent_assistant_qa.py` 用 20 个线程对**同一个 sqlite 文件**并发写，必然撞

@@ -218,7 +218,7 @@ def test_judge_and_advance_integration():
         call_count = 0
         def chat(self, *a, **kw):
             self.call_count += 1
-            return '{"done": true}'
+            return '{"verdict": "supported", "reason": "正文已写明升至部门经理", "source_ids": ["P001"]}'
     pTrue = PTrue()
     r = _judge_and_advance(s, p, pTrue, "林悠然升至部门经理的剧情已经发生。", 0)
     check("5.1 judge=True 时 current_node 切到 n2", r["current_node"], "n2")
@@ -237,7 +237,7 @@ def test_judge_and_advance_integration():
         call_count = 0
         def chat(self, *a, **kw):
             self.call_count += 1
-            return '{"done": false}'
+            return '{"verdict": "contradicted", "reason": "仍在铺垫，未落实", "source_ids": ["P001"]}'
     pFalse = PFalse()
     r = _judge_and_advance(s, p, pFalse, "还在铺垫期。", 0)
     check("5.2 judge=False 时 current_node 仍是 n1", r["current_node"], "n1")
