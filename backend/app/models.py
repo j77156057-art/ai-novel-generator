@@ -65,6 +65,10 @@ class Project(Base):
     # 加不了），取值由写入方保证 ∈ raw_novels.id。
     continuation_novel_id = Column(Integer, nullable=True)
     plot_bible = Column(JSON, nullable=True)  # 动态剧情圣经：角色关系/后续走向/剧情冲突/伏笔
+    # 设定卡是否已从剧情圣经 / 知识图谱自动同步过一次（一次性标记）。
+    # NULL = 尚未同步；非空 = 已同步——之后即使卡片被删空也不再自动导入，
+    # 因为「删空」是用户的明确意图，不能被下次页面加载又填回来。
+    story_cards_seeded_at = Column(DateTime, nullable=True)
     # 单次生成字数（长文，避免多段压缩）。默认 4,000 与
     # `style.consistency.DEFAULT_TARGET_LENGTH` 同步：3,000 压不下 id=23 的
     # 5,224 字而不伤情节（详见该常量注释），故两者一起放宽到 4,000/4,800。
@@ -488,6 +492,36 @@ class KgForeshadow(Base):
         Index("ix_kg_foreshadow_project_status", "project_id", "status"),
         # 按书取伏笔（切片 active 伏笔 / Judge 到期检查）
         Index("ix_kg_foreshadow_project_novel", "project_id", "novel_id"),
+    )
+
+
+class ForeshadowLedger(Base):
+    """作者侧伏笔台账（意图层）。
+
+    与 `KgForeshadow`（从正文/参考语料反推的事实层）严格分开：这里只存作者
+    亲手登记与编辑的伏笔。状态只有三态——作者不需要理解 planted/developing/
+    expired 那套抽取状态机；事实层仍然留在 `kg_foreshadows`。
+
+    提示词只注入 `status == "open"` 的条目；resolved / dropped 视为已结案。
+    """
+
+    __tablename__ = "foreshadow_ledger"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    title = Column(String(200), nullable=False)
+    status = Column(String(16), nullable=False, default="open")
+    planted_chapter = Column(Integer, nullable=True)
+    planned_chapter = Column(Integer, nullable=True)
+    resolved_chapter = Column(Integer, nullable=True)
+    evidence = Column(String(500), nullable=True)
+    resolution = Column(String(500), nullable=True)
+    source = Column(String(16), nullable=False, default="manual")
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        Index("ix_foreshadow_ledger_project_status", "project_id", "status"),
     )
 
 
@@ -1452,6 +1486,33 @@ class AssistantMessage(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
 
+class AssistantMemory(Base):
+    """项目级**长期记忆**：用户明确要助手记住的事。
+
+    与 `assistant_messages` 的区别：
+    - `assistant_messages` 是**流水**（谁说过什么，按条追加，供历史回放）；
+    - 本表是**结论**（「这本书用第一人称」「别写电话号码」这类要长期生效的
+      约束），条数上限很小，每次问答都整段进提示词。
+
+    只存用户显式要求记住的内容（`source="manual"`）。不做自动抽取：自动
+    沉淀会引入额外模型调用，且把噪声写进「长期生效」的位置比漏记更糟。
+
+    归属 `project_id`：换一本书，记忆不该跟着串。
+    """
+
+    __tablename__ = "assistant_memories"
+    __table_args__ = (
+        Index("ix_assistant_memories_project", "project_id", "id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    text = Column(Text, nullable=False)
+    #: manual（用户说「记住…」）| 以后若有导入来源，再加枚举值
+    source = Column(String(16), nullable=False, default="manual")
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
 class WizardActionAudit(Base):
     """助理在引导里执行的每一次写操作（审计 + 撤销依据）。
 
@@ -1978,3 +2039,41 @@ class RoleplayMessage(Base):
     #: 用的哪几本参考书
     novel_ids_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
+
+
+class StoryCard(Base):
+    """作者亲手维护的**设定卡**：人物 / 场景 / 道具。
+
+    与 `kg_*` / `facts` 的分工：
+
+    - `kg_*` / `facts` 是「从正文抽取或裁决出来的已发生事实」，只读、由系统写；
+    - 本表是「作者直接写下的意图」，可随时增删改，下次生成原样注入。
+
+    两者冲突时以本表（作者意图）为准——提示层会给模型一条明确的优先级说明。
+    固定类型的字段键受 `app.generation.story_cards.FIELD_SCHEMA` 白名单约束；
+    自定义卡（kind="custom"）允许用户自拟字段名。渲染时只输出非空值，
+    避免空字段在提示词里占位。
+    """
+
+    __tablename__ = "story_cards"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    kind = Column(String(16), nullable=False)  # character | scene | item
+    title = Column(String(160), nullable=False)
+    fields = Column(JSON, nullable=True)  # {字段键: 文本}
+    # 上次从角色卡同步过来的字段快照。用于「智能合并」：字段仍等于快照
+    # 说明作者没手改，可以随角色卡更新；不等则视为手改，保留。
+    # NULL = 从未走过新合并逻辑（老数据 / KG 导入卡）。
+    sync_snapshot = Column(JSON, nullable=True)
+    # 关闭后不参与生成；不删行，方便用户临时停用后恢复。
+    enabled = Column(
+        Boolean, nullable=False, default=True, server_default="1"
+    )
+    sort_order = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_story_card_project_kind", "project_id", "kind", "sort_order"),
+    )

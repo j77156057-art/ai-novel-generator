@@ -19,6 +19,7 @@ import type {
   AssistantDiagnoseResponse,
   AssistantInvokeGenerationRequest,
   AssistantInvokeGenerationResult,
+  AssistantMemoryListResponse,
   AssistantProposalActionResponse,
   AssistantProposalCreate,
   AssistantProposalCreateResponse,
@@ -54,10 +55,17 @@ import type {
   DistillJobListResponse,
   DistillStartResponse,
   ExpertQuestions,
+  ForeshadowCreateRequest,
+  ForeshadowEntry,
+  ForeshadowImportResponse,
+  ForeshadowListResponse,
+  ForeshadowPatchRequest,
   GenerateLoopResult,
   GeneratePlan,
   GenerateResult,
   GenerationOut,
+  GenerationEditResult,
+  GenerationStatus,
   GenerateStreamDoneMeta,
   Graph,
   KgRebuildResult,
@@ -94,6 +102,11 @@ import type {
   StyleDistillDetail,
   StyleDistillListResponse,
   SearchHit,
+  StoryCardCreateRequest,
+  StoryCardListResponse,
+  StoryCardOut,
+  StoryCardPatchRequest,
+  StoryCardSyncResponse,
   UploadResult,
   WizardAnswerRequest,
   WizardAnswerResponse,
@@ -103,6 +116,10 @@ import type {
   WizardMessageListResponse,
   WizardSayResponse,
   WorkflowState,
+  WorldBackgroundGenerateRequest,
+  WorldBackgroundGenerateResponse,
+  WorldBackgroundResponse,
+  WorldBackgroundSaveRequest,
   WizardStateResponse,
 } from "./types";
 
@@ -126,7 +143,31 @@ export class ApiError extends Error {
   }
 }
 
+// 短 TTL 读缓存：只缓存高频、体积大、短时间内不会变的 GET。
+// `/projects/{id}` 实测能到 14MB（plot_bible + style_narrative），页面来回
+// 切换时反复拉它是最明显的卡顿来源。任何写操作都会清空缓存，保证改完
+// 回到页面看到的是新数据。
+const GET_CACHE_TTL_MS = 60_000;
+const getCache = new Map<string, { at: number; data: unknown }>();
+
+function isCacheableGet(path: string, init?: RequestInit): boolean {
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (method !== "GET") return false;
+  return /^\/projects(?:\/\d+)?$/.test(path) || path === "/novels";
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (isCacheableGet(path, init)) {
+    const hit = getCache.get(path);
+    if (hit && Date.now() - hit.at < GET_CACHE_TTL_MS) {
+      return hit.data as T;
+    }
+  }
+  if (method !== "GET") {
+    getCache.clear();
+  }
+
   const res = await fetch(BASE + path, init);
   const text = await res.text();
   const data = text ? safeJson(text) : null;
@@ -137,6 +178,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         : undefined;
     const detail = raw !== undefined ? detailText(raw) : text || `HTTP ${res.status}`;
     throw new ApiError(res.status, detail, raw === undefined ? text : raw);
+  }
+  if (isCacheableGet(path, init)) {
+    getCache.set(path, { at: Date.now(), data });
   }
   return data as T;
 }
@@ -419,11 +463,12 @@ export const api = {
     ),
 
   // ---------- 生成环 ----------
-  generatePlan: (projectId: number) =>
-    request<GeneratePlan>(
-      "/generate-plan",
-      jsonInit("POST", { project_id: projectId }),
-    ),
+  /** 生成前预检：只组装上下文与提示词（不调模型）。可传 signal 做超时取消。 */
+  generatePlan: (projectId: number, signal?: AbortSignal) =>
+    request<GeneratePlan>("/generate-plan", {
+      ...jsonInit("POST", { project_id: projectId }),
+      ...(signal ? { signal } : {}),
+    }),
 
   // 流式续写：SSE 逐块回调 onChunk，结束回调 onDone。流结束时 Promise resolve。
   generateStream: (
@@ -532,6 +577,21 @@ export const api = {
   listGenerations: (projectId: number) =>
     request<GenerationOut[]>(`/generations/${projectId}`),
 
+  /**
+   * 手动改一段正文（不调模型改字）。
+   * 后端会重算剧情总结与摘要树、重建图谱，并把 v3 批抽重新入队；
+   * 任何配套步骤失败都随 `cascade.errors` 返回，正文本身已保存。
+   */
+  updateGenerationText: (projectId: number, generationId: number, text: string) =>
+    request<GenerationEditResult>(
+      `/generations/${projectId}/${generationId}`,
+      jsonInit("PATCH", { text }),
+    ),
+
+  /** 生成进度（轻量）：段数 + 最新段/章 + 是否在生成。轮询用，不含正文。 */
+  generationStatus: (projectId: number) =>
+    request<GenerationStatus>(`/projects/${projectId}/generation-status`),
+
   /** 规则哨兵的历史告警（落库的，按段号倒序）。只读，不触发重新判定。 */
   listAlerts: (projectId: number) =>
     request<AlertsResponse>(`/alerts/${projectId}`),
@@ -569,6 +629,18 @@ export const api = {
   /** 1. 问答：只读检索 + Assistant 模型回答，返回 evidence 与 confidence。 */
   assistantQa: (body: AssistantQaRequest) =>
     request<AssistantQaResponse>("/assistant/qa", jsonInit("POST", body)),
+
+  // —— 助理长期记忆（项目级；内容由助手在问答后自动抽取，这里只读与删除）——
+  listAssistantMemories: (projectId: number) =>
+    request<AssistantMemoryListResponse>(
+      `/assistant/memories?project_id=${projectId}`,
+    ),
+
+  deleteAssistantMemory: (projectId: number, memoryId: number) =>
+    request<AssistantMemoryListResponse>(
+      `/assistant/memories/${memoryId}?project_id=${projectId}`,
+      { method: "DELETE" },
+    ),
 
   /** 上传文本附件到项目暂存区（只暂存，不写库；投放必须另点确认卡）。 */
   uploadAssistantAttachment: (projectId: number, file: File) => {
@@ -857,6 +929,96 @@ export const api = {
   backWizard: (projectId: number) =>
     request<WizardStateResponse>(`/assistant/wizard/${projectId}/back`, jsonInit("POST", {})),
 
+  /** 重新生成角色卡（names 为空 = 全部），写回剧情圣经。 */
+  regenerateWizardCards: (projectId: number, names: string[] = []) =>
+    request<{
+      ok: boolean;
+      bible: Record<string, unknown>;
+      character_cards: {
+        generated: number;
+        names: string[];
+        missing?: string[];
+        collisions: number;
+        reason?: string;
+      };
+      message: string;
+    }>(
+      `/assistant/wizard/${projectId}/character-cards/regenerate`,
+      jsonInit("POST", { names }),
+    ),
+
+  /** 蒸馏完成后：只用文风档案重建角色卡（不改剧情圣经）。 */
+  rebuildWizardCardsWithArchive: (projectId: number) =>
+    request<{
+      ok: boolean;
+      character_cards: {
+        generated: number;
+        names: string[];
+        missing?: string[];
+        collisions: number;
+        reason?: string;
+      };
+      message: string;
+    }>(
+      `/assistant/wizard/${projectId}/character-cards/rebuild-with-archive`,
+      jsonInit("POST", {}),
+    ),
+
+  /** 手工保存一张角色卡（来源标为 user，批量重生成不会覆盖）。 */
+  updateWizardCard: (
+    projectId: number,
+    name: string,
+    card: Record<string, unknown>,
+  ) =>
+    request<{
+      ok: boolean;
+      bible: Record<string, unknown>;
+      card: Record<string, unknown>;
+      character_cards: {
+        generated: number;
+        names: string[];
+        missing?: string[];
+        collisions: number;
+        reason?: string;
+      };
+      message: string;
+    }>(
+      `/assistant/wizard/${projectId}/character-cards/${encodeURIComponent(name)}`,
+      jsonInit("PUT", { card }),
+    ),
+
+  /** 把角色从剧情圣经整体移除（同时清理涉及 TA 的关系）。 */
+  removeWizardCharacter: (projectId: number, name: string) =>
+    request<{
+      ok: boolean;
+      bible: Record<string, unknown>;
+      removed_relationships: number;
+      /** 对应设定卡的处理结果：未手改则删，手改过则停用。 */
+      story_card?: { deleted: boolean; disabled: boolean };
+      message: string;
+    }>(
+      `/assistant/wizard/${projectId}/characters/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+
+  /** 删除一张角色卡（只删卡，角色仍留在剧情圣经里）。 */
+  deleteWizardCard: (projectId: number, name: string) =>
+    request<{
+      ok: boolean;
+      bible: Record<string, unknown>;
+      character_cards: {
+        generated: number;
+        names: string[];
+        missing?: string[];
+        collisions: number;
+        reason?: string;
+      };
+      message: string;
+    }>(
+      `/assistant/wizard/${projectId}/character-cards/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+
   /** 直接打字：可能被解析成作答，也可能是追问（追问不推进流程）。 */
   sayWizard: (projectId: number, text: string) =>
     request<WizardSayResponse>(
@@ -1042,5 +1204,88 @@ export const api = {
     request<ChapterOutlineDraftResponse>(
       `/projects/${projectId}/chapter-outline/draft`,
       jsonInit("POST", body),
+    ),
+
+  // ---------- 设定卡（人物 / 场景 / 道具） ----------
+  /** 返回字段 schema 与全部卡片（含停用卡）。 */
+  listStoryCards: (projectId: number) =>
+    request<StoryCardListResponse>(`/projects/${projectId}/story-cards`),
+
+  /** 从剧情圣经与知识图谱补卡：只新增、不覆盖，可重复调用。 */
+  syncStoryCards: (projectId: number) =>
+    request<StoryCardSyncResponse>(
+      `/projects/${projectId}/story-cards/sync`,
+      { method: "POST" },
+    ),
+
+  createStoryCard: (projectId: number, body: StoryCardCreateRequest) =>
+    request<StoryCardOut>(
+      `/projects/${projectId}/story-cards`,
+      jsonInit("POST", body),
+    ),
+
+  patchStoryCard: (projectId: number, cardId: number, body: StoryCardPatchRequest) =>
+    request<StoryCardOut>(
+      `/projects/${projectId}/story-cards/${cardId}`,
+      jsonInit("PATCH", body),
+    ),
+
+  deleteStoryCard: (projectId: number, cardId: number) =>
+    request<{ ok: boolean; deleted_id: number }>(
+      `/projects/${projectId}/story-cards/${cardId}`,
+      { method: "DELETE" },
+    ),
+
+  // ---------- 世界观（一句话世界 / 硬规则 / 势力与地点） ----------
+  getBackground: (projectId: number) =>
+    request<WorldBackgroundResponse>(`/projects/${projectId}/background`),
+
+  saveBackground: (projectId: number, body: WorldBackgroundSaveRequest) =>
+    request<{ ok: boolean; background: WorldBackgroundResponse["background"] }>(
+      `/projects/${projectId}/background`,
+      jsonInit("POST", body),
+    ),
+
+  /** AI 补一份，只返回建议、不落库；作者点「采纳」再走 saveBackground。 */
+  generateBackground: (projectId: number, body: WorldBackgroundGenerateRequest = {}) =>
+    request<WorldBackgroundGenerateResponse>(
+      `/projects/${projectId}/background/generate`,
+      jsonInit("POST", body),
+    ),
+
+  // ---------- 伏笔台账 ----------
+  listForeshadows: (projectId: number) =>
+    request<ForeshadowListResponse>(`/projects/${projectId}/foreshadows`),
+
+  createForeshadow: (projectId: number, body: ForeshadowCreateRequest) =>
+    request<ForeshadowEntry>(
+      `/projects/${projectId}/foreshadows`,
+      jsonInit("POST", body),
+    ),
+
+  patchForeshadow: (projectId: number, entryId: number, body: ForeshadowPatchRequest) =>
+    request<ForeshadowEntry>(
+      `/projects/${projectId}/foreshadows/${entryId}`,
+      jsonInit("PATCH", body),
+    ),
+
+  deleteForeshadow: (projectId: number, entryId: number) =>
+    request<{ ok: boolean; deleted_id: number }>(
+      `/projects/${projectId}/foreshadows/${entryId}`,
+      { method: "DELETE" },
+    ),
+
+  /** 把剧情圣经旧伏笔导入台账：按标题去重，只新增不覆盖。 */
+  importForeshadows: (projectId: number) =>
+    request<ForeshadowImportResponse>(
+      `/projects/${projectId}/foreshadows/import`,
+      { method: "POST" },
+    ),
+
+  /** 把 KG 里仍 open 的未填坑登记进台账：按标题去重，只新增不覆盖。 */
+  importForeshadowsFromKg: (projectId: number) =>
+    request<ForeshadowImportResponse>(
+      `/projects/${projectId}/foreshadows/import-kg`,
+      { method: "POST" },
     ),
 };

@@ -27,9 +27,19 @@ from app.routers import digest as digest_router
 from app.routers import roleplay as roleplay_router
 from app.routers import assistant_action_proposals as assistant_action_proposals_router
 from app.routers import assistant_attachments as assistant_attachments_router
+from app.routers import assistant_memory as assistant_memory_router
 from app.routers import chapter_outline as chapter_outline_router
 from app.routers import rhythm as rhythm_router
 from app.routers import timeline as timeline_router
+from app.routers import story_cards as story_cards_router
+from app.routers import foreshadow_ledger as foreshadow_ledger_router
+
+# uvicorn 默认只配自己的 logger，不接管 root；不显式配置的话，模块里的
+# logger.info（如向导里的角色增删）会被默认 WARNING 级别过滤掉，等于没记录。
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 @asynccontextmanager
@@ -174,12 +184,17 @@ app.include_router(roleplay_router.router)
 app.include_router(assistant_action_proposals_router.router)
 # 助理附件：/api/assistant/attachments/*（上传解析后交给附件对话）。
 app.include_router(assistant_attachments_router.router)
+# 助理长期记忆：/api/assistant/memories（查看 / 新增 / 删除）。
+app.include_router(assistant_memory_router.router)
 # 章纲写入/编辑：/api/projects/{id}/chapter-outline/*。
 app.include_router(chapter_outline_router.router)
 # 时间线节点（B2）：/api/projects/{id}/timeline*。
 app.include_router(timeline_router.router)
 # 高潮密度蒸馏（B6）：/api/projects/{id}/rhythm/distill。
 app.include_router(rhythm_router.router)
+# 设定卡（人物/场景/道具）：/api/projects/{id}/story-cards，作者可增删改。
+app.include_router(story_cards_router.router)
+app.include_router(foreshadow_ledger_router.router)
 
 
 @app.get("/health")

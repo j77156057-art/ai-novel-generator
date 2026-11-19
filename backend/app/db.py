@@ -149,6 +149,12 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         # 回答的是「从哪本书往后写」，与 active_novel_id（事实来自哪本书）分开。
         ("projects", "continuation_novel_id", "INTEGER"),
         ("projects", "plot_bible", "JSON"),
+        # —— 设定卡一次性自动同步标记（NULL = 尚未从剧情圣经/KG 导入）——
+        # 漏这一项的后果：老库 SELECT projects.* 直接 no such column。
+        ("projects", "story_cards_seeded_at", "DATETIME"),
+        # —— 设定卡智能同步快照：记录上次从角色卡同步来的字段值 ——
+        # NULL = 老数据 / KG 导入卡（从未走过新合并逻辑）；补 NULL 不改变现有展示。
+        ("story_cards", "sync_snapshot", "JSON"),
         ("projects", "generation_length", "INTEGER NOT NULL DEFAULT 3000"),
         ("projects", "summary_tree", "JSON"),
         ("projects", "style_profile", "JSON"),

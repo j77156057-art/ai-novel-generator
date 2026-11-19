@@ -388,6 +388,49 @@ export interface GenerationOut {
   summary: unknown;
 }
 
+/** 手动改正文后的配套重算结果（总结 / 摘要树 / 图谱）。 */
+export interface GenerationEditCascade {
+  /** 正文没变时为 true：没有触发任何重算。 */
+  skipped: boolean;
+  /** L1 剧情总结是否重算成功。 */
+  summary: boolean;
+  /** L1/L2/L3 摘要树是否重建成功（依赖 summary）。 */
+  tree: boolean;
+  /** v2.6 图谱是否重建完整（无失败段）。 */
+  kg: boolean;
+  kg_stats?: {
+    segments?: number | null;
+    replayed?: number | null;
+    complete?: boolean | null;
+    failed?: unknown[];
+  } | null;
+  /** v3 批抽是否成功入队（异步落库）。 */
+  v3_enqueued: boolean;
+  v3_pending?: number | null;
+  /** 失败原因（正文仍已保存）。 */
+  errors: string[];
+}
+
+export interface GenerationEditResult extends GenerationOut {
+  cascade: GenerationEditCascade;
+}
+
+/**
+ * 生成进度（轻量轮询）：只有对账字段，**不含正文**。
+ * `/api/projects/{id}/generation-status`。
+ */
+export interface GenerationStatus {
+  project_id: number;
+  /** 已落库段数。 */
+  count: number;
+  /** 已落库正文字数合计（SQLite length()，按字符计）。 */
+  total_chars: number;
+  last_segment_no: number | null;
+  last_chapter: string | null;
+  /** 进程内租约是否被占用（只覆盖走租约的生成入口）。 */
+  running: boolean;
+}
+
 export interface PremiseProposal {
   proposals: string[];
   note?: string | null;
@@ -1209,6 +1252,30 @@ export interface AssistantQaResponse {
   tool_fallback_reason?: string;
   /** 本次问题命中的动作目录项（档 2/3 只会出现在这里）。 */
   available_actions?: AssistantAvailableAction[];
+  /**
+   * 本次问答是否改动了长期记忆（用户说「记住…」/「忘掉…」）。
+   * 旧后端不返回 → undefined → 不刷新记忆抽屉。
+   */
+  memory_changed?: boolean;
+  /** 记忆变更后的全量清单（仅 `memory_changed=true` 时返回）。 */
+  memories?: AssistantMemory[];
+}
+
+/** 一条项目级长期记忆（助手在问答后自动抽取写入）。 */
+export interface AssistantMemory {
+  id: number;
+  text: string;
+  /** auto = 助手自动抽取。 */
+  source: string;
+  created_at: string | null;
+}
+
+/** GET/DELETE `/api/assistant/memories` 的响应。 */
+export interface AssistantMemoryListResponse {
+  project_id: number;
+  items: AssistantMemory[];
+  count: number;
+  limit: number;
 }
 
 export interface AssistantDiagnoseResponse extends AssistantQaResponse {
@@ -1952,6 +2019,17 @@ export interface WizardCommitResult {
   message?: string;
   distill?: Record<string, unknown> | null;
   bible?: Record<string, unknown> | null;
+  /** 引导提交时批量补角色卡的结果；失败时 reason 非空，不影响大纲。 */
+  character_cards?: {
+    generated: number;
+    names: string[];
+    /** 本次没生成成功的角色名（模型漏掉或失败）。 */
+    missing?: string[];
+    /** 缺卡二次补建成功的角色名（批量生成后自动再补一轮）。 */
+    retried?: string[];
+    collisions: number;
+    reason?: string;
+  };
   character?: string;
   scene?: string;
   segments?: WizardCommitSegment[];
@@ -2721,3 +2799,193 @@ export interface ChapterOutlineDraftResponse {
   source_fingerprint: string;
 }
 
+
+// ---------- 设定卡（人物 / 势力 / 场景 / 道具 / 规则 / 自定义） ----------
+export type StoryCardKind =
+  | "character"
+  | "faction"
+  | "scene"
+  | "item"
+  | "rule"
+  | "custom";
+
+/** 字段规格：后端 FIELD_SCHEMA 原样下发，前端据此渲染表单。 */
+export interface StoryCardFieldSpec {
+  key: string;
+  label: string;
+  hint?: string;
+  multiline?: boolean;
+  max_chars?: number;
+}
+
+export interface StoryCardKindSpec {
+  kind: StoryCardKind;
+  label: string;
+  fields: StoryCardFieldSpec[];
+  /** true = 字段名由用户自拟（自定义卡），界面渲染可增删的「字段名 + 内容」行。 */
+  freeform?: boolean;
+}
+
+export interface StoryCardOut {
+  id: number;
+  project_id: number;
+  kind: StoryCardKind;
+  title: string;
+  fields: Record<string, string>;
+  enabled: boolean;
+  sort_order: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface StoryCardListResponse {
+  project_id: number;
+  kinds: StoryCardKindSpec[];
+  cards: StoryCardOut[];
+  /** false = 还没从剧情圣经 / 知识图谱自动同步过，前端可触发一次同步。 */
+  seeded?: boolean;
+}
+
+export interface StoryCardSyncResponse {
+  project_id: number;
+  created: number;
+  skipped: number;
+  /** 本次有映射字段被更新的卡数（旧字段名，兼容保留）。 */
+  filled: number;
+  /** 本次有字段更新的卡数。 */
+  updated?: number;
+  /** 因作者手改而保留字段的卡数。 */
+  kept?: number;
+  seeded: boolean;
+  cards: StoryCardOut[];
+}
+
+export interface StoryCardCreateRequest {
+  kind: StoryCardKind;
+  title: string;
+  fields?: Record<string, string>;
+  enabled?: boolean;
+  sort_order?: number;
+}
+
+export interface StoryCardPatchRequest {
+  kind?: StoryCardKind;
+  title?: string;
+  fields?: Record<string, string>;
+  enabled?: boolean;
+  sort_order?: number;
+}
+
+
+// ---------- 世界观（作者手写：一句话世界 / 硬规则 / 势力与地点） ----------
+export interface WorldBackground {
+  "一句话世界"?: string;
+  "硬规则"?: string[];
+  "势力与地点"?: string[];
+}
+
+export interface WorldBackgroundResponse {
+  background: WorldBackground;
+}
+
+export interface WorldBackgroundSaveRequest {
+  background: WorldBackground;
+}
+
+export interface WorldBackgroundGenerateRequest {
+  note?: string;
+}
+
+export interface WorldBackgroundGenerateResponse {
+  ok: boolean;
+  background?: WorldBackground;
+  detail?: string;
+  /** AI 回了但不像背景组时的原文（截断），便于作者手工摘取。 */
+  "原文"?: string;
+}
+
+
+// ---------- 伏笔台账（作者意图层，与 KG 事实层分开） ----------
+export type ForeshadowStatus = "open" | "resolved" | "dropped";
+
+export interface ForeshadowEntry {
+  id: number;
+  project_id: number;
+  title: string;
+  status: ForeshadowStatus;
+  planted_chapter: number | null;
+  planned_chapter: number | null;
+  resolved_chapter: number | null;
+  evidence: string;
+  resolution: string;
+  source: "manual" | "bible" | "kg" | string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ForeshadowSummary {
+  open: number;
+  resolved: number;
+  dropped: number;
+}
+
+export interface ForeshadowListResponse {
+  project_id: number;
+  entries: ForeshadowEntry[];
+  summary: ForeshadowSummary;
+  /** 剧情圣经 `foreshadowing` 里尚未导入台账的旧伏笔标题。 */
+  legacy: string[];
+  /** KG 联动清单（只读）：可登记的未填坑 + 已回收的回收建议。 */
+  kg: ForeshadowKgLinkage;
+}
+
+/** KG 里仍 open 的坑：可一键登记进台账。 */
+export interface ForeshadowKgHole {
+  question: string;
+  status: string;
+  /** KG 的段号（不是台账的章号），登记时只写进「依据」。 */
+  first_chapter: number | null;
+}
+
+/** 台账仍 open、但同名 KG 坑已不是 open：建议标记已回收。 */
+export interface ForeshadowKgResolvable {
+  entry_id: number;
+  title: string;
+  kg_status: string;
+  first_chapter: number | null;
+}
+
+export interface ForeshadowKgLinkage {
+  importable: ForeshadowKgHole[];
+  resolvable: ForeshadowKgResolvable[];
+}
+
+export interface ForeshadowImportResponse {
+  project_id: number;
+  created: number;
+  titles: string[];
+  entries: ForeshadowEntry[];
+  summary: ForeshadowSummary;
+  legacy: string[];
+  kg: ForeshadowKgLinkage;
+}
+
+export interface ForeshadowCreateRequest {
+  title: string;
+  status?: ForeshadowStatus;
+  planted_chapter?: number | null;
+  planned_chapter?: number | null;
+  resolved_chapter?: number | null;
+  evidence?: string;
+  resolution?: string;
+}
+
+export interface ForeshadowPatchRequest {
+  title?: string;
+  status?: ForeshadowStatus;
+  planted_chapter?: number | null;
+  planned_chapter?: number | null;
+  resolved_chapter?: number | null;
+  evidence?: string;
+  resolution?: string;
+}

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+defineOptions({ name: "ProjectWorkspace" });
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, ApiError } from "@/api/client";
 import type {
@@ -14,7 +15,11 @@ import type {
   AssistantSnapshot,
   AssistantSnapshotGroup,
   DistillJob,
+  ForeshadowEntry,
+  ForeshadowKgLinkage,
+  ForeshadowKgResolvable,
   GeneratePlan,
+  GenerationEditCascade,
   GenerationOutlineChapter,
   GenerationOutlineNotice,
   Graph,
@@ -28,12 +33,17 @@ import type {
   PlotBible,
   ProjectOut,
   ReferenceCutoff,
+  StoryCardKind,
+  StoryCardKindSpec,
+  StoryCardOut,
   StyleDistillSummary,
+  WorldBackground,
 } from "@/api/types";
 import DistillProgress from "@/components/DistillProgress.vue";
 import RoleplayPanel from "@/components/RoleplayPanel.vue";
 import type { CutoffInputs } from "@/utils/referenceBoundary";
 import { buildStructureNotices } from "@/utils/structureStatus.js";
+import { useModalResize } from "@/utils/useModalResize";
 import type { StructureNotice } from "@/utils/structureStatus.js";
 
 const route = useRoute();
@@ -539,6 +549,659 @@ async function loadGenerations() {
 }
 
 // ==================================================================
+// 设定卡（人物 / 场景 / 道具）
+// ------------------------------------------------------------------
+// 作者亲手维护，改动即时 PATCH 落库；下一次生成由后端
+// `generation.story_cards.render_for_project` 注入提示词。
+// 字段表由后端 GET 接口下发（kinds[].fields），前端不重复维护一份。
+// ==================================================================
+const storyCards = ref<StoryCardOut[]>([]);
+const storyCardKinds = ref<StoryCardKindSpec[]>([]);
+const storyCardsLoading = ref(false);
+const storyCardsSyncing = ref(false);
+const storyCardsError = ref<string | null>(null);
+const storyCardsNotice = ref<string | null>(null);
+// 新增按钮的防重复：双击会连发两个 POST，产生两张同名卡（实测踩到）。
+const storyCardAdding = reactive<Record<string, boolean>>({});
+const storyCardOpen = reactive<Record<number, boolean>>({});
+const storyCardGroupOpen = reactive<Record<string, boolean>>({
+  character: true,
+  faction: false,
+  scene: false,
+  item: false,
+  rule: false,
+  custom: false,
+});
+
+// ==================================================================
+// 设定卡编辑弹窗：列表只展示概览，字段编辑在居中模态卡片里完成。
+// ==================================================================
+const storyCardEditing = ref<StoryCardOut | null>(null);
+const storyCardModalEl = ref<HTMLElement | null>(null);
+const {
+  style: storyCardModalStyle,
+  start: startStoryCardResize,
+  reset: resetStoryCardResize,
+} = useModalResize(storyCardModalEl);
+const storyCardEditBusy = ref(false);
+const storyCardEditError = ref<string | null>(null);
+const storyCardDraft = reactive<{
+  title: string;
+  enabled: boolean;
+  fields: Record<string, string>;
+  rows: { name: string; value: string }[];
+}>({ title: "", enabled: true, fields: {}, rows: [] });
+
+function openStoryCardEditor(card: StoryCardOut) {
+  storyCardEditing.value = card;
+  storyCardDraft.title = card.title;
+  storyCardDraft.enabled = card.enabled;
+  storyCardDraft.fields = { ...(card.fields ?? {}) };
+  storyCardDraft.rows = Object.entries(card.fields ?? {}).map(
+    ([name, value]) => ({ name, value: String(value ?? "") }),
+  );
+  storyCardEditError.value = null;
+  closeCardRef();
+  resetStoryCardResize();
+}
+
+function closeStoryCardEditor() {
+  storyCardEditing.value = null;
+  storyCardEditError.value = null;
+  closeCardRef();
+}
+
+function addStoryCardDraftRow() {
+  storyCardDraft.rows.push({ name: "", value: "" });
+}
+
+function removeStoryCardDraftRow(index: number) {
+  storyCardDraft.rows.splice(index, 1);
+}
+
+function storyCardDraftFields(): Record<string, string> {
+  if (storyCardEditing.value?.kind !== "custom") {
+    return { ...storyCardDraft.fields };
+  }
+  const fields: Record<string, string> = {};
+  for (const row of storyCardDraft.rows) {
+    const name = row.name.trim();
+    if (name) fields[name] = row.value;
+  }
+  return fields;
+}
+
+async function saveStoryCardDraft() {
+  const card = storyCardEditing.value;
+  if (!card || storyCardEditBusy.value) return;
+  storyCardEditBusy.value = true;
+  storyCardEditError.value = null;
+  try {
+    const updated = await api.patchStoryCard(projectId, card.id, {
+      title: storyCardDraft.title,
+      fields: storyCardDraftFields(),
+      enabled: storyCardDraft.enabled,
+    });
+    Object.assign(card, normalizeStoryCard(updated));
+    storyCardsNotice.value = "已保存，下一次生成将使用最新设定。";
+    closeStoryCardEditor();
+  } catch (err) {
+    storyCardEditError.value = errorText(err);
+  } finally {
+    storyCardEditBusy.value = false;
+  }
+}
+
+/** 列表上的启用开关：只 PATCH enabled，不携带字段，避免误清空自定义卡。 */
+async function toggleStoryCard(card: StoryCardOut) {
+  const previous = card.enabled;
+  try {
+    const updated = await api.patchStoryCard(projectId, card.id, {
+      enabled: card.enabled,
+    });
+    Object.assign(card, normalizeStoryCard(updated));
+  } catch (err) {
+    card.enabled = previous;
+    showActionError("切换设定卡启用状态", err);
+  }
+}
+
+function storyCardSummary(card: StoryCardOut): string {
+  return Object.entries(card.fields ?? {})
+    .filter(([, value]) => String(value ?? "").trim())
+    .slice(0, 3)
+    .map(([key, value]) =>
+      `${fieldLabel(card, key)}：${String(value).replace(/\s+/g, " ").slice(0, 28)}`)
+    .join(" · ");
+}
+
+// ==================================================================
+// 卡片引用：从另一张卡复制某个字段的内容
+// ------------------------------------------------------------------
+// 语义是**一次性复制**，不做动态绑定：复制后两张卡各自独立，改来源不会
+// 悄悄影响本卡（避免一处修改引发多处正文变化，排查成本太高）。
+// 固定类型按 FIELD_SCHEMA 选字段；自定义卡按用户自拟的字段名选。
+// ==================================================================
+const refPanelCardId = ref<number | null>(null);
+const refSourceCardId = ref<number | null>(null);
+const refSourceFieldKey = ref("");
+const refTargetFieldKey = ref("");
+
+const refTargetCard = computed(
+  () =>
+    storyCardEditing.value
+    ?? storyCards.value.find((card) => card.id === refPanelCardId.value)
+    ?? null,
+);
+
+const refSourceCard = computed(
+  () => storyCards.value.find((card) => card.id === refSourceCardId.value) ?? null,
+);
+
+const refSourceCards = computed(() =>
+  storyCards.value.filter((card) => card.id !== refPanelCardId.value),
+);
+
+function fieldSpecsFor(kind: StoryCardKind) {
+  return storyCardKinds.value.find((item) => item.kind === kind)?.fields ?? [];
+}
+
+function fieldLabel(card: StoryCardOut, key: string): string {
+  if (card.kind === "custom") return key;
+  return fieldSpecsFor(card.kind).find((spec) => spec.key === key)?.label ?? key;
+}
+
+/** 来源字段只列有内容的，避免选了之后预览为空、按钮不可点。 */
+const refSourceFields = computed(() => {
+  const card = refSourceCard.value;
+  if (!card) return [];
+  if (card.kind === "custom") {
+    return Object.entries(card.fields ?? {})
+      .filter(([, value]) => String(value).trim())
+      .map(([key]) => ({ key, label: key }));
+  }
+  return fieldSpecsFor(card.kind)
+    .filter((spec) => (card.fields?.[spec.key] ?? "").trim())
+    .map((spec) => ({ key: spec.key, label: spec.label }));
+});
+
+const refTargetFields = computed(() => {
+  const card = refTargetCard.value;
+  if (!card) return [];
+  if (card.kind === "custom") {
+    return [
+      { key: "__new__", label: "+ 新增字段（用来源字段名）" },
+      ...storyCardDraft.rows
+        .map((row) => row.name.trim())
+        .filter(Boolean)
+        .map((name) => ({ key: name, label: name })),
+    ];
+  }
+  return fieldSpecsFor(card.kind).map((spec) => ({
+    key: spec.key,
+    label: spec.label,
+  }));
+});
+
+const refPreview = computed(() => {
+  const card = refSourceCard.value;
+  if (!card || !refSourceFieldKey.value) return "";
+  return String((card.fields ?? {})[refSourceFieldKey.value] ?? "");
+});
+
+const canApplyRef = computed(
+  () =>
+    !!(refSourceCard.value
+      && refSourceFieldKey.value
+      && refTargetFieldKey.value
+      && refPreview.value.trim()),
+);
+
+function openCardRef(card: StoryCardOut) {
+  refPanelCardId.value = card.id;
+  refSourceCardId.value = null;
+  refSourceFieldKey.value = "";
+  refTargetFieldKey.value = card.kind === "custom" ? "__new__" : "";
+}
+
+function closeCardRef() {
+  refPanelCardId.value = null;
+  refSourceCardId.value = null;
+  refSourceFieldKey.value = "";
+  refTargetFieldKey.value = "";
+}
+
+function onRefSourceChange() {
+  refSourceFieldKey.value = "";
+  refTargetFieldKey.value = refTargetCard.value?.kind === "custom" ? "__new__" : "";
+}
+
+async function applyCardRef() {
+  const target = storyCardEditing.value;
+  const source = refSourceCard.value;
+  const sourceKey = refSourceFieldKey.value;
+  const targetKey = refTargetFieldKey.value;
+  if (!target || !source || !sourceKey || !targetKey || !canApplyRef.value) return;
+  const value = String((source.fields ?? {})[sourceKey] ?? "");
+
+  if (target.kind === "custom") {
+    if (targetKey === "__new__") {
+      storyCardDraft.rows.push({ name: fieldLabel(source, sourceKey), value });
+    } else {
+      const row = storyCardDraft.rows.find((item) => item.name === targetKey);
+      if (!row) return;
+      if (row.value.trim() && row.value !== value
+          && !window.confirm(`「${targetKey}」已有内容，用来源卡片的内容覆盖？`)) {
+        return;
+      }
+      row.value = value;
+    }
+  } else {
+    const current = String(storyCardDraft.fields[targetKey] ?? "").trim();
+    if (current && current !== value
+        && !window.confirm(`「${fieldLabel(target, targetKey)}」已有内容，用来源卡片的内容覆盖？`)) {
+      return;
+    }
+    storyCardDraft.fields[targetKey] = value;
+  }
+
+  storyCardsNotice.value = `已从「${source.title || storyCardGroupLabel(source.kind)}」复制到编辑中的卡片，保存后生效。`;
+  closeCardRef();
+}
+
+const storyCardGroups = computed(() =>
+  storyCardKinds.value.map((spec) => ({
+    ...spec,
+    cards: storyCards.value
+      .filter((card) => card.kind === spec.kind)
+      .slice()
+      .sort((a, b) => (a.sort_order - b.sort_order) || (a.id - b.id)),
+  })),
+);
+
+const enabledStoryCardCount = computed(
+  () => storyCards.value.filter((card) => card.enabled).length,
+);
+
+function normalizeStoryCard(card: StoryCardOut): StoryCardOut {
+  const spec = storyCardKinds.value.find((item) => item.kind === card.kind);
+  const fields: Record<string, string> = {};
+  for (const field of spec?.fields ?? []) fields[field.key] = "";
+  return { ...card, fields: { ...fields, ...(card.fields ?? {}) } };
+}
+
+async function loadStoryCards() {
+  storyCardsLoading.value = true;
+  storyCardsError.value = null;
+  try {
+    const resp = await api.listStoryCards(projectId);
+    storyCardKinds.value = resp.kinds;
+    if (!resp.seeded && !resp.cards.length) {
+      // 首次进入且从未同步：把剧情圣经 / 知识图谱里已有的实体补成卡片。
+      await syncStoryCards(false);
+    } else {
+      storyCards.value = resp.cards.map(normalizeStoryCard);
+    }
+  } catch (err) {
+    storyCardsError.value = errorText(err);
+  } finally {
+    storyCardsLoading.value = false;
+  }
+}
+
+async function syncStoryCards(manual = true) {
+  if (storyCardsSyncing.value) return;
+  storyCardsSyncing.value = true;
+  storyCardsError.value = null;
+  try {
+    const res = await api.syncStoryCards(projectId);
+    storyCards.value = res.cards.map(normalizeStoryCard);
+    const parts: string[] = [];
+    if (res.created) parts.push(`新增 ${res.created} 张`);
+    const updated = res.updated ?? res.filled;
+    if (updated) parts.push(`更新 ${updated} 张卡的同步字段`);
+    if (parts.length) {
+      storyCardsNotice.value = `已同步：${parts.join("，")}。`;
+    } else if (manual) {
+      storyCardsNotice.value = "没有新的可同步设定。";
+    }
+  } catch (err) {
+    showActionError("同步设定卡", err);
+  } finally {
+    storyCardsSyncing.value = false;
+  }
+}
+
+function storyCardGroupLabel(kind: StoryCardKind): string {
+  return storyCardKinds.value.find((item) => item.kind === kind)?.label ?? kind;
+}
+
+async function addStoryCard(kind: StoryCardKind) {
+  if (storyCardAdding[kind]) return;
+  storyCardAdding[kind] = true;
+  storyCardsError.value = null;
+  try {
+    const created = await api.createStoryCard(projectId, {
+      kind,
+      title: `新${storyCardGroupLabel(kind)}`,
+      fields: {},
+      enabled: true,
+    });
+    storyCards.value.push(normalizeStoryCard(created));
+    storyCardGroupOpen[kind] = true;
+    storyCardOpen[created.id] = true;
+    storyCardsNotice.value = "已新增，下一次生成立即使用这张卡。";
+  } catch (err) {
+    showActionError("新增设定卡", err);
+  } finally {
+    storyCardAdding[kind] = false;
+  }
+}
+
+function onStoryCardToggle(card: StoryCardOut, event: Event) {
+  storyCardOpen[card.id] = (event.target as HTMLDetailsElement).open;
+}
+
+function onStoryCardGroupToggle(kind: StoryCardKind, event: Event) {
+  storyCardGroupOpen[kind] = (event.target as HTMLDetailsElement).open;
+}
+
+async function removeStoryCard(card: StoryCardOut) {
+  const name = card.title || storyCardGroupLabel(card.kind);
+  if (!window.confirm(`删除「${name}」？删除后下一次生成不再包含这张卡。`)) return;
+  try {
+    await api.deleteStoryCard(projectId, card.id);
+    storyCards.value = storyCards.value.filter((item) => item.id !== card.id);
+    if (refPanelCardId.value === card.id || refSourceCardId.value === card.id) {
+      closeCardRef();
+    }
+    storyCardsNotice.value = "已删除，下一次生成不再包含这张卡。";
+  } catch (err) {
+    showActionError("删除设定卡", err);
+  }
+}
+
+// ==================================================================
+// 世界观（一句话世界 / 硬规则 / 势力与地点）
+// ------------------------------------------------------------------
+// 后端 `/background` 三端点已存在；这里只做编辑与「AI 建议 → 采纳」。
+// 保存空组 = 清空这一块（提示词里那一段随之消失）。
+// ==================================================================
+const worldBgLoading = ref(false);
+const worldBgSaving = ref(false);
+const worldBgGenerating = ref(false);
+const worldBgError = ref<string | null>(null);
+const worldBgNotice = ref<string | null>(null);
+const worldBgSummary = ref("");
+const worldBgRules = ref<string[]>([]);
+const worldBgFactions = ref<string[]>([]);
+const worldBgSuggestion = ref<WorldBackground | null>(null);
+
+function applyWorldBackground(bg: WorldBackground | null | undefined) {
+  worldBgSummary.value = bg?.["一句话世界"] || "";
+  worldBgRules.value = [...(bg?.["硬规则"] || [])];
+  worldBgFactions.value = [...(bg?.["势力与地点"] || [])];
+}
+
+function worldBgPayload(): WorldBackground {
+  const payload: WorldBackground = {};
+  const summary = worldBgSummary.value.trim();
+  const rules = worldBgRules.value.map((value) => value.trim()).filter(Boolean);
+  const factions = worldBgFactions.value.map((value) => value.trim()).filter(Boolean);
+  if (summary) payload["一句话世界"] = summary;
+  if (rules.length) payload["硬规则"] = rules;
+  if (factions.length) payload["势力与地点"] = factions;
+  return payload;
+}
+
+async function loadBackground() {
+  worldBgLoading.value = true;
+  worldBgError.value = null;
+  try {
+    const resp = await api.getBackground(projectId);
+    applyWorldBackground(resp.background);
+  } catch (err) {
+    worldBgError.value = errorText(err);
+  } finally {
+    worldBgLoading.value = false;
+  }
+}
+
+async function saveWorldBackground() {
+  if (worldBgSaving.value) return;
+  worldBgSaving.value = true;
+  worldBgError.value = null;
+  try {
+    await api.saveBackground(projectId, { background: worldBgPayload() });
+    worldBgNotice.value = "世界观已保存，下一次生成立即生效。";
+  } catch (err) {
+    showActionError("保存世界观", err);
+  } finally {
+    worldBgSaving.value = false;
+  }
+}
+
+async function generateWorldBackground() {
+  if (worldBgGenerating.value) return;
+  worldBgGenerating.value = true;
+  worldBgError.value = null;
+  worldBgNotice.value = null;
+  try {
+    const res = await api.generateBackground(projectId);
+    if (!res.ok || !res.background) {
+      worldBgError.value = res.detail || "AI 没有给出可用的世界背景。";
+      return;
+    }
+    worldBgSuggestion.value = res.background;
+  } catch (err) {
+    showActionError("生成世界背景", err);
+  } finally {
+    worldBgGenerating.value = false;
+  }
+}
+
+async function adoptWorldSuggestion() {
+  if (!worldBgSuggestion.value) return;
+  applyWorldBackground(worldBgSuggestion.value);
+  worldBgSuggestion.value = null;
+  await saveWorldBackground();
+}
+
+function addWorldRule() {
+  worldBgRules.value.push("");
+}
+
+function removeWorldRule(index: number) {
+  worldBgRules.value.splice(index, 1);
+  void saveWorldBackground();
+}
+
+function addWorldFaction() {
+  worldBgFactions.value.push("");
+}
+
+function removeWorldFaction(index: number) {
+  worldBgFactions.value.splice(index, 1);
+  void saveWorldBackground();
+}
+
+// ==================================================================
+// 伏笔台账（作者意图层）
+// ------------------------------------------------------------------
+// 状态只有三种：open / resolved / dropped；提示词只注入 open。
+// 行内修改即时 PATCH；旧 plot_bible.foreshadowing 通过「导入」迁移。
+// ==================================================================
+const foreshadows = ref<ForeshadowEntry[]>([]);
+const foreshadowSummary = ref({ open: 0, resolved: 0, dropped: 0 });
+const foreshadowLegacy = ref<string[]>([]);
+const foreshadowLoading = ref(false);
+const foreshadowBusy = reactive<Record<number, boolean>>({});
+const foreshadowError = ref<string | null>(null);
+const foreshadowNotice = ref<string | null>(null);
+const foreshadowAdding = ref(false);
+const foreshadowImporting = ref(false);
+const foreshadowImportingKg = ref(false);
+/** KG 联动清单：可登记的未填坑 + 已回收的回收建议（后端只读 KG，不反写）。 */
+const foreshadowKg = ref<ForeshadowKgLinkage>({ importable: [], resolvable: [] });
+
+function recalcForeshadowSummary() {
+  const counts = { open: 0, resolved: 0, dropped: 0 };
+  for (const entry of foreshadows.value) {
+    if (entry.status === "open") counts.open += 1;
+    else if (entry.status === "resolved") counts.resolved += 1;
+    else if (entry.status === "dropped") counts.dropped += 1;
+  }
+  foreshadowSummary.value = counts;
+}
+
+function applyForeshadowList(resp: {
+  entries: ForeshadowEntry[];
+  summary: { open: number; resolved: number; dropped: number };
+  legacy: string[];
+  kg: ForeshadowKgLinkage;
+}) {
+  foreshadows.value = resp.entries;
+  foreshadowSummary.value = { ...resp.summary };
+  foreshadowLegacy.value = resp.legacy;
+  foreshadowKg.value = resp.kg ?? { importable: [], resolvable: [] };
+}
+
+async function loadForeshadows() {
+  foreshadowLoading.value = true;
+  foreshadowError.value = null;
+  try {
+    applyForeshadowList(await api.listForeshadows(projectId));
+  } catch (err) {
+    foreshadowError.value = errorText(err);
+  } finally {
+    foreshadowLoading.value = false;
+  }
+}
+
+async function addForeshadow() {
+  if (foreshadowAdding.value) return;
+  foreshadowAdding.value = true;
+  foreshadowError.value = null;
+  try {
+    const created = await api.createForeshadow(projectId, {
+      title: "新伏笔",
+      status: "open",
+    });
+    foreshadows.value.push(created);
+    recalcForeshadowSummary();
+    foreshadowNotice.value = "已新增，标题与章号可直接在行内修改。";
+  } catch (err) {
+    showActionError("新增伏笔", err);
+  } finally {
+    foreshadowAdding.value = false;
+  }
+}
+
+/** 空串 / 0 / null 统一成 null，避免 PATCH 传 "" 被 422 拒绝。 */
+function chapterPayload(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 1 ? Math.trunc(number) : null;
+}
+
+async function saveForeshadow(entry: ForeshadowEntry) {
+  if (foreshadowBusy[entry.id]) return;
+  foreshadowBusy[entry.id] = true;
+  foreshadowError.value = null;
+  try {
+    const updated = await api.patchForeshadow(projectId, entry.id, {
+      title: entry.title,
+      status: entry.status,
+      planted_chapter: chapterPayload(entry.planted_chapter),
+      planned_chapter: chapterPayload(entry.planned_chapter),
+      resolved_chapter: chapterPayload(entry.resolved_chapter),
+      evidence: entry.evidence,
+      resolution: entry.resolution,
+    });
+    Object.assign(entry, updated);
+    recalcForeshadowSummary();
+    foreshadowNotice.value = "已保存，下一次生成只带未回收的伏笔。";
+  } catch (err) {
+    showActionError("保存伏笔", err);
+  } finally {
+    foreshadowBusy[entry.id] = false;
+  }
+}
+
+async function removeForeshadow(entry: ForeshadowEntry) {
+  if (!window.confirm(`删除伏笔「${entry.title}」？删除后不再注入生成。`)) return;
+  try {
+    await api.deleteForeshadow(projectId, entry.id);
+    foreshadows.value = foreshadows.value.filter((item) => item.id !== entry.id);
+    recalcForeshadowSummary();
+    foreshadowNotice.value = "已删除。";
+  } catch (err) {
+    showActionError("删除伏笔", err);
+  }
+}
+
+async function importForeshadows() {
+  if (foreshadowImporting.value) return;
+  foreshadowImporting.value = true;
+  foreshadowError.value = null;
+  try {
+    const res = await api.importForeshadows(projectId);
+    applyForeshadowList(res);
+    foreshadowNotice.value = res.created
+      ? `已从剧情圣经导入 ${res.created} 条伏笔。`
+      : "剧情圣经里的伏笔都已在台账中。";
+  } catch (err) {
+    showActionError("导入伏笔", err);
+  } finally {
+    foreshadowImporting.value = false;
+  }
+}
+
+/** 一键把 KG 里仍 open 的未填坑登记进台账（按标题去重）。 */
+async function importForeshadowsFromKg() {
+  if (foreshadowImportingKg.value) return;
+  foreshadowImportingKg.value = true;
+  foreshadowError.value = null;
+  try {
+    const res = await api.importForeshadowsFromKg(projectId);
+    applyForeshadowList(res);
+    foreshadowNotice.value = res.created
+      ? `已从 KG 登记 ${res.created} 条未填坑。`
+      : "KG 里的未填坑都已在台账中。";
+  } catch (err) {
+    showActionError("从 KG 登记伏笔", err);
+  } finally {
+    foreshadowImportingKg.value = false;
+  }
+}
+
+/** 采纳回收建议：KG 里同名坑已回收，把台账条目改 resolved。 */
+async function acceptKgResolution(item: ForeshadowKgResolvable) {
+  const entry = foreshadows.value.find((row) => row.id === item.entry_id);
+  if (!entry || foreshadowBusy[entry.id]) return;
+  foreshadowBusy[entry.id] = true;
+  foreshadowError.value = null;
+  try {
+    const updated = await api.patchForeshadow(projectId, entry.id, {
+      status: "resolved",
+    });
+    Object.assign(entry, updated);
+    recalcForeshadowSummary();
+    foreshadowKg.value = {
+      importable: foreshadowKg.value.importable,
+      resolvable: foreshadowKg.value.resolvable.filter(
+        (row) => row.entry_id !== item.entry_id,
+      ),
+    };
+    foreshadowNotice.value = `「${item.title}」已标记为已回收。`;
+  } catch (err) {
+    showActionError("标记已回收", err);
+  } finally {
+    foreshadowBusy[entry.id] = false;
+  }
+}
+
+// ==================================================================
 // 重写快照与回滚（档 3：前端显式入口，助手不代执行）
 // ------------------------------------------------------------------
 // 快照由 invoke-generation 每次重写时自动记录；这里只负责「退回去」。
@@ -1022,7 +1685,9 @@ function inferStep(): number {
 function restoreStep() {
   const n = inferStep();
   step.value = n;
-  maxStep.value = Math.max(maxStep.value, n);
+  // 已有正文 = 图谱有东西可看，直接解锁第 7 步；否则用户只能滚到控制台
+  // 最底部找「下一步：看知识图谱」，第一步导航里的标签又是灰的。
+  maxStep.value = Math.max(maxStep.value, n, generations.value.length ? 7 : 0);
 }
 
 function goStep(n: number) {
@@ -1204,7 +1869,7 @@ async function pollDistill(jobId: number) {
   } catch (err) {
     // 轮询失败**不**打断主流程、也不弹窗：下一 tick 会再试。
     // 真正的结论由服务端任务状态兜底（它不会永远停在 running，见后端注释）。
-    console.warn("蒸馏进度轮询失败，下个周期重试：", err);
+    console.warn("提炼进度轮询失败，下个周期重试：", err);
   }
 }
 
@@ -1346,7 +2011,7 @@ async function applyStyleDistill(id: number) {
       }
     }
     styleDistillMsg.value =
-      "已应用该文风档案到本项目：生成时直接套用，无需重新蒸馏。";
+      "已应用该文风档案到本项目：生成时直接套用，无需重新提炼。";
     // 应用成功后清掉强制开关——本次「应用」已把文风档案落进项目缓存，
     // 再点「保存并开始蒸馏」若仍带着 force=true 会无谓地重新烧一遍 LLM。
     forceRedistill.value = false;
@@ -1432,7 +2097,7 @@ async function skipRefs() {
  */
 async function submitDistill(force = false): Promise<boolean> {
   if (!selectedRefs.value.length) {
-    distillNotice.value = "未选参考语料 → 本次为自由生成，不发起蒸馏。";
+    distillNotice.value = "未选参考语料 → 本次为自由生成，不发起提炼。";
     stopDistillPolling();
     distillJob.value = null;
     return false;
@@ -1446,8 +2111,8 @@ async function submitDistill(force = false): Promise<boolean> {
   // 少了这一步，用户点击后会有 1.5s 的「什么都没发生」窗口。
   const cacheNote =
     r.cache_source === "library"
-      ? "✓ 已复用蒸馏库里已有的文风档案（同语料+同档位），本次未重新调用模型，秒级返回。"
-      : "✓ 已复用本项目已缓存的文风档案（上次蒸馏结果），本次未重新调用模型，秒级返回。";
+      ? "✓ 已复用文风档案库里已有的档案（同语料+同档位），本次未重新调用模型，秒级返回。"
+      : "✓ 已复用本项目已缓存的文风档案（上次提炼结果），本次未重新调用模型，秒级返回。";
   distillJob.value = {
     id: r.job_id,
     project_id: projectId,
@@ -1470,10 +2135,10 @@ async function submitDistill(force = false): Promise<boolean> {
   };
   distillDismissed.value = false;
   distillNotice.value = r.reused
-    ? "该档位的蒸馏已在运行中，已切到那条任务的进度。"
+    ? "该档位的提炼已在运行中，已切到那条任务的进度。"
     : r.from_cache
-      ? `${cacheNote} 如需重新提炼，请勾选「强制重新蒸馏」后再点一次。`
-      : "已提交，蒸馏后台运行中 —— 可继续下一步，进度不会丢。";
+      ? `${cacheNote} 如需重新提炼，请勾选「强制重新提炼」后再点一次。`
+      : "已提交，提炼后台运行中 —— 可继续下一步，进度不会丢。";
   startDistillPolling(r.job_id);
   void pollDistill(r.job_id); // 立刻拉一次，不等第一个 tick
   return true;
@@ -1596,6 +2261,7 @@ async function runGenerate() {
 
 async function runRegenerate(g: { id: number; segment_no: number }) {
   actionNotice.value = null;
+  delete segmentSaved[g.id]; // 重新生成会覆盖正文，旧的「已保存」回执不再成立
   regenState.value[g.id] = { text: "", loading: true };
   genKgMsg.value = null; // 同上：本轮重生成的簿记结果覆盖上一轮提示
   genKgLevel.value = "";
@@ -1679,6 +2345,80 @@ function toggleLocalRewrite(g: { id: number }) {
 
 type SegmentRef = { id: number; segment_no: number };
 
+// ===== 手动改正文 =====
+// 不走模型、不走提案：用户自己改字，保存到 generations.text。
+// 只改 text；复读/文风结论由后端清成「未检测」，摘要与图谱仍是旧的。
+type SegmentTextRef = SegmentRef & { text: string | null };
+type SegmentEditState = {
+  text: string;
+  busy: boolean;
+  error: string | null;
+};
+
+const segmentEdits = reactive<Record<number, SegmentEditState>>({});
+/** 保存回执：不仅说「已保存」，还要如实说总结/图谱有没有跟上。 */
+type SegmentSaveNote = { ok: boolean; text: string };
+const segmentSaved = reactive<Record<number, SegmentSaveNote>>({});
+
+/** 把后端的 cascade 结果翻成一句人话。 */
+function cascadeNote(cascade?: GenerationEditCascade): SegmentSaveNote {
+  if (!cascade) return { ok: true, text: "正文已保存。" };
+  if (cascade.skipped) {
+    return { ok: true, text: "正文没有改动，未重算总结与图谱。" };
+  }
+  const parts = ["正文已保存"];
+  parts.push(cascade.summary && cascade.tree ? "剧情总结已重算" : "剧情总结未重算");
+  parts.push(cascade.kg ? "图谱已重建" : "图谱重建未完成");
+  if (cascade.v3_enqueued) parts.push("v3 抽取已排队");
+  const text = parts.join("；") + "。";
+  return {
+    ok: cascade.errors.length === 0,
+    text: cascade.errors.length ? `${text} ${cascade.errors.join("；")}` : text,
+  };
+}
+
+function toggleSegmentEdit(g: SegmentTextRef): void {
+  if (segmentEdits[g.id]) {
+    delete segmentEdits[g.id];
+    return;
+  }
+  delete segmentSaved[g.id];
+  segmentEdits[g.id] = { text: g.text ?? "", busy: false, error: null };
+  expandedSegs[g.id] = true;
+}
+
+async function saveSegmentEdit(g: SegmentTextRef): Promise<void> {
+  const s = segmentEdits[g.id];
+  if (!s || s.busy) return;
+  const text = s.text.trim();
+  if (!text) {
+    s.error = "正文不能为空。";
+    return;
+  }
+  s.busy = true;
+  s.error = null;
+  try {
+    const res = await api.updateGenerationText(projectId, g.id, text);
+    g.text = res.text ?? text;
+    delete segmentEdits[g.id];
+    segmentSaved[g.id] = cascadeNote(res.cascade);
+    // 预览区若正显示这一段，让它从 generations 重新取新正文。
+    if (latestGeneration.value?.id === g.id) lastText.value = null;
+  } catch (err) {
+    s.error = errorText(err);
+  } finally {
+    s.busy = false;
+  }
+}
+
+/** Ctrl/⌘ + Enter 保存，避免长文编辑时还要去够按钮。 */
+function onSegmentEditKey(e: KeyboardEvent, g: SegmentTextRef): void {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    void saveSegmentEdit(g);
+  }
+}
+
 /** 发一次 invoke-generation；202 时把候选摆出来，200 时刷新正文。 */
 async function callLocalRewrite(
   g: SegmentRef,
@@ -1706,6 +2446,7 @@ async function callLocalRewrite(
     return;
   }
   s.notice = `已改写：${res.chars} 字`;
+  delete segmentSaved[g.id]; // 模型改写同样覆盖了手动保存的版本
   s.candidates = [];
   s.clarificationId = null;
   s.showNote = false;
@@ -1797,8 +2538,24 @@ async function runExport() {
 const priorOpen = ref(false);
 const priorLoading = ref(false);
 const priorErr = ref<string | null>(null);
+/** 这次读取已经等了多少秒（>2s 才显示，避免一闪而过的数字）。 */
+const priorElapsed = ref(0);
 const plan = ref<GeneratePlan | null>(null);
 const priorTab = ref<"blocks" | "system" | "user">("blocks");
+
+/** 前情预检的硬超时：后端卡住（库被占用等）时不能让用户无限等。 */
+const PRIOR_TIMEOUT_MS = 120_000;
+let priorTick: number | null = null;
+let priorAbort: AbortController | null = null;
+/** 请求序号：点「刷新」会取消上一次，旧请求的 finally 不能改新请求的状态。 */
+let priorSeq = 0;
+
+function stopPriorTick(): void {
+  if (priorTick !== null) {
+    window.clearInterval(priorTick);
+    priorTick = null;
+  }
+}
 
 type PriorLayer = "spine" | "volume" | "recent" | "other";
 
@@ -2064,21 +2821,162 @@ const priorHealth = computed<"ok" | "warn" | "err">(() => {
   return "ok";
 });
 
+// ==================================================================
+// 写作执行看板（步骤 6 顶部）
+// ------------------------------------------------------------------
+// 只汇总本页**已加载**的数据（正文 / 伏笔台账 / 设定卡 / 前情预检 / 提炼任务），
+// 不新增请求、不新建路由——作者在一屏里看清「写到哪了、哪里会出事」。
+// ==================================================================
+const writingBoard = computed(() => {
+  const segments = generations.value.length;
+  const styleProfile = plan.value?.style_profile;
+  const styleReady = !!styleProfile?.available;
+  return {
+    segments,
+    nextSegment: segments + 1,
+    openForeshadows: foreshadowSummary.value.open,
+    kgImportable: foreshadowKg.value.importable.length,
+    kgResolvable: foreshadowKg.value.resolvable.length,
+    cardsEnabled: enabledStoryCardCount.value,
+    cardsTotal: storyCards.value.length,
+    styleReady,
+    styleText: styleReady
+      ? "已就绪"
+      : project.value?.reference_novel_ids?.length
+        ? "未提炼"
+        : "自由生成",
+    distillText: distillActive.value
+      ? distillJob.value?.progress_total
+        ? `提炼中 ${distillJob.value.progress_current}/${distillJob.value.progress_total} 块`
+        : "提炼中"
+      : null,
+  };
+});
+
+/** 待处理风险：与「前情预检」同一批事实，按严重度排序展示。 */
+const writingRisks = computed<{ severity: "err" | "warn"; text: string }[]>(() => {
+  const out: { severity: "err" | "warn"; text: string }[] = [];
+  const report = plan.value?.prior_report;
+
+  if (report?.uncovered?.length) {
+    out.push({
+      severity: "err",
+      text: `前情有 ${report.uncovered.length} 段完全没覆盖（段 ${report.uncovered.slice(0, 6).join("、")}），这些内容模型看不到。`,
+    });
+  }
+  if (report?.over_budget) {
+    out.push({
+      severity: "warn",
+      text: `前情 ${report.chars} / ${report.budget_chars} 字，已超预算；可调小「近情段数」或等卷情滚上。`,
+    });
+  }
+  if (report?.missing_l1) {
+    out.push({
+      severity: "warn",
+      text: `${report.missing_l1} 段摘要是占位符，前情里对它们是空白。`,
+    });
+  }
+  if (foreshadowKg.value.resolvable.length) {
+    out.push({
+      severity: "warn",
+      text: `${foreshadowKg.value.resolvable.length} 条伏笔在 KG 里已回收，台账还是「未回收」，会继续注入提示词。`,
+    });
+  }
+  if (foreshadowKg.value.importable.length) {
+    out.push({
+      severity: "warn",
+      text: `KG 还有 ${foreshadowKg.value.importable.length} 个未填坑没登记台账，生成时不会作为伏笔推进。`,
+    });
+  }
+  if (!storyCards.value.length) {
+    out.push({
+      severity: "warn",
+      text: "还没有设定卡，人物与场景细节容易前后不一致。",
+    });
+  }
+  const styleProfile = plan.value?.style_profile;
+  if (
+    styleProfile &&
+    !styleProfile.available &&
+    (project.value?.reference_novel_ids?.length || 0) > 0
+  ) {
+    out.push({
+      severity: "warn",
+      text: `文风档案不可用：${styleProfile.reason || "原因未知"}；本次 system 提示里没有文风块。`,
+    });
+  }
+  return out;
+});
+
+/** 下一步建议：有 err 先处理，其次建议清掉 warn，最后才是「可以继续写」。 */
+const writingNextStep = computed(() => {
+  const risks = writingRisks.value;
+  const errCount = risks.filter((item) => item.severity === "err").length;
+  if (errCount) return `有 ${errCount} 项必须先处理，再继续写。`;
+  if (risks.length) {
+    return `可以继续写第 ${writingBoard.value.nextSegment} 段，建议顺手清掉上面 ${risks.length} 项。`;
+  }
+  return `没有待处理风险，可以继续写第 ${writingBoard.value.nextSegment} 段。`;
+});
+
+/** 读取中的一行字：3 秒后才报秒数，避免正常速度时数字一闪而过。 */
+const priorWaitText = computed(() => {
+  if (priorElapsed.value < 3) return "读取中…";
+  if (priorElapsed.value < 15) return `读取中… ${priorElapsed.value} 秒`;
+  return `仍在组装前情 · 已等 ${priorElapsed.value} 秒`;
+});
+
 async function loadPlan() {
+  // 点「刷新」= 放弃上一次：旧请求的 catch/finally 不能再改状态。
+  const seq = ++priorSeq;
+  priorAbort?.abort();
+  const controller = new AbortController();
+  priorAbort = controller;
+
   priorLoading.value = true;
   priorErr.value = null;
+  priorElapsed.value = 0;
+  stopPriorTick();
+  const startedAt = Date.now();
+  priorTick = window.setInterval(() => {
+    if (seq === priorSeq) {
+      priorElapsed.value = Math.floor((Date.now() - startedAt) / 1000);
+    }
+  }, 1000);
+
+  const timeout = window.setTimeout(() => {
+    if (seq !== priorSeq) return;
+    priorErr.value =
+      "前情预检超过 2 分钟仍未返回（后端可能正忙或数据库被占用）。稍后点「刷新」重试。";
+    controller.abort();
+  }, PRIOR_TIMEOUT_MS);
+
   try {
-    plan.value = await api.generatePlan(projectId);
+    const loaded = await api.generatePlan(projectId, controller.signal);
+    if (seq === priorSeq) plan.value = loaded;
   } catch (err) {
-    priorErr.value = err instanceof Error ? err.message : String(err);
+    if (seq !== priorSeq) return;
+    const aborted = err instanceof DOMException && err.name === "AbortError";
+    if (aborted) {
+      // 超时分支已经写好原因；手动取消才需要补一句。
+      if (!priorErr.value) priorErr.value = "前情预检已取消。";
+    } else {
+      priorErr.value = err instanceof Error ? err.message : String(err);
+    }
   } finally {
-    priorLoading.value = false;
+    window.clearTimeout(timeout);
+    if (seq === priorSeq) {
+      stopPriorTick();
+      priorLoading.value = false;
+      priorAbort = null;
+    }
   }
 }
 
 function togglePrior() {
   priorOpen.value = !priorOpen.value;
-  if (priorOpen.value && !plan.value) void loadPlan();
+  // 失败过的面板点开就重试：否则用户只能盯着一条旧错误。
+  if (priorOpen.value && (!plan.value || priorErr.value)) void loadPlan();
 }
 
 /** 生成完成后前情必然变了，面板开着就顺手刷新（没开则不多发一次请求）。 */
@@ -2436,6 +3334,9 @@ async function initialize() {
     // 档 3 两个入口的数据（只读列表），与正文一起加载；失败各自降级，不阻塞工作台。
     void loadSnapshots();
     void loadProposals();
+    void loadStoryCards();
+    void loadBackground();
+    void loadForeshadows();
     restoreStep();
     if (generations.value.length) void loadPlan();
     void loadAlerts();
@@ -2451,11 +3352,41 @@ async function initialize() {
 
 onMounted(initialize);
 
+// keep-alive 回来时只轻量刷新正文列表：助手那边可能生成/改写过段落。
+// 首次挂载也会触发 onActivated，用标记跳过，避免和 initialize 重复拉一遍。
+let workspaceActivated = false;
+onActivated(() => {
+  if (!workspaceActivated) {
+    workspaceActivated = true;
+    return;
+  }
+  void loadGenerations();
+  void resumeDistillJob();
+  // 提案 / 快照 / 告警是只读列表，助手那边可能刚改过状态；一起轻量刷新。
+  void loadProposals();
+  void loadSnapshots();
+  void loadAlerts();
+});
+
+// keep-alive 只是「停用」不是「卸载」：定时器与在途请求必须在这里停，
+// 否则切到别的页面后仍在后台轮询、拉接口。
+onDeactivated(() => {
+  stopDistillPolling();
+  stopPriorTick();
+  priorAbort?.abort();
+});
+
 // 轮询定时器必须在组件销毁时清掉，否则会对着已卸载的组件继续写 ref。
 onUnmounted(stopDistillPolling);
+// 前情预检的秒表与在途请求同理：离开页面就停掉，别让后台请求继续占连接。
+onUnmounted(() => {
+  stopPriorTick();
+  priorAbort?.abort();
+});
 </script>
 
 <template>
+  <div class="workspace-page">
   <header class="page-head workspace-head">
     <div class="eyebrow">Project workspace</div>
     <div class="title-block">
@@ -2530,9 +3461,9 @@ onUnmounted(stopDistillPolling);
     >
       <span class="num">{{ i + 1 }}</span>{{ s }}
       <!-- 步骤①上的蒸馏徽标：跨步骤常驻横幅之外，这里再冗余一份。
-           文字在前（"蒸馏中"），色点只做冗余强化 → 灰度/色弱下照样读得出。 -->
+           文字在前（"提炼中"），色点只做冗余强化 → 灰度/色弱下照样读得出。 -->
       <span v-if="i === 0 && distillActive" class="step-distill">
-        <span class="step-dot" aria-hidden="true"></span>蒸馏中
+        <span class="step-dot" aria-hidden="true"></span>提炼中
       </span>
     </button>
   </div>
@@ -2547,6 +3478,7 @@ onUnmounted(stopDistillPolling);
     </span>
   </div>
 
+  <div class="workspace-scroll">
   <!-- 蒸馏进度（跨步骤常驻）：蒸馏期间允许用户继续下一步，
        所以进度条不能只挂在步骤①里 —— 一跳步就看不见，等于白做。 -->
   <div v-if="showDistillBanner && distillJob" class="distill-banner">
@@ -2590,21 +3522,21 @@ onUnmounted(stopDistillPolling);
     </div>
     <div class="row" style="margin-top: var(--gap)">
       <button class="btn primary" :disabled="distillSubmitting" @click="startDistillAndStay">
-        {{ distillSubmitting ? "正在提交…" : "保存并开始蒸馏" }}
+        {{ distillSubmitting ? "正在提交…" : "保存并开始提炼" }}
       </button>
       <!-- 语义明确：跳过 = **不发起**蒸馏，直接自由生成。文案写明，不只是换了个跳转。 -->
       <button class="btn" :disabled="distillSubmitting" @click="skipRefs">
-        跳过（自由生成，不蒸馏）
+        跳过（自由生成，不提炼）
       </button>
       <button class="btn ghost" @click="goStep(2)">
-        下一步 →<span v-if="distillActive">（蒸馏后台继续）</span>
+        下一步 →<span v-if="distillActive">（提炼后台继续）</span>
       </button>
     </div>
 
     <!-- 提交结果必须**可见**：旧版 `saveRefs(); goStep(2)` 既不 await 也不 catch，
          PATCH 失败时界面毫无反应，这正是「点了也不知道开始没有」的根源。 -->
     <div v-if="distillErr" class="notice err distill-inline">
-      保存或提交蒸馏失败：{{ distillErr }}
+      保存或提交提炼失败：{{ distillErr }}
     </div>
     <div v-else-if="distillNotice" class="notice info distill-inline">
       {{ distillNotice }}
@@ -2659,10 +3591,10 @@ onUnmounted(stopDistillPolling);
     <!-- ============ 蒸馏档位（与选语料同一步落库） ============ -->
     <div class="tier-block">
       <div class="card-title" style="font-size: var(--fs-md)">
-        蒸馏档位<span class="hint">完整档最准，但最贵</span>
+        提炼档位<span class="hint">完整档最准，但最贵</span>
       </div>
       <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
-        档位决定蒸馏时<strong>读多少语料、提炼多少维度</strong>。默认「完整」最准，
+        档位决定提炼时<strong>读多少语料、提炼多少维度</strong>。默认「完整」最准，
         但它是<strong>耗时最长</strong>的一档；只是先看看管线通不通，就选「快速」。
         各档的成本差异见卡片下方。
       </p>
@@ -2708,7 +3640,7 @@ onUnmounted(stopDistillPolling);
       <div class="row force-redistill" style="margin-top: var(--gap); align-items: center; gap: 12px">
         <label class="checkbox">
           <input type="checkbox" v-model="forceRedistill" />
-          强制重新蒸馏（忽略已缓存的文风档案，重新调用模型）
+          强制重新提炼（忽略已缓存的文风档案，重新调用模型）
         </label>
         <button
           v-if="forceRedistill"
@@ -2718,24 +3650,24 @@ onUnmounted(stopDistillPolling);
         >取消强制</button>
       </div>
       <p v-if="forceRedistill" class="notice warn distill-inline">
-        已开启强制重算：本次会真正重新调用模型蒸馏，耗时与费用按所选档位正常发生。
+        已开启强制重算：本次会真正重新调用模型提炼，耗时与费用按所选档位正常发生。
       </p>
     </div>
 
     <!-- ============ 文风蒸馏库（跨项目复用） ============ -->
     <div class="library-block">
       <div class="card-title" style="font-size: var(--fs-md)">
-        文风蒸馏库<span class="hint">蒸馏一次 · 全局共享 · 其它项目直接复用</span>
+        文风档案库<span class="hint">提炼一次 · 全局共享 · 其它项目直接复用</span>
       </div>
       <p class="muted" style="font-size: var(--fs-sm); margin-bottom: var(--gap)">
-        已经蒸馏过的文风档案会存到这里，<strong>全局共享</strong>：任何项目都能应用，
+        已经提炼过的文风档案会存到这里，<strong>全局共享</strong>：任何项目都能应用，
         不限创建它的项目。给别的项目选了<strong>同样的语料与档位</strong>，
-        点「应用」即可秒级套用，不必再跑一遍分钟级蒸馏。每条都标明了<strong>蒸馏程度</strong>（完整/平衡/快速）。
+        点「应用」即可秒级套用，不必再跑一遍分钟级提炼。每条都标明了<strong>提炼档位</strong>（完整/平衡/快速）。
       </p>
 
-      <div v-if="styleDistillsLoading" class="faint">正在加载蒸馏库…</div>
+      <div v-if="styleDistillsLoading" class="faint">正在加载文风档案库…</div>
       <div v-else-if="!styleDistills.length" class="empty">
-        蒸馏库还是空的。在步骤①点「保存并开始蒸馏」一次（真跑一遍），结果就会进库、之后可复用。
+        文风档案库还是空的。在步骤①点「保存并开始提炼」一次（真跑一遍），结果就会进库、之后可复用。
       </div>
       <ul v-else class="lib-list">
         <li v-for="d in styleDistills" :key="d.id" class="lib-item">
@@ -2743,7 +3675,7 @@ onUnmounted(stopDistillPolling);
             <span class="tag" :class="d.tier">{{ d.tier_name || d.tier }}</span>
             <span class="faint mono">#{{ d.id }}</span>
             <span class="faint">语料 {{ (d.source_ids || []).join("、") || "—" }}</span>
-            <span class="faint">蒸馏程度：{{ d.tier_name || d.tier }}档 · {{ d.n_chapters ?? 0 }} 章 · {{ d.rule_count ?? 0 }} 条规则</span>
+            <span class="faint">提炼档位：{{ d.tier_name || d.tier }}档 · {{ d.n_chapters ?? 0 }} 章 · {{ d.rule_count ?? 0 }} 条规则</span>
           </div>
           <div class="lib-actions">
             <button
@@ -2904,6 +3836,215 @@ onUnmounted(stopDistillPolling);
       {{ buildingBible ? "构思中…" : "合成剧情圣经 →" }}
     </button>
 
+    <!-- 世界观：作者手写，进每一段提示词（后端已有 /background 三端点）。 -->
+    <section class="author-panel" aria-labelledby="world-bg-title">
+      <header class="author-panel-head">
+        <div>
+          <h3 id="world-bg-title">世界观</h3>
+          <p class="author-panel-hint">
+            写世界是什么样，不写故事往哪走；保存后每一段生成都会带上。
+          </p>
+        </div>
+        <div class="author-panel-actions">
+          <span v-if="worldBgLoading" class="faint">加载中…</span>
+          <button
+            class="btn sm"
+            :disabled="worldBgSaving || worldBgLoading"
+            @click="saveWorldBackground"
+          >{{ worldBgSaving ? "保存中…" : "保存世界观" }}</button>
+          <button
+            class="btn sm ghost"
+            :disabled="worldBgGenerating"
+            @click="generateWorldBackground"
+          >{{ worldBgGenerating ? "生成中…" : "AI 补一份" }}</button>
+        </div>
+      </header>
+      <div v-if="worldBgError" class="notice err">{{ worldBgError }}</div>
+      <div v-else-if="worldBgNotice" class="notice ok">{{ worldBgNotice }}</div>
+
+      <label class="field">
+        <span>一句话世界（≤300 字）</span>
+        <textarea
+          class="input"
+          rows="2"
+          maxlength="300"
+          v-model="worldBgSummary"
+          @change="saveWorldBackground"
+        />
+      </label>
+
+      <div class="world-list">
+        <div class="world-list-head">
+          <span>硬规则</span>
+          <button class="btn sm ghost" @click="addWorldRule">＋ 添加</button>
+        </div>
+        <div v-for="(_, index) in worldBgRules" :key="`rule-${index}`" class="world-list-row">
+          <input
+            class="input"
+            maxlength="200"
+            v-model="worldBgRules[index]"
+            @change="saveWorldBackground"
+          />
+          <button class="btn sm ghost" @click="removeWorldRule(index)">移除</button>
+        </div>
+        <p v-if="!worldBgRules.length" class="faint">还没有硬规则。</p>
+      </div>
+
+      <div class="world-list">
+        <div class="world-list-head">
+          <span>势力与地点</span>
+          <button class="btn sm ghost" @click="addWorldFaction">＋ 添加</button>
+        </div>
+        <div v-for="(_, index) in worldBgFactions" :key="`faction-${index}`" class="world-list-row">
+          <input
+            class="input"
+            maxlength="200"
+            v-model="worldBgFactions[index]"
+            @change="saveWorldBackground"
+          />
+          <button class="btn sm ghost" @click="removeWorldFaction(index)">移除</button>
+        </div>
+        <p v-if="!worldBgFactions.length" class="faint">还没有势力与地点。</p>
+      </div>
+
+      <div v-if="worldBgSuggestion" class="world-suggestion">
+        <div class="world-suggestion-head">
+          <strong>AI 建议（未落库）</strong>
+          <div class="row">
+            <button class="btn sm primary" @click="adoptWorldSuggestion">采纳并保存</button>
+            <button class="btn sm ghost" @click="worldBgSuggestion = null">放弃</button>
+          </div>
+        </div>
+        <p v-if="worldBgSuggestion['一句话世界']">
+          <span class="k">一句话世界</span>{{ worldBgSuggestion["一句话世界"] }}
+        </p>
+        <p v-if="worldBgSuggestion['硬规则']?.length">
+          <span class="k">硬规则</span>{{ (worldBgSuggestion["硬规则"] || []).join("；") }}
+        </p>
+        <p v-if="worldBgSuggestion['势力与地点']?.length">
+          <span class="k">势力与地点</span>{{ (worldBgSuggestion["势力与地点"] || []).join("；") }}
+        </p>
+      </div>
+    </section>
+
+    <!-- 伏笔台账：作者意图层；提示词只注入 open 条目。 -->
+    <section class="author-panel" aria-labelledby="foreshadow-ledger-title">
+      <header class="author-panel-head">
+        <div>
+          <h3 id="foreshadow-ledger-title">伏笔台账</h3>
+          <p class="author-panel-hint">
+            记录埋设与回收；已回收 / 已放弃的伏笔不会再注入生成。
+          </p>
+        </div>
+        <div class="author-panel-actions">
+          <span class="tag accent">未回收 {{ foreshadowSummary.open }}</span>
+          <span class="tag">已回收 {{ foreshadowSummary.resolved }}</span>
+          <span class="tag">已放弃 {{ foreshadowSummary.dropped }}</span>
+          <button class="btn sm" :disabled="foreshadowAdding" @click="addForeshadow">
+            ＋ 添加伏笔
+          </button>
+          <button
+            v-if="foreshadowLegacy.length"
+            class="btn sm ghost"
+            :disabled="foreshadowImporting"
+            @click="importForeshadows"
+          >从剧情圣经导入 {{ foreshadowLegacy.length }} 条</button>
+          <button
+            v-if="foreshadowKg.importable.length"
+            class="btn sm ghost"
+            :disabled="foreshadowImportingKg"
+            :title="`KG 里有 ${foreshadowKg.importable.length} 个未填坑还没进台账；登记后生成时会作为未回收伏笔注入`"
+            @click="importForeshadowsFromKg"
+          >从 KG 登记未填坑 {{ foreshadowKg.importable.length }} 条</button>
+        </div>
+      </header>
+      <div v-if="foreshadowError" class="notice err">{{ foreshadowError }}</div>
+      <div v-else-if="foreshadowNotice" class="notice ok">{{ foreshadowNotice }}</div>
+
+      <!-- 回收建议：KG 里同名坑已回收，台账还标着未回收。 -->
+      <div v-if="foreshadowKg.resolvable.length" class="foreshadow-kg-suggest">
+        <p class="faint">KG 图谱里这些坑已经回收，台账还标着「未回收」：</p>
+        <div
+          v-for="item in foreshadowKg.resolvable"
+          :key="item.entry_id"
+          class="foreshadow-kg-suggest-row"
+        >
+          <span class="foreshadow-kg-title" :title="item.title">{{ item.title }}</span>
+          <button
+            class="btn sm"
+            :disabled="foreshadowBusy[item.entry_id]"
+            @click="acceptKgResolution(item)"
+          >标记已回收</button>
+        </div>
+      </div>
+
+      <div class="foreshadow-table">
+        <div class="foreshadow-row foreshadow-row-head">
+          <span>伏笔</span>
+          <span>状态</span>
+          <span>埋设章</span>
+          <span>计划回收</span>
+          <span>实际回收</span>
+          <span>依据 / 回收说明</span>
+          <span></span>
+        </div>
+        <div v-for="entry in foreshadows" :key="entry.id" class="foreshadow-row">
+          <input class="input" v-model="entry.title" maxlength="200" @change="saveForeshadow(entry)" />
+          <select class="input" v-model="entry.status" @change="saveForeshadow(entry)">
+            <option value="open">未回收</option>
+            <option value="resolved">已回收</option>
+            <option value="dropped">已放弃</option>
+          </select>
+          <input
+            class="input"
+            type="number"
+            min="1"
+            v-model.number="entry.planted_chapter"
+            @change="saveForeshadow(entry)"
+          />
+          <input
+            class="input"
+            type="number"
+            min="1"
+            v-model.number="entry.planned_chapter"
+            @change="saveForeshadow(entry)"
+          />
+          <input
+            class="input"
+            type="number"
+            min="1"
+            v-model.number="entry.resolved_chapter"
+            @change="saveForeshadow(entry)"
+          />
+          <div class="foreshadow-notes">
+            <input
+              class="input"
+              v-model="entry.evidence"
+              maxlength="500"
+              placeholder="依据 / 出处"
+              @change="saveForeshadow(entry)"
+            />
+            <input
+              v-if="entry.status === 'resolved'"
+              class="input"
+              v-model="entry.resolution"
+              maxlength="500"
+              placeholder="怎么收的"
+              @change="saveForeshadow(entry)"
+            />
+          </div>
+          <button
+            class="btn sm ghost"
+            :disabled="foreshadowBusy[entry.id]"
+            @click="removeForeshadow(entry)"
+          >删除</button>
+        </div>
+        <p v-if="!foreshadowLoading && !foreshadows.length" class="faint">
+          还没有伏笔。可以手动添加，或从剧情圣经导入旧伏笔。
+        </p>
+      </div>
+    </section>
+
     <div v-if="bible" class="bible">
       <div class="card-title" style="font-size: var(--fs-md)">
         剧情圣经（已落库）
@@ -2950,9 +4091,12 @@ onUnmounted(stopDistillPolling);
         <span class="k">冲突</span>
         <span class="v"><span v-for="c in bible.conflicts" :key="c" class="tag warn">{{ c }}</span></span>
       </div>
-      <div class="bible-row" v-if="bible.foreshadowing?.length">
+      <div class="bible-row" v-if="bible.foreshadowing?.length && !foreshadows.length">
         <span class="k">伏笔</span>
-        <span class="v"><span v-for="f in bible.foreshadowing" :key="f" class="tag">{{ f }}</span></span>
+        <span class="v">
+          <span v-for="f in bible.foreshadowing" :key="f" class="tag">{{ f }}</span>
+          <span v-if="foreshadowLegacy.length" class="faint">（旧字段，可在上方台账导入）</span>
+        </span>
       </div>
       <div v-if="bible.note" class="notice warn" style="margin-top: 12px">{{ bible.note }}</div>
       <div v-if="charEditReceipt" class="notice info" style="margin-top: 12px">
@@ -3237,6 +4381,267 @@ onUnmounted(stopDistillPolling);
       <div><span class="section-kicker">Production & proof</span><h2>生成与校样</h2></div>
       <span class="edition-mark">已归档 {{ generations.length }} 段</span>
     </div>
+
+    <!-- 写作执行看板：进度 + 风险，一屏看完再决定要不要开下一段。
+         数据全部复用本页已加载项，不额外请求。 -->
+    <section class="writing-board" aria-label="写作执行看板">
+      <div class="writing-board-metrics">
+        <div class="writing-kpi">
+          <span class="k">正文进度</span>
+          <strong>{{ writingBoard.segments }} 段</strong>
+          <span class="faint">下一段 #{{ writingBoard.nextSegment }}</span>
+        </div>
+        <div class="writing-kpi">
+          <span class="k">未回收伏笔</span>
+          <strong>{{ writingBoard.openForeshadows }} 条</strong>
+          <span class="faint">
+            KG 待登记 {{ writingBoard.kgImportable }}<template v-if="writingBoard.kgResolvable"> · 回收建议 {{ writingBoard.kgResolvable }}</template>
+          </span>
+        </div>
+        <div class="writing-kpi">
+          <span class="k">设定卡</span>
+          <strong>{{ writingBoard.cardsEnabled }} / {{ writingBoard.cardsTotal }}</strong>
+          <span class="faint">启用 / 总数</span>
+        </div>
+        <div class="writing-kpi">
+          <span class="k">文风档案</span>
+          <strong>{{ writingBoard.styleText }}</strong>
+          <span class="faint">{{ writingBoard.distillText || "生成时注入 system 提示" }}</span>
+        </div>
+      </div>
+      <div class="writing-board-risks">
+        <p class="writing-board-risk-head">
+          待处理
+          <span v-if="writingRisks.length" class="tag accent">{{ writingRisks.length }}</span>
+          <span v-else class="tag">0</span>
+        </p>
+        <ul v-if="writingRisks.length">
+          <li
+            v-for="(risk, index) in writingRisks"
+            :key="index"
+            :class="risk.severity === 'err' ? 'err' : 'warn'"
+          >{{ risk.text }}</li>
+        </ul>
+        <p v-else class="faint">暂无风险。</p>
+        <p class="writing-board-next">{{ writingNextStep }}</p>
+      </div>
+    </section>
+
+    <!-- 设定卡：作者亲手维护的人物/场景/道具，改动直接进入下一次生成。
+         三类各一组折叠，组内每张卡再折叠——卡片字段较多，不折叠会淹没控制台。 -->
+    <section class="story-cards-panel" aria-labelledby="story-cards-title">
+      <header class="story-cards-head">
+        <div>
+          <span class="control-kicker">Continuity cards</span>
+          <h3 id="story-cards-title">设定卡</h3>
+          <p class="story-cards-hint">
+            人物、势力、场景、道具、规则等设定会注入下一次生成；保存后立即生效，停用的卡片不参与生成。
+            角色卡保存或重新生成后会自动同步映射字段，你手改过的字段不会被覆盖。
+          </p>
+        </div>
+        <div class="story-cards-summary">
+          <span class="tag accent">启用 {{ enabledStoryCardCount }} / {{ storyCards.length }}</span>
+          <span v-if="storyCardsLoading || storyCardsSyncing" class="faint">
+            {{ storyCardsSyncing ? "同步中…" : "加载中…" }}
+          </span>
+          <button
+            class="btn sm ghost"
+            :disabled="storyCardsLoading || storyCardsSyncing"
+            @click="syncStoryCards(true)"
+          >同步已有设定</button>
+        </div>
+      </header>
+      <div v-if="storyCardsError" class="notice err">{{ storyCardsError }}</div>
+      <div v-else-if="storyCardsNotice" class="notice ok">{{ storyCardsNotice }}</div>
+
+      <details
+        v-for="group in storyCardGroups"
+        :key="group.kind"
+        class="card-group"
+        :open="storyCardGroupOpen[group.kind] ?? false"
+        @toggle="onStoryCardGroupToggle(group.kind, $event)"
+      >
+        <summary class="card-group-head">
+          <span class="card-group-title">{{ group.label }}</span>
+          <span class="card-group-count">{{ group.cards.length }}</span>
+        </summary>
+        <div class="card-group-body">
+          <p v-if="!group.cards.length" class="story-cards-empty">还没有{{ group.label }}。</p>
+          <details
+            v-for="card in group.cards"
+            :key="card.id"
+            class="story-card"
+            :class="{ disabled: !card.enabled }"
+            :open="storyCardOpen[card.id] ?? false"
+            @toggle="onStoryCardToggle(card, $event)"
+          >
+            <summary class="story-card-head">
+              <span class="story-card-title">{{ card.title || "未命名" }}</span>
+              <span v-if="!card.enabled" class="tag">已停用</span>
+            </summary>
+            <div class="story-card-body">
+              <label class="story-card-enable">
+                <input type="checkbox" v-model="card.enabled" @change="toggleStoryCard(card)" />
+                启用（参与下一次生成）
+              </label>
+              <p v-if="storyCardSummary(card)" class="story-card-summary">
+                {{ storyCardSummary(card) }}
+              </p>
+              <p v-else class="faint">还没有填写字段。</p>
+              <div class="story-card-actions">
+                <button class="btn sm" @click="openStoryCardEditor(card)">编辑这张卡</button>
+                <button class="btn sm ghost" @click="removeStoryCard(card)">删除这张卡</button>
+              </div>
+            </div>
+          </details>
+          <button
+            class="btn sm ghost"
+            :disabled="storyCardAdding[group.kind]"
+            @click="addStoryCard(group.kind)"
+          >{{ storyCardAdding[group.kind] ? "新增中…" : `+ 新增${group.label}` }}</button>
+        </div>
+      </details>
+    </section>
+
+    <!-- 设定卡编辑：居中模态卡片，保存后自动关闭。 -->
+    <div v-if="storyCardEditing" class="bible-modal-mask" @click.self="closeStoryCardEditor">
+      <div
+        ref="storyCardModalEl"
+        class="bible-modal story-card-edit-modal"
+        role="dialog"
+        aria-modal="true"
+        :style="storyCardModalStyle"
+      >
+        <div class="card-title">
+          编辑{{ storyCardGroupLabel(storyCardEditing.kind) }}
+          <span class="hint">{{ storyCardEditing.title || "未命名" }}</span>
+        </div>
+
+        <label class="story-card-enable">
+          <input type="checkbox" v-model="storyCardDraft.enabled" />
+          启用（参与下一次生成）
+        </label>
+        <label class="field card-field" style="margin-top: 10px">
+          <span>名称</span>
+          <input class="input" v-model="storyCardDraft.title" maxlength="80" />
+        </label>
+
+        <!-- 引用：从另一张卡复制字段内容。一次性复制，不与来源同步。 -->
+        <div class="card-ref">
+          <button
+            v-if="refPanelCardId !== storyCardEditing.id"
+            class="btn sm ghost"
+            :disabled="storyCards.length < 2"
+            @click="openCardRef(storyCardEditing)"
+          >引用其他卡片…</button>
+          <div v-else class="card-ref-panel">
+            <p class="card-ref-hint">
+              从其他卡片复制一个字段的内容。复制后两张卡各自独立，修改来源不会影响本卡。
+            </p>
+            <div class="card-ref-grid">
+              <label class="field">
+                <span>来源卡片</span>
+                <select class="input" v-model.number="refSourceCardId" @change="onRefSourceChange">
+                  <option :value="null">选择卡片…</option>
+                  <option v-for="src in refSourceCards" :key="src.id" :value="src.id">
+                    {{ storyCardGroupLabel(src.kind) }} · {{ src.title || "未命名" }}{{ src.enabled ? "" : "（已停用）" }}
+                  </option>
+                </select>
+              </label>
+              <label class="field">
+                <span>来源字段</span>
+                <select class="input" v-model="refSourceFieldKey">
+                  <option value="">选择字段…</option>
+                  <option v-for="item in refSourceFields" :key="item.key" :value="item.key">
+                    {{ item.label }}
+                  </option>
+                </select>
+              </label>
+              <label class="field">
+                <span>写入本卡字段</span>
+                <select class="input" v-model="refTargetFieldKey">
+                  <option v-for="item in refTargetFields" :key="item.key" :value="item.key">
+                    {{ item.label }}
+                  </option>
+                </select>
+              </label>
+            </div>
+            <div class="card-ref-preview">
+              <span class="faint">内容预览</span>
+              <p>{{ refPreview || "（该字段为空）" }}</p>
+            </div>
+            <div class="card-ref-actions">
+              <button class="btn sm" :disabled="!canApplyRef" @click="applyCardRef()">
+                复制到此字段
+              </button>
+              <button class="btn sm ghost" @click="closeCardRef">取消</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 自定义卡：字段名由用户自拟；固定类型按后端 FIELD_SCHEMA 渲染。 -->
+        <template v-if="storyCardEditing.kind === 'custom'">
+          <div class="custom-field-list">
+            <div
+              v-for="(row, rowIndex) in storyCardDraft.rows"
+              :key="rowIndex"
+              class="custom-field-row"
+            >
+              <input
+                class="input custom-field-name"
+                v-model="row.name"
+                maxlength="30"
+                placeholder="字段名，如：种族"
+              />
+              <textarea class="input" rows="2" maxlength="1000" placeholder="内容" v-model="row.value" />
+              <button class="btn sm ghost" @click="removeStoryCardDraftRow(rowIndex)">移除</button>
+            </div>
+          </div>
+          <button class="btn sm ghost" @click="addStoryCardDraftRow">+ 添加字段</button>
+        </template>
+        <div v-else class="card-field-grid">
+          <label
+            v-for="spec in fieldSpecsFor(storyCardEditing.kind)"
+            :key="spec.key"
+            class="field card-field"
+            :class="{ wide: spec.multiline }"
+          >
+            <span>{{ spec.label }}</span>
+            <textarea
+              v-if="spec.multiline"
+              class="input"
+              rows="2"
+              :maxlength="spec.max_chars || 1000"
+              :placeholder="spec.hint || ''"
+              v-model="storyCardDraft.fields[spec.key]"
+            />
+            <input
+              v-else
+              class="input"
+              :maxlength="spec.max_chars || 200"
+              :placeholder="spec.hint || ''"
+              v-model="storyCardDraft.fields[spec.key]"
+            />
+          </label>
+        </div>
+
+        <div v-if="storyCardEditError" class="notice err" style="margin-top: 12px">
+          {{ storyCardEditError }}
+        </div>
+        <div class="row" style="margin-top: var(--gap); justify-content: flex-end">
+          <button class="btn ghost" @click="closeStoryCardEditor">取消</button>
+          <button class="btn primary" :disabled="storyCardEditBusy" @click="saveStoryCardDraft">
+            {{ storyCardEditBusy ? "保存中…" : "保存" }}
+          </button>
+        </div>
+        <span
+          class="modal-resize-handle"
+          title="拖动调整大小"
+          @pointerdown="startStoryCardResize"
+        />
+      </div>
+    </div>
+
     <div class="production-grid">
       <div class="production-controls">
         <span class="control-kicker">印刷控制</span>
@@ -3454,14 +4859,36 @@ onUnmounted(stopDistillPolling);
               }}
             </span>
           </template>
-          <span v-else-if="priorLoading" class="prior-stat faint">读取中…</span>
+          <span v-else-if="priorLoading" class="prior-stat prior-wait">
+            <span class="spinner" aria-hidden="true" />{{ priorWaitText }}
+          </span>
+          <span v-else-if="priorErr" class="prior-stat prior-err">读取失败</span>
           <span v-else class="prior-stat faint">点开看看这次到底喂了什么给模型</span>
         </button>
-        <button class="prior-refresh" :disabled="priorLoading" @click="loadPlan">刷新</button>
+        <button class="prior-refresh" :disabled="priorLoading" @click="loadPlan">
+          {{ priorLoading ? "读取中…" : priorErr ? "重试" : "刷新" }}
+        </button>
       </div>
 
       <div v-if="priorOpen" class="prior-body">
-        <div v-if="priorErr" class="notice err">{{ priorErr }}</div>
+        <div v-if="priorErr" class="notice err prior-error">
+          <span>{{ priorErr }}</span>
+          <button class="btn sm" :disabled="priorLoading" @click="loadPlan">重试</button>
+        </div>
+
+        <!-- 首次读取：说明这一步在干什么 + 骨架占位，而不是留一片空白 -->
+        <div v-else-if="priorLoading && !plan" class="prior-loading" role="status">
+          <span class="spinner" aria-hidden="true" />
+          <div class="prior-loading-text">
+            <b>正在组装这次要注入的前情</b>
+            <p class="faint">要读全部段落摘要并按层压缩，通常十几秒。</p>
+          </div>
+          <div class="skeleton-lines" aria-hidden="true">
+            <span style="width: 92%" />
+            <span style="width: 78%" />
+            <span style="width: 86%" />
+          </div>
+        </div>
 
         <template v-else-if="plan">
           <!-- 问题清单：有洞/退化/超预算/丢卷，全部摆明 -->
@@ -3684,23 +5111,29 @@ onUnmounted(stopDistillPolling);
         <span class="tag info">零 LLM 规则判定（只标红，不改正文）</span>
       </div>
 
-      <div v-if="alertView" class="list">
-        <div v-for="(a, i) in alertView.items" :key="i" class="notice err">
-          <b>第 {{ a.segment_no }} 段 · <span class="mono">{{ a.entity }}</span> · {{ a.rule }}</b>
-          <div style="margin-top: 4px">{{ a.message }}</div>
-          <div v-if="a.proof" class="faint" style="margin-top: 4px">
-            依据：{{ a.proof }}
+      <div v-if="alertView" class="conflict-list">
+        <article v-for="(a, i) in alertView.items" :key="i" class="conflict-item">
+          <div class="conflict-head">
+            <span class="conflict-seg">第 {{ a.segment_no }} 段</span>
+            <span class="conflict-entity">{{ a.entity }}</span>
+            <span class="conflict-rule mono">{{ a.rule }}</span>
           </div>
-        </div>
+          <p class="conflict-message">{{ a.message }}</p>
+          <p v-if="a.proof" class="conflict-proof">依据：{{ a.proof }}</p>
+        </article>
       </div>
 
-      <!-- 未生效的规则必须显式列出来：否则「没告警」会被读成「都检查过了」 -->
-      <div v-if="inactiveRules.length" class="notice warn">
-        以下规则<b>当前不参与判定</b>，别把「没告警」读成「没问题」：
-        <div v-for="r in inactiveRules" :key="r.name" style="margin-top: 4px">
+      <!-- 未生效的规则必须显式列出来：否则「没告警」会被读成「都检查过了」。
+           默认折叠：它是「别误读」的说明，不是待办事项，不该和错误抢版面。 -->
+      <details v-if="inactiveRules.length" class="conflict-inactive">
+        <summary>
+          以下 {{ inactiveRules.length }} 条规则当前不参与判定
+          <span class="faint">（别把「没告警」读成「没问题」）</span>
+        </summary>
+        <div v-for="r in inactiveRules" :key="r.name" class="conflict-inactive-row">
           <b class="mono">{{ r.name }}</b> —— {{ r.note }}
         </div>
-      </div>
+      </details>
       <div v-else-if="alertsErr" class="faint" style="font-size: var(--fs-xs)">
         告警未取到（{{ alertsErr }}）——不影响生成。
       </div>
@@ -3740,6 +5173,13 @@ onUnmounted(stopDistillPolling);
           <div class="row tight" style="width: 100%">
             <span class="tag accent mono" style="flex: none">第 {{ g.segment_no }} 段</span>
             <span class="faint mono" style="font-size: var(--fs-xs)">#{{ g.id }}</span>
+            <span class="faint seg-meta">{{ (g.text || "").length }} 字</span>
+            <span
+              v-if="segmentSaved[g.id]"
+              class="tag"
+              :class="segmentSaved[g.id].ok ? 'ok' : 'warn'"
+              :title="segmentSaved[g.id].text"
+            >已保存</span>
             <span style="flex: 1"></span>
             <button
               class="btn sm"
@@ -3755,6 +5195,14 @@ onUnmounted(stopDistillPolling);
             >
               {{ localRewrites[g.id]?.open ? "收起局部改写" : "局部改写" }}
             </button>
+            <button
+              class="btn sm"
+              :class="{ primary: segmentEdits[g.id] }"
+              :disabled="regenState[g.id]?.loading || streaming"
+              @click="toggleSegmentEdit(g)"
+            >
+              {{ segmentEdits[g.id] ? "收起编辑" : "编辑" }}
+            </button>
             <button class="btn sm" @click="toggleSeg(g.id)">
               {{ expandedSegs[g.id] ? "收起" : "展开" }}
             </button>
@@ -3764,11 +5212,60 @@ onUnmounted(stopDistillPolling);
             class="prose live-box"
             style="width: 100%"
           >{{ regenState[g.id]?.text }}</div>
+          <!-- 手动改正文：直接改字并保存回 generations.text（不调模型） -->
+          <div
+            v-else-if="segmentEdits[g.id]"
+            class="seg-editor"
+          >
+            <textarea
+              v-model="segmentEdits[g.id].text"
+              class="input seg-edit-input"
+              rows="10"
+              :disabled="segmentEdits[g.id].busy"
+              placeholder="在这里直接修改正文…"
+              @keydown="onSegmentEditKey($event, g)"
+            ></textarea>
+            <div class="row tight" style="width: 100%; align-items: center">
+              <button
+                class="btn primary sm"
+                :disabled="segmentEdits[g.id].busy || !segmentEdits[g.id].text.trim()"
+                @click="saveSegmentEdit(g)"
+              >
+                {{ segmentEdits[g.id].busy ? "保存中…" : "保存" }}
+              </button>
+              <button
+                class="btn ghost sm"
+                :disabled="segmentEdits[g.id].busy"
+                @click="toggleSegmentEdit(g)"
+              >
+                取消
+              </button>
+              <span class="faint" style="font-size: var(--fs-xs)">
+                {{ segmentEdits[g.id].text.length }} 字
+              </span>
+              <span style="flex: 1"></span>
+              <span class="faint" style="font-size: var(--fs-xs)">Ctrl/⌘ + Enter 保存</span>
+            </div>
+            <p v-if="segmentEdits[g.id].error" class="notice err" style="width: 100%">
+              {{ segmentEdits[g.id].error }}
+            </p>
+            <p class="faint seg-edit-hint">
+              保存会重算剧情总结、L1/L2/L3 摘要树并重建图谱，可能需要一会儿；
+              复读 / 文风结论会标记为「未检测」。
+            </p>
+          </div>
           <div
             v-else
             class="prose seg-text"
             :class="{ expanded: expandedSegs[g.id] }"
           >{{ g.text }}</div>
+          <p
+            v-if="segmentSaved[g.id]"
+            class="seg-save-note"
+            :class="{ bad: !segmentSaved[g.id].ok }"
+          >
+            {{ segmentSaved[g.id].text }}
+          </p>
 
           <!-- 局部改写：含糊指令 → 202 候选 → 用户点选 / 都不对 -->
           <div
@@ -4225,6 +5722,7 @@ onUnmounted(stopDistillPolling);
       @update:cutoffs="saveRoleplayCutoffs"
     />
   </section>
+  </div>
   </template>
 
   <!-- ===== 回滚二次确认（唯一的请求发起点；关掉就没有别的路径能回滚） ===== -->
@@ -4358,6 +5856,7 @@ onUnmounted(stopDistillPolling);
       </div>
     </div>
   </div>
+  </div>
 </template>
 
 <style scoped>
@@ -4466,7 +5965,7 @@ onUnmounted(stopDistillPolling);
 .step.done .num { color: var(--fg); }
 /* ---------- 蒸馏进度（跨步骤常驻） ---------- */
 /* 步骤①上的小徽标：蒸馏在后台跑时，用户跳到别的步骤也能一眼看到
-   「还在跑」。**文字在前**（"蒸馏中"），圆点只是冗余强化 —— 灰度/色弱下
+   「还在跑」。**文字在前**（"提炼中"），圆点只是冗余强化 —— 灰度/色弱下
    照样读得出来，不靠颜色单打独斗。 */
 .step-distill {
   display: inline-flex;
@@ -4784,6 +6283,95 @@ onUnmounted(stopDistillPolling);
 .section-kicker, .control-kicker, .proof-kicker { color: var(--accent-ink); font-size: 10px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
 .generation-heading h2 { margin-top: 4px; font-family: var(--font-display); font-size: 28px; font-weight: 600; }
 .edition-mark { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; }
+
+/* ---------- 写作执行看板 ---------- */
+.writing-board { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; margin-bottom: 20px; padding: 14px 16px; border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--bg-elev); }
+.writing-board-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.writing-kpi { display: flex; flex-direction: column; gap: 2px; }
+.writing-kpi .k { color: var(--fg-muted); font-size: var(--fs-xs); }
+.writing-kpi strong { font-family: var(--font-display); font-size: 22px; font-weight: 600; line-height: 1.2; }
+.writing-kpi .faint { font-size: var(--fs-xs); }
+.writing-board-risks { min-width: 0; border-left: 1px solid var(--border); padding-left: 16px; }
+.writing-board-risk-head { display: flex; align-items: center; gap: 8px; font-size: var(--fs-xs); font-weight: 600; }
+.writing-board-risks ul { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-xs); line-height: 1.6; }
+.writing-board-risks li.err { color: var(--danger, #b42318); }
+.writing-board-risks li.warn { color: var(--fg-muted); }
+.writing-board-next { margin-top: 8px; font-size: var(--fs-xs); color: var(--fg-muted); }
+@media (max-width: 960px) {
+  .writing-board { grid-template-columns: 1fr; }
+  .writing-board-risks { border-left: 0; padding-left: 0; border-top: 1px solid var(--border); padding-top: 10px; }
+}
+
+/* ---------- 设定卡（人物 / 场景 / 道具） ---------- */
+.author-panel { margin-bottom: 24px; padding: 18px 20px 20px; border: 1px solid var(--border); background: var(--bg-elev); }
+.author-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 14px; }
+.author-panel-head h3 { font-family: var(--font-display); font-size: 20px; font-weight: 600; }
+.author-panel-hint { margin-top: 6px; max-width: 68ch; color: var(--fg-muted); font-size: var(--fs-xs); line-height: 1.7; }
+.author-panel-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.world-list { margin-top: 12px; }
+.world-list-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; font-size: var(--fs-sm); color: var(--fg-muted); }
+.world-list-row { display: flex; gap: 8px; margin-bottom: 6px; }
+.world-list-row .input { flex: 1; }
+.world-suggestion { margin-top: 14px; padding: 12px 14px; border: 1px dashed var(--border); background: var(--bg); }
+.world-suggestion-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.world-suggestion p { margin: 4px 0; font-size: var(--fs-sm); }
+.world-suggestion .k { margin-right: 8px; color: var(--fg-muted); }
+.foreshadow-table { margin-top: 8px; overflow-x: auto; }
+.foreshadow-row { display: grid; grid-template-columns: minmax(160px, 1.4fr) 96px 76px 84px 84px minmax(200px, 1.6fr) 64px; gap: 8px; align-items: start; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.foreshadow-row-head { font-size: var(--fs-xs); color: var(--fg-muted); }
+.foreshadow-notes { display: flex; flex-direction: column; gap: 6px; }
+.foreshadow-kg-suggest { margin-top: 8px; padding: 8px 10px; border: 1px dashed var(--border); border-radius: 8px; }
+.foreshadow-kg-suggest p { margin: 0 0 4px; }
+.foreshadow-kg-suggest-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 0; }
+.foreshadow-kg-title { font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.story-cards-panel { margin-bottom: 24px; padding: 18px 20px 20px; border: 1px solid var(--border); border-top: 2px solid var(--accent); background: var(--bg-elev); }
+.story-cards-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.story-cards-head h3 { margin-top: 4px; font-family: var(--font-display); font-size: 22px; font-weight: 600; }
+.story-cards-hint { margin-top: 6px; max-width: 72ch; color: var(--fg-muted); font-size: var(--fs-xs); line-height: 1.7; }
+.story-cards-summary { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+.card-group { margin-top: 14px; border-top: 1px solid var(--border); }
+.card-group-head { display: flex; align-items: center; gap: 10px; padding: 12px 2px; cursor: pointer; list-style: none; }
+.card-group-head::-webkit-details-marker { display: none; }
+.card-group-head::before { content: "▸"; display: inline-block; color: var(--accent-ink); font-size: 11px; transition: transform 160ms var(--ease-out-quart); }
+.card-group[open] > .card-group-head::before { transform: rotate(90deg); }
+.card-group-title { font-weight: 700; font-size: var(--fs-sm); }
+.card-group-count { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; }
+.card-group-body { display: flex; flex-direction: column; gap: 8px; padding: 0 0 14px 18px; }
+.story-cards-empty { color: var(--fg-muted); font-size: var(--fs-xs); }
+.story-card { border: 1px solid var(--border); background: var(--bg); }
+.story-card.disabled { opacity: .62; }
+.story-card-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; list-style: none; }
+.story-card-head::-webkit-details-marker { display: none; }
+.story-card-head::before { content: "▸"; display: inline-block; color: var(--accent-ink); font-size: 10px; transition: transform 160ms var(--ease-out-quart); }
+.story-card[open] > .story-card-head::before { transform: rotate(90deg); }
+.story-card-title { font-weight: 600; }
+.story-card-body { padding: 4px 12px 14px; border-top: 1px dashed var(--border); }
+.story-card-enable { display: flex; align-items: center; gap: 8px; margin: 10px 0 12px; color: var(--fg-muted); font-size: var(--fs-xs); cursor: pointer; }
+.card-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-top: 10px; }
+.card-field-grid .card-field.wide { grid-column: 1 / -1; }
+.card-field textarea.input { min-height: 58px; resize: vertical; line-height: 1.6; }
+.custom-field-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.custom-field-row { display: grid; grid-template-columns: 168px minmax(0, 1fr) auto; gap: 8px; align-items: start; }
+.custom-field-row textarea.input { min-height: 52px; resize: vertical; line-height: 1.6; }
+.card-ref { margin-top: 6px; }
+.card-ref-panel { margin-top: 8px; padding: 12px; border: 1px dashed var(--border-strong); background: var(--bg-elev); }
+.card-ref-hint { margin-bottom: 10px; color: var(--fg-muted); font-size: var(--fs-xs); line-height: 1.6; }
+.card-ref-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.card-ref-preview { margin-top: 10px; }
+.card-ref-preview p { margin-top: 4px; max-height: 96px; overflow: auto; padding: 8px 10px; border: 1px solid var(--border); background: var(--bg); font-size: var(--fs-xs); line-height: 1.7; white-space: pre-wrap; }
+.card-ref-actions { display: flex; gap: 8px; margin-top: 10px; }
+.story-card-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+.story-card-summary { margin-top: 10px; color: var(--fg-muted); font-size: var(--fs-xs); line-height: 1.7; }
+.story-card-edit-modal { position: relative; width: min(760px, 100%); max-height: 86vh; overflow: auto; }
+@media (max-width: 900px) {
+  .card-field-grid { grid-template-columns: 1fr; }
+  .custom-field-row { grid-template-columns: 1fr; }
+  .card-ref-grid { grid-template-columns: 1fr; }
+  .story-cards-head { flex-direction: column; }
+  .author-panel-head { flex-direction: column; }
+  .foreshadow-row { grid-template-columns: 1fr; }
+}
+
 .production-grid { display: grid; grid-template-columns: 282px minmax(0, 1fr); gap: 24px; align-items: start; }
 .production-controls { min-width: 0; padding: 20px; border: 1px solid var(--border); border-top: 2px solid var(--accent); background: var(--bg-elev); }
 .generation-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 18px; }
@@ -4800,7 +6388,18 @@ onUnmounted(stopDistillPolling);
 .proof-count { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
 .proof-status { display: flex; align-items: center; gap: 8px; padding: 9px 24px; border-bottom: 1px solid var(--accent-line); background: var(--accent-soft); color: var(--accent-ink); font-size: var(--fs-xs); }
 .proof-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: proof-pulse 1.4s ease-in-out infinite; }
-.manuscript-stage .proof-text { flex: 1; width: 100%; max-width: 76ch; max-height: min(62vh, 680px); padding: 26px 32px 32px 46px; background: transparent; border-radius: 0; font-size: 17px; line-height: 2.1; letter-spacing: .015em; }
+.manuscript-stage .proof-text { flex: 1; width: 100%; max-width: 76ch; max-height: min(62vh, 680px); padding: 26px 32px 32px 46px; background: transparent; border-radius: 0; font-size: 17px; line-height: 2.1; letter-spacing: .015em;
+  /* 卡片里不再套一层滚动框：折叠时靠底部渐隐截断，展开后整段交给页面滚动 */
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 90%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 90%, transparent 100%);
+}
+.manuscript-stage .proof-text.expanded {
+  max-height: none;
+  overflow: visible;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
 .proof-empty { flex: 1; min-height: 330px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 32px; text-align: center; }
 .proof-empty strong { font-family: var(--font-display); font-size: 24px; }
 .proof-empty p { margin: 0 0 8px; color: var(--fg-muted); font-size: var(--fs-sm); }
@@ -4831,13 +6430,131 @@ onUnmounted(stopDistillPolling);
 }
 .seg-text {
   width: 100%;
-  max-height: min(46vh, 560px);
-  overflow: auto;
+  /* 折叠时只露约 6 行，用渐隐提示「下面还有」；不再给每段一个独立滚动条 */
+  max-height: 13em;
+  overflow: hidden;
+  position: relative;
   background: var(--bg-sunken);
   border-radius: var(--radius-md);
   padding: 16px 18px;
   line-height: 2;
   font-size: var(--fs-md);
+}
+.seg-text.expanded {
+  max-height: none;
+  overflow: visible;
+}
+.generation-history .seg-text::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3.2em;
+  background: linear-gradient(to bottom, transparent, var(--bg-elev));
+  pointer-events: none;
+}
+.generation-history .seg-text.expanded::after {
+  display: none;
+}
+.seg-meta {
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+/* 手动改正文：编辑区占满整行，长文可纵向拉伸 */
+.seg-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.seg-edit-input {
+  width: 100%;
+  min-height: 220px;
+  max-height: 62vh;
+  resize: vertical;
+  line-height: 1.85;
+}
+.seg-edit-hint {
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+}
+.seg-save-note {
+  margin: 0;
+  width: 100%;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--ok);
+}
+.seg-save-note.bad {
+  color: var(--warn);
+}
+
+/* ---------- 硬冲突检查：左侧色条 + 一行摘要，不用整块红底压字 ---------- */
+.conflict-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.conflict-item {
+  padding: 12px 14px 12px 16px;
+  border: var(--border-w) solid var(--border);
+  border-left: 3px solid var(--danger);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+}
+.conflict-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+.conflict-seg {
+  color: var(--danger);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+}
+.conflict-entity {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.conflict-rule {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  color: var(--fg-faint);
+  font-size: 11px;
+}
+.conflict-message {
+  margin: 6px 0 0;
+  color: var(--fg);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+.conflict-proof {
+  margin: 4px 0 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+}
+.conflict-inactive {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.7;
+}
+.conflict-inactive summary {
+  cursor: pointer;
+  color: var(--warn);
+  font-weight: 600;
+}
+.conflict-inactive-row {
+  margin-top: 6px;
 }
 .local-rewrite {
   width: 100%;
@@ -4957,6 +6674,71 @@ onUnmounted(stopDistillPolling);
 }
 .prior-stat {
   font-size: var(--fs-xs);
+}
+.prior-stat.prior-err {
+  color: var(--danger);
+}
+/* 读取中的一行字：转圈 + 秒数，长等待时换成「仍在组装」的措辞 */
+.prior-stat.prior-wait {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-muted);
+}
+.prior-loading {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 6px 0 2px;
+}
+.prior-loading-text {
+  flex: 1 1 240px;
+  min-width: 0;
+  font-size: var(--fs-sm);
+}
+.prior-loading-text p {
+  margin: 2px 0 0;
+  font-size: var(--fs-xs);
+}
+.skeleton-lines {
+  flex: 1 1 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.skeleton-lines span {
+  height: 10px;
+  border-radius: var(--radius-full);
+  background: linear-gradient(
+    90deg,
+    var(--bg-sunken) 0%,
+    var(--border) 50%,
+    var(--bg-sunken) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s linear infinite;
+}
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-lines span {
+    animation: none;
+  }
+}
+.prior-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 .prior-refresh {
   font: inherit;
@@ -5209,5 +6991,61 @@ onUnmounted(stopDistillPolling);
   .manuscript-stage .proof-text { padding: 22px; }
   .prior-table td:last-child,
   .prior-table th:last-child { display: none; }
+}
+
+/*
+ * 宽屏一屏布局：抬头 + 步骤指示器 + 角色对话开关固定，步骤内容内部滚动。
+ * 高度 = 视口 − 顶栏 60px − .main 上下内边距（默认 30 + 56）。
+ * 窄屏不锁定高度，保持页面自然滚动。
+ */
+@media (min-width: 881px) {
+  .workspace-page {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 146px);
+    height: calc(100dvh - 146px);
+    min-height: 520px;
+  }
+  .workspace-page > .page-head,
+  .workspace-page > .notice,
+  .workspace-page > .stepper,
+  .workspace-page > .row,
+  .workspace-page > .workspace-loading,
+  .workspace-page > .state-panel {
+    flex: none;
+  }
+  .workspace-page > .page-head {
+    margin-bottom: 10px;
+  }
+  /* 抬头与步骤条收紧：一屏里把高度尽量让给步骤内容 */
+  .workspace-head {
+    padding-bottom: 12px;
+  }
+  .workspace-head .title-click {
+    font-size: 30px;
+  }
+  .stepper {
+    margin-bottom: 12px;
+  }
+  .workspace-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 6px;
+    padding-bottom: 8px;
+  }
+}
+@media (min-width: 881px) and (max-width: 1100px) {
+  /* .main 内边距变成 26 + 48 */
+  .workspace-page {
+    height: calc(100vh - 134px);
+    height: calc(100dvh - 134px);
+  }
+}
+/* 常规笔记本高度优先保步骤内容：抬头说明文字让位 */
+@media (min-width: 881px) and (max-height: 900px) {
+  .workspace-head > p {
+    display: none;
+  }
 }
 </style>
