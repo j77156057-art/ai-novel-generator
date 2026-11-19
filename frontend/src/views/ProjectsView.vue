@@ -227,7 +227,7 @@ function formatIndex(index: number) {
 .project-ledger { min-width: 0; }
 .project-card { min-width: 0; border-bottom: 1px solid var(--border); transition: background 180ms var(--ease-out-quart); }
 .project-card:not(.featured):hover { background: var(--bg-elev); }
-.project-card-link { min-width: 0; display: grid; grid-template-columns: 54px minmax(0, 1fr) 70px; gap: 16px; align-items: center; padding: 20px 0 12px; }
+.project-card-link { min-width: 0; display: grid; grid-template-columns: 54px minmax(0, 1fr) 70px; gap: 16px; align-items: center; padding: 16px 0 10px; }
 .project-card-link:focus-visible { outline-offset: 3px; }
 .project-number { align-self: start; padding-top: 3px; color: var(--fg-faint); font-family: Georgia, serif; font-size: 25px; line-height: 1; font-variant-numeric: tabular-nums; }
 .project-main { min-width: 0; }
@@ -277,7 +277,9 @@ function formatIndex(index: number) {
 }
 @media (max-width: 940px) {
   .projects-layout { grid-template-columns: 1fr; }
-  .project-rail { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  /* 窄屏时把「开一部新书 + 概览」提到目录前面：否则新建入口要滚过
+     全部项目卡片才看得到，首次进入几乎找不到。 */
+  .project-rail { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; order: -1; }
 }
 @media (max-width: 720px) {
   .project-head { align-items: flex-start; flex-direction: column; }

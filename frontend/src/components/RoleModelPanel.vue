@@ -449,7 +449,7 @@ function submitTest(): void {
           该角色不支持改写超时，此处显示生效值。
         </span>
         <span v-else-if="role === 'distiller'" class="faint limit-note">
-          蒸馏是长任务：语料越多越慢，建议 ≥180s。
+          提炼是长任务：语料越多越慢，建议 ≥180s。
         </span>
       </div>
     </div>

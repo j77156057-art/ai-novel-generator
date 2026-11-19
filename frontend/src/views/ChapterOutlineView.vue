@@ -1,4 +1,5 @@
 <script setup lang="ts">
+defineOptions({ name: "ChapterOutlineView" });
 /**
  * 章纲写入/编辑独立页（/projects/:id/outline）。
  *
@@ -7,7 +8,7 @@
  * 2. **写入必须人工确认**：单章保存与草稿应用都要勾选确认，AI 起草只出候选；
  * 3. **不许静默**：校验错误带命中词与原文位置，checks / skipped_checks 原样列出。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onActivated, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ApiError, api } from "@/api/client";
 import type {
@@ -218,7 +219,22 @@ function afterWrite(res: ChapterOutlineWriteResponse, what: string) {
   void load();
 }
 
+// 逐章默认折叠：47 章全展开会变成一整面「文字墙」，先给一行摘要让人扫读，
+// 需要看全文或编辑时再展开。编辑时自动展开对应章。
+const openChapters = reactive<Record<number, boolean>>({});
+
+function onChapterToggle(chapter: number, event: Event) {
+  openChapters[chapter] = (event.target as HTMLDetailsElement).open;
+}
+
+function chapterPreview(entry: ChapterOutlineEntry): string {
+  const text = (entry.entry ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "（未填写章纲）";
+  return text.length > 46 ? text.slice(0, 46) + "…" : text;
+}
+
 function startEdit(entry: ChapterOutlineEntry) {
+  openChapters[entry.chapter] = true;
   editing.value = { chapter: entry.chapter, text: entry.entry ?? "", confirm: false };
   report.value = null;
 }
@@ -337,9 +353,21 @@ async function applyDraft() {
 }
 
 onMounted(load);
+
+// keep-alive 回来时重拉一次章纲：助手可能刚改过。正在编辑就不动，
+// 避免把用户没保存的输入冲掉。
+let outlineActivated = false;
+onActivated(() => {
+  if (!outlineActivated) {
+    outlineActivated = true;
+    return;
+  }
+  if (!editing.value) void load();
+});
 </script>
 
 <template>
+  <div class="outline-page">
   <header class="page-head">
     <div class="eyebrow">02 · 项目</div>
     <h1>
@@ -357,6 +385,7 @@ onMounted(load);
     </div>
   </header>
 
+  <div class="outline-scroll">
   <p v-if="flash" class="flash" :class="flash.kind" role="status" aria-live="polite">
     {{ flash.text }}
   </p>
@@ -439,55 +468,66 @@ onMounted(load);
     <section class="card">
       <div class="card-title">逐章章纲</div>
       <div v-if="!data.entries.length" class="empty">这个区间没有章节。</div>
-      <div v-for="entry in data.entries" :key="entry.chapter" class="chapter-row">
-        <div class="chapter-head">
-          <strong>第 {{ entry.chapter }} 章</strong>
-          <span class="tag" :class="statusClass(entry)">{{ statusLabel(entry) }}</span>
-          <span v-if="entry.written" class="tag info">正文已写</span>
-          <span v-if="entry.node_id" class="faint mono">
-            节点 {{ entry.node_id }}
-            <template v-if="entry.node_range">
-              · 第 {{ entry.node_range[0] }}–{{ entry.node_range[1] }} 章
-            </template>
-          </span>
-          <span class="row-spacer"></span>
-          <button type="button" class="btn ghost sm" @click="startEdit(entry)">编辑</button>
-          <button
-            type="button"
-            class="btn ghost sm"
-            :disabled="!entry.entry"
-            @click="markMissing(entry)"
-          >
-            标记缺失
-          </button>
-        </div>
-        <p v-if="entry.entry" class="chapter-text">{{ entry.entry }}</p>
-        <p v-else class="chapter-text absent">
-          {{ statusLabel(entry) }}：第 {{ entry.chapter }} 章没有章纲文本。
-        </p>
-
-        <div v-if="editing && editing.chapter === entry.chapter" class="editor">
-          <textarea v-model="editing.text" class="input" rows="4"></textarea>
-          <p class="hint">
-            空文本不能保存；要缺省请用「标记缺失」。保存时会重新校验章号、时间窗与权威物件。
-          </p>
-          <label class="check-line">
-            <input v-model="editing.confirm" type="checkbox" />
-            我已核对，确认写入第 {{ entry.chapter }} 章
-          </label>
-          <div class="actions">
+      <details
+        v-for="entry in data.entries"
+        :key="entry.chapter"
+        class="chapter-row"
+        :open="!!openChapters[entry.chapter]"
+        @toggle="onChapterToggle(entry.chapter, $event)"
+      >
+        <summary class="chapter-head">
+          <span class="chapter-head-line">
+            <strong>第 {{ entry.chapter }} 章</strong>
+            <span class="tag" :class="statusClass(entry)">{{ statusLabel(entry) }}</span>
+            <span v-if="entry.written" class="tag info">正文已写</span>
+            <span v-if="entry.node_id" class="faint mono">
+              节点 {{ entry.node_id }}
+              <template v-if="entry.node_range">
+                · 第 {{ entry.node_range[0] }}–{{ entry.node_range[1] }} 章
+              </template>
+            </span>
+            <span class="row-spacer"></span>
+            <button type="button" class="btn ghost sm" @click.prevent.stop="startEdit(entry)">编辑</button>
             <button
               type="button"
-              class="btn primary sm"
-              :disabled="saving || !editing.text.trim() || !editing.confirm"
-              @click="saveEdit"
+              class="btn ghost sm"
+              :disabled="!entry.entry"
+              @click.prevent.stop="markMissing(entry)"
             >
-              {{ saving ? "保存中…" : "保存" }}
+              标记缺失
             </button>
-            <button type="button" class="btn ghost sm" @click="editing = null">取消</button>
+          </span>
+          <span class="chapter-preview">{{ chapterPreview(entry) }}</span>
+        </summary>
+        <div class="chapter-body">
+          <p v-if="entry.entry" class="chapter-text">{{ entry.entry }}</p>
+          <p v-else class="chapter-text absent">
+            {{ statusLabel(entry) }}：第 {{ entry.chapter }} 章没有章纲文本。
+          </p>
+
+          <div v-if="editing && editing.chapter === entry.chapter" class="editor">
+            <textarea v-model="editing.text" class="input" rows="4"></textarea>
+            <p class="hint">
+              空文本不能保存；要缺省请用「标记缺失」。保存时会重新校验章号、时间窗与权威物件。
+            </p>
+            <label class="check-line">
+              <input v-model="editing.confirm" type="checkbox" />
+              我已核对，确认写入第 {{ entry.chapter }} 章
+            </label>
+            <div class="actions">
+              <button
+                type="button"
+                class="btn primary sm"
+                :disabled="saving || !editing.text.trim() || !editing.confirm"
+                @click="saveEdit"
+              >
+                {{ saving ? "保存中…" : "保存" }}
+              </button>
+              <button type="button" class="btn ghost sm" @click="editing = null">取消</button>
+            </div>
           </div>
         </div>
-      </div>
+      </details>
     </section>
 
     <section class="card">
@@ -584,6 +624,8 @@ onMounted(load);
       </div>
     </section>
   </template>
+  </div>
+  </div>
 </template>
 
 <style scoped>
@@ -642,7 +684,6 @@ onMounted(load);
   color: var(--fg);
 }
 .chapter-row {
-  padding: 12px 0;
   border-top: var(--border-w) solid var(--border);
 }
 .chapter-row:first-of-type {
@@ -650,16 +691,38 @@ onMounted(load);
 }
 .chapter-head {
   display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 0;
+  cursor: pointer;
+  list-style: none;
+}
+.chapter-head::-webkit-details-marker { display: none; }
+.chapter-head-line {
+  display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--gap-sm);
 }
+.chapter-head-line::before {
+  content: "▸";
+  color: var(--accent-ink);
+  font-size: 11px;
+}
+.chapter-row[open] .chapter-head-line::before { content: "▾"; }
+.chapter-preview {
+  overflow-wrap: anywhere;
+  color: var(--fg-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+.chapter-body { padding: 0 0 14px; }
 .row-spacer {
   flex: 1;
 }
 .chapter-text {
-  margin-top: 6px;
-  line-height: 1.6;
+  margin-top: 0;
+  line-height: 1.9;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -739,5 +802,39 @@ onMounted(load);
 }
 .invalid-report {
   border-color: var(--danger);
+}
+
+/*
+ * 宽屏一屏布局：抬头固定，下面的区间/状态/逐章列表整体在内部滚动。
+ * 高度 = 视口 − 顶栏 60px − .main 上下内边距（默认 30 + 56）。
+ * 窄屏不锁定高度，保持页面自然滚动。
+ */
+@media (min-width: 881px) {
+  .outline-page {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 146px);
+    height: calc(100dvh - 146px);
+    min-height: 480px;
+  }
+  .outline-page > .page-head {
+    flex: none;
+    margin-bottom: 12px;
+  }
+  .outline-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 6px;
+    /* 底部留一点余量，最后一张卡不贴着滚动区边缘 */
+    padding-bottom: 8px;
+  }
+}
+@media (min-width: 881px) and (max-width: 1100px) {
+  /* .main 内边距变成 26 + 48 */
+  .outline-page {
+    height: calc(100vh - 134px);
+    height: calc(100dvh - 134px);
+  }
 }
 </style>

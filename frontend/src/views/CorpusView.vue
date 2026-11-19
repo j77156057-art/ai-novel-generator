@@ -623,7 +623,9 @@ const cleanRuleCounts = computed(() => {
   overflow-wrap: anywhere;
 }
 .novel-action {
+  color: var(--accent-ink);
   font-size: var(--fs-xs);
+  font-weight: 600;
   white-space: nowrap;
 }
 .selection-title {
@@ -707,7 +709,7 @@ const cleanRuleCounts = computed(() => {
 .clean-form {
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: var(--gap-md);
+  gap: 14px var(--gap-md);
 }
 .clean-novel-field {
   flex: 1 1 240px;
@@ -717,6 +719,8 @@ const cleanRuleCounts = computed(() => {
   flex: 0 0 150px;
 }
 .clean-limit-hint {
+  display: block;
+  margin-top: 4px;
   font-size: var(--fs-xs);
 }
 .clean-dry {

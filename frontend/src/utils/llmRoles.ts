@@ -37,7 +37,7 @@ export const LLM_ROLE_META: Record<LlmRole, LlmRoleMeta> = {
     purpose: "正文生成用的模型：向导里的续写、重生成、让模型出方案，都走它。",
     short: "生成模型",
     saveLabel: "保存生成模型",
-    savedText: "生成模型已保存并生效（助手 / 蒸馏模型配置未改动）。",
+    savedText: "生成模型已保存并生效（助手 / 提炼模型配置未改动）。",
     supportsChain: true,
     supportsLimits: true,
   },
@@ -46,20 +46,20 @@ export const LLM_ROLE_META: Record<LlmRole, LlmRoleMeta> = {
     purpose: "助手用的模型：只读问答、结构化诊断、提案与版本审核，都走它。",
     short: "助手模型",
     saveLabel: "保存助手模型",
-    savedText: "助手模型已保存并生效（生成 / 蒸馏模型配置未改动）。",
+    savedText: "助手模型已保存并生效（生成 / 提炼模型配置未改动）。",
     supportsChain: false,
     supportsLimits: true,
   },
   distiller: {
-    title: "蒸馏模型（Distiller）",
+    title: "提炼模型（Distiller）",
     // 刻意写清「文风档案抽取用（长任务）」：否则会和项目里的「蒸馏档位」
     // （full / balanced / fast，采样与计算档位）混淆成同一件事。
     purpose:
       "文风档案抽取用：把参考语料压成可注入的文风特征。长任务，建议把 timeout 配大。"
-      + "（注意：它决定「用哪个模型抽」，与「蒸馏档位」决定「抽多细」不是一回事。）",
-    short: "蒸馏模型",
-    saveLabel: "保存蒸馏模型",
-    savedText: "蒸馏模型已保存并生效（生成 / 助手模型配置未改动）。",
+      + "（注意：它决定「用哪个模型抽」，与「提炼档位」决定「抽多细」不是一回事。）",
+    short: "提炼模型",
+    saveLabel: "保存提炼模型",
+    savedText: "提炼模型已保存并生效（生成 / 助手模型配置未改动）。",
     supportsChain: false,
     supportsLimits: true,
   },

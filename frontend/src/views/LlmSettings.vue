@@ -131,7 +131,7 @@ async function onSaveKgExtract(payload: LlmKgExtractSavePayload): Promise<void> 
     config.value = await api.saveLlmConfig({ kg_extract: payload });
     kgNotice.value = {
       kind: "ok",
-      text: "KG 抽取配置已保存并热生效；生成 / 助手 / 蒸馏与写正文的渠道、预算均未改动。",
+      text: "KG 抽取配置已保存并热生效；生成 / 助手 / 文风提炼与写正文的渠道、预算均未改动。",
     };
   } catch (err) {
     const text = err instanceof Error ? err.message : String(err);
@@ -152,7 +152,7 @@ async function onSaveKgExtract(payload: LlmKgExtractSavePayload): Promise<void> 
     <div class="eyebrow">04 · 设置</div>
     <h1>模型设置</h1>
     <p>
-      三个角色分开配：生成模型写正文、助手模型做问答与诊断、蒸馏模型抽文风档案。
+      三个角色分开配：生成模型写正文、助手模型做问答与诊断、提炼模型抽文风档案。
       各自的渠道 / key / 模型互不影响，分别保存、分别测试。key 只存在本机数据库
       （.gitignore 保护），页面不显示明文。
       知识图谱抽取可以单独指定渠道与模型链（默认跟随生成渠道），不影响写正文。

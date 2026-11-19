@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+defineOptions({ name: "KgWorkspace" });
+import { computed, nextTick, onActivated, onMounted, reactive, ref } from "vue";
 import { useRoute } from "vue-router";
 import { api } from "@/api/client";
 import type {
@@ -32,15 +33,36 @@ type TabKey = (typeof TABS)[number]["key"];
 // vue-tsc 5.x 推断 ref<TabKey>(literal) 会把 T 缩到字面量类型，下方 v-if 改用 (activeTab as string) === "style" 绕过。
 // 保留 `as TabKey` 双重断言确保 ref 真正按 union 处理。
 const activeTab = ref<TabKey>("slice" as TabKey);
+// 每个 tab 只在该页生命周期内加载一次：来回点标签不再重复打接口。
+// 数据变了用各 tab 自带的「刷新」显式重拉，而不是靠切换标签顺手重拉。
+const loadedTabs = reactive<Record<string, boolean>>({ slice: true });
+const loadingTabs = reactive<Record<string, boolean>>({});
+/** 标签内容滚动容器：切换标签时回到顶部，避免新标签从中段开始。 */
+const kgBodyEl = ref<HTMLElement | null>(null);
+
+const TAB_LOADERS: Record<TabKey, () => Promise<unknown> | void> = {
+  slice: loadSlice,
+  intel: loadCharacters,
+  events: loadEvents,
+  judge: loadFindings,
+  graph: loadGraphTab,
+  worker: loadWorker,
+  style: loadStyleWarnings,
+};
+
 function switchTab(k: TabKey) {
   activeTab.value = k;
-  // 惰性加载：首次进入某 tab 才拉数据（切片在 onMounted 已拉）
-  if (k === "intel") loadCharacters();
-  else if (k === "events") loadEvents();
-  else if (k === "judge") loadFindings();
-  else if (k === "graph") loadGraphTab();
-  else if (k === "worker") loadWorker();
-  else if (k === "style") loadStyleWarnings();
+  // 一屏布局下内容区是独立滚动容器：换标签必须回到顶部。
+  void nextTick(() => {
+    if (kgBodyEl.value) kgBodyEl.value.scrollTop = 0;
+  });
+  if (loadedTabs[k] || loadingTabs[k]) return;
+  loadingTabs[k] = true;
+  Promise.resolve(TAB_LOADERS[k]()).finally(() => {
+    loadingTabs[k] = false;
+    // 失败也标记为已加载：用户可点「刷新」重试，避免每次切回来都自动重跑。
+    loadedTabs[k] = true;
+  });
 }
 
 // ---------- 语料摄取窗口状态条（只读） ----------
@@ -478,14 +500,22 @@ const curvePts = computed(() => {
   }));
 });
 
-function sevTag(sev: string): string {
-  return sev === "err" ? "tag err" : "tag warn";
-}
-
 onMounted(() => {
   loadSlice();
   loadCorpusWindows();
   loadBookScope();
+});
+
+// 页面被 keep-alive 缓存后，onMounted 不会重跑。状态条是轻量只读聚合，
+// 回来时刷新它们；各标签的数据仍按需点「刷新」，不会整页重拉。
+let kgActivated = false;
+onActivated(() => {
+  if (!kgActivated) {
+    kgActivated = true;
+    return;
+  }
+  void loadCorpusWindows();
+  void loadBookScope();
 });
 
 // ---------- Tab 7 Style 审计（v2.1） ----------
@@ -514,6 +544,16 @@ function fmtPct(p: number | null | undefined): string {
   return p.toFixed(1) + "th";
 }
 
+/** 后端是带时区的 ISO 串；这里只显示到分钟，避免一长串毫秒把列挤爆。 */
+function fmtTime(value: string | null | undefined): string {
+  if (!value) return "—";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+    + `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 /** v2.14 方案 B：bucket chip 颜色——让用户一眼看出本段走哪档。 */
 function bucketChipStyle(bucket: string): Record<string, string> {
   const colorMap: Record<string, string> = {
@@ -534,10 +574,11 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 </script>
 
 <template>
+  <div class="kg-page">
   <header class="page-head">
     <div class="eyebrow">KG v3.0</div>
     <h1>知识图谱工作台</h1>
-    <p>9 表实时读侧：切片预览 · 人物情报 · 事件时间线 · Judge 一致性告警 · 关系与节奏。</p>
+    <p>查看人物、事件、伏笔与一致性告警；数据来自已写正文的自动抽取。</p>
   </header>
 
   <!-- 语料摄取窗口状态条：failed>0 必须显式报失败，不能退化成「无实体」 -->
@@ -560,7 +601,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
     <strong class="corpus-status__text">{{ corpusStatusView.text }}</strong>
     <span v-if="corpusStatusView.detail" class="hint">{{ corpusStatusView.detail }}</span>
     <span v-if="corpusWindows.last_run_at" class="hint">
-      最近运行：{{ corpusWindows.last_run_at }}
+      最近运行：{{ fmtTime(corpusWindows.last_run_at) }}
     </span>
     <details v-if="corpusWindows.failures?.length" class="corpus-failures">
       <summary>查看失败窗口与原始错误（{{ corpusWindows.failures.length }}）</summary>
@@ -599,10 +640,13 @@ function bucketChipStyle(bucket: string): Record<string, string> {
       {{ bookScopeView.driftText }}
     </span>
     <span v-if="bookScopeView.excludedText" class="hint">{{ bookScopeView.excludedText }}</span>
-    <span v-if="bookScopeView.detail" class="hint">{{ bookScopeView.detail }}</span>
+    <details v-if="bookScopeView.detail" class="scope-detail">
+      <summary>口径说明</summary>
+      <p>{{ bookScopeView.detail }}</p>
+    </details>
   </div>
 
-  <nav class="tabs" style="margin-bottom: var(--gap-lg)">
+  <nav class="tabs kg-tabs">
     <button
       v-for="t in TABS"
       :key="t.key"
@@ -614,6 +658,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
     </button>
   </nav>
 
+  <div ref="kgBodyEl" class="kg-body">
   <!-- ============ Tab 1：切片预览 ============ -->
   <section v-if="activeTab === 'slice'" class="card">
     <div class="card-title">
@@ -838,34 +883,52 @@ function bucketChipStyle(bucket: string): Record<string, string> {
     <div v-if="findingsLoading" class="empty"><span class="spinner" /> 加载中…</div>
     <div v-else-if="findingsErr" class="notice err">{{ findingsErr }}</div>
     <template v-else-if="findings">
-      <div class="row tight" style="margin-bottom: var(--gap); flex-wrap: wrap">
-        <span v-for="(r, name) in findings.rules" :key="name" class="tag" :class="r.severity === 'err' ? 'err' : 'warn'">
-          {{ name }}: {{ r.desc }}
-        </span>
+      <div class="judge-toolbar">
+        <div class="judge-stats">
+          <span class="judge-stat err"><b>{{ findings.by_severity.err }}</b> err</span>
+          <span class="judge-stat warn"><b>{{ findings.by_severity.warn }}</b> warn</span>
+        </div>
+        <details class="judge-rules">
+          <summary>判定规则（{{ Object.keys(findings.rules).length }}）</summary>
+          <div class="judge-rule-grid">
+            <div v-for="(r, name) in findings.rules" :key="name" class="judge-rule">
+              <span class="tag" :class="r.severity === 'err' ? 'err' : 'warn'">{{ r.severity }}</span>
+              <code>{{ name }}</code>
+              <span class="judge-rule-desc">{{ r.desc }}</span>
+            </div>
+          </div>
+        </details>
       </div>
       <div v-if="judgeMsg" class="notice info" style="margin-bottom: var(--gap)">{{ judgeMsg }}</div>
 
-      <div v-if="!findings.items.length" class="empty">没有落库告警（生成后 Judge 自动判定并落库；没告警 ≠ 规则没跑，见上方规则清单）</div>
-      <div v-else class="list">
-        <div v-for="(f, i) in findings.items" :key="i" class="list-item" style="align-items: flex-start">
-          <div style="flex: 1">
-            <div class="row tight" style="margin-bottom: 4px">
-              <span :class="sevTag(f.severity)">{{ f.severity }}</span>
-              <span class="tag">{{ f.rule }}</span>
-              <strong>{{ f.entity || "—" }}</strong>
-              <span class="faint mono" style="font-size: var(--fs-xs)">段 {{ f.segment_no ?? "?" }}</span>
-              <span v-if="f.exempted" class="tag">已豁免</span>
-            </div>
-            <div style="font-size: var(--fs-sm)">{{ f.message }}</div>
-            <details v-if="f.evidence.length" style="margin-top: 4px">
-              <summary class="faint" style="font-size: var(--fs-xs); cursor: pointer">证据（{{ f.evidence.length }}）</summary>
-              <div v-for="(ev, j) in f.evidence" :key="j" class="faint mono" style="font-size: var(--fs-xs)">{{ ev }}</div>
-            </details>
-            <div v-if="!f.exempted" style="margin-top: 6px">
-              <button class="btn ghost" style="font-size: var(--fs-xs)" @click="askExempt(f)">豁免此告警…</button>
-            </div>
-          </div>
-        </div>
+      <div v-if="!findings.items.length" class="empty">
+        没有落库告警。生成后 Judge 会自动判定并落库；没告警 ≠ 规则没跑。
+      </div>
+      <div v-else class="judge-list">
+        <article
+          v-for="(f, i) in findings.items"
+          :key="i"
+          class="judge-item"
+          :class="f.severity"
+        >
+          <header class="judge-head">
+            <span class="judge-sev" :class="f.severity">{{ f.severity }}</span>
+            <code class="judge-rule-name">{{ f.rule }}</code>
+            <strong class="judge-entity">{{ f.entity || "—" }}</strong>
+            <span class="judge-seg">段 {{ f.segment_no ?? "?" }}</span>
+            <span v-if="f.exempted" class="tag">已豁免</span>
+            <button
+              v-if="!f.exempted"
+              class="btn ghost judge-exempt"
+              @click="askExempt(f)"
+            >豁免</button>
+          </header>
+          <p class="judge-msg">{{ f.message }}</p>
+          <details v-if="f.evidence.length" class="judge-evidence">
+            <summary>证据（{{ f.evidence.length }}）</summary>
+            <div v-for="(ev, j) in f.evidence" :key="j">{{ ev }}</div>
+          </details>
+        </article>
       </div>
 
       <div v-if="exemptTarget" class="notice info" style="margin-top: var(--gap)">
@@ -880,19 +943,19 @@ function bucketChipStyle(bucket: string): Record<string, string> {
         </div>
       </div>
 
-      <div class="card-title" style="font-size: var(--fs-md); margin-top: var(--gap-lg)">
-        已豁免 <span class="hint">{{ exemptions.length }}</span>
-      </div>
-      <div v-if="!exemptions.length" class="empty">无豁免</div>
-      <div v-else class="list">
-        <div v-for="(x, i) in exemptions" :key="i" class="list-item">
-          <div style="flex: 1">
-            <strong>{{ x.rule }}</strong> / {{ x.entity || "（无实体）" }}
-            <div v-if="x.note" class="faint" style="font-size: var(--fs-xs)">{{ x.note }}</div>
+      <details class="judge-exemptions">
+        <summary>已豁免（{{ exemptions.length }}）</summary>
+        <div class="list">
+          <div v-for="(x, i) in exemptions" :key="i" class="list-item">
+            <div style="flex: 1">
+              <strong>{{ x.rule }}</strong> / {{ x.entity || "（无实体）" }}
+              <div v-if="x.note" class="faint" style="font-size: var(--fs-xs)">{{ x.note }}</div>
+            </div>
+            <button class="btn ghost" style="font-size: var(--fs-xs)" @click="revoke(x.rule, x.entity)">撤销</button>
           </div>
-          <button class="btn ghost" style="font-size: var(--fs-xs)" @click="revoke(x.rule, x.entity)">撤销</button>
+          <div v-if="!exemptions.length" class="empty">无豁免</div>
         </div>
-      </div>
+      </details>
     </template>
   </section>
 
@@ -1087,54 +1150,64 @@ function bucketChipStyle(bucket: string): Record<string, string> {
     </template>
   </section>
 
-  <!-- ============ Tab 7：Style 审计（v2.1 + v2.19 bucket chip + v2.20 max_tokens） ============ -->
-  <section v-if="(activeTab as string) === 'style'" class="card">
-    <h2>文风告警（v2.1）</h2>
-    <p style="color: var(--fg-muted); font-size: 0.9em">
-      percentile ≥ 99.5（留出集分位）触发告警（v2.15 从 97.5 提到 99.5——
-      bucket 留出样本数少是工程边界，100% 触发常态化不构成真异常）。
-      段 1 mean_abs_z ≈ 1.27 与 medium bucket 留出 max 几乎齐平——
-      percentile = UI 标尺，bucket chip + scale + 字数更直观。
-    </p>
-    <div v-if="styleLoading" class="empty">加载中…</div>
-    <div v-else-if="styleErr" class="empty error">{{ styleErr }}</div>
-    <div v-else-if="styleWarnings.length === 0" class="empty">
-      暂无告警——所有生成段 percentile 都在 99.5 分位以内。
-    </div>
-    <div v-else>
-      <div style="display: flex; gap: 16px; margin: 8px 0 16px; font-size: 0.9em">
-        <span><b>{{ styleTotal }}</b> 条告警</span>
-        <span v-if="styleTruncated" style="color: #b00">已截断（&gt;500 保留最新 500）</span>
+  <!-- ============ Tab 7：Style 审计 ============ -->
+  <section v-if="(activeTab as string) === 'style'" class="card style-audit">
+    <header class="style-head">
+      <div>
+        <div class="style-kicker">Style audit</div>
+        <h2>文风告警</h2>
       </div>
-      <table class="prior-table">
-        <thead>
-          <tr><th>段号</th><th>时间</th><th>percentile</th><th>mean_abs_z</th><th>bucket</th><th>scale</th><th>字数</th><th>最偏特征</th><th>消息</th></tr>
-        </thead>
-        <tbody>
-          <tr v-for="w in styleWarnings" :key="w.segment_no + '_' + w.generated_at">
-            <td>{{ w.segment_no }}</td>
-            <td style="font-family: monospace; font-size: 0.85em">{{ w.generated_at }}</td>
-            <td>{{ fmtPct(w.percentile) }}</td>
-            <td>{{ w.mean_abs_z?.toFixed(2) ?? "—" }}</td>
-            <td>
-              <span v-if="w.bucket" class="chip"
-                    :style="bucketChipStyle(w.bucket)">{{ w.bucket }}</span>
-              <span v-else>—</span>
-            </td>
-            <td>{{ w.scale_ratio != null ? w.scale_ratio + 'x' : '—' }}</td>
-            <td>{{ w.chars ?? '—' }}</td>
-            <td>
-              <span v-for="f in w.worst_features" :key="f" class="chip" style="margin-right: 4px">{{ f }}</span>
-            </td>
-            <td style="font-size: 0.85em">{{ w.warn_message ?? "—" }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="style-summary">
+        <span><b>{{ styleTotal }}</b> 条</span>
+        <span v-if="styleTruncated" class="tag warn">已截断 · 仅显示最新 500 条</span>
+      </div>
+    </header>
+
+    <details class="style-note">
+      <summary>判定口径</summary>
+      <p>
+        percentile ≥ 99.5 视为偏离档案。percentile 是 UI 标尺；
+        bucket 与 scale 表示这一段按哪种长度档对齐，字数是判断
+        「偏离是否只是篇幅差异」的依据。
+      </p>
+    </details>
+
+    <div v-if="styleLoading" class="empty"><span class="spinner" /> 加载中…</div>
+    <div v-else-if="styleErr" class="notice err">{{ styleErr }}</div>
+    <div v-else-if="styleWarnings.length === 0" class="empty">
+      暂无告警——所有生成段都在 99.5 分位以内。
+    </div>
+    <div v-else class="warn-list">
+      <article
+        v-for="w in styleWarnings"
+        :key="w.segment_no + '_' + w.generated_at"
+        class="warn-item"
+      >
+        <header class="warn-head">
+          <span class="warn-seg">第 {{ w.segment_no }} 段</span>
+          <time class="warn-time">{{ fmtTime(w.generated_at) }}</time>
+          <span class="warn-pct">{{ fmtPct(w.percentile) }}</span>
+          <span v-if="w.bucket" class="chip" :style="bucketChipStyle(w.bucket)">{{ w.bucket }}</span>
+          <span v-if="w.scale_ratio != null" class="warn-meta">口径 {{ w.scale_ratio }}x</span>
+          <span v-if="w.chars != null" class="warn-meta">{{ w.chars }} 字</span>
+        </header>
+        <div v-if="w.worst_features?.length" class="warn-features">
+          <span v-for="f in w.worst_features" :key="f" class="chip">{{ f }}</span>
+        </div>
+        <p class="warn-msg">{{ w.warn_message || "本段文风偏离档案，但没有附带说明。" }}</p>
+        <details class="warn-raw">
+          <summary>技术指标</summary>
+          <span>mean_abs_z {{ w.mean_abs_z?.toFixed(2) ?? "—" }}</span>
+          <span>percentile {{ fmtPct(w.percentile) }}</span>
+        </details>
+      </article>
     </div>
   </section>
 
   <div class="row" style="margin-top: var(--gap-lg)">
     <router-link class="btn ghost" :to="`/projects/${projectId}`">← 返回项目工作台</router-link>
+  </div>
+  </div>
   </div>
 </template>
 
@@ -1143,6 +1216,9 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+.kg-tabs {
+  margin-bottom: var(--gap-lg);
 }
 .tab {
   font: inherit;
@@ -1188,12 +1264,16 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   margin: 0 0 var(--gap-lg);
   padding: 10px 14px;
   border: var(--border-w) solid var(--border);
+  border-left: 3px solid var(--border-strong);
   border-radius: var(--radius);
   background: var(--bg-elev);
   font-size: var(--fs-sm);
 }
 .corpus-status__label {
+  font-size: 10px;
   font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
   color: var(--fg-muted);
 }
 .corpus-status__book {
@@ -1206,21 +1286,31 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .corpus-status--ok {
   background: var(--ok-soft);
   border-color: var(--ok);
+  border-left-color: var(--ok);
   color: var(--ok);
 }
 .corpus-status--warn {
   background: var(--warn-soft);
   border-color: var(--warn);
+  border-left-color: var(--warn);
   color: var(--warn);
 }
 .corpus-status--error {
   background: var(--danger-soft);
   border-color: var(--danger);
+  border-left-color: var(--danger);
   color: var(--danger);
 }
 .corpus-status__err {
   color: var(--danger);
 }
+.scope-detail {
+  width: 100%;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+}
+.scope-detail summary { cursor: pointer; }
+.scope-detail p { margin: 6px 0 0; line-height: 1.7; }
 .corpus-failures {
   width: 100%;
   color: var(--fg-muted);
@@ -1235,5 +1325,250 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .corpus-failures li {
   margin-bottom: 4px;
   word-break: break-all;
+}
+
+/* ---------- Style 审计：告警卡片（替代 9 列表格） ---------- */
+.style-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+.style-head h2 { margin: 0; }
+.style-kicker {
+  color: var(--accent-ink, var(--accent));
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .15em;
+  text-transform: uppercase;
+}
+.style-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+}
+.style-summary b {
+  color: var(--fg);
+  font-family: var(--mono, monospace);
+  font-size: var(--fs-sm);
+}
+.style-note { margin: 14px 0 18px; }
+.style-note summary {
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.style-note p {
+  max-width: 76ch;
+  margin: 8px 0 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.8;
+}
+.warn-list { display: flex; flex-direction: column; gap: 10px; }
+.warn-item {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  background: var(--bg);
+}
+.warn-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.warn-seg {
+  font-family: var(--mono, monospace);
+  font-size: var(--fs-sm);
+  font-weight: 700;
+}
+.warn-time {
+  color: var(--fg-muted);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+}
+.warn-pct {
+  padding: 2px 8px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  color: var(--warn);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  font-weight: 600;
+}
+.warn-meta { color: var(--fg-muted); font-size: var(--fs-xs); }
+.warn-features {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+.warn-msg {
+  margin: 9px 0 0;
+  color: var(--fg);
+  font-size: var(--fs-sm);
+  line-height: 1.75;
+}
+.warn-raw { margin-top: 8px; }
+.warn-raw summary {
+  color: var(--fg-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.warn-raw span {
+  margin-right: 16px;
+  color: var(--fg-muted);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+}
+@media (max-width: 720px) {
+  .style-head { flex-direction: column; align-items: flex-start; }
+}
+
+/* ---------- Judge：规则折叠 + 告警卡片 ---------- */
+.judge-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.judge-stats { display: flex; gap: 8px; }
+.judge-stat {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  font-size: var(--fs-xs);
+}
+.judge-stat b { margin-right: 4px; font-family: var(--mono, monospace); }
+.judge-stat.err b { color: var(--danger); }
+.judge-stat.warn b { color: var(--warn); }
+.judge-rules { flex: 1; min-width: 220px; }
+.judge-rules summary {
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.judge-rule-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 18px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.judge-rule {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--fs-xs);
+}
+.judge-rule code {
+  color: var(--fg);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+}
+.judge-rule-desc { color: var(--fg-muted); }
+.judge-list { display: flex; flex-direction: column; gap: 8px; }
+.judge-item {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  background: var(--bg);
+}
+.judge-item.err { border-left-color: var(--danger); }
+.judge-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.judge-sev {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.judge-sev.err { background: var(--danger-soft); color: var(--danger); }
+.judge-rule-name {
+  color: var(--fg-muted);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+}
+.judge-entity { font-size: var(--fs-sm); }
+.judge-seg {
+  color: var(--fg-muted);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+}
+.judge-exempt { margin-left: auto; font-size: 11px; }
+.judge-msg { margin: 8px 0 0; font-size: var(--fs-sm); line-height: 1.7; }
+.judge-evidence { margin-top: 6px; }
+.judge-evidence summary {
+  color: var(--fg-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.judge-evidence div {
+  color: var(--fg-muted);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+}
+.judge-exemptions { margin-top: var(--gap-lg); }
+.judge-exemptions summary {
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+@media (max-width: 720px) {
+  .judge-rule-grid { grid-template-columns: 1fr; }
+}
+
+/*
+ * 宽屏一屏布局：抬头 + 两条状态条 + 标签栏固定，标签内容区内部滚动。
+ * 高度 = 视口 − 顶栏 60px − .main 上下内边距（默认 30 + 56）。
+ * 窄屏不锁定高度，保持页面自然滚动。
+ */
+@media (min-width: 881px) {
+  .kg-page {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 146px);
+    height: calc(100dvh - 146px);
+    min-height: 520px;
+  }
+  .kg-page > .page-head {
+    flex: none;
+    margin-bottom: 12px;
+  }
+  .kg-page > .corpus-status {
+    flex: none;
+  }
+  .kg-page > .kg-tabs {
+    flex: none;
+    margin-bottom: 10px;
+  }
+  .kg-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 6px;
+    padding-bottom: 8px;
+  }
+}
+@media (min-width: 881px) and (max-width: 1100px) {
+  /* .main 内边距变成 26 + 48 */
+  .kg-page {
+    height: calc(100vh - 134px);
+    height: calc(100dvh - 134px);
+  }
 }
 </style>
