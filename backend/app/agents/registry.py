@@ -24,7 +24,9 @@ callable 内部——所以工具在业务数据上是纯只读，进白名单�
 由用户点确认后调既有端点执行。
 
 不在本表范围：
-- LangGraph 节点 / Deep Agents 编排：本轮禁用（见 ADR §3「Deep Agents 暂缓」）。
+- Deep Agents 编排：本轮暂缓（见 ADR §3）。审批转移已由
+  `app.agents.approval_graph` 的 LangGraph 子图承载，但工具白名单不变——
+  图里没有任何写工具，写入仍只走用户审批端点。
 - 流式续写：Assistant 端不流式；不在本表暴露 stream_chat。
 - Prompt / 章节 / 角色等业务表写入：EditorProposal/Version 已建模但**未**在本表
   提供任何写入端点；审批流在后续 ADR（ADR-2026-10-12 第 5 步第 4 步）开放。
@@ -1198,7 +1200,7 @@ def _action_options(kind: str, action_body: dict[str, Any]
                     ) -> tuple[str, list[dict[str, Any]]]:
     """某类动作里**需要用户决断**的参数 →（问题，选项）；补丁已嵌好。
 
-    只有「蒸馏档位」这一处：档位直接决定提炼多少语料（几十分钟 vs 几小时），
+    只有「提炼档位」这一处：档位直接决定提炼多少语料（几十分钟 vs 几小时），
     猜错的代价远大于多问一句 —— 既有决策点注册表里已经有它，选项与端点
     都从那儿来，不在这里另造一套。
 
@@ -1510,7 +1512,7 @@ _MODEL_TOOL_PARAMETERS: dict[str, dict] = {
             "detail": {"type": "object",
                        "description": "补充说明（人话）：为什么现在要做这件事"},
             "tier": {"type": "string", "enum": ["full", "balanced", "fast"],
-                     "description": "start_distill 用：蒸馏档位"},
+                     "description": "start_distill 用：提炼档位"},
             "outline": {"type": "array", "items": {"type": "string"},
                         "description": "plan_outline 用：剧情大纲，每条一个剧情点"},
             "count": {"type": "integer", "minimum": 1,
@@ -1876,7 +1878,7 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         name="propose_action",
         description=(
             "提出一个「动作提案」（只构造待确认卡，不落库、不执行）："
-            "启动文风蒸馏 / 规划剧情大纲 / 扩展规划 / 调动生成。"
+            "启动文风提炼 / 规划剧情大纲 / 扩展规划 / 调动生成。"
             "只能提**当前这一步**允许的动作（看 get_workflow_state 的 write_actions）。"
             "用户点确认后才会创建提案行，批准并执行后才会真的发生。"
         ),

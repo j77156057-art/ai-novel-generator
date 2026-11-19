@@ -39,7 +39,8 @@
   ——段号随证据一起出参，调用方无需再去猜这条证据对应哪一段。
 - 端点**不**暴露任何写权限字段：请求体里只有 project_id / query / scope / version_id。
   任何 patch_json / target_table / target_id 等字段被请求体携带 → 422。
-- 不引入 LangGraph 节点 / Deep Agents。
+- 不引入 LangGraph 诊断节点 / Deep Agents；审批转移子图见
+  `app.agents.approval_graph`，本文件不碰写入路径。
 - 流式首字延迟相关超时（556c057 / c1a7179 合入的 180s）由 Writer 单例持有，Assistant 端
   不触发 stream_chat，故不会触碰 stream_timeout 默认值。
 
@@ -69,6 +70,12 @@ from app.agents.log_audit import (
     run_history_to_dicts,
     run_log_audit_rules,
     run_to_dict,
+)
+from app.assistant_memory import (
+    auto_extract as memory_auto_extract,
+    list_memories as memory_list,
+    prompt_block as memory_prompt_block,
+    row_to_dict as memory_row_to_dict,
 )
 from app.assistant_store import record_message
 from app.db import get_db
@@ -689,6 +696,7 @@ def _qa_answer_with_tools(
     action_block: str,
     trace_ctx: dict[str, Any],
     attachment_plan: dict[str, Any] | None = None,
+    memory_block: str = "",
 ) -> dict[str, Any]:
     """模型自主选工具：有界循环（≤3 步），只允许只读白名单工具。
 
@@ -712,6 +720,10 @@ def _qa_answer_with_tools(
     allowed = {item["function"]["name"] for item in visible_tools}
 
     user = f"项目标题：{project.title or '未命名'}\n问题：{query}"
+    # 记忆放在问题**前面**：长期记忆是「这次回答要遵守的前提」，
+    # 最近对话是「理解指代的上下文」，都不是问题本身。
+    if memory_block:
+        user = f"{memory_block}\n\n{user}"
     attachment_block = _attachment_prompt_block(attachment_plan)
     if attachment_block:
         user = f"{user}\n\n{attachment_block}"
@@ -867,6 +879,7 @@ def _qa_answer_deterministic(
     trace_ctx: dict[str, Any],
     fallback_reason: str,
     attachment_plan: dict[str, Any] | None = None,
+    memory_block: str = "",
 ) -> dict[str, Any]:
     """确定性路径（原主路径）：固定三工具 + 纯文本模型调用。"""
     evidence_rows, evidence_lines, generation_segment_nos, tool_results = (
@@ -922,6 +935,9 @@ def _qa_answer_deterministic(
             f"问题：{query}\n\n"
             f"evidence:\n{evidence_blob}{missing_note}"
         )
+        if memory_block:
+            # 与自主工具路径同序：记忆 → 项目/问题 → evidence。
+            user = f"{memory_block}\n\n{user}"
         attachment_block = _attachment_prompt_block(attachment_plan)
         if attachment_block:
             user = f"{user}\n\n{attachment_block}"
@@ -1029,6 +1045,11 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
         )
 
     fallback_reason = ""
+    # 记忆（长期 + 最近对话）在调模型前一次性拼好：两条路径用同一份文本，
+    # 避免「模型路径记得、回落路径忘了」这种只在故障时才暴露的不一致。
+    memory_block = memory_prompt_block(
+        db, project.id, query=body.query, exclude_text=body.query
+    )
     try:
         outcome = _qa_answer_with_tools(
             db=db,
@@ -1038,6 +1059,7 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
             action_block=action_block,
             trace_ctx=trace_ctx,
             attachment_plan=attachment_plan,
+            memory_block=memory_block,
         )
     except PermissionError:
         # 黑名单工具被 Assistant 误调：直接 fail-fast（绝不静默）
@@ -1059,6 +1081,7 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
             trace_ctx=trace_ctx,
             fallback_reason=fallback_reason,
             attachment_plan=attachment_plan,
+            memory_block=memory_block,
         )
 
     answer = outcome["answer"]
@@ -1108,6 +1131,20 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
         payload={"agent_run_id": run_id},
     )
 
+    # 6.5) 自动记忆抽取：只对陈述句跑（问句在 auto_extract 里就跳过了），
+    #      抽不到/模型不可用都只影响「记忆」这一项，不影响本次回答。
+    auto_memories = []
+    try:
+        auto_memories = memory_auto_extract(
+            db,
+            project.id,
+            query=body.query,
+            answer=answer,
+            provider=_ensure_assistant_provider(),
+        )
+    except Exception as exc:  # noqa: BLE001 - 抽取失败不拖垮问答
+        logger.warning("assistant/qa 自动记忆抽取异常：%s", exc)
+
     # 7) 出参（每次都包含 answer / evidence[] / confidence / agent_run_id）
     return {
         "answer": answer,
@@ -1136,6 +1173,13 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
         },
         # 回落原因（仅 deterministic 时非空），供诊断，不用于前端展示正文。
         "tool_fallback_reason": fallback_reason,
+        # 本轮自动记住了新内容时，把变更后的全量清单带回去刷新「记忆」抽屉。
+        "memory_changed": bool(auto_memories),
+        "memories": (
+            [memory_row_to_dict(row) for row in memory_list(db, project.id)]
+            if auto_memories
+            else []
+        ),
     }
 
 

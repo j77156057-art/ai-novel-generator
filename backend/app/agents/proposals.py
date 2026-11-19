@@ -29,15 +29,21 @@
    任一步抛错立即 `db.rollback()` 并把异常原样冒泡。
    不存在「业务表改了但快照没写」的中间态。
 
-## 为什么不用 LangGraph
+## 为什么最终引入 LangGraph 审批子图
 
-审批流的状态是 5 个节点、单向为主、无分支并行、无循环：
-`pending → approved → applied`，加两个终态 `rejected` / `stale`，
-外加一条 `applied → rolled_back` 的回滚边。这个规模用**显式状态转移表**
-（`ALLOWED_TRANSITIONS`）表达得更直接：转移条件是纯函数、可离线复现、
-能被单测逐条枚举。为它拉一个图依赖只会把「谁在什么状态下能做什么」
-这类必须一眼可查的事实藏进节点连线里。派单里「若纯状态机能完成就不加依赖」
-的条件成立，故本步**不引入** LangGraph。
+本模块最初刻意不用 LangGraph：状态只有 5 个、单向为主，用显式转移表
+（`ALLOWED_TRANSITIONS`）就能表达，且转移条件是纯函数、可离线枚举。
+后来按产品要求引入 `langgraph`，但**只把「审批转移」这一步交给
+`app.agents.approval_graph` 的子图编排**：
+
+- 状态事实仍由本模块的 `ALLOWED_TRANSITIONS` + `validate_action` 决定；
+  子图节点只调用这里的 `approve_proposal` / `reject_proposal` /
+  `apply_proposal`，不另抄一份状态集合；
+- 批量应用（`apply_selected`）与回滚（`restore_version`）仍是直接调用，
+  不被子图包一层，避免「整批同事务」的语义被拆散；
+- Writer 主链路零改动，也不存在「图里偷偷写业务表」的路径。
+
+一句话：图负责把「谁先谁后」画出来，能不能做仍然由状态机说了算。
 
 ## patch 的能力边界（硬约束 4）
 
@@ -1095,6 +1101,44 @@ def _apply_one_no_commit(
         "status": proposal.status,
         "applied_at": proposal.applied_at.isoformat() if proposal.applied_at else None,
     }
+
+
+def approve_proposal(
+    db: Any, *, proposal: Any, actor: str | None = None
+) -> dict[str, Any]:
+    """`pending --approve--> approved`：只改状态，不写任何业务表。
+
+    审批与落库刻意分成两步：审批是人的判断，落库是系统的动作。本函数
+    只做前者，且与 `apply_proposal` 同样的失败纪律——抛错即回滚。
+    """
+    try:
+        validate_action(proposal.status, "approve")
+        proposal.status = "approved"
+        proposal.approved_by = actor
+        proposal.approved_at = _now_utc()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"status": proposal.status}
+
+
+def reject_proposal(
+    db: Any, *, proposal: Any, actor: str | None = None, note: str | None = None
+) -> dict[str, Any]:
+    """`pending --reject--> rejected`（终态）：永不写业务表。"""
+    try:
+        validate_action(proposal.status, "reject")
+        proposal.status = "rejected"
+        proposal.approved_by = actor
+        proposal.approved_at = _now_utc()
+        if note:
+            proposal.reason = f"{proposal.reason or ''}\n[reject] {note}".strip()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"status": proposal.status}
 
 
 def apply_proposal(

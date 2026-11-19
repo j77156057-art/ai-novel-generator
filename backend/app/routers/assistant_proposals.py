@@ -55,6 +55,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agents import approval_graph
 from app.agents import proposals as proposal_lib
 from app.agents.diagnosis import run_diagnostic_rules
 from app.agents.prompt_overrides import (
@@ -405,13 +406,10 @@ def approve_proposal(
         )
     proposal = _get_proposal(db, proposal_id)
     try:
-        proposal_lib.validate_action(proposal.status, "approve")
-        proposal.status = "approved"
-        proposal.approved_by = body.actor
-        proposal.approved_at = proposal_lib._now_utc()
-        db.commit()
+        approval_graph.run_approval(
+            db, proposal=proposal, action="approve", actor=body.actor
+        )
     except Exception as exc:  # noqa: BLE001
-        db.rollback()
         _raise_http(exc)
     db.refresh(proposal)
     return {
@@ -435,15 +433,14 @@ def reject_proposal(
         )
     proposal = _get_proposal(db, proposal_id)
     try:
-        proposal_lib.validate_action(proposal.status, "reject")
-        proposal.status = "rejected"
-        proposal.approved_by = body.actor
-        proposal.approved_at = proposal_lib._now_utc()
-        if body.note:
-            proposal.reason = f"{proposal.reason or ''}\n[reject] {body.note}".strip()
-        db.commit()
+        approval_graph.run_approval(
+            db,
+            proposal=proposal,
+            action="reject",
+            actor=body.actor,
+            note=body.note,
+        )
     except Exception as exc:  # noqa: BLE001
-        db.rollback()
         _raise_http(exc)
     db.refresh(proposal)
     return {
@@ -481,10 +478,13 @@ def apply_proposal(
         )
     proposal = _get_proposal(db, proposal_id)
     try:
-        result = proposal_lib.apply_proposal(db, proposal=proposal, actor=body.actor)
+        out = approval_graph.run_approval(
+            db, proposal=proposal, action="apply", actor=body.actor
+        )
     except Exception as exc:  # noqa: BLE001 - apply 内部已自行回滚
         _raise_http(exc)
     db.refresh(proposal)
+    result = out.get("result") or {}
     result["proposal"] = proposal_lib.proposal_to_dict(proposal)
     return result
 
@@ -512,6 +512,10 @@ def apply_selected_proposals(
 
     它不是新的写入旁路：内部走的仍是 `proposal_lib.apply_selected`（复用单条
     apply 的核心 `_apply_one_no_commit`），状态机与漂移检测与 `/apply` 完全一致。
+
+    批量路径**刻意不经审批子图**（`agents/approval_graph`）：整批同事务的
+    原子性由一个 Session 内的 `apply_selected` 保证，拆进图节点反而会把事务
+    边界打散。子图只负责单条的 approve / reject / apply 编排。
     """
     if body.action != "apply":
         raise HTTPException(
