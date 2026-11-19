@@ -10,7 +10,7 @@
 - 流程改写走白名单：只能跳过 `SKIPPABLE`、只能在非受保护步骤间换序、
   只能插入字段已登记（`CUSTOM_FIELDS`）的自定义问题。
 - 每次写操作落一行 `WizardActionAudit`，回复里给出「旧值 → 新值 + 影响」，
-  除「触发蒸馏」外都可撤销（任务已起跑，撤销只能恢复参数）。
+  除「触发提炼」外都可撤销（任务已起跑，撤销只能恢复参数）。
 """
 
 from __future__ import annotations
@@ -35,14 +35,14 @@ ACTIONS: dict[str, dict[str, Any]] = {
         "params": "tier ∈ {full, balanced, fast}",
         "confirm": False,
         "undoable": True,
-        "note": "只改偏好，当前档案不变；下次蒸馏生效。",
+        "note": "只改偏好，当前档案不变；下次提炼生效。",
     },
     "set_sampling": {
         "target": "project.narrative_sample_chapters",
         "params": "chapters = 0（全本）或 1..语料总章数",
         "confirm": False,
         "undoable": True,
-        "note": "进蒸馏指纹，改完必须重跑；回执给预计耗时。",
+        "note": "进提炼指纹，改完必须重跑；回执给预计耗时。",
     },
     "trigger_distill": {
         "target": "distill run",
@@ -139,7 +139,7 @@ _STEP_LABELS = {
     "chapters": "段数",
     "outline": "大纲",
     "scene": "情境",
-    "distill": "蒸馏",
+    "distill": "提炼",
     "corpus": "语料",
 }
 
@@ -194,8 +194,8 @@ def plan(text: str, ctx: dict[str, Any], current_step: str | None = None) -> dic
     if re.search(r"^(撤销|撤回|undo)", t, re.I) or re.search(r"撤销(刚才|上次|这次|刚)", t):
         return {"action": "undo"}
 
-    # 触发蒸馏
-    if re.search(r"(开始|触发|执行|跑|启动).{0,6}蒸馏|蒸馏.{0,4}(开始|跑起来)", t):
+    # 触发蒸馏（「提炼」是新叫法，两种说法都要认）
+    if re.search(r"(开始|触发|执行|跑|启动).{0,6}(提炼|蒸馏)|(提炼|蒸馏).{0,4}(开始|跑起来)", t):
         return {"action": "trigger_distill", "force": "重新" in t or "强制" in t}
 
     # 采样章数（没有对应的引导步骤，永远是动作）
@@ -220,7 +220,7 @@ def plan(text: str, ctx: dict[str, Any], current_step: str | None = None) -> dic
         step = _step_of(t)
         if step:
             return {"action": "skip_step", "step": step}
-        if "蒸馏" in t:
+        if "提炼" in t or "蒸馏" in t:
             return {"action": "skip_step", "step": "distill"}
         if "语料" in t:
             return {"action": "skip_step", "step": "corpus"}
@@ -380,7 +380,7 @@ def apply(
         cfg = facts.tier_by_key(key)  # 未知抛 ValueError
         old = getattr(project, "narrative_tier", None)
         if old == key:
-            return _ok(f"蒸馏档位本来就是{cfg.name}，没改。", None, action=kind, target="project.narrative_tier")
+            return _ok(f"提炼档位本来就是{cfg.name}，没改。", None, action=kind, target="project.narrative_tier")
         project.narrative_tier = key
         db.commit()
         total = int(ctx.get("corpus_total_chapters") or 0)
@@ -389,7 +389,7 @@ def apply(
         sampled_chars = facts.sampled_chars_for(cfg, total, chars)
         est = facts.estimate_minutes(sampled_chars)
         impact = (
-            f"当前档案不变，要重跑蒸馏才会按新档算；按当前语料约 {sampled} 章 / "
+            f"当前档案不变，要重跑提炼才会按新档算；按当前语料约 {sampled} 章 / "
             f"{sampled_chars / 10000:.0f} 万字，预计约 {est['minutes']} 分钟"
             f"（{est['basis']}）。"
         )
@@ -399,7 +399,7 @@ def apply(
             impact=impact, undo_payload={"field": "narrative_tier", "value": old},
         )
         return _ok(
-            f"改了：蒸馏档位 {_tier_name(old)} → {cfg.name}。影响：{impact}",
+            f"改了：提炼档位 {_tier_name(old)} → {cfg.name}。影响：{impact}",
             row,
         )
 
@@ -429,7 +429,7 @@ def apply(
         new_txt = "全本（不抽样）" if n == 0 else f"最多 {n} 章"
         old_txt = "按档位默认" if old is None else ("全本" if int(old) <= 0 else f"最多 {old} 章")
         impact = (
-            f"采样覆盖进蒸馏指纹，改完必须重跑才生效，不会命中旧档案；"
+            f"采样覆盖进提炼指纹，改完必须重跑才生效，不会命中旧档案；"
             f"按当前语料约 {sampled} 章 / {sampled_chars / 10000:.0f} 万字，"
             f"预计约 {est['minutes']} 分钟（{est['basis']}）。维度和清洗强度不变。"
         )
@@ -440,7 +440,7 @@ def apply(
             undo_payload={"field": "narrative_sample_chapters", "value": old},
         )
         return _ok(
-            f"改了：蒸馏采样 {old_txt} → {new_txt}。影响：{impact}",
+            f"改了：提炼采样 {old_txt} → {new_txt}。影响：{impact}",
             row,
         )
 
@@ -448,7 +448,7 @@ def apply(
         from app.routers.projects import DistillStartRequest, start_distill
 
         if background_tasks is None:
-            raise ValueError("当前请求没有后台任务上下文，无法起蒸馏")
+            raise ValueError("当前请求没有后台任务上下文，无法起提炼")
         res = start_distill(
             int(project.id),
             DistillStartRequest(tier=None, force=bool(action.get("force"))),
@@ -465,7 +465,7 @@ def apply(
             impact=impact, undoable=False, undo_payload={},
         )
         return _ok(
-            f"已提交蒸馏 {impact}",
+            f"已提交提炼 {impact}",
             row,
             job=res,
         )
@@ -696,7 +696,7 @@ def undo_by_id(db: Session, project, session, audit_id: int) -> dict[str, Any]:
     if row is None or int(row.project_id) != int(project.id):
         raise ValueError("找不到这条操作记录")
     if not row.undoable:
-        raise ValueError("这次操作不可撤销（例如已经起跑的蒸馏任务）")
+        raise ValueError("这次操作不可撤销（例如已经起跑的提炼任务）")
     if row.undone_at is not None:
         raise ValueError("这次操作已经撤销过了")
     return _apply_undo(db, project, session, row)

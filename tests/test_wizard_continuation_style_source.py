@@ -257,7 +257,7 @@ def test_precheck_rejects_when_archive_does_not_cover_project(db, monkeypatch):
     project.style_narrative = _archive([5])
     db.commit()
 
-    with pytest.raises(ValueError, match="尚未蒸馏"):
+    with pytest.raises(ValueError, match="尚未提炼"):
         _require_distill_ready(db, project)
 
 
@@ -270,7 +270,7 @@ def test_precheck_and_retrieval_share_one_criterion(db, monkeypatch):
     project.style_narrative = _archive([5])
 
     monkeypatch.setattr(narrative_mod, "reusable_narrative", lambda *a, **k: None)
-    with pytest.raises(ValueError, match="尚未蒸馏"):
+    with pytest.raises(ValueError, match="尚未提炼"):
         _require_distill_ready(db, project)
 
     monkeypatch.setattr(

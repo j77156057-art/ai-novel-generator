@@ -324,8 +324,56 @@ def voice_collisions(cards: dict[str, Any], *, min_shared: int = 3) -> list[dict
     return out
 
 
+#: 通用自称：重复不算冲突（中文里绝大多数人自称「我」）。
+GENERIC_SELF_REFERENCES = frozenset({"我", "俺", "我自己", "我们", "咱们"})
+
+
+def _forbidden_set(card: Any) -> set[str]:
+    voice = (card or {}).get("声纹") if isinstance(card, dict) else {}
+    if not isinstance(voice, dict):
+        return set()
+    return {str(x).strip() for x in _as_list(voice.get("禁用词")) if str(x).strip()}
+
+
+def strict_voice_collisions(cards: dict[str, Any], *, min_shared: int = 3) -> list[dict]:
+    """`voice_collisions` 的严格版：补两类**单项即算撞**的硬冲突。
+
+    1. 非通用自称重复（两个人都自称「本座」）；
+    2. 「禁用词」整套完全一样（六张卡都写 ["但是","然后","我感觉"]）。
+
+    这两类在实测里都会让角色听起来像同一个人，但原来的判据要求
+    「句长 + 句末 + 底色」至少三项相同才报，单项重复会被漏掉。
+    """
+    names = [n for n in (cards or {}) if n]
+    out = list(voice_collisions(cards, min_shared=min_shared))
+    reported = {tuple(sorted(x["人物"])) for x in out}
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            pair = tuple(sorted((a, b)))
+            if pair in reported:
+                continue
+            sa = voice_signature(cards[a])
+            sb = voice_signature(cards[b])
+            hard: list[str] = []
+            self_a = sa.get("自称")
+            if self_a and self_a == sb.get("自称") and self_a not in GENERIC_SELF_REFERENCES:
+                hard.append(f"自称都是「{self_a}」")
+            fa, fb = _forbidden_set(cards[a]), _forbidden_set(cards[b])
+            if fa and fa == fb:
+                hard.append("禁用词整套一样（" + "、".join(sorted(fa)[:4]) + "）")
+            if hard:
+                out.append({
+                    "人物": [a, b],
+                    "相同": hard,
+                    "建议": f"「{b}」必须换掉这些锚点：至少改自称，或让禁用词与「{a}」不同",
+                })
+    return out
+
+
 def render_card(card: Any, *, max_items: int = 3,
-                include_scale: bool = False) -> str:
+                include_scale: bool = False,
+                skip_fields: tuple[str, ...] = ()) -> str:
     """把角色卡渲染成一行人话（进提示词）。
 
     形态：`性别…｜职业…｜武器：断刀（锈）｜功法：换气｜上限：不会水｜声纹：…`
@@ -344,6 +392,8 @@ def render_card(card: Any, *, max_items: int = 3,
     ident = card.get("身份") or {}
     if isinstance(ident, dict):
         for f in IDENTITY_FIELDS:
+            if f in skip_fields:
+                continue
             v = _as_text(ident.get(f))
             if v:
                 parts.append(f"{f}{v}" if f in ("性别", "年龄") else f"{f}：{v}")

@@ -1,9 +1,9 @@
 """助理对话里的「一步步生成」引导接口。
 
 这一层只做三件事：
-1. 把 `app.wizard_flow` 的纯状态机接到项目数据上（语料列表 / 蒸馏档位 /
+1. 把 `app.wizard_flow` 的纯状态机接到项目数据上（语料列表 / 提炼档位 /
    角色列表 / 已有段号）；
-2. 把用户选中的答案**映射到现有参数**：项目字段、现有蒸馏后台任务、
+2. 把用户选中的答案**映射到现有参数**：项目字段、现有提炼后台任务、
    现有 `build_bible`、现有 `generate_loop`——不新造生成执行层；
 3. 把会话落库，支持刷新/关页后续跑。
 
@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -51,6 +53,8 @@ from app.style.jobs import (
 from app.style.narrative import DEFAULT_TIER, list_tiers
 
 router = APIRouter(prefix="/api/assistant/wizard", tags=["assistant-wizard"])
+
+logger = logging.getLogger(__name__)
 
 #: 长文本至少落进 project.premise 的步骤（方向/角色名/情境有自己的语义，
 #: 不在这里兜底）。premise 是既有字段，已被生成链路读取，不需要改表。
@@ -99,6 +103,18 @@ class WizardUndoIn(StrictRequest):
     audit_id: int | None = None
 
 
+class CardsRegenerateIn(StrictRequest):
+    """重新生成角色卡；names 为空 = 全部角色。"""
+
+    names: list[str] = []
+
+
+class CharacterCardIn(StrictRequest):
+    """手工编辑后的角色卡（分组结构：身份/声纹/能力/关系）。"""
+
+    card: dict[str, Any]
+
+
 # ---------------------------------------------------------------------------
 # 会话与上下文
 # ---------------------------------------------------------------------------
@@ -137,7 +153,7 @@ def _story_prefill(
     林深，第一人称，30 万字日更」，题材/写法/主角/篇幅会一次性预填，后面
     对应的卡片直接跳过，回执里告诉用户「已记下什么、还差什么」。
     """
-    if step not in story.STORY_STEPS and step != "branch":
+    if step not in story.STORY_STEPS and step not in ("branch", "corpus"):
         return {}, []
     sig = story.read_signals(text, tuple(flow.GENRE_HINTS), tuple(flow.STYLE_HINTS))
     if not sig:
@@ -254,7 +270,7 @@ def _context(
 
     只做只读查询；`needs_distill` 用「有参考语料但项目没有档案」近似，
     不在这里跑指纹/全量哈希——那会把每次提问拖成秒级 IO。真的命中
-    蒸馏库时，多问一次档位也只是返回一次 `from_cache: True`。
+    文风档案库时，多问一次档位也只是返回一次 `from_cache: True`。
 
     讲解需要的**硬事实**（语料章数/字数、已有档案、各档预计耗时、维度清单）
     全部来自 `wizard_facts`，不在这里手写数字。
@@ -431,7 +447,7 @@ def _materialize_stalled(db: Session, run: DistillRun | None) -> None:
             "status": run.status,
             "stage": run.stage,
             "health": health,
-            "message": f"蒸馏疑似卡住：{note}",
+            "message": f"提炼疑似卡住：{note}",
             "progress_current": int(run.progress_current or 0),
             "progress_total": int(run.progress_total or 0),
             "expected_minutes": run.expected_minutes,
@@ -441,10 +457,39 @@ def _materialize_stalled(db: Session, run: DistillRun | None) -> None:
             # 重启后 reap_stale_runs 把它转成「中断」回执，那条上才有按钮。
             "next": (
                 "建议：先按上面的分钟数再等一会。若仍无进度，重启后端——重启会把这条"
-                "任务转成「中断」回执，点那条回执上的「继续蒸馏」接着跑（已完成的块不会重跑）。"
+                "任务转成「中断」回执，点那条回执上的「继续提炼」接着跑（已完成的块不会重跑）。"
             ),
         },
     )
+
+
+def _heal_step(
+    db: Session,
+    session: AssistantWizardSession,
+    answers: dict[str, Any],
+    ctx: dict[str, Any],
+) -> None:
+    """旧会话自愈：步骤序列变动后，退回序列里第一个未答步骤。
+
+    语料前置（2026-11-20）后，旧会话可能停在 `genre` 而 `corpus` 还没答。
+    只靠 `_state()` 的自愈不够——`answer/say` 会直接用旧 `step_key` 推进，
+    从而永久跳过 corpus。所有「读取当前题」的入口都必须先调用本函数。
+    """
+    if session.status != "active":
+        return
+    order = flow.step_order(answers.get("branch"), answers, ctx)
+    pending = next((s for s in order if s not in answers), None)
+    # 只修「结构性插入」的跳过：corpus 前置、book_scope 因多本语料插入。
+    # 不做通用回退——用户可能有意跳过剧情追问，硬退回去会打断输入。
+    if pending not in ("corpus", "book_scope"):
+        return
+    if (
+        session.step_key in order
+        and order.index(pending) < order.index(session.step_key)
+    ):
+        session.step_key = pending
+        db.commit()
+        db.refresh(session)
 
 
 def _state(
@@ -462,20 +507,9 @@ def _state(
     answers = session.answers or {}
     question = None
     if session.status == "active":
-        # 步骤序列是动态的（例如本轮新增的 book_scope 会因为「在场语料 ≥2 本」
-        # 插在 corpus 之后）。部署前就停在后面的旧会话，step_key 会「越过」
-        # 一个从未答过的步骤——进度写着 10 步、实际只走 9 步，新步骤对它永不
-        # 可见。这里退回到序列里第一个未答的步骤，自愈一次即可。
-        order = flow.step_order(answers.get("branch"), answers, ctx)
-        pending = next((s for s in order if s not in answers), None)
-        if (
-            pending
-            and session.step_key in order
-            and order.index(pending) < order.index(session.step_key)
-        ):
-            session.step_key = pending
-            db.commit()
-            db.refresh(session)
+        # 步骤序列是动态的（例如本轮把 corpus 前置、book_scope 因语料 ≥2 本
+        # 插入）。旧会话的 step_key 可能越过一个从未答过的步骤，这里自愈。
+        _heal_step(db, session, answers, ctx)
         question = flow.build_question(session.step_key, answers, ctx)
         if ack:
             question["message"] = ack + "\n\n" + str(question.get("message") or "")
@@ -547,7 +581,7 @@ def get_messages(
 
 @router.get("/{project_id}/notices")
 def list_notices(project_id: int, db: Session = Depends(get_db)) -> dict:
-    """未消费的蒸馏通知 + 最近一条任务状态（一次轮询同时更新进度和回执）。
+    """未消费的提炼通知 + 最近一条任务状态（一次轮询同时更新进度和回执）。
 
     这就是「完成唤醒」的**可运行机制**：任务终态时后台把回执写进
     `wizard_notices`；前端每 3 秒拉这个接口，拿到未消费的行就渲染成助手气泡，
@@ -638,6 +672,11 @@ def answer(
     if session is None:
         raise HTTPException(status_code=409, detail="没有进行中的引导，请先调用 /start")
 
+    answers = dict(session.answers or {})
+    ctx = _context(db, project, session.history or [], session.overrides or {})
+    # 先自愈再校验：旧会话可能停在「题材」而新的序列把语料放在前面。
+    _heal_step(db, session, answers, ctx)
+
     if body.step_key != session.step_key:
         # 页面停留在旧题（另一个标签页已经答过）：不覆盖，直接把当前题推回去。
         raise HTTPException(
@@ -645,8 +684,6 @@ def answer(
             detail=f"当前问题已变为「{session.step_key}」，请刷新后重答",
         )
 
-    answers = dict(session.answers or {})
-    ctx = _context(db, project, session.history or [], session.overrides or {})
     # 只为「用户气泡显示什么」重建一次当前题（纯内存，不查库）。
     question = flow.build_question(session.step_key, answers, ctx)
 
@@ -815,6 +852,11 @@ def _advance(
     session.history = history
 
     ctx = _context(db, project, history, session.overrides or {})
+    # 语料一选定就落库：紧随其后的 distill 步骤要立即用它启动后台提炼，
+    # `start_distill` 读的是项目字段而不是会话 answers。
+    if step == "corpus" and session.kind == flow.KIND_ORIGINAL:
+        project.reference_novel_ids = flow._corpus_ids(answers, ctx)
+
     nxt = flow.next_step(session.kind, step, answers, ctx)
     if nxt is None:
         # 理论上只有 confirm 会走到末尾，而 confirm 已在上面处理。
@@ -822,7 +864,26 @@ def _advance(
     session.step_key = nxt
     db.commit()
     db.refresh(session)
-    out = _state(db, project, session, ack=ack)
+
+    # 蒸馏不再等到最后提交：答完档位就后台开跑，用户继续答后面的题。
+    # 失败只记日志 + 回执提示，不让一次后台任务把作答打成 500。
+    distill_note = ""
+    if step == "distill":
+        tier = str(value or "").strip()
+        if tier and tier != flow.DISTILL_REUSE:
+            project.narrative_tier = tier
+            try:
+                db.commit()
+                _start_distill(db, project, tier, background_tasks)
+                distill_note = "\n\n（蒸馏已在后台开始，继续答题即可。）"
+            except Exception as exc:  # noqa: BLE001 —— 蒸馏启动失败不阻断引导
+                logger.warning(
+                    "引导内提前启动蒸馏失败 project=%s tier=%s: %s",
+                    project.id, tier, exc,
+                )
+                distill_note = "\n\n（蒸馏没能立即启动，可稍后在工作台重新发起。）"
+
+    out = _state(db, project, session, ack=ack + distill_note)
     _record_question(db, project.id, session, out.get("question"))
     return out
 
@@ -844,9 +905,10 @@ def say(
     if session is None:
         raise HTTPException(status_code=409, detail="没有进行中的引导，请先调用 /start")
 
-    step = session.step_key
     answers = dict(session.answers or {})
     ctx = _context(db, project, session.history or [], session.overrides or {})
+    _heal_step(db, session, answers, ctx)
+    step = session.step_key
     question = flow.build_question(step, answers, ctx)
 
     # 越界要求先明确拒绝：不执行、不推进，也不写进 premise。
@@ -1111,8 +1173,8 @@ def _project_hint(project: Project) -> dict:
 def _require_continuation_corpus(db: Session, novel_id: int) -> None:
     """续写书必须先有正文语料，否则文风档案与续写上下文都无从谈起。
 
-    `novel_chunks` 是蒸馏与 RAG 的唯一语料源；为空时蒸馏会整批失败，
-    用户只会看到「蒸馏完成但 0 条规则」。所以在写字段前拦下，并把
+    `novel_chunks` 是提炼与 RAG 的唯一语料源；为空时提炼会整批失败，
+    用户只会看到「提炼完成但 0 条规则」。所以在写字段前拦下，并把
     「先去导入语料」这一步说清楚。
     """
     novel = db.get(RawNovel, novel_id)
@@ -1144,7 +1206,9 @@ def _commit(
     distill: dict | None = None
 
     if kind == flow.KIND_ORIGINAL:
-        project.reference_novel_ids = list(answers.get("corpus") or [])
+        # 只在真的答过 corpus 时覆盖：旧会话没有这一项，不能把项目已有语料清空。
+        if "corpus" in answers:
+            project.reference_novel_ids = list(answers.get("corpus") or [])
         project.genre = answers.get("genre") or project.genre
         project.style = answers.get("style") or project.style
         project.generation_length = int(answers.get("length") or project.generation_length or 3000)
@@ -1190,9 +1254,12 @@ def _commit(
 
         if answers.get("outline", True):
             result["stage"] = "outline"
-            result["bible"] = _build_bible(db, project, answers)
+            bible, card_stats = _build_bible(db, project, answers)
+            result["bible"] = bible
+            result["character_cards"] = card_stats
         result["distill"] = distill
-        result["message"] = _commit_message(kind, distill, result["stage"])
+        result["message"] = _commit_message(
+            kind, distill, result["stage"], result.get("character_cards"))
 
     elif kind == flow.KIND_CONTINUATION:
         project.generation_length = int(answers.get("length") or project.generation_length or 3000)
@@ -1253,7 +1320,12 @@ def _commit(
     }
 
 
-def _commit_message(kind: str, distill: dict | None, stage: str) -> str:
+def _commit_message(
+    kind: str,
+    distill: dict | None,
+    stage: str,
+    cards: dict | None = None,
+) -> str:
     parts = []
     if kind == flow.KIND_CONTINUATION:
         parts.append("已按你的选择保存续写参数。")
@@ -1261,12 +1333,26 @@ def _commit_message(kind: str, distill: dict | None, stage: str) -> str:
         parts.append("已按你的选择保存项目参数。")
     if distill:
         if distill.get("from_cache"):
-            parts.append("文风档案直接命中缓存，没有重新蒸馏。")
+            parts.append("文风档案直接命中缓存，没有重新提炼。")
         else:
             parts.append(
-                f"蒸馏任务已提交（job #{distill.get('job_id')}），"
+                f"提炼任务已提交（job #{distill.get('job_id')}），"
                 "后台跑完才能开始生成；可以在项目工作台看进度。"
             )
+    if cards:
+        generated = int(cards.get("generated") or 0)
+        if generated:
+            extra = ""
+            if int(cards.get("collisions") or 0):
+                extra = f"（有 {cards['collisions']} 处声纹撞车，已在卡里标出）"
+            parts.append(
+                f"已为 {generated} 个角色生成角色卡：身份/外貌/说话方式/口头禅{extra}。")
+        elif cards.get("reason") == "already_have_cards":
+            parts.append("角色卡已存在，未重复生成。")
+        elif cards.get("reason") == "no_characters":
+            pass
+        else:
+            parts.append("角色卡这次没生成成功（不影响大纲，可稍后重试）。")
     if stage == "outline":
         parts.append("大纲已经生成，确认后再开写。")
     elif stage == "ready":
@@ -1324,22 +1410,580 @@ def undo_action(
     }
 
 
+def _apply_world_background(
+    db: Session, project: Project, answers: dict[str, Any]
+) -> None:
+    """把向导的 `world / power / scale` 答案补进 `plot_bible.background`。
+
+    只补空、不覆盖作者手写：世界观卡一旦有「一句话世界 / 硬规则」，向导答案
+    不再写入。`build_bible` 已经 commit 过一次，这里单独再提交一次。
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.generation.background import normalize_background
+
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    background = normalize_background(bible.get("background"))
+
+    world = str(answers.get("world") or "").strip()
+    changed = False
+    if world and not background.get("一句话世界"):
+        background["一句话世界"] = world[:300]
+        changed = True
+
+    extras = []
+    for key, label in (("power", "力量体系"), ("scale", "世界规模")):
+        value = str(answers.get(key) or "").strip()
+        if value:
+            extras.append(f"{label}：{value}")
+    if extras and not background.get("硬规则"):
+        background["硬规则"] = extras
+        changed = True
+
+    if not changed:
+        return
+    bible["background"] = background
+    project.plot_bible = bible
+    try:
+        flag_modified(project, "plot_bible")
+    except Exception:  # noqa: BLE001 —— 测试里的假 project 没有 ORM 状态
+        pass
+    db.commit()
+
+
 def _build_bible(
     db: Session,
     project: Project,
     answers: dict[str, Any] | None = None,
-) -> dict:
-    """复用现有 build-bible（含无 LLM 时的离线兜底）。
+) -> tuple[dict, dict]:
+    """复用现有 build-bible（含无 LLM 时的离线兜底），并给角色补卡。
 
     把引导里的故事问答作为「创作者问答」传进去：大纲要按用户刚说的题材、
     写法、核心冲突、主角、世界约束、篇幅来构思，而不是只按 genre/style 猜。
+
+    返回 `(bible, card_stats)`。补卡失败不影响剧情圣经本身——引导必须能走完。
     """
     from app.routers.wizard import ExpertAnswersIn, build_bible
 
     qa = _story_brief(answers or {})
     body = ExpertAnswersIn(answers=qa) if qa else None
     bible = build_bible(project.id, body, db)
-    return bible if isinstance(bible, dict) else dict(bible)
+    bible = bible if isinstance(bible, dict) else dict(bible)
+    _apply_world_background(db, project, answers or {})
+    card_stats = _attach_character_cards(db, project, bible)
+    return bible, card_stats
+
+
+#: 引导提交时一次最多补多少张角色卡（异常大的角色表也不能打爆成本）。
+_MAX_WIZARD_CARDS = 12
+
+
+def _story_of(project: Project) -> dict[str, str]:
+    """角色卡生成用的故事背景（与 /character-cards/batch 同口径）。"""
+    return {
+        "title": project.title or "",
+        "genre": project.genre or "",
+        "style": project.style or "",
+        "premise": project.premise or "",
+    }
+
+
+def _attach_character_cards(
+    db: Session,
+    project: Project,
+    bible: dict,
+    *,
+    only_names: list[str] | None = None,
+    force: bool = False,
+    provider: Any = None,
+) -> dict:
+    """给剧情圣经里的角色批量补卡，写回 `characters[].card`。
+
+    设计取舍：角色卡的唯一权威就是 `plot_bible.characters[].card`，
+    不再镜像一份到 `story_cards`——两份同源数据一定会漂移。
+
+    只补没有声纹卡的角色；`force=True` 时连已有卡一起重生成（用户显式要求）。
+    任何失败都只返回 reason，不抛异常：补卡是增强，不能阻断引导。
+    """
+    chars = [c for c in (bible.get("characters") or []) if isinstance(c, dict)]
+    if not chars:
+        return {"generated": 0, "names": [], "missing": [], "collisions": 0,
+                "reason": "no_characters"}
+
+    wanted = {str(n).strip() for n in (only_names or []) if str(n).strip()}
+    known = {str(c.get("name") or "").strip() for c in chars}
+    targets: list[dict] = []
+    for c in chars:
+        name = str(c.get("name") or "").strip()
+        if not name:
+            continue
+        if wanted and name not in wanted:
+            continue
+        card = c.get("card")
+        # 用户手写的卡（来源=user）是权威：批量重生成不能覆盖，
+        # 只有用户在 UI 上点名这一张时才允许重写。
+        if (isinstance(card, dict) and card.get("来源") == "user"
+                and name not in wanted):
+            continue
+        if not force and isinstance(card, dict) and card.get("声纹"):
+            continue
+        targets.append(c)
+        if len(targets) >= _MAX_WIZARD_CARDS:
+            break
+
+    if not targets:
+        reason = ("unknown_names" if wanted and not (wanted & known)
+                  else "already_have_cards")
+        return {"generated": 0, "names": [], "missing": [], "collisions": 0,
+                "reason": reason}
+
+    if provider is not None:
+        providers = [provider]
+    else:
+        providers = []
+        try:
+            from app.llm.provider import get_llm_provider
+
+            providers.append(get_llm_provider())
+        except Exception:  # noqa: BLE001 —— 主渠道没配
+            pass
+        # 主渠道跑角色卡实测会偶发「远端直接断开」；抽取渠道（默认 zhipu）
+        # 是同一份 JSON 生成任务的可替代通道，失败时再试一次，不改变主链路。
+        try:
+            from app.llm.provider import get_kg_extract_provider
+
+            alt = get_kg_extract_provider()
+            if alt is not None and all(alt is not p for p in providers):
+                providers.append(alt)
+        except Exception:  # noqa: BLE001
+            pass
+        if not providers:
+            return {"generated": 0, "names": [], "missing": [], "collisions": 0,
+                    "reason": "provider_unavailable"}
+
+    from app.generation.character_card import voice_signature
+    from app.generation.character_card_gen import generate_cards, style_reference
+
+    # 生成前先记录旧 source 作为同步基线：重生成覆盖 card 后，仍能判断
+    # 设定卡里的字段是「上次同步值」还是「作者手改值」。
+    from app.generation.story_cards import character_fields_of
+
+    previous_fields = {
+        str(c.get("name") or "").strip().lower(): character_fields_of(c)
+        for c in targets
+        if str(c.get("name") or "").strip()
+    }
+
+    # 参考语料：蒸馏档案里的对白风格 / 人物声音 / 禁用表达。
+    # 没有选参考书或还没蒸馏时是空串，按原逻辑生成。
+    style_ref = style_reference(getattr(project, "style_narrative", None))
+
+    target_names = {str(c.get("name") or "").strip() for c in targets}
+    already: dict[str, Any] = {}
+    for c in chars:
+        name = str(c.get("name") or "").strip()
+        card = c.get("card")
+        if name and name not in target_names and isinstance(card, dict):
+            sig = voice_signature(card)
+            if sig:
+                already[name] = sig
+
+    wants = []
+    for c in targets:
+        name = str(c.get("name") or "").strip()
+        role = str(c.get("role") or "").strip()
+        wants.append(f"{name}：{role}" if role else name)
+
+    result: dict = {}
+    last_reason = "model_returned_no_cards"
+    for p in providers:
+        try:
+            result = generate_cards(
+                p, _story_of(project), wants, already=already,
+                style_ref=style_ref,
+                raise_errors=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_reason = f"generate_failed: {exc}"[:160]
+            continue
+        if result.get("角色"):
+            break
+        last_reason = "model_returned_no_cards"
+
+    cards = result.get("角色") or {}
+    if not cards:
+        return {"generated": 0, "names": [], "missing": [str(c.get("name") or "")
+                                                         for c in targets],
+                "collisions": 0, "reason": last_reason}
+    attached: list[str] = []
+    missing: list[str] = []
+    for c in targets:
+        name = str(c.get("name") or "").strip()
+        card = cards.get(name)
+        if not isinstance(card, dict) or not card:
+            missing.append(name)
+            continue
+        c["card"] = card
+        attached.append(name)
+
+    # 一次批量调用后仍缺卡：只对缺失角色再补一轮（最多一轮），不整批重跑。
+    collisions = result.get("冲突") or []
+    retried: list[str] = []
+    if missing:
+        retry_wants = list(missing)
+        retry_already = {
+            name: (card.get("声纹") or {})
+            for name, card in cards.items()
+            if isinstance(card, dict)
+        }
+        retry_collisions: list[dict] = []
+        for p in providers:
+            try:
+                retry = generate_cards(
+                    p, _story_of(project), retry_wants,
+                    already=retry_already, style_ref=style_ref,
+                    raise_errors=True,
+                )
+            except Exception as exc:  # noqa: BLE001 —— 补建失败不改变首轮结果
+                last_reason = f"retry_failed: {exc}"[:160]
+                continue
+            retry_cards = retry.get("角色") or {}
+            if not retry_cards:
+                continue
+            remaining: list[str] = []
+            for name in missing:
+                card = retry_cards.get(name)
+                if not isinstance(card, dict) or not card:
+                    remaining.append(name)
+                    continue
+                target = next(
+                    (c for c in targets
+                     if str(c.get("name") or "").strip() == name),
+                    None,
+                )
+                if target is None:
+                    remaining.append(name)
+                    continue
+                target["card"] = card
+                attached.append(name)
+                retried.append(name)
+            retry_collisions.extend(retry.get("冲突") or [])
+            missing = remaining
+            if not missing:
+                break
+        collisions = retry_collisions + collisions
+        if retried or missing:
+            logger.info(
+                "角色卡缺卡二次补建 project=%s retried=%s still_missing=%s",
+                getattr(project, "id", "?"), retried, missing,
+            )
+
+    if collisions:
+        bible["card_collisions"] = collisions[:8]
+    else:
+        bible.pop("card_collisions", None)
+
+    project.plot_bible = bible
+    # JSON 列是原地改的：不标脏时 SQLAlchemy 认为「同一个对象、值相等」而不发
+    # UPDATE，接口返回里有卡、库里却没有（实测）。
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(project, "plot_bible")
+    except Exception:  # noqa: BLE001 —— 测试里的假 project 没有 ORM 状态
+        pass
+    db.commit()
+
+    # 卡写回后同步进设定卡视图：按快照智能合并，作者手改字段保留；
+    # 同步失败不影响建卡（设定卡视图是展示层增强）。
+    try:
+        from app.generation.story_cards import sync_from_project
+
+        sync_from_project(db, project, previous_fields=previous_fields)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 —— 测试里的假 db 没有 rollback
+            pass
+
+    return {
+        "generated": len(attached),
+        "names": attached,
+        "missing": missing,
+        "retried": retried,
+        "collisions": len(collisions),
+        "reason": "" if attached else "model_returned_no_cards",
+    }
+
+
+@router.post("/{project_id}/character-cards/regenerate")
+def regenerate_character_cards(
+    project_id: int,
+    body: CardsRegenerateIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    """重新生成角色卡（names 为空 = 全部），写回剧情圣经。
+
+    与引导提交时同一套生成器；区别只有 `force=True`：用户显式点了重生成，
+    已有卡也要覆盖。生成失败返回 502，前端可以重试。
+    """
+    project = _require_project(db, project_id)
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    if not (bible.get("characters") or []):
+        raise HTTPException(status_code=409, detail="还没有剧情圣经，请先走完创作引导")
+
+    stats = _attach_character_cards(
+        db, project, bible, only_names=body.names or None, force=True)
+    if stats.get("reason") == "unknown_names":
+        raise HTTPException(status_code=400, detail="指定的角色不在剧情圣经里")
+    if not stats.get("generated"):
+        reason = stats.get("reason") or "模型没有返回可用角色卡"
+        raise HTTPException(status_code=502, detail=f"角色卡生成失败：{reason}")
+    message = f"已重新生成 {stats['generated']} 张角色卡。"
+    if stats.get("missing"):
+        message += f"以下角色这次没生成成功：{'、'.join(stats['missing'])}。"
+    return {
+        "ok": True,
+        "bible": project.plot_bible,
+        "character_cards": stats,
+        "message": message,
+    }
+
+
+@router.post("/{project_id}/character-cards/rebuild-with-archive")
+def rebuild_cards_with_archive(
+    project_id: int, db: Session = Depends(get_db)
+) -> dict:
+    """蒸馏完成后，用刚就绪的文风档案重建角色卡。
+
+    只重建剧情圣经里的角色卡，**不重建剧情圣经本身**——后者会覆盖作者已改的
+    世界观与人物设定。用户手写卡（来源=user）即使 force=True 也不会被覆盖。
+    """
+    project = _require_project(db, project_id)
+    if not isinstance(project.style_narrative, dict) or not project.style_narrative:
+        raise HTTPException(status_code=409, detail="文风档案还没就绪，等蒸馏完成后重试")
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    if not (bible.get("characters") or []):
+        raise HTTPException(status_code=409, detail="还没有剧情圣经，请先走完创作引导")
+
+    stats = _attach_character_cards(db, project, bible, force=True)
+    if not stats.get("generated"):
+        reason = stats.get("reason") or "模型没有返回可用角色卡"
+        raise HTTPException(status_code=502, detail=f"角色卡重建失败：{reason}")
+    message = f"已用文风档案重建 {stats['generated']} 张角色卡。"
+    if stats.get("missing"):
+        message += f"以下角色这次没生成成功：{'、'.join(stats['missing'])}。"
+    return {"ok": True, "character_cards": stats, "message": message}
+
+
+@router.delete("/{project_id}/characters/{name}")
+def remove_character(
+    project_id: int,
+    name: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """把角色从剧情圣经整体移除（同时清理涉及 TA 的关系）。
+
+    只改作者意图层：已有正文、KG 抽取结果不删；后续生成不再把 TA 当锁定角色。
+    """
+    project = _require_project(db, project_id)
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    chars = [c for c in (bible.get("characters") or []) if isinstance(c, dict)]
+    target = next(
+        (c for c in chars if str(c.get("name") or "").strip() == name), None)
+    if target is None:
+        logger.warning(
+            "角色移除被拒：不在剧情圣经里 project_id=%s name=%s", project_id, name)
+        raise HTTPException(status_code=404, detail="角色不在剧情圣经里")
+
+    bible["characters"] = [c for c in chars if c is not target]
+    removed_rel = 0
+    rels = bible.get("relationships")
+    if isinstance(rels, list):
+        kept = [
+            r for r in rels
+            if not (isinstance(r, dict) and name in (r.get("a"), r.get("b")))
+        ]
+        removed_rel = len(rels) - len(kept)
+        bible["relationships"] = kept
+    collisions = bible.get("card_collisions")
+    if isinstance(collisions, list):
+        kept_c = [
+            c for c in collisions
+            if not (isinstance(c, dict) and name in (c.get("人物") or []))
+        ]
+        if kept_c:
+            bible["card_collisions"] = kept_c
+        else:
+            bible.pop("card_collisions", None)
+
+    project.plot_bible = bible
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(project, "plot_bible")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        db.commit()
+    except Exception:
+        logger.exception(
+            "角色移除落库失败 project_id=%s name=%s", project_id, name)
+        raise
+
+    # 同步设定卡视图：未手改的镜像卡删除，手改过的停用保留。
+    retired = {"deleted": False, "disabled": False}
+    try:
+        from app.generation.story_cards import retire_story_card
+
+        retired = retire_story_card(db, project, name)
+        db.commit()
+    except Exception:  # noqa: BLE001 —— 同步失败不影响角色移除本身
+        logger.warning(
+            "角色移除后同步设定卡失败 project_id=%s name=%s", project_id, name)
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+    logger.info(
+        "角色已从剧情圣经移除 project_id=%s name=%s removed_relationships=%s "
+        "remaining_characters=%s",
+        project_id, name, removed_rel, len(bible["characters"]),
+    )
+    message = f"已从剧情圣经移除「{name}」"
+    if removed_rel:
+        message += f"，并清理 {removed_rel} 条相关关系"
+    message += "。正文与已有图谱不受影响，后续生成不再把 TA 当锁定角色。"
+    if retired.get("deleted"):
+        message += "对应设定卡已删除。"
+    elif retired.get("disabled"):
+        message += "对应设定卡已停用（保留手改内容）。"
+    return {
+        "ok": True,
+        "bible": project.plot_bible,
+        "removed_relationships": removed_rel,
+        "story_card": retired,
+        "message": message,
+    }
+
+
+@router.delete("/{project_id}/character-cards/{name}")
+def delete_character_card(
+    project_id: int,
+    name: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """删除一张角色卡（只删卡，角色仍保留在剧情圣经里）。"""
+    project = _require_project(db, project_id)
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    chars = [c for c in (bible.get("characters") or []) if isinstance(c, dict)]
+    target = next(
+        (c for c in chars if str(c.get("name") or "").strip() == name), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="角色不在剧情圣经里")
+    if not isinstance(target.get("card"), dict):
+        raise HTTPException(status_code=409, detail="这个角色还没有角色卡")
+
+    target.pop("card", None)
+    collisions = bible.get("card_collisions")
+    if isinstance(collisions, list):
+        kept = [
+            c for c in collisions
+            if not (isinstance(c, dict) and name in (c.get("人物") or []))
+        ]
+        if kept:
+            bible["card_collisions"] = kept
+        else:
+            bible.pop("card_collisions", None)
+
+    project.plot_bible = bible
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(project, "plot_bible")
+    except Exception:  # noqa: BLE001
+        pass
+    db.commit()
+    return {
+        "ok": True,
+        "bible": project.plot_bible,
+        "character_cards": {
+            "generated": 0, "names": [], "missing": [name],
+            "collisions": len(bible.get("card_collisions") or []),
+            "reason": "",
+        },
+        "message": f"已删除「{name}」的角色卡（角色仍在剧情圣经里，可随时重新生成）。",
+    }
+
+
+@router.put("/{project_id}/character-cards/{name}")
+def update_character_card(
+    project_id: int,
+    name: str,
+    body: CharacterCardIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    """手工保存一张角色卡（来源标记为 user，自动流程不再覆盖）。"""
+    project = _require_project(db, project_id)
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    if not (bible.get("characters") or []):
+        raise HTTPException(status_code=409, detail="还没有剧情圣经，请先走完创作引导")
+    if len(json.dumps(body.card, ensure_ascii=False)) > 20000:
+        raise HTTPException(status_code=413, detail="角色卡内容过长")
+
+    from app.generation.character_card import normalize_card
+
+    chars = [c for c in (bible.get("characters") or []) if isinstance(c, dict)]
+    target = next(
+        (c for c in chars if str(c.get("name") or "").strip() == name), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="角色不在剧情圣经里")
+    card = normalize_card(body.card)
+    if not card:
+        raise HTTPException(status_code=422, detail="角色卡内容为空")
+    # 保存前先算旧 source：同步时据此区分「上次同步值」与「作者手改值」。
+    from app.generation.story_cards import character_fields_of
+
+    previous_fields = {
+        str(name).strip().lower(): character_fields_of(target),
+    }
+    card["来源"] = "user"
+    target["card"] = card
+
+    project.plot_bible = bible
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(project, "plot_bible")
+    except Exception:  # noqa: BLE001
+        pass
+    db.commit()
+
+    # 保存角色卡后立即同步设定卡视图；失败只记日志，不影响保存本身。
+    try:
+        from app.generation.story_cards import sync_from_project
+
+        sync_from_project(db, project, previous_fields=previous_fields)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("角色卡保存后同步设定卡失败 project_id=%s name=%s", project_id, name)
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return {
+        "ok": True,
+        "bible": project.plot_bible,
+        "card": card,
+        "character_cards": {
+            "generated": 1, "names": [name], "missing": [],
+            "collisions": 0, "reason": "",
+        },
+        "message": f"已保存「{name}」的角色卡（手写，重生成全部不会覆盖）。",
+    }
 
 
 @router.post("/{project_id}/run")
@@ -1378,7 +2022,7 @@ def run(project_id: int, db: Session = Depends(get_db)) -> dict:
         )
     except chapter_labels.ChapterRangeError as exc:  # 先于 ValueError（子类）
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ValueError as exc:  # 未蒸馏等可操作错误：如实返回，不吞成 500
+    except ValueError as exc:  # 未提炼等可操作错误：如实返回，不吞成 500
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     produced = []

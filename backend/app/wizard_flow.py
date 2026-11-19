@@ -5,7 +5,7 @@
 - **每一步只问一件事**，卡片类型固定为 single / multi / number / text / confirm；
 - 每条问题都带一句 `why`，解释「为什么要问这个」，让不熟流程的人也能做决定；
 - 分支三条：原创 / 续写 / 角色对话，后续步骤由已选项动态决定
-  （例如没选参考语料就不问蒸馏档位）；
+  （例如没选参考语料就不问提炼档位）；
 - 支持回退（history 栈）、跳过有默认值的步骤、最后汇总确认。
 
 这里只做「下一步是哪题 / 这题长什么样 / 这个答案合不合法」，
@@ -98,7 +98,7 @@ CUSTOM_FIELDS = {"premise"}
 def step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> list[str]:
     """按分支与已选项算出完整步骤序列。
 
-    序列是**动态**的：选了语料才问蒸馏；项目本来就有参考语料或文风档案
+    序列是**动态**的：选了语料才问提炼；项目本来就有参考语料或文风档案
     才问「是否沿用原风格」。回退时用同一条序列反查上一题，保证前后一致。
 
     本轮引导的流程改写（`ctx["overrides"]`）在这里叠加，但**只做白名单
@@ -112,19 +112,19 @@ def step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
 
 def _base_step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> list[str]:
     if kind == KIND_ORIGINAL:
-        # 先问题材与写法，再问参考语料：用户说「我要写小说」时，先问清要写
-        # 什么，而不是先照着生产路径问「投喂哪本」。语料/蒸馏仍保留，只是
-        # 排到故事塑造之后，按题材族动态决定中间问哪几件。
-        steps = [FIRST_STEP, "genre"]
-        steps += story.plan_steps(answers, tuple(GENRE_HINTS))
-        steps.append("corpus")
+        # 先选参考语料：用户要求「语料放在前面」——后面生成的剧情圣经、角色卡、
+        # 章纲都要参考蒸馏档案，语料越早确定，蒸馏越有时间在提交前完成。
+        steps = [FIRST_STEP, "corpus"]
         corpus_ids = _corpus_ids(answers, ctx)
-        if corpus_ids:
-            steps.append("distill")
         if len(corpus_ids) > 1:
             # 多本参考语料才问：书级事实（物品/实体）按哪本读。
             # 单本不存在跨书歧义，问它只是多一步。
-            steps.insert(steps.index("corpus") + 1, "book_scope")
+            steps.append("book_scope")
+        if corpus_ids:
+            steps.append("distill")
+        # 再问题材与故事：此时语料已定，问答可围绕「像不像那本书」展开。
+        steps.append("genre")
+        steps += story.plan_steps(answers, tuple(GENRE_HINTS))
         steps += ["style", "length", "chapters", "outline", "confirm"]
         return steps
     if kind == KIND_CONTINUATION:
@@ -155,7 +155,11 @@ def _apply_overrides(steps: list[str], ctx: dict[str, Any]) -> list[str]:
     core = [s for s in base if s != confirm]
 
     # 换序：只动可动步骤，受保护步骤保持原相对位置（branch/corpus 在头部）。
-    seq = [s for s in (ov.get("order") or []) if s in core and s not in PROTECTED_STEPS]
+    # distill 不参与换序：它必须在 corpus 之后、且依赖已选语料。
+    seq = [
+        s for s in (ov.get("order") or [])
+        if s in core and s not in PROTECTED_STEPS and s != "distill"
+    ]
     if seq:
         head = [s for s in core if s in PROTECTED_STEPS]
         movable = [s for s in core if s not in PROTECTED_STEPS]
@@ -299,9 +303,10 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
     return body
 
 
-#: 允许「跳过 = 用默认值」的步骤。必答项（方向、语料、确认）不在其中。
-#: 书级事实默认「不指定（合并读）」，跳过等于保持合并读，因此可跳。
+#: 允许「跳过 = 用默认值」的步骤。方向与确认不可跳过；语料可跳过，
+#: 默认值 = 空列表（等价于「不投喂，自由生成」）。
 SKIPPABLE = {
+    "corpus",
     "genre",
     "pov",
     "premise",
@@ -353,7 +358,7 @@ def _msg_story(step: str, kind: str | None, answers: dict[str, Any], ctx: dict[s
 def _msg_branch(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
     return (
         "先定方向，因为三条路要填的参数完全不同：原创是从零起一本新书，后面要定语料、"
-        "蒸馏档位、题材、风格、字数和这次写几段；续写是接着你已有正文的结尾往下写，"
+        "提炼档位、题材、风格、字数和这次写几段；续写是接着你已有正文的结尾往下写，"
         "只问起点和篇幅；角色对话不出正文，是我用书里某个角色的口吻跟你聊，只问是谁、"
         "在什么情境下。\n\n"
         "如果你手上还没正文、也没想好要不要仿写某本书，选原创最稳——它会把该定的都定下来，"
@@ -371,8 +376,8 @@ def _msg_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) 
         )
         opening = (
             f"这里有 {len(novels)} 本已上传的语料可选（可多选）：{sizes}。"
-            "选了会怎样：蒸馏把它的句长、对话密度、场景切换节奏和角色说话方式提炼成文风档案，"
-            "写出来更贴那本书；代价是蒸馏要跑模型，选中几本就按合计章数叠时间。"
+            "选了会怎样：提炼把它的句长、对话密度、场景切换节奏和角色说话方式提炼成文风档案，"
+            "写出来更贴那本书；代价是提炼要跑模型，选中几本就按合计章数叠时间。"
         )
     else:
         opening = (
@@ -382,7 +387,7 @@ def _msg_corpus(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) 
     return (
         opening
         + "\n\n"
-        "不投喂的好处是快、可控：生成时不用等蒸馏，风格靠题材和平台调性兜。"
+        "不投喂的好处是快、可控：生成时不用等提炼，风格靠题材和平台调性兜。"
         "如果你想「像某本书那样写」，就选那本书；只是想要个能读的故事，可以不投喂。"
     )
 
@@ -417,7 +422,7 @@ def _msg_distill(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
         opening = (
             f"你这个项目投喂的是{names}，合计 {total} 章 / "
             f"{(int(ctx.get('corpus_total_chars') or 0)) / 10000:.1f} 万字。"
-            "蒸馏会把它的句长、对白密度、场景切换节奏、角色说话方式压成一份档案，"
+            "提炼会把它的句长、对白密度、场景切换节奏、角色说话方式压成一份档案，"
             "写正文时注入提示词。"
         )
     else:
@@ -456,16 +461,16 @@ def _msg_distill(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
             "砍掉节拍序列、潜台词模式两个维度（13→11），角色名完全不清洗；"
             "只适合先验证管线通不通，不建议拿它出成品。",
         ),
-        "选哪一档，接下来都是同一条链：起后台蒸馏任务 → 项目工作台显示逐块进度 → "
+        "选哪一档，接下来都是同一条链：起后台提炼任务 → 项目工作台显示逐块进度 → "
         "跑完才允许写正文（没跑完去生成会直接 409）。",
     ]
 
     if full:
         parts.append(
-            "另外，你之前提过「全本完整蒸馏」：代码里并没有第四个档位，完整档本身就是"
+            "另外，你之前提过「全本完整提炼」：代码里并没有第四个档位，完整档本身就是"
             f"按语料 {int((full.get('sample_ratio') or 0) * 100)}% 采样。"
             f"但我可以直接把采样章数覆盖成这批语料共 {total} 章（说「采样改成全本」），"
-            "或者压到 200 章（说「采样改成 200 章」）。这个覆盖会进蒸馏指纹，"
+            "或者压到 200 章（说「采样改成 200 章」）。这个覆盖会进提炼指纹，"
             "改完必须重跑才会生效——不会偷偷复用旧档案。"
         )
 
@@ -605,7 +610,7 @@ def _msg_scene(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
 
 def _msg_confirm(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
     return (
-        "下面是这次的全部参数，确认后我会写回项目：该蒸馏的先起蒸馏任务、"
+        "下面是这次的全部参数，确认后我会写回项目：该提炼的先起提炼任务、"
         "该出大纲的先出大纲，之后才轮到写正文。\n\n"
         "想改哪一项，直接点那一行跳回去，或者告诉我「上一步」。"
     )
@@ -683,7 +688,7 @@ def ack_for(step: str, value: Any, answers: dict[str, Any], ctx: dict[str, Any])
         return f"好，事实来源书定为《{name}》，物品持有按它读。"
     if step == "distill":
         if value == DISTILL_REUSE:
-            return "好，沿用现有档案，不用重跑蒸馏，秒级完成。"
+            return "好，沿用现有档案，不用重跑提炼，秒级完成。"
         for t in ctx.get("tiers") or []:
             if t["key"] == value:
                 est = t.get("estimated_minutes")
@@ -698,7 +703,7 @@ def ack_for(step: str, value: Any, answers: dict[str, Any], ctx: dict[str, Any])
                 if t["key"] == "balanced":
                     return f"好，平衡档，{detail}（维度齐全，但不做角色名归一化）。"
                 return f"好，快速档，{detail}，只够验证管线，出成品前建议换档重跑。"
-        return f"好，蒸馏档位记为 {value}。"
+        return f"好，提炼档位记为 {value}。"
     if step.startswith(CUSTOM_PREFIX):
         return "好，记下了，会写进项目简介。" if value else "好，这条先空着。"
     if step == "genre":
@@ -898,13 +903,13 @@ def _q_distill(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
             {
                 "value": DISTILL_REUSE,
                 "label": "沿用现有档案（不重跑）",
-                "desc": "项目里已有蒸馏结果，直接复用，秒级完成",
+                "desc": "项目里已有提炼结果，直接复用，秒级完成",
             }
         )
     return {
-        "title": "文风蒸馏做到什么程度？",
+        "title": "文风提炼做到什么程度？",
         "why": (
-            "蒸馏把参考语料提炼成可复用的文风档案，档位越高越像原著、也越慢越贵。"
+            "提炼把参考语料提炼成可复用的文风档案，档位越高越像原著、也越慢越贵。"
             "选了语料时，生成前必须先有档案，所以我不会给你「跳过」这个选项。"
         ),
         "card": {
@@ -1211,7 +1216,7 @@ def validate(
                 raise AnswerError("当前项目还没有可沿用的文风档案")
             return value
         if value not in valid:
-            raise AnswerError(f"蒸馏档位只能是 {' / '.join(sorted(valid))}")
+            raise AnswerError(f"提炼档位只能是 {' / '.join(sorted(valid))}")
         return value
 
     if step == "genre":
@@ -1328,11 +1333,11 @@ def echo_label(step: str, value: Any, kind: str | None, ctx: dict[str, Any]) -> 
         return f"{label}：{titles.get(int(value), f'#{value}')}"
     if step == "distill":
         if value == DISTILL_REUSE:
-            return "蒸馏：沿用现有档案"
+            return "提炼：沿用现有档案"
         for t in ctx.get("tiers") or []:
             if t["key"] == value:
-                return f"蒸馏：{t['name']}档"
-        return f"蒸馏：{value}"
+                return f"提炼：{t['name']}档"
+        return f"提炼：{value}"
     if step == "length":
         return f"{value} 字"
     if step == "chapters":
@@ -1362,7 +1367,7 @@ def summary_rows(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
         if len(_corpus_ids(answers, ctx)) > 1:
             add("book_scope", "事实来源书", answers.get("book_scope", BOOK_SCOPE_NONE))
         if _has_corpus(answers, ctx):
-            add("distill", "蒸馏档位", answers.get("distill"))
+            add("distill", "提炼档位", answers.get("distill"))
         add("genre", "题材", answers.get("genre") or "未选")
         # 故事塑造项：只展示真正答过/预填过的，顺序跟本轮题材计划一致。
         for step in story.plan_steps(answers, tuple(GENRE_HINTS)):
@@ -1379,7 +1384,7 @@ def summary_rows(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
         if len(_corpus_ids(answers, ctx)) > 1:
             add("book_scope", "续写书", answers.get("book_scope", BOOK_SCOPE_NONE))
         if ctx.get("needs_distill"):
-            add("distill", "蒸馏档位", answers.get("distill"))
+            add("distill", "提炼档位", answers.get("distill"))
         add("length", "单段字数", answers.get("length", ctx.get("generation_length") or 3000))
         add("chapters", "本次段数", answers.get("chapters", 1))
     elif kind == KIND_ROLE:

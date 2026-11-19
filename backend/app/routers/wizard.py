@@ -194,6 +194,34 @@ def expert_questions(project_id: int, db: Session = Depends(get_db)) -> dict:
     return {"questions": _coerce_string_list(data, "questions", 8)}
 
 
+def _bible_user_prompt(
+    proj: Project,
+    answers: dict,
+    sample: str,
+    digest: str,
+) -> str:
+    """剧情圣经的 user prompt（纯函数，便于测试注入顺序）。"""
+    user_p = _genre_style_text(proj)
+    if proj.premise:
+        user_p += f"\n大概内容：{proj.premise}"
+    if answers:
+        qa = "\n".join(f"Q：{k}\nA：{v}" for k, v in answers.items())
+        user_p += f"\n—— 创作者问答 ——\n{qa}"
+    if digest:
+        user_p += (
+            "\n—— 蒸馏文风档案（参考语料的叙事节奏与对白手法，"
+            "只借写法，不要照搬情节、人名、专名） ——\n"
+            f"{digest}"
+        )
+    if sample:
+        # 有蒸馏档案时原始样本只作纹理补充，避免提示词膨胀。
+        user_p += (
+            "\n—— 参考语料风格样本（仅取风格纹理） ——\n"
+            f"{sample[:1200 if digest else 2000]}"
+        )
+    return user_p
+
+
 @router.post("/{project_id}/build-bible", response_model=PlotBibleOut)
 def build_bible(
     project_id: int, body: ExpertAnswersIn | None = None, db: Session = Depends(get_db)
@@ -202,6 +230,17 @@ def build_bible(
     proj = _require_project(db, project_id)
     answers = (body.answers if body else None) or {}
     sample = _style_sample(db, proj.reference_novel_ids)
+    # 蒸馏档案优先：它把参考语料的叙事节奏/对白规则压成了可执行条目。
+    try:
+        from app.style.narrative import narrative_digest
+
+        digest = narrative_digest(
+            getattr(proj, "style_narrative", None),
+            max_chars=2400,
+            allowed_novel_ids=proj.reference_novel_ids,
+        )
+    except Exception:  # noqa: BLE001 —— 档案不可用不阻断构思
+        digest = ""
 
     if not _has_real_llm():
         bible = _offline_bible(proj, answers)
@@ -210,6 +249,7 @@ def build_bible(
             sys_p = (
                 "你是网文主编。综合用户给的类型、风格平台调性、大概内容（与可选的追问答案）、"
                 "以及参考语料的风格样本，为这部小说构思一份「剧情圣经」。\n"
+                "若提供了蒸馏文风档案，优先遵循其中的叙事节奏与对白规则。\n"
                 "严格输出 JSON：\n"
                 "{\"synopsis\": 完整剧情梗概(300字内), "
                 "\"characters\": [{\"name\":角色名,\"role\":身份设定,\"motivation\":核心动机}], "
@@ -219,14 +259,7 @@ def build_bible(
                 "\"foreshadowing\": [伏笔1, 伏笔2]}\n"
                 "要求：角色名用中文；关系要具体；foreshadowing 是『暂不打烊的悬念』，不要在此兑现。"
             )
-            user_p = _genre_style_text(proj)
-            if proj.premise:
-                user_p += f"\n大概内容：{proj.premise}"
-            if answers:
-                qa = "\n".join(f"Q：{k}\nA：{v}" for k, v in answers.items())
-                user_p += f"\n—— 创作者问答 ——\n{qa}"
-            if sample:
-                user_p += f"\n—— 参考语料风格样本（仅取风格纹理） ——\n{sample[:2000]}"
+            user_p = _bible_user_prompt(proj, answers, sample, digest)
             txt = get_llm_provider().chat(sys_p, user_p)
             bible = _safe_parse(txt, _offline_bible(proj, answers))
         except Exception:  # noqa: BLE001 - 限流等异常：降级本地圣经，保证向导闭环

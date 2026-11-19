@@ -77,7 +77,7 @@ def dimension_inventory() -> dict[str, Any]:
 
 
 def estimate_minutes(sampled_chars: int) -> dict[str, Any]:
-    """按唯一实测点、按**待蒸馏字数**外推预计耗时（分钟）。"""
+    """按唯一实测点、按**待提炼字数**外推预计耗时（分钟）。"""
     chars = max(0, int(sampled_chars))
     minutes = max(1, math.ceil(chars * _MINUTES_PER_CHAR))
     return {
@@ -207,7 +207,7 @@ def _novel_stats(db: Session, ids: list[int]) -> list[dict[str, Any]]:
 
 
 def archive_facts(project) -> dict[str, Any] | None:
-    """项目里已有蒸馏档案的真实内容摘要。"""
+    """项目里已有提炼档案的真实内容摘要。"""
     profile = getattr(project, "style_narrative", None)
     if not isinstance(profile, dict) or not profile:
         return None
@@ -234,7 +234,7 @@ def archive_facts(project) -> dict[str, Any] | None:
 
 
 def distill_context(db: Session, project) -> dict[str, Any]:
-    """蒸馏这一步讲解所需的全部事实（供 wizard_flow / wizard_chat 使用）。"""
+    """提炼这一步讲解所需的全部事实（供 wizard_flow / wizard_chat 使用）。"""
     ids = [int(i) for i in (getattr(project, "reference_novel_ids", None) or [])]
     books = _novel_stats(db, ids)
     total_chapters = sum(b["chapters"] for b in books)

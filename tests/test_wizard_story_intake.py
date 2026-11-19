@@ -96,14 +96,14 @@ def _say(client: TestClient, project_id: int, text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_bare_write_novel_is_original_and_asks_genre():
+def test_bare_write_novel_is_original_and_asks_corpus():
     out = _parse("branch", "我要写一篇小说", {})
     assert out["kind"] == "answer", out
     assert out["value"] == flow.KIND_ORIGINAL, out
 
     answers = {"branch": flow.KIND_ORIGINAL}
     nxt = flow.next_step(flow.KIND_ORIGINAL, "branch", answers, dict(CTX))
-    assert nxt == "genre", f"下一题不是题材，而是 {nxt}"
+    assert nxt == "corpus", f"下一题不是语料，而是 {nxt}"
 
 
 def test_genre_word_without_novel_word_is_original():
@@ -196,7 +196,7 @@ def test_bypass_fills_defaults_and_reaches_confirm(db_session):
     proj = _project(db_session)
     client = TestClient(fastapi_app)
     _start(client, proj.id)
-    assert _say(client, proj.id, "我要写一篇小说")["session"]["step_key"] == "genre"
+    assert _say(client, proj.id, "我要写一篇小说")["session"]["step_key"] == "corpus"
 
     body = _say(client, proj.id, "别问了")
     assert body["mode"] == "answered", body
@@ -248,7 +248,7 @@ def test_end_to_end_from_one_sentence_to_premise_and_bible(db_session):
     client = TestClient(fastapi_app)
     _start(client, proj.id)
 
-    assert _say(client, proj.id, "我要写一篇小说")["session"]["step_key"] == "genre"
+    assert _say(client, proj.id, "我要写一篇小说")["session"]["step_key"] == "corpus"
 
     body = _say(
         client,
@@ -265,9 +265,9 @@ def test_end_to_end_from_one_sentence_to_premise_and_bible(db_session):
     for step in ("pov", "premise", "protagonist", "world", "power", "scale"):
         assert step in answers, f"{step} 未被一句话吸收：{answers}"
         assert step in (answers.get("_auto") or []), f"{step} 没进 _auto：{answers}"
-    # 故事信息已齐 → 进入语料/参数，不再回头问题材与写法。
-    assert body["session"]["step_key"] == "corpus", body["session"]
-    assert _say(client, proj.id, "不投喂")["session"]["step_key"] == "style"
+    # 故事信息已齐；语料在同一句按「不投喂」落库 → 直接进入风格参数。
+    assert answers["corpus"] == [], answers
+    assert body["session"]["step_key"] == "style", body["session"]
     assert _say(client, proj.id, "番茄")["session"]["step_key"] == "length"
     assert _say(client, proj.id, "3000 字")["session"]["step_key"] == "chapters"
     resp = client.post(
