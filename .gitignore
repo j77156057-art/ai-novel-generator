@@ -48,6 +48,8 @@ experiments/*
 worktrees/
 minimax-vol1/
 frontend/ui-preview/
+# 静态展示站点（宣传物料，含 7.7MB demo.webm）：本地预览产物，不入库
+/site/
 
 # 例外：被其他实验 import 的共享脚本入库（产物、探针、生成章节仍忽略）。
 # 归属清单见 experiments/2026-11-07-e2e-generation/exp_manifest.py 的 OWNERSHIP。
