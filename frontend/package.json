@@ -8,6 +8,8 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "test:corpus-status": "node --test tests/corpusStatus.test.mjs",
     "test:kg-chapter": "node --test tests/kgChapter.test.mjs",
     "test:structure-status": "node --test tests/structureStatus.test.mjs"
@@ -20,8 +22,11 @@
     "@tsconfig/node22": "^22.0.0",
     "@types/node": "^22.10.2",
     "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.6.0",
+    "happy-dom": "^21.0.4",
     "typescript": "^5.7.2",
     "vite": "^6.0.5",
+    "vitest": "^5.1.1",
     "vue-tsc": "^3.3.14"
   }
 }
