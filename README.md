@@ -119,6 +119,16 @@ Every segment also receives the author-side layer: `plot_bible.background`（一
 - **语料前置的引导**：顺序为方向 → 参考语料 → 蒸馏档位 → 题材/故事 → 风格/篇幅/章数/大纲；
   答完蒸馏步骤就后台开跑。剧情圣经与章纲 AI 起草优先读取蒸馏档案，
   蒸馏完成后再用档案重建角色卡也不会覆盖手写卡。
+- **生成可信度**：计划未就绪（规划失败 / 仍是占位节点）时，`planning_guard_mode` 可在
+  「只报告」与「409 `needs_planning` 阻断」之间切换；扩展规划只允许在权威清单内追加，
+  段号不复用。每段落库前记段契约，手动改正文后自动重算总结 / 摘要树 / 图谱，
+  `GET /api/projects/{id}/generation-status` 可查最近一次生成状态。
+- **KG 角色名过滤**：抽取侧对 2–4 字候选做形态与功能词校验、剔除职业泛称；judge 按书域隔离，
+  参考语料里的角色不会被当成作者自己书里的人物。
+- **长期记忆**：`assistant_memories` 存作者明确要求记住的偏好（人称、称呼、禁忌），
+  每次问答整段进提示词；历史对话可用 `scripts/backfill_assistant_memory.py` 一次性回填。
+- **工作台交互**：顶部双轨工作流条展示蒸馏 / 大纲 / 正文各步完成度；KG 工作台分栏 +
+  标签懒加载；章纲支持行内编辑；助手工作台支持角色卡弹窗编辑、会话历史与长期记忆。
 
 ---
 
@@ -130,7 +140,7 @@ Every segment also receives the author-side layer: `plot_bible.background`（一
 | Storage | **SQLite（默认，零配置）** · PostgreSQL + **pgvector**（可选，生产规模向量检索） |
 | Retrieval | Pure-Python **BM25 × dense-vector RRF fusion** |
 | Knowledge graph | LLM soft-schema extractor (v3.0, 批量合并抽取) + deterministic rule extractor 作离线兜底 |
-| Generation | Layered-prior engine + segment summary chain |
+| Generation | Layered-prior engine + segment summary chain · **planning guard / segment contracts** |
 | Style | **Globally-shared distillation library**, 3 tiers, idempotent upsert |
 | Frontend | **Vue 3 + Vite + TypeScript**, semantic design tokens (WCAG AA) |
 | Agents | Writer/Assistant role isolation, `ProviderRegistry` two-track, proposal/approval workflow · **LangGraph approval subgraph**（approve / reject / apply，状态机仍为唯一事实来源） |
@@ -296,6 +306,10 @@ distillation library and the dual-model agent workflow.
 工作台的写作执行看板与 KG 登记交互）；LangGraph 审批子图
 （`app/agents/approval_graph.py`，只承载单条 approve / reject / apply 的状态转移；
 批量 apply-selected 与版本回滚仍走显式实现，Writer 主链路不变）。
+
+**Shipped 2026-11（生成可信度与工作台）：** 规划就绪闸与权威内扩展规划、段契约、
+手动改稿后重同步总结 / 摘要树 / 图谱、叙事 digest；KG 角色名过滤与 judge 书域隔离；
+向导角色卡增删改与步骤自愈；双轨工作流条、KG 分栏与章纲行内编辑；长期记忆与历史回填脚本。
 
 > AI 腔检测已接入重写反馈链路（解决方案库、复发计数与复读闸门）。
 > 审批状态机仍是唯一事实来源（`ALLOWED_TRANSITIONS`），子图只负责编排。
