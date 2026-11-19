@@ -109,7 +109,7 @@ export function workflowTracks(
 
 /** 动作提案的种类 → 人话（界面不出现 kind 字符串）。 */
 const ACTION_KIND_LABELS: Record<string, string> = {
-  start_distill: "启动文风蒸馏",
+  start_distill: "启动文风提炼",
   plan_outline: "规划剧情大纲",
   extend_plan: "扩展规划",
   invoke_generation: "写正文",

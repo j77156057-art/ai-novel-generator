@@ -32,6 +32,7 @@ import {
   proposalTargetLabel as targetLabel,
   workflowTracks,
 } from "@/utils/workflowDisplay";
+import type { WorkflowTrackView } from "@/utils/workflowDisplay";
 
 const props = defineProps<{ projectId: number }>();
 
@@ -47,6 +48,32 @@ const error = ref<string | null>(null);
 const tracks = computed(() =>
   state.value ? workflowTracks(state.value.steps, state.value.current_step) : [],
 );
+
+/**
+ * 总进度：已完成工序 / 全部工序。
+ *
+ * 为什么可以直接按工序数算：工序链本身就是「先备料再写正文」的线性流程，
+ * 每一步的完成状态由服务端重新评估得出（不是日志里的一句话）。这里只做
+ * 除法，不猜权重 —— 「备齐提示词」和「写正文」同样算一步，比例才不会被
+ * 主观权重带偏。
+ */
+const progress = computed(() => {
+  const steps = state.value?.steps ?? [];
+  const done = steps.filter((s) => s.state === "done").length;
+  const total = steps.length;
+  return {
+    done,
+    total,
+    pct: total ? Math.round((done / total) * 100) : 0,
+    blocked: steps.some((s) => s.state === "blocked"),
+  };
+});
+
+/** 每条轨自己走了几步（「4/5」这种，比一排色块更好读）。 */
+function laneDone(track: WorkflowTrackView): string {
+  const done = track.steps.filter((item) => item.step.state === "done").length;
+  return `${done}/${track.steps.length}`;
+}
 
 /** 等着你处理的改动。 */
 const openProposals = computed<WorkflowPendingProposal[]>(
@@ -80,7 +107,7 @@ const openHistoryDiffId = ref<number | null>(null);
  * 为什么：这个面板在对话框**上面**，展开成九条会把输入框顶出屏幕。
  * 紧凑条一行就能看完「走到哪、卡在哪」，细节按需展开。
  */
-const showSteps = ref(false);
+const expanded = ref(false);
 const showHistory = ref(false);
 
 function toggleHistoryDiff(proposal: AssistantProposal): void {
@@ -237,8 +264,9 @@ async function actAction(
     <div class="card-title">
       全流程进度
       <span class="row tight">
-        <button class="link-btn" @click="showSteps = !showSteps">
-          {{ showSteps ? "收起" : "展开" }}
+        <span v-if="state" class="wf-pct-compact">{{ progress.pct }}%</span>
+        <button class="link-btn" @click="expanded = !expanded">
+          {{ expanded ? "收起" : "展开" }}
         </button>
         <button class="link-btn" :disabled="loading" @click="load">
           {{ loading ? "刷新中…" : "刷新" }}
@@ -250,23 +278,43 @@ async function actAction(
     <div v-else-if="!state" class="muted">读取工序状态…</div>
 
     <template v-else>
-      <!-- 紧凑条：一行看完「走到哪、卡在哪」。详情默认收起 ——
-           展开成九条会把下面的对话框顶出屏幕。 -->
-      <div class="wf-compact">
-        <span v-for="track in tracks" :key="track.id" class="wf-compact-track">
-          <span class="wf-compact-label">{{ track.title }}</span>
-          <span
-            v-for="item in track.steps"
-            :key="item.step.id"
-            class="wf-mini"
-            :class="item.tone"
-            :title="`${item.step.title}｜${item.label}｜${item.step.reason}`"
-          />
-        </span>
-        <span class="wf-compact-now" :title="state.summary">{{ state.summary }}</span>
+      <!-- 进度条：一条总进度 + 两条轨的分段细条。
+           段=一道工序，填充=已完成；当前步加一圈描边。 -->
+      <div class="wf-progress" :class="{ 'wf-blocked-flow': progress.blocked }">
+        <div class="wf-progress-top">
+          <span class="wf-progress-label">写作进度</span>
+          <span class="wf-progress-pct">{{ progress.pct }}%</span>
+        </div>
+        <div
+          class="wf-progress-bar"
+          role="progressbar"
+          :aria-valuenow="progress.pct"
+          aria-valuemin="0"
+          aria-valuemax="100"
+        >
+          <span class="wf-progress-fill" :style="{ width: progress.pct + '%' }" />
+        </div>
+
+        <div v-if="expanded" class="wf-lanes">
+          <div v-for="track in tracks" :key="track.id" class="wf-lane">
+            <span class="wf-lane-title">{{ track.title }}</span>
+            <span class="wf-lane-segs">
+              <span
+                v-for="item in track.steps"
+                :key="item.step.id"
+                class="wf-seg"
+                :class="[item.tone, { 'wf-seg-current': item.current }]"
+                :title="`${item.step.title}｜${item.label}｜${item.step.reason}`"
+              />
+            </span>
+            <span class="wf-lane-count">{{ laneDone(track) }}</span>
+          </div>
+        </div>
+
+        <p class="wf-progress-note" :title="state.summary">{{ state.summary }}</p>
       </div>
 
-      <template v-if="showSteps">
+      <template v-if="expanded">
         <!-- 两条轨：先备提示词，再写正文。分组是为了让顺序一眼可见。 -->
         <div v-for="track in tracks" :key="track.id" class="wf-track-row">
           <div class="wf-track-title">{{ track.title }}</div>
@@ -284,11 +332,11 @@ async function actAction(
           </span>
         </div>
       </div>
+      </template>
 
       <div v-if="state.needs_decision" class="notice info">
         需要你定：{{ state.needs_decision.title }} —— {{ state.needs_decision.question }}
       </div>
-      </template>
     </template>
   </section>
 
@@ -418,49 +466,124 @@ async function actAction(
   margin-bottom: 16px;
 }
 
-/* 紧凑条：一行看完「走到哪、卡在哪」。 */
-.wf-compact {
+/* ---------- 写作进度：总进度条 + 两条轨的分段细条 ---------- */
+.wf-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wf-progress-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.wf-progress-label {
+  font-family: var(--font-display);
+  font-size: var(--fs-md);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.wf-progress-pct {
+  color: var(--accent-ink);
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.wf-pct-compact {
+  color: var(--accent-ink);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.wf-progress-bar {
+  height: 8px;
+  border-radius: var(--radius-full);
+  background: var(--bg-sunken);
+  border: var(--border-w) solid var(--border);
+  overflow: hidden;
+}
+.wf-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-hover) 100%);
+  transition: width 0.4s var(--ease-out-quart);
+}
+/* 卡住时不改整条的颜色：朱砂本身就是品牌色，再变红会让人分不清
+   「正常在写」和「出问题了」。卡点只标在对应那一段，并写进下面那句话。 */
+.wf-blocked-flow .wf-progress-pct {
+  color: var(--danger);
+}
+
+.wf-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wf-lane {
   display: flex;
   align-items: center;
   gap: 10px;
-  flex-wrap: wrap;
-}
-.wf-compact-track {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.wf-compact-label {
   font-size: var(--fs-xs);
-  color: var(--muted, rgba(127, 127, 127, 0.95));
-  margin-right: 2px;
+  color: var(--fg-muted);
 }
-.wf-mini {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--line, rgba(127, 127, 127, 0.5));
-}
-.wf-mini.wf-done {
-  background: var(--ok, #2f9e6b);
-}
-.wf-mini.wf-pending {
-  background: var(--accent, #4a7dff);
-}
-.wf-mini.wf-blocked {
-  background: var(--err, #d4574f);
-}
-.wf-mini.wf-skip {
-  opacity: 0.35;
-}
-.wf-compact-now {
-  flex: 1 1 220px;
-  min-width: 0;
-  font-size: var(--fs-sm);
-  color: var(--muted, rgba(127, 127, 127, 0.95));
-  overflow: hidden;
-  text-overflow: ellipsis;
+.wf-lane-title {
+  flex: none;
+  width: 6.4em;
   white-space: nowrap;
+}
+.wf-lane-segs {
+  flex: 1 1 auto;
+  display: flex;
+  gap: 3px;
+  min-width: 0;
+}
+/* 一段 = 一道工序。比一排圆点更像「阅读进度」，也更容易看出还剩几段。
+   未做的段也要有形状（浅底 + 细描边），否则在米色卡片上会被读成「空隙」。 */
+.wf-seg {
+  flex: 1 1 0;
+  height: 8px;
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+}
+.wf-seg.wf-done {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.wf-seg.wf-pending {
+  background: var(--bg-sunken);
+  border-color: var(--border-strong);
+}
+.wf-seg.wf-blocked {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+.wf-seg.wf-skip {
+  background: transparent;
+  border-color: var(--border-strong);
+  border-style: dashed;
+}
+/* 当前该动的那一段：描边而不是换色，色相仍表示状态。 */
+.wf-seg-current {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 1px;
+}
+.wf-lane-count {
+  flex: none;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+.wf-progress-note {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+.wf-blocked-flow .wf-progress-note {
+  color: var(--danger);
 }
 
 .wf-track-row + .wf-track-row {
@@ -469,7 +592,7 @@ async function actAction(
 
 .wf-track-title {
   font-size: var(--fs-xs);
-  color: var(--muted, rgba(127, 127, 127, 0.95));
+  color: var(--fg-muted);
   margin-bottom: 4px;
 }
 
@@ -483,29 +606,30 @@ async function actAction(
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
-  border: 1px solid var(--line, rgba(127, 127, 127, 0.25));
-  border-radius: 999px;
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius-full);
   font-size: var(--fs-xs);
   line-height: 1.6;
+  color: var(--fg-muted);
 }
 
 .wf-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--line, rgba(127, 127, 127, 0.5));
+  background: var(--border-strong);
 }
 
 .wf-done .wf-dot {
-  background: var(--ok, #2f9e6b);
+  background: var(--ok);
 }
 
 .wf-pending .wf-dot {
-  background: var(--accent, #4a7dff);
+  background: var(--accent);
 }
 
 .wf-blocked .wf-dot {
-  background: var(--err, #d4574f);
+  background: var(--danger);
 }
 
 .wf-skip {
@@ -514,8 +638,9 @@ async function actAction(
 
 /* 当前该动的那一步：描边 + 底色，不只靠颜色区分。 */
 .wf-current {
-  border-color: var(--accent, #4a7dff);
-  background: rgba(74, 125, 255, 0.08);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
   font-weight: 600;
 }
 
