@@ -3,7 +3,7 @@
 ## 为什么单独一张表
 
 `EditProposal` 回答「**改哪些字**」；动作提案回答「**做什么事**」
-（启动蒸馏 / 规划大纲 / 扩展规划 / 调动生成）。动作提案没有 before/after，
+（启动提炼 / 规划大纲 / 扩展规划 / 调动生成）。动作提案没有 before/after，
 它的漂移判据是「**前提**」变了没有 —— 前提变了就置 `stale` + 409，
 不静默重算、不覆盖。
 
@@ -89,17 +89,17 @@ def _written_segments(db: Any, project: Any) -> int:
 
 def _precondition_start_distill(db: Any, project: Any,
                                  params: Mapping[str, Any]) -> tuple[str, str]:
-    """启动蒸馏的前提：**语料**没被动过。
+    """启动提炼的前提：**语料**没被动过。
 
     用仓库既有的 `corpus_content_hash`（语料正文 + 清洗版本的规范指纹）：
-    它已经被蒸馏库的复用查找当键用，另算一套会在「语料顺序/重切」时对不上。
+    它已经被文风档案库的复用查找当键用，另算一套会在「语料顺序/重切」时对不上。
     """
     from app.style.narrative import corpus_content_hash
     ids = [int(i) for i in (params.get('source_ids')
                             or (project.reference_novel_ids or []))]
     if not ids:
         raise ActionProposalError('missing_reference_corpus',
-                                  '没有参考语料，起不了蒸馏。')
+                                  '没有参考语料，起不了提炼。')
     fingerprint = corpus_content_hash(ids, db)
     return fingerprint, '参考语料的内容与清洗版本（动了就得重算）'
 
@@ -376,7 +376,7 @@ def _exec_plan_outline(db: Any, project: Any, proposal: Any, *,
 def _exec_start_distill(db: Any, project: Any, proposal: Any, *,
                         actor: str | None = None,
                         background_tasks: Any = None) -> dict[str, Any]:
-    """启动文风蒸馏（后台跑，跟 `POST /api/projects/{id}/distill` 同一套作业）。"""
+    """启动文风提炼（后台跑，跟 `POST /api/projects/{id}/distill` 同一套作业）。"""
     body = proposal.body_json if isinstance(proposal.body_json, dict) else {}
     tier = str(body.get('tier') or getattr(project, 'narrative_tier', None) or 'full')
     from app.style.jobs import create_distill_run, run_distill_job
@@ -387,7 +387,7 @@ def _exec_start_distill(db: Any, project: Any, proposal: Any, *,
         'distill_run_id': run.id,
         'tier': tier,
         'background': background_tasks is not None,
-        'note': '蒸馏已启动（后台跑）。完成后档案会落在蒸馏库里，可直接应用到项目。',
+        'note': '提炼已启动（后台跑）。完成后档案会落在文风档案库里，可直接应用到项目。',
     }
 
 

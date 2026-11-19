@@ -2,15 +2,15 @@
 
 ## 为什么要有这道体检
 
-「蒸馏跑完了」≠「writer 吃到了文风」。中间隔着好几道会**静默失败**的门：
+「提炼跑完了」≠「writer 吃到了文风」。中间隔着好几道会**静默失败**的门：
 
-- 档案存着，但渲染进提示词时是空的（维度对不上 / 内容被过滤）→ 蒸馏白做；
+- 档案存着，但渲染进提示词时是空的（维度对不上 / 内容被过滤）→ 提炼白做；
 - 叙事档案里的「禁用词」自己也写在档案正文里 → 「不许出现 X」与档案自相矛盾；
 - 原创模式却把参考书的**角色声音词典**带进来 → 模型照着参考书角色造人；
 - 覆写块超长 → 挤掉正文额度，也击穿提示词缓存；
 - 静态提示词整体过长 → 同样挤正文额度。
 
-这些都不会报错，只会让「文风蒸馏白做了」或「正文开始像参考书」。
+这些都不会报错，只会让「文风提炼白做了」或「正文开始像参考书」。
 所以要有一道**只读**的体检：组装 → 查 → 出报告（九字段 issue 结构，与其它审核同构）。
 
 ## 与已有审核的分工
@@ -121,11 +121,11 @@ def run_prompt_audit(db: Any, project: Any, *, profile: str = 'original'
         issues.append(_issue(
             taken, issue_id='narrative', issue_type='prompt_effectiveness',
             severity='error',
-            title='文风蒸馏产物没有进到系统提示词里',
-            claim='项目里有叙事档案（蒸馏产物），但渲染成提示词块后是空的 —— '
-                  'writer 这次生成吃到的还是默认文风，蒸馏等于白做。',
+            title='文风提炼产物没有进到系统提示词里',
+            claim='项目里有叙事档案（提炼产物），但渲染成提示词块后是空的 —— '
+                  'writer 这次生成吃到的还是默认文风，提炼等于白做。',
             suggestion='查档案的维度键是否与当前方法维度清单一致（app.style.layers.method_rules），'
-                       '或重跑一次蒸馏（换档位/换语料）。',
+                       '或重跑一次提炼（换档位/换语料）。',
             rule='prompt_narrative_not_injected',
             evidence=(IssueEvidence(kind='novel', source=f'project:{project.id}',
                                     ref_id=f'project:{project.id}',
@@ -250,7 +250,7 @@ def run_prompt_audit(db: Any, project: Any, *, profile: str = 'original'
             title=f'静态系统提示词过长（{len(system)} 字符，预算 {SYSTEM_PROMPT_BUDGET}）',
             claim='静态提示词太长会挤掉正文额度，也击穿提示词缓存的收益（每段都要重发）。',
             suggestion='精简档案规则条数（默认每维 5 条，觉得太长就调小）'
-                       '或换更低的蒸馏档位。',
+                       '或换更低的提炼档位。',
             rule='prompt_system_too_long',
             evidence=(IssueEvidence(kind='novel', source=f'project:{project.id}',
                                     ref_id=f'project:{project.id}',

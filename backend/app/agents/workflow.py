@@ -1,4 +1,4 @@
-"""助理 agent 的**工序链**：交稿 → 清洗 → 抽检 → 蒸馏 → 审查 → 修复 → 收敛。
+"""助理 agent 的**工序链**：交稿 → 清洗 → 抽检 → 提炼 → 审查 → 修复 → 收敛。
 
 设计见 `docs/agent-pipeline-design.md`。三条纪律：
 
@@ -12,7 +12,7 @@
 
 `steps` 列里存的是**推进日志**（谁在什么时候做了哪一步、结论是什么），
 但「这一步现在算不算做完」是每次调用 `evaluate()` 时**重新查库**判出来的。
-理由：正文改过、蒸馏重跑过、提案批了 —— 日志不会自己更新，
+理由：正文改过、提炼重跑过、提案批了 —— 日志不会自己更新，
 只有重新评估才不会出现「日志说做完了、其实没做完」。
 
 状态取值：
@@ -83,14 +83,14 @@ STEPS: tuple[Step, ...] = (
          ('check_ingest_clean', 'audit_chunks'), 'ingest_clean',
          track='prompt', dispatch='清洗 agent（错字/漏字/水印）',
          note='清洗后的抽样复查：错字、漏字、广告水印、切分破损。'),
-    Step('distill', '文风蒸馏',
+    Step('distill', '文风提炼',
          ('audit_corpus',), 'start_distill',
-         track='prompt', dispatch='蒸馏 agent（抽取文风档案）',
+         track='prompt', dispatch='提炼 agent（抽取文风档案）',
          note='从干净语料里提炼文体档案（完整/平衡/快速三档）。'),
     Step('review_narrative', '档案审查',
          ('audit_narrative',), 'start_distill',
          track='prompt', dispatch='审查 agent（审档案本身）',
-         note='审蒸馏产物本身：维度齐不齐、规则有没有证据。'),
+         note='审提炼产物本身：维度齐不齐、规则有没有证据。'),
     Step('review_prompt', '提示词体检',
          ('audit_prompt',), 'prompt_override',
          track='prompt', dispatch='提示词审核 agent（审组装后的系统提示词）',
@@ -295,7 +295,7 @@ def _corpus_ready(db: Any, project: Any, ctx: dict[str, Any] | None = None) -> t
         if _has_story_seed(project):
             return 'skipped', '自由生成（没选参考语料）→ 语料侧工序不适用。'
         return 'pending', ('还没交稿：把小说文本交给助理 agent，'
-                          '它会带它走清洗、抽检、蒸馏、审查。')
+                          '它会带它走清洗、抽检、提炼、审查。')
     chunks = db.scalar(
         select(func.count(NovelChunk.id)).where(NovelChunk.novel_id.in_(ids)))
     if not chunks:
@@ -320,9 +320,9 @@ def _clean_check(db: Any, project: Any, ctx: dict[str, Any] | None = None) -> tu
 
 
 def _active_archive_for(db: Any, source_ids: list[int]) -> Any | None:
-    """蒸馏库里有没有这份语料的**可复用**档案（active 态）。
+    """文风档案库里有没有这份语料的**可复用**档案（active 态）。
 
-    匹配键用 `source_ids_hash`（仓库里蒸馏库复用查找的**同一个**归一化口径，
+    匹配键用 `source_ids_hash`（仓库里文风档案库复用查找的**同一个**归一化口径，
     见 `app.style.narrative._source_ids_hash`）—— 自己另算一套哈希会在
     「语料顺序不同」时对不上，档案明明在却找不到。
     """
@@ -336,23 +336,23 @@ def _active_archive_for(db: Any, source_ids: list[int]) -> Any | None:
 
 
 def _distill(db: Any, project: Any, ctx: dict[str, Any] | None = None) -> tuple[str, ...]:
-    """文风蒸馏：这道工序的**产物**是「文风档案」，判据就看产物在不在位。
+    """文风提炼：这道工序的**产物**是「文风档案」，判据就看产物在不在位。
 
     产物有两条来路，只认其中一条就会把链条说成自相矛盾：
 
-    1. 项目上已生效的 `style_narrative`（自己跑蒸馏得到，或从蒸馏库**应用**得到）；
-    2. 蒸馏库里有一份同一份语料的 active 档案（还没应用到本项目）。
+    1. 项目上已生效的 `style_narrative`（自己跑提炼得到，或从文风档案库**应用**得到）；
+    2. 文风档案库里有一份同一份语料的 active 档案（还没应用到本项目）。
 
     只看 `distill_runs` 的老写法会把第 1 条里的「应用来的」误判成
-    「还没跑过文风蒸馏」，而同一时刻「档案审查」却显示 done（档案确实在）——
-    面板上就出现「蒸馏 待做」紧挨着「档案审查 已完成」。
+    「还没跑过文风提炼」，而同一时刻「档案审查」却显示 done（档案确实在）——
+    面板上就出现「提炼 待做」紧挨着「档案审查 已完成」。
     实测：《北荒刀歌》真书档案的两个项目正是这样（distill_runs=0，档案在位）。
     """
     if not _project_corpus_ids(project):
         if _has_story_seed(project):
             # 自由生成：没有参考语料就没有文风可提炼 —— 这步「不适用」，
             # 不是「下一步」（否则选择框会问「蒸馏用哪一档」，而根本无从蒸馏）。
-            return 'skipped', '自由生成（没选参考语料）→ 没有语料可提炼文风，跳过蒸馏。'
+            return 'skipped', '自由生成（没选参考语料）→ 没有语料可提炼文风，跳过提炼。'
         return 'pending', '等语料到位后提炼文风。'
     from app.models import DistillRun
     runs = list(db.scalars(
@@ -361,21 +361,21 @@ def _distill(db: Any, project: Any, ctx: dict[str, Any] | None = None) -> tuple[
     profile = getattr(project, 'style_narrative', None)
     if profile:
         if runs and runs[0].status == 'success':
-            return 'done', f'最近一次蒸馏成功（{runs[0].rule_count or 0} 条规则）。'
-        return 'done', '文风档案已就位（从蒸馏库应用）。'
+            return 'done', f'最近一次提炼成功（{runs[0].rule_count or 0} 条规则）。'
+        return 'done', '文风档案已就位（从文风档案库应用）。'
     archive = _active_archive_for(db, _project_corpus_ids(project))
     if archive is not None:
         return ('pending',
-                f'蒸馏库里已有这份语料的文风档案'
+                f'文风档案库里已有这份语料的文风档案'
                 f'（{archive.rule_count or 0} 条规则），应用到本项目后这一步才算完。')
     if not runs:
-        return 'pending', '还没跑过文风蒸馏。'
+        return 'pending', '还没跑过文风提炼。'
     last = runs[0]
     if last.status == 'success':
-        return 'done', f'最近一次蒸馏成功（{last.rule_count or 0} 条规则）。'
+        return 'done', f'最近一次提炼成功（{last.rule_count or 0} 条规则）。'
     if last.status in ('pending', 'running'):
-        return 'pending', f'蒸馏还在跑（{last.stage or last.status}）。'
-    return 'blocked', f'最近一次蒸馏失败：{str(last.error or "")[:120]}'
+        return 'pending', f'提炼还在跑（{last.stage or last.status}）。'
+    return 'blocked', f'最近一次提炼失败：{str(last.error or "")[:120]}'
 
 
 def _review_narrative(db: Any, project: Any, ctx: dict[str, Any] | None = None) -> tuple[str, ...]:
@@ -384,22 +384,22 @@ def _review_narrative(db: Any, project: Any, ctx: dict[str, Any] | None = None) 
         if not _project_corpus_ids(project):
             if _has_story_seed(project):
                 return 'skipped', '自由生成 → 没有文风档案可审。'
-            return 'pending', '等蒸馏产物。'
-        return 'pending', '还没有蒸馏产物可审。'
+            return 'pending', '等提炼产物。'
+        return 'pending', '还没有提炼产物可审。'
     from app.agents.audit_narrative import run_narrative_audit
     issues, _stats = run_narrative_audit(profile)
     errors = [i for i in issues if i.get('severity') == 'error']
     if errors:
-        return 'blocked', (f'蒸馏产物有 {len(errors)} 个必须先处理的问题'
+        return 'blocked', (f'提炼产物有 {len(errors)} 个必须先处理的问题'
                            f'（第一件：{errors[0].get("title", "")}）。')
-    return 'done', f'蒸馏产物审查通过（{len(issues)} 条提示不阻塞）。'
+    return 'done', f'提炼产物审查通过（{len(issues)} 条提示不阻塞）。'
 
 
 def _review_prompt(db: Any, project: Any, ctx: dict[str, Any] | None = None) -> tuple[str, ...]:
     """提示词体检：组装一次 writer 的静态提示词，逐条查。
 
-    查的是「蒸馏产物有没有真进到提示词里」这一类**静默失败** ——
-    它们不会报错，只会让文风蒸馏白做、或让正文开始像参考书。
+    查的是「提炼产物有没有真进到提示词里」这一类**静默失败** ——
+    它们不会报错，只会让文风提炼白做、或让正文开始像参考书。
     """
     if not _project_corpus_ids(project):
         if _has_story_seed(project):
@@ -412,7 +412,7 @@ def _review_prompt(db: Any, project: Any, ctx: dict[str, Any] | None = None) -> 
         return 'blocked', (f'提示词体检有 {len(errors)} 个必须先处理的问题'
                            f'（第一件：{getattr(errors[0], "title", "")}）。')
     if not stats.get('has_narrative'):
-        return 'pending', '还没有文风档案可体检（先跑蒸馏）。'
+        return 'pending', '还没有文风档案可体检（先跑提炼）。'
     return 'done', f'提示词体检通过（{len(report.issues)} 条提示不阻塞）。'
 
 
@@ -670,7 +670,7 @@ def evaluate(db: Any, project: Any) -> dict[str, Any]:
     done = all(s['state'] in ('done', 'skipped') for s in steps)
     if done:
         status, current = 'done', None
-        summary = '这一轮做完了：语料、蒸馏、审查都过了，没有待批的修改。'
+        summary = '这一轮做完了：语料、提炼、审查都过了，没有待批的修改。'
     else:
         # 当前步 = 链上**第一个还没做完**的工序（按顺序）。
         #
@@ -752,7 +752,7 @@ def workflow_decision_card(db: Any, project: Any,
     """工序链当前需要**用户决断**时，给一张选择框卡片（没有则 None）。
 
     什么时候需要用户决断：工序链的**下一步**正等着开始，而那一步有个岔路口
-    系统不能替作者决定（蒸馏用哪一档、一次生成几章…）。
+    系统不能替作者决定（提炼用哪一档、一次生成几章…）。
     决策点与选项来自注册表（服务端说了算），模型不参与编选项。
     """
     from app.agents.decision_points import build_choice_action, decision_for_step

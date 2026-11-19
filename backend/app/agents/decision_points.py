@@ -2,7 +2,7 @@
 
 ## 为什么是「选项」而不是「问一句」
 
-工序链走到某一步时，有些岔路口**不能由系统替作者决定**：蒸馏用哪一档、
+工序链走到某一步时，有些岔路口**不能由系统替作者决定**：提炼用哪一档、
 每段写多少字、一次生成几章。这些决定直接影响成本、节奏与产物形态，
 猜错的代价远大于多问一句。
 
@@ -69,12 +69,12 @@ GENERIC_START_WORDS: tuple[str, ...] = (
 #: 语义见 app.style.narrative 的档位注释；这里只管「让人选」。
 DISTILL_TIER = DecisionPoint(
     key='distill_tier',
-    title='文风蒸馏用哪一档？',
-    question='蒸馏档位决定提炼多少语料：越完整越准也越慢越费额度。',
+    title='文风提炼用哪一档？',
+    question='提炼档位决定提炼多少语料：越完整越准也越慢越费额度。',
     endpoint='/api/projects/{project_id}/distill',
     body={'tier': ''},
     step_id='distill',
-    triggers=('蒸馏', '文风', '档位', '提炼', '仿写', '学习', '风格档案'),
+    triggers=('提炼', '蒸馏', '文风', '档位', '仿写', '学习', '风格档案'),
     options=(
         Option('full', '完整档',
                '全量语料提炼，最准；耗时长、额度消耗最大。',

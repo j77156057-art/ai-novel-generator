@@ -1,9 +1,9 @@
-"""蒸馏产物质量审核规则。
+"""提炼产物质量审核规则。
 
 ## 为什么需要
 
-蒸馏产物（`projects.style_narrative`）没有任何审核。它产出几千条规则，
-但**没人检查这些规则能不能用**。实测北荒刀歌 M3 蒸馏 3508 条规则，问题有：
+提炼产物（`projects.style_narrative`）没有任何审核。它产出几千条规则，
+但**没人检查这些规则能不能用**。实测北荒刀歌 M3 提炼 3508 条规则，问题有：
 
 1. **剧情泄漏**：三个剧情型维度占 43%（1506 条），规则正文是具体剧情
    （「贵客抵达→王府开中门→以糖葫芦诱引小王爷」），人名换成占位符后
@@ -35,19 +35,26 @@ from typing import Any
 TOO_SHORT_THRESHOLD = 15
 
 #: 单维度条数超过此值 → 条目膨胀。
-#: 依据：`describe_narrative` 每维只取 RULES_PER_DIM 条（默认 5），
+#: 依据：`describe_narrative` 每维只按 `RENDER_PRESETS` 的配额取（每维 1–5 条），
 #: 超过 100 条的维度有 95% 的产出永远进不了 prompt。
 DIM_BLOAT_THRESHOLD = 100
 
 
-def dim_usage() -> int:
-    """生成时每维实际使用的条数（与 describe_narrative 的默认一致）。
+def dim_usage(dim: str | None = None) -> int:
+    """生成时该维度实际会用的条数上限（跨生成模式取最大）。
 
-    从 `narrative.RULES_PER_DIM` 现读，不写死 —— 那个常量一改，
-    这里写死的数字就会变成过期结论（agent 会照着它给建议）。
+    2026-11 的配额重构把全局常量 `RULES_PER_DIM` 换成了分模式的
+    `RENDER_PRESETS`（每维 `dim_limits` 覆盖，未列出的维度走 `per_dim`）。
+    审计要回答的是「有多少条**永远**进不了 prompt」，所以取所有模式里的
+    最大配额：超过它的条数在任何模式下都用不上，结论才不受模式选择影响。
     """
-    from app.style.narrative import RULES_PER_DIM
-    return int(RULES_PER_DIM)
+    from app.style.narrative import RENDER_PRESETS
+
+    quotas = [
+        preset.dim_limits.get(dim, preset.per_dim) if dim is not None else preset.per_dim
+        for preset in RENDER_PRESETS.values()
+    ]
+    return max(quotas, default=5)
 
 _EVIDENCE_RE = re.compile(r"[（(]\s*证据\s*[：:].*?[）)]")
 
@@ -120,8 +127,8 @@ def rule_narrative_too_short(profile: dict) -> tuple[list[dict], dict]:
             f"集中维度： " + "、".join(f"{d}({n})" for d, n in worst)
         ),
         "suggestion": (
-            "换更强的模型重蒸馏（实测弱模型过短率 29%，M3 为 0%），"
-            "或在蒸馏 prompt 里给最低字数要求。抽查： "
+            "换更强的模型重新提炼（实测弱模型过短率 29%，M3 为 0%），"
+            "或在提炼 prompt 里给最低字数要求。抽查： "
             + " / ".join(repr(s) for s in samples)
         ),
         "ref": {"metric": "too_short_pct"},
@@ -129,7 +136,7 @@ def rule_narrative_too_short(profile: dict) -> tuple[list[dict], dict]:
 
 
 def rule_dimension_bloat(profile: dict) -> tuple[list[dict], dict]:
-    """某维度条数远超实际使用量（蒸馏白干）。"""
+    """某维度条数远超实际使用量（提炼白干）。"""
     from app.style.layers import method_rules
 
     rules = method_rules(profile) or {}
@@ -141,7 +148,7 @@ def rule_dimension_bloat(profile: dict) -> tuple[list[dict], dict]:
             continue
         n = len(items)
         if n > DIM_BLOAT_THRESHOLD:
-            usage = dim_usage()
+            usage = dim_usage(dim)
             bloated[dim] = n
             issues.append({
                 "rule": "narrative_dimension_bloat",
@@ -153,7 +160,7 @@ def rule_dimension_bloat(profile: dict) -> tuple[list[dict], dict]:
                     f"要么生成侧该多取几条。"
                 ),
                 "suggestion": (
-                    "检查该维度的蒸馏 prompt 是否要求「逐段罗列」而非「归纳模式」。"
+                    "检查该维度的提炼 prompt 是否要求「逐段罗列」而非「归纳模式」。"
                     "若内容确实需要保留，调整生成时每维取的条数。"
                 ),
                 "ref": {"dimension": dim, "count": n},
@@ -204,7 +211,7 @@ def rule_narrative_plot_leak(profile: dict) -> tuple[list[dict], dict]:
                 + "、".join(f"{d}({n})" for d, n in worst)
             ),
             "suggestion": (
-                "在蒸馏 prompt 里加正反例：正例「用动作暗示情绪」，"
+                "在提炼 prompt 里加正反例：正例「用动作暗示情绪」，"
                 "反例「他走到门口说」。"
             ),
             "ref": {"metric": "method_plot_leak"},
@@ -240,14 +247,14 @@ def rule_empty_dimensions(profile: dict, expected: list[str] | None = None) -> t
 def run_narrative_audit(
     profile: dict | None, expected_dims: list[str] | None = None,
 ) -> tuple[list[dict], dict]:
-    """跑全部蒸馏产物审核规则。"""
+    """跑全部提炼产物审核规则。"""
     if not profile:
         return [{
             "rule": "narrative_missing",
             "severity": "info",
             "title": "项目还没有叙事档案",
-            "detail": "未蒸馏或蒸馏失败，生成时不会注入文风规则。",
-            "suggestion": "调用 build-narrative 蒸馏。",
+            "detail": "未提炼或提炼失败，生成时不会注入文风规则。",
+            "suggestion": "调用 build-narrative 提炼。",
             "ref": {},
         }], {}
 
