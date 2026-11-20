@@ -216,7 +216,9 @@ def test_client_disconnect_marks_failed_without_touching_text(db):
         db, project, 2, provider=StubProvider(SEG2_NEW),
         snapshot_id=snap.id, expected_before=snap.before_text,
     )
-    assert next(stream)["type"] == "chunk"
+    # 引擎会先发 stage 事件（装配上下文等），首个正文事件才是 chunk。
+    first = next(ev for ev in stream if ev.get("type") != "stage")
+    assert first["type"] == "chunk"
     stream.close()  # 等价于客户端断开：GeneratorExit 打在 yield 处
 
     db.expire_all()

@@ -301,6 +301,19 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
     outline_notice = build_notice(db, proj, span[0], span[1]) if span else None
     _begin_generation(proj.id)
 
+    # 两段式写入第一段：调模型前先写 pending 快照（与助手重写同一条链路）。
+    # 工作台的重写此前不建快照，导致「撤销/回滚」只对助手重写可用。
+    from app.agents.dialog.snapshot import SnapshotBusy, begin_snapshot
+
+    try:
+        snapshot = begin_snapshot(db, proj, target)
+    except SnapshotBusy as exc:
+        _end_generation(proj.id)
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    # 生成器里不再碰 ORM 对象：流式响应期间依赖会话可能已关闭，先取出纯值。
+    snapshot_id = snapshot.id
+    expected_before = snapshot.before_text
+
     def event_stream():
         from app.db import SessionLocal
         from app.generation.engine import regenerate_segment_stream
@@ -311,11 +324,16 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
             for ev in regenerate_segment_stream(
                 sdb, p, body.segment_no, novel_ids=novel_ids, max_chars=body.max_chars,
                 chapter_label=label,
+                snapshot_id=snapshot_id,
+                expected_before=expected_before,
             ):
                 if outline_notice is not None and ev.get("type") == "done":
                     ev = {**ev, "outline": outline_notice}
                 yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 异常也作为 SSE 事件下发
+            from app.agents.dialog.snapshot import fail_snapshot
+
+            fail_snapshot(sdb, snapshot_id, type(exc).__name__)
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
             sdb.close()

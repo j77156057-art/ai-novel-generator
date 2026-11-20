@@ -676,7 +676,7 @@ class Generation(Base):
 
 
 class GenerationSnapshot(Base):
-    """重写前的段级快照（撤销「助手重写」的唯一数据源）。
+    """重写前的段级快照（撤销「助手重写 / 工作台重写」的唯一数据源）。
 
     为什么不复用 `versions`：该表的 `proposal_id` 是 `NOT NULL` 外键，而重写
     没有提案；且 `versions` 被定义为「永不 UPDATE」的提案产物，而本表必须经历
