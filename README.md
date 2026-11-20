@@ -11,6 +11,17 @@
   <b>RRF Hybrid Retrieval</b> · <b>Knowledge Graph</b> · <b>Agent Workflow</b>
 </p>
 
+<p align="center">
+  <a href="https://37kr8ly196kgggyob7w.traesite.cn"><b>🔗 在线介绍页 · Live introduction site</b></a>
+  &nbsp;|&nbsp;
+  <a href="https://37kr8ly196kgggyob7w.traesite.cn/#demo"><b>▶ 65 秒实机演示 · Demo video</b></a>
+  &nbsp;|&nbsp;
+  <a href="https://37kr8ly196kgggyob7w.traesite.cn/#screens">界面截图 · Screenshots</a>
+</p>
+
+> 演示视频是启动前后端后的真实操作录屏（书稿工作台 → 语料库 → 生成控制台 →
+> 知识图谱 → 我的小说 → 助手工作台），非设计稿或后期合成。
+
 ---
 
 ## ✨ Why this belongs on a résumé
@@ -72,9 +83,9 @@ Every segment also receives the author-side layer: `plot_bible.background`（一
 
 ---
 
-## 🔁 审批流与 LangGraph 子图（2026-11 落地）
+## 🔁 审批流与 LangGraph 子图
 
-编辑提案仍守原来的产品红线：Assistant 不能写，人审批后系统才落库。2026-11 起，
+编辑提案仍守原来的产品红线：Assistant 不能写，人审批后系统才落库。
 **单条审批的状态转移由 LangGraph 子图编排**，实现在
 `backend/app/agents/approval_graph.py`：
 
@@ -297,17 +308,17 @@ distillation library and the dual-model agent workflow.
 离线兜底）与批量合并抽取 worker；蒸馏失败按因分桶报错；SQLite 默认 + PostgreSQL/pgvector 可选；
 前端 lock 可复现安装（`npm ci`）。
 
-**Shipped 2026-11（作者侧创作层 P0/P1）：** 世界观（一句话世界 / 硬规则 / 势力与地点）；
+**作者侧创作层 P0/P1：** 世界观（一句话世界 / 硬规则 / 势力与地点）；
 角色卡六组结构与声纹质量收尾；设定卡视图与角色卡快照智能同步（手改字段保留、移除角色时删/停）；
 独立伏笔台账与只注入未回收项的提示词；向导参考语料前置、蒸馏提前启动，剧情圣经 / 章纲接入蒸馏档案；
 角色卡与设定卡编辑改为可拖拽缩放的居中模态卡片。
 
-**Shipped 2026-11（测试与审批编排）：** 组件级 `vitest`（`useModalResize` 拖拽缩放、
+**测试与审批编排：** 组件级 `vitest`（`useModalResize` 拖拽缩放、
 工作台的写作执行看板与 KG 登记交互）；LangGraph 审批子图
 （`app/agents/approval_graph.py`，只承载单条 approve / reject / apply 的状态转移；
 批量 apply-selected 与版本回滚仍走显式实现，Writer 主链路不变）。
 
-**Shipped 2026-11（生成可信度与工作台）：** 规划就绪闸与权威内扩展规划、段契约、
+**生成可信度与工作台：** 规划就绪闸与权威内扩展规划、段契约、
 手动改稿后重同步总结 / 摘要树 / 图谱、叙事 digest；KG 角色名过滤与 judge 书域隔离；
 向导角色卡增删改与步骤自愈；双轨工作流条、KG 分栏与章纲行内编辑；长期记忆与历史回填脚本。
 
