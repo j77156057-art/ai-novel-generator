@@ -237,6 +237,11 @@ def distill_run_to_dict(run: DistillRun) -> dict[str, Any]:
     return {
         "id": run.id,
         "project_id": run.project_id,
+        # 产物种类（narrative / character_template / book_digest）：同表不同产物，
+        # 前端据此区分「这次任务是什么」，不必靠 tier 猜。
+        "kind": run.kind,
+        # 按书产物（全书摘要）对应的书；叙事提炼为 null。
+        "novel_id": run.novel_id,
         "tier": run.tier,
         "status": run.status,
         "stage": run.stage,

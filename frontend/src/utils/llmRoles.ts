@@ -68,10 +68,11 @@ export const LLM_ROLE_META: Record<LlmRole, LlmRoleMeta> = {
 /**
  * 需要用户填自定义端点（Base URL）的渠道。
  *
- * 「通用 OpenAI 接口」没有厂商默认地址可依赖——端点本身就是配置，
- * 所以只有它显示 Base URL 输入框；其余渠道有各自的默认地址，隐藏即可。
+ * 「通用 OpenAI 接口」没有厂商默认地址可依赖——端点本身就是配置；
+ * 「本地模型（Ollama）」虽然有本机默认地址，但端口/宿主随时会变
+ * （Ollama 11434 / LM Studio 1234 / 局域网机器），也允许覆盖。
  */
-export const CUSTOM_URL_PROVIDERS: readonly string[] = ["openai"] as const;
+export const CUSTOM_URL_PROVIDERS: readonly string[] = ["openai", "ollama"] as const;
 
 export function needsBaseUrl(provider: string): boolean {
   return CUSTOM_URL_PROVIDERS.includes(provider);

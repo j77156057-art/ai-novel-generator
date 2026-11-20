@@ -105,6 +105,7 @@ FALLBACKS: dict[str, str] = {
     "length": "说单段字数，比如「3000 字」（范围 500–8000）；这是每段字数，不是全书长度。",
     "chapters": "说这次写几段，比如「1 段」「3 段」；也可以直接点卡片。",
     "outline": "说「先出大纲」或「直接开写」；也可以直接点卡片。",
+    "cards": "看一遍上面的角色卡，满意就说「继续」「没问题」；要改就直接点卡上的编辑/重生成。",
     "continue_from": "说「接在最后一段之后」，或者给一个段号；也可以直接点卡片。",
     "character": "直接打一个角色名（用上面的角色卡），或者点卡片选。",
     "scene": "描述一下情境，比如「初次见面」「一场对峙之后」；也可以点卡片选。",
@@ -656,6 +657,11 @@ def _match(step: str, text: str, answers: dict[str, Any], ctx: dict[str, Any],
             return False, "直接开写"
         if any(k in t for k in ("要", "需要", "先出", "先看", "大纲", "确认")):
             return True, "先出大纲再写"
+        return None
+
+    if step == "cards":
+        if any(k in t for k in ("确认", "继续", "没问题", "可以", "好的", "行", "下一步")):
+            return True, "角色卡已确认"
         return None
 
     if step == "continue_from":

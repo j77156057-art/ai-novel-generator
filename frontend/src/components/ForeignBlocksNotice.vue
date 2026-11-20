@@ -86,10 +86,10 @@ function onToggle(e: Event): void {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 12px 14px;
   border: var(--border-w) solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-2, var(--bg));
+  border-radius: var(--radius-md);
+  background: var(--bg-elev);
 }
 .foreign-blocks {
   margin: 0;

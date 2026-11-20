@@ -11,12 +11,15 @@
  * 书卡数据来自 `GET /api/projects`（与项目列表同源）。当前路由带项目 id
  * 时高亮对应作品；取不到就整块不渲染，不影响任何页面功能。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { api } from "@/api/client";
 import type { ProjectOut } from "@/api/types";
+import { lastProjectId, rememberProject } from "@/utils/lastProject";
+import { useAppTheme } from "./theme";
 
 const route = useRoute();
+const { theme, toggleInkTheme } = useAppTheme();
 
 // 只缓存「重」的工作台页面：项目工作台、助手工作台、知识图谱、章纲。
 // 列表页 / 设置页不缓存，保证新建项目、改配置后回来一定是新数据。
@@ -40,8 +43,36 @@ interface NavGroup {
 
 const assistantTo = computed(() => {
   const id = route.params.id;
-  return typeof id === "string" && /^\d+$/.test(id) ? `/projects/${id}/assistant` : "/assistant";
+  if (typeof id === "string" && /^\d+$/.test(id)) return `/projects/${id}/assistant`;
+  // 列表页 / 设置页没有项目 id：优先回「最后打开的作品」，别落到自动挑选的
+  // 那一本（记忆、会话都是按项目隔离的，落错项目看起来就像数据丢了）。
+  // 项目列表已加载时顺手校验存在性，避免作品被删后点进空页。
+  const last = lastProjectId();
+  if (
+    last &&
+    (projects.value.length === 0 || projects.value.some((p) => p.id === last))
+  ) {
+    return `/projects/${last}/assistant`;
+  }
+  return "/assistant";
 });
+
+/**
+ * 顶部/左栏导航只放**全局**入口。
+ *
+ * 全书摘要 / 人物模板 / 角色卡 / 力量体系是项目级页面，入口统一收在
+ * 项目工作台里（`/projects/:id` 的快捷按钮）；不再按「最后打开的作品」
+ * 猜一个项目塞进全局导航——那会让全局导航看起来像项目导航，也容易点错书。
+ */
+
+// 任何项目级页面打开过，就记下来（工作台 / 助手 / 图谱 / 章纲都带 :id）。
+watch(
+  () => route.params.id,
+  (id) => {
+    if (typeof id === "string" && /^\d+$/.test(id)) rememberProject(Number(id));
+  },
+  { immediate: true },
+);
 
 const groups = computed<NavGroup[]>(() => [
   {
@@ -49,18 +80,13 @@ const groups = computed<NavGroup[]>(() => [
     links: [
       {
         to: assistantTo.value,
-        label: "写作台",
+        label: "对话助手",
         icon: "M20 15a3 3 0 0 1-3 3H9l-5 3v-6a3 3 0 0 1-1-2V7a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3v8ZM8 9h8M8 13h5",
       },
       {
         to: "/projects",
         label: "创作项目",
         icon: "M4 7.5h6l2-3h8v15H4v-12ZM4 10h16M8 14h8",
-      },
-      {
-        to: "/mine",
-        label: "我的小说",
-        icon: "M5 3h11a3 3 0 0 1 3 3v15H8a3 3 0 0 1-3-3V3Zm0 15a3 3 0 0 1 3-3h11M9 7h6M9 11h6",
       },
     ],
   },
@@ -152,7 +178,40 @@ onMounted(async () => {
     <div class="main-shell">
       <header class="topbar">
         <div class="breadcrumbs">工作台 <span aria-hidden="true">/</span> <strong>{{ crumb || "概览" }}</strong></div>
-        <span class="topbar-note">长篇创作与校样</span>
+        <div class="topbar-right">
+          <span class="topbar-note">长篇创作与校样</span>
+          <button
+            class="theme-switch"
+            type="button"
+            :title="theme === 'ink' ? '切换到纸色主题' : '切换到暗色工作台'"
+            :aria-label="theme === 'ink' ? '切换到纸色主题' : '切换到暗色工作台'"
+            @click="toggleInkTheme"
+          >
+            <svg
+              v-if="theme === 'ink'"
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.7"
+            >
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" />
+            </svg>
+            <svg
+              v-else
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.7"
+            >
+              <path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.5 6.5 0 0 0 9.8 9.8Z" />
+            </svg>
+          </button>
+        </div>
       </header>
       <main class="main">
         <router-view v-slot="{ Component }">
@@ -164,3 +223,32 @@ onMounted(async () => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.theme-switch {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--bg-sunken);
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: color 0.14s ease, border-color 0.14s ease, background 0.14s ease, transform 0.2s var(--ease-out-quart);
+}
+.theme-switch:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  transform: rotate(12deg);
+}
+@media (max-width: 880px) {
+  .topbar-note { display: none; }
+}
+</style>

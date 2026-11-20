@@ -397,10 +397,10 @@ function pickCharacter(c: string) {
   font-size: var(--fs-xs);
 }
 .rp-msg {
-  padding: 10px 12px;
+  padding: 12px 14px;
   margin-bottom: 10px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   background: var(--bg-elev);
 }
 .rp-q {
@@ -427,9 +427,9 @@ function pickCharacter(c: string) {
 }
 .rp-tag {
   display: inline-block;
-  padding: 1px 6px;
+  padding: 1px 7px;
   margin-right: 6px;
-  border-radius: 3px;
+  border-radius: var(--radius-full);
   font-size: var(--fs-xs);
 }
 .rp-tag.ok {

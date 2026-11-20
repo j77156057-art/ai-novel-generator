@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 一步一张卡片：单选 / 多选 / 数字 / 文本 / 确认。
 // 卡片只负责收集一个值并 emit，流程推进全部由 AssistantWorkspace 调后端完成。
 import { computed, ref, watch } from "vue";
@@ -160,6 +160,20 @@ const confirmSummary = computed(() =>
         <p v-if="card.empty_hint" class="wz-hint">{{ card.empty_hint }}</p>
       </div>
 
+      <!-- 角色卡步骤：只列清单，逐张编辑在消息气泡里的角色卡面板完成 -->
+      <div v-else-if="type === 'cards'" class="wz-people">
+        <p v-if="!card.characters?.length" class="wz-hint">
+          这次大纲里没有抽出角色，直接继续即可，之后也能在项目工作台补角色。
+        </p>
+        <div v-for="c in card.characters" :key="c.name" class="wz-person">
+          <span class="wz-person-name">{{ c.name }}</span>
+          <span class="wz-person-role">{{ c.role }}</span>
+          <span class="tag" :class="{ mono: c.has_card }">
+            {{ c.has_card ? "已生成" : "未生成" }}
+          </span>
+        </div>
+      </div>
+
       <!-- 数字 -->
       <div v-else-if="type === 'number'" class="wz-number">
         <div class="wz-quick">
@@ -297,6 +311,15 @@ const confirmSummary = computed(() =>
         下一步
       </button>
       <button
+        v-if="!answeredLabel && type === 'cards'"
+        type="button"
+        class="btn primary sm"
+        :disabled="locked"
+        @click="emit('answer', true, card.action_label || '角色卡没问题，继续')"
+      >
+        {{ card.action_label || "角色卡没问题，继续" }}
+      </button>
+      <button
         v-if="!answeredLabel && confirmSummary.length"
         type="button"
         class="btn primary sm"
@@ -413,7 +436,7 @@ const confirmSummary = computed(() =>
   border-radius: var(--radius-sm);
   display: grid;
   place-items: center;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   line-height: 1;
   color: var(--accent-fg);
   background: var(--bg-elev);
@@ -439,6 +462,34 @@ const confirmSummary = computed(() =>
   margin: 2px 0 0;
   font-size: var(--fs-xs);
   color: var(--fg-faint);
+}
+
+.wz-people {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wz-person {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+}
+
+.wz-person-name {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.wz-person-role {
+  flex: 1;
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
 }
 
 .wz-number {

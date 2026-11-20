@@ -462,6 +462,66 @@ def apply_style_distill(
     return proj
 
 
+# 注意路由顺序：`/{project_id}` 是动态段，会吞掉后面定义的静态路径
+# （`/character-templates` 曾被它匹配成 project_id="character-templates" 而 422）。
+# 所以所有 `/projects/<静态名>` 的集合路由都必须定义在 `/{project_id}` 之前。
+@router.get("/character-templates")
+def list_character_templates(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> dict:
+    """列出库里的**人物塑造模板**产物（新的在前）。
+
+    每条产物的 `id` 自带档位（`full:9a3f1166f4e6:1f2a3b4c`）：
+    哪一档、哪次档位配置、哪一版语料 —— 一眼就看出来，不用再翻表。
+    """
+    from app.style.character_template import list_templates
+    items = []
+    for row in list_templates(db, limit=limit):
+        items.append({
+            "id": row.id,
+            "tier": row.tier,
+            "tier_signature": row.tier_signature,
+            "source_ids": row.source_ids,
+            "content_hash": row.content_hash,
+            "rule_count": len(row.rules or []),
+            "n_chunks": row.n_chunks,
+            "rejected": row.rejected,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "applied_at": row.applied_at.isoformat() if row.applied_at else None,
+        })
+    return {"items": items}
+
+
+@router.get("/character-templates/{template_id}")
+def get_character_template(
+    template_id: str, db: Session = Depends(get_db)
+) -> dict:
+    """单条人物模板详情（含规则全文）。
+
+    列表只给条数（列表页不需要几十条规则）；点开某条时再取详情。
+    `template_id` 里的 `:` 是合法的路径字符，前端做 URL 编码即可。
+    """
+    from app.models import CharacterTemplate
+
+    row = db.get(CharacterTemplate, template_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="模板产物不存在")
+    return {
+        "id": row.id,
+        "tier": row.tier,
+        "tier_signature": row.tier_signature,
+        "source_ids": row.source_ids,
+        "content_hash": row.content_hash,
+        "rule_count": len(row.rules or []),
+        "n_chunks": row.n_chunks,
+        "rejected": row.rejected,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "applied_at": row.applied_at.isoformat() if row.applied_at else None,
+        "rules": [str(r) for r in (row.rules or []) if str(r).strip()],
+    }
+
+
 @router.get("/{project_id}", response_model=ProjectOut)
 def get_project(project_id: int, db: Session = Depends(get_db)) -> Project:
     proj = db.get(Project, project_id)
@@ -905,7 +965,9 @@ def build_narrative(
 @router.get("/{project_id}/kg")
 def kg(
     project_id: int,
-    type_: str = Query(default="all"),
+    # 前端按 `?type=` 传（与 KgNode.type 同名）；参数名带下划线是 Python 侧
+    # 避免遮蔽内置 type，必须给 alias，否则 FastAPI 只认 `type_`，`type` 被静默忽略。
+    type_: str = Query(default="all", alias="type"),
     source: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -1013,34 +1075,6 @@ class CharacterTemplateApplyRequest(StrictRequest):
     template_id: str
 
 
-@router.get("/character-templates")
-def list_character_templates(
-    limit: int = Query(default=50, ge=1, le=200),
-    db: Session = Depends(get_db),
-) -> dict:
-    """列出库里的**人物塑造模板**产物（新的在前）。
-
-    每条产物的 `id` 自带档位（`full:9a3f1166f4e6:1f2a3b4c`）：
-    哪一档、哪次档位配置、哪一版语料 —— 一眼就看出来，不用再翻表。
-    """
-    from app.style.character_template import list_templates
-    items = []
-    for row in list_templates(db, limit=limit):
-        items.append({
-            "id": row.id,
-            "tier": row.tier,
-            "tier_signature": row.tier_signature,
-            "source_ids": row.source_ids,
-            "content_hash": row.content_hash,
-            "rule_count": len(row.rules or []),
-            "n_chunks": row.n_chunks,
-            "rejected": row.rejected,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "applied_at": row.applied_at.isoformat() if row.applied_at else None,
-        })
-    return {"items": items}
-
-
 @router.post("/{project_id}/character-template")
 def start_character_template(
     project_id: int,
@@ -1116,6 +1150,24 @@ def apply_character_template(
     if row is None:
         raise HTTPException(status_code=404, detail="模板产物不存在")
     apply_template(db, proj, row)
+    return proj
+
+
+@router.delete("/{project_id}/character-template", response_model=ProjectOut)
+def clear_character_template(
+    project_id: int, db: Session = Depends(get_db)
+) -> Project:
+    """取消应用人物模板：只清项目引用，**不删模板库产物、不改正文**。
+
+    与 apply 对称：应用只是记了一个引用，取消应用同样只清引用。
+    没有这个入口时，用户想换一档只能直接改库（界面只能再应用另一条）。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+    proj.character_template_id = None
+    db.commit()
+    db.refresh(proj)
     return proj
 
 
@@ -1468,6 +1520,9 @@ class TierGenerateRequest(StrictRequest):
     """`POST /api/projects/{id}/power-system/tiers/generate` 的请求体。"""
 
     note: str = ""
+    #: 页面里**尚未保存**的体系草稿。给了就用它生成分层，不必先落库；
+    #: 没给才回退到项目已保存的体系（兼容旧调用）。
+    systems: list = []
 
 
 class CultivationSaveRequest(StrictRequest):
@@ -1483,6 +1538,10 @@ class RoutePlanRequest(StrictRequest):
 
     name: str
     note: str = ""
+    #: 页面里**尚未保存**的修炼档案草稿；给了就用它规划，不必先保存。
+    profile: dict = {}
+    #: 页面里**尚未保存**的体系草稿；给了就用它，不必先落库。
+    systems: list = []
 
 
 def _ps_bible(proj) -> dict:
@@ -1746,15 +1805,22 @@ def generate_tiers(
     if provider is None:
         raise HTTPException(status_code=503, detail="LLM 渠道未配置")
 
-    from app.generation.power_system import systems_of
+    from app.generation.power_system import normalize_power_system, systems_of
     from app.generation.power_system_gen import (
         build_tier_prompt, filter_tiers_by_bands, parse_tiers,
     )
 
     bible = _ps_bible(proj)
-    systems = systems_of(bible)
+    # 优先用页面传入的草稿：用户刚生成/手写完体系还没保存时，
+    # 「生成档位分层」也应该能直接基于它工作，而不是报「还没有修炼体系」。
+    systems = normalize_power_system({"体系": body.systems})["体系"] if body.systems else []
     if not systems:
-        raise HTTPException(status_code=400, detail="还没有修炼体系，先建体系")
+        systems = systems_of(bible)
+    if not systems:
+        raise HTTPException(
+            status_code=400,
+            detail="页面和项目里都还没有体系：先「AI 生成体系」或手写一套，再生成分层",
+        )
     prompt = build_tier_prompt(systems[0]) + (f"\n\n{body.note}" if body.note else "")
     raw = _model_call("生成档位分层", lambda: provider.chat("你为群像设计档位分层。", prompt))
     tiers = filter_tiers_by_bands(parse_tiers(raw), systems[0])
@@ -1813,26 +1879,46 @@ def plan_cultivation_route(
     if provider is None:
         raise HTTPException(status_code=503, detail="LLM 渠道未配置")
 
-    from app.generation.cultivation import derive_situation, plan_route, profile_of
-    from app.generation.power_system import systems_of
+    from app.generation.cultivation import (
+        derive_situation, normalize_profile, plan_route, profile_of,
+    )
+    from app.generation.power_system import normalize_power_system, systems_of
 
     bible = _ps_bible(proj)
-    systems = systems_of(bible)
+    # 优先用页面草稿：体系/档案都还没保存时也能规划，不再报「还没有」。
+    systems = normalize_power_system({"体系": body.systems})["体系"] if body.systems else []
     if not systems:
-        raise HTTPException(status_code=400, detail="还没有修炼体系，先建体系")
+        systems = systems_of(bible)
+    if not systems:
+        raise HTTPException(
+            status_code=400,
+            detail="页面和项目里都还没有体系：先在「体系与分层」生成或保存一套，再规划路线",
+        )
 
     name = (body.name or "").strip()
-    profile = {}
+    # 角色卡是路线与「天赋/来历」的事实来源：即使档案还没保存，也带上卡片摘要。
+    char_card: dict = {}
+    saved_profile: dict = {}
     for c in (bible.get("characters") or []):
         if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
-            profile = profile_of(c.get("card") or {})
+            char_card = c.get("card") if isinstance(c.get("card"), dict) else {}
+            saved_profile = profile_of(char_card)
             break
-    if not profile:
-        raise HTTPException(status_code=400, detail="这个角色还没有修炼档案")
+    profile = normalize_profile(body.profile) if body.profile else saved_profile
+    # 允许空白档案：模型会按体系给出一个合理起点，结果仍是草稿。
+
+    prompt_profile = dict(profile)
+    brief = {
+        k: char_card.get(k)
+        for k in ("身份", "能力", "声纹", "量级")
+        if isinstance(char_card, dict) and char_card.get(k)
+    }
+    if brief:
+        prompt_profile["角色资料"] = brief
 
     route = _model_call(
         "规划修炼路线",
-        lambda: plan_route(provider, profile, systems[0], raise_errors=True),
+        lambda: plan_route(provider, prompt_profile, systems[0], raise_errors=True),
     )
     if not route:
         return {"ok": False, "detail": "AI 没给出可用路线（可重试或改要求）"}

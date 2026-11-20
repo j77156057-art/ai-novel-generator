@@ -377,6 +377,9 @@ def _context(
         "segments": segments,
         "characters": characters,
         "character_source": character_source,
+        # 剧情圣经里的角色：角色卡步骤要列出「谁、什么角色、有没有卡」。
+        # 只读投影，不参与任何写入。
+        "bible_characters": _bible_characters(project),
         "generation_length": project.generation_length or 3000,
         "project_genre": project.genre,
     }
@@ -384,6 +387,50 @@ def _context(
     ctx.update(facts.distill_context(db, project))
     ctx["overrides"] = overrides or {}
     return ctx
+
+
+def _bible_characters(project: Project) -> list[dict[str, Any]]:
+    """剧情圣经里的角色摘要（角色卡步骤的清单/校验来源）。"""
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    out: list[dict[str, Any]] = []
+    for item in bible.get("characters") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        card = item.get("card")
+        out.append(
+            {
+                "name": name,
+                "role": str(item.get("role") or ""),
+                "has_card": isinstance(card, dict) and bool(card.get("声纹")),
+            }
+        )
+    return out
+
+
+def _card_stats_from_bible(bible: dict) -> dict[str, Any]:
+    """由已有 `characters[].card` 反算补卡统计（提交复用时的回执口径）。"""
+    chars = [c for c in (bible.get("characters") or []) if isinstance(c, dict)]
+    names: list[str] = []
+    missing: list[str] = []
+    for c in chars:
+        name = str(c.get("name") or "").strip()
+        if not name:
+            continue
+        card = c.get("card")
+        if isinstance(card, dict) and card.get("声纹"):
+            names.append(name)
+        else:
+            missing.append(name)
+    return {
+        "generated": len(names),
+        "names": names,
+        "missing": missing,
+        "collisions": 0,
+        "reason": "reused" if names else ("no_characters" if not chars else "no_cards"),
+    }
 
 
 def _session_view(session: AssistantWizardSession) -> dict[str, Any]:
@@ -524,6 +571,19 @@ def _state(
     }
     if ack:
         out["ack"] = ack
+    # 角色卡步骤：把刚生成（或用户改过）的卡作为预览交给前端，
+    # 复用结果气泡里已有的编辑/重生成/移除 UI。
+    if session.status == "active" and session.step_key == "cards":
+        bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+        if bible.get("characters"):
+            out["cards_preview"] = {
+                "kind": flow.KIND_ORIGINAL,
+                "stage": "cards",
+                "applied": [],
+                "message": "",
+                "bible": bible,
+                "character_cards": _card_stats_from_bible(bible),
+            }
     return out
 
 
@@ -852,6 +912,11 @@ def _advance(
     session.history = history
 
     ctx = _context(db, project, history, session.overrides or {})
+    # 条件步骤会因上游答案变化而失效（例如换了一本非仙侠的书）：清掉旧答案，
+    # 避免提交时还给不适用力量体系的题材生成体系。
+    if "system" in answers and "system" not in flow.step_order(session.kind, answers, ctx):
+        answers.pop("system", None)
+        session.answers = answers
     # 语料一选定就落库：紧随其后的 distill 步骤要立即用它启动后台提炼，
     # `start_distill` 读的是项目字段而不是会话 answers。
     if step == "corpus" and session.kind == flow.KIND_ORIGINAL:
@@ -864,6 +929,14 @@ def _advance(
     session.step_key = nxt
     db.commit()
     db.refresh(session)
+
+    # 进入角色卡步骤：先把剧情圣经和角色卡生成并落库，_state 随后把它们
+    # 作为 cards_preview 交给前端（复用已有的卡编辑/重生成 UI）。
+    # 已经有角色时不重建，保留用户在卡步骤里做过的修改。
+    if nxt == "cards" and not _bible_characters(project):
+        _build_bible(db, project, answers)
+        db.refresh(project)
+        db.refresh(session)
 
     # 蒸馏不再等到最后提交：答完档位就后台开跑，用户继续答后面的题。
     # 失败只记日志 + 回执提示，不让一次后台任务把作答打成 500。
@@ -985,9 +1058,15 @@ def say(
         history.append(step)
         session.answers = answers
         session.history = history
-        session.step_key = "confirm"
+        order = flow.step_order(answers.get("branch"), answers, ctx)
+        # 「按默认来」也不能把角色卡步骤静默跳过：先出大纲时停下来让用户过目。
+        session.step_key = "cards" if "cards" in order else "confirm"
         db.commit()
         db.refresh(session)
+        if session.step_key == "cards" and not _bible_characters(project):
+            _build_bible(db, project, answers)
+            db.refresh(project)
+            db.refresh(session)
         labels = "、".join(story.STORY_LABELS.get(k, k) for k in filled) or "后续参数"
         ack = f"好，不逐题问了：{labels}按默认补齐，之后在确认页还能逐项改。"
         out = _state(db, project, session, ack=ack)
@@ -1254,12 +1333,22 @@ def _commit(
 
         if answers.get("outline", True):
             result["stage"] = "outline"
-            bible, card_stats = _build_bible(db, project, answers)
+            existing = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+            if existing.get("characters"):
+                # 角色卡步骤已经生成过（可能含手工修改）：只补世界观背景，
+                # 不再重建大纲，避免把用户确认过的卡覆盖掉。
+                _apply_world_background(db, project, answers)
+                bible = project.plot_bible
+                card_stats = _card_stats_from_bible(bible)
+            else:
+                bible, card_stats = _build_bible(db, project, answers)
             result["bible"] = bible
             result["character_cards"] = card_stats
         result["distill"] = distill
+        _maybe_generate_power_system(db, project, answers, result)
         result["message"] = _commit_message(
             kind, distill, result["stage"], result.get("character_cards"))
+        _append_power_system_message(result)
 
     elif kind == flow.KIND_CONTINUATION:
         project.generation_length = int(answers.get("length") or project.generation_length or 3000)
@@ -1289,7 +1378,9 @@ def _commit(
             if project.continuation_novel_id:
                 result["applied"].append("reference_novel_ids")
         result["distill"] = distill
+        _maybe_generate_power_system(db, project, answers, result)
         result["message"] = _commit_message(kind, distill, "ready")
+        _append_power_system_message(result)
 
     elif kind == flow.KIND_ROLE:
         result["stage"] = "role"
@@ -1341,7 +1432,9 @@ def _commit_message(
             )
     if cards:
         generated = int(cards.get("generated") or 0)
-        if generated:
+        if cards.get("reason") == "reused":
+            parts.append(f"沿用你在角色卡步骤确认过的 {generated} 张卡，没有重复生成。")
+        elif generated:
             extra = ""
             if int(cards.get("collisions") or 0):
                 extra = f"（有 {cards['collisions']} 处声纹撞车，已在卡里标出）"
@@ -1449,6 +1542,116 @@ def _apply_world_background(
     except Exception:  # noqa: BLE001 —— 测试里的假 project 没有 ORM 状态
         pass
     db.commit()
+
+
+def _maybe_generate_power_system(
+    db: Session,
+    project: Project,
+    answers: dict[str, Any],
+    result: dict,
+) -> None:
+    """按向导答案生成力量体系（原创/续写共用；未勾选或失败都不阻断提交）。"""
+    if not answers.get("system"):
+        return
+    try:
+        ps = _generate_and_attach_power_system(db, project, answers)
+    except Exception as exc:  # noqa: BLE001 —— 增强项，不能拖垮提交
+        ps = {"ok": False, "detail": f"力量体系生成失败：{exc}"[:200]}
+    result["power_system"] = ps
+    if ps.get("ok"):
+        result["applied"].append("power_system")
+
+
+def _append_power_system_message(result: dict) -> None:
+    ps = result.get("power_system")
+    if not ps:
+        return
+    if ps.get("ok") and not ps.get("skipped"):
+        result["message"] = (result.get("message") or "") + (
+            f"\n力量体系：{ps.get('systems', 0)} 套体系、"
+            f"{ps.get('tiers', 0)} 层档位已保存，可在项目资产里修改。"
+        )
+    elif not ps.get("ok"):
+        result["message"] = (result.get("message") or "") + (
+            f"\n力量体系未生成：{ps.get('detail') or '模型未返回可用结果'}"
+            "（可稍后在项目资产 → 力量体系里补）。"
+        )
+
+
+def _generate_and_attach_power_system(
+    db: Session,
+    project: Project,
+    answers: dict[str, Any],
+) -> dict:
+    """按向导答案生成力量体系与档位，写进 `plot_bible`（只在此处落库）。
+
+    为什么放在提交而不是某一步：体系和档位各要一次模型调用，放在问答中途
+    会把「点下一步」变成长时间等待；提交时一次跑完，失败也只降级成一条提示。
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.generation.power_system import normalize_power_system
+    from app.generation.power_system_gen import (
+        _SYSTEM_PROMPT, build_system_prompt, build_tier_prompt,
+        filter_tiers_by_bands, parse_systems, parse_tiers, retry_instructions,
+        system_quality_issues,
+    )
+    from app.llm.provider import get_llm_provider
+
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    if bible.get("power_system"):
+        systems = (bible.get("power_system") or {}).get("体系") or []
+        return {"ok": True, "skipped": True,
+                "systems": len(systems), "tiers": len(bible.get("tier_layers") or [])}
+
+    note = "\n".join(
+        str(x).strip() for x in (
+            answers.get("world"), answers.get("power"), answers.get("premise"),
+        ) if str(x or "").strip()
+    )
+    genre = project.genre or str(answers.get("genre") or "")
+    # 续写分支没有「题材」这一步：从被续写的书里取题材与书名补进上下文。
+    if project.continuation_novel_id:
+        from app.models import RawNovel
+
+        novel = db.get(RawNovel, int(project.continuation_novel_id))
+        if novel is not None:
+            genre = genre or (novel.genre or "")
+            if not genre:
+                from app.wizard_flow import GENRE_HINTS
+                from app.wizard_story import detect_genres
+
+                hits = detect_genres(str(novel.title or ""), tuple(GENRE_HINTS))
+                genre = hits[0] if hits else ""
+            note = f"续写《{novel.title or ''}》" + (f"\n{note}" if note else "")
+    prompt = build_system_prompt(genre, project.style or "", note)
+    provider = get_llm_provider()
+
+    raw = provider.chat(_SYSTEM_PROMPT, prompt)
+    systems = parse_systems(raw)
+    issues = system_quality_issues(systems)
+    if issues:
+        raw = provider.chat(_SYSTEM_PROMPT, prompt + retry_instructions(issues, ""))
+        systems = parse_systems(raw)
+        issues = system_quality_issues(systems)
+    if not systems:
+        return {"ok": False, "detail": "模型没有给出可用体系（可重试）"}
+
+    tiers: list[dict] = []
+    try:
+        tier_raw = provider.chat("你为群像设计档位分层。", build_tier_prompt(systems[0]))
+        tiers = filter_tiers_by_bands(parse_tiers(tier_raw), systems[0])
+    except Exception:  # noqa: BLE001 —— 档位是增强项，体系已经可用
+        tiers = []
+
+    bible = dict(bible)
+    bible["power_system"] = normalize_power_system({"体系": systems})
+    if tiers:
+        bible["tier_layers"] = tiers
+    project.plot_bible = bible
+    flag_modified(project, "plot_bible")
+    db.commit()
+    return {"ok": True, "systems": len(systems), "tiers": len(tiers)}
 
 
 def _build_bible(

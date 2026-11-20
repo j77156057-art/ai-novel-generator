@@ -33,6 +33,8 @@ from app.routers import rhythm as rhythm_router
 from app.routers import timeline as timeline_router
 from app.routers import story_cards as story_cards_router
 from app.routers import foreshadow_ledger as foreshadow_ledger_router
+from app.routers import style_repair as style_repair_router
+from app.routers import web_search_settings as web_search_settings_router
 
 # uvicorn 默认只配自己的 logger，不接管 root；不显式配置的话，模块里的
 # logger.info（如向导里的角色增删）会被默认 WARNING 级别过滤掉，等于没记录。
@@ -195,6 +197,8 @@ app.include_router(rhythm_router.router)
 # 设定卡（人物/场景/道具）：/api/projects/{id}/story-cards，作者可增删改。
 app.include_router(story_cards_router.router)
 app.include_router(foreshadow_ledger_router.router)
+app.include_router(style_repair_router.router)
+app.include_router(web_search_settings_router.router)
 
 
 @app.get("/health")

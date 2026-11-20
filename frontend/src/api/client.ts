@@ -30,6 +30,7 @@ import type {
   AssistantPromptsActiveResponse,
   AssistantQaRequest,
   AssistantQaResponse,
+  AssistantChatStreamEvent,
   AssistantRestoreRequest,
   AssistantRestoreResult,
   AssistantRollbackBatchRequest,
@@ -43,14 +44,29 @@ import type {
   AssistantVersionDiffResponse,
   AssistantVersionListResponse,
   AttachmentCleaningPreview,
+  BookDigest,
+  BookDigestListResponse,
+  BookDigestStartRequest,
+  BookDigestStartResponse,
+  BookDigestVerify,
   ChapterOutlineApplyRequest,
   ChapterOutlineDraftRequest,
   ChapterOutlineDraftResponse,
   ChapterOutlineListResponse,
   ChapterOutlinePutRequest,
   ChapterOutlineWriteResponse,
+  CharacterCard,
+  CharacterCardGenerateResponse,
+  CharacterCardListResponse,
+  CharacterCardsBatchResponse,
   CharacterDetail,
+  CharacterTemplateDetail,
+  CharacterTemplateListResponse,
+  CharacterTemplateStartRequest,
+  CharacterTemplateStartResponse,
   ChunkOut,
+  CultivationPlanResponse,
+  CultivationProfile,
   DistillJob,
   DistillJobListResponse,
   DistillStartResponse,
@@ -67,12 +83,17 @@ import type {
   GenerationEditResult,
   GenerationStatus,
   GenerateStreamDoneMeta,
+  GenerationStageEvent,
   Graph,
   KgRebuildResult,
   KgBibleApplyResult,
   KgBibleRevisionListItem,
   KgCharacterEditResult,
   KgCharacterRenameResult,
+  KgBackfillResponse,
+  KgRecoverResponse,
+  KgStoryTimelineResponse,
+  KgWorldviewResponse,
   KgV3BookScopeResponse,
   KgV3Character,
   KgV3ExemptRequest,
@@ -84,11 +105,17 @@ import type {
   KgV3Slice,
   LlmConfig,
   LlmConfigIn,
+  LlmLocalModelsResponse,
   LlmTestIn,
   LlmTestResult,
   NovelOut,
   NarrativeTiersResponse,
   PlotBible,
+  PlotTimelineState,
+  PowerSystemDef,
+  PowerSystemGenerateResponse,
+  PowerSystemState,
+  PowerTier,
   PremiseProposal,
   ProjectCreate,
   ProjectOut,
@@ -100,7 +127,10 @@ import type {
   RoleplayMessage,
   StyleDistillApplyRequest,
   StyleDistillDetail,
+  StyleNarrativeConflictsResponse,
+  TierGenerateResponse,
   StyleDistillListResponse,
+  StyleRepairPlan,
   SearchHit,
   StoryCardCreateRequest,
   StoryCardListResponse,
@@ -121,6 +151,9 @@ import type {
   WorldBackgroundResponse,
   WorldBackgroundSaveRequest,
   WizardStateResponse,
+  WebSearchConfig,
+  WebSearchConfigIn,
+  WebSearchTestResult,
 } from "./types";
 
 const BASE = "/api";
@@ -401,6 +434,162 @@ export const api = {
   getDistillJob: (projectId: number, jobId: number) =>
     request<DistillJob>(`/projects/${projectId}/distill/jobs/${jobId}`),
 
+  // ---------- 全书摘要（书级产物，项目级提交） ----------
+
+  /** 提交一次全书摘要：立即返回 job_id，摘要在后台跑（与蒸馏同一套任务表）。 */
+  startBookDigest: (projectId: number, body: BookDigestStartRequest) =>
+    request<BookDigestStartResponse>(
+      `/projects/${projectId}/digests`,
+      jsonInit("POST", body),
+    ),
+
+  /** 取这本书的最新摘要（没有时后端 404，调用方按「还没生成」处理）。 */
+  getBookDigest: (novelId: number) =>
+    request<BookDigest>(`/books/${novelId}/digest`),
+
+  /** 取这本书摘要的三项验收结论。 */
+  verifyBookDigest: (novelId: number) =>
+    request<BookDigestVerify>(`/books/${novelId}/digest/verify`),
+
+  /** 摘要历史（active + archived，新的在前；不带正文）。 */
+  listBookDigests: (novelId: number, limit = 20) =>
+    request<BookDigestListResponse>(
+      `/books/${novelId}/digests?limit=${encodeURIComponent(String(limit))}`,
+    ),
+
+  /** 指定版本的摘要详情（含正文），供历史对比。 */
+  getBookDigestVersion: (novelId: number, digestId: number) =>
+    request<BookDigest>(`/books/${novelId}/digests/${digestId}`),
+
+  // ---------- 人物塑造模板 ----------
+
+  /** 模板库列表（跨项目复用；id 自带档位）。 */
+  listCharacterTemplates: (limit = 50) =>
+    request<CharacterTemplateListResponse>(
+      `/projects/character-templates?limit=${encodeURIComponent(String(limit))}`,
+    ),
+
+  /** 单条模板详情（含规则全文；列表只有条数）。 */
+  getCharacterTemplate: (templateId: string) =>
+    request<CharacterTemplateDetail>(
+      `/projects/character-templates/${encodeURIComponent(templateId)}`,
+    ),
+
+  /** 提炼人物塑造模板：立即返回 job_id，抽取在后台跑；同档同语料会复用库里的产物。 */
+  startCharacterTemplate: (
+    projectId: number,
+    body: CharacterTemplateStartRequest = {},
+  ) =>
+    request<CharacterTemplateStartResponse>(
+      `/projects/${projectId}/character-template`,
+      jsonInit("POST", body),
+    ),
+
+  /** 把库里某条模板应用到本项目（只记引用，不改正文）。 */
+  applyCharacterTemplate: (projectId: number, templateId: string) =>
+    request<ProjectOut>(
+      `/projects/${projectId}/character-templates/apply`,
+      jsonInit("POST", { template_id: templateId }),
+    ),
+
+  /** 取消应用人物模板：只清项目引用，不动模板库产物与正文。 */
+  clearCharacterTemplate: (projectId: number) =>
+    request<ProjectOut>(`/projects/${projectId}/character-template`, {
+      method: "DELETE",
+    }),
+
+  // ---------- 角色卡（身份 / 能力 / 声纹 / 关系） ----------
+
+  /** 本项目全部角色卡 + 声纹撞车提示。 */
+  listCharacterCards: (projectId: number) =>
+    request<CharacterCardListResponse>(`/projects/${projectId}/character-cards`),
+
+  /** 保存用户编辑后的卡（后端标 来源=user，自动流程不再覆盖）。 */
+  saveCharacterCard: (projectId: number, name: string, card: CharacterCard) =>
+    request<{ ok: boolean; name: string; card: CharacterCard }>(
+      `/projects/${projectId}/character-cards`,
+      jsonInit("POST", { name, card }),
+    ),
+
+  /** 单角色 AI 补全：只返回「补充」，不落库。 */
+  generateCharacterCard: (
+    projectId: number,
+    name: string,
+    card: CharacterCard = {},
+    note = "",
+  ) =>
+    request<CharacterCardGenerateResponse>(
+      `/projects/${projectId}/character-cards/generate`,
+      jsonInit("POST", { name, card, note }),
+    ),
+
+  /** 批量生成新角色草稿：只返回，不落库。 */
+  generateCharacterCardsBatch: (
+    projectId: number,
+    wants: string[],
+    note = "",
+  ) =>
+    request<CharacterCardsBatchResponse>(
+      `/projects/${projectId}/character-cards/batch`,
+      jsonInit("POST", { wants, note }),
+    ),
+
+  // ---------- 力量体系 / 档位分层 / 角色修炼 ----------
+
+  getPowerSystem: (projectId: number) =>
+    request<PowerSystemState>(`/projects/${projectId}/power-system`),
+
+  savePowerSystem: (
+    projectId: number,
+    systems: PowerSystemDef[],
+    tiers: PowerTier[],
+  ) =>
+    request<{ ok: boolean; power_system: unknown; tiers: PowerTier[] }>(
+      `/projects/${projectId}/power-system`,
+      jsonInit("POST", { power_system: { 体系: systems }, tiers }),
+    ),
+
+  /** AI 生成体系：只建议，不落库。 */
+  generatePowerSystem: (
+    projectId: number,
+    body: { genre?: string; tone?: string; note?: string; system_type?: string },
+  ) =>
+    request<PowerSystemGenerateResponse>(
+      `/projects/${projectId}/power-system/generate`,
+      jsonInit("POST", body),
+    ),
+
+  /** AI 生成档位分层：可带上页面里尚未保存的体系草稿。 */
+  generatePowerTiers: (projectId: number, note = "", systems: PowerSystemDef[] = []) =>
+    request<TierGenerateResponse>(
+      `/projects/${projectId}/power-system/tiers/generate`,
+      jsonInit("POST", { note, systems }),
+    ),
+
+  /** 保存角色修炼档案（挂到角色卡 `card.修炼`）。 */
+  saveCultivation: (
+    projectId: number,
+    name: string,
+    profile: CultivationProfile,
+  ) =>
+    request<{ ok: boolean; name: string }>(
+      `/projects/${projectId}/cultivation`,
+      jsonInit("POST", { name, profile }),
+    ),
+
+  /** AI 规划修炼路线：可带页面里尚未保存的档案与体系草稿。 */
+  planCultivation: (
+    projectId: number,
+    name: string,
+    note = "",
+    profile: CultivationProfile = {},
+    systems: PowerSystemDef[] = [],
+  ) =>
+    request<CultivationPlanResponse>(
+      `/projects/${projectId}/cultivation/plan`,
+      jsonInit("POST", { name, note, profile, systems }),
+    ),
+
   // ---------- 文风蒸馏库（跨项目复用） ----------
 
   /**
@@ -476,12 +665,18 @@ export const api = {
     maxChars: number | null,
     onChunk: (text: string) => void,
     onDone: (meta: GenerateStreamDoneMeta) => void,
+    signal?: AbortSignal,
+    onReasoning?: (chars: number) => void,
+    onStage?: (stage: GenerationStageEvent) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
-      fetch(`${BASE}/generate-stream`, jsonInit("POST", {
-        project_id: projectId,
-        max_chars: maxChars ?? null,
-      })).then(async (res) => {
+      fetch(`${BASE}/generate-stream`, {
+        ...jsonInit("POST", {
+          project_id: projectId,
+          max_chars: maxChars ?? null,
+        }),
+        ...(signal ? { signal } : {}),
+      }).then(async (res) => {
         if (!res.ok) {
           reject(new ApiError(res.status, `生成失败 HTTP ${res.status}`));
           return;
@@ -506,9 +701,13 @@ export const api = {
               try {
                 const ev = JSON.parse(payload) as
                   | { type: "chunk"; text: string }
+                  | { type: "reasoning"; chars: number }
+                  | GenerationStageEvent
                   | ({ type: "done" } & GenerateStreamDoneMeta)
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
+                else if (ev.type === "reasoning") onReasoning?.(ev.chars);
+                else if (ev.type === "stage") onStage?.(ev);
                 else if (ev.type === "done") onDone(ev);
                 else if (ev.type === "error") reject(new ApiError(500, ev.message));
               } catch {
@@ -528,13 +727,19 @@ export const api = {
     maxChars: number | null,
     onChunk: (text: string) => void,
     onDone: (meta: RegenerateStreamDoneMeta) => void,
+    signal?: AbortSignal,
+    onReasoning?: (chars: number) => void,
+    onStage?: (stage: GenerationStageEvent) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
-      fetch(`${BASE}/regenerate-stream`, jsonInit("POST", {
-        project_id: projectId,
-        segment_no: segmentNo,
-        max_chars: maxChars ?? null,
-      })).then(async (res) => {
+      fetch(`${BASE}/regenerate-stream`, {
+        ...jsonInit("POST", {
+          project_id: projectId,
+          segment_no: segmentNo,
+          max_chars: maxChars ?? null,
+        }),
+        ...(signal ? { signal } : {}),
+      }).then(async (res) => {
         if (!res.ok) {
           reject(new ApiError(res.status, `重生成失败 HTTP ${res.status}`));
           return;
@@ -559,9 +764,13 @@ export const api = {
               try {
                 const ev = JSON.parse(payload) as
                   | { type: "chunk"; text: string }
+                  | { type: "reasoning"; chars: number }
+                  | GenerationStageEvent
                   | ({ type: "done" } & RegenerateStreamDoneMeta)
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
+                else if (ev.type === "reasoning") onReasoning?.(ev.chars);
+                else if (ev.type === "stage") onStage?.(ev);
                 else if (ev.type === "done") onDone(ev);
                 else if (ev.type === "error") reject(new ApiError(500, ev.message));
               } catch {
@@ -577,6 +786,12 @@ export const api = {
   listGenerations: (projectId: number) =>
     request<GenerationOut[]>(`/generations/${projectId}`),
 
+  /** 定向返修计划（只读诊断，不调模型）。 */
+  styleRepairPlan: (projectId: number, segmentNo: number) =>
+    request<StyleRepairPlan>(
+      `/projects/${projectId}/segments/${segmentNo}/repair-plan`,
+    ),
+
   /**
    * 手动改一段正文（不调模型改字）。
    * 后端会重算剧情总结与摘要树、重建图谱，并把 v3 批抽重新入队；
@@ -586,6 +801,17 @@ export const api = {
     request<GenerationEditResult>(
       `/generations/${projectId}/${generationId}`,
       jsonInit("PATCH", { text }),
+    ),
+
+  /** 当前时间线（世界线）存档：节点 + 章区间 + 当前锚点，只读。 */
+  getTimeline: (projectId: number) =>
+    request<PlotTimelineState>(`/projects/${projectId}/timeline`),
+
+  /** 让模型把占位节点规划成真实剧情点（需要章纲；会覆盖非人工节点）。 */
+  planTimeline: (projectId: number, keepUserNodes = true) =>
+    request<{ replaced: number; timeline: PlotTimelineState }>(
+      `/projects/${projectId}/timeline/plan`,
+      jsonInit("POST", { keep_user_nodes: keepUserNodes }),
     ),
 
   /** 生成进度（轻量）：段数 + 最新段/章 + 是否在生成。轮询用，不含正文。 */
@@ -614,6 +840,27 @@ export const api = {
   // ---------- 模型设置（渠道 / key / 模型，持久化 + 热切换） ----------
   getLlmConfig: () => request<LlmConfig>("/settings/llm"),
 
+  /** 探测本机 Ollama 已安装的模型（只读；失败返回 ok=false + 可读原因）。 */
+  listLocalModels: (baseUrl?: string) =>
+    request<LlmLocalModelsResponse>(
+      `/settings/llm/local-models${baseUrl ? `?base_url=${encodeURIComponent(baseUrl)}` : ""}`,
+    ),
+
+  getWebSearchConfig: () =>
+    request<WebSearchConfig>("/settings/web-search"),
+
+  saveWebSearchConfig: (body: WebSearchConfigIn) =>
+    request<WebSearchConfig>(
+      "/settings/web-search",
+      jsonInit("PUT", body),
+    ),
+
+  testWebSearch: (query = "Tavily 联网搜索测试") =>
+    request<WebSearchTestResult>(
+      "/settings/web-search/test",
+      jsonInit("POST", { query }),
+    ),
+
   saveLlmConfig: (body: LlmConfigIn) =>
     request<LlmConfig>("/settings/llm", jsonInit("PUT", body)),
 
@@ -629,6 +876,74 @@ export const api = {
   /** 1. 问答：只读检索 + Assistant 模型回答，返回 evidence 与 confidence。 */
   assistantQa: (body: AssistantQaRequest) =>
     request<AssistantQaResponse>("/assistant/qa", jsonInit("POST", body)),
+
+  /**
+   * 剧情讨论（SSE 流式）：逐字回调 onDelta，`done` 事件解析成完整响应后 resolve。
+   *
+   * 与 generateStream 同协议（`data: {json}\n\n`）。流式失败时 reject，
+   * 调用方可以在「一个字都没收到」时回落到一次性 `/assistant/qa`。
+   */
+  assistantChatStream: (
+    body: AssistantQaRequest,
+    onDelta: (text: string) => void,
+    onMeta?: (meta: {
+      agent_run_id: number;
+      model?: string;
+      evidence_count?: number;
+      confidence?: number;
+    }) => void,
+    onSteps?: (steps: { name: string; meta?: string; detail?: string }[]) => void,
+  ): Promise<AssistantQaResponse> =>
+    new Promise<AssistantQaResponse>((resolve, reject) => {
+      fetch(`${BASE}/assistant/chat/stream`, jsonInit("POST", body))
+        .then(async (res) => {
+          if (!res.ok) {
+            reject(new ApiError(res.status, `对话失败 HTTP ${res.status}`));
+            return;
+          }
+          if (!res.body) {
+            reject(new ApiError(500, "对话流没有响应体"));
+            return;
+          }
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          let final: AssistantQaResponse | null = null;
+          const pump = (): Promise<void> =>
+            reader.read().then(({ done, value }) => {
+              if (done) {
+                if (final) resolve(final);
+                else reject(new ApiError(500, "对话流意外结束"));
+                return;
+              }
+              buf += decoder.decode(value, { stream: true });
+              let idx: number;
+              while ((idx = buf.indexOf("\n\n")) !== -1) {
+                const frame = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                const line = frame.split("\n").find((l) => l.startsWith("data:"));
+                if (!line) continue;
+                const payload = line.slice(5).trim();
+                try {
+                  const ev = JSON.parse(payload) as AssistantChatStreamEvent;
+                  if (ev.type === "delta") onDelta(ev.text);
+                  else if (ev.type === "meta") onMeta?.(ev);
+                  else if (ev.type === "steps") onSteps?.(ev.steps);
+                  else if (ev.type === "done") final = ev;
+                  else if (ev.type === "error") {
+                    reject(new ApiError(500, ev.message));
+                    return;
+                  }
+                } catch {
+                  /* 跳过不完整帧 */
+                }
+              }
+              return pump();
+            });
+          pump().catch((e) => reject(e));
+        })
+        .catch((e) => reject(e));
+    }),
 
   // —— 助理长期记忆（项目级；内容由助手在问答后自动抽取，这里只读与删除）——
   listAssistantMemories: (projectId: number) =>
@@ -856,6 +1171,12 @@ export const api = {
   kgV3StyleWarnings: (projectId: number) =>
     request<KgV3StyleWarningsResponse>(`/projects/${projectId}/kg-v3/style-warnings`),
 
+  /** 文风档案的禁用词冲突（只读；error 级会挡住生成）。 */
+  styleNarrativeConflicts: (projectId: number) =>
+    request<StyleNarrativeConflictsResponse>(
+      `/projects/${projectId}/style-narrative/conflicts`,
+    ),
+
   /** 项目角色清单（mention 降序）。 */
   kgV3Characters: (projectId: number, limit = 200) =>
     request<{ characters: KgV3Character[] }>(
@@ -905,6 +1226,45 @@ export const api = {
       `/projects/${projectId}/kg-v3/worker/requeue`,
       jsonInit("POST", { run_ids: runIds }),
     ),
+
+  /** 为「压根没有入队行」的已生成段补建任务并入队。 */
+  kgV3Backfill: (projectId: number) =>
+    request<KgBackfillResponse>(
+      `/projects/${projectId}/kg-v3/worker/backfill`,
+      { method: "POST" },
+    ),
+
+  /** 恢复停在 running 的批抽行（stuckOnly=false = 全部 running）。 */
+  kgV3Recover: (projectId: number, stuckOnly = true) =>
+    request<KgRecoverResponse>(
+      `/projects/${projectId}/kg-v3/worker/recover?stuck_only=${stuckOnly ? "true" : "false"}`,
+      { method: "POST" },
+    ),
+
+  // ---------- KG v3：世界观 / 剧情时间线 ----------
+
+  /** 世界观：`novelId=null` 表示本书（生成正文）的 KG。 */
+  kgV3Worldview: (projectId: number, novelId: number | null) =>
+    request<KgWorldviewResponse>(
+      `/projects/${projectId}/kg-v3/worldview${novelId == null ? "" : `?novel_id=${novelId}`}`,
+    ),
+
+  /** 剧情时间线：`novelId=null` 表示本书（生成正文）的 KG。 */
+  kgV3StoryTimeline: (
+    projectId: number,
+    novelId: number | null,
+    opts: { fromChapter?: number; offset?: number; limit?: number } = {},
+  ) => {
+    const p = new URLSearchParams();
+    if (novelId != null) p.set("novel_id", String(novelId));
+    if (opts.fromChapter != null) p.set("from_chapter", String(opts.fromChapter));
+    if (opts.offset != null) p.set("offset", String(opts.offset));
+    if (opts.limit != null) p.set("limit", String(opts.limit));
+    const q = p.toString();
+    return request<KgStoryTimelineResponse>(
+      `/projects/${projectId}/kg-v3/timeline${q ? `?${q}` : ""}`,
+    );
+  },
 
   // ---------- 对话式创作引导 ----------
 

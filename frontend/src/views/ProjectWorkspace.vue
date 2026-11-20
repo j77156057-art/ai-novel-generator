@@ -3,6 +3,7 @@ defineOptions({ name: "ProjectWorkspace" });
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, ApiError } from "@/api/client";
+import ProjectNav from "@/components/ProjectNav.vue";
 import type {
   AlertsResponse,
   AssistantApplyResult,
@@ -37,6 +38,7 @@ import type {
   StoryCardKindSpec,
   StoryCardOut,
   StyleDistillSummary,
+  StyleRepairPlan,
   WorldBackground,
 } from "@/api/types";
 import DistillProgress from "@/components/DistillProgress.vue";
@@ -2514,6 +2516,86 @@ async function submitLocalNote(g: SegmentRef): Promise<void> {
   }
 }
 
+// ===========================================================================
+// 定向返修：先读「文风档案说这段哪里不对」，再把这几条要求交给既有重写链路
+// ---------------------------------------------------------------------------
+// 诊断端点不调模型，只做规则命中 + 指标偏离；执行仍走 invoke-generation，
+// 因此快照、回滚、AgentRun 审计都与手动重写一致。
+// ===========================================================================
+type RepairPanelState = {
+  open: boolean;
+  loading: boolean;
+  busy: boolean;
+  error: string | null;
+  notice: string | null;
+  plan: StyleRepairPlan | null;
+};
+
+const repairPlans = reactive<Record<number, RepairPanelState>>({});
+
+function repairState(g: { id: number }): RepairPanelState {
+  if (!repairPlans[g.id]) {
+    repairPlans[g.id] = {
+      open: false,
+      loading: false,
+      busy: false,
+      error: null,
+      notice: null,
+      plan: null,
+    };
+  }
+  return repairPlans[g.id];
+}
+
+async function toggleRepairPlan(g: SegmentRef): Promise<void> {
+  const s = repairState(g);
+  s.open = !s.open;
+  if (!s.open || s.plan || s.loading) return;
+  s.loading = true;
+  s.error = null;
+  s.notice = null;
+  try {
+    s.plan = await api.styleRepairPlan(projectId, g.segment_no);
+  } catch (err) {
+    s.error = errorText(err);
+  } finally {
+    s.loading = false;
+  }
+}
+
+async function runTargetedRepair(g: SegmentRef): Promise<void> {
+  const s = repairState(g);
+  const plan = s.plan;
+  if (!plan?.instruction || s.busy) return;
+  s.busy = true;
+  s.error = null;
+  s.notice = null;
+  try {
+    const res = await api.assistantInvokeGeneration({
+      project_id: projectId,
+      action: "regenerate_segment",
+      segment_no: g.segment_no,
+      instruction: plan.instruction,
+    });
+    if (res.status === "needs_clarification") {
+      s.error = "返修指令被判定为局部改写，需要补充修改范围；请改用「局部改写」。";
+      return;
+    }
+    delete segmentSaved[g.id];
+    s.open = false;
+    s.plan = null;
+    actionNotice.value = {
+      kind: "ok",
+      text: `已定向返修第 ${g.segment_no} 段：${res.chars} 字。可在下方「重写快照与回滚」退回。`,
+    };
+    await loadGenerations();
+  } catch (err) {
+    s.error = errorText(err);
+  } finally {
+    s.busy = false;
+  }
+}
+
 async function runExport() {
   actionNotice.value = null;
   try {
@@ -3387,6 +3469,7 @@ onUnmounted(() => {
 
 <template>
   <div class="workspace-page">
+  <ProjectNav :project-id="projectId" />
   <header class="page-head workspace-head">
     <div class="eyebrow">Project workspace</div>
     <div class="title-block">
@@ -3428,6 +3511,7 @@ onUnmounted(() => {
         {{ completed ? "重新开启创作" : "保存并标记完成" }}
       </button>
       <button class="btn" @click="router.push(`/projects/${projectId}/assistant`)">打开助手工作台</button>
+      <button class="btn" @click="router.push(`/projects/${projectId}/assets`)">项目资产</button>
     </div>
   </header>
 
@@ -5197,6 +5281,18 @@ onUnmounted(() => {
             </button>
             <button
               class="btn sm"
+              :disabled="
+                repairPlans[g.id]?.loading ||
+                repairPlans[g.id]?.busy ||
+                regenState[g.id]?.loading ||
+                streaming
+              "
+              @click="toggleRepairPlan(g)"
+            >
+              {{ repairPlans[g.id]?.open ? "收起返修" : "定向返修" }}
+            </button>
+            <button
+              class="btn sm"
               :class="{ primary: segmentEdits[g.id] }"
               :disabled="regenState[g.id]?.loading || streaming"
               @click="toggleSegmentEdit(g)"
@@ -5352,6 +5448,60 @@ onUnmounted(() => {
                 </button>
               </div>
             </div>
+          </div>
+
+          <!-- 定向返修：先看「哪条规则不对」，再把要求交给既有重写链路 -->
+          <div v-if="repairPlans[g.id]?.open" class="targeted-repair">
+            <div v-if="repairPlans[g.id]?.loading" class="faint repair-status">
+              <span class="spinner" /> 正在对照文风档案…
+            </div>
+            <div v-else-if="repairPlans[g.id]?.error" class="notice err">
+              {{ repairPlans[g.id]?.error }}
+            </div>
+            <template v-else-if="repairPlans[g.id]?.plan">
+              <div class="repair-head">
+                <strong>{{ repairPlans[g.id]?.plan?.summary }}</strong>
+                <span
+                  v-if="repairPlans[g.id]?.plan?.issues.length"
+                  class="tag accent"
+                >{{ repairPlans[g.id]?.plan?.issues.length }} 条</span>
+              </div>
+              <p v-if="!repairPlans[g.id]?.plan?.ok" class="faint repair-status">
+                {{
+                  repairPlans[g.id]?.plan?.reason === "no_archive"
+                    ? "还没有可用的文风档案；先在项目页完成一次文风提炼。"
+                    : "没有可量化的偏离；仍可用「局部改写」按自己的要求改。"
+                }}
+              </p>
+              <ul v-else class="repair-issues">
+                <li
+                  v-for="(issue, idx) in repairPlans[g.id]?.plan?.issues || []"
+                  :key="`${g.id}-${idx}`"
+                >
+                  <div class="repair-issue-head">
+                    <span
+                      class="tag"
+                      :class="issue.severity === 'high' ? 'err' : 'warn'"
+                    >{{ issue.dimension }}</span>
+                    <strong>{{ issue.title }}</strong>
+                  </div>
+                  <p>{{ issue.detail }}</p>
+                  <p class="faint">{{ issue.fix }}</p>
+                </li>
+              </ul>
+              <div v-if="repairPlans[g.id]?.plan?.ok" class="repair-actions">
+                <button
+                  class="btn sm primary"
+                  :disabled="repairPlans[g.id]?.busy"
+                  @click="runTargetedRepair(g)"
+                >
+                  {{ repairPlans[g.id]?.busy ? "返修中…" : "开始定向返修" }}
+                </button>
+                <span class="faint repair-hint">
+                  会调用一次改写模型；完成后可在「重写快照与回滚」退回。
+                </span>
+              </div>
+            </template>
           </div>
         </div>
       </div>
@@ -5877,7 +6027,7 @@ onUnmounted(() => {
 .title-input {
   width: min(100%, 560px);
   min-width: min(320px, 100%);
-  font-size: var(--fs-xl);
+  font-size: var(--fs-3xl);
   font-weight: 650;
   padding: 5px 10px;
 }
@@ -5888,7 +6038,7 @@ onUnmounted(() => {
 }
 .title-click:hover { color: var(--accent-ink); }
 .workspace-head { padding-bottom: 22px; border-bottom: 1px solid var(--border-strong); }
-.workspace-head .title-click { font-size: 38px; }
+.workspace-head .title-click { font-size: var(--fs-6xl); }
 .workspace-actions { align-items: center; margin-top: 14px; }
 .action-notice { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
 .action-notice .link-btn { flex: none; color: inherit; }
@@ -5951,7 +6101,7 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   font-family: Georgia, serif;
-  font-size: 18px;
+  font-size: var(--fs-xl);
   font-weight: 400;
   line-height: 1;
   flex: none;
@@ -6279,17 +6429,17 @@ onUnmounted(() => {
 }
 /* ---------- 生成与正文校样 ---------- */
 .generation-console { min-width: 0; }
-.generation-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; padding: 16px 0 18px; border-top: 2px solid var(--fg); }
-.section-kicker, .control-kicker, .proof-kicker { color: var(--accent-ink); font-size: 10px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
-.generation-heading h2 { margin-top: 4px; font-family: var(--font-display); font-size: 28px; font-weight: 600; }
-.edition-mark { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; }
+.generation-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; padding: 16px 0 18px; border-top: 1px solid var(--border-strong); }
+.section-kicker, .control-kicker, .proof-kicker { color: var(--accent-ink); font-size: var(--fs-3xs); font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
+.generation-heading h2 { margin-top: 4px; font-family: var(--font-display); font-size: var(--fs-4xl); font-weight: 600; }
+.edition-mark { color: var(--fg-muted); font-family: var(--font-mono); font-size: var(--fs-2xs); }
 
 /* ---------- 写作执行看板 ---------- */
-.writing-board { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; margin-bottom: 20px; padding: 14px 16px; border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--bg-elev); }
+.writing-board { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; margin-bottom: 20px; padding: 16px 18px; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius-md); background: var(--bg-elev); box-shadow: var(--shadow-sm); }
 .writing-board-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .writing-kpi { display: flex; flex-direction: column; gap: 2px; }
 .writing-kpi .k { color: var(--fg-muted); font-size: var(--fs-xs); }
-.writing-kpi strong { font-family: var(--font-display); font-size: 22px; font-weight: 600; line-height: 1.2; }
+.writing-kpi strong { font-family: var(--font-display); font-size: var(--fs-2xl); font-weight: 600; line-height: 1.2; }
 .writing-kpi .faint { font-size: var(--fs-xs); }
 .writing-board-risks { min-width: 0; border-left: 1px solid var(--border); padding-left: 16px; }
 .writing-board-risk-head { display: flex; align-items: center; gap: 8px; font-size: var(--fs-xs); font-weight: 600; }
@@ -6303,16 +6453,16 @@ onUnmounted(() => {
 }
 
 /* ---------- 设定卡（人物 / 场景 / 道具） ---------- */
-.author-panel { margin-bottom: 24px; padding: 18px 20px 20px; border: 1px solid var(--border); background: var(--bg-elev); }
+.author-panel { margin-bottom: 24px; padding: 20px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-elev); box-shadow: var(--shadow-sm); }
 .author-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 14px; }
-.author-panel-head h3 { font-family: var(--font-display); font-size: 20px; font-weight: 600; }
+.author-panel-head h3 { font-family: var(--font-display); font-size: var(--fs-2xl); font-weight: 600; }
 .author-panel-hint { margin-top: 6px; max-width: 68ch; color: var(--fg-muted); font-size: var(--fs-xs); line-height: 1.7; }
 .author-panel-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .world-list { margin-top: 12px; }
 .world-list-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; font-size: var(--fs-sm); color: var(--fg-muted); }
 .world-list-row { display: flex; gap: 8px; margin-bottom: 6px; }
 .world-list-row .input { flex: 1; }
-.world-suggestion { margin-top: 14px; padding: 12px 14px; border: 1px dashed var(--border); background: var(--bg); }
+.world-suggestion { margin-top: 14px; padding: 12px 14px; border: 1px dashed var(--border-strong); border-radius: var(--radius-md); background: var(--bg); }
 .world-suggestion-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .world-suggestion p { margin: 4px 0; font-size: var(--fs-sm); }
 .world-suggestion .k { margin-right: 8px; color: var(--fg-muted); }
@@ -6324,25 +6474,26 @@ onUnmounted(() => {
 .foreshadow-kg-suggest p { margin: 0 0 4px; }
 .foreshadow-kg-suggest-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 0; }
 .foreshadow-kg-title { font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.story-cards-panel { margin-bottom: 24px; padding: 18px 20px 20px; border: 1px solid var(--border); border-top: 2px solid var(--accent); background: var(--bg-elev); }
+.story-cards-panel { margin-bottom: 24px; padding: 20px; border: 1px solid var(--border); border-top: 2px solid var(--accent); border-radius: var(--radius-lg); background: var(--bg-elev); box-shadow: var(--shadow-sm); }
 .story-cards-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
-.story-cards-head h3 { margin-top: 4px; font-family: var(--font-display); font-size: 22px; font-weight: 600; }
+.story-cards-head h3 { margin-top: 4px; font-family: var(--font-display); font-size: var(--fs-2xl); font-weight: 600; }
 .story-cards-hint { margin-top: 6px; max-width: 72ch; color: var(--fg-muted); font-size: var(--fs-xs); line-height: 1.7; }
 .story-cards-summary { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
 .card-group { margin-top: 14px; border-top: 1px solid var(--border); }
 .card-group-head { display: flex; align-items: center; gap: 10px; padding: 12px 2px; cursor: pointer; list-style: none; }
 .card-group-head::-webkit-details-marker { display: none; }
-.card-group-head::before { content: "▸"; display: inline-block; color: var(--accent-ink); font-size: 11px; transition: transform 160ms var(--ease-out-quart); }
+.card-group-head::before { content: "▸"; display: inline-block; color: var(--accent-ink); font-size: var(--fs-2xs); transition: transform 160ms var(--ease-out-quart); }
 .card-group[open] > .card-group-head::before { transform: rotate(90deg); }
 .card-group-title { font-weight: 700; font-size: var(--fs-sm); }
-.card-group-count { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; }
+.card-group-count { color: var(--fg-muted); font-family: var(--font-mono); font-size: var(--fs-2xs); }
 .card-group-body { display: flex; flex-direction: column; gap: 8px; padding: 0 0 14px 18px; }
 .story-cards-empty { color: var(--fg-muted); font-size: var(--fs-xs); }
-.story-card { border: 1px solid var(--border); background: var(--bg); }
+.story-card { border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg); }
 .story-card.disabled { opacity: .62; }
-.story-card-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; list-style: none; }
+.story-card-head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; cursor: pointer; list-style: none; border-radius: var(--radius-md); transition: background .13s ease; }
+.story-card-head:hover { background: var(--bg-sunken); }
 .story-card-head::-webkit-details-marker { display: none; }
-.story-card-head::before { content: "▸"; display: inline-block; color: var(--accent-ink); font-size: 10px; transition: transform 160ms var(--ease-out-quart); }
+.story-card-head::before { content: "▸"; display: inline-block; color: var(--accent-ink); font-size: var(--fs-3xs); transition: transform 160ms var(--ease-out-quart); }
 .story-card[open] > .story-card-head::before { transform: rotate(90deg); }
 .story-card-title { font-weight: 600; }
 .story-card-body { padding: 4px 12px 14px; border-top: 1px dashed var(--border); }
@@ -6354,7 +6505,7 @@ onUnmounted(() => {
 .custom-field-row { display: grid; grid-template-columns: 168px minmax(0, 1fr) auto; gap: 8px; align-items: start; }
 .custom-field-row textarea.input { min-height: 52px; resize: vertical; line-height: 1.6; }
 .card-ref { margin-top: 6px; }
-.card-ref-panel { margin-top: 8px; padding: 12px; border: 1px dashed var(--border-strong); background: var(--bg-elev); }
+.card-ref-panel { margin-top: 8px; padding: 14px; border: 1px dashed var(--border-strong); border-radius: var(--radius-md); background: var(--bg-elev); }
 .card-ref-hint { margin-bottom: 10px; color: var(--fg-muted); font-size: var(--fs-xs); line-height: 1.6; }
 .card-ref-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .card-ref-preview { margin-top: 10px; }
@@ -6372,23 +6523,23 @@ onUnmounted(() => {
   .foreshadow-row { grid-template-columns: 1fr; }
 }
 
-.production-grid { display: grid; grid-template-columns: 282px minmax(0, 1fr); gap: 24px; align-items: start; }
-.production-controls { min-width: 0; padding: 20px; border: 1px solid var(--border); border-top: 2px solid var(--accent); background: var(--bg-elev); }
+.production-grid { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 24px; align-items: start; }
+.production-controls { min-width: 0; padding: 20px; border: 1px solid var(--border); border-top: 2px solid var(--accent); border-radius: var(--radius-lg); background: var(--bg-elev); box-shadow: var(--shadow-sm); }
 .generation-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 18px; }
 .reference-field { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
 .generation-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; margin-top: 22px; }
 .back-step { margin-top: 8px; padding-left: 0; }
 .generation-notice { margin-top: 16px; }
-.manuscript-stage { position: relative; min-width: 0; min-height: 520px; display: flex; flex-direction: column; border: 1px solid var(--border-strong); border-top: 3px solid var(--accent); background: var(--bg-elev); transition: border-color 220ms var(--ease-out-quart); }
+.manuscript-stage { position: relative; min-width: 0; min-height: 520px; display: flex; flex-direction: column; border: 1px solid var(--border); border-top: 3px solid var(--accent); border-radius: var(--radius-lg); background: var(--bg-elev); box-shadow: var(--shadow-sm); transition: border-color 220ms var(--ease-out-quart); overflow: hidden; }
 .manuscript-stage::before { content: ""; position: absolute; top: 104px; bottom: 48px; left: 22px; width: 1px; background: var(--accent-line); }
 .manuscript-stage.streaming { border-color: var(--accent-line); }
 .proof-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 20px 24px 16px; border-bottom: 1px solid var(--border); }
-.proof-head h3 { margin-top: 4px; font-family: var(--font-display); font-size: 25px; font-weight: 600; }
+.proof-head h3 { margin-top: 4px; font-family: var(--font-display); font-size: var(--fs-3xl); font-weight: 600; }
 .proof-tools { display: flex; align-items: center; gap: 12px; }
-.proof-count { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
+.proof-count { color: var(--fg-muted); font-family: var(--font-mono); font-size: var(--fs-2xs); white-space: nowrap; }
 .proof-status { display: flex; align-items: center; gap: 8px; padding: 9px 24px; border-bottom: 1px solid var(--accent-line); background: var(--accent-soft); color: var(--accent-ink); font-size: var(--fs-xs); }
 .proof-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: proof-pulse 1.4s ease-in-out infinite; }
-.manuscript-stage .proof-text { flex: 1; width: 100%; max-width: 76ch; max-height: min(62vh, 680px); padding: 26px 32px 32px 46px; background: transparent; border-radius: 0; font-size: 17px; line-height: 2.1; letter-spacing: .015em;
+.manuscript-stage .proof-text { flex: 1; width: 100%; max-width: 76ch; max-height: min(62vh, 680px); padding: 26px 32px 32px 46px; background: transparent; border-radius: 0; font-size: var(--fs-xl); line-height: 2.1; letter-spacing: .015em;
   /* 卡片里不再套一层滚动框：折叠时靠底部渐隐截断，展开后整段交给页面滚动 */
   overflow: hidden;
   -webkit-mask-image: linear-gradient(to bottom, #000 90%, transparent 100%);
@@ -6401,10 +6552,10 @@ onUnmounted(() => {
   mask-image: none;
 }
 .proof-empty { flex: 1; min-height: 330px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 32px; text-align: center; }
-.proof-empty strong { font-family: var(--font-display); font-size: 24px; }
+.proof-empty strong { font-family: var(--font-display); font-size: var(--fs-3xl); }
 .proof-empty p { margin: 0 0 8px; color: var(--fg-muted); font-size: var(--fs-sm); }
-.proof-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: auto; padding: 10px 24px; border-top: 1px solid var(--border); color: var(--fg-faint); font-size: 10px; letter-spacing: .08em; }
-.generation-history { border-top: 2px solid var(--fg); }
+.proof-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: auto; padding: 10px 24px; border-top: 1px solid var(--border); color: var(--fg-faint); font-size: var(--fs-3xs); letter-spacing: .08em; }
+.generation-history { border-top: 1px solid var(--border-strong); }
 .generation-history .segment-entry { padding: 20px 0; }
 .generation-history .seg-text { padding: 18px 0; border-top: 1px solid var(--border); border-radius: 0; background: transparent; }
 @keyframes proof-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
@@ -6524,7 +6675,7 @@ onUnmounted(() => {
   border-radius: var(--radius-sm);
   background: var(--bg-sunken);
   color: var(--fg-faint);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 .conflict-message {
   margin: 6px 0 0;
@@ -6570,6 +6721,65 @@ onUnmounted(() => {
 .local-rewrite-notice {
   font-size: var(--fs-xs);
   color: var(--fg-muted);
+}
+/* 定向返修：不套框，只用一条虚线分隔和左侧细线标出每条规则 */
+.targeted-repair {
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px 0 2px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.repair-status {
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.65;
+}
+.repair-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.repair-head strong {
+  font-size: var(--fs-sm);
+}
+.repair-issues {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.repair-issues li {
+  padding: 8px 0 8px 12px;
+  border-left: 2px solid var(--accent-line);
+}
+.repair-issue-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.repair-issue-head strong {
+  font-size: var(--fs-sm);
+}
+.repair-issues p {
+  margin: 4px 0 0;
+  font-size: var(--fs-xs);
+  line-height: 1.65;
+}
+.repair-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.repair-hint {
+  font-size: var(--fs-xs);
 }
 .local-candidates {
   display: flex;
@@ -7022,7 +7232,7 @@ onUnmounted(() => {
     padding-bottom: 12px;
   }
   .workspace-head .title-click {
-    font-size: 30px;
+    font-size: var(--fs-5xl);
   }
   .stepper {
     margin-bottom: 12px;

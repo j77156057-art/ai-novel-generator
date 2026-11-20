@@ -252,6 +252,43 @@ def digest_caps(chars_in: int) -> DigestCaps:
     )
 
 
+#: 条目数缩放的保底（再小的渠道也不能把摘要压成两三条）。
+_CAPS_FLOOR = (6, 3, 4)
+
+
+def digest_caps_for(provider, chars_in: int) -> DigestCaps:
+    """按**渠道声明的输出上限**收敛条目数（没声明就沿用按字数的估算）。
+
+    为什么要在**首次请求前**收敛：`TOKENS_PER_DIGEST_ENTRY` 只是估算，
+    小输出渠道（GLM-4-Flash 4096）按 40 条请求会必然截断——白跑一轮、
+    再降质重抽。声明了 `digest_output_tokens` 的渠道，第一次就按能装下的
+    条目数请求，省一轮调用且质量可预期。
+    """
+    caps = digest_caps(chars_in)
+    cap_tokens = int(getattr(provider, "digest_output_tokens", 0) or 0)
+    if cap_tokens <= 0:
+        return caps
+    max_entries = max(sum(_CAPS_FLOOR), cap_tokens // TOKENS_PER_DIGEST_ENTRY)
+    total = caps.timeline + caps.characters + caps.reactions
+    if total <= max_entries:
+        return caps
+    ratio = max_entries / float(total)
+    timeline = max(_CAPS_FLOOR[0], int(caps.timeline * ratio))
+    characters = max(_CAPS_FLOOR[1], int(caps.characters * ratio))
+    reactions = max(_CAPS_FLOOR[2], int(caps.reactions * ratio))
+    # 取整后可能仍超一点：从当前最大的那一项逐条削，直到装得下。
+    while timeline + characters + reactions > max_entries:
+        if timeline >= characters and timeline >= reactions and timeline > _CAPS_FLOOR[0]:
+            timeline -= 1
+        elif characters >= reactions and characters > _CAPS_FLOOR[1]:
+            characters -= 1
+        elif reactions > _CAPS_FLOOR[2]:
+            reactions -= 1
+        else:
+            break
+    return DigestCaps(timeline=timeline, characters=characters, reactions=reactions)
+
+
 def digest_output_budget(caps: DigestCaps) -> int:
     """按**条目数**推导这一次的输出预算（token）。
 
@@ -269,19 +306,128 @@ def digest_output_budget(caps: DigestCaps) -> int:
     return max(MIN_DIGEST_OUTPUT_TOKENS, min(MAX_DIGEST_OUTPUT_TOKENS, raw))
 
 
-def _chat_budgeted(provider, system: str, user: str, max_tokens: int) -> str:
-    """按这一次推导出的输出预算发请求。
+def _chat_budgeted(
+    provider, system: str, user: str, max_tokens: int
+) -> tuple[str, str | None]:
+    """按这一次推导出的输出预算发请求，并带回 `finish_reason`。
 
     feat 的 `LLMProvider.chat` 没有 per-request `max_tokens`（预算挂在实例上），
     所以用 `variant()` 派生一个只对本次调用生效的实例；渠道不支持变体时
     退回原实例（等价于 feat 现状，不会多发任何字段）。
+
+    **必须把 finish_reason 带回来**：`length` = 响应被输出上限拦腰截断，
+    此时 JSON 必然不完整——要退让重抽，而不是把半截结果当成功。
     """
     try:
         scoped = provider.variant(max_tokens=max_tokens)
     except (AttributeError, TypeError):
         # 只有 duck-typed 的 provider（测试替身 / 极简实现）会走到这里。
         scoped = provider
-    return scoped.chat(system, user)
+    raw = scoped.chat(system, user)
+    return raw, getattr(scoped, "last_finish_reason", None)
+
+
+def _denser_caps(caps: DigestCaps) -> DigestCaps:
+    """响应撞上模型输出上限时的退让档：条目数减半（只减量，不改验收口径）。
+
+    为什么不是「调高 max_tokens」：实测 GLM-4-Flash 无论请求 8k 还是 16k，
+    都会在约 8k token 处 `finish_reason=length`（渠道侧硬上限）。此时唯一
+    能让 JSON 完整返回的办法，是让**这次要它写的东西变少**。
+    """
+    return DigestCaps(
+        timeline=max(6, caps.timeline // 2),
+        characters=max(3, caps.characters // 2),
+        reactions=max(4, caps.reactions // 2),
+    )
+
+
+def _hard_output_cap(provider) -> int | None:
+    """渠道对当前模型的**硬输出上限**（token）；没声明就是 None。
+
+    为什么需要它：撞上 `finish_reason=length` 有两种原因——
+    1. 我们自己给的预算太小（渠道还能写更长）⇒ 先加预算，别降条目数；
+    2. 渠道硬上限就到这（如 GLM-4-Flash 4096）⇒ 只能减少条目数。
+    分不清这两者时一律减条目，会把有能力的渠道也压成稀疏摘要。
+    """
+    caps_map = getattr(provider, "_MODEL_MAX_TOKENS", None) or {}
+    model = getattr(provider, "model", "") or ""
+    value = caps_map.get(model)
+    try:
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _digest_entries(
+    provider,
+    book_text: str,
+    caps: DigestCaps,
+    *,
+    whole: bool,
+    chunk_label: str | None = None,
+) -> tuple[dict, DigestCaps, bool]:
+    """发一次摘要请求；撞上输出上限时先加预算，仍不够再减少条目。
+
+    Returns:
+        `(parsed, used_caps, tightened)`。`tightened=True` 表示条目数被减过
+        （调用方可以把这件事写进 mode_reason，别静默降质）。
+    """
+    hard_cap = _hard_output_cap(provider)
+    budget = digest_output_budget(caps)
+
+    def call(use_caps: DigestCaps, use_budget: int) -> tuple[str, str | None]:
+        system, user = build_digest_prompt(
+            book_text, caps=use_caps, whole=whole, chunk_label=chunk_label
+        )
+        return _chat_budgeted(provider, system, user, use_budget)
+
+    raw, finish = call(caps, budget)
+    tightened = False
+
+    # 第一优先：渠道还能写更长 ⇒ 加预算重试，条目数保持不变（质量不降）。
+    for _ in range(2):
+        if finish != "length":
+            break
+        if hard_cap is not None and budget >= hard_cap:
+            break
+        bigger = min(MAX_DIGEST_OUTPUT_TOKENS, budget * 2)
+        if bigger <= budget:
+            break
+        logger.warning(
+            "摘要被输出预算截断（max_tokens=%s），先加预算重试 %s -> %s（条目数不变）",
+            budget, budget, bigger,
+        )
+        budget = bigger
+        raw, finish = call(caps, budget)
+
+    # 第二优先：预算到头仍截断 ⇒ 减少条目数（最多两档）。
+    for _ in range(2):
+        if finish != "length":
+            break
+        tight = _denser_caps(caps)
+        if tight == caps:
+            break
+        logger.warning(
+            "摘要响应撞上渠道输出上限（finish_reason=length），"
+            "按更紧凑的条目数重抽：%s -> %s",
+            caps, tight,
+        )
+        budget = max(budget, digest_output_budget(tight))
+        raw, finish = call(tight, budget)
+        caps = tight
+        tightened = True
+
+    if finish == "length":
+        raise ValueError(
+            "摘要输出被渠道截断（finish_reason=length）：单次条目超出该模型"
+            "输出上限；加预算与紧凑档重试仍不够，请换渠道或降低条目上限"
+        )
+    try:
+        return parse_digest(raw), caps, tightened
+    except ValueError as exc:
+        raise ValueError(
+            f"摘要 JSON 解析失败（finish_reason={finish}，输出 {len(raw)} 字）：{exc}"
+        ) from exc
 
 
 def _even_trim(items: list, cap: int) -> list:
@@ -444,7 +590,9 @@ def _extract_json(raw: str) -> Any:
     end = text.rfind("}")
     if start < 0 or end <= start:
         raise ValueError("模型输出里找不到 JSON 对象")
-    return json.loads(text[start : end + 1])
+    # strict=False：模型经常在 JSON 字符串里直接写换行/制表符（尤其引文），
+    # 严格模式会以「Invalid control character」整份拒掉，而它其实是合法内容的转义瑕疵。
+    return json.loads(text[start : end + 1], strict=False)
 
 
 def parse_digest(raw: str) -> dict:
@@ -1201,7 +1349,14 @@ def digest_plan(
     chapter_map = {ch: text for ch, text in chapters}
     chars_in = sum(len(text or "") for _, text in chapters)
     chosen, reason = choose_digest_mode(chars_in, provider, mode)
-    caps = digest_caps(chars_in)
+    base_caps = digest_caps(chars_in)
+    caps = digest_caps_for(provider, chars_in)
+    if caps != base_caps:
+        cap_tokens = int(getattr(provider, "digest_output_tokens", 0) or 0)
+        reason = (
+            f"{reason}（渠道单次输出上限 {cap_tokens} token："
+            f"条目数已按上限收敛到 {caps.timeline + caps.characters + caps.reactions} 条）"
+        )
     return {
         "chapters": chapters,
         "chapter_map": chapter_map,
@@ -1249,11 +1404,13 @@ def build_book_digest(
         progress(f"准备抽取（{chosen}）：{reason}", 0, 1)
 
     if chosen == MODE_WHOLE:
-        system, user = build_digest_prompt(
-            _render_book(chapters), caps=caps, whole=True
+        parsed, used_caps, tightened = _digest_entries(
+            provider, _render_book(chapters), caps, whole=True
         )
-        raw = _chat_budgeted(provider, system, user, digest_output_budget(caps))
-        parsed = _apply_caps(parse_digest(raw), caps)
+        parsed = _apply_caps(parsed, used_caps)
+        if tightened:
+            # 不能静默降质：模式理由里写清「为什么条目变少了」。
+            reason = f"{reason}（模型输出上限：已按更紧凑的条目数重抽）"
         if progress is not None:
             progress("整本摘要已返回，正在校验证据", 1, 1)
     else:
@@ -1263,18 +1420,14 @@ def build_book_digest(
         for idx, chunk in enumerate(chunks, start=1):
             label = f"第 {chunk[0][0]}~{chunk[-1][0]} 章"
             chunk_text = _render_book(chunk)
-            # caps 按**这一块**的字数算，不是按整本书。
+            # caps 按**这一块**的字数算，不是按整本书；同时受渠道输出上限收敛。
             # 为什么：按整本书算 ⇒ 每个 5 万字的块都被要求给 200 条时间线，
             # 而块里根本没有那么多内容 ⇒ 模型硬凑（编）或撞输出预算（截断）。
-            chunk_caps = digest_caps(len(chunk_text))
-            system, user = build_digest_prompt(
-                chunk_text, caps=chunk_caps, whole=False, chunk_label=label
-            )
-            raw = _chat_budgeted(
-                provider, system, user, digest_output_budget(chunk_caps)
-            )
+            chunk_caps = digest_caps_for(provider, len(chunk_text))
             try:
-                part = parse_digest(raw)
+                part, _used, _tight = _digest_entries(
+                    provider, chunk_text, chunk_caps, whole=False, chunk_label=label
+                )
             except ValueError as exc:
                 logger.warning("摘要块解析失败（%s）：%s", label, exc)
                 continue
@@ -1343,7 +1496,7 @@ def digest_content_hash(db, novel_id: int) -> str:
 
 
 def save_digest(db, digest: dict, content_hash: str) -> Any:
-    """把摘要落库（同输入幂等 upsert），返回行。"""
+    """把摘要落库（同内容幂等；内容变了则归档旧行、新增一行保留历史）。"""
     from datetime import datetime, timezone
 
     from app.models import BookDigest
@@ -1362,28 +1515,45 @@ def save_digest(db, digest: dict, content_hash: str) -> Any:
         "characters": digest.get("characters") or [],
         "reactions": digest.get("reactions") or [],
     }
+    mode = digest.get("mode") or MODE_AUTO
+    text = digest.get("text") or ""
+    stats = digest.get("stats") or {}
+    verify = digest.get("verify") or {}
+    now = datetime.now(timezone.utc)
+
+    # 完全相同的产物 = 幂等重复提交：只刷新模式理由，不制造历史噪音。
+    same = (
+        row is not None
+        and (row.payload or {}) == payload
+        and (row.text or "") == text
+        and (row.stats_json or {}) == stats
+        and (row.verify_json or {}) == verify
+        and row.mode == mode
+    )
+    if row is not None and not same:
+        # 内容变了（force 重跑 / 换档位）：旧行归档留存，供「历史版本对比」。
+        row.status = "archived"
+        row.updated_at = now
+        row = None
+
     if row is None:
         row = BookDigest(
             novel_id=novel_id,
             digest_version=DIGEST_VERSION,
-            mode=digest.get("mode") or MODE_AUTO,
+            mode=mode,
             mode_reason=digest.get("mode_reason"),
             content_hash=content_hash,
             payload=payload,
-            text=digest.get("text") or "",
-            stats_json=digest.get("stats"),
-            verify_json=digest.get("verify"),
+            text=text,
+            stats_json=stats,
+            verify_json=verify,
             status="active",
         )
         db.add(row)
     else:
-        row.mode = digest.get("mode") or MODE_AUTO
+        row.mode = mode
         row.mode_reason = digest.get("mode_reason")
-        row.payload = payload
-        row.text = digest.get("text") or ""
-        row.stats_json = digest.get("stats")
-        row.verify_json = digest.get("verify")
-        row.updated_at = datetime.now(timezone.utc)
+        row.updated_at = now
     db.commit()
     db.refresh(row)
     return row

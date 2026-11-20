@@ -21,7 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
-    KgCharacterState, KgEntity, KgEvent, KgForeshadow,
+    KgCharacterState, KgEntity, KgEvent, KgForeshadow, Project,
 )
 
 #: 世界观视图要覆盖的 kind（info 不展示——它是解析失败的兜底类）
@@ -38,6 +38,17 @@ _PLACEHOLDER_NAMES = {
 
 def _is_placeholder(name: str | None) -> bool:
     return not name or name.strip().lower() in _PLACEHOLDER_NAMES
+
+
+def _novel_cond(col, novel_id: int | None):
+    """按书过滤的列条件。
+
+    ``novel_id=None`` 代表**本书（生成正文）**：生成段抽取出的 KG 没有
+    参考书 id，库里 ``novel_id IS NULL``。不能用 ``== None`` 之外的写法，
+    否则「本书」在按书视图里永远查不到。
+    """
+    return col.is_(None) if novel_id is None else col == novel_id
+
 
 
 def _clean_name(name: str | None) -> str:
@@ -88,7 +99,7 @@ def _event_dict(ev: KgEvent, names: dict[int, str]) -> dict:
     }
 
 
-def _events_for_entities(db: Session, novel_id: int, ids: list[int]) -> dict[int, list[dict]]:
+def _events_for_entities(db: Session, novel_id: int | None, ids: list[int]) -> dict[int, list[dict]]:
     """每个实体最多 3 条证据事件（按章升序）。批量查，避免 N+1。"""
     out: dict[int, list[dict]] = {i: [] for i in ids}
     if not ids:
@@ -98,7 +109,7 @@ def _events_for_entities(db: Session, novel_id: int, ids: list[int]) -> dict[int
         chunk = ids[start:start + 400]
         rows = db.scalars(
             select(KgEvent).where(
-                KgEvent.novel_id == novel_id,
+                _novel_cond(KgEvent.novel_id, novel_id),
                 KgEvent.is_current.is_(True),  # 同章旧稿事件只留档，不当证据
                 (KgEvent.subject_id.in_(chunk))
                 | (KgEvent.object_id.in_(chunk))
@@ -118,12 +129,91 @@ def _events_for_entities(db: Session, novel_id: int, ids: list[int]) -> dict[int
     return out
 
 
-def worldview(db: Session, project_id: int, novel_id: int) -> dict:
-    """世界观清单：势力/组织、地点、体系与境界、资源与规则，各带证据章号。"""
+def _defined_power_entries(proj: Project) -> list[dict]:
+    """「力量体系」页保存的体系/档位（plot_bible），转成世界观视图条目。
+
+    为什么要合并：世界观视图原先只读 KG 抽取结果。作者在「力量体系」页
+    手写或采纳 AI 的体系，若正文里还没出现对应境界词，KG 抽不到，视图就
+    显示「体系与境界 0」——数据其实存在，只是没被展示。
+    """
+    import json as _json
+
+    from app.generation.cultivation import normalize_tiers
+    from app.generation.power_system import systems_of
+
+    bible = proj.plot_bible
+    if isinstance(bible, str):
+        try:
+            bible = _json.loads(bible)
+        except Exception:  # noqa: BLE001
+            bible = {}
+    if not isinstance(bible, dict):
+        return []
+    systems = systems_of(bible)
+    if not systems:
+        return []
+    tiers = [
+        {"名称": t.get("名称") or "", "档位": t.get("档位") or "",
+         "人数": t.get("人数") or "", "特征": t.get("特征") or ""}
+        for t in normalize_tiers(bible.get("tier_layers") or [])
+    ]
+    out: list[dict] = []
+    for s in systems:
+        realms = []
+        for r in s.get("境界") or []:
+            name = (r.get("名称") or "").strip()
+            if not name:
+                continue
+            item = {"名称": name, "档位": r.get("档位") or ""}
+            subs = [x.get("名称") for x in (r.get("小境界") or []) if x.get("名称")]
+            if subs:
+                item["小境界"] = subs
+            if r.get("说明"):
+                item["说明"] = r.get("说明")
+            realms.append(item)
+        out.append({
+            "name": s.get("名称") or "（未命名体系）",
+            "aliases": [],
+            "first_chapter": None,
+            "last_chapter": None,
+            "mention_count": None,
+            "kind_origin": "power_system",
+            # 前端据此标「作者定义」，与 KG 抽取条目区分。
+            "source": "defined",
+            "attrs": {
+                "来源": "力量体系页",
+                "类型": s.get("类型") or "",
+                "境界": realms,
+                "档位层": tiers,
+                "说明": s.get("说明") or "",
+            },
+            "evidence": [],
+        })
+    return out
+
+
+def _is_project_book(proj: Project, novel_id: int | None) -> bool:
+    """``novel_id`` 是否就是项目正在写的「本书」。
+
+    纯生成项目（未绑定参考书）的 KG 存在 ``novel_id IS NULL``；
+    续写项目则挂在 ``active_novel_id`` / ``continuation_novel_id`` 上。
+    两种情况都算本书，作者定义的力量体系要合并进这个视角。
+    """
+    if novel_id is None:
+        return True
+    active = (proj.active_novel_id or proj.continuation_novel_id) if proj is not None else None
+    return active is not None and novel_id == active
+
+
+def worldview(db: Session, project_id: int, novel_id: int | None) -> dict:
+    """世界观清单：势力/组织、地点、体系与境界、资源与规则，各带证据章号。
+
+    ``novel_id=None`` 时看**本书（生成正文）**。
+    """
     ents = db.scalars(
         select(KgEntity).where(
             KgEntity.project_id == project_id,
-            KgEntity.novel_id == novel_id,
+            _novel_cond(KgEntity.novel_id, novel_id),
             KgEntity.kind.in_(WORLDVIEW_KINDS),
         ).order_by(KgEntity.mention_count.desc(), KgEntity.first_chapter)
     ).all()
@@ -154,6 +244,19 @@ def worldview(db: Session, project_id: int, novel_id: int) -> dict:
         if _faction_like(loc["name"]):
             groups["faction"].append(dict(loc))
     groups["faction"].sort(key=lambda x: (-(x["mention_count"] or 0), x["first_chapter"] or 0))
+    # 本书额外合并「力量体系」页保存的体系：作者定义过但正文还没抽到的，
+    # 也要在这个视图里看得到（参考书视角不合并，定义只属于本书）。
+    proj = db.get(Project, project_id)
+    if proj is not None and _is_project_book(proj, novel_id):
+        existing = {x.get("name"): x for x in groups["power_system"]}
+        for defined in _defined_power_entries(proj):
+            hit = existing.get(defined["name"])
+            if hit is None:
+                groups["power_system"].insert(0, defined)
+            else:
+                # 同名：以 KG 条目为主体（保留章号/证据），补上作者定义。
+                hit["attrs"] = {**(hit.get("attrs") or {}), **defined["attrs"]}
+                hit["source"] = "defined"
     return {
         "novel_id": novel_id,
         "factions": groups["faction"],
@@ -165,19 +268,22 @@ def worldview(db: Session, project_id: int, novel_id: int) -> dict:
     }
 
 
-def _chapter_gaps(db: Session, novel_id: int, from_chapter: int, to_chapter: int) -> list[list[int]]:
-    """事件覆盖不到、但语料里存在的章节的连续空段。"""
+def _chapter_gaps(db: Session, novel_id: int | None, from_chapter: int, to_chapter: int) -> list[list[int]]:
+    """事件覆盖不到、但语料里存在的章节的连续空段。
+
+    ``novel_id=None``（本书）没有 ``novel_chunks`` 语料，天然不会有空段。
+    """
     from app.models import NovelChunk
     corpus = {c for (c,) in db.execute(
         select(func.distinct(NovelChunk.chapter_no)).where(
-            NovelChunk.novel_id == novel_id,
+            _novel_cond(NovelChunk.novel_id, novel_id),
             NovelChunk.chapter_no >= from_chapter,
             NovelChunk.chapter_no <= to_chapter,
         )
     )}
     covered = {c for (c,) in db.execute(
         select(func.distinct(KgEvent.chapter)).where(
-            KgEvent.novel_id == novel_id,
+            _novel_cond(KgEvent.novel_id, novel_id),
             KgEvent.chapter >= from_chapter,
             KgEvent.chapter <= to_chapter,
         )
@@ -198,12 +304,16 @@ def _chapter_gaps(db: Session, novel_id: int, from_chapter: int, to_chapter: int
     return gaps
 
 
-def timeline(db: Session, project_id: int, novel_id: int,
+def timeline(db: Session, project_id: int, novel_id: int | None,
              from_chapter: int = 1, to_chapter: int | None = None,
              offset: int = 0, limit: int = 500,
              include_gaps: bool = False) -> dict:
-    """按章排序的事件序列。``to_chapter=None`` 时取到本书最大事件章。"""
-    cond = [KgEvent.novel_id == novel_id, KgEvent.chapter.isnot(None),
+    """按章排序的事件序列。``to_chapter=None`` 时取到本书最大事件章。
+
+    ``novel_id=None`` 时看**本书（生成正文）**的事件。
+    """
+    cond = [KgEvent.project_id == project_id,
+            _novel_cond(KgEvent.novel_id, novel_id), KgEvent.chapter.isnot(None),
             KgEvent.chapter >= from_chapter, KgEvent.is_current.is_(True)]
     if to_chapter is not None:
         cond.append(KgEvent.chapter <= to_chapter)
@@ -228,7 +338,9 @@ def timeline(db: Session, project_id: int, novel_id: int,
         out["gaps"] = _chapter_gaps(db, novel_id, from_chapter,
                                     to_chapter or (db.scalar(
                                         select(func.max(KgEvent.chapter)).where(
-                                            KgEvent.novel_id == novel_id)) or from_chapter))
+                                            KgEvent.project_id == project_id,
+                                            _novel_cond(KgEvent.novel_id, novel_id)))
+                                        or from_chapter))
     return out
 
 

@@ -14,13 +14,16 @@
 <p align="center">
   <a href="https://37kr8ly196kgggyob7w.traesite.cn"><b>🔗 在线介绍页 · Live introduction site</b></a>
   &nbsp;|&nbsp;
-  <a href="https://37kr8ly196kgggyob7w.traesite.cn/#demo"><b>▶ 65 秒实机演示 · Demo video</b></a>
+  <a href="https://37kr8ly196kgggyob7w.traesite.cn/#demo"><b>▶ 实机演示 · Demo videos</b></a>
   &nbsp;|&nbsp;
   <a href="https://37kr8ly196kgggyob7w.traesite.cn/#screens">界面截图 · Screenshots</a>
 </p>
 
-> 演示视频是启动前后端后的真实操作录屏（书稿工作台 → 语料库 → 生成控制台 →
-> 知识图谱 → 我的小说 → 助手工作台），非设计稿或后期合成。
+> 两段演示都是启动前后端后的真实操作录屏，非设计稿或后期合成：
+>
+> 1. 产品漫游：书稿工作台 → 生成控制台 → 语料库 → 我的小说 → 助手工作台 → 知识图谱。
+> 2. 对话生成：在 31 万字的长篇里输入「帮我续写下一段，800 字左右」，助手读取正文与
+>    设定后给出推进方向，点开写作面板即流式生成正文。
 
 ---
 

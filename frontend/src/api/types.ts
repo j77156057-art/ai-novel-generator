@@ -333,6 +333,8 @@ export interface ProjectOut {
    * 角色对话 / 续写共用的可见性规则；null = 未设边界。
    */
   reference_cutoffs?: ReferenceCutoff[] | null;
+  /** 当前项目已应用的人物塑造模板 id；null/缺省 = 没应用过。 */
+  character_template_id?: string | null;
 }
 
 export interface KgNode {
@@ -429,6 +431,43 @@ export interface GenerationStatus {
   last_chapter: string | null;
   /** 进程内租约是否被占用（只覆盖走租约的生成入口）。 */
   running: boolean;
+}
+
+/**
+ * 时间线（世界线）节点：`GET /api/projects/{id}/timeline`。
+ * 与 `app/generation/timeline.py::PlotNode` 对齐，只读展示用。
+ */
+export interface PlotTimelineNode {
+  id: string;
+  kind: "main" | "branch";
+  title: string;
+  emotion: string;
+  entry_condition: string;
+  exit_condition: string;
+  beats: string[];
+  segment_budget: number;
+  parent: string | null;
+  children: string[];
+  chapter_start: number;
+  chapter_end: number;
+  source: string;
+}
+
+export interface PlotTimelineState {
+  /** false = 还没规划过（首次生成或追加节点时才建骨架）。 */
+  exists: boolean;
+  outline_chapters: number;
+  nodes: PlotTimelineNode[];
+  order: string[];
+  current_node: string | null;
+  current_beat: number;
+  done: number[];
+  early_done: number[];
+  branch_used: number;
+  has_chapter_ranges: boolean;
+  planning_status: string;
+  planning_incomplete: boolean;
+  planning_reason: string;
 }
 
 export interface PremiseProposal {
@@ -561,6 +600,58 @@ export interface LlmTestIn {
   api_key?: string | null;
   model?: string | null;
   role?: LlmRole;
+}
+
+export interface LlmLocalModelsResponse {
+  ok: boolean;
+  base_url: string;
+  models: string[];
+  error: string | null;
+}
+
+/** GET /api/settings/web-search（多渠道）。 */
+export interface WebSearchProviderMeta {
+  value: string;
+  label: string;
+  /** 该渠道是否需要 API key（SearXNG 不需要）。 */
+  needs_key: boolean;
+  key_hint: string;
+  /** 该渠道的默认端点；空串 = 必须由用户填写（自建实例）。 */
+  default_base_url: string;
+}
+
+export interface WebSearchConfig {
+  enabled: boolean;
+  provider: string;
+  has_key: boolean;
+  api_key_masked: string | null;
+  base_url: string;
+  max_results: number;
+  timeout: number;
+  safe_search: boolean;
+  providers: WebSearchProviderMeta[];
+}
+
+export interface WebSearchConfigIn {
+  enabled?: boolean;
+  provider?: string;
+  api_key?: string;
+  base_url?: string;
+  max_results?: number;
+  timeout?: number;
+  safe_search?: boolean;
+}
+
+export interface WebSearchTestResult {
+  ok: boolean;
+  provider?: string;
+  latency_ms?: number;
+  count?: number;
+  /** 被清洗规则剔除的低质条数。 */
+  dropped?: number;
+  cached?: boolean;
+  error?: string | null;
+  preview?: string[];
 }
 
 /**
@@ -903,6 +994,19 @@ export interface KgMergeResult {
 export type KgStatus = KgMergeResult | KgRebuildResult;
 
 /**
+ * 生成流里的「作者 Agent」阶段事件（SSE `{type:"stage"}`）。
+ *
+ * 后端在装配上下文 / 等待首字 / 模型思考 / 流式撰写 / 重算摘要与图谱
+ * 这五个节点各发一次，用来替代「只有一个思考字数」的干等展示。
+ * 旧后端不发 stage → 前端保持既有的字数 + 计时展示。
+ */
+export interface GenerationStageEvent {
+  type: "stage";
+  stage: "prepare" | "model" | "thinking" | "writing" | "post";
+  label: string;
+}
+
+/**
  * `/generate-stream` 的 `done` 事件负载（`kg` = merge 形状）。
  *
  * `kg` 是纯新增键：既有字段语义一个都没改。挂簿记统计是为了让**流式路径**
@@ -1223,6 +1327,37 @@ export interface AssistantAvailableAction {
 
 // ---------- 响应体 ----------
 
+export interface AssistantWebSource {
+  index: number;
+  title: string;
+  url: string;
+  snippet: string;
+  provider: string;
+  published_at?: string | null;
+}
+
+export interface AssistantWebSearchMeta {
+  enabled: boolean;
+  provider: string;
+  cached?: boolean;
+  /** 被清洗规则剔除的低质条数（登录墙 / 重复 / 同站超限 / 导流垃圾）。 */
+  dropped?: number;
+  error?: string | null;
+}
+
+/**
+ * 模型在正文前的推理留痕（只报客观数字，不含推理内容）。
+ *
+ * 推理内容由后端 provider 层剥离，这里只让界面能如实画出「思考了 N 秒」，
+ * 避免把真实发生的推理当成不存在。
+ */
+export interface AssistantThinking {
+  /** 推理字数（>0 才会下发）。 */
+  chars: number;
+  /** 首批推理 token 到首个正文 token 的耗时；渠道不区分钟无法计算时为 null。 */
+  duration_ms?: number | null;
+}
+
 export interface AssistantQaResponse {
   answer: string;
   evidence: AssistantEvidence[];
@@ -1230,6 +1365,11 @@ export interface AssistantQaResponse {
   agent_run_id: number;
   tool_results: Record<string, unknown>;
   version_id: number | null;
+  /** 联网检索来源；未配置/未触发时为空数组或 undefined。 */
+  web_sources?: AssistantWebSource[];
+  web_search?: AssistantWebSearchMeta;
+  /** 本轮确实发生推理时的留痕；没有推理（或渠道不暴露）时为 null/undefined。 */
+  thinking?: AssistantThinking | null;
   /**
    * agent 自主调度诊断 / 日志分析 / 三类审核后产出的结构化 issues。
    * 旧后端不返回这一组字段 → undefined → 界面整段不渲染（不留空态）。
@@ -1242,10 +1382,10 @@ export interface AssistantQaResponse {
   /** 待用户确认的写操作卡片；旧后端不返回 → [] → 整段不渲染。 */
   pending_actions?: AssistantPendingAction[];
   /**
-   * 本次取证的执行方式：`model`=模型自主选了工具；`deterministic`=回落确定性检索。
-   * 旧后端不返回 → undefined → 不显示该标签。
+   * 本次取证的执行方式：`model`=模型自主选了工具；`deterministic`=回落确定性检索；
+   * `chat`=剧情讨论的流式回答（不跑工具循环）。
    */
-  tool_mode?: "model" | "deterministic";
+  tool_mode?: "model" | "deterministic" | "chat";
   /** 模型自主调用轨迹；确定性路径为空数组，旧后端不返回 → undefined。 */
   tool_trace?: AssistantToolTraceItem[];
   /** 回落原因（仅 deterministic 时非空；供诊断，不展示为正文）。 */
@@ -1260,6 +1400,24 @@ export interface AssistantQaResponse {
   /** 记忆变更后的全量清单（仅 `memory_changed=true` 时返回）。 */
   memories?: AssistantMemory[];
 }
+
+/** POST /api/assistant/chat/stream 的 SSE 事件（meta / steps / delta / done / error）。 */
+export type AssistantChatStreamEvent =
+  | {
+      type: "meta";
+      agent_run_id: number;
+      model?: string;
+      /** 证据条数 / 置信度：在正文开始前下发，前端可提前显示徽标。 */
+      evidence_count?: number;
+      confidence?: number;
+    }
+  | {
+      type: "steps";
+      steps: { name: string; meta?: string; detail?: string }[];
+    }
+  | { type: "delta"; text: string }
+  | ({ type: "done" } & AssistantQaResponse)
+  | { type: "error"; message: string };
 
 /** 一条项目级长期记忆（助手在问答后自动抽取写入）。 */
 export interface AssistantMemory {
@@ -1646,6 +1804,14 @@ export type DistillHealth = "queued" | "running" | "stalled" | "success" | "fail
 export interface DistillJob {
   id: number;
   project_id: number;
+  /**
+   * 任务产物种类（新后端字段）：
+   * narrative（叙事档案）/ character_template（人物模板）/ book_digest（全书摘要）。
+   * 旧后端不返回 → undefined，按旧行为处理。
+   */
+  kind?: string | null;
+  /** 按书产物（全书摘要）对应的语料 id；叙事提炼为 null。 */
+  novel_id?: number | null;
   /** 本次实际使用的档位 key（full/balanced/fast）。 */
   tier: string | null;
   status: DistillStatus;
@@ -1713,6 +1879,147 @@ export interface DistillStartResponse {
 /** GET /api/projects/{id}/distill/jobs 的响应（id 降序）。 */
 export interface DistillJobListResponse {
   items: DistillJob[];
+}
+
+// ---------- 全书摘要（BookDigest） ----------
+
+/**
+ * POST /api/projects/{id}/digests 的请求体。
+ *
+ * 注意提交端点是**项目级**（后台任务挂在项目下），产物是**书级**的
+ * （同一本书的摘要任何项目都能复用）。
+ */
+export interface BookDigestStartRequest {
+  /** 要做摘要的参考语料（raw_novels.id）。 */
+  novel_id: number;
+  /** auto = 按书大小与渠道能力自动选；whole = 整本直读；retrieval = 检索式。 */
+  mode?: "auto" | "whole" | "retrieval";
+  /** 压缩比目标（输出 ≤ 输入 / 该值），后端限制 1~100。 */
+  target_ratio?: number;
+  /** true = 忽略已有摘要强制重算。 */
+  force?: boolean;
+}
+
+/** POST /api/projects/{id}/digests 的响应：立即返回，摘要在后台跑。 */
+export interface BookDigestStartResponse {
+  job_id: number;
+  status: DistillStatus;
+  novel_id: number;
+  /** true = 复用了这本书正在跑的任务，没有新起一条。 */
+  reused: boolean;
+}
+
+/** 单项验收结论。`ok === null` 表示这一项**不适用**（没跑到，不算通过）。 */
+export interface BookDigestCheck {
+  ok: boolean | null;
+  applicable?: boolean;
+  value?: number | null;
+  covered?: number;
+  candidates?: number;
+  threshold?: number;
+  chars_in?: number;
+  chars_out?: number;
+  ratio?: number;
+  target_ratio?: number;
+  dropped?: number;
+  kept?: number;
+  reattributed?: number;
+  dropped_ratio?: number | null;
+  [key: string]: unknown;
+}
+
+/** GET /api/books/{novel_id}/digest（没有摘要时后端 404）。 */
+export interface BookDigest {
+  id: number;
+  novel_id: number;
+  digest_version: number;
+  mode: string;
+  mode_reason: string | null;
+  status: string;
+  stats: Record<string, unknown>;
+  verify_passed: boolean | null;
+  checks: Record<string, BookDigestCheck>;
+  created_at: string | null;
+  updated_at: string | null;
+  /** ok=null 的检查项名（不适用，不算失败）。 */
+  not_applicable?: string[];
+  /** 证据丢弃明细（界面要能区分「模型在编」和「引文写错一个标点」）。 */
+  evidence_detail?: {
+    dropped: number;
+    kept: number;
+    reattributed: number;
+    dropped_ratio: number | null;
+    threshold: number | null;
+    drop_reasons?: Record<string, number>;
+    dropped_by_block?: Record<string, number>;
+    drop_samples?: Record<string, unknown>;
+  };
+  payload: Record<string, unknown>;
+  /** 渲染后的摘要正文（给人读的那份）。 */
+  text: string;
+}
+
+/** GET /api/books/{novel_id}/digest/verify。 */
+export interface BookDigestVerify {
+  novel_id: number;
+  digest_id: number;
+  passed: boolean;
+  checks: Record<string, BookDigestCheck>;
+  stats: Record<string, unknown>;
+}
+
+/** 历史列表项：摘要字段齐全，但不带正文（正文按需取单条详情）。 */
+export type BookDigestSummary = Omit<BookDigest, "payload" | "text">;
+
+/** GET /api/books/{novel_id}/digests（新的在前，含 active / archived）。 */
+export interface BookDigestListResponse {
+  items: BookDigestSummary[];
+}
+
+// ---------- 人物塑造模板 ----------
+
+/** GET /api/projects/character-templates 的列表项（新的在前）。 */
+export interface CharacterTemplateItem {
+  /** 形如 `full:9a3f1166f4e6:1f2a3b4c`，自带档位。 */
+  id: string;
+  tier: string;
+  tier_signature: string;
+  source_ids: number[] | null;
+  content_hash: string;
+  rule_count: number;
+  n_chunks: number;
+  rejected: number | null;
+  created_at: string | null;
+  applied_at: string | null;
+}
+
+export interface CharacterTemplateListResponse {
+  items: CharacterTemplateItem[];
+}
+
+/** 单条模板详情（列表只在点开时取它，避免一次传几十条规则）。 */
+export interface CharacterTemplateDetail extends CharacterTemplateItem {
+  rules: string[];
+}
+
+/** POST /api/projects/{id}/character-template 的请求体。 */
+export interface CharacterTemplateStartRequest {
+  /** 档位 key；不传 = 沿用项目已存的 narrative_tier / 默认档。 */
+  tier?: string | null;
+  /** true = 同档位也强制重抽。 */
+  force?: boolean;
+}
+
+/** POST /api/projects/{id}/character-template 的响应（后台任务）。 */
+export interface CharacterTemplateStartResponse {
+  job_id: number;
+  status: DistillStatus;
+  tier: string;
+  kind: string;
+  reused: boolean;
+  /** true = 库里已有同档同语料模板，本次直接复用。 */
+  from_cache: boolean;
+  cache_source: "library" | null;
 }
 
 // ---------- 文风蒸馏库（跨项目复用） ----------
@@ -1966,7 +2273,7 @@ export interface WizardSummaryRow {
  * text 用 placeholder/suggestions，confirm 用 options 或 summary。
  */
 export interface WizardCard {
-  type: "single" | "multi" | "number" | "text" | "confirm";
+  type: "single" | "multi" | "number" | "text" | "confirm" | "cards";
   field: string;
   options?: WizardOption[];
   default?: unknown;
@@ -1982,6 +2289,15 @@ export interface WizardCard {
   empty_hint?: string;
   summary?: WizardSummaryRow[];
   action_label?: string;
+  /** 仅 type="cards"：剧情圣经里的角色清单（角色卡步骤）。 */
+  characters?: WizardCardCharacter[];
+}
+
+/** 角色卡步骤里的一个角色（是否已有声纹卡）。 */
+export interface WizardCardCharacter {
+  name: string;
+  role: string;
+  has_card: boolean;
 }
 
 export interface WizardQuestion {
@@ -2014,7 +2330,7 @@ export interface WizardCommitSegment {
 
 export interface WizardCommitResult {
   kind: string;
-  stage: "outline" | "ready" | "role" | "done";
+  stage: "outline" | "cards" | "ready" | "role" | "done";
   applied: string[];
   message?: string;
   distill?: Record<string, unknown> | null;
@@ -2030,6 +2346,15 @@ export interface WizardCommitResult {
     collisions: number;
     reason?: string;
   };
+  /** 提交时生成的力量体系（题材为仙侠/奇幻/游戏且选择生成时才有）。 */
+  power_system?: {
+    ok: boolean;
+    systems?: number;
+    tiers?: number;
+    /** 已有体系被沿用时为 true。 */
+    skipped?: boolean;
+    detail?: string;
+  };
   character?: string;
   scene?: string;
   segments?: WizardCommitSegment[];
@@ -2038,6 +2363,8 @@ export interface WizardCommitResult {
 export interface WizardStateResponse {
   session: WizardSessionView | null;
   question: WizardQuestion | null;
+  /** 角色卡步骤：刚生成（或改过）的卡，前端复用结果气泡里的卡编辑 UI。 */
+  cards_preview?: WizardCommitResult | null;
   /** 最近一条蒸馏任务（进度 + 看护结论）；没有任务时为 null。 */
   distill?: DistillJob | null;
   project_hint?: {
@@ -2156,6 +2483,8 @@ export interface WizardAnswerResponse {
   ack?: string;
   done?: boolean;
   result?: WizardCommitResult;
+  /** 进入角色卡步骤时随题返回的卡预览。 */
+  cards_preview?: WizardCommitResult | null;
 }
 
 /**
@@ -2190,6 +2519,8 @@ export interface WizardSayResponse {
   question: WizardQuestion | null;
   done?: boolean;
   result?: WizardCommitResult;
+  /** 进入角色卡步骤时随题返回的卡预览。 */
+  cards_preview?: WizardCommitResult | null;
   /** 仅 mode="action"：这次改了什么（旧值 → 新值 + 影响）。 */
   action?: WizardActionEcho | null;
   /** 仅 mode="action" 且可撤销：审计行 id，传给撤销接口。 */
@@ -2630,11 +2961,21 @@ export interface CardVoice {
   语气底色?: string;
 }
 
+/** 角色卡的「量级」组：力量层次 / 出手规模 / 能压制谁。 */
+export interface CardScale {
+  量级?: string;
+  出手规模?: string;
+  压制?: string;
+}
+
 /** 角色卡。 */
 export interface CharacterCard {
   身份?: Record<string, string>;
   能力?: CardAbility;
   声纹?: CardVoice;
+  量级?: CardScale;
+  /** 修炼档案（当前境界/天赋/瓶颈/路线…），由力量体系页维护。 */
+  修炼?: CultivationProfile;
   关系?: Record<string, string>;
   来源?: string;
 }
@@ -2661,6 +3002,188 @@ export interface VoiceCollision {
 export interface CharacterCardListResponse {
   characters: CharacterCardItem[];
   voice_collisions: VoiceCollision[];
+}
+
+/** 单角色 AI 补全：只返回「补充」，不落库。 */
+export interface CharacterCardGenerateResponse {
+  ok: boolean;
+  name: string;
+  补充: CharacterCard;
+  说明: string;
+  voice_collisions: VoiceCollision[];
+}
+
+/** 批量生成新角色：只返回草稿，采纳后逐条保存。 */
+export interface CharacterCardsBatchResponse {
+  ok: boolean;
+  角色: Record<string, CharacterCard>;
+  冲突: VoiceCollision[];
+  轮次: number;
+}
+
+// ==================================================================
+// 力量体系 / 档位分层 / 角色修炼档案
+// ==================================================================
+
+export interface PowerStage {
+  名称?: string;
+  说明?: string;
+}
+
+export interface PowerRealm {
+  名称?: string;
+  说明?: string;
+  档位?: string;
+  小境界?: PowerStage[];
+}
+
+export interface PowerSystemDef {
+  名称?: string;
+  说明?: string;
+  /** 细分型 / 序列型 / 粗放型（后端 normalize_system_type）。 */
+  类型?: string;
+  境界?: PowerRealm[];
+}
+
+/** GET /api/projects/{id}/power-system。 */
+export interface PowerSystemState {
+  power_system: { 体系: PowerSystemDef[] };
+  tiers: PowerTier[];
+}
+
+/** 档位层：分层群像用（路人只记档位）。 */
+export interface PowerTier {
+  名称?: string;
+  档位?: string;
+  人数?: string;
+  特征?: string;
+}
+
+export interface PowerSystemGenerateResponse {
+  ok: boolean;
+  体系?: PowerSystemDef[];
+  detail?: string;
+  原文?: string;
+}
+
+export interface TierGenerateResponse {
+  ok: boolean;
+  档位层?: PowerTier[];
+  detail?: string;
+}
+
+/** 角色修炼档案（挂在角色卡的 `card.修炼` 下）。 */
+export interface CultivationProfile {
+  当前境界?: string;
+  当前小境界?: string;
+  档位?: string;
+  天赋?: string;
+  瓶颈?: string;
+  目标境界?: string;
+  代价?: string;
+  来历?: string;
+  路线?: string[];
+}
+
+export interface CultivationPlanResponse {
+  ok: boolean;
+  路线?: CultivationProfile;
+  /** 由已有数据推导的处境（不调模型）。 */
+  处境?: string;
+  detail?: string;
+}
+
+// ==================================================================
+// KG v3：世界观 / 剧情时间线 / Worker 补抽与恢复
+// ==================================================================
+
+export interface KgStoryEvidence {
+  chapter?: number | null;
+  event_type?: string;
+  summary?: string;
+}
+
+export interface KgWorldviewEntity {
+  name: string;
+  aliases?: string[];
+  first_chapter?: number | null;
+  last_chapter?: number | null;
+  mention_count?: number | null;
+  kind_origin?: string;
+  /** defined = 来自「力量体系」页的作者定义（非 KG 抽取）。 */
+  source?: string;
+  attrs?: Record<string, unknown>;
+  evidence?: KgStoryEvidence[];
+}
+
+/** GET /api/projects/{id}/kg-v3/worldview。 */
+export interface KgWorldviewResponse {
+  /** null = 本书（生成正文）的 KG。 */
+  novel_id: number | null;
+  factions: KgWorldviewEntity[];
+  locations: KgWorldviewEntity[];
+  power_systems: KgWorldviewEntity[];
+  resources: KgWorldviewEntity[];
+  rules: KgWorldviewEntity[];
+  counts: Record<string, number>;
+}
+
+export interface KgStoryTimelineEvent {
+  chapter?: number | null;
+  who?: string;
+  where?: string;
+  what?: string;
+  result?: string;
+  event_type?: string;
+  [key: string]: unknown;
+}
+
+/** GET /api/projects/{id}/kg-v3/timeline。 */
+export interface KgStoryTimelineResponse {
+  /** null = 本书（生成正文）的 KG。 */
+  novel_id: number | null;
+  from_chapter: number;
+  to_chapter: number | null;
+  offset: number;
+  limit: number;
+  total: number;
+  events: KgStoryTimelineEvent[];
+  gaps?: number[][];
+}
+
+/** POST /api/projects/{id}/kg-v3/worker/backfill。 */
+export interface KgBackfillResponse {
+  enqueued: { segment_no: number; run_id?: number }[];
+  skipped: { segment_no: number; reason: string; run_id?: number }[];
+}
+
+/** POST /api/projects/{id}/kg-v3/worker/recover。 */
+export interface KgRecoverResponse {
+  requeued: number;
+  missing: number[];
+  overflow?: unknown[];
+  skipped?: unknown[];
+  segments?: unknown[];
+}
+
+/** 文风档案里「禁用词与档案正文自相矛盾」的一条。 */
+export interface StyleNarrativeConflict {
+  word: string;
+  dimension: string;
+  rule_dimension: string;
+  context: string;
+  rule_text: string;
+}
+
+/** GET /api/projects/{id}/style-narrative/conflicts（只读，不调模型）。 */
+export interface StyleNarrativeConflictsResponse {
+  has_archive: boolean;
+  /** error 级：会挡住生成（档案正文在教模型用禁用词）。 */
+  conflicts: StyleNarrativeConflict[];
+  /** 名词性用法：列出但不挡生成。 */
+  attributive: StyleNarrativeConflict[];
+  can_generate: boolean;
+  note: string;
 }
 
 // ==================================================================
@@ -2989,3 +3512,41 @@ export interface ForeshadowPatchRequest {
   evidence?: string;
   resolution?: string;
 }
+
+// ---------- 定向返修（文风规则 → 可执行返修指令） ----------
+
+export interface StyleRepairIssue {
+  kind: "metric" | "forbidden";
+  /** 对应蒸馏档案里的维度，如「节奏控制」「禁用转折词」。 */
+  dimension: string;
+  title: string;
+  /** 面向人的偏离说明：当前值 / 参考区间 / 命中的表达。 */
+  detail: string;
+  /** 面向模型的具体修法。 */
+  fix: string;
+  severity: "high" | "medium";
+  /** 仅 metric：统计特征名、实测值、z 分数。 */
+  feature?: string;
+  value?: number;
+  z?: number;
+  /** 仅 forbidden：命中的短表达，如「突然」×2。 */
+  hits?: string[];
+}
+
+export interface StyleRepairPlan {
+  project_id: number;
+  segment_no: number;
+  generation_id: number;
+  ok: boolean;
+  summary: string;
+  /** no_archive / empty_text / clean；有可修问题时为空串。 */
+  reason: string;
+  issues: StyleRepairIssue[];
+  /** 可直接交给 invoke-generation 的返修指令；无问题时为空串。 */
+  instruction: string;
+  archive: {
+    has_profile: boolean;
+    has_rules: boolean;
+  };
+}
+

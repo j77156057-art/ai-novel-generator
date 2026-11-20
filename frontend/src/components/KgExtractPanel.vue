@@ -272,16 +272,17 @@ function submitSave(): void {
 
 <style scoped>
 .kg-panel {
-  border: var(--border-w) solid var(--border-strong);
+  border: var(--border-w) solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-elev);
-  padding: var(--gap);
+  padding: 20px;
   display: flex;
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  box-shadow: var(--shadow-sm);
   /* 与三个角色面板区分：用 info 色带 + 自己的标题文案双编码 */
-  border-left: 4px solid var(--info);
+  border-left: 3px solid var(--info);
 }
 .role-head {
   display: flex;

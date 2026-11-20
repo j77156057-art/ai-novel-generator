@@ -12,6 +12,7 @@ from app.agents.action_catalog import (
     actions_prompt_block,
     list_actions,
     match_actions,
+    model_tool_names,
 )
 
 
@@ -45,6 +46,30 @@ def test_match_actions_is_deterministic_and_policy_aware():
     rollback = next(s for s in rollback_hits if s.key == "snapshot_rollback")
     assert rollback.policy == "frontend_only"
     assert rollback.requires_confirmation is True
+
+
+def test_kg_and_distill_reads_are_wired_to_tools():
+    """原先 unwired_read 的只读能力已全部接到白名单内的只读工具。"""
+    by_key = {s.key: s for s in ACTIONS}
+    expected = {
+        "kg_worldview": "get_kg_worldview",
+        "kg_timeline": "get_kg_timeline",
+        "kg_story_context": "get_story_context",
+        "style_distill_detail": "get_style_distill_detail",
+        "text_gate": "get_text_gate_no_generation",
+        "project_diagnosis": "diagnose_project",
+        "assistant_runs": "list_assistant_runs",
+        "proposal_list": "list_proposals",
+        "version_list": "list_versions",
+        "prompt_active": "get_active_prompts",
+        "snapshot_list": "list_snapshots",
+    }
+    for key, tool in expected.items():
+        spec = by_key[key]
+        assert spec.policy == "auto_read", key
+        assert spec.read_tool == tool, key
+        assert tool in model_tool_names(), tool
+    assert "kg_worldview" in [s.key for s in match_actions("这个世界观有什么设定")]
 
 
 def test_prompt_block_spells_out_frontend_only():

@@ -35,16 +35,24 @@ import { ApiError, api } from "@/api/client";
 import AssistantIssueList from "@/components/AssistantIssueList.vue";
 import WizardStepCard from "@/components/WizardStepCard.vue";
 import WorkflowStrip from "@/components/WorkflowStrip.vue";
+import WritingPanel from "@/components/WritingPanel.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
 import { createAttachmentDraft } from "@/utils/assistantAttachments";
 import { pendingActionKindLabel, pendingActionRiskMeta, sourceLabel } from "@/utils/assistantDisplay";
+import { renderMarkdown } from "@/utils/markdown";
+import { stepStateLabel } from "@/utils/workflowDisplay";
+import { useAppTheme } from "@/theme";
 import { useModalResize } from "@/utils/useModalResize";
 import type {
   AssistantEvidence,
   AssistantIssue,
   AssistantMemory,
   AssistantPendingAction,
+  AssistantQaResponse,
+  AssistantThinking,
   AssistantToolTraceItem,
+  AssistantWebSearchMeta,
+  AssistantWebSource,
   AttachmentCleaningPreview,
   DistillJob,
   ProjectOut,
@@ -56,6 +64,7 @@ import type {
   WizardQuestion,
   WizardSayResponse,
   WizardSessionView,
+  WorkflowState,
 } from "@/api/types";
 
 const route = useRoute();
@@ -121,6 +130,8 @@ interface ActionCard {
   notice: string;
   /** 执行成功后拿到的响应体，原样存下便于对账。 */
   result: Record<string, unknown> | null;
+  /** 提案类卡片：是否已经「批准并写入」（写入后按钮收起）。 */
+  applied?: boolean;
   /** 执行轨迹：确认时刻起按真实事件追加（见 pollCardTrace）。 */
   trace: TraceStep[];
   /** 点下确认的时刻（毫秒）；未执行为 null，用于算「已等待」。 */
@@ -131,6 +142,19 @@ interface ActionCard {
   sawLanding: boolean;
   /** 后端是否提供进度端点；旧后端 404 时为 false，停止轮询。 */
   traceSupported: boolean;
+  /** 写作卡片：生成/定位到的段号（点开面板时直接跳过去）。 */
+  segmentNo?: number | null;
+  /** 写作卡片：正文开头预览（只用于卡片展示，完整正文在写作面板）。 */
+  preview?: string;
+  /** 写作卡片进度：已收到字数 / 已等待秒数 / 目标字数。 */
+  progressChars?: number;
+  progressSeconds?: number;
+  progressTarget?: number;
+  progressReasoning?: number;
+  /** 作者 Agent 当前阶段标签（旧后端不发 stage 时为 undefined）。 */
+  progressStage?: string;
+  /** 从本机历史恢复的卡片：点开只查看，不自动重新生成。 */
+  restored?: boolean;
 }
 
 interface Turn {
@@ -143,13 +167,19 @@ interface Turn {
   /** assistant 侧：本次调用的出参（user 消息为 null）。 */
   answer: string;
   evidence: AssistantEvidence[];
+  /** 联网检索来源（Phase 1：Tavily）。 */
+  webSources?: AssistantWebSource[];
+  /** 本轮联网检索的元信息（含清洗掉多少条低质结果）。 */
+  webSearch?: AssistantWebSearchMeta | null;
+  /** 本轮模型在正文前的推理留痕（只有真实发生推理才有值）。 */
+  thinking?: AssistantThinking | null;
   issues: AssistantIssue[];
   rulesEvaluated: string[];
   confidence: number;
   agentRunId: number;
   cards: ActionCard[];
   /** 本次取证的执行方式（旧后端不返回 → 空串，不显示相关提示）。 */
-  toolMode: "model" | "deterministic" | "";
+  toolMode: "model" | "deterministic" | "chat" | "";
   /** 模型自主调用的工具轨迹（确定性路径为空数组）。 */
   toolTrace: AssistantToolTraceItem[];
   /** 工具名 → 结果体（只用来给人看「拿到了什么」，不参与任何请求构造）。 */
@@ -158,6 +188,12 @@ interface Turn {
   toolFallbackReason: string;
   error: string | null;
   loading: boolean;
+  /** 正在接收流式回答：正文逐字追加，光标闪烁，不显示「展开全文」。 */
+  streaming?: boolean;
+  /** 后端在正文前下发的读取步骤（检索过程）；比 evidence 反推更及时。 */
+  liveSteps?: AgentStep[];
+  /** 正文开始前拿到的证据条数：用于提前显示证据徽标。 */
+  liveEvidenceCount?: number;
   /** 创作引导的一步（卡片）；与普通问答互斥。 */
   wizard?: WizardStepState | null;
   /** 引导里的一次「追问/没听懂」：只有解释文字，没有卡片，也不推进流程。 */
@@ -294,6 +330,9 @@ function makeAssistantTurn(): Turn {
     text: "",
     answer: "",
     evidence: [],
+    webSources: [],
+    webSearch: null,
+    thinking: null,
     issues: [],
     rulesEvaluated: [],
     confidence: 0,
@@ -305,14 +344,72 @@ function makeAssistantTurn(): Turn {
     toolFallbackReason: "",
     error: null,
     loading: true,
+    streaming: false,
   };
 }
 
-/** 新内容进来后滚到底部（对话流的基本行为）。 */
-async function scrollToBottom(): Promise<void> {
+/**
+ * 是否跟随流式内容滚到底。
+ *
+ * 用户往上翻看前文时不能强行把他拽回底部；只有他本来就在底部附近，
+ * 新 delta 才继续跟随。滚回底部后自动恢复跟随。
+ */
+const stickToBottom = ref(true);
+/**
+ * 最后一次真实读到的滚动位置。
+ *
+ * keep-alive 停用会把对话 DOM 移出文档，离场后 `el.scrollTop` 往往被浏览器
+ * 重置成 0；如果在 onDeactivated 里直接读元素，就会把「停在中间」覆盖成 0，
+ * 回来自然回到顶部。所以滚动时先记在内存里，离场时写这一份。
+ */
+let lastStreamScrollTop = 0;
+
+function rememberScroll(top: number): void {
+  lastStreamScrollTop = Math.max(0, top);
+  const session = chatSessions.value.find((s) => s.id === activeSessionId.value);
+  if (session) session.scrollTop = lastStreamScrollTop;
+}
+
+function onStreamScroll(e: Event): void {
+  const el = e.currentTarget as HTMLElement | null;
+  if (!el) return;
+  stickToBottom.value =
+    el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  // 记住当前会话停在哪：切走/刷新/从别的页面回来时按这个位置恢复，
+  // 而不是每次都把用户扔回底部。
+  rememberScroll(el.scrollTop);
+}
+
+/** 新内容进来后滚到底部；`force` 用于「刚发出一条新消息」。 */
+async function scrollToBottom(force = false): Promise<void> {
+  await nextTick();
+  if (!force && !stickToBottom.value) return;
+  const el = streamEl.value;
+  if (el) {
+    el.scrollTop = el.scrollHeight;
+    rememberScroll(el.scrollTop);
+  }
+}
+
+/**
+ * 恢复到某个滚动位置；没有记录时才落到顶部/底部。
+ *
+ * 恢复在 nextTick 之后做：turns 刚换掉时 DOM 还没量出新的 scrollHeight，
+ * 早一步赋值会被浏览器夹到 0。
+ */
+async function restoreScroll(pos?: number): Promise<void> {
   await nextTick();
   const el = streamEl.value;
-  if (el) el.scrollTop = el.scrollHeight;
+  if (!el) return;
+  if (typeof pos === "number" && Number.isFinite(pos)) {
+    el.scrollTop = Math.min(Math.max(0, pos), el.scrollHeight);
+    rememberScroll(el.scrollTop);
+    stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  } else {
+    el.scrollTop = el.scrollHeight;
+    rememberScroll(el.scrollTop);
+    stickToBottom.value = true;
+  }
 }
 
 // ==================================================================
@@ -329,6 +426,8 @@ async function scrollToBottom(): Promise<void> {
 /** 最近 30 轮（一问一答算一轮）。 */
 const HISTORY_ROUNDS = 30;
 const HISTORY_MAX_TURNS = HISTORY_ROUNDS * 2;
+/** 每个项目最多保留多少个本机会话（超出丢最旧的）。 */
+const MAX_SESSIONS = 30;
 
 interface StoredTurn {
   role: "user" | "assistant";
@@ -341,11 +440,100 @@ interface StoredTurn {
   agentRunId: number;
   attachments?: { filename: string }[];
   evidence?: AssistantEvidence[];
+  /** 本轮读取步骤：刷新后仍能看到「读了什么」，不再只剩证据反推。 */
+  steps?: { name: string; meta?: string; detail?: string }[];
+  /** 推理留痕（字数 / 耗时），刷新后保留「思考了 N 秒」。 */
+  thinking?: AssistantThinking | null;
+  /** 联网检索元信息（含清洗掉的低质条数），刷新后仍能解释来源数量。 */
+  webSearch?: AssistantWebSearchMeta | null;
+  /** 联网来源：刷新后「联网来源」小窗口仍能看到，不再只剩一句带 [1] 的回答。 */
+  webSources?: AssistantWebSource[];
+  /**
+   * 写作卡片（只存已完成/失败的生成卡）。
+   *
+   * 不存 pending / running：刷新后那些动作已经不在跑，恢复成可点按钮
+   * 只会制造一个必然失败或重复生成的假按钮。卡片只保留「点开看正文」
+   * 这一件事，正文本身仍在 generations 表里。
+   */
+  cards?: StoredCard[];
 }
+
+/** 刷新后仍保留的写作卡片（无执行轨迹、无实时进度）。 */
+interface StoredCard {
+  action: AssistantPendingAction;
+  state: "confirmed" | "failed";
+  notice: string;
+  segmentNo?: number | null;
+  preview?: string;
+}
+
+/** 一条本机会话：标题 + 时间 + 已落盘的问答轮次。 */
+interface ChatSession {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  turns: StoredTurn[];
+  /** 本会话最后停留的滚动位置（像素）；恢复会话时回到这里而不是强行滚底。 */
+  scrollTop?: number;
+}
+
+const chatSessions = ref<ChatSession[]>([]);
+const activeSessionId = ref("");
+/** 窄屏时会话列表变成抽屉。 */
+const sessionsOpen = ref(false);
+/** 中窄屏时右侧上下文变成抽屉。 */
+const ctxOpen = ref(false);
+/** 对话页外观直接跟随全站主题 token，不再自建 surface 状态。 */
+const { theme, toggleInkTheme } = useAppTheme();
 
 function historyKey(): string {
   return `assistant:chat:v1:${projectId}`;
 }
+
+function sessionsKey(): string {
+  return `assistant:sessions:v1:${projectId}`;
+}
+
+function activeSessionKey(): string {
+  return `assistant:active-session:v1:${projectId}`;
+}
+
+function newSessionId(): string {
+  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+/** 会话标题取第一句用户原话（不做模型总结，避免标题与内容漂移）。 */
+function sessionTitleFromTurns(list: StoredTurn[]): string {
+  const first = list.find((t) => t.role === "user" && t.text.trim());
+  if (!first) return "新对话";
+  const text = first.text.trim().replace(/\s+/g, " ");
+  return text.length > 18 ? text.slice(0, 18) + "…" : text;
+}
+
+function sessionPreview(session: ChatSession): string {
+  const last = [...session.turns]
+    .reverse()
+    .find((t) => t.role === "assistant" && (t.answer || "").trim());
+  if (!last) return "还没有消息";
+  const text = last.answer
+    .replace(/[#>*`|_-]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > 36 ? text.slice(0, 36) + "…" : text;
+}
+
+function sessionTimeLabel(session: ChatSession): string {
+  const diff = Date.now() - session.updatedAt;
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  const d = new Date(session.updatedAt);
+  if (d.toDateString() === new Date().toDateString()) {
+    return `${d.getHours()}:${String(d.getMinutes()).padStart(2, "0")}`;
+  }
+  return `${d.getMonth() + 1} 月 ${d.getDate()} 日`;
+}
+
 
 /** 证据只留开头几段：足够认出「当时引了什么」，又不至于撑爆 5MB 配额。 */
 function trimEvidence(list: AssistantEvidence[]): AssistantEvidence[] {
@@ -360,7 +548,8 @@ function serializeTurn(turn: Turn): StoredTurn | null {
   const isUser = turn.role === "user";
   // 引导 / 通知 / 回执类消息没有 answer，正文在 text 里；统一落成文字记录。
   const answer = (turn.answer || turn.text || "").trim();
-  if (!isUser && !answer && !turn.error) return null;
+  // 只有卡片、没有文字的回答也要落盘，否则刷新后卡片会跟着整轮消失。
+  if (!isUser && !answer && !turn.error && !turn.cards.length) return null;
   const item: StoredTurn = {
     role: turn.role,
     text: isUser ? turn.text : "",
@@ -374,6 +563,60 @@ function serializeTurn(turn: Turn): StoredTurn | null {
   }
   if (!isUser && turn.evidence.length) {
     item.evidence = trimEvidence(turn.evidence);
+  }
+  if (!isUser && turn.liveSteps?.length) {
+    // 步骤明细可能很长，只留够认出「读了什么」的长度（整份会挤爆 5MB 配额）。
+    item.steps = turn.liveSteps.slice(0, 8).map((s) => ({
+      name: s.name,
+      meta: s.meta ?? "",
+      detail: (s.detail ?? "").slice(0, 400),
+    }));
+  }
+  if (!isUser && turn.thinking) {
+    item.thinking = {
+      chars: turn.thinking.chars,
+      duration_ms: turn.thinking.duration_ms ?? null,
+    };
+  }
+  if (!isUser && turn.webSearch) {
+    item.webSearch = turn.webSearch;
+  }
+  if (!isUser && turn.webSources?.length) {
+    // 来源只留够认出「引了哪几篇」：标题 + URL + 截断摘要。
+    item.webSources = turn.webSources.slice(0, 8).map((s) => ({
+      index: s.index,
+      title: s.title,
+      url: s.url,
+      snippet: (s.snippet ?? "").slice(0, 300),
+      provider: s.provider,
+      published_at: s.published_at ?? null,
+    }));
+  }
+  if (!isUser) {
+    // 生成卡全部保留：已完成 → 只读卡片；失败 / 刷新时还没跑完 → 失败态，
+    // 点开可以重新发起。只存 pending/running 会让「刷新后卡片消失」重现，
+    // 所以这里把「没跑完」显式降级成 failed，而不是整张丢掉。
+    const cards = turn.cards.filter(isGenerationCard).slice(-3);
+    if (cards.length) {
+      item.cards = cards.map((c) => {
+        const confirmed = c.state === "confirmed";
+        let notice = c.notice;
+        if (c.state === "running") {
+          notice = "刷新前生成被中断；点开可查看最新正文并决定是否重试。";
+        } else if (c.state === "pending") {
+          notice = "刷新前未执行；点开可查看最新正文并决定是否重试。";
+        }
+        const bodySeg = c.action.body?.segment_no;
+        return {
+          action: c.action,
+          state: confirmed ? "confirmed" : "failed",
+          notice,
+          segmentNo:
+            c.segmentNo ?? (typeof bodySeg === "number" ? bodySeg : null),
+          preview: (c.preview ?? "").slice(0, 300),
+        };
+      });
+    }
   }
   return item;
 }
@@ -391,10 +634,49 @@ function saveHistory(): void {
     const item = serializeTurn(turn);
     if (item) payload.push(item);
   }
+
+  const session = chatSessions.value.find((s) => s.id === activeSessionId.value);
+  const now = Date.now();
+  if (!session) {
+    // 首次发送前还没有会话：补一条，避免消息只存在内存里。
+    const id = activeSessionId.value || newSessionId();
+    activeSessionId.value = id;
+    chatSessions.value.push({
+      id,
+      title: sessionTitleFromTurns(payload),
+      createdAt: now,
+      updatedAt: now,
+      turns: payload,
+    });
+  } else {
+    session.turns = payload;
+    session.updatedAt = now;
+    if (!payload.length) session.title = "新对话";
+    else if (session.title === "新对话" || !session.title) {
+      session.title = sessionTitleFromTurns(payload);
+    }
+  }
+  if (chatSessions.value.length > MAX_SESSIONS) {
+    chatSessions.value = chatSessions.value.slice(-MAX_SESSIONS);
+  }
   try {
-    localStorage.setItem(historyKey(), JSON.stringify(payload));
+    localStorage.setItem(sessionsKey(), JSON.stringify(chatSessions.value));
+    localStorage.setItem(activeSessionKey(), activeSessionId.value);
   } catch {
-    // 配额满 / 隐私模式：历史只是便利功能，写不进去不影响当前会话。
+    // 配额满 / 隐私模式：先尝试「瘦身」再写一次。
+    // 常见触发是历史会话攒了 30 个 + 每轮卡片预览；如果直接放弃，
+    // 用户会再次遇到「刷新后卡片/消息没了」。
+    try {
+      const active = chatSessions.value.find((s) => s.id === activeSessionId.value);
+      const compact = (active ? [active] : chatSessions.value.slice(-1)).map((s) => ({
+        ...s,
+        turns: s.turns.slice(-20),
+      }));
+      localStorage.setItem(sessionsKey(), JSON.stringify(compact));
+      localStorage.setItem(activeSessionKey(), activeSessionId.value);
+    } catch {
+      /* 仍然写不进：历史只是便利功能，不影响当前会话 */
+    }
   }
 }
 
@@ -421,50 +703,220 @@ function flushHistory(): void {
   saveHistory();
 }
 
-/** 恢复本地历史：只还原文字，所有可交互字段保持空值。 */
-function restoreHistory(): void {
-  if (badId) return;
-  let parsed: unknown;
-  try {
-    const raw = localStorage.getItem(historyKey());
-    if (!raw) return;
-    parsed = JSON.parse(raw);
-  } catch {
-    return;
-  }
-  if (!Array.isArray(parsed)) return;
+/** 把落盘的轮次还原成气泡：只还原文字，所有可交互字段保持空值。 */
+function restoreTurnsFromStored(parsed: StoredTurn[]): Turn[] {
   const restored: Turn[] = [];
   let index = 0;
   for (const raw of parsed) {
     if (!raw || typeof raw !== "object") continue;
-    const s = raw as Partial<StoredTurn>;
-    if (s.role !== "user" && s.role !== "assistant") continue;
+    if (raw.role !== "user" && raw.role !== "assistant") continue;
     index += 1;
-    const turn = s.role === "user" ? makeUserTurn(String(s.text ?? "")) : makeAssistantTurn();
+    const turn = raw.role === "user" ? makeUserTurn(String(raw.text ?? "")) : makeAssistantTurn();
     turn.key = `h-${index}`;
     turn.loading = false;
     turn.historical = true;
-    if (s.role === "user") {
-      const names = Array.isArray(s.attachments) ? s.attachments : [];
+    if (raw.role === "user") {
+      const names = Array.isArray(raw.attachments) ? raw.attachments : [];
       const attachments = names
         .filter((a) => a && typeof a.filename === "string")
         .map((a, i) => ({ key: i, filename: a.filename as string }));
       if (attachments.length) turn.attachments = attachments;
     } else {
-      turn.answer = typeof s.answer === "string" ? s.answer : "";
-      turn.error = typeof s.error === "string" ? s.error : null;
-      turn.confidence = Number(s.confidence) || 0;
-      turn.agentRunId = Number(s.agentRunId) || 0;
-      turn.evidence = Array.isArray(s.evidence)
-        ? (s.evidence.filter(
+      turn.answer = typeof raw.answer === "string" ? raw.answer : "";
+      turn.error = typeof raw.error === "string" ? raw.error : null;
+      turn.confidence = Number(raw.confidence) || 0;
+      turn.agentRunId = Number(raw.agentRunId) || 0;
+      turn.evidence = Array.isArray(raw.evidence)
+        ? (raw.evidence.filter(
             (ev) => ev && typeof ev === "object",
           ) as AssistantEvidence[])
         : [];
+      turn.liveSteps = Array.isArray(raw.steps)
+        ? raw.steps
+            .filter((s) => s && typeof s === "object" && typeof s.name === "string")
+            .map((s) => ({ name: s.name, meta: s.meta ?? "", detail: s.detail ?? "" }))
+        : [];
+      const thinking = raw.thinking;
+      turn.thinking =
+        thinking && typeof thinking === "object" && Number(thinking.chars) > 0
+          ? {
+              chars: Number(thinking.chars),
+              duration_ms:
+                typeof thinking.duration_ms === "number" ? thinking.duration_ms : null,
+            }
+          : null;
+      turn.webSearch =
+        raw.webSearch && typeof raw.webSearch === "object" ? raw.webSearch : null;
+      turn.webSources = Array.isArray(raw.webSources)
+        ? raw.webSources.filter(
+            (s) =>
+              s &&
+              typeof s === "object" &&
+              typeof s.url === "string" &&
+              typeof s.title === "string",
+          )
+        : [];
+      // 写作卡片：只恢复「已完成/失败」的生成卡，且保持只读；
+      // 点开仍然去写作面板定位到该段，不会在这里直接重跑。
+      const storedCards = Array.isArray(raw.cards) ? raw.cards : [];
+      turn.cards = storedCards
+        .filter((c) => c && typeof c === "object" && c.action)
+        .slice(-3)
+        .map((c, i) => ({
+          key: `hc-${index}-${i}`,
+          action: c.action,
+          state: c.state === "failed" ? "failed" : "confirmed",
+          rows: detailRows(c.action),
+          notice: typeof c.notice === "string" ? c.notice : "",
+          result: null,
+          trace: [],
+          startedAt: null,
+          baseCount: null,
+          sawLanding: false,
+          traceSupported: false,
+          segmentNo: typeof c.segmentNo === "number" ? c.segmentNo : null,
+          preview: typeof c.preview === "string" ? c.preview : "",
+          restored: true,
+        }));
     }
     restored.push(turn);
   }
-  turns.value = restored;
+  return restored;
 }
+
+function readStoredSessions(): ChatSession[] {
+  try {
+    const raw = localStorage.getItem(sessionsKey());
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (s): s is ChatSession =>
+        !!s &&
+        typeof s === "object" &&
+        typeof (s as ChatSession).id === "string" &&
+        Array.isArray((s as ChatSession).turns),
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** 旧版单会话记录 → 一条会话（迁移后仍读旧键，不做破坏性删除）。 */
+function migrateLegacyHistory(): ChatSession | null {
+  try {
+    const raw = localStorage.getItem(historyKey());
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const turns = parsed.filter(
+      (t): t is StoredTurn => !!t && typeof t === "object",
+    );
+    if (!turns.length) return null;
+    const now = Date.now();
+    return {
+      id: newSessionId(),
+      title: sessionTitleFromTurns(turns),
+      createdAt: now,
+      updatedAt: now,
+      turns,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 恢复本机会话列表与当前会话（首次使用会把旧单会话迁移进来）。 */
+function restoreHistory(): void {
+  if (badId) return;
+  let sessions = readStoredSessions();
+  if (!sessions.length) {
+    const migrated = migrateLegacyHistory();
+    if (migrated) sessions = [migrated];
+  }
+  if (!sessions.length) {
+    const now = Date.now();
+    sessions = [{
+      id: newSessionId(),
+      title: "新对话",
+      createdAt: now,
+      updatedAt: now,
+      turns: [],
+    }];
+  }
+  chatSessions.value = sessions;
+  const storedActive = localStorage.getItem(activeSessionKey()) || "";
+  const active =
+    chatSessions.value.find((s) => s.id === storedActive) ||
+    chatSessions.value[chatSessions.value.length - 1];
+  activeSessionId.value = active.id;
+  turns.value = restoreTurnsFromStored(active.turns);
+  // 停在刷新前那一屏，而不是无条件滚到底。
+  void restoreScroll(active.scrollTop);
+  // 迁移/新建后的列表立即落盘：下一次刷新必须拿到同一个会话 id。
+  try {
+    localStorage.setItem(sessionsKey(), JSON.stringify(chatSessions.value));
+    localStorage.setItem(activeSessionKey(), active.id);
+  } catch {
+    /* 本地存储不可用时只影响刷新后的恢复 */
+  }
+}
+
+/** 切换本机会话：先把当前会话落盘，再载入目标会话的文字记录。 */
+function switchSession(id: string): void {
+  sessionsOpen.value = false;
+  if (id === activeSessionId.value) return;
+  // 引导/角色对话是服务端状态，切走会与当前题卡错位；引导结束后再切。
+  if (wizardActive.value || roleMode.value) return;
+  flushHistory();
+  const target = chatSessions.value.find((s) => s.id === id);
+  if (!target) return;
+  activeSessionId.value = id;
+  turns.value = restoreTurnsFromStored(target.turns);
+  try {
+    localStorage.setItem(activeSessionKey(), id);
+  } catch {
+    /* 本地存储不可用不影响本次切换 */
+  }
+  // 每个会话各自记住上次停的位置；首次进入的会话才兜底滚底。
+  void restoreScroll(target.scrollTop);
+}
+
+/** 新建一条本机会话（不清服务端引导；引导进行中不允许切走）。 */
+function newChatSession(): void {
+  if (wizardActive.value || roleMode.value) return;
+  flushHistory();
+  const now = Date.now();
+  const session: ChatSession = {
+    id: newSessionId(),
+    title: "新对话",
+    createdAt: now,
+    updatedAt: now,
+    turns: [],
+  };
+  chatSessions.value.push(session);
+  activeSessionId.value = session.id;
+  turns.value = [];
+  lastStreamScrollTop = 0;
+  stickToBottom.value = true;
+  sessionsOpen.value = false;
+  try {
+    localStorage.setItem(activeSessionKey(), session.id);
+    localStorage.setItem(sessionsKey(), JSON.stringify(chatSessions.value));
+  } catch {
+    /* 写不进去只影响刷新后的恢复 */
+  }
+  nextTick(() => queryInput.value?.focus());
+}
+
+const activeSession = computed<ChatSession | null>(
+  () => chatSessions.value.find((s) => s.id === activeSessionId.value) ?? null,
+);
+
+/** 最近有动静的会话排前面（与 Qoder 的会话列表一致）。 */
+const sortedSessions = computed<ChatSession[]>(() =>
+  [...chatSessions.value].sort((a, b) => b.updatedAt - a.updatedAt),
+);
 
 watch(turns, scheduleHistorySave, { deep: true });
 
@@ -655,8 +1107,22 @@ async function resumeDistill(turn: Turn): Promise<void> {
   }
 }
 
+/** 把当前滚动位置写进会话对象（离开页面/切会话前调用）。 */
+function recordScrollNow(): void {
+  const session = chatSessions.value.find((s) => s.id === activeSessionId.value);
+  if (!session) return;
+  const el = streamEl.value;
+  // 元素已被 keep-alive 摘出文档时 scrollTop 不可信（通常是 0），
+  // 用滚动过程中记下的最后位置兜底。
+  if (el && el.isConnected) {
+    lastStreamScrollTop = el.scrollTop;
+  }
+  session.scrollTop = lastStreamScrollTop;
+}
+
 onUnmounted(() => {
   pageAlive = false;
+  recordScrollNow();
   if (distillTimer) clearTimeout(distillTimer);
   if (traceClock !== null) {
     window.clearInterval(traceClock);
@@ -666,6 +1132,7 @@ onUnmounted(() => {
   traceTimers.clear();
   // 组件被 keep-alive 淘汰 / 真正卸载时，把最后一次改动落盘。
   window.removeEventListener("pagehide", flushHistory);
+  window.removeEventListener("keydown", onGlobalKeydown);
   flushHistory();
   draft.reset(0);
 });
@@ -673,6 +1140,10 @@ onUnmounted(() => {
 // keep-alive 停用时停掉轮询/计时器；回来时若蒸馏任务仍在跑，继续轮询。
 onDeactivated(() => {
   pageAlive = false;
+  // 离开路由前记下停在那一屏并立刻落盘：keep-alive 回来时恢复，
+  // 同时避免组件稍后被缓存淘汰时丢掉最后的滚动位置。
+  recordScrollNow();
+  flushHistory();
   railOpen.value = false;
   if (distillTimer) {
     clearTimeout(distillTimer);
@@ -687,6 +1158,13 @@ onDeactivated(() => {
 });
 onActivated(() => {
   pageAlive = true;
+  // 从工作台/设置页回到对话时，停在离开前的位置；只有没记录过才落到底部。
+  // 激活瞬间 DOM 刚插回容器，布局高度可能还没算完，延到下一帧再赋值，
+  // 否则浏览器会把 scrollTop 夹成 0（看起来就是「又回到顶部」）。
+  const pos = activeSession.value?.scrollTop;
+  void nextTick(() => {
+    window.requestAnimationFrame(() => void restoreScroll(pos));
+  });
   if (distillActive.value) void pollDistill();
 });
 
@@ -705,11 +1183,17 @@ function makeWizardTurn(text: string): Turn {
   return t;
 }
 
-function pushWizardTurn(question: WizardQuestion, intro = ""): Turn {
+function pushWizardTurn(
+  question: WizardQuestion,
+  intro = "",
+  preview?: WizardCommitResult | null,
+): Turn {
   // 一条回复 = 解释正文 + 卡片；正文里可能已经带了上一题的回执。
   const parts = [intro, question.message].filter((s) => s && s.trim());
   const t = makeWizardTurn(parts.join("\n\n"));
   t.wizard = { question, answeredLabel: null, busy: false, disabled: false };
+  // 角色卡步骤：同一轮里挂上刚生成的卡预览，复用结果气泡的卡编辑 UI。
+  if (preview) t.wizardResult = preview;
   turns.value.push(t);
   void scrollToBottom();
   return t;
@@ -740,7 +1224,7 @@ async function startWizardFlow(intro = "", restart = false): Promise<void> {
   try {
     const st = await api.startWizard(projectId, restart);
     wizard.value = st.session;
-    if (st.question) pushWizardTurn(st.question, intro);
+    if (st.question) pushWizardTurn(st.question, intro, st.cards_preview);
   } catch (err) {
     const t = makeAssistantTurn();
     t.loading = false;
@@ -834,7 +1318,7 @@ async function loadWizard(): Promise<void> {
   if (liveBible) {
     const latest = [...turns.value]
       .reverse()
-      .find((t) => t.wizardResult?.stage === "outline");
+      .find((t) => t.wizardResult?.stage === "outline" || t.wizardResult?.stage === "cards");
     if (latest?.wizardResult) latest.wizardResult.bible = liveBible;
   }
   try {
@@ -852,8 +1336,10 @@ async function loadWizard(): Promise<void> {
       if (isCurrent && last.wizard) {
         // 历史最后一条就是当前题：解除只读，让用户接着答，别再画一张重复的。
         last.wizard.disabled = false;
+        // 角色卡步骤：刷新后重新接上后端刚返回的卡预览（历史消息里不存卡）。
+        if (st.cards_preview) last.wizardResult = st.cards_preview;
       } else {
-        pushWizardTurn(st.question, "上次问到这一步，接着来。");
+        pushWizardTurn(st.question, "上次问到这一步，接着来。", st.cards_preview);
       }
     } else if (
       st.session.status === "committed" &&
@@ -884,7 +1370,7 @@ async function answerStep(turn: Turn, value: unknown, label: string): Promise<vo
     ws.answeredLabel = label;
     wizard.value = res.session;
     if (res.done && res.result) applyCommitResult(res.result);
-    else if (res.question) pushWizardTurn(res.question);
+    else if (res.question) pushWizardTurn(res.question, "", res.cards_preview);
   } catch (err) {
     ws.busy = false;
     turn.error = `这一步没提交成功（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
@@ -906,7 +1392,7 @@ async function skipStep(turn: Turn): Promise<void> {
     ws.answeredLabel = "使用默认值";
     wizard.value = res.session;
     if (res.done && res.result) applyCommitResult(res.result);
-    else if (res.question) pushWizardTurn(res.question);
+    else if (res.question) pushWizardTurn(res.question, "", res.cards_preview);
   } catch (err) {
     ws.busy = false;
     turn.error = `跳过失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
@@ -916,7 +1402,11 @@ async function skipStep(turn: Turn): Promise<void> {
 /** 上一步 / 点汇总行跳回：都走同一个「重新画当前题」的路径。 */
 async function revisitStep(
   turn: Turn,
-  fetcher: () => Promise<{ session: WizardSessionView | null; question: WizardQuestion | null }>,
+  fetcher: () => Promise<{
+    session: WizardSessionView | null;
+    question: WizardQuestion | null;
+    cards_preview?: WizardCommitResult | null;
+  }>,
   intro: string,
 ): Promise<void> {
   const ws = turn.wizard;
@@ -927,7 +1417,7 @@ async function revisitStep(
     ws.busy = false;
     ws.disabled = true;
     wizard.value = st.session;
-    if (st.question) pushWizardTurn(st.question, intro);
+    if (st.question) pushWizardTurn(st.question, intro, st.cards_preview);
   } catch (err) {
     ws.busy = false;
     turn.error = `无法回到上一步（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
@@ -966,7 +1456,7 @@ async function sayInWizard(text: string): Promise<void> {
         ws.answeredLabel = res.echo || res.ack || text;
       }
       if (res.done && res.result) applyCommitResult(res.result);
-      else if (res.question) pushWizardTurn(res.question);
+      else if (res.question) pushWizardTurn(res.question, "", res.cards_preview);
     } else if (res.mode === "action") {
       if (ws) ws.busy = false;
       const t = makeAssistantTurn();
@@ -1392,6 +1882,44 @@ function recentRoleHistory(): { role: string; content: string }[] {
 // 问答
 // ==================================================================
 
+/** 把一次问答响应（流式 done 或一次性 /qa）落到气泡上。 */
+function applyAssistantResult(turn: Turn, res: AssistantQaResponse): void {
+  // 流式已经逐字写在 turn.answer 上；done 里的完整回答只用于「一个字都没收到」
+  // 的兜底。无条件覆盖会让整段正文在收尾瞬间重排（看起来像闪一下/被替换）。
+  if (!turn.answer) turn.answer = res.answer || "";
+  turn.evidence = res.evidence ?? [];
+  turn.webSources = res.web_sources ?? [];
+  turn.webSearch = res.web_search ?? null;
+  turn.thinking = res.thinking ?? null;
+  turn.confidence = res.confidence ?? 0;
+  turn.agentRunId = res.agent_run_id ?? 0;
+  // agent 自主调的诊断 / 日志 / 审核结果：新后端会给 issues + rules_evaluated，
+  // 旧后端不给 → 空数组 → 整段不渲染（不留空态）。
+  turn.issues = res.issues ?? res.findings ?? [];
+  turn.rulesEvaluated = res.rules_evaluated ?? [];
+  // 工具调用轨迹：旧后端不返回 tool_mode / tool_trace → 空值 → 整块不渲染。
+  turn.toolMode = res.tool_mode ?? "";
+  turn.toolTrace = res.tool_trace ?? [];
+  turn.toolResults = res.tool_results ?? {};
+  turn.toolFallbackReason = res.tool_fallback_reason ?? "";
+  turn.cards = (res.pending_actions ?? []).map((action) => ({
+    key: nextKey("card"),
+    action,
+    state: "pending" as CardState,
+    rows: detailRows(action),
+    notice: "",
+    result: null,
+    applied: false,
+    trace: [],
+    startedAt: null,
+    baseCount: null,
+    sawLanding: false,
+    traceSupported: true,
+  }));
+  // 说「记住…」/「忘掉…」时后端直接回了处理结果：抽屉与计数跟着刷新。
+  if (res.memory_changed) memories.value = res.memories ?? [];
+}
+
 async function send(): Promise<void> {
   const q = query.value.trim();
   if (!q || sending.value) return;
@@ -1432,11 +1960,14 @@ async function send(): Promise<void> {
     filename: item.metadata!.filename,
   }));
   turns.value.push(userTurn);
-  const turn = makeAssistantTurn();
+  // 必须是 reactive 代理：流式 delta 直接改这个对象；若只把原始对象 push
+  // 进 ref 数组，后续 `turn.answer += delta` 不会触发视图更新，看起来就像
+  // 「生成完了才一次性出现」。
+  const turn = reactive(makeAssistantTurn());
   turns.value.push(turn);
   query.value = "";
   sending.value = true;
-  await scrollToBottom();
+  await scrollToBottom(true);
 
   try {
     if (roleMode.value) {
@@ -1446,37 +1977,44 @@ async function send(): Promise<void> {
       turn.loading = false;
       return;
     }
-    const res = await api.assistantQa(body ?? { project_id: projectId, query: q });
-    turn.answer = res.answer || "";
-    turn.evidence = res.evidence ?? [];
-    turn.confidence = res.confidence;
-    turn.agentRunId = res.agent_run_id;
-    // agent 自主调的诊断 / 日志 / 审核结果：新后端会给 issues + rules_evaluated，
-    // 旧后端不给 → 空数组 → 整段不渲染（不留空态）。
-    turn.issues = res.issues ?? res.findings ?? [];
-    turn.rulesEvaluated = res.rules_evaluated ?? [];
-    // 工具调用轨迹：旧后端不返回 tool_mode / tool_trace → 空值 → 整块不渲染。
-    turn.toolMode = res.tool_mode ?? "";
-    turn.toolTrace = res.tool_trace ?? [];
-    turn.toolResults = res.tool_results ?? {};
-    turn.toolFallbackReason = res.tool_fallback_reason ?? "";
-    turn.cards = (res.pending_actions ?? []).map((action) => ({
-      key: nextKey("card"),
-      action,
-      state: "pending" as CardState,
-      rows: detailRows(action),
-      notice: "",
-      result: null,
-      trace: [],
-      startedAt: null,
-      baseCount: null,
-      sawLanding: false,
-      traceSupported: true,
-    }));
-    // 说「记住…」/「忘掉…」时后端直接回了处理结果：抽屉与计数跟着刷新。
-    if (res.memory_changed) {
-      memories.value = res.memories ?? [];
+    const request = body ?? { project_id: projectId, query: q };
+    let res: AssistantQaResponse | null = null;
+    turn.streaming = true;
+    try {
+      // 剧情讨论走 SSE：先出资料、再逐字吐答案。
+      res = await api.assistantChatStream(
+        request,
+        (delta) => {
+          turn.answer += delta;
+          // 首字一到就收掉「正在读资料」，让正文直接占位。
+          turn.loading = false;
+          void scrollToBottom();
+        },
+        (meta) => {
+          turn.agentRunId = meta.agent_run_id;
+          if (typeof meta.confidence === "number") turn.confidence = meta.confidence;
+          if (typeof meta.evidence_count === "number") {
+            turn.liveEvidenceCount = meta.evidence_count;
+          }
+        },
+        (steps) => {
+          turn.liveSteps = steps.map((step) => ({
+            name: step.name,
+            meta: step.meta ?? "",
+            detail: step.detail ?? "",
+          }));
+          void scrollToBottom();
+        },
+      );
+    } catch (streamErr) {
+      // 一个字都没收到时回落到一次性问答（旧能力不丢）；已出字则保留正文报错。
+      if (!turn.answer) {
+        res = await api.assistantQa(request);
+      } else {
+        throw streamErr;
+      }
     }
+    if (res) applyAssistantResult(turn, res);
     turn.loading = false;
     // 请求已把附件 id 交给后端（答疑/提卡都在服务端完成），草稿可以清空；
     // 真正的写库仍要用户在上方卡片上点确认。
@@ -1485,13 +2023,20 @@ async function send(): Promise<void> {
     turn.error = `问答失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
     turn.loading = false;
   } finally {
+    turn.streaming = false;
     sending.value = false;
+    // 这一轮可能推进了工序（生成/提案/改设定），计划卡要跟着刷新。
+    void loadWorkflow();
     await scrollToBottom();
   }
 }
 
 /** Enter 发送、Shift+Enter 换行（textarea 默认 Enter 是换行，这里反转）。 */
 function onKeydown(e: KeyboardEvent): void {
+  // 中文输入法里 Enter 是「选中候选词」，不是发送。少了这个判断，
+  // 用户按 Enter 选词会把正在组合的半句话提前发出去，输入框还被清空 ——
+  // 表现出来就是「问题没进对话」。
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     void send();
@@ -1637,6 +2182,8 @@ async function confirmCard(card: ActionCard): Promise<void> {
     pushTrace(card, `完成，总耗时 ${elapsedText(card)}`, "ok");
     // 正文可能刚落库：目录和字数跟着刷新（失败也不影响卡片结论）。
     void loadDesk();
+    // 生成/提案会推进工序链，计划卡跟着重算。
+    void loadWorkflow();
   } catch (err) {
     const status = statusOf(err);
     const detail = detailOf(err);
@@ -1664,6 +2211,295 @@ function cancelCard(turn: Turn, card: ActionCard): void {
   if (card.state === "running" || card.state === "confirmed") return;
   const i = turn.cards.indexOf(card);
   if (i >= 0) turn.cards.splice(i, 1);
+}
+
+// ==================================================================
+// 写作面板：正文生成从聊天里拆出去
+// ==================================================================
+//
+// 卡片上点「在写作面板生成」后，聊天只保留一张状态卡，真正的流式正文
+// 在右侧面板里写、看、改。这样对话流不会被几百字正文撑开，也不会让人
+// 误以为「聊天 = 稿子」。
+
+const writingOpen = ref(false);
+const writingSegmentNo = ref<number | null>(null);
+const writingMode = ref<"view" | "continue" | "regenerate">("view");
+/** 同一面板再次从卡片打开时递增，触发面板开始新一轮生成。 */
+const writingRunKey = ref(0);
+/** 当前由哪张卡片调起（只用于把生成结果写回那张卡）。 */
+const writingCardKey = ref<string | null>(null);
+
+const writingCard = computed<ActionCard | null>(() => {
+  const key = writingCardKey.value;
+  if (!key) return null;
+  for (const turn of turns.value) {
+    const found = turn.cards.find((c) => c.key === key);
+    if (found) return found;
+  }
+  return null;
+});
+
+/** 生成类卡片：正文交给写作面板，不走 /assistant/invoke-generation 同步接口。 */
+function isGenerationCard(card: ActionCard): boolean {
+  if (card.action.kind === "invoke_generation") return true;
+  const action = card.action.body?.action;
+  return action === "generate_next" || action === "regenerate_segment";
+}
+
+/** 主按钮文案：生成类卡片明确写「在写作面板」，避免以为点了就当场出正文。 */
+function primaryLabel(card: ActionCard): string {
+  if (isGenerationCard(card)) {
+    if (card.state === "running") return "写作面板生成中…";
+    if (card.state === "confirmed") return "已在写作面板完成";
+    if (card.state === "failed") return "在写作面板重试";
+    return "在写作面板生成";
+  }
+  if (card.state === "running") return "执行中…";
+  if (card.state === "confirmed") return "已确认";
+  if (card.state === "failed") return "重试";
+  return "确认执行";
+}
+
+/** 写作卡片的状态文案 / 色标（文字与颜色双编码）。 */
+function genStateText(card: ActionCard): string {
+  if (card.restored) return "历史";
+  if (card.state === "running") return "生成中";
+  if (card.state === "confirmed") return "已生成";
+  if (card.state === "failed") return "失败";
+  return "待开始";
+}
+
+function genStateTag(card: ActionCard): string {
+  if (card.restored) return "info";
+  if (card.state === "running") return "info";
+  if (card.state === "confirmed") return "ok";
+  if (card.state === "failed") return "err";
+  return "warn";
+}
+
+/** 卡片预览：只展示开头一段；完整正文永远在写作面板里。 */
+function genPreview(card: ActionCard): string {
+  if (card.preview) return card.preview;
+  if (card.state === "running") return "正在写作面板中流式生成，点开可查看进度。";
+  if (card.state === "failed") return card.notice || "生成失败，点开重试。";
+  if (card.state === "confirmed") return card.notice || "正文已生成。";
+  return card.action.body?.action === "regenerate_segment"
+    ? "点开在写作面板重写这一段。"
+    : "点开在写作面板续写下一段。";
+}
+
+function genFoot(card: ActionCard): string {
+  if (card.restored) return "刷新前记录 · 点开查看最新正文";
+  if (card.state === "running") return "正文只在写作面板里流式输出";
+  if (card.state === "confirmed") return "点开可查看、编辑或重生成";
+  if (card.state === "failed") return "点开重试";
+  return "点开开始生成";
+}
+
+/** 进度百分比：不知道总量时按目标字数估，封顶 99% 等 done。 */
+function genPercent(card: ActionCard): number {
+  const chars = card.progressChars ?? 0;
+  const target = Math.max(1, card.progressTarget ?? 3000);
+  return Math.min(99, Math.round((chars / target) * 100));
+}
+
+/**
+ * 打开写作面板并接一张生成卡。
+ *
+ * 卡片进入 running 是「已转交」而不是「已完成」：真正的结果由面板的
+ * generated / failed 事件写回。这样即使面板生成失败，卡片也不会显示成功。
+ */
+function openWritingPanel(card: ActionCard): void {
+  const body = card.action.body ?? {};
+  const action = typeof body.action === "string" ? body.action : "generate_next";
+  writingMode.value = action === "regenerate_segment" ? "regenerate" : "continue";
+  writingSegmentNo.value = typeof body.segment_no === "number" ? body.segment_no : null;
+  card.segmentNo = writingSegmentNo.value;
+  writingCardKey.value = card.key;
+
+  card.state = "running";
+  card.notice = "";
+  card.result = null;
+  card.trace = [];
+  card.startedAt = Date.now();
+  card.baseCount = null;
+  card.sawLanding = false;
+  card.traceSupported = true;
+  card.progressChars = 0;
+  card.progressSeconds = 0;
+  card.progressTarget = undefined;
+  card.progressReasoning = 0;
+  card.progressStage = undefined;
+  traceNow.value = card.startedAt;
+  ensureTraceClock();
+  pushTrace(card, "已转交写作面板：正文在右侧面板内流式生成，聊天里不再展开");
+
+  writingOpen.value = true;
+  writingRunKey.value += 1;
+}
+
+/** 页头入口：只查看 / 修改，不自动生成。 */
+function openWritingPanelPlain(): void {
+  writingMode.value = "view";
+  writingSegmentNo.value = null;
+  // 有生成在跑时保留卡片绑定，否则关掉再打开会让卡片停在「生成中」。
+  if (writingCard.value?.state !== "running") writingCardKey.value = null;
+  writingOpen.value = true;
+}
+
+/**
+ * 点写作卡片：
+ * - 未执行/失败 → 转交面板并开始生成；
+ * - 已生成/执行中 → 只打开面板定位到该段（view），不再重复生成。
+ */
+function openCardPanel(card: ActionCard): void {
+  // 历史恢复的卡片只查看：刷新前那次生成可能已经在后台落库，
+  // 直接重跑会覆盖掉它。
+  if (card.restored) {
+    writingCardKey.value = card.key;
+    writingMode.value = "view";
+    writingSegmentNo.value = card.segmentNo ?? null;
+    writingOpen.value = true;
+    return;
+  }
+  if (card.state === "pending" || card.state === "failed") {
+    openWritingPanel(card);
+    return;
+  }
+  writingCardKey.value = card.key;
+  writingMode.value = "view";
+  writingSegmentNo.value = card.segmentNo ?? null;
+  writingOpen.value = true;
+}
+
+/** 卡片预览：只取正文开头，完整正文留在写作面板里。 */
+async function loadCardPreview(card: ActionCard, segmentNo: number): Promise<void> {
+  try {
+    const list = await api.listGenerations(projectId);
+    const seg = list.find((s) => s.segment_no === segmentNo);
+    const text = (seg?.text ?? "").trim();
+    if (text) card.preview = text.length > 150 ? `${text.slice(0, 150)}…` : text;
+  } catch {
+    /* 预览失败不影响卡片结论 */
+  }
+}
+
+function closeWritingPanel(): void {
+  // 只收起抽屉，不中断生成：面板组件保持挂载，流式进度继续回写卡片。
+  writingOpen.value = false;
+}
+
+function onWritingGenerated(payload: { segment_no: number; chars: number }): void {
+  const card = writingCard.value;
+  if (card) {
+    card.state = "confirmed";
+    card.segmentNo = payload.segment_no;
+    card.notice = `已在写作面板生成第 ${payload.segment_no} 段（${payload.chars} 字）。`;
+    pushTrace(card, `正文已落库：第 ${payload.segment_no} 段`, "ok");
+    stopTrace(card);
+    void loadCardPreview(card, payload.segment_no);
+  }
+  void loadDesk();
+  void loadWorkflow();
+  refreshProject();
+}
+
+function onWritingFailed(message: string): void {
+  const card = writingCard.value;
+  if (card) {
+    card.state = "failed";
+    card.notice = message;
+    pushTrace(card, "写作面板生成失败", "err");
+    stopTrace(card);
+  }
+}
+
+/** 写作面板每秒回报一次进度：卡片上的进度条只吃这一份数据。 */
+function onWritingProgress(payload: {
+  chars: number;
+  seconds: number;
+  target: number;
+  reasoning: number;
+  stage?: string;
+  stageLabel?: string;
+}): void {
+  const card = writingCard.value;
+  if (!card || card.state !== "running") return;
+  card.progressChars = payload.chars;
+  card.progressSeconds = payload.seconds;
+  card.progressTarget = payload.target;
+  card.progressReasoning = payload.reasoning;
+  card.progressStage = payload.stageLabel;
+}
+
+function onWritingUpdated(): void {
+  void loadDesk();
+  void loadWorkflow();
+  refreshProject();
+}
+
+/** 设定可能被保存/生成改动：刷新项目，右侧上下文跟着更新。 */
+function refreshProject(): void {
+  api
+    .getProject(projectId)
+    .then((p) => {
+      project.value = p;
+    })
+    .catch(() => {
+      /* 刷新失败不影响正文结论 */
+    });
+}
+
+/** 「批准并写入」的忙态（按卡片 key，不放到卡片数据里）。 */
+const promoteBusy = reactive<Record<string, boolean>>({});
+
+/** 卡片结果里是否带着一条「已创建、待批准」的提案。 */
+function proposalIdOf(card: ActionCard): number | null {
+  const proposal = card.result?.proposal;
+  if (!proposal || typeof proposal !== "object") return null;
+  const id = (proposal as Record<string, unknown>).id;
+  return typeof id === "number" ? id : null;
+}
+
+/**
+ * 提案卡确认后只创建了一条 pending 提案，业务表还没动。
+ *
+ * 这里把「批准 → 写入」两步补在同一张卡上：用户不用再跳去项目页找。
+ * 仍然保持两次状态转换（不合成一键写库），只是路径更短。
+ */
+async function approveAndApplyCard(card: ActionCard): Promise<void> {
+  const id = proposalIdOf(card);
+  if (id === null || promoteBusy[card.key]) return;
+  promoteBusy[card.key] = true;
+  card.notice = "正在批准并写入…";
+  try {
+    try {
+      await api.approveProposal(id);
+    } catch (err) {
+      // 已经批准过、状态机不允许重复批准：继续尝试写入；其他错误照常抛。
+      if (!(err instanceof ApiError && err.status === 409)) throw err;
+    }
+    const res = await api.applyProposal(id);
+    card.applied = true;
+    card.notice = `已写入项目（Version #${res.version_id}）。`;
+    pushTrace(card, "已批准并写入项目", "ok");
+    void loadDesk();
+    void loadWorkflow();
+    // 设定可能刚变：刷新项目，右侧上下文/角色卡跟着更新。
+    api
+      .getProject(projectId)
+      .then((p) => {
+        project.value = p;
+      })
+      .catch(() => {
+        /* 刷新失败不影响写入结论 */
+      });
+  } catch (err) {
+    card.notice = `写入失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
+    pushTrace(card, `写入失败：${textOf(err)}`, "err");
+  } finally {
+    promoteBusy[card.key] = false;
+  }
 }
 
 const RISK_LABEL: Record<string, string> = {
@@ -1772,6 +2608,12 @@ const DETAIL_LABELS: Record<string, string> = {
   // 通用
   project_id: "项目 project_id",
   max_chars: "字数上限 max_chars",
+  // 改设定卡片（对话里【写设定】标记折叠成的提案）
+  character: "角色 character",
+  field: "字段 field",
+  old_value: "原值 old_value",
+  new_value: "新值 new_value",
+  requires_confirmation: "需要确认 requires_confirmation",
 };
 
 interface DetailRow {
@@ -1935,6 +2777,271 @@ function askAboutChapter(): void {
   void nextTick(() => queryInput.value?.focus());
 }
 
+// ==================================================================
+// Qoder 风格对话页：快捷指令、引用菜单、上下文与 Agent 读取步骤
+// ==================================================================
+
+const QUICK_PROMPTS: { label: string; text: string }[] = [
+  { label: "继续推演", text: "接着刚才的方向，继续推演下一段。" },
+  { label: "分析动机", text: "分析一下主要角色这几段的动机是否前后一致。" },
+  { label: "查设定矛盾", text: "检查最近两段有没有设定或时间线上的矛盾。" },
+  { label: "给个开头钩子", text: "给下一段的开头一个钩子，先讨论方案，不要写正文。" },
+];
+
+/** 输入区上面的「@ 引用 / / 指令」弹层。 */
+const quoteMenu = ref<"" | "ref" | "cmd">("");
+
+const quoteItems = computed<{ label: string; token: string; kind: string }[]>(() => {
+  const items: { label: string; token: string; kind: string }[] = [];
+  if (bookSegments.value) {
+    items.push({
+      label: `第 ${bookSegments.value} 段正文`,
+      token: `@第${bookSegments.value}段`,
+      kind: "正文",
+    });
+  }
+  for (const c of bibleCharacterList.value.slice(0, 3)) {
+    items.push({ label: `角色 · ${c.name}`, token: `@${c.name}`, kind: "角色" });
+  }
+  if ((bible.value?.foreshadowing ?? []).length) {
+    items.push({ label: "未填坑 / 伏笔", token: "@伏笔", kind: "设定" });
+  }
+  items.push({ label: "剧情圣经 · 后续走向", token: "@后续走向", kind: "圣经" });
+  return items;
+});
+
+const commandItems = QUICK_PROMPTS.map((p) => ({
+  label: p.label,
+  token: p.text,
+  kind: "指令",
+}));
+
+function toggleQuoteMenu(kind: "ref" | "cmd"): void {
+  quoteMenu.value = quoteMenu.value === kind ? "" : kind;
+}
+
+function insertComposerToken(token: string): void {
+  query.value = (query.value ? query.value + " " : "") + token + " ";
+  quoteMenu.value = "";
+  nextTick(() => {
+    autoGrowComposer();
+    queryInput.value?.focus();
+  });
+}
+
+function useQuickPrompt(text: string): void {
+  query.value = text;
+  nextTick(() => {
+    autoGrowComposer();
+    queryInput.value?.focus();
+  });
+}
+
+/** 输入框随内容长高（上限 180px），不出现双滚动条。 */
+function autoGrowComposer(): void {
+  const el = queryInput.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 180) + "px";
+}
+
+watch(query, () => nextTick(autoGrowComposer));
+
+/* ---- 右栏上下文：全部来自项目真实数据，不编造 ---- */
+const bible = computed(() => project.value?.plot_bible ?? null);
+
+const bibleCharacterList = computed(() =>
+  (bible.value?.characters ?? []).filter(
+    (c): c is { name: string; role?: string; motivation?: string } =>
+      !!c && typeof c.name === "string" && c.name.trim() !== "",
+  ),
+);
+
+const bibleRelations = computed(() =>
+  (bible.value?.relationships ?? []).filter((r) => !!r && !!(r.a || r.b)),
+);
+
+/** 最近一轮带证据的回答：右栏「证据」卡展示它。 */
+const latestEvidence = computed<AssistantEvidence[]>(() => {
+  for (let i = turns.value.length - 1; i >= 0; i -= 1) {
+    const t = turns.value[i];
+    if (t.role === "assistant" && t.evidence.length) return t.evidence;
+  }
+  return [];
+});
+
+const contextChips = computed<{ label: string; accent?: boolean }[]>(() => {
+  const chips: { label: string; accent?: boolean }[] = [];
+  if (bookSegments.value) {
+    chips.push({ label: `已写 ${bookSegments.value} 段`, accent: true });
+  }
+  chips.push({ label: "剧情圣经" });
+  if (bibleCharacterList.value.length) {
+    chips.push({ label: `角色 ×${bibleCharacterList.value.length}` });
+  }
+  if ((bible.value?.foreshadowing ?? []).length) {
+    chips.push({ label: `伏笔 ×${(bible.value?.foreshadowing ?? []).length}` });
+  }
+  if (chapterRail.value.length) {
+    chips.push({ label: `章纲 ×${chapterRail.value.length}` });
+  }
+  return chips;
+});
+
+interface AgentStep {
+  name: string;
+  meta: string;
+  detail: string;
+}
+
+const EVIDENCE_KIND_LABEL: Record<string, string> = {
+  generation: "读取正文",
+  chunk: "检索参考语料",
+  reminder: "读取未填坑 / 角色约束",
+  tool: "读取作品资料",
+  run: "分析调用日志",
+};
+
+/** 把本轮 evidence 按类型压成「已读取 N 项资料」的时间线。 */
+function agentSteps(turn: Turn): AgentStep[] {
+  const groups = new Map<string, AssistantEvidence[]>();
+  for (const ev of turn.evidence) {
+    const list = groups.get(ev.kind) ?? [];
+    list.push(ev);
+    groups.set(ev.kind, list);
+  }
+  return [...groups.entries()].map(([kind, rows]) => ({
+    name: EVIDENCE_KIND_LABEL[kind] ?? "读取资料",
+    meta: `${rows.length} 条`,
+    detail: rows
+      .map((r) => `[${r.ref_id}] ${r.snippet}`)
+      .join("\n\n")
+      .slice(0, 1200),
+  }));
+}
+
+/** 优先用后端实时下发的读取步骤；历史消息退回 evidence 反推。 */
+function displaySteps(turn: Turn): AgentStep[] {
+  return turn.liveSteps?.length ? turn.liveSteps : agentSteps(turn);
+}
+
+/** 还在取资料（正文未开始）：chip 显示「读取中」与扫光。 */
+function isRetrieving(turn: Turn): boolean {
+  return Boolean(turn.streaming && !turn.answer);
+}
+
+// ------------------------------------------------------------------
+// 本轮数据块的小窗口（资料 / 证据 / 工具调用 / 联网来源）
+// ------------------------------------------------------------------
+//
+// 这些块原来全部平铺在正文下面，一条长回答之后要翻很久才能回到输入框。
+// 现在折叠成一行 chip，点开才在自带滚动的小窗口里看明细。
+
+type DetailKind = "steps" | "evidence" | "tools" | "web";
+
+interface DataChip {
+  kind: DetailKind;
+  label: string;
+  live: boolean;
+}
+
+const detailView = ref<{ turnKey: string; kind: DetailKind } | null>(null);
+
+const detailTurn = computed<Turn | null>(() => {
+  const view = detailView.value;
+  if (!view) return null;
+  return turns.value.find((t) => t.key === view.turnKey) ?? null;
+});
+
+const DETAIL_TITLES: Record<DetailKind, string> = {
+  steps: "本轮读取的资料",
+  evidence: "证据原文",
+  tools: "工具调用轨迹",
+  web: "联网检索来源",
+};
+
+const detailTitle = computed(() =>
+  detailView.value ? DETAIL_TITLES[detailView.value.kind] : "",
+);
+
+const detailSubtitle = computed(() => {
+  const view = detailView.value;
+  const turn = detailTurn.value;
+  if (!view || !turn) return "";
+  if (view.kind === "steps") return `${displaySteps(turn).length} 项 · 只读`;
+  if (view.kind === "evidence") return `${turn.evidence.length} 条`;
+  if (view.kind === "tools") return `${turn.toolTrace.length} 次调用`;
+  const dropped = turn.webSearch?.dropped ?? 0;
+  return `${turn.webSources?.length ?? 0} 条${dropped ? ` · 已过滤 ${dropped} 条低质结果` : ""}`;
+});
+
+// 窗口内容从 detailTurn 派生：模板里不必再对可空对象做类型收窄。
+const detailSteps = computed(() =>
+  detailTurn.value ? displaySteps(detailTurn.value) : [],
+);
+const detailEvidence = computed(() => detailTurn.value?.evidence ?? []);
+const detailTools = computed(() => detailTurn.value?.toolTrace ?? []);
+const detailWeb = computed(() => detailTurn.value?.webSources ?? []);
+
+function detailToolResult(name: string): string {
+  const turn = detailTurn.value;
+  return turn ? toolResultText(turn, name) : "";
+}
+
+/** 本轮的 chip 列表：没有内容的类型不出现。 */
+function turnChips(turn: Turn): DataChip[] {
+  const chips: DataChip[] = [];
+  const stepCount = displaySteps(turn).length;
+  if (stepCount) {
+    chips.push({
+      kind: "steps",
+      label: isRetrieving(turn)
+        ? `正在读取资料 · ${stepCount} 项`
+        : `已读取 ${stepCount} 项资料`,
+      live: isRetrieving(turn),
+    });
+  }
+  if (turn.evidence.length) {
+    chips.push({ kind: "evidence", label: `证据 ${turn.evidence.length} 条`, live: false });
+  }
+  if (turn.toolTrace.length) {
+    chips.push({ kind: "tools", label: `工具调用 ${turn.toolTrace.length} 次`, live: false });
+  }
+  if (turn.webSources?.length) {
+    chips.push({ kind: "web", label: `联网来源 ${turn.webSources.length} 条`, live: false });
+  }
+  return chips;
+}
+
+function openDetail(turn: Turn, kind: DetailKind): void {
+  detailView.value = { turnKey: turn.key, kind };
+}
+
+function closeDetail(): void {
+  detailView.value = null;
+}
+
+/** 小窗口打开时 Esc 关闭（不抢输入框的键盘事件：只在有窗口时生效）。 */
+function onGlobalKeydown(e: KeyboardEvent): void {
+  if (e.key === "Escape" && detailView.value) closeDetail();
+}
+
+/** 推理耗时文案：「3 秒」；渠道拿不到分段耗时时退回字数。 */
+function thinkingText(thinking: AssistantThinking): string {
+  if (typeof thinking.duration_ms === "number") {
+    const seconds = Math.max(1, Math.round(thinking.duration_ms / 1000));
+    return `${seconds} 秒`;
+  }
+  return `${thinking.chars} 字`;
+}
+
+function answerHtml(turn: Turn): string {
+  return renderMarkdown(
+    turn.answer || "（助手未返回文字回答，请直接看下方证据）",
+  );
+}
+
+
 /**
  * 目录里只放「标题」，不放整条章纲。
  *
@@ -2021,6 +3128,66 @@ async function removeMemory(item: AssistantMemory): Promise<void> {
   }
 }
 
+// ==================================================================
+// 本次推进计划（服务端重新评估的工序链，只读展示）
+// ==================================================================
+//
+// 数据来自 GET /projects/{id}/workflow：服务端查库 + 只读规则算出来的
+// 「走到哪一步」，不是前端编的进度。只画在最新一条回答下面，避免每轮都重复。
+
+const workflow = ref<WorkflowState | null>(null);
+
+async function loadWorkflow(): Promise<void> {
+  if (badId) return;
+  try {
+    workflow.value = await api.getWorkflow(projectId);
+  } catch {
+    /* 工序链是辅助展示：取不到就不画卡片 */
+  }
+}
+
+/**
+ * 只看本作品实际用到的工序：`skipped`（未启用/不适用）不算进度，
+ * 否则 11 步里一半是「不适用」，计划卡会被噪声占满。
+ */
+const planStepsAll = computed(
+  () => (workflow.value?.steps ?? []).filter((s) => s.state !== "skipped"),
+);
+const planDone = computed(
+  () => planStepsAll.value.filter((s) => s.state === "done").length,
+);
+const planTotal = computed(() => planStepsAll.value.length);
+const planPct = computed(() =>
+  planTotal.value ? Math.round((planDone.value / planTotal.value) * 100) : 0,
+);
+
+/** 只展示三步：最近完成的 + 当前 + 下一步，长链路不铺满。 */
+const planSteps = computed(() => {
+  const steps = planStepsAll.value;
+  const idx = steps.findIndex((s) => s.state !== "done");
+  const start = idx === -1 ? Math.max(0, steps.length - 3) : Math.max(0, idx - 1);
+  return steps.slice(start, start + 3);
+});
+
+const lastAssistantKey = computed(() => {
+  for (let i = turns.value.length - 1; i >= 0; i -= 1) {
+    if (turns.value[i].role === "assistant") return turns.value[i].key;
+  }
+  return "";
+});
+
+/** 计划卡挂在最新一条正常问答下面（引导卡/通知卡不带）。 */
+function showPlanCard(turn: Turn): boolean {
+  return (
+    turn.key === lastAssistantKey.value &&
+    !turn.loading &&
+    !turn.wizard &&
+    !turn.note &&
+    !turn.notice &&
+    planTotal.value > 0
+  );
+}
+
 onMounted(async () => {
   if (badId) return;
   // 附件草稿按项目隔离：路由里的项目 id 就是暂存区的 scope。
@@ -2031,6 +3198,7 @@ onMounted(async () => {
   historyReady = true;
   // 刷新/关页时同步落盘：pagehide 是浏览器保证会跑的最后时机。
   window.addEventListener("pagehide", flushHistory);
+  window.addEventListener("keydown", onGlobalKeydown);
   // 三条读取互相独立：任何一条失败都不能把后面的目录/轮询一起带走
   // （旧写法串行 await，后端重启窗口里一次失败会让整页停在空壳状态）。
   await Promise.all([
@@ -2055,6 +3223,8 @@ onMounted(async () => {
   }
   // 章节目录 / 字数：装饰性辅助，慢一点不影响首屏可聊。
   void loadDesk();
+  // 本次推进计划：服务端算好的工序链，只读展示。
+  void loadWorkflow();
   // 记忆条数要显示在页头按钮上：先读一次（读不到就显示 0）。
   void loadMemories();
   // 引导卡先入列，再开始轮询：回执/卡住提醒是「之后发生的事」，必须排在卡片后面。
@@ -2064,7 +3234,25 @@ onMounted(async () => {
 </script>
 
 <template>
+  <div class="asst-root">
   <div class="desk">
+    <!-- 窄屏：会话列表是抽屉，点遮罩关闭 -->
+    <Transition name="rail-fade">
+      <div
+        v-if="sessionsOpen"
+        class="rail-backdrop sessions-backdrop"
+        aria-hidden="true"
+        @click="sessionsOpen = false"
+      />
+    </Transition>
+    <Transition name="rail-fade">
+      <div
+        v-if="ctxOpen"
+        class="rail-backdrop ctx-backdrop"
+        aria-hidden="true"
+        @click="ctxOpen = false"
+      />
+    </Transition>
     <!-- 左栏目录已收进抽屉：默认不占宽，点抬头「目录」打开。 -->
     <Transition name="rail-fade">
       <div
@@ -2129,127 +3317,172 @@ onMounted(async () => {
       </router-link>
     </aside>
 
-    <div class="desk-body">
-      <header class="page-head">
-        <div class="eyebrow">助手工作台</div>
-        <div class="asst-head">
-          <h1>{{ project ? project.title : "未命名作品" }}</h1>
-          <select
-            v-if="bookSwitcherVisible"
-            class="book-switcher"
-            :value="projectId"
-            aria-label="切换当前小说项目"
-            @change="switchBook"
-          >
-            <option v-for="b in bookOptions" :key="b.id" :value="b.id">
-              {{ b.title }}（{{ b.segment_count ?? 0 }} 段）
-            </option>
-          </select>
+    <!-- 左：本机会话列表（引导进行中锁定，避免与服务端题卡错位） -->
+    <aside class="sessions-rail" :class="{ open: sessionsOpen }" aria-label="对话会话">
+      <div class="sr-head">
+        <div class="sr-head-row">
+          <div class="sr-kicker"><span class="sr-mark" aria-hidden="true">墨</span>写作台</div>
           <button
-            v-if="chapterRail.length"
-            class="link-btn rail-toggle"
+            class="icon-btn surface-toggle"
             type="button"
-            :aria-expanded="railOpen"
-            @click="railOpen = true"
+            :title="theme === 'ink' ? '切换到纸色' : '切换到暗色工作台'"
+            :aria-label="theme === 'ink' ? '切换到纸色' : '切换到暗色工作台'"
+            @click="toggleInkTheme"
           >
-            目录
-            <span class="rail-toggle-count">{{ writtenChapterCount }}/{{ chapterRail.length }}</span>
-          </button>
-          <button class="link-btn back-link" @click="router.push(`/projects/${projectId}`)">
-            ← 项目工作台
-          </button>
-          <button
-            class="link-btn memory-toggle"
-            :class="{ on: memoryOpen }"
-            :aria-expanded="memoryOpen"
-            @click="toggleMemory"
-          >
-            记忆 <span class="memory-count">{{ memories.length }}</span>
+            <svg
+              v-if="theme === 'ink'"
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.7"
+            >
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" />
+            </svg>
+            <svg
+              v-else
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.7"
+            >
+              <path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.5 6.5 0 0 0 9.8 9.8Z" />
+            </svg>
           </button>
         </div>
+        <h1 class="sr-title">{{ project ? project.title : "未命名作品" }}</h1>
+        <select
+          v-if="bookSwitcherVisible"
+          class="book-switcher"
+          :value="projectId"
+          aria-label="切换当前小说项目"
+          @change="switchBook"
+        >
+          <option v-for="b in bookOptions" :key="b.id" :value="b.id">
+            {{ b.title }}（{{ b.segment_count ?? 0 }} 段）
+          </option>
+        </select>
+      </div>
 
-        <!-- 写作台抬头：写到哪了、多少字，一眼可见 -->
-        <div class="book-stats">
-          <span><b>{{ bookSegments ?? "—" }}</b> 段正文</span>
-          <span><b>{{ bookChars === null ? "—" : bookChars.toLocaleString() }}</b> 字</span>
-          <span><b>{{ writtenChapterCount || "—" }}</b> 章已写</span>
-          <span v-if="latestWrittenChapter">写到 <b>第 {{ latestWrittenChapter }} 章</b></span>
-        </div>
-
-        <div v-if="badId" class="notice err">路由缺少有效的项目 id（/projects/:id/assistant）。</div>
-
-    <div class="asst-meta">
-      <!-- 三个模型徽标：生成 / 助手 / 蒸馏分开显示，一眼看出是三回事 -->
-      <span
-        class="tag model-badge"
-        :class="writerCfg?.is_fallback ? 'warn' : 'info'"
-        :title="writerCfg ? `生成模型（Writer）：${writerCfg.label} · ${writerCfg.model}` : '生成模型配置未取到'"
+      <button
+        class="new-chat"
+        type="button"
+        :disabled="wizardActive || !!roleMode"
+        :title="wizardActive || roleMode ? '引导 / 角色对话进行中，结束后可新建会话' : '新建一条本机对话'"
+        @click="newChatSession"
       >
-        生成 · {{ writerCfg?.is_fallback ? "本地兜底" : writerCfg?.label }}
-      </span>
-      <span
-        class="tag model-badge"
-        :class="assistantCfg?.is_fallback ? 'warn' : 'info'"
-        :title="assistantCfg ? `助手模型（Assistant）：${assistantCfg.label} · ${assistantCfg.model}` : '助手模型配置未取到'"
-      >
-        助手 · {{ assistantCfg?.is_fallback ? "本地兜底" : assistantCfg?.label }}
-      </span>
-      <span
-        class="tag model-badge"
-        :class="distillerCfg?.is_fallback ? 'warn' : 'info'"
-        :title="distillerCfg ? `提炼模型（Distiller，文风档案抽取用）：${distillerCfg.label} · ${distillerCfg.model}` : '提炼模型配置未取到'"
-      >
-        提炼 · {{ distillerCfg?.is_fallback ? "本地兜底" : distillerCfg?.label }}
-      </span>
-      <!-- 模型设置只有一个入口：跳路由页 /settings（弹窗已退役） -->
-      <button class="btn sm" @click="openModelSettings">模型设置</button>
-      <span
-        v-if="!rolesReady"
-        class="faint"
-        style="font-size: var(--fs-xs)"
-        title="后端未返回全部分角色配置，徽标当前显示的是同一份单模型生效值"
-      >配置未齐全</span>
-    </div>
+        <span aria-hidden="true">＋</span> 新建对话
+      </button>
 
-    <p class="asst-intro">
-      想写小说就说一句「我想生成一本小说」，我一步一步问你；
-      不想走引导，也可以直接问正文、语料或图谱上的问题。
-    </p>
-  </header>
-
-  <!-- 工序链：全流程走到哪一步、卡在哪、哪条改动等你批（服务端每次重新评估） -->
-  <WorkflowStrip v-if="!badId" :project-id="projectId" />
-
-  <section class="card assistant">
-    <!-- ==================== 对话流 ==================== -->
-    <div ref="streamEl" class="stream">
-      <div v-if="!hasHistory" class="stream-hint">
-        <p><strong>要写小说？</strong>我一步步问：参考语料、提炼档位、题材、字数、章节。</p>
-        <div class="row tight">
-          <button
-            class="btn primary sm"
-            :disabled="wizardBusy || badId"
-            @click="startWizardFlow('好，我一步一步问你。先定这次要做哪一种作品。')"
-          >
-            {{ wizardBusy ? "准备中…" : "开始创作引导" }}
-          </button>
-          <span class="faint" style="font-size: var(--fs-xs)">
-            或者说一句「我想生成一本小说」
+      <div class="sr-group">本机对话</div>
+      <div class="session-list">
+        <button
+          v-for="s in sortedSessions"
+          :key="s.id"
+          type="button"
+          class="session-item"
+          :class="{ on: s.id === activeSessionId }"
+          :disabled="wizardActive || !!roleMode"
+          @click="switchSession(s.id)"
+        >
+          <span class="session-row">
+            <span class="session-title">{{ s.title }}</span>
+            <span class="session-time">{{ sessionTimeLabel(s) }}</span>
           </span>
+          <span class="session-preview">{{ sessionPreview(s) }}</span>
+        </button>
+      </div>
+
+      <div class="sr-foot">
+        <button class="link-btn" :class="{ on: memoryOpen }" @click="toggleMemory">
+          记忆 <span class="memory-count">{{ memories.length }}</span>
+        </button>
+        <button v-if="chapterRail.length" class="link-btn" @click="railOpen = true">
+          目录 {{ writtenChapterCount }}/{{ chapterRail.length }}
+        </button>
+        <button class="link-btn" @click="openModelSettings">模型</button>
+        <button class="link-btn" @click="router.push(`/projects/${projectId}`)">← 工作台</button>
+        <span v-if="!rolesReady" class="sr-warn" title="后端未返回全部分角色配置">配置未齐全</span>
+      </div>
+    </aside>
+
+    <div class="desk-body">
+      <header class="chat-top">
+        <button
+          class="icon-btn sessions-toggle"
+          type="button"
+          aria-label="打开会话列表"
+          @click="sessionsOpen = true"
+        >☰</button>
+        <div class="chat-top-main">
+          <span class="chat-live" aria-hidden="true" />
+          <span class="chat-book">{{ project?.title || "未命名作品" }}</span>
+          <span class="chat-slash" aria-hidden="true">/</span>
+          <span class="chat-mode">助手</span>
+          <span
+            v-if="activeSession?.title && activeSession.title !== '新对话'"
+            class="chat-session"
+          >{{ activeSession.title }}</span>
         </div>
-        <p class="faint">
-          也可以直接问：<span class="mono">第 3 段和第 1 段的动机是不是重复了？</span>
-        </p>
+        <div class="chat-top-meta">
+          <span class="tag mono">
+            {{ bookSegments ?? "—" }} 段 · {{ bookChars === null ? "—" : bookChars.toLocaleString() }} 字
+          </span>
+          <span class="model-chip" :class="{ fallback: assistantCfg?.is_fallback }">
+            <i aria-hidden="true" />
+            助手 · {{ assistantCfg?.label || "未配置" }}
+          </span>
+          <button class="link-btn" @click="openWritingPanelPlain">写作</button>
+          <button class="link-btn ctx-toggle" @click="ctxOpen = true">上下文</button>
+          <button class="link-btn" @click="toggleMemory">记忆 {{ memories.length }}</button>
+        </div>
+      </header>
+
+      <div v-if="badId" class="notice err">路由缺少有效的项目 id（/projects/:id/assistant）。</div>
+
+  <section class="card assistant chat-card">
+    <!-- ==================== 对话流 ==================== -->
+    <div ref="streamEl" class="stream" @scroll.passive="onStreamScroll">
+      <div v-if="!hasHistory" class="stream-empty">
+        <div class="stream-empty-mark">墨</div>
+        <h2>从哪一段开始？</h2>
+        <p>可以直接聊剧情走向，也可以让我查正文、对设定、给桥段。</p>
+        <div class="stream-prompts">
+          <button
+            v-for="p in QUICK_PROMPTS"
+            :key="p.label"
+            type="button"
+            class="prompt-card"
+            @click="useQuickPrompt(p.text)"
+          >
+            <b>{{ p.label }}</b>
+            <span>{{ p.text }}</span>
+          </button>
+        </div>
+        <button
+          class="btn primary sm"
+          :disabled="wizardBusy || badId"
+          @click="startWizardFlow('好，我一步一步问你。先定这次要做哪一种作品。')"
+        >
+          {{ wizardBusy ? "准备中…" : "开始创作引导" }}
+        </button>
       </div>
 
       <div v-for="turn in turns" :key="turn.key" class="turn" :class="turn.role">
-        <!-- 用户气泡 -->
-        <div v-if="turn.role === 'user'" class="bubble user">
-          <div>{{ turn.text }}</div>
-          <div v-if="turn.attachments?.length" class="file-list sent">
-            <span v-for="file in turn.attachments" :key="file.key" class="file-chip">
-              {{ file.filename }}
-            </span>
+        <!-- 用户消息：紧凑靠右，不用大头像 -->
+        <div v-if="turn.role === 'user'" class="msg-entry user">
+          <div class="msg-meta"><span class="msg-who">你</span></div>
+          <div class="bubble user">
+            <div>{{ turn.text }}</div>
+            <div v-if="turn.attachments?.length" class="file-list sent">
+              <span v-for="file in turn.attachments" :key="file.key" class="file-chip">
+                {{ file.filename }}
+              </span>
+            </div>
           </div>
         </div>
 
@@ -2366,22 +3599,13 @@ onMounted(async () => {
             </div>
           </div>
 
-          <WizardStepCard
-            v-if="turn.wizard"
-            :question="turn.wizard.question"
-            :busy="turn.wizard.busy"
-            :disabled="turn.wizard.disabled"
-            :answered-label="turn.wizard.answeredLabel"
-            @answer="(v, l) => answerStep(turn, v, l)"
-            @skip="skipStep(turn)"
-            @back="backStep(turn)"
-            @goto="(step) => gotoStep(turn, step)"
-          />
-
           <template v-if="turn.wizardResult">
-            <p class="wz-prose">{{ turn.wizardResult.message }}</p>
+            <p v-if="turn.wizardResult.message" class="wz-prose">{{ turn.wizardResult.message }}</p>
 
-            <div v-if="turn.wizardResult.stage === 'outline' && turn.wizardResult.bible" class="blk">
+            <div
+              v-if="(turn.wizardResult.stage === 'outline' || turn.wizardResult.stage === 'cards') && turn.wizardResult.bible"
+              class="blk"
+            >
               <button
                 class="link-btn"
                 @click="toggle(`bible-${turn.key}`)"
@@ -2396,7 +3620,7 @@ onMounted(async () => {
 
             <!-- 以剧情圣经为准渲染：历史会话没有 character_cards 字段，也要能看到卡/角色。 -->
             <div
-              v-if="turn.wizardResult.stage === 'outline' && bibleCharacters(turn.wizardResult).length"
+              v-if="(turn.wizardResult.stage === 'outline' || turn.wizardResult.stage === 'cards') && bibleCharacters(turn.wizardResult).length"
               class="wz-cards"
             >
               <div class="row tight">
@@ -2544,22 +3768,42 @@ onMounted(async () => {
               </button>
             </div>
           </template>
+
+          <WizardStepCard
+            v-if="turn.wizard"
+            :question="turn.wizard.question"
+            :busy="turn.wizard.busy"
+            :disabled="turn.wizard.disabled"
+            :answered-label="turn.wizard.answeredLabel"
+            @answer="(v, l) => answerStep(turn, v, l)"
+            @skip="skipStep(turn)"
+            @back="backStep(turn)"
+            @goto="(step) => gotoStep(turn, step)"
+          />
         </div>
 
-        <!-- 助手气泡：普通问答 -->
-        <div v-else class="bubble assistant">
+        <!-- 助手回答：扁平消息 + Markdown + 本轮读取步骤 -->
+        <div v-else class="bubble assistant flat">
           <div class="msg-head">
-            <span class="msg-avatar">AI</span>
+            <span class="spark-dot" aria-hidden="true"></span>
             <span class="msg-name">助手</span>
             <span v-if="turn.historical" class="tag" title="从本机历史恢复的文本记录">
               历史
             </span>
             <div class="row tight bubble-meta" style="align-items: center">
-              <span v-if="turn.agentRunId" class="tag" :class="confidenceTag(turn.confidence)">
-                {{ confidenceLabel(turn.confidence) }} {{ turn.confidence.toFixed(2) }}
+              <span
+                v-if="turn.agentRunId"
+                class="tag"
+                :class="confidenceTag(turn.confidence)"
+                :title="confidenceLabel(turn.confidence)"
+              >
+                置信度 {{ turn.confidence.toFixed(2) }}
               </span>
-              <span v-if="turn.evidence.length" class="tag mono">
-                证据 {{ turn.evidence.length }} 条
+              <span
+                v-if="turn.evidence.length || turn.liveEvidenceCount"
+                class="tag mono"
+              >
+                证据 {{ turn.evidence.length || turn.liveEvidenceCount }} 条
               </span>
               <span v-if="turn.issues.length" class="tag mono">
                 自查 {{ turn.issues.length }}
@@ -2571,24 +3815,91 @@ onMounted(async () => {
             </div>
           </div>
 
-          <div v-if="turn.loading" class="loading-line">助手正在查证…</div>
+          <!--
+            本轮数据块：只占一行 chip，明细点开小窗口看。
+            资料 / 证据 / 工具调用 / 联网来源不再整块铺在正文下面 —— 长回答
+            会把这些块推到很远，用户得翻很久才能回到输入框。
+          -->
+          <div v-if="turnChips(turn).length" class="turn-chips">
+            <button
+              v-for="chip in turnChips(turn)"
+              :key="chip.kind"
+              type="button"
+              class="data-chip"
+              :class="{ live: chip.live }"
+              @click="openDetail(turn, chip.kind)"
+            >
+              <span v-if="chip.live" class="data-chip-dot" aria-hidden="true" />
+              <span v-else class="data-chip-ico" aria-hidden="true">
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.1"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path d="m5 12 5 5L20 7" />
+                </svg>
+              </span>
+              {{ chip.label }}
+            </button>
+          </div>
+
+          <div
+            v-if="turn.loading && !turn.answer && !displaySteps(turn).length"
+            class="loading-line"
+          >助手正在读资料…</div>
 
           <div v-if="turn.error" class="notice err">{{ turn.error }}</div>
 
-          <template v-if="!turn.loading">
-            <!-- 回答正文 -->
-            <div class="blk">
-              <div
-                class="prose snippet"
-                :class="{ expanded: isOpen(`answer-${turn.key}`) }"
-              >
-                {{ turn.answer || "（助手未返回文字回答，请直接看下方证据）" }}
-              </div>
-              <button class="link-btn" @click="toggle(`answer-${turn.key}`)">
-                {{ isOpen(`answer-${turn.key}`) ? "收起" : "展开全文" }}
-              </button>
-            </div>
+          <!-- Markdown 正文：流式时逐字出现，所以不放在 !loading 分支里 -->
+          <div
+            v-if="turn.answer || !turn.loading"
+            class="md-body"
+            v-html="answerHtml(turn)"
+          ></div>
+          <span v-if="turn.streaming" class="stream-cursor">▍</span>
 
+          <!-- 推理留痕：渠道确实在做推理时如实标出耗时，不再被悄悄吃掉 -->
+          <div
+            v-if="turn.thinking"
+            class="think-line"
+            :title="`推理 ${turn.thinking.chars} 字；内容不展示，仅记录耗时与字数`"
+          >
+            <span class="think-chevron" aria-hidden="true">›</span>
+            <span>思考了 {{ thinkingText(turn.thinking) }}</span>
+            <span class="think-chars">{{ turn.thinking.chars }} 字推理</span>
+          </div>
+
+          <!-- 本次推进计划：服务端评估的工序链，只在最新一条回答下展示 -->
+          <div v-if="showPlanCard(turn)" class="plan-card">
+            <div class="plan-head">
+              <span class="plan-title">本次推进计划</span>
+              <span class="plan-count">{{ planDone }} / {{ planTotal }}</span>
+            </div>
+            <div class="plan-bar">
+              <span :style="{ width: planPct + '%' }" />
+            </div>
+            <ul class="plan-list">
+              <li
+                v-for="step in planSteps"
+                :key="step.id"
+                class="plan-item"
+                :class="`is-${step.state}`"
+              >
+                <span class="plan-mark" aria-hidden="true">
+                  {{ step.state === "done" ? "✓" : step.id === workflow?.current_step ? "●" : "○" }}
+                </span>
+                <span class="plan-name">{{ step.title }}</span>
+                <span class="plan-state">{{ stepStateLabel(step) }}</span>
+              </li>
+            </ul>
+          </div>
+
+          <template v-if="!turn.loading">
             <!-- agent 自主跑出的 issues：复用统一渲染器（文字 + 色标双编码）。
                  不传 answer：上面刚渲染过同一段回答，重复一遍只会让人以为是两件事。 -->
             <AssistantIssueList
@@ -2600,87 +3911,78 @@ onMounted(async () => {
               :agent-run-id="turn.agentRunId"
             />
 
-            <!-- 工具调用轨迹：默认折叠；确定性回落时只给一行说明。
-                 tool_trace 为空且不是回落 → 整块不渲染（旧后端行为一致）。 -->
+            <!-- 确定性回落时留一行说明（工具轨迹明细在小窗口里看） -->
             <div
-              v-if="turn.toolTrace.length || turn.toolMode === 'deterministic'"
-              class="blk"
+              v-if="turn.toolMode === 'deterministic' && !turn.toolTrace.length"
+              class="tool-mode-hint"
             >
-              <div class="blk-head">
-                工具调用{{ turn.toolTrace.length ? `（${turn.toolTrace.length} 次）` : "" }}
-              </div>
-              <div v-if="turn.toolMode === 'deterministic'" class="tool-mode-hint">
-                本次由确定性检索取证（模型未自主调用工具）。
-                <span v-if="turn.toolFallbackReason" class="mono">
-                  原因：{{ turn.toolFallbackReason }}
-                </span>
-              </div>
-              <button
-                v-if="turn.toolTrace.length"
-                class="link-btn"
-                @click="toggle(`tools-${turn.key}`)"
-              >
-                {{ isOpen(`tools-${turn.key}`) ? "收起调用轨迹" : "展开调用轨迹" }}
-              </button>
-              <div
-                v-if="turn.toolTrace.length && isOpen(`tools-${turn.key}`)"
-                class="ev-list"
-              >
-                <div
-                  v-for="t in turn.toolTrace"
-                  :key="`tool-${turn.key}-${t.seq}`"
-                  class="ev"
-                >
-                  <div class="row tight" style="align-items: center">
-                    <span class="tag mono">#{{ t.seq }} · 第 {{ t.step }} 轮</span>
-                    <span class="tag accent mono">{{ t.name }}</span>
-                    <span class="tag" :class="toolStatusMeta(t.status).tag">
-                      {{ toolStatusMeta(t.status).label }}
-                    </span>
-                    <span class="tag mono">{{ t.latency_ms }}ms</span>
-                  </div>
-                  <div class="tool-args mono">参数：{{ t.arguments }}</div>
-                  <div
-                    v-if="t.status === 'ok' && toolResultText(turn, t.name)"
-                    class="prose snippet mono"
-                  >
-                    结果：{{ toolResultText(turn, t.name) }}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- 证据 -->
-            <div v-if="turn.evidence.length" class="blk">
-              <div class="blk-head">证据（{{ turn.evidence.length }} 条）</div>
-              <div class="ev-list">
-                <div v-for="(ev, i) in turn.evidence" :key="`ev-${turn.key}-${i}`" class="ev">
-                  <div class="row tight" style="align-items: center">
-                    <span class="tag accent">{{ sourceLabel(ev.source) }}</span>
-                    <span class="tag mono">source={{ ev.source }}</span>
-                    <span class="tag mono">kind={{ ev.kind }}</span>
-                    <span class="tag mono">score={{ Number(ev.score).toFixed(3) }}</span>
-                    <span class="tag mono">ref={{ ev.ref_id }}</span>
-                  </div>
-                  <div
-                    class="prose snippet"
-                    :class="{ expanded: isOpen(`ev-${turn.key}-${i}`) }"
-                  >
-                    {{ ev.snippet }}
-                  </div>
-                  <button class="link-btn" @click="toggle(`ev-${turn.key}-${i}`)">
-                    {{ isOpen(`ev-${turn.key}-${i}`) ? "收起原文" : "展开原文" }}
-                  </button>
-                </div>
-              </div>
+              本次由确定性检索取证（模型未自主调用工具）。
+              <span v-if="turn.toolFallbackReason" class="mono">
+                原因：{{ turn.toolFallbackReason }}
+              </span>
             </div>
 
             <!-- 待确认卡片：pending_actions 为空时这块整个不渲染 -->
             <div v-if="turn.cards.length" class="cards">
               <div class="cards-hint">
-                助手想动手改东西，需要你点头（不确认就不会发生）：
+                助手的动作卡片；写作卡片点开即可在右侧查看/修改正文（不会直接改库）：
               </div>
-              <div v-for="card in turn.cards" :key="card.key" class="card-pending">
+              <template v-for="card in turn.cards" :key="card.key">
+                <!-- 写作卡片：聊天里只留一张小卡，点开去右侧写作面板看/改正文 -->
+                <div
+                  v-if="isGenerationCard(card)"
+                  class="gen-card"
+                  :class="card.state"
+                  role="button"
+                  tabindex="0"
+                  @click="openCardPanel(card)"
+                  @keydown.enter="openCardPanel(card)"
+                >
+                  <div class="gen-card-head">
+                    <span class="gen-card-kicker">写作卡片</span>
+                    <span class="tag mono">
+                      {{ card.segmentNo ? `第 ${card.segmentNo} 段` : "续写下一段" }}
+                    </span>
+                    <span class="tag" :class="genStateTag(card)">{{ genStateText(card) }}</span>
+                  </div>
+                  <div class="gen-card-title">{{ card.action.title }}</div>
+                  <p class="gen-card-preview">{{ genPreview(card) }}</p>
+                  <div v-if="card.state === 'running'" class="gen-progress">
+                    <div class="gen-progress-head">
+                      <span>
+                        <template v-if="card.progressStage">
+                          作者 Agent · {{ card.progressStage }}
+                          <template v-if="card.progressChars"> · {{ card.progressChars }} 字</template>
+                        </template>
+                        <template v-else-if="card.progressChars">
+                          已生成 {{ card.progressChars }} 字
+                        </template>
+                        <template v-else-if="card.progressReasoning">
+                          模型思考中 · {{ card.progressReasoning }} 字
+                        </template>
+                        <template v-else>等待首字…</template>
+                      </span>
+                      <span>
+                        已等待 {{ card.progressSeconds ?? 0 }} 秒
+                        <template v-if="card.progressTarget">
+                          · 目标约 {{ card.progressTarget }} 字
+                        </template>
+                      </span>
+                    </div>
+                    <div class="gen-progress-track">
+                      <span
+                        class="gen-progress-fill"
+                        :class="{ waiting: !card.progressChars }"
+                        :style="card.progressChars ? { width: genPercent(card) + '%' } : undefined"
+                      />
+                    </div>
+                  </div>
+                  <div class="gen-card-foot">
+                    <span class="faint">{{ genFoot(card) }}</span>
+                    <span class="gen-card-open">打开写作面板 →</span>
+                  </div>
+                </div>
+                <div v-else class="card-pending">
                 <div class="row tight" style="align-items: center">
                   <span class="tag accent">{{ kindLabelOf(card) }}</span>
                   <span class="tag mono">kind={{ card.action.kind }}</span>
@@ -2731,6 +4033,22 @@ onMounted(async () => {
                       {{ isOpen(`rx-${card.key}-${i}`) ? "收起" : "展开完整内容" }}
                     </button>
                   </div>
+
+                  <!--
+                    提案类卡片：确认只创建了待批提案，业务表还没动。
+                    在这里补上「批准 → 写入」，用户不必再跳去项目页找。
+                  -->
+                  <div v-if="proposalIdOf(card) && !card.applied" class="promote-row">
+                    <span class="faint">提案已创建，项目数据还没改。</span>
+                    <button
+                      class="btn primary sm"
+                      :disabled="!!promoteBusy[card.key]"
+                      @click="approveAndApplyCard(card)"
+                    >
+                      {{ promoteBusy[card.key] ? "写入中…" : "批准并写入" }}
+                    </button>
+                  </div>
+                  <div v-else-if="card.applied" class="faint">已写入项目。</div>
                 </div>
 
                 <div v-if="card.state === 'failed'" class="notice err confirm-box">
@@ -2755,15 +4073,7 @@ onMounted(async () => {
                     :disabled="card.state !== 'pending' && card.state !== 'failed'"
                     @click="confirmCard(card)"
                   >
-                    {{
-                      card.state === "running"
-                        ? "执行中…"
-                        : card.state === "confirmed"
-                          ? "已确认"
-                          : card.state === "failed"
-                            ? "重试"
-                            : "确认执行"
-                    }}
+                    {{ primaryLabel(card) }}
                   </button>
                   <button
                     class="btn"
@@ -2773,7 +4083,8 @@ onMounted(async () => {
                     取消
                   </button>
                 </div>
-              </div>
+                </div>
+              </template>
             </div>
           </template>
         </div>
@@ -2805,7 +4116,20 @@ onMounted(async () => {
     </div>
 
     <!-- ==================== 输入 ==================== -->
-    <form class="composer" @submit.prevent="send">
+    <div class="composer-wrap">
+      <div v-if="!wizardActive && !roleMode" class="quick-row">
+        <button
+          v-for="p in QUICK_PROMPTS"
+          :key="p.label"
+          type="button"
+          class="quick-chip"
+          @click="useQuickPrompt(p.text)"
+        >
+          {{ p.label }}
+        </button>
+      </div>
+
+      <form class="composer" @submit.prevent="send">
       <div v-if="wizardActive" class="composer-hint">
         引导进行中：直接打字回答，或问「为什么」我就地解释；缺参数就让我改（如「采样改成 200 章」「跳过风格」），改完可撤销。
         <button type="button" class="link-btn" @click="startWizardFlow('重新开始，先定方向。', true)">
@@ -2900,52 +4224,182 @@ onMounted(async () => {
       <textarea
         ref="queryInput"
         v-model="query"
-        class="input"
-        rows="2"
+        class="composer-input"
+        rows="1"
         :disabled="badId"
         :placeholder="
           roleMode
             ? `对${roleMode.character}说点什么…`
             : wizardActive
               ? '直接回答这一步，或问我「为什么」；也可以让我改：采样改成 200 章 / 跳过风格'
-              : '问助手一个问题，例如：主角第 3 段的动机和第 1 段一致吗？'
+              : '描述你想推进的剧情，或问一个关于正文的问题…'
         "
         @keydown="onKeydown"
       ></textarea>
-      <div class="row tight" style="align-items: center">
-        <input
-          ref="fileInput"
-          type="file"
-          accept=".txt,.md,text/plain,text/markdown"
-          multiple
-          hidden
-          :disabled="badId || sending"
-          @change="onFilesSelected"
-        />
+
+      <input
+        ref="fileInput"
+        type="file"
+        accept=".txt,.md,text/plain,text/markdown"
+        multiple
+        hidden
+        :disabled="badId || sending"
+        @change="onFilesSelected"
+      />
+
+      <div class="composer-bar">
+        <button type="button" class="tool-btn" @click.stop="toggleQuoteMenu('ref')">
+          @ 引用
+        </button>
+        <button type="button" class="tool-btn" @click.stop="toggleQuoteMenu('cmd')">
+          / 指令
+        </button>
         <button
-          class="btn"
           type="button"
+          class="tool-btn"
           title="支持 .txt / .md；点卡片确认后才投放"
           :disabled="badId || sending"
           @click="fileInput?.click()"
         >
           附件
         </button>
-        <button class="btn primary" type="submit" :disabled="!canSend">
-          {{ sending ? "思考中…" : "发送" }}
+        <span class="composer-hint-text">Enter 发送 · Shift+Enter 换行</span>
+        <button class="send-btn" type="submit" :disabled="!canSend" aria-label="发送">
+          {{ sending ? "…" : "↑" }}
         </button>
-        <span
-          class="faint"
-          style="font-size: var(--fs-xs)"
-          title="写操作都会留审计记录，可在提案与版本历史中撤销"
-        >
-          Enter 发送 · Shift+Enter 换行
-        </span>
       </div>
-    </form>
+
+      <div v-if="quoteMenu" class="composer-mask" @click="quoteMenu = ''" />
+      <div v-if="quoteMenu" class="composer-pop" @click.stop>
+        <div class="composer-pop-head">
+          {{ quoteMenu === "ref" ? "引用当前上下文" : "快捷指令" }}
+        </div>
+        <button
+          v-for="item in quoteMenu === 'ref' ? quoteItems : commandItems"
+          :key="item.label"
+          type="button"
+          class="composer-pop-item"
+          @click="insertComposerToken(item.token)"
+        >
+          <span>{{ item.label }}</span>
+          <span class="kind">{{ item.kind }}</span>
+        </button>
+      </div>
+      </form>
+
+      <div class="composer-meta">
+        <span class="ok">● 流式输出已开启</span>
+        <span class="dot">·</span>
+        <span v-if="wizardActive">引导进行中，第一处提到「写小说」也会进入引导</span>
+        <span v-else-if="roleMode">角色对话中，回答不会写入正文</span>
+        <span v-else>不会修改正文，写操作需你确认</span>
+      </div>
+    </div>
   </section>
     </div>
+
+    <!-- 右：本轮上下文（全部来自项目真实数据） -->
+    <aside class="ctx-panel" :class="{ open: ctxOpen }" aria-label="本次上下文">
+      <div class="ctx-title">
+        <span>本次上下文</span>
+        <button class="link-btn ctx-close" @click="ctxOpen = false">关闭</button>
+      </div>
+
+      <!-- 工序链：全流程走到哪一步、卡在哪、哪条改动等你批（服务端每次重新评估） -->
+      <WorkflowStrip v-if="!badId" class="ctx-workflow" :project-id="projectId" />
+
+      <div class="ctx-card">
+        <h3>
+          {{ project ? project.title : "未命名作品" }}
+          <span class="mini">
+            {{ [project?.genre, project?.style].filter(Boolean).join(" · ") || "题材未定" }}
+          </span>
+        </h3>
+        <div class="ctx-row">
+          <span>已写正文</span>
+          <b>{{ bookSegments ?? "—" }} 段 · {{ bookChars === null ? "—" : bookChars.toLocaleString() }} 字</b>
+        </div>
+        <div class="ctx-row">
+          <span>章纲</span><b>{{ chapterRail.length || "—" }} 章</b>
+        </div>
+        <div class="ctx-row">
+          <span>剧情圣经</span>
+          <b>{{ bibleCharacterList.length }} 角色 · {{ bibleRelations.length }} 关系</b>
+        </div>
+        <div class="ctx-chips">
+          <span
+            v-for="chip in contextChips"
+            :key="chip.label"
+            class="chip"
+            :class="{ accent: chip.accent }"
+          >{{ chip.label }}</span>
+        </div>
+      </div>
+
+      <div class="ctx-card">
+        <h3>证据 <span class="mini">{{ latestEvidence.length }}</span></h3>
+        <p v-if="!latestEvidence.length" class="ctx-empty">
+          这一轮还没有检索证据；问正文或设定类问题时会自动读取。
+        </p>
+        <div v-for="(ev, i) in latestEvidence.slice(0, 6)" :key="i" class="ctx-ev">
+          <div class="ctx-ev-head">
+            <span class="src">{{ sourceLabel(ev.source) }}</span>
+            <span>{{ Number(ev.score).toFixed(2) }}</span>
+          </div>
+          <p>{{ ev.snippet }}</p>
+        </div>
+      </div>
+
+      <div class="ctx-card">
+        <h3>长期记忆 <span class="mini">{{ memories.length }}</span></h3>
+        <div v-for="m in memories.slice(0, 4)" :key="m.id" class="ctx-mem">{{ m.text }}</div>
+        <p v-if="!memories.length" class="ctx-empty">
+          聊几句后，助手会自动记住你的写作偏好。
+        </p>
+        <button class="link-btn" @click="toggleMemory">管理记忆</button>
+      </div>
+
+      <div class="ctx-card">
+        <h3>模型</h3>
+        <div class="ctx-row">
+          <span>生成</span><b>{{ writerCfg?.is_fallback ? "本地兜底" : writerCfg?.label || "—" }}</b>
+        </div>
+        <div class="ctx-row">
+          <span>助手</span><b>{{ assistantCfg?.is_fallback ? "本地兜底" : assistantCfg?.label || "—" }}</b>
+        </div>
+        <div class="ctx-row">
+          <span>提炼</span><b>{{ distillerCfg?.is_fallback ? "本地兜底" : distillerCfg?.label || "—" }}</b>
+        </div>
+        <button class="link-btn" @click="openModelSettings">模型设置</button>
+      </div>
+
+      <div class="ctx-card">
+        <h3>章节进度</h3>
+        <div class="ctx-row">
+          <span>已写</span><b>{{ writtenChapterCount }} / {{ chapterRail.length || "—" }}</b>
+        </div>
+        <div v-if="latestWrittenChapter" class="ctx-row">
+          <span>最新</span><b>第 {{ latestWrittenChapter }} 章</b>
+        </div>
+        <button v-if="chapterRail.length" class="link-btn" @click="railOpen = true">打开目录</button>
+      </div>
+    </aside>
   </div>
+
+  <!-- 写作面板：正文生成 / 查看 / 就地修改都在这里，聊天只留一张状态卡。 -->
+  <WritingPanel
+    v-if="!badId"
+    :open="writingOpen"
+    :project-id="projectId"
+    :initial-segment-no="writingSegmentNo"
+    :mode="writingMode"
+    :run-key="writingRunKey"
+    @close="closeWritingPanel"
+    @generated="onWritingGenerated"
+    @failed="onWritingFailed"
+    @progress="onWritingProgress"
+    @updated="onWritingUpdated"
+  />
 
   <!-- 记忆抽屉：内容由助手自动抽取，这里只做「看见 / 删除」。
        抽错了要能删掉，而不是让用户只能忍着。 -->
@@ -3015,6 +4469,109 @@ onMounted(async () => {
       />
     </div>
   </div>
+  <!--
+    本轮数据块的明细小窗口：自带滚动，不占对话流的高度。
+    资料 / 证据 / 工具调用 / 联网来源共用这一个窗口，按 kind 换内容。
+  -->
+  <div v-if="detailView && detailTurn" class="detail-mask" @click.self="closeDetail">
+    <section
+      class="detail-window"
+      role="dialog"
+      aria-modal="true"
+      :aria-label="detailTitle"
+    >
+      <header class="detail-head">
+        <div class="detail-head-main">
+          <div class="detail-kicker">{{ detailSubtitle }}</div>
+          <h3>{{ detailTitle }}</h3>
+        </div>
+        <button class="link-btn" type="button" @click="closeDetail">关闭</button>
+      </header>
+
+      <div class="detail-body">
+        <!-- 读取步骤 -->
+        <template v-if="detailView.kind === 'steps'">
+          <div
+            v-for="(step, si) in detailSteps"
+            :key="`ds-${si}`"
+            class="detail-item"
+          >
+            <div class="detail-item-head">
+              <span class="detail-item-name">{{ step.name }}</span>
+              <span v-if="step.meta" class="detail-item-meta">{{ step.meta }}</span>
+            </div>
+            <pre v-if="step.detail" class="detail-pre">{{ step.detail }}</pre>
+          </div>
+          <p v-if="!detailSteps.length" class="faint">本轮没有读取资料。</p>
+        </template>
+
+        <!-- 证据原文 -->
+        <template v-else-if="detailView.kind === 'evidence'">
+          <div
+            v-for="(ev, i) in detailEvidence"
+            :key="`de-${i}`"
+            class="detail-item"
+          >
+            <div class="detail-item-head">
+              <span class="tag accent">{{ sourceLabel(ev.source) }}</span>
+              <span class="detail-item-meta mono">kind={{ ev.kind }}</span>
+              <span class="detail-item-meta mono">score={{ Number(ev.score).toFixed(3) }}</span>
+              <span class="detail-item-meta mono">ref={{ ev.ref_id }}</span>
+            </div>
+            <pre class="detail-pre">{{ ev.snippet }}</pre>
+          </div>
+          <p v-if="!detailEvidence.length" class="faint">本轮没有证据。</p>
+        </template>
+
+        <!-- 工具调用轨迹 -->
+        <template v-else-if="detailView.kind === 'tools'">
+          <div
+            v-for="t in detailTools"
+            :key="`dt-${t.seq}`"
+            class="detail-item"
+          >
+            <div class="detail-item-head">
+              <span class="tag mono">#{{ t.seq }} · 第 {{ t.step }} 轮</span>
+              <span class="tag accent mono">{{ t.name }}</span>
+              <span class="tag" :class="toolStatusMeta(t.status).tag">
+                {{ toolStatusMeta(t.status).label }}
+              </span>
+              <span class="detail-item-meta mono">{{ t.latency_ms }}ms</span>
+            </div>
+            <div class="detail-line mono">参数：{{ t.arguments }}</div>
+            <div
+              v-if="t.status === 'ok' && detailToolResult(t.name)"
+              class="detail-line mono"
+            >
+              结果：{{ detailToolResult(t.name) }}
+            </div>
+          </div>
+          <p v-if="!detailTools.length" class="faint">本轮没有工具调用。</p>
+        </template>
+
+        <!-- 联网检索来源 -->
+        <template v-else>
+          <a
+            v-for="s in detailWeb"
+            :key="`dw-${s.index}`"
+            class="detail-web"
+            :href="s.url"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <span class="detail-web-index">[{{ s.index }}]</span>
+            <span class="detail-web-main">
+              <span class="detail-web-title">{{ s.title }}</span>
+              <span class="detail-web-url">{{ s.url }}</span>
+              <span class="detail-web-snippet">{{ s.snippet }}</span>
+            </span>
+          </a>
+          <p v-if="!detailWeb.length" class="faint">本轮没有联网来源。</p>
+        </template>
+      </div>
+    </section>
+  </div>
+  </div>
 </template>
 
 <style scoped>
@@ -3036,7 +4593,7 @@ onMounted(async () => {
 .rail-toggle-count {
   color: var(--fg-faint);
   font-family: var(--mono, monospace);
-  font-size: 10px;
+  font-size: var(--fs-3xs);
   font-variant-numeric: tabular-nums;
 }
 .rail-backdrop {
@@ -3109,7 +4666,7 @@ onMounted(async () => {
   border: 0;
   background: none;
   color: var(--fg-muted);
-  font-size: 18px;
+  font-size: var(--fs-xl);
   line-height: 1;
   cursor: pointer;
 }
@@ -3228,7 +4785,9 @@ onMounted(async () => {
   font-variant-numeric: tabular-nums;
 }
 
-.assistant {
+/* 只作用于对话区外层卡片；此前写成 .assistant，连带 .turn.assistant 和
+   .bubble.assistant 也吃到了 24px 大阴影，整段对话看起来像一个浮起来的框。 */
+.card.assistant {
   margin-top: 4px;
   padding: 24px;
   border-color: var(--border);
@@ -3269,7 +4828,7 @@ onMounted(async () => {
 }
 .asst-head h1 {
   font-family: var(--font-display);
-  font-size: 30px;
+  font-size: var(--fs-5xl);
   font-weight: 700;
   letter-spacing: 0.01em;
   margin-top: 6px;
@@ -3297,7 +4856,7 @@ onMounted(async () => {
   border-radius: var(--radius-full);
   background: var(--bg-sunken);
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-variant-numeric: tabular-nums;
 }
 .memory-toggle.on .memory-count {
@@ -3389,13 +4948,13 @@ onMounted(async () => {
 }
 .meta-detail summary {
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   cursor: pointer;
 }
 .meta-detail span {
   margin-left: 6px;
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 
 /* 对话流：像常规 agent 会话一样——中间一列、消息间留白、滚到底。 */
@@ -3433,6 +4992,10 @@ onMounted(async () => {
   gap: 10px;
   padding: 0;
   border-radius: 0;
+  /* 消息本身永远不带外框和阴影 */
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 /* 用户靠右 + 主色气泡；助手靠左 + 无边框正文。 */
 .bubble.user {
@@ -3466,7 +5029,7 @@ onMounted(async () => {
   border-radius: 50%;
   background: var(--accent);
   color: var(--accent-fg);
-  font-size: 10px;
+  font-size: var(--fs-3xs);
   font-weight: 700;
 }
 .msg-name {
@@ -3478,6 +5041,18 @@ onMounted(async () => {
 .loading-line {
   color: var(--fg-faint);
   font-size: var(--fs-sm);
+}
+/* 流式回答的尾部光标：告诉用户「还在写」，不是卡住了。 */
+.stream-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--accent-ink);
+  animation: stream-blink 1s steps(2, start) infinite;
+}
+@keyframes stream-blink {
+  to {
+    opacity: 0.15;
+  }
 }
 .blk {
   display: flex;
@@ -3561,6 +5136,100 @@ onMounted(async () => {
   font-size: var(--fs-md);
   line-height: 1.6;
 }
+
+/* 写作卡片：聊天里只占一小块，完整正文在右侧写作面板 */
+.gen-card {
+  width: 100%;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: var(--border-w) solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+.gen-card:hover { border-color: var(--accent-line); }
+.gen-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.gen-card.running { border-left-color: var(--info); }
+.gen-card.failed { border-left-color: var(--err, #c0392b); }
+.gen-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.gen-card-kicker {
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.gen-card-title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  line-height: 1.5;
+}
+.gen-card-preview {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.gen-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.gen-progress-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--fg-faint);
+  font-size: var(--fs-2xs);
+}
+.gen-progress-track {
+  position: relative;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--bg-sunken);
+  overflow: hidden;
+}
+.gen-progress-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+.gen-progress-fill.waiting {
+  width: 35%;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: gen-wait 1.2s linear infinite;
+}
+@keyframes gen-wait {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(300%); }
+}
+.gen-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--fs-2xs);
+}
+.gen-card-open {
+  color: var(--accent-ink);
+  font-weight: 600;
+}
 .card-hint {
   color: var(--fg-muted);
   font-size: var(--fs-sm);
@@ -3582,6 +5251,17 @@ onMounted(async () => {
   gap: var(--gap-md);
   line-height: 1.7;
 }
+
+/* 提案确认后的「批准并写入」行：与上面的回执分开，动作更醒目 */
+.promote-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: var(--gap-md);
+  border-top: 1px dashed var(--border);
+}
+.promote-row .btn { flex: none; }
 
 /* ---- 执行轨迹（确认 → 请求发出 → 落库 → 完成） ---- */
 .trace {
@@ -3999,7 +5679,7 @@ onMounted(async () => {
   }
   /* 抬头收紧一档：省下的高度全给对话流 */
   .asst-head h1 {
-    font-size: 26px;
+    font-size: var(--fs-3xl);
     margin-top: 2px;
   }
   .book-stats {
@@ -4057,14 +5737,14 @@ onMounted(async () => {
 .card-edit-kicker {
   color: var(--fg-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 .card-edit-head h3 {
   margin-top: 4px;
   font-family: var(--font-display);
-  font-size: 22px;
+  font-size: var(--fs-2xl);
   font-weight: 600;
 }
 .card-edit-grid {
@@ -4081,6 +5761,1157 @@ onMounted(async () => {
 @media (max-width: 680px) {
   .card-edit-grid {
     grid-template-columns: 1fr;
+  }
+}
+/* ================================================================
+   Qoder 风格对话页（2026-11-20）
+   三栏：会话 / 对话 / 上下文；消息扁平化 + Markdown + 读取步骤。
+   下面这组规则放在样式表末尾，覆盖上面旧的居中气泡布局。
+   ================================================================ */
+.desk {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr) 292px;
+  height: calc(100dvh - 146px);
+  min-height: 420px;
+  /* 无框：整个对话工作面直接铺在页面上，不画外框、不铺底色 */
+  overflow: hidden;
+}
+.desk-body {
+  width: auto;
+  max-width: none;
+  margin: 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+}
+
+/* ---------- 左：会话 ---------- */
+.sessions-rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* 无框：会话列表只靠留白与选中态区分，不铺底、不画分隔线 */
+}
+.sr-head { padding: 15px 13px 8px; }
+.sr-kicker {
+  font-size: var(--fs-3xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+.sr-title {
+  margin: 5px 0 8px;
+  font-family: var(--font-display);
+  font-size: var(--fs-xl);
+  line-height: 1.3;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sr-head .book-switcher { width: 100%; }
+.new-chat {
+  margin: 0 12px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.14s ease;
+}
+.new-chat:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-soft) 60%, var(--accent) 10%);
+}
+.new-chat:disabled { opacity: 0.45; cursor: not-allowed; }
+.sr-group {
+  padding: 9px 15px 4px;
+  font-size: var(--fs-3xs);
+  letter-spacing: 0.12em;
+  color: var(--fg-faint);
+}
+.session-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 8px 10px;
+}
+.session-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 8px 9px 9px 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.session-item:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--bg-elev) 55%, transparent);
+}
+.session-item.on {
+  background: var(--accent-soft);
+  border-color: transparent;
+  box-shadow: none;
+}
+.session-item.on::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.session-item:disabled { cursor: not-allowed; opacity: 0.6; }
+.session-row { display: flex; align-items: center; gap: 6px; }
+.session-title {
+  font-family: var(--font-display);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-time {
+  margin-left: auto;
+  font-size: var(--fs-3xs);
+  color: var(--fg-faint);
+  white-space: nowrap;
+}
+.session-preview {
+  font-size: var(--fs-3xs);
+  color: var(--fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sr-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 9px 14px 12px;
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-2xs);
+}
+.sr-foot .link-btn { font-size: var(--fs-2xs); }
+.sr-foot .link-btn.on { color: var(--accent-ink); }
+.sr-warn { flex-basis: 100%; font-size: var(--fs-3xs); color: var(--warn); }
+
+/* ---------- 中：顶部条 / 对话 / 输入 ---------- */
+.chat-top {
+  flex: none;
+  height: 46px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 16px;
+  /* 无框：抬头只是页面上的一行信息，不再做成带底色的条 */
+  background: transparent;
+}
+.chat-top-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.chat-live {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 16%, transparent);
+}
+.chat-book {
+  font-family: var(--font-display);
+  font-size: var(--fs-sm);
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-slash { color: var(--fg-faint); }
+.chat-mode {
+  flex: none;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--fs-3xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.chat-session {
+  max-width: 240px;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  font-size: var(--fs-3xs);
+  white-space: nowrap;
+}
+.model-chip i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.model-chip.fallback i { background: var(--warn); }
+.chat-top-meta {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 7px;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+}
+.chat-top-meta > * { flex: none; }
+.chat-top-meta .link-btn { white-space: nowrap; }
+/* 窄屏优先保住抬头主信息：会话标题与字数标签让位，避免「上下文」被挤成两行 */
+@media (max-width: 1200px) {
+  .chat-top .chat-session { display: none; }
+  .chat-top-meta > .tag.mono { display: none; }
+}
+.sessions-toggle { display: none; }
+
+.chat-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+/* 旧布局给 .card.assistant 限了 860px；对话页要占满中栏，消息本身再用 1000px 居中。 */
+.card.assistant.chat-card {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+.chat-card .stream {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  display: block;
+  overflow-y: auto;
+  padding: 18px 16px 14px;
+  gap: 0;
+}
+.chat-card .stream > .turn,
+.stream-empty {
+  width: 100%;
+  max-width: 1000px;
+  margin-left: auto;
+  margin-right: auto;
+}
+.chat-card .stream > .turn + .turn { margin-top: 26px; }
+
+.stream-empty {
+  margin-top: 7vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+  text-align: center;
+}
+.stream-empty-mark {
+  width: 46px;
+  height: 46px;
+  border-radius: 13px;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-display);
+  font-size: var(--fs-2xl);
+  color: var(--accent-fg);
+  background: linear-gradient(145deg, var(--accent), var(--accent-hover));
+  box-shadow: var(--shadow-sm);
+}
+.stream-empty h2 {
+  margin: 4px 0 0;
+  font-family: var(--font-display);
+  font-size: var(--fs-2xl);
+  font-weight: 600;
+}
+.stream-empty p { margin: 0 0 8px; color: var(--fg-faint); font-size: var(--fs-xs); }
+.stream-prompts {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 4px;
+  text-align: left;
+}
+.prompt-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+.prompt-card:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.prompt-card b { font-size: var(--fs-xs); color: var(--fg); }
+.prompt-card span { font-size: var(--fs-3xs); line-height: 1.55; color: var(--fg-faint); }
+
+/* 消息：用户靠右、助手平铺；没有气泡、边框和底色 */
+.msg-entry.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+.msg-meta { display: flex; align-items: center; gap: 6px; color: var(--fg-faint); font-size: var(--fs-3xs); }
+.msg-who { font-weight: 600; color: var(--fg-muted); }
+.msg-entry.user .msg-who { color: var(--accent-ink); }
+.bubble.user {
+  max-width: min(620px, 86%);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--fs-sm);
+  line-height: 1.75;
+  white-space: pre-wrap;
+  box-shadow: none;
+}
+.bubble.assistant.flat {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  gap: 6px;
+}
+.msg-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 4px;
+}
+.spark-dot {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  background: linear-gradient(145deg, var(--accent), var(--accent-hover));
+  box-shadow: 0 0 10px var(--accent-soft);
+}
+.msg-name { font-size: var(--fs-2xs); letter-spacing: 0.04em; color: var(--fg-muted); }
+.bubble-meta { margin-left: auto; gap: 6px; margin-bottom: 0; }
+.bubble .msg-avatar { width: 18px; height: 18px; font-size: var(--fs-3xs); }
+
+@keyframes tracePulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.12); }
+}
+
+/* ---------- 本轮数据 chip：一行收纳，明细进小窗口 ---------- */
+.turn-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 10px;
+}
+.data-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  font-size: var(--fs-3xs);
+  line-height: 1.6;
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease;
+}
+.data-chip:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.data-chip-ico {
+  display: inline-grid;
+  place-items: center;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.data-chip.live {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.data-chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: tracePulse 1.15s ease-in-out infinite;
+}
+
+/* ---------- 推理留痕：如实标出「思考了 N 秒」 ---------- */
+.think-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 2px;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+}
+.think-chevron { font-size: var(--fs-sm); line-height: 1; opacity: 0.7; }
+.think-chars { opacity: 0.65; }
+
+/* ---------- 本次推进计划（工序链只读卡） ---------- */
+.plan-card {
+  margin: 6px 0 8px;
+  padding: 10px 12px 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elev);
+}
+.plan-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.plan-title {
+  color: var(--fg);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.plan-count {
+  color: var(--fg-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-3xs);
+}
+.plan-bar {
+  height: 3px;
+  margin: 7px 0 6px;
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  overflow: hidden;
+}
+.plan-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.3s var(--ease-out-quart, ease);
+}
+.plan-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.plan-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--fg-muted);
+  font-size: var(--fs-3xs);
+}
+.plan-mark { width: 12px; text-align: center; color: var(--fg-faint); }
+.plan-item.is-done .plan-mark,
+.plan-item.is-done .plan-state { color: var(--ok); }
+.plan-item.is-blocked .plan-mark,
+.plan-item.is-blocked .plan-state { color: var(--warn); }
+.plan-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plan-state { white-space: nowrap; }
+
+/* ---------- 明细小窗口 ---------- */
+.detail-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  backdrop-filter: blur(3px);
+  animation: detailMaskIn 0.14s ease both;
+}
+.detail-window {
+  width: min(680px, 100%);
+  max-height: min(72vh, 640px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  animation: detailWindowIn 0.18s ease both;
+}
+.detail-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.detail-head-main { min-width: 0; flex: 1; }
+.detail-kicker {
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+  letter-spacing: 0.06em;
+}
+.detail-head h3 {
+  margin: 2px 0 0;
+  font-family: var(--font-display);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+.detail-body {
+  padding: 12px 16px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.detail-item {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-sunken);
+}
+.detail-item-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.detail-item-name { font-size: var(--fs-xs); font-weight: 600; color: var(--fg); }
+.detail-item-meta { color: var(--fg-faint); font-size: var(--fs-3xs); }
+.detail-pre {
+  margin: 6px 0 0;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-3xs);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.detail-line {
+  margin-top: 6px;
+  color: var(--fg-muted);
+  font-size: var(--fs-3xs);
+  word-break: break-word;
+}
+.detail-web {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-sunken);
+  text-decoration: none;
+}
+.detail-web:hover { border-color: var(--accent-line); }
+.detail-web-index {
+  color: var(--accent-ink);
+  font-family: var(--font-mono);
+  font-size: var(--fs-3xs);
+}
+.detail-web-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.detail-web-title { color: var(--fg); font-size: var(--fs-xs); }
+.detail-web-url {
+  color: var(--fg-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-3xs);
+  word-break: break-all;
+}
+.detail-web-snippet { color: var(--fg-muted); font-size: var(--fs-3xs); line-height: 1.6; }
+@keyframes detailMaskIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes detailWindowIn {
+  from { opacity: 0; transform: translateY(6px) scale(0.99); }
+  to { opacity: 1; transform: none; }
+}
+/* Markdown 正文 */
+.md-body {
+  margin: 2px 0 4px;
+  font-family: var(--font-serif);
+  font-size: var(--fs-lg);
+  line-height: 1.9;
+  letter-spacing: 0.01em;
+  color: var(--fg);
+}
+.md-body > :first-child { margin-top: 0; }
+.md-body > :last-child { margin-bottom: 0; }
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  margin: 16px 0 7px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.45;
+  letter-spacing: 0.02em;
+}
+.md-body h1 { font-size: var(--fs-2xl); }
+.md-body h2 { font-size: var(--fs-xl); }
+.md-body h3 { font-size: var(--fs-lg); }
+.md-body h4 { font-size: var(--fs-md); color: var(--fg-muted); }
+.md-body p { margin: 8px 0; }
+.md-body strong { font-weight: 700; color: var(--fg); }
+.md-body em { color: var(--fg-muted); }
+.md-body ul,
+.md-body ol { margin: 7px 0; padding-left: 22px; }
+.md-body li { margin: 4px 0; }
+.md-body li::marker { color: var(--accent); font-family: var(--font-mono); font-size: var(--fs-xs); }
+.md-body blockquote {
+  margin: 11px 0;
+  padding: 8px 13px;
+  border-left: 2px solid var(--accent-line);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--accent-soft);
+  color: var(--fg-muted);
+  font-size: var(--fs-sm);
+}
+.md-body blockquote p { margin: 3px 0; }
+.md-body code {
+  padding: 1.5px 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  color: var(--accent-ink);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+}
+.md-body pre {
+  margin: 11px 0;
+  padding: 11px 13px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+}
+.md-body pre code {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--fg-muted);
+  font-size: var(--fs-2xs);
+  line-height: 1.7;
+}
+.md-body table {
+  width: 100%;
+  margin: 11px 0;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+.md-body th,
+.md-body td {
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+.md-body th {
+  background: var(--bg-sunken);
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+.md-body hr { margin: 16px 0; border: 0; border-top: 1px dashed var(--border); }
+
+/* 输入区：一条细分隔线 + 平铺输入，不做成独立聊天框 */
+.composer-wrap {
+  flex: none;
+  padding: 10px 16px 12px;
+  border-top: 1px solid var(--border);
+  background: transparent;
+}
+.quick-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 1000px;
+  margin: 0 auto 7px;
+}
+.quick-chip {
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+  cursor: pointer;
+  transition: 0.14s;
+}
+.quick-chip:hover {
+  color: var(--fg-muted);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.composer {
+  position: relative;
+  display: block;
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.composer:focus-within {
+  box-shadow: none;
+}
+.composer .file-list { padding: 0 0 8px; }
+.composer .composer-input {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  max-height: 180px;
+  padding: 9px 0 2px;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  resize: none;
+}
+.composer-input::placeholder { color: var(--fg-faint); }
+.composer-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0 8px;
+}
+.tool-btn {
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+  cursor: pointer;
+}
+.tool-btn:hover:not(:disabled) { background: var(--bg-sunken); color: var(--fg-muted); }
+.tool-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.composer-hint-text { margin-left: 2px; color: var(--fg-faint); font-size: var(--fs-3xs); }
+.send-btn {
+  margin-left: auto;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+}
+.send-btn:hover:not(:disabled) { background: var(--accent-hover); }
+.send-btn:disabled { opacity: 0.4; cursor: default; }
+.composer-meta {
+  max-width: 1000px;
+  margin: 5px auto 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+}
+.composer-meta .ok { color: var(--ok); }
+.composer-meta .dot { opacity: 0.6; }
+.composer-mask { position: fixed; inset: 0; z-index: 30; }
+.composer-pop {
+  position: absolute;
+  left: 10px;
+  bottom: 54px;
+  z-index: 31;
+  width: 280px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-md);
+}
+.composer-pop-head {
+  padding: 5px 7px;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+  letter-spacing: 0.1em;
+}
+.composer-pop-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 7px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--fs-2xs);
+  text-align: left;
+  cursor: pointer;
+}
+.composer-pop-item:hover { background: var(--bg-sunken); color: var(--fg); }
+.composer-pop-item .kind {
+  margin-left: auto;
+  color: var(--fg-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-3xs);
+}
+
+/* ---------- 右：上下文 ---------- */
+.ctx-panel {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 13px 20px;
+  /* 无框：上下文是一列信息，不是一张侧边卡片 */
+  background: transparent;
+}
+.ctx-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 9px;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.ctx-toggle,
+.ctx-close { display: none; }
+.ctx-card {
+  margin-bottom: 0;
+  padding: 12px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.ctx-card + .ctx-card {
+  border-top: 1px solid var(--border);
+}
+.ctx-card h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+  font-family: var(--font-display);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+.ctx-card h3 .mini {
+  margin-left: auto;
+  color: var(--fg-faint);
+  font-family: var(--font-sans);
+  font-size: var(--fs-3xs);
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+.ctx-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 0;
+  color: var(--fg-faint);
+  font-size: var(--fs-3xs);
+}
+.ctx-row b { color: var(--fg-muted); font-weight: 500; text-align: right; }
+.ctx-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.chip {
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  font-size: var(--fs-3xs);
+}
+.chip.accent {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.ctx-empty { margin: 0 0 6px; color: var(--fg-faint); font-size: var(--fs-3xs); line-height: 1.6; }
+.ctx-ev { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border); }
+.ctx-ev:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.ctx-ev-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--fg-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-3xs);
+}
+.ctx-ev p {
+  margin: 3px 0 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--fg-muted);
+  font-size: var(--fs-3xs);
+  line-height: 1.6;
+}
+.ctx-mem {
+  position: relative;
+  padding: 3px 0 3px 10px;
+  color: var(--fg-muted);
+  font-size: var(--fs-3xs);
+  line-height: 1.6;
+}
+.ctx-mem::before {
+  content: "·";
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+}
+
+/* ---------- 响应式 ---------- */
+@media (max-width: 1360px) {
+  .desk { grid-template-columns: 220px minmax(0, 1fr); }
+  .ctx-toggle { display: inline-flex; }
+  .ctx-close { display: inline-flex; }
+  .ctx-panel {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    z-index: 60;
+    width: 300px;
+    transform: translateX(100%);
+    transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: var(--shadow-md);
+  }
+  .ctx-panel.open { transform: none; }
+  .ctx-backdrop { z-index: 55; }
+}
+/* 超宽屏：会话栏与上下文栏一起加宽，避免中间正文被拉成长条、两侧挤成细缝 */
+@media (min-width: 1800px) {
+  .desk { grid-template-columns: 264px minmax(0, 1fr) 360px; }
+  .chat-card .stream > .turn,
+  .stream-empty { max-width: 1200px; }
+}
+@media (min-width: 2400px) {
+  .desk { grid-template-columns: 300px minmax(0, 1fr) 420px; }
+}
+@media (min-width: 1361px) {
+  .ctx-backdrop { display: none; }
+}
+@media (max-width: 900px) {
+  .desk { grid-template-columns: minmax(0, 1fr); }
+  .sessions-rail {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 60;
+    width: 280px;
+    transform: translateX(-100%);
+    transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: var(--shadow-md);
+  }
+  .sessions-rail.open { transform: none; }
+  .sessions-toggle { display: grid; }
+  .sessions-backdrop { z-index: 55; }
+}
+@media (min-width: 901px) {
+  .sessions-backdrop { display: none; }
+}
+@media (max-width: 880px) {
+  .desk { height: calc(100dvh - 170px); min-height: 380px; border-radius: 0; }
+  .chat-card .stream { padding: 18px 14px; }
+  .composer-wrap { padding: 6px 12px 10px; }
+  .chat-top-meta .tag { display: none; }
+  .stream-prompts { grid-template-columns: 1fr; }
+}
+
+/* ================================================================
+   质感层：对话页专属的「暗色工作台」与细节打磨
+   ----------------------------------------------------------------
+   不覆盖 token，也不自建明暗状态；只在全局 [data-theme="ink"]
+   生效时叠加氛围背景。明暗完全由 tokens.css 决定，组件零改动。
+   ================================================================ */
+/* 暗色氛围只在**全局 token 真正是 ink** 时叠加。
+   页面不再自建 surface 状态：那种写法一旦和 <html data-theme> 不同步，
+   就会出现「浅色 token + 深色桌面 + 暗字」的不可读混搭。 */
+:global(html[data-theme="ink"]) .asst-root .desk {
+  background:
+    radial-gradient(1000px 460px at 18% -10%, rgba(224, 101, 74, 0.16), transparent 62%),
+    radial-gradient(820px 420px at 108% 4%, rgba(120, 145, 170, 0.10), transparent 58%),
+    #101013;
+}
+:global(html[data-theme="ink"]) .asst-root .sessions-rail {
+  background: transparent;
+}
+:global(html[data-theme="ink"]) .asst-root .ctx-panel {
+  background: transparent;
+}
+:global(html[data-theme="ink"]) .asst-root .chat-top {
+  background: transparent;
+}
+:global(html[data-theme="ink"]) .asst-root .rail-backdrop {
+  background: rgba(0, 0, 0, 0.55);
+}
+:global(html[data-theme="ink"]) .asst-root .send-btn {
+  box-shadow: 0 6px 18px rgba(224, 101, 74, 0.3);
+}
+
+/* 无论明暗都生效的细节：去掉外层大卡片，让对话更像一块完整工作面 */
+.asst-root .desk {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+}
+.asst-root .sessions-rail {
+  background: transparent;
+}
+.asst-root .sr-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.asst-root .sr-kicker {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.asst-root .sr-mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-display);
+  font-size: var(--fs-2xs);
+  color: var(--accent-fg);
+  background: linear-gradient(145deg, var(--accent), var(--accent-hover));
+  box-shadow: 0 4px 12px rgba(224, 101, 74, 0.28);
+}
+.asst-root .ctx-panel .ctx-workflow {
+  margin: 0 0 4px;
+  padding: 2px 0 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.asst-root .ctx-panel .ctx-workflow :deep(.card-title) {
+  margin-bottom: 5px;
+  font-size: var(--fs-2xs);
+}
+.asst-root .ctx-panel .ctx-workflow :deep(.wf-progress-note) {
+  margin-top: 5px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--fs-3xs);
+  line-height: 1.5;
+}
+.asst-root .ctx-panel .ctx-workflow :deep(.wf-progress-bar) { height: 3px; }
+.asst-root .surface-toggle { opacity: 0.7; }
+.asst-root .surface-toggle:hover { opacity: 1; }
+.asst-root .chat-top { height: 50px; }
+.asst-root .md-body { font-size: var(--fs-lg); line-height: 1.92; }
+.asst-root .md-body p { margin: 9px 0; }
+.asst-root .ctx-card {
+  background: transparent;
+  box-shadow: none;
+}
+.asst-root .stream-empty-mark {
+  box-shadow: 0 10px 30px rgba(224, 101, 74, 0.26);
+}
+.asst-root .composer {
+  border-radius: 0;
+  box-shadow: none;
+}
+.asst-root .chat-card .stream::-webkit-scrollbar,
+.asst-root .session-list::-webkit-scrollbar,
+.asst-root .ctx-panel::-webkit-scrollbar {
+  width: 9px;
+}
+.asst-root .chat-card .stream::-webkit-scrollbar-thumb,
+.asst-root .session-list::-webkit-scrollbar-thumb,
+.asst-root .ctx-panel::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 9px;
+  background: var(--border-strong);
+  background-clip: content-box;
+}
+.asst-root .chat-card .stream::-webkit-scrollbar-thumb:hover,
+.asst-root .session-list::-webkit-scrollbar-thumb:hover,
+.asst-root .ctx-panel::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-faint);
+  background-clip: content-box;
+}
+
+/* 桌面端侧栏透明；一旦变成抽屉，必须有实底，否则会透出背后的对话。 */
+@media (max-width: 900px) {
+  .asst-root .desk .sessions-rail {
+    background: var(--bg-elev);
+  }
+}
+@media (max-width: 1360px) {
+  .asst-root .desk .ctx-panel {
+    background: var(--bg-elev);
   }
 }
 </style>

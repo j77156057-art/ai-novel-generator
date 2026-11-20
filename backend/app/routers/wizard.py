@@ -85,17 +85,18 @@ def _style_sample(db: Session, novel_ids: list[int] | None, per: int = 4) -> str
 
 
 def _has_real_llm() -> bool:
-    if settings.llm_provider == "openrouter" and settings.openrouter_api_key:
-        return True
-    if settings.llm_provider == "dashscope" and settings.dashscope_api_key:
-        return True
-    if settings.llm_provider == "zhipu" and settings.zhipu_api_key:
-        return True
-    if settings.llm_provider == "siliconflow" and settings.siliconflow_api_key:
-        return True
-    if settings.llm_provider == "minimax" and settings.minimax_api_key:
-        return True
-    return False
+    """当前配置能否真正调用模型。
+
+    判据必须与 `get_llm_provider()` 一致：历史版本只认 openrouter / dashscope /
+    zhipu / siliconflow / minimax 五个渠道，于是把 command-code 等新渠道一律
+    当成「没有模型」——剧情圣经静默降级成本地模板（角色变成「主角/关键配角」）。
+    """
+    try:
+        from app.llm.provider import LocalFallbackLLMProvider, get_llm_provider
+
+        return not isinstance(get_llm_provider(), LocalFallbackLLMProvider)
+    except Exception:  # noqa: BLE001 —— 配不起来就按离线处理，不抛栈
+        return False
 
 
 def _strip_json_block(text: str) -> str:

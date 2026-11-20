@@ -341,14 +341,23 @@ class LLMProvider:
             "…" if len(text) > _FALLBACK_SUMMARY_CHARS else ""
         )
 
+    def stream_chat_events(self, system: str, user: str, constraints: dict | None = None,
+                           stop_sequences: list[str] | None = None):
+        """流式续写的事件流：`("content", 文本)` / `("reasoning", 推理增量)`。
+
+        子类（OpenAI 兼容层）实现真实流式；基类退化为一次性 `chat`。
+        调用方需要「看到模型在想什么」时用本方法；只要正文时用 `stream_chat`。
+        """
+        yield ("content", self.chat(system, user, constraints=constraints))
+
     def stream_chat(self, system: str, user: str, constraints: dict | None = None,
                      stop_sequences: list[str] | None = None):
-        """流式续写：默认实现把整段一次性 yield（非流式 provider 也兼容 SSE）。
-
-        逐 delta 产出的子类（OpenAI 兼容）应重写此方法，降低长文首字延迟。
-        stop_sequences：与 chat 同款，per-request 透传（不依赖单例 setter）。
-        """
-        yield self.chat(system, user, constraints=constraints)
+        """只要正文的兼容入口（过滤掉 reasoning 事件）。"""
+        for kind, text in self.stream_chat_events(
+            system, user, constraints=constraints, stop_sequences=stop_sequences
+        ):
+            if kind == "content":
+                yield text
 
     def variant(self, *, thinking_off: bool = False, max_tokens: int | None = None):
         """返回一个「关思考 / 换输出预算」的变体 provider。
@@ -450,6 +459,11 @@ class OpenAICompatibleChatProvider(LLMProvider):
     #: `invalid params, model[MiniMax-Text-01] does not support max tokens > 40000`，
     #: 重写轮因此被静默吞掉（正文与首轮逐字节相同）。
     _MODEL_MAX_TOKENS: dict[str, int] = {}
+
+    #: 全书摘要这类「一次性长输出」在该渠道可用的输出上限（token）。
+    #: None = 未声明（摘要按估算预算请求，撞上限再重试）。
+    #: 声明后摘要会**首次就按上限收敛条目数**，避免白跑一轮再降质重抽。
+    digest_output_tokens: int | None = None
 
     def _effective_max_tokens(self, model: str) -> int | None:
         """本次请求对**该模型**实际下发的 max_tokens（受 `_MODEL_MAX_TOKENS` 裁剪）。"""
@@ -950,14 +964,13 @@ class OpenAICompatibleChatProvider(LLMProvider):
             kwargs["budget_seconds"] = budget_seconds
         return self._complete(messages, **kwargs)
 
-    def stream_chat(self, system: str, user: str, constraints: dict | None = None,
-                    stop_sequences: list[str] | None = None):
-        """流式续写：stream=True 逐 delta 产出，长文首字即显、不干等。
+    def stream_chat_events(self, system: str, user: str, constraints: dict | None = None,
+                           stop_sequences: list[str] | None = None):
+        """流式续写：stream=True 逐 delta 产出 `(kind, text)`。
 
-        stop_sequences：v2.6 —— 本次调用独立的 stop token 列表（同 chat）。
-        429/403（限流/无权限）自动换模型链上的下一个免费模型重试；
-        重试仅在「尚未产出任何内容」时生效——一旦开始吐字，半途失败直接抛错
-        （由 SSE 处理层转成 error 事件），避免把已产出正文与重试用正文拼接污染。
+        kind="content"：正文增量；kind="reasoning"：模型思考增量（只用于展示
+        「模型还在想」，绝不拼进正文）。首字前先到的 reasoning 会让长文生成
+        看起来「一直没动静」，这里把它们暴露给 SSE 层。
         """
         payload_base = {
             "messages": [
@@ -1028,10 +1041,21 @@ class OpenAICompatibleChatProvider(LLMProvider):
                                 obj = json.loads(data)
                             except Exception:  # noqa: BLE001 - 跳过不完整/心跳帧
                                 continue
-                            choice0 = obj.get("choices", [{}])[0]
+                            # 有些 OpenAI 兼容网关（Command Code 实测）会在正文之后
+                            # 再发一帧 `{"choices": [], "usage": {...}}`：只带用量、
+                            # 不带增量。旧写法直接取 [0] 会 IndexError，把已经在
+                            # 流式输出的正文判成失败。空 choices 按「无增量」跳过。
+                            choices = obj.get("choices")
+                            choice0 = (
+                                choices[0]
+                                if isinstance(choices, list) and choices
+                                else {}
+                            )
                             if obj.get("usage"):
                                 self._note_usage(obj["usage"])
                                 usage_note = dict(self.last_usage or {})
+                            if not isinstance(choice0, dict):
+                                continue
                             if choice0.get("finish_reason"):
                                 finish_reason = choice0["finish_reason"]
                             delta = choice0.get("delta") or {}
@@ -1050,6 +1074,8 @@ class OpenAICompatibleChatProvider(LLMProvider):
                                 reasoning_chars += len(reasoning_piece)
                                 if first_reasoning_ms is None:
                                     first_reasoning_ms = _stream_ms(started)
+                                # 只上报「还在思考」，不把思维链文本交给前端落库/展示。
+                                yield ("reasoning", reasoning_piece)
                             if piece:
                                 safe = rfilter.feed(piece)
                                 if safe:
@@ -1064,12 +1090,12 @@ class OpenAICompatibleChatProvider(LLMProvider):
                                         )
                                     content_chars += len(safe)
                                     yielded = True
-                                    yield safe
+                                    yield ("content", safe)
                         tail = rfilter.flush()
                         if tail:
                             content_chars += len(tail)
                             yielded = True
-                            yield tail
+                            yield ("content", tail)
                         if rfilter.saw_reasoning:
                             logger.info(
                                 "%s 模型 %s 的流里含推理块，已剥离", self.label, model
@@ -1202,7 +1228,16 @@ class ZhipuChatProvider(OpenAICompatibleChatProvider):
     #: 2026-11-13 实测 400 `{"code":"1210","message":"max_tokens参数非法：限制数值范围[1,16384]"}`；
     #: 回退到旧 `glm-4-flash` 虽接受该值，但会直接 `finish_reason=length` 拦腰截断
     #: （第 4 章只出 1,167 字符）。按模型裁到 16384，两条路都不会再 400/截断。
-    _MODEL_MAX_TOKENS = {"glm-4-flash-250414": 16384}
+    #:
+    #: `glm-4-flash`（无日期别名）：2026-11-21 全书摘要实测，请求 max_tokens=8000
+    #: 时 usage.completion_tokens 停在 **4095** 且 finish_reason=length —— 渠道侧
+    #: 实际输出上限是 4096。不裁的话「按预算请求 8000」会被静默压到 4096。
+    _MODEL_MAX_TOKENS = {"glm-4-flash-250414": 16384, "glm-4-flash": 4096}
+
+    @property
+    def digest_output_tokens(self) -> int | None:
+        """摘要输出上限：按当前模型的硬上限声明（未声明的模型返回 None）。"""
+        return self._MODEL_MAX_TOKENS.get(str(self.model or ""))
 
     #: 蒸馏/摘要的块大小：2 万字。
     #:
@@ -1757,6 +1792,32 @@ def _build_channel_provider(
             max_tokens=max_tokens,
             **_timeouts,
         )
+    elif channel == "command-code":
+        # Command Code：key 优先取设置页临时值，否则读环境变量
+        # COMMAND_CODE_GOAT_KEY（类内部也会再兜一次）。
+        key = (
+            str(settings.command_code_api_key or "").strip()
+            or os.environ.get(CommandCodeChatProvider.KEY_ENV, "").strip()
+        )
+        if key:
+            return CommandCodeChatProvider(
+                key,
+                settings.command_code_base_url,
+                settings.command_code_model,
+                models=settings.command_code_model_list,
+                max_tokens=max_tokens,
+                **_timeouts,
+            )
+    elif channel == "ollama":
+        # 本地模型：Ollama 不校验 Bearer，但父类要求非空 key，给占位串。
+        return GenericOpenAIChatProvider(
+            str(settings.local_llm_api_key or "").strip() or "ollama",
+            settings.llm_base_url or settings.local_llm_base_url,
+            settings.local_llm_model,
+            models=settings.ollama_model_list,
+            max_tokens=max_tokens,
+            **_timeouts,
+        )
     elif channel == "dashscope" and settings.dashscope_api_key:
         base = settings.llm_base_url or settings.dashscope_base_url
         return DashScopeChatProvider(
@@ -2101,6 +2162,19 @@ def build_provider(provider: str, api_key: str, model: str, base_url: str = "",
                                          max_tokens=max_tokens, timeout=timeout,
                                          stream_timeout=stream_timeout,
                                          total_timeout=total_timeout)
+    if provider == "command-code":
+        # key 可空：类内部会读环境变量 COMMAND_CODE_GOAT_KEY。
+        url = base_url or settings.command_code_base_url
+        return CommandCodeChatProvider(api_key or None, url, model, models=[model],
+                                       max_tokens=max_tokens, timeout=timeout,
+                                       stream_timeout=stream_timeout,
+                                       total_timeout=total_timeout)
+    if provider == "ollama":
+        url = base_url or settings.local_llm_base_url
+        return GenericOpenAIChatProvider(api_key or "ollama", url, model, models=[model],
+                                         max_tokens=max_tokens, timeout=timeout,
+                                         stream_timeout=stream_timeout,
+                                         total_timeout=total_timeout)
     return LocalFallbackLLMProvider()
 
 
@@ -2127,6 +2201,8 @@ def _default_model_for(provider: str) -> str:
         "dashscope": "qwen-plus",
         "openai": "gpt-4o-mini",
         "opencode-go": "deepseek-v4.1-flash",
+        "command-code": "deepseek/deepseek-v4.1-flash",
+        "ollama": "qwen2.5:7b",
     }.get(provider, "")
 
 
@@ -2153,7 +2229,12 @@ def build_role_provider(role: str, stream_timeout: int = 60) -> LLMProvider:
     if not provider or provider == "local":
         return LocalFallbackLLMProvider()
     api_key = str(cfg.get("api_key") or "").strip()
-    if not api_key:
+    # 两类渠道允许没有「已保存的 key」：
+    #   command-code：key 由环境变量 COMMAND_CODE_GOAT_KEY 提供；
+    #   ollama      ：本地模型不校验 Authorization。
+    if not api_key and provider == "command-code":
+        api_key = os.environ.get("COMMAND_CODE_GOAT_KEY", "").strip()
+    if not api_key and provider != "ollama":
         return LocalFallbackLLMProvider()
     base_url = str(cfg.get("base_url") or "").strip()
     model = str(cfg.get("model") or "").strip() or _default_model_for(provider)

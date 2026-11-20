@@ -50,26 +50,44 @@
   --font-mono: "Sarasa Mono SC", "Cascadia Code", "JetBrains Mono", ui-monospace,
     Consolas, monospace;
 
-  /* 圆角 */
-  --radius-sm: 3px;
-  --radius-md: 5px;
-  --radius-lg: 6px;
+  /* 圆角：纸面感靠「大圆角 + 细边」而不是叠框 */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius: var(--radius-md);
   --radius-full: 999px;
 
   /* 描边 */
   --border-w: 1px;
 
-  /* 阴影 */
-  --shadow-sm: 0 1px 2px rgba(50, 42, 32, 0.035);
-  --shadow-md: 0 12px 30px rgba(50, 42, 32, 0.10);
+  /* 阴影：一层贴边、一层扩散，避免生硬的灰块 */
+  --shadow-sm: 0 1px 2px rgba(50, 42, 32, 0.05), 0 8px 20px -18px rgba(50, 42, 32, 0.22);
+  --shadow-md: 0 2px 6px rgba(50, 42, 32, 0.05), 0 24px 48px -26px rgba(50, 42, 32, 0.30);
+  --shadow-lg: 0 32px 72px -30px rgba(50, 42, 32, 0.38);
 
-  /* 固定产品字阶：小标签、界面正文、阅读正文、分节标题、页标题。 */
-  --fs-xs: 0.75rem;
-  --fs-sm: 0.8125rem;
-  --fs-md: 0.875rem;
-  --fs-lg: 1rem;
-  --fs-xl: 1.375rem;
-  --fs-2xl: 2.5rem;
+  /* 兼容别名：历史上各页散落的 var(--line/--muted/--err/--mono) 回退值，
+     统一收口到语义 token，暗色下不会再漏出浅灰。 */
+  --line: var(--border);
+  --muted: var(--fg-muted);
+  --err: var(--danger);
+  --mono: var(--font-mono);
+
+  /* 统一字阶：10 / 11 / 12 / 13 / 14 / 16 / 18 / 20 / 24 / 28 / 32 / 40。
+     全站只允许使用这 12 档，不再出现 9.5 / 10.5 / 11.5 / 12.5 这类半档值。
+     单位全部用 rem，跟随浏览器根字号缩放，避免 px 与 rem 混用导致大小不一致。 */
+  --fs-3xs: 0.625rem;  /* 10 · 微型标签、序号 */
+  --fs-2xs: 0.6875rem; /* 11 · 细注、计数 */
+  --fs-xs: 0.75rem;    /* 12 · 说明、标签 */
+  --fs-sm: 0.8125rem;  /* 13 · 控件、辅助正文 */
+  --fs-md: 0.875rem;   /* 14 · 界面正文 */
+  --fs-lg: 1rem;       /* 16 · 阅读正文 */
+  --fs-xl: 1.125rem;   /* 18 · 小标题 */
+  --fs-2xl: 1.25rem;   /* 20 · 卡片标题 */
+  --fs-3xl: 1.5rem;    /* 24 · 分区标题 */
+  --fs-4xl: 1.75rem;   /* 28 · 工作区标题 */
+  --fs-5xl: 2rem;      /* 32 · 大标题 */
+  --fs-6xl: 2.5rem;    /* 40 · 页面标题 */
 
   --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
 
@@ -79,6 +97,50 @@
   --gap-md: 12px;
   --gap: 16px;
   --gap-lg: 24px;
+}
+
+[data-theme="ink"] {
+  color-scheme: dark;
+
+  /* 暗色工作台：深墨底 + 暖橙朱砂。全站共享，组件不改一行。 */
+  --bg: #0f0f12;
+  --bg-elev: #151518;
+  --bg-sunken: #191920;
+  --fg: #ece9e3;
+  --fg-muted: #b6b1a7;
+  --fg-faint: #817c73;
+  --border: #2b2b33;
+  --border-strong: #3c3c46;
+  --ink: #ece9e3;
+  --ink-line: #b6b1a7;
+  --paper: #1b1b21;
+  --paper-muted: #6e6a62;
+
+  --accent: #e0654a;
+  --accent-hover: #ef8f5f;
+  --accent-ink: #f0a15a;
+  --accent-fg: #fff8f2;
+  --accent-soft: rgba(224, 101, 74, 0.14);
+  --accent-line: rgba(224, 101, 74, 0.38);
+
+  --ok: #7cb98c;
+  --ok-soft: rgba(124, 185, 140, 0.14);
+  --warn: #e0b46a;
+  --warn-soft: rgba(224, 180, 106, 0.13);
+  --danger: #e08a7a;
+  --danger-soft: rgba(224, 138, 122, 0.13);
+  --info: #8fb6c4;
+  --info-soft: rgba(143, 182, 196, 0.13);
+
+  --radius-xs: 8px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius: var(--radius-md);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 18px 48px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 32px 80px rgba(0, 0, 0, 0.62);
 }
 
 [data-theme="brutalist"] {
@@ -122,12 +184,7 @@
   --shadow-sm: 2px 2px 0 #0a0a0a;
   --shadow-md: 4px 4px 0 #0a0a0a;
 
-  --fs-xs: 12px;
-  --fs-sm: 13px;
-  --fs-md: 15px;
-  --fs-lg: 19px;
-  --fs-xl: 26px;
-  --fs-2xl: 36px;
+  /* 字阶统一继承 :root，主题只改字体家族与几何，不改字号。 */
 
   /* 节奏（与 editorial 同档位，值继承自 :root 亦可，显式写出便于单独调档） */
   --gap-xs: 4px;
@@ -176,12 +233,7 @@
   --shadow-sm: 0 1px 3px rgba(26, 32, 48, 0.08);
   --shadow-md: 0 10px 30px rgba(26, 32, 48, 0.12);
 
-  --fs-xs: 12px;
-  --fs-sm: 13px;
-  --fs-md: 15px;
-  --fs-lg: 18px;
-  --fs-xl: 24px;
-  --fs-2xl: 30px;
+  /* 字阶统一继承 :root，主题只改字体家族与几何，不改字号。 */
 
   /* 节奏（与 editorial 同档位，值继承自 :root 亦可，显式写出便于单独调档） */
   --gap-xs: 4px;

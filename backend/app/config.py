@@ -43,7 +43,8 @@ _KG_EXTRACT_DEFAULTS = _PROVIDERS_YAML.get("kg_extract") if isinstance(_PROVIDER
 #: 构造时就抛错（启动即失败），绝不静默回退主渠道——回退会把
 #: `KG_EXTRACT_PROVIDER=zhiphu` 这类笔误藏成「配置已生效」。
 KG_EXTRACT_CHANNELS: frozenset[str] = frozenset(
-    {"openrouter", "zhipu", "siliconflow", "minimax", "openai", "dashscope", "local"}
+    {"openrouter", "zhipu", "siliconflow", "minimax", "openai", "dashscope",
+     "opencode-go", "command-code", "ollama", "local"}
 )
 
 # Assistant / Distiller **显式留空**时的渠道回退表（backend/config/providers.yaml 的注释承诺）：
@@ -65,6 +66,12 @@ _LEGACY_CHANNEL_FIELDS: dict[str, tuple[str, str]] = {
     "dashscope": ("dashscope_api_key", "dashscope_base_url"),
     # 通用 OpenAI 兼容接口：没有厂商默认值，端点必须来自本表（用户可覆盖）。
     "openai": ("openai_api_key", "openai_base_url"),
+    # Command Code：key 只从环境变量 COMMAND_CODE_GOAT_KEY 读（本字段可空）。
+    "command-code": ("command_code_api_key", "command_code_base_url"),
+    # 本地模型（Ollama / LM Studio）：无需 key，端点默认本机 11434。
+    # 注意字段名用 local_llm_* 而不是 ollama_*：Ollama 自己的服务端也会读
+    # OLLAMA_MODELS / OLLAMA_HOST，同名会把「模型目录」误当成「模型链」。
+    "ollama": ("local_llm_api_key", "local_llm_base_url"),
 }
 
 #: 走「渠道 legacy 字段回退」的角色（Writer 有自己的 legacy 路径，不走这张表）。
@@ -284,6 +291,33 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     openai_models: str = "gpt-4o-mini,gpt-4o"
+
+    # ------------------------------------------------------------------
+    # Command Code（OpenAI 兼容网关，按量计费）
+    #
+    # key 只从环境变量 COMMAND_CODE_GOAT_KEY 读（命令行 `$env:...` 或进程环境），
+    # 不落盘；`command_code_api_key` 仅用于「设置页临时覆盖」，留空即用环境变量。
+    # 模型 id 带厂商前缀，与 opencode-go 的 `deepseek-v4.1-flash` 不是同一个串。
+    # ------------------------------------------------------------------
+    command_code_api_key: str = ""
+    command_code_base_url: str = "https://api.commandcode.ai/provider/v1"
+    command_code_model: str = "deepseek/deepseek-v4.1-flash"
+    command_code_models: str = "deepseek/deepseek-v4.1-flash"
+
+    # ------------------------------------------------------------------
+    # 本地模型（Ollama / LM Studio，OpenAI 兼容）
+    #
+    # 与 "local"（确定性模板兜底）不是一回事：这里真的连本机模型服务。
+    # Ollama 默认监听 127.0.0.1:11434，且不校验 Authorization；
+    # LM Studio 默认 1234 端口，把 base_url 改成 http://127.0.0.1:1234/v1 即可。
+    #
+    # 字段名刻意用 local_llm_*：Ollama 服务端本身会用 OLLAMA_MODELS 等环境变量，
+    # 若这里也叫 ollama_models，会把「模型目录 D:\ollama\models」误读成候选链。
+    # ------------------------------------------------------------------
+    local_llm_api_key: str = ""
+    local_llm_base_url: str = "http://127.0.0.1:11434/v1"
+    local_llm_model: str = "qwen2.5:7b"
+    local_llm_models: str = "qwen2.5:7b,qwen2.5:14b,llama3.1:8b"
 
     # ------------------------------------------------------------------
     # ADR-2026-10-12 第 2 步：Writer / Assistant 双轨隔离（第 8 步再加 Distiller 第三轨）。
@@ -599,6 +633,20 @@ class Settings(BaseSettings):
     distiller_budget_floor: bool = bool(_DISTILLER_DEFAULTS.get("budget_floor", True))
 
     # ------------------------------------------------------------------
+    # 联网搜索（Phase 1：Tavily）
+    #
+    # 这些字段是 .env 兜底；模型设置页写入的 `web_search.*` AppSetting
+    # 优先级更高（见 app/web_search/service.py 的 load_config）。
+    # ------------------------------------------------------------------
+    web_search_enabled: bool = False
+    web_search_provider: str = ""
+    web_search_api_key: str = ""
+    web_search_base_url: str = "https://api.tavily.com"
+    web_search_max_results: int = 30
+    web_search_timeout: int = 8
+    web_search_safe_search: bool = True
+
+    # ------------------------------------------------------------------
     # 量级与体系护栏（power_guard，独立区块）
     #
     # 默认开，但只做与体系类型匹配的检查；关闭后退回改造前的单判据
@@ -666,6 +714,14 @@ class Settings(BaseSettings):
     def openai_model_list(self) -> list[str]:
         """通用 OpenAI 兼容渠道的候选链。"""
         return self._dedup_models(self.openai_models)
+
+    @property
+    def command_code_model_list(self) -> list[str]:
+        return self._dedup_models(self.command_code_models)
+
+    @property
+    def ollama_model_list(self) -> list[str]:
+        return self._dedup_models(self.local_llm_models)
 
     @staticmethod
     def _dedup_models(csv: str) -> list[str]:

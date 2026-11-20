@@ -73,6 +73,71 @@ def test_two_corpora_insert_book_scope_before_distill():
     assert order.index("distill") < order.index("genre")
 
 
+# ── 续写：力量体系只看被续写书的题材 ─────────────────────────────────
+
+
+def _cont_ctx(**overrides) -> dict:
+    novels = [
+        {"id": 7, "title": "修真聊天群.txt", "genre": None},
+        {"id": 8, "title": "豪门宠婚.txt", "genre": None},
+        {"id": 9, "title": "某本游戏书.txt", "genre": "游戏"},
+    ]
+    return _ctx(novels=novels, project_corpus_ids=[7, 8, 9], **overrides)
+
+
+def test_continuation_adds_system_for_power_genre_book():
+    order = flow.step_order(
+        flow.KIND_CONTINUATION,
+        {"branch": flow.KIND_CONTINUATION},
+        _ctx(novels=[{"id": 7, "title": "修真聊天群.txt", "genre": None}],
+             project_corpus_ids=[7]),
+    )
+    # 书名关键词识别出「修真 → 仙侠」，即使语料 genre 为空。
+    assert "system" in order
+    assert order.index("continue_from") < order.index("system") < order.index("length")
+
+
+def test_continuation_skips_system_for_non_power_book():
+    order = flow.step_order(
+        flow.KIND_CONTINUATION,
+        {"branch": flow.KIND_CONTINUATION},
+        _ctx(novels=[{"id": 8, "title": "豪门宠婚.txt", "genre": None}],
+             project_corpus_ids=[8], project_genre=None),
+    )
+    assert "system" not in order
+
+
+def test_continuation_system_follows_book_scope():
+    ctx = _cont_ctx(continuation_novel_id=8)
+
+    default_order = flow.step_order(
+        flow.KIND_CONTINUATION, {"branch": flow.KIND_CONTINUATION}, ctx,
+    )
+    picked_order = flow.step_order(
+        flow.KIND_CONTINUATION,
+        {"branch": flow.KIND_CONTINUATION, "book_scope": 7},
+        ctx,
+    )
+    assert default_order.index("book_scope") < default_order.index("length")
+    assert "system" not in default_order
+    assert "system" in picked_order
+
+
+def test_continuation_summary_shows_system_only_when_applicable():
+    ctx = _cont_ctx(continuation_novel_id=8)
+
+    def steps(_answers: dict) -> set[str]:
+        return {
+            row["step"]
+            for row in flow.summary_rows(flow.KIND_CONTINUATION, _answers, ctx)
+        }
+
+    assert "system" not in steps({"branch": flow.KIND_CONTINUATION})
+    assert "system" in steps(
+        {"branch": flow.KIND_CONTINUATION, "book_scope": 7}
+    )
+
+
 def test_overrides_cannot_move_corpus_or_distill():
     order = flow.step_order(
         flow.KIND_ORIGINAL,
@@ -82,6 +147,48 @@ def test_overrides_cannot_move_corpus_or_distill():
     assert order[0] == flow.FIRST_STEP
     assert order[1] == "corpus"
     assert order.index("corpus") < order.index("distill")
+
+
+def test_original_order_has_cards_step_between_outline_and_confirm():
+    order = flow.step_order(
+        flow.KIND_ORIGINAL,
+        {"branch": flow.KIND_ORIGINAL, "outline": True},
+        _ctx(),
+    )
+    assert order.index("outline") < order.index("cards") < order.index("confirm")
+
+
+def test_original_order_skips_cards_when_writing_directly():
+    order = flow.step_order(
+        flow.KIND_ORIGINAL,
+        {"branch": flow.KIND_ORIGINAL, "outline": False},
+        _ctx(),
+    )
+    assert "cards" not in order
+    assert order.index("outline") < order.index("confirm")
+
+
+def test_cards_step_renders_bible_characters():
+    question = flow.build_question(
+        "cards",
+        {"branch": flow.KIND_ORIGINAL, "outline": True},
+        _ctx(
+            bible_characters=[
+                {"name": "林深", "role": "主角", "has_card": True},
+                {"name": "周遥", "role": "配角", "has_card": False},
+            ]
+        ),
+    )
+    assert question["card"]["type"] == "cards"
+    assert question["card"]["characters"][0]["name"] == "林深"
+    assert question["can_skip"] is False
+
+
+def test_cards_answer_accepts_true_only():
+    ctx = _ctx()
+    assert flow.validate("cards", True, flow.KIND_ORIGINAL, {}, ctx) is True
+    with pytest.raises(flow.AnswerError):
+        flow.validate("cards", "乱写", flow.KIND_ORIGINAL, {}, ctx)
 
 
 # ── 语料即时落库 / 蒸馏提前启动 ──────────────────────────────────────
@@ -146,6 +253,64 @@ def test_distill_start_failure_does_not_fail_answer(db, monkeypatch):
     out = wizard._advance(db, project, session, "distill", "fast", BackgroundTasks(), "好")
     assert "没能立即启动" in (out.get("ack") or "")
     assert session.step_key == "genre"
+
+
+# ── 角色卡步骤 ───────────────────────────────────────────────────────
+
+
+def test_outline_answer_enters_cards_and_builds_bible(db, monkeypatch):
+    project, session = _seed(db)
+    session.answers = {"branch": flow.KIND_ORIGINAL, "corpus": [], "outline": True}
+    session.step_key = "outline"
+    db.commit()
+
+    calls: list[int] = []
+
+    def fake_build(_db, proj, _answers=None):
+        calls.append(proj.id)
+        proj.plot_bible = {
+            "characters": [
+                {"name": "林深", "role": "主角", "card": {"声纹": {"自称": "我"}}},
+            ]
+        }
+        _db.commit()
+        return proj.plot_bible, {
+            "generated": 1, "names": ["林深"], "missing": [], "collisions": 0,
+        }
+
+    monkeypatch.setattr(wizard, "_build_bible", fake_build)
+
+    out = wizard._advance(db, project, session, "outline", True, BackgroundTasks(), "好")
+
+    assert calls == [project.id]
+    assert session.step_key == "cards"
+    assert out["question"]["card"]["type"] == "cards"
+    assert out["question"]["card"]["characters"][0]["has_card"] is True
+    assert out["cards_preview"]["stage"] == "cards"
+    assert out["cards_preview"]["character_cards"]["generated"] == 1
+
+
+def test_commit_reuses_generated_cards(db, monkeypatch):
+    project, session = _seed(db)
+    session.answers = {"branch": flow.KIND_ORIGINAL, "outline": True, "cards": True}
+    session.step_key = "confirm"
+    project.plot_bible = {
+        "characters": [
+            {"name": "林深", "role": "主角", "card": {"声纹": {"自称": "我"}}},
+        ]
+    }
+    db.commit()
+
+    called: list[int] = []
+    monkeypatch.setattr(wizard, "_build_bible", lambda *a, **k: called.append(1))
+
+    out = wizard._commit(db, project, session, BackgroundTasks())
+
+    assert called == []
+    stats = out["result"]["character_cards"]
+    assert stats["reason"] == "reused"
+    assert stats["generated"] == 1
+    assert "沿用" in out["result"]["message"]
 
 
 # ── 剧情圣经注入 ─────────────────────────────────────────────────────

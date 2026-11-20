@@ -52,7 +52,10 @@ chat timeout=120 / stream_timeout=180，`llm/*` 行为不变；GET 的
 本模块不重复实现，只负责把持久化值写进 settings（= 第 1 档）。
 """
 
+import json
+import os
 import time
+import urllib.request
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -181,10 +184,34 @@ PROVIDER_META: dict[str, dict] = {
         ),
         "default_models": ["gpt-4o-mini", "gpt-4o"],
     },
+    "command-code": {
+        "label": "Command Code",
+        "key_hint": (
+            "默认读环境变量 COMMAND_CODE_GOAT_KEY；此处留空即用环境变量。"
+            "key 形如 cc-...，来自 commandcode.ai 的 Goat 套餐"
+        ),
+        "free_note": (
+            "按量计费；deepseek-v4.1-flash 上下文 1M token，"
+            "额度与 opencode go 独立"
+        ),
+        "default_models": ["deepseek/deepseek-v4.1-flash"],
+    },
+    "ollama": {
+        "label": "本地模型（Ollama）",
+        "key_hint": (
+            "不需要 key。Ollama 默认端点 http://127.0.0.1:11434/v1；"
+            "LM Studio 改成 http://127.0.0.1:1234/v1"
+        ),
+        "free_note": (
+            "真正调用本机模型，不产生 API 费用；先 `ollama pull qwen2.5:7b`，"
+            "模型名必须与 `ollama list` 里的一致"
+        ),
+        "default_models": ["qwen2.5:7b", "qwen2.5:14b", "llama3.1:8b"],
+    },
     "local": {
-        "label": "本地兜底（无需 key）",
+        "label": "本地兜底（模板，不调模型）",
         "key_hint": "",
-        "free_note": "确定性模板生成，离线可跑，非模型质量",
+        "free_note": "确定性模板生成，离线可跑，非模型质量；要跑本地模型请选「本地模型（Ollama）」",
         "default_models": ["local-template"],
     },
 }
@@ -197,6 +224,8 @@ _KEY_FIELD = {
     "minimax": "minimax_api_key",
     "dashscope": "dashscope_api_key",
     "openai": "openai_api_key",
+    "command-code": "command_code_api_key",
+    "ollama": "local_llm_api_key",
 }
 _MODEL_FIELD = {
     "openrouter": "openrouter_model",
@@ -205,6 +234,8 @@ _MODEL_FIELD = {
     "minimax": "minimax_model",
     "dashscope": "llm_model",
     "openai": "openai_model",
+    "command-code": "command_code_model",
+    "ollama": "local_llm_model",
 }
 _MODELS_FIELD = {
     "openrouter": "openrouter_models",
@@ -213,10 +244,18 @@ _MODELS_FIELD = {
     "minimax": "minimax_models",
     "dashscope": "dashscope_models",
     "openai": "openai_models",
+    "command-code": "command_code_models",
+    "ollama": "local_llm_models",
+}
+
+#: 渠道 → settings 里的 base_url 字段名。多数渠道就是 `{provider}_base_url`；
+#: 本地模型刻意用 `local_llm_base_url`（避开 Ollama 自己的 OLLAMA_* 环境变量）。
+_BASE_URL_FIELD = {
+    "ollama": "local_llm_base_url",
 }
 
 #: 需要用户填自定义 base_url 的渠道（没有厂商默认地址可回落 / 端点即配置）。
-_CUSTOM_URL_PROVIDERS: frozenset[str] = frozenset({"openai"})
+_CUSTOM_URL_PROVIDERS: frozenset[str] = frozenset({"openai", "ollama"})
 
 _DB_KEY_PROVIDER = "llm.provider"
 _DB_KEY_MODEL = "llm.model"
@@ -280,7 +319,9 @@ def _legacy_effective_config() -> dict[str, Any]:
     model_field = _MODEL_FIELD.get(provider)
     base_url = (settings.llm_base_url or "").strip()
     if not base_url and provider != "local":
-        base_url = str(getattr(settings, f"{provider}_base_url", "") or "").strip()
+        base_url = str(
+            getattr(settings, _BASE_URL_FIELD.get(provider, f"{provider}_base_url"), "") or ""
+        ).strip()
     return {
         "provider": provider,
         "api_key": str(getattr(settings, key_field, "") or "").strip() if key_field else "",
@@ -378,6 +419,9 @@ def _role_block(role: str) -> dict[str, Any]:
         label = "(unavailable)"
         is_fallback = True
 
+    # 本地模型不需要 key：占位串不算「已保存 key」。
+    if provider == "ollama":
+        api_key = ""
     return {
         "provider": provider,
         "model": model,
@@ -468,6 +512,15 @@ def _kg_extract_block() -> dict[str, Any]:
     )
     is_fallback = active is not None and type(active).__name__ == "LocalFallbackLLMProvider"
 
+    # 只暴露「界面上有元数据」的渠道：否则前端会渲染出没有标签、没有
+    # 默认模型链的裸按钮（opencode-go 就属于这种情况）。后端校验仍用完整
+    # KG_EXTRACT_CHANNELS —— 已保存的旧配置不会被这里判非法。
+    ui_channels = sorted(p for p in KG_EXTRACT_CHANNELS if p in PROVIDER_META)
+    channel_models = {p: _channel_chain(p) for p in ui_channels}
+    # 跟随主渠道时，输入框要按主渠道回填默认链；主渠道可能恰好不在 UI 列表里。
+    if main_provider and main_provider not in channel_models:
+        channel_models[main_provider] = _channel_chain(main_provider)
+
     return {
         "provider": configured,
         "follow_main": follow_main,
@@ -477,10 +530,8 @@ def _kg_extract_block() -> dict[str, Any]:
         "models": models,
         "models_source": models_source,
         "models_override": override,
-        "channel_models": {
-            p: _channel_chain(p) for p in sorted(KG_EXTRACT_CHANNELS)
-        },
-        "allowed_providers": sorted(KG_EXTRACT_CHANNELS),
+        "channel_models": channel_models,
+        "allowed_providers": ui_channels,
         "total_timeout": settings.kg_extract_total_timeout,
         "first_byte_timeout": settings.kg_extract_first_byte_timeout,
         "is_fallback": is_fallback,
@@ -502,6 +553,9 @@ def _current(db: Session) -> dict:
         db_row = db.get(AppSetting, f"llm.{field}")
         db_val = (db_row.value if db_row else "") or ""
         val = db_val or env_val
+        # command-code 的 key 通常只存在于进程环境变量里（不落库）。
+        if not val and provider == "command-code":
+            val = os.environ.get("COMMAND_CODE_GOAT_KEY", "")
         keys_status[provider] = {"has": bool(val), "masked": _mask(val) if val else None}
 
     provider = settings.llm_provider or "local"
@@ -591,6 +645,37 @@ class LlmConfigIn(StrictRequest):
 @router.get("/llm")
 def get_llm_config(db: Session = Depends(get_db)) -> dict:
     return _current(db)
+
+
+@router.get("/llm/local-models")
+def list_local_models(base_url: str = "") -> dict:
+    """列出 Ollama 本机已安装的模型（只读探测，不落库）。
+
+    Ollama 的 `/api/tags` 在根路径，不在 OpenAI 兼容的 `/v1` 下；这里把
+    用户填的 `http://host:11434/v1` 自动还原成根地址再探测，省得让用户
+    同时维护两个地址。
+    """
+    raw = (base_url or settings.local_llm_base_url).strip().rstrip("/")
+    root = raw[:-3] if raw.endswith("/v1") else raw
+    req = urllib.request.Request(f"{root}/api/tags")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001 —— 探测失败只回可读原因，不 500
+        return {
+            "ok": False,
+            "base_url": raw,
+            "models": [],
+            "error": f"读取失败：{exc}"[:200],
+        }
+    items = data.get("models") if isinstance(data, dict) else None
+    models = [
+        str(item.get("name"))
+        for item in (items or [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    return {"ok": True, "base_url": raw, "models": models, "error": None}
 
 
 def _set(db: Session, key: str, value: str) -> None:
@@ -800,7 +885,7 @@ def _put_role(body: LlmConfigIn, provider: str, role: str, db: Session) -> dict:
             # `llm_base_url or dashscope_base_url` 一层回退）。
             url = body.base_url.strip()
             if provider != "local":
-                base_field = f"{provider}_base_url"
+                base_field = _BASE_URL_FIELD.get(provider, f"{provider}_base_url")
                 if hasattr(settings, base_field):
                     _set(db, f"llm.{base_field}", url)
                     overrides[base_field] = url
@@ -1047,6 +1132,8 @@ def test_llm_config(body: LlmTestIn, db: Session = Depends(get_db)) -> dict:
         if (cfg.get("provider") or "") != provider:
             cfg = {}  # 表单渠道 ≠ 角色已存渠道 →不回退到别的渠道的 key
         key = (body.api_key or "").strip() or str(cfg.get("api_key") or "").strip()
+        if not key and provider == "command-code":
+            key = os.environ.get("COMMAND_CODE_GOAT_KEY", "").strip()
         model = (
             (body.model or "").strip()
             or str(cfg.get("model") or "").strip()
@@ -1055,7 +1142,7 @@ def test_llm_config(body: LlmTestIn, db: Session = Depends(get_db)) -> dict:
         base_url = str(cfg.get("base_url") or "").strip()
         if provider == "local":
             return _local_test(model, body.role)
-        if not key:
+        if not key and provider != "ollama":
             return {"ok": False, "role": body.role, "error": "尚未填写 API key"}
         t0 = time.time()
         try:
@@ -1084,6 +1171,8 @@ def test_llm_config(body: LlmTestIn, db: Session = Depends(get_db)) -> dict:
         if key_field:
             row = db.get(AppSetting, f"llm.{key_field}")
             key = (row.value if row else "") or (getattr(settings, key_field, "") or "")
+    if not key and provider == "command-code":
+        key = os.environ.get("COMMAND_CODE_GOAT_KEY", "").strip()
     model = (body.model or "").strip()
     if not model:
         model_field = _MODEL_FIELD.get(provider)
@@ -1092,7 +1181,7 @@ def test_llm_config(body: LlmTestIn, db: Session = Depends(get_db)) -> dict:
 
     if provider == "local":
         return _local_test(model, None)
-    if not key:
+    if not key and provider != "ollama":
         return {"ok": False, "error": "尚未填写 API key"}
 
     t0 = time.time()

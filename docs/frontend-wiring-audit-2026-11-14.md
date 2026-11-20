@@ -181,7 +181,8 @@
 - `auto_read` 12 项（助手可直接调只读工具）；
 - `propose_write` 2 项（助手提出、用户点确认卡片）；
 - `frontend_only` 18 项（破坏性/批量/配置/密钥，全部 `requires_confirmation=true`，并写明前端入口）；
-- `unwired_read` 11 项（只读、后端就绪、两边未接）。
+- `unwired_read` 11 项（只读、后端就绪、两边未接）。**2026-11-21：已全部绑定白名单只读工具，现为 0 项**；
+  当前分布为 `auto_read 26 / propose_write 2 / frontend_only 18 / unwired_read 0`。
 
 档 3 **全部在目录里**，`list_actions` 能返回；助手看到的是「只能由用户在前端页面操作，不得代执行」，不会被当成可代劳。约束由 `ActionSpec.__post_init__` 强制：破坏性操作若标成非 `frontend_only`、`frontend_only` 若没写入口或没标确认，模块导入即报错。
 
@@ -218,10 +219,10 @@
 
 ### 4.7 已知缺口（第一批结束时）
 
-1. **TODO（下一步分水岭，未在本轮动）**：provider 目前只有文本 `chat`，**没有 function calling**，模型不能自主调用任何工具。`/qa` 的发现是「确定性触发词匹配 → 注入上下文」，`list_actions` 只解决了「动作目录存在且助手看得见」，**没有解决「模型主动调用」**。下一步接 tool-calling 协议后，才谈得上模型自己选工具/自己发起只读查询；届时目录与四档策略无需重写。
+1. ~~**TODO（下一步分水岭，未在本轮动）**：provider 目前只有文本 `chat`，**没有 function calling**，模型不能自主调用任何工具。~~ → **2026-11-21 已解决**：`/qa` 已走 provider 原生 `tool_calls`（确定性取证保留为回落腿），模型可自主调用白名单只读工具。
 2. ~~`frontend_only` 里几项目前两端都没有入口~~ → 已在第二批补齐（语料清洗、快照回滚/整组回滚、批量应用提案），见 §5。
-3. `proposal_list` / `version_list` / `prompt_active` 等读能力仍是 `unwired_read`，助手只能如实回答「暂未接入」。
-4. 单条提案应用（`POST /proposals/{id}/apply`）仍只有后端；前端目前只提供「勾选 → 批量应用」，单条也走同一条批量通道。
+3. ~~`proposal_list` / `version_list` / `prompt_active` 等读能力仍是 `unwired_read`~~ → **2026-11-21 已接线**：连同 KG 世界观/时间线/故事上下文、提炼详情、无生成章检查、项目诊断、运行记录、快照列表一起绑定为只读工具。
+4. ~~单条提案应用（`POST /proposals/{id}/apply`）仍只有后端~~ → 前端已在助手工作台、项目页回滚入口与工作流条使用单条 `applyProposal`。
 
 ## 5. 第二批：补齐三项档 3 的显式入口（2026-11-14）
 

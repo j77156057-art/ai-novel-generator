@@ -3669,6 +3669,22 @@ def _parse_tool_arguments(raw) -> dict:
 
 #: 素材轮的系统后缀：这一轮只判断「要不要查素材 + 取哪几条」，不写正文。
 #: 末轮成文走正常的 chat / stream_chat（流式），不把整章退化成一次性下发。
+#: 预算是硬上限：素材只是增强项，不能让「等待首字」被它拖到几十秒。
+_BRIEF_ROUND_BUDGET_S = 15.0
+
+
+def _complete_with_budget(provider, messages, *, tools, tool_choice, budget):
+    """给素材轮的结构化补全加预算；provider 不认这个参数时退回原签名。"""
+    try:
+        return provider.complete_message(
+            messages, tools=tools, tool_choice=tool_choice,
+            budget_seconds=budget,
+        )
+    except TypeError:
+        return provider.complete_message(
+            messages, tools=tools, tool_choice=tool_choice,
+        )
+
 _BRIEF_DECISION_SUFFIX = (
     "\n\n【本轮只做素材判断】\n"
     "先不要写正文。若本章需要补充具体细节（环境、器物、职业流程、专业信息等），"
@@ -3726,10 +3742,17 @@ def _gather_brief_materials(provider, brief_tool, system: str, user: str, *,
     blocks: list[str] = []
     # 轮数 = 检索次数上限 + 选择轮 + 「不需要素材」的收尾判断。
     rounds = max(1, int(brief_tool.settings.max_calls_per_chapter)) + 2
+    # 整段素材轮共享一份时长预算：每轮只能用「剩余额度」，
+    # 避免 rounds 轮各自吃满预算把首字拖到几十秒（实测单轮曾耗时 49s）。
+    deadline = time.monotonic() + _BRIEF_ROUND_BUDGET_S
     try:
         for _ in range(rounds):
-            message = provider.complete_message(
-                messages, tools=specs, tool_choice="auto",
+            remaining = deadline - time.monotonic()
+            if remaining <= 1:
+                break
+            message = _complete_with_budget(
+                provider, messages, tools=specs, tool_choice="auto",
+                budget=remaining,
             )
             calls = list(message.get("tool_calls") or [])
             if not calls:
@@ -3756,7 +3779,10 @@ def _gather_brief_materials(provider, brief_tool, system: str, user: str, *,
                 })
         # 模型常拿到候选后直接回复「无」；不补这一轮，两阶段会退化成「只查不选」。
         if not blocks and brief_tool.chapter_stats().get("candidates", 0) > 0:
-            blocks = _ask_brief_selection(provider, brief_tool, messages)
+            blocks = _ask_brief_selection(
+                provider, brief_tool, messages,
+                budget=deadline - time.monotonic(),
+            )
     except ToolsUnsupportedError:
         logging.getLogger(__name__).warning(
             "当前模型链不支持 function calling，本章退化为无素材初稿")
@@ -3768,7 +3794,7 @@ def _gather_brief_materials(provider, brief_tool, system: str, user: str, *,
     return blocks
 
 
-def _ask_brief_selection(provider, brief_tool, messages: list[dict]) -> list[str]:
+def _ask_brief_selection(provider, brief_tool, messages: list[dict], *, budget: float) -> list[str]:
     """候选已就绪但模型没点名时的补选轮：只给选择工具，不给检索工具。
 
     单独留一个函数而不是塞进主循环，是为了让「是否真的走到选择」在代码上可读：
@@ -3776,10 +3802,13 @@ def _ask_brief_selection(provider, brief_tool, messages: list[dict]) -> list[str
     """
     from app.retrieval.brief.tool import SELECT_TOOL_NAME
 
+    if budget <= 1:
+        return []
     convo = list(messages) + [{"role": "user", "content": _BRIEF_SELECT_SUFFIX}]
     blocks: list[str] = []
-    message = provider.complete_message(
-        convo, tools=[brief_tool.select_spec()], tool_choice="auto",
+    message = _complete_with_budget(
+        provider, convo, tools=[brief_tool.select_spec()], tool_choice="auto",
+        budget=budget,
     )
     for call in list(message.get("tool_calls") or []):
         fn = call.get("function") or {}
@@ -3864,6 +3893,33 @@ def _stream_with_retry(provider, system: str, user: str, **kwargs):
             for piece in provider.stream_chat(system, user, **kwargs):
                 emitted = True
                 yield piece
+            return
+        except Exception as exc:  # noqa: BLE001
+            if emitted or attempt == 2 or not _is_transient_api_error(exc):
+                raise
+            logging.getLogger(__name__).warning(
+                "流式生成命中可重试 HTTP 错误，1 次重试（复用同一 prompt）: %s", exc)
+            time.sleep(1.5)
+
+
+def _stream_events_with_retry(provider, system: str, user: str, **kwargs):
+    """`_stream_with_retry` 的事件版：额外把 reasoning 增量透传出来。
+
+    重试判定只认「已经吐出正文」；只收到 reasoning 时重试不会污染正文。
+    """
+    emitted = False
+    for attempt in (1, 2):
+        try:
+            fn = getattr(provider, "stream_chat_events", None)
+            source = (
+                fn(system, user, **kwargs)
+                if callable(fn)
+                else (("content", p) for p in provider.stream_chat(system, user, **kwargs))
+            )
+            for kind, piece in source:
+                if kind == "content":
+                    emitted = True
+                yield kind, piece
             return
         except Exception as exc:  # noqa: BLE001
             if emitted or attempt == 2 or not _is_transient_api_error(exc):
@@ -5608,6 +5664,8 @@ def generate_next_segment_stream(
     """
     from app.llm.provider import get_llm_provider
 
+    yield {"type": "stage", "stage": "prepare", "label": "装配上下文"}
+
     # 档案预检：与 generate_next_segment 同——无缓存档案时明确失败，
     # 不把请求挂死在同步蒸馏上（流式下作为 SSE error 事件下发）。
     _require_distill_ready(db, project)
@@ -5718,12 +5776,23 @@ def generate_next_segment_stream(
         provider, brief_tool, system, user, constraints=ctx["constraints"])
     draft_user = user + _material_suffix(brief_blocks)
     pieces: list[str] = []
-    for piece in _stream_with_retry(
+    reasoning_chars = 0
+    yield {"type": "stage", "stage": "model", "label": "等待模型首字"}
+    for kind, piece in _stream_events_with_retry(
         provider, system, draft_user, constraints=ctx["constraints"],
         stop_sequences=get_section_stop_sequences(),
     ):
+        if kind == "reasoning":
+            if reasoning_chars == 0:
+                yield {"type": "stage", "stage": "thinking", "label": "模型思考中"}
+            reasoning_chars += len(piece)
+            yield {"type": "reasoning", "chars": reasoning_chars}
+            continue
+        if not pieces:
+            yield {"type": "stage", "stage": "writing", "label": "流式撰写中"}
         pieces.append(piece)
         yield {"type": "chunk", "text": piece}
+    yield {"type": "stage", "stage": "post", "label": "重算摘要与图谱"}
     # 初稿流刚结束就取：后续补完/重写走非流式 chat，不会覆盖这份留痕。
     # 取不到（非 OpenAI 兼容 provider / 测试桩）就是 None → 落库写 null。
     draft_stream_stats = getattr(provider, "last_stream_stats", None)
@@ -6173,6 +6242,8 @@ def regenerate_segment_stream(
     """
     from app.llm.provider import get_llm_provider
 
+    yield {"type": "stage", "stage": "prepare", "label": "装配上下文"}
+
     # 档案预检：重生成同样不该把请求挂死在同步蒸馏上
     _require_distill_ready(db, project)
 
@@ -6367,11 +6438,28 @@ def regenerate_segment_stream(
         yield {"type": "chunk", "text": text}
     else:
         try:
-            for piece in provider.stream_chat(system, user, constraints=constraints):
+            reasoning_chars = 0
+            yield {"type": "stage", "stage": "model", "label": "等待模型首字"}
+            fn = getattr(provider, "stream_chat_events", None)
+            source = (
+                fn(system, user, constraints=constraints)
+                if callable(fn)
+                else (("content", p) for p in provider.stream_chat(system, user, constraints=constraints))
+            )
+            for kind, piece in source:
+                if kind == "reasoning":
+                    if reasoning_chars == 0:
+                        yield {"type": "stage", "stage": "thinking", "label": "模型思考中"}
+                    reasoning_chars += len(piece)
+                    yield {"type": "reasoning", "chars": reasoning_chars}
+                    continue
+                if not pieces:
+                    yield {"type": "stage", "stage": "writing", "label": "流式撰写中"}
                 if lease is not None:
                     lease.touch(db)
                 pieces.append(piece)
                 yield {"type": "chunk", "text": piece}
+            yield {"type": "stage", "stage": "post", "label": "重算摘要与图谱"}
         except BaseException as exc:  # noqa: BLE001 —— 含客户端断开（GeneratorExit）
             # 快照留痕：模型报错/超时/客户端中断都置 failed，正文一行没动。
             # 不做这两行的话，残留的 pending 会变成一条没有心跳的租约，该段要等

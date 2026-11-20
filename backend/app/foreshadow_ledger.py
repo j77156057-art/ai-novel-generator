@@ -249,6 +249,41 @@ def _norm_question(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
+#: 从对话里误抽出来的「坑」共用这几个外观特征：整句被引号包住、带
+#: 「某某：“……」」的说话人前缀，或干脆是「你是谁？」这类第二人称短问句。
+_DIALOGUE_PREFIXES = ("“", "\"", "「", "『", "【", "】", "‘", "'")
+_DEICTIC_STARTS = (
+    "你", "您", "我", "咱", "这", "那", "哪", "谁", "什么", "怎么", "为什么",
+    "到底", "至于", "没有",
+)
+_SHORT_QUESTION_MARKERS = ("我", "你", "您", "咱", "吗", "呢", "不是", "对不对", "是不是", "不？")
+
+
+def _is_plausible_plothole(question: str) -> bool:
+    """判断 KG 里的「坑」像不像作者埋的伏笔，而不是正文对话里的一句问话。
+
+    宁可漏收，也不把「你是谁？」这类台词登记进作者台账——台账是作者的
+    意图清单，混进台词后每次生成都会把它们当成待回收伏笔注入。
+    """
+    q = question.strip()
+    if not q:
+        return False
+    if q.startswith(_DIALOGUE_PREFIXES):
+        return False
+    if any(mark in q for mark in ("：“", "：「", ':"')):
+        return False
+    if q.startswith(_DEICTIC_STARTS):
+        return False
+    if q.endswith(("？", "?")):
+        # 五个字以内的问句基本是台词（「还有呢？」「现在几点？」）；
+        # 带第一/第二人称且不长时，同样按台词处理。
+        if len(q) <= 5:
+            return False
+        if len(q) < 24 and any(marker in q for marker in _SHORT_QUESTION_MARKERS):
+            return False
+    return True
+
+
 def kg_plotholes(db: Session, project_id: int, source: str = KG_SOURCE) -> list[dict]:
     """取图谱里的坑，按问题去重（同一问题多节点时保留最近提出的那条）。
 
@@ -266,7 +301,7 @@ def kg_plotholes(db: Session, project_id: int, source: str = KG_SOURCE) -> list[
     for node in rows:
         props = node.props if isinstance(node.props, dict) else {}
         question = _norm_question(props.get("question"))
-        if not question:
+        if not question or not _is_plausible_plothole(question):
             continue
         current = merged.get(question)
         if current is None or (node.first_chapter or -1) > (current["first_chapter"] or -1):

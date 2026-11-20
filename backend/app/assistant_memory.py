@@ -79,6 +79,12 @@ AUTO_ITEM_CHARS = 40
 _QUESTION_SIGNALS = re.compile(
     r"(怎么|为什么|如何|是不是|多少|哪一?[个段章]|能不能|可不可以|有没有)"
 )
+#: 明确的疑问开头。必须在偏好词之前判：否则「能不能」里的「不能」会命中
+#: `_PREFERENCE_SIGNALS`，把一句提问误抽成长期记忆。
+_INTERROGATIVE_STARTERS = re.compile(
+    r"(能不能|可不可以|是否|是不是|有没有|要不要|该不该)"
+)
+
 #: 检索/查看类祈使句：没有问号，但也不产生长期偏好。
 _LOOKUP_SIGNALS = re.compile(r"(帮我|看看|查一下|找一下|读一下|念一下|讲一下)")
 #: 偏好的措辞：出现这些词就按陈述处理（即使句子里带「第 N 段」）。
@@ -131,10 +137,13 @@ def should_extract(query: str) -> bool:
     text = (query or "").strip()
     if len(text) < 6:
         return False
-    if _PREFERENCE_SIGNALS.search(text):
-        return True
+    # 明确疑问句式先判；「能不能加入修仙境界？」里的「不能」不能被当成偏好。
+    if _INTERROGATIVE_STARTERS.search(text):
+        return False
     if text.endswith(("?", "？")):
         return False
+    if _PREFERENCE_SIGNALS.search(text):
+        return True
     if _QUESTION_SIGNALS.search(text):
         return False
     if _LOOKUP_SIGNALS.search(text):

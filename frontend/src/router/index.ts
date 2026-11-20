@@ -48,6 +48,42 @@ const routes = [
     meta: { title: "章纲", idx: "02" },
   },
   {
+    // 全书摘要：书级产物（跨项目复用），提交挂在项目下（后台任务表项目列必填）。
+    path: "/projects/:id/digest",
+    name: "book-digest",
+    component: () => import("@/views/BookDigestView.vue"),
+    meta: { title: "全书摘要", idx: "02" },
+  },
+  {
+    // 人物塑造模板：库里按档位存多份，应用后才进入本项目生成提示。
+    path: "/projects/:id/templates",
+    name: "character-template",
+    component: () => import("@/views/CharacterTemplateView.vue"),
+    meta: { title: "人物模板", idx: "02" },
+  },
+  {
+    // 角色卡：身份 / 能力 / 声纹 / 关系的静态档案（与角色状态分开）。
+    path: "/projects/:id/cards",
+    name: "character-cards",
+    component: () => import("@/views/CharacterCardsView.vue"),
+    meta: { title: "角色卡", idx: "02" },
+  },
+  {
+    // 力量体系：修炼体系 + 档位分层 + 角色修炼档案。
+    path: "/projects/:id/power",
+    name: "power-system",
+    component: () => import("@/views/PowerSystemView.vue"),
+    meta: { title: "力量体系", idx: "02" },
+  },
+  {
+    // 项目资产：摘要 / 人物模板 / 角色卡 / 力量体系的统一入口，
+    // 不再把四个按钮直接堆在项目工作台头部。
+    path: "/projects/:id/assets",
+    name: "project-assets",
+    component: () => import("@/views/ProjectAssetsView.vue"),
+    meta: { title: "项目资产", idx: "02" },
+  },
+  {
     // 顶层助手入口：自动挑一个项目后 replace 到上面的项目级助手页。
     // 让「助手工作台」导航与首屏都能直达对话，不必先经项目列表。
     path: "/assistant",
@@ -56,10 +92,10 @@ const routes = [
     meta: { title: "助手工作台", idx: "05" },
   },
   {
+    // 「我的小说」与「创作项目」是同一份书单，已合并到 /projects；
+    // 旧链接直接重定向，避免书签 404。
     path: "/mine",
-    name: "mine",
-    component: () => import("@/views/MyNovels.vue"),
-    meta: { title: "我的小说", idx: "03" },
+    redirect: "/projects",
   },
   {
     path: "/settings",

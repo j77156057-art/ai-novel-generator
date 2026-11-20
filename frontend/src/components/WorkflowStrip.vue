@@ -493,7 +493,7 @@ async function actAction(
 .wf-pct-compact {
   color: var(--accent-ink);
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }

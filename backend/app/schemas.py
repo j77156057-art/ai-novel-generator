@@ -142,6 +142,9 @@ class ProjectOut(BaseModel):
     # 原文边界（每本书「故事进行到第几章」）：[{"novel_id": 1, "chapter": 40}]。
     # 角色对话 / 续写共用的可见性边界；缺 = 该书整本挡掉（fail closed）。
     reference_cutoffs: Optional[list[dict]] = None
+    # 当前项目已应用的人物塑造模板 id（`full:<tier_sig>:<content_hash>`）。
+    # 模板库页据此标「已应用」；空 = 没应用过。
+    character_template_id: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

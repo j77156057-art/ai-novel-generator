@@ -10,6 +10,7 @@
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "@/api/client";
+import { lastProjectId } from "@/utils/lastProject";
 
 const router = useRouter();
 const loading = ref(true);
@@ -27,10 +28,16 @@ async function resolveAssistant() {
     // 返回按 id 倒序（最近创建在前）。最近建的往往是还没挂语料的空壳项目，
     // 直接拿 [0] 会一进来就落在空壳上。优先挑「已挂参考语料」的项目，
     // 都没有再退回 [0]，保证助手默认就有可对话的上下文。
+    //
+    // 但「最后打开的作品」优先：记忆与会话都按项目隔离，从设置页/列表页
+    // 点回写作台时落错书，用户会觉得「之前的记忆全没了」。
+    const last = lastProjectId();
+    const remembered =
+      last == null ? undefined : projects.find((p) => p.id === last);
     const withCorpus = projects.filter(
       (p) => (p.reference_novel_ids?.length ?? 0) > 0,
     );
-    const target = withCorpus[0] ?? projects[0];
+    const target = remembered ?? withCorpus[0] ?? projects[0];
     await router.replace(`/projects/${target.id}/assistant`);
   } catch {
     loading.value = false;

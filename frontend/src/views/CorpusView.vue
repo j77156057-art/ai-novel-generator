@@ -585,19 +585,22 @@ const cleanRuleCounts = computed(() => {
   flex-wrap: wrap;
   border: 0;
   border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
+  transition: background 0.13s ease;
 }
 .novel-item:last-child {
   border-bottom: 0;
 }
 .novel-item:hover {
-  background: var(--bg-sunken);
+  background: color-mix(in srgb, var(--bg-sunken) 72%, transparent);
 }
 .novel-item.active {
   background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .novel-item:focus-visible {
   outline: 2px solid var(--accent);
@@ -678,6 +681,8 @@ const cleanRuleCounts = computed(() => {
 }
 .hit-text {
   max-height: 120px;
+  padding-left: 12px;
+  border-left: 2px solid var(--accent-line);
 }
 .chunk-skeleton .skeleton-line {
   width: 100%;
@@ -704,6 +709,7 @@ const cleanRuleCounts = computed(() => {
 /* ---- 语料清洗 ---- */
 .clean-intro {
   margin-bottom: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.7;
 }
 .clean-form {
@@ -776,10 +782,10 @@ const cleanRuleCounts = computed(() => {
 }
 .edit-before {
   text-decoration: line-through;
-  color: var(--err, #b3261e);
+  color: var(--danger);
 }
 .edit-after {
-  color: var(--ok, #1e7d32);
+  color: var(--ok);
 }
 .edit-reason {
   font-size: var(--fs-xs);
@@ -804,11 +810,11 @@ const cleanRuleCounts = computed(() => {
   max-width: 560px;
   max-height: 86vh;
   overflow: auto;
-  padding: 20px;
+  padding: 24px;
   border: 1px solid var(--border);
-  border-radius: var(--radius, 10px);
-  background: var(--bg, #fff);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-lg);
 }
 .clean-confirm-lead {
   margin: 8px 0 12px;
@@ -823,11 +829,11 @@ const cleanRuleCounts = computed(() => {
   margin-top: 6px;
 }
 .clean-scope .err-text {
-  color: var(--err, #b3261e);
+  color: var(--danger);
   font-weight: 700;
 }
 .clean-scope .dry-line {
-  color: var(--warn, #a15c00);
+  color: var(--warn);
 }
 .modal-actions {
   margin-top: var(--gap);

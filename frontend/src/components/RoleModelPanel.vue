@@ -15,6 +15,7 @@
  *      `role === "writer" ? … : …`** —— 那种二元判断加第三个角色时必漏。
  */
 import { computed, reactive, ref, useId, watch } from "vue";
+import { api } from "@/api/client";
 import type {
   LlmProviderMeta,
   LlmRole,
@@ -173,7 +174,9 @@ function switchProvider(p: string): void {
   form.baseUrl = "";
   // 思考档位与渠道强弱相关：换渠道后回到「默认 high」（不拿 A 渠道的档位去打 B）。
   form.thinking = "high";
-  localError.value = null;
+  // 本机模型清单属于上一个渠道的探测结果，换渠道即作废。
+  localModels.value = [];
+  localModelsError.value = null;
 }
 
 function splitChain(text: string): string[] {
@@ -183,8 +186,24 @@ function splitChain(text: string): string[] {
     .filter(Boolean);
 }
 
-/** 当前渠道是否要求自定义端点（通用 OpenAI 接口）。 */
+/** 当前渠道是否要求自定义端点（通用 OpenAI 接口 / 本地 Ollama）。 */
 const showBaseUrl = computed(() => needsBaseUrl(form.provider));
+
+/** 不需要在页面填 key 的渠道：本地兜底、本地模型（Ollama 不校验鉴权）。 */
+const hideKeyField = computed(
+  () => form.provider === "local" || form.provider === "ollama",
+);
+
+/** Command Code 的 key 默认来自环境变量，输入框只是可选的临时覆盖。 */
+const keyPlaceholder = computed(() => {
+  if (props.config?.has_key) {
+    return `已保存 ${props.config.api_key_masked}，输入新 key 可替换`;
+  }
+  if (form.provider === "command-code") {
+    return "留空 = 使用环境变量 COMMAND_CODE_GOAT_KEY";
+  }
+  return "粘贴 API key";
+});
 
 /** 解析非负整数输入：空 → null（不改）；非法 → undefined（调用方报错）。 */
 function parseCount(raw: string): number | null | undefined {
@@ -199,8 +218,35 @@ const modelOptions = computed(() => {
   const opts = new Set<string>(props.providers[form.provider]?.default_models ?? []);
   if (form.model.trim()) opts.add(form.model.trim());
   for (const m of splitChain(form.chainText)) opts.add(m);
+  // 本机 Ollama 实际安装的模型：只在这一轮探测成功后加入候选。
+  for (const m of localModels.value) opts.add(m);
   return [...opts];
 });
+
+// —— 本地模型探测（仅 Ollama）：把「本机已安装」直接变成可选项 ——
+const localModels = ref<string[]>([]);
+const localBusy = ref(false);
+const localModelsError = ref<string | null>(null);
+
+async function fetchLocalModels(): Promise<void> {
+  if (localBusy.value) return;
+  localBusy.value = true;
+  localModelsError.value = null;
+  try {
+    const res = await api.listLocalModels(form.baseUrl.trim() || undefined);
+    if (!res.ok) {
+      localModelsError.value = res.error || "读取失败";
+      return;
+    }
+    localModels.value = res.models;
+    if (!form.model.trim() && res.models.length) form.model = res.models[0];
+    if (!res.models.length) localModelsError.value = "本机还没有安装模型（先 ollama pull）";
+  } catch (err) {
+    localModelsError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    localBusy.value = false;
+  }
+}
 
 /** 该渠道+模型可选的思考档位（后端实测表下发，前端不重复渠道知识）。 */
 const thinkingControl = computed(() => props.config?.thinking_control ?? null);
@@ -366,7 +412,7 @@ function submitTest(): void {
     </div>
 
     <!-- API key（脱敏显示，可切换；空 = 不改） -->
-    <div v-if="form.provider !== 'local'" class="field">
+    <div v-if="!hideKeyField" class="field">
       <label :for="`${uid}-key`">API key（留空 = 不改变已存 key）</label>
       <div class="key-row">
         <input
@@ -375,7 +421,7 @@ function submitTest(): void {
           :type="form.showKey ? 'text' : 'password'"
           v-model="form.apiKey"
           autocomplete="off"
-          :placeholder="config?.has_key ? `已保存 ${config.api_key_masked}，输入新 key 可替换` : '粘贴 API key'"
+          :placeholder="keyPlaceholder"
         />
         <button type="button" class="btn ghost" @click="form.showKey = !form.showKey">
           {{ form.showKey ? "隐藏" : "显示" }}
@@ -402,6 +448,20 @@ function submitTest(): void {
       <datalist :id="`${uid}-models`">
         <option v-for="m in modelOptions" :key="m" :value="m" />
       </datalist>
+      <div v-if="form.provider === 'ollama'" class="local-model-row">
+        <button
+          type="button"
+          class="btn ghost sm"
+          :disabled="localBusy"
+          @click="fetchLocalModels"
+        >
+          {{ localBusy ? "读取中…" : "读取本机已安装模型" }}
+        </button>
+        <span v-if="localModels.length" class="faint">
+          找到 {{ localModels.length }} 个模型，可直接从下拉候选里选
+        </span>
+      </div>
+      <p v-if="localModelsError" class="faint chain-note local-model-error">{{ localModelsError }}</p>
     </div>
 
     <!-- 候选模型链：仅 Writer 有（限流切换）；助手 / 蒸馏是单模型配置 -->
@@ -517,24 +577,25 @@ function submitTest(): void {
 
 <style scoped>
 .role-panel {
-  border: var(--border-w) solid var(--border-strong);
+  border: var(--border-w) solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-elev);
-  padding: var(--gap);
+  padding: 20px;
   display: flex;
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  box-shadow: var(--shadow-sm);
 }
 /* 三个角色用不同的左侧色带 + 标题文案双编码，一眼看出「这是三件事」 */
 .role-panel.writer {
-  border-left: 4px solid var(--accent);
+  border-left: 3px solid var(--accent);
 }
 .role-panel.assistant {
-  border-left: 4px solid var(--info);
+  border-left: 3px solid var(--info);
 }
 .role-panel.distiller {
-  border-left: 4px solid var(--warn, #b7791f);
+  border-left: 3px solid var(--warn, #b7791f);
 }
 .role-head {
   display: flex;
@@ -546,7 +607,9 @@ function submitTest(): void {
   min-width: 0;
 }
 .role-title {
-  font-size: var(--fs-md);
+  font-family: var(--font-display);
+  font-size: var(--fs-2xl);
+  font-weight: 600;
   margin: 0;
 }
 .role-purpose {
@@ -609,6 +672,16 @@ function submitTest(): void {
   font-size: var(--fs-xs);
   margin: 0;
   line-height: 1.6;
+}
+.local-model-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.local-model-error {
+  color: var(--warn, #b7791f);
 }
 .floor-toggle {
   display: flex;

@@ -62,7 +62,7 @@ export function pendingActionRiskMeta(
       hint:
         typeof detail.risk_hint === "string" && detail.risk_hint
           ? detail.risk_hint
-          : "确认后只创建一条待批提案，不改任何正文；要到项目页批准并应用后才会写入（改写类会覆盖目标段落）。",
+          : "确认后只创建一条待批提案，不改任何正文；可在卡片上直接「批准并写入」，或去项目页处理。改写类会覆盖目标段落。",
     };
   }
   return {
@@ -91,6 +91,7 @@ export function sourceLabel(source: string): string {
   if (s === "fact") return "事实账本";
   if (s === "run") return "助手运行日志";
   if (s === "generated") return "助手调动生成的正文";
+  if (s === "web" || s === "tavily") return "联网检索";
   return "其它来源";
 }
 

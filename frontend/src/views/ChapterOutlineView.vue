@@ -11,6 +11,7 @@ defineOptions({ name: "ChapterOutlineView" });
 import { computed, onActivated, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ApiError, api } from "@/api/client";
+import ProjectNav from "@/components/ProjectNav.vue";
 import type {
   ChapterOutlineDraftResponse,
   ChapterOutlineEntry,
@@ -368,6 +369,7 @@ onActivated(() => {
 
 <template>
   <div class="outline-page">
+  <ProjectNav :project-id="projectId" />
   <header class="page-head">
     <div class="eyebrow">02 · 项目</div>
     <h1>
@@ -636,7 +638,7 @@ onActivated(() => {
 }
 .flash {
   margin-bottom: var(--gap-md);
-  padding: 10px 14px;
+  padding: 11px 15px;
   border-radius: var(--radius-md);
   border: var(--border-w) solid var(--border);
   background: var(--bg-elev);
@@ -679,9 +681,11 @@ onActivated(() => {
 }
 .sub-title {
   margin: var(--gap-md) 0 var(--gap-sm);
-  font-size: var(--fs-sm);
-  font-weight: 650;
-  color: var(--fg);
+  color: var(--accent-ink);
+  font-size: var(--fs-3xs);
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
 }
 .chapter-row {
   border-top: var(--border-w) solid var(--border);
@@ -693,9 +697,15 @@ onActivated(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 12px 0;
+  margin: 0 -8px;
+  padding: 12px 8px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   list-style: none;
+  transition: background 0.13s ease;
+}
+.chapter-head:hover {
+  background: var(--bg-sunken);
 }
 .chapter-head::-webkit-details-marker { display: none; }
 .chapter-head-line {
@@ -707,7 +717,7 @@ onActivated(() => {
 .chapter-head-line::before {
   content: "▸";
   color: var(--accent-ink);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 .chapter-row[open] .chapter-head-line::before { content: "▾"; }
 .chapter-preview {
@@ -802,6 +812,7 @@ onActivated(() => {
 }
 .invalid-report {
   border-color: var(--danger);
+  border-left: 3px solid var(--danger);
 }
 
 /*

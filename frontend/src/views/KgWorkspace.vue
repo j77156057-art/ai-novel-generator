@@ -3,7 +3,9 @@ defineOptions({ name: "KgWorkspace" });
 import { computed, nextTick, onActivated, onMounted, reactive, ref } from "vue";
 import { useRoute } from "vue-router";
 import { api } from "@/api/client";
+import ProjectNav from "@/components/ProjectNav.vue";
 import type {
+  KgStoryTimelineResponse,
   KgV3BookScopeResponse,
   KgV3Character,
   KgV3CorpusWindowsResponse,
@@ -12,6 +14,11 @@ import type {
   KgV3JudgeFindingsResponse,
   KgV3Relation,
   KgV3Slice,
+  KgWorldviewEntity,
+  KgWorldviewResponse,
+  NovelOut,
+  ProjectOut,
+  StyleNarrativeConflictsResponse,
 } from "@/api/types";
 import { buildCorpusStatus } from "@/utils/corpusStatus.js";
 import { buildBookScopeStatus, chapterTag } from "@/utils/kgChapter.js";
@@ -24,6 +31,7 @@ const TABS = [
   { key: "slice", label: "切片预览" },
   { key: "intel", label: "人物情报" },
   { key: "events", label: "事件时间线" },
+  { key: "story", label: "世界观与时间线" },
   { key: "judge", label: "Judge 面板" },
   { key: "graph", label: "关系与节奏" },
   { key: "worker", label: "Worker 状态" },
@@ -44,6 +52,7 @@ const TAB_LOADERS: Record<TabKey, () => Promise<unknown> | void> = {
   slice: loadSlice,
   intel: loadCharacters,
   events: loadEvents,
+  story: loadStory,
   judge: loadFindings,
   graph: loadGraphTab,
   worker: loadWorker,
@@ -246,6 +255,148 @@ async function loadEvents() {
   }
 }
 
+// ---------- 世界观与剧情时间线（纯读） ----------
+const storyProject = ref<ProjectOut | null>(null);
+const storyNovels = ref<NovelOut[]>([]);
+/** "book" = 本书（生成正文/续写书）；"ref" = 参考书。 */
+const storyMode = ref<"book" | "ref">("book");
+const storyRefId = ref<number | null>(null);
+/** 本书对应的语料 id：续写项目就是 active/continuation 那本；纯生成项目为 null。 */
+const storyBookNovelId = computed<number | null>(() =>
+  storyProject.value?.active_novel_id
+  ?? storyProject.value?.continuation_novel_id
+  ?? null,
+);
+/** 当前实际查询的 novel_id（null = 纯生成项目的本书）。 */
+const storyNovelId = computed<number | null>(() =>
+  storyMode.value === "book" ? storyBookNovelId.value : storyRefId.value,
+);
+/** 参考书下拉项：去掉与「本书」同一本，避免同一个选项出现两次。 */
+const storyRefOptions = computed(() =>
+  storyNovels.value.filter((n) => n.id !== storyBookNovelId.value),
+);
+const storySelectValue = computed(() =>
+  storyMode.value === "book" ? "book" : String(storyRefId.value ?? ""),
+);
+const storyBookLabel = computed(() => {
+  const title = storyNovels.value.find((n) => n.id === storyBookNovelId.value)?.title;
+  return title ? `本书（生成正文）· ${title}` : "本书（生成正文）";
+});
+const worldview = ref<KgWorldviewResponse | null>(null);
+const storyTimeline = ref<KgStoryTimelineResponse | null>(null);
+const storyLoading = ref(false);
+const storyErr = ref<string | null>(null);
+const storyFrom = ref(1);
+const storyOffset = ref(0);
+const STORY_LIMIT = 200;
+
+const worldviewGroups = computed(() => {
+  const w = worldview.value;
+  if (!w) return [];
+  return [
+    { key: "factions", label: "势力 / 组织", items: w.factions },
+    { key: "locations", label: "地点", items: w.locations },
+    { key: "power_systems", label: "体系与境界", items: w.power_systems },
+    { key: "resources", label: "资源 / 物品", items: w.resources },
+    { key: "rules", label: "世界规则", items: w.rules },
+  ];
+});
+
+/** 作者定义体系的境界阶梯（来自「力量体系」页，不是 KG）。 */
+function definedRealms(it: KgWorldviewEntity): string[] {
+  const raw = it.attrs?.境界;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((r) => (typeof r === "string" ? r : String((r as { 名称?: string })?.名称 ?? "")))
+    .filter(Boolean);
+}
+
+/** 作者定义的档位层（名称/档位/人数）。 */
+function definedTiers(it: KgWorldviewEntity): string[] {
+  const raw = it.attrs?.档位层;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((t) => {
+      const o = t as { 名称?: string; 档位?: string; 人数?: string };
+      return [o?.名称, o?.档位, o?.人数].filter(Boolean).join(" / ");
+    })
+    .filter(Boolean);
+}
+
+/** 当前是否在看「本书」（生成正文/续写书）。 */
+const storyIsBook = computed(() => storyMode.value === "book");
+
+/** 本书还没有任何 KG 时给一句明确解释，而不是让五组全显示（空）。 */
+const storyEmpty = computed(() => {
+  if (!worldview.value || !storyTimeline.value) return false;
+  const entityCount = worldviewGroups.value.reduce((n, g) => n + g.items.length, 0);
+  return storyIsBook.value && entityCount === 0 && (storyTimeline.value.total ?? 0) === 0;
+});
+
+function onStoryBookChange(e: Event) {
+  const raw = (e.target as HTMLSelectElement).value;
+  if (raw === "book") {
+    storyMode.value = "book";
+    storyRefId.value = null;
+  } else {
+    storyMode.value = "ref";
+    storyRefId.value = Number(raw);
+  }
+  storyOffset.value = 0;
+  void refreshStory();
+}
+
+async function loadStoryData() {
+  const [w, t] = await Promise.all([
+    api.kgV3Worldview(projectId, storyNovelId.value),
+    api.kgV3StoryTimeline(projectId, storyNovelId.value, {
+      fromChapter: storyFrom.value,
+      offset: storyOffset.value,
+      limit: STORY_LIMIT,
+    }),
+  ]);
+  worldview.value = w;
+  storyTimeline.value = t;
+}
+
+async function loadStory() {
+  storyLoading.value = true;
+  storyErr.value = null;
+  try {
+    // 需要项目信息才能判断「本书」对应哪本语料（续写项目挂在 active/continuation 上）。
+    const [proj, novels] = await Promise.all([
+      storyProject.value ?? api.getProject(projectId),
+      storyNovels.value.length ? Promise.resolve(storyNovels.value) : api.listNovels(),
+    ]);
+    storyProject.value = proj;
+    storyNovels.value = novels;
+    await loadStoryData();
+  } catch (e) {
+    storyErr.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    storyLoading.value = false;
+  }
+}
+
+async function refreshStory() {
+  storyLoading.value = true;
+  storyErr.value = null;
+  try {
+    await loadStoryData();
+  } catch (e) {
+    storyErr.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    storyLoading.value = false;
+  }
+}
+
+function storyPage(dir: -1 | 1) {
+  const total = storyTimeline.value?.total ?? 0;
+  const next = storyOffset.value + dir * STORY_LIMIT;
+  storyOffset.value = Math.max(0, Math.min(next, Math.max(0, total - 1)));
+  void refreshStory();
+}
+
 // ---------- Tab 6 Worker 状态 ----------
 // 视图层只关心「线程活没活/有没有积压/failed/stuck/empty」——后端 summary 已聚合，
 // 前端只负责展示 + 失败行手动重捞的二次确认。
@@ -304,6 +455,40 @@ async function requeueSelected() {
     workerMsg.value = e instanceof Error ? e.message : String(e);
   } finally {
     requeueBusy.value = false;
+  }
+}
+
+const backfillBusy = ref(false);
+const recoverBusy = ref(false);
+
+/** 为「一行入队记录都没有」的已生成段补建任务。 */
+async function runBackfill() {
+  backfillBusy.value = true;
+  workerMsg.value = null;
+  try {
+    const r = await api.kgV3Backfill(projectId);
+    workerMsg.value = `补抽：入队 ${r.enqueued.length} 段；跳过 ${r.skipped.length} 段` +
+      (r.skipped.length ? `（${r.skipped.slice(0, 3).map((x) => `段 ${x.segment_no}:${x.reason}`).join("；")}…）` : "");
+    await loadWorker();
+  } catch (e) {
+    workerMsg.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    backfillBusy.value = false;
+  }
+}
+
+/** 把停在 running 的超时行重新入队。 */
+async function runRecover() {
+  recoverBusy.value = true;
+  workerMsg.value = null;
+  try {
+    const r = await api.kgV3Recover(projectId, true);
+    workerMsg.value = `恢复：重入队 ${r.requeued} 段；缺失正文 ${r.missing.length} 段`;
+    await loadWorker();
+  } catch (e) {
+    workerMsg.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    recoverBusy.value = false;
   }
 }
 
@@ -525,9 +710,12 @@ const styleTruncated = ref(false);
 const styleTotal = ref(0);
 const styleLoading = ref(false);
 const styleErr = ref<string | null>(null);
+const conflicts = ref<StyleNarrativeConflictsResponse | null>(null);
+const conflictsErr = ref<string | null>(null);
 async function loadStyleWarnings() {
   styleLoading.value = true;
   styleErr.value = null;
+  conflictsErr.value = null;
   try {
     const r = await api.kgV3StyleWarnings(projectId);
     styleWarnings.value = r.warnings;
@@ -535,6 +723,12 @@ async function loadStyleWarnings() {
     styleTotal.value = r.total;
   } catch (e) {
     styleErr.value = e instanceof Error ? e.message : String(e);
+  }
+  // 档案冲突与「逐段告警」是两件事：一边失败不能拖垮另一边。
+  try {
+    conflicts.value = await api.styleNarrativeConflicts(projectId);
+  } catch (e) {
+    conflictsErr.value = e instanceof Error ? e.message : String(e);
   } finally {
     styleLoading.value = false;
   }
@@ -575,6 +769,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 
 <template>
   <div class="kg-page">
+  <ProjectNav :project-id="projectId" />
   <header class="page-head">
     <div class="eyebrow">KG v3.0</div>
     <h1>知识图谱工作台</h1>
@@ -983,15 +1178,15 @@ function bucketChipStyle(bucket: string): Record<string, string> {
               <text
                 :x="(e.x1 + e.x2) / 2" :y="(e.y1 + e.y2) / 2 - 3"
                 text-anchor="middle"
-                style="font-size: 9px" fill="var(--fg-faint)"
+                style="font-size: var(--fs-3xs)" fill="var(--fg-faint)"
               >{{ e.rel_type }}</text>
             </g>
             <g v-for="n in ringNodes" :key="n.name">
               <circle :cx="n.x" :cy="n.y" r="16" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1" />
-              <text :x="n.x" :y="n.y + 4" text-anchor="middle" style="font-size: 10px; font-weight: 700" fill="var(--accent-ink)">{{
+              <text :x="n.x" :y="n.y + 4" text-anchor="middle" style="font-size: var(--fs-3xs); font-weight: 700" fill="var(--accent-ink)">{{
                 n.name.length > 4 ? n.name.slice(0, 4) : n.name
               }}</text>
-              <text :x="n.x" :y="n.y + 28" text-anchor="middle" style="font-size: 10px" fill="var(--fg)">{{ n.name }}</text>
+              <text :x="n.x" :y="n.y + 28" text-anchor="middle" style="font-size: var(--fs-3xs)" fill="var(--fg)">{{ n.name }}</text>
             </g>
           </svg>
           <div class="faint" style="font-size: var(--fs-xs)">线宽 = 关系强度；颜色 = 关系类型（ally 绿 / enemy 红 / romantic 朱 / mentor 蓝 / subordinate 黄）</div>
@@ -1037,8 +1232,8 @@ function bucketChipStyle(bucket: string): Record<string, string> {
           />
           <g v-for="p in curvePts" :key="p.i">
             <circle :cx="p.x" :cy="p.y" r="4" fill="var(--accent-ink)" />
-            <text :x="p.x" :y="p.y - 8" text-anchor="middle" style="font-size: 9px" fill="var(--fg-muted)">{{ p.strength.toFixed(1) }}</text>
-            <text :x="p.x" :y="p.H - 6" text-anchor="middle" style="font-size: 9px" fill="var(--fg-faint)">ch{{ p.chapter ?? "?" }}</text>
+            <text :x="p.x" :y="p.y - 8" text-anchor="middle" style="font-size: var(--fs-3xs)" fill="var(--fg-muted)">{{ p.strength.toFixed(1) }}</text>
+            <text :x="p.x" :y="p.H - 6" text-anchor="middle" style="font-size: var(--fs-3xs)" fill="var(--fg-faint)">ch{{ p.chapter ?? "?" }}</text>
           </g>
         </svg>
         <div class="list" style="margin-top: 8px">
@@ -1051,6 +1246,114 @@ function bucketChipStyle(bucket: string): Record<string, string> {
         </div>
       </template>
       <div v-else-if="curveFrom.trim() && curveTo.trim()" class="empty" style="margin-top: 12px">这两位之间暂无关系演变记录</div>
+    </template>
+  </section>
+
+  <!-- ============ 世界观与剧情时间线 ============ -->
+  <section v-else-if="activeTab === 'story'" class="card">
+    <div class="card-title">
+      世界观与剧情时间线
+      <span class="hint">纯读：默认「本书」的 KG（生成正文/续写书），可切换参考书对照</span>
+      <button class="btn" :disabled="storyLoading" @click="refreshStory">刷新</button>
+    </div>
+    <div class="row" style="margin-bottom: var(--gap)">
+      <div class="field" style="flex: 1; min-width: 220px">
+        <label>书</label>
+        <select class="input" :value="storySelectValue" @change="onStoryBookChange">
+          <option value="book">{{ storyBookLabel }}</option>
+          <option v-for="n in storyRefOptions" :key="n.id" :value="String(n.id)">
+            参考书 · {{ n.title || `语料 #${n.id}` }}
+          </option>
+        </select>
+      </div>
+      <div class="field" style="width: 130px">
+        <label>起始章</label>
+        <input class="input" type="number" min="1" v-model.number="storyFrom" @change="refreshStory" />
+      </div>
+      <span v-if="!storyRefOptions.length" class="faint">没有其他参考书，可先只看本书。</span>
+    </div>
+
+    <div v-if="storyLoading" class="empty"><span class="spinner" /> 加载中…</div>
+    <div v-else-if="storyErr" class="notice err">{{ storyErr }}</div>
+    <template v-else>
+      <div v-if="storyEmpty" class="notice">
+        本书还没有 KG 数据。正文生成后由 KG 抽取自动入库；也可以去「Worker 状态」点「补抽缺失段」。
+      </div>
+      <div class="world-groups">
+        <div v-for="g in worldviewGroups" :key="g.key" class="world-group">
+          <div class="world-head">
+            <b>{{ g.label }}</b>
+            <span class="tag">{{ g.items.length }}</span>
+          </div>
+          <div v-if="!g.items.length" class="faint">（空）</div>
+          <div v-for="(it, i) in g.items.slice(0, 30)" :key="`${g.key}-${i}`" class="world-item">
+            <div class="world-name">
+              {{ it.name }}
+              <span v-if="it.source === 'defined'" class="tag ok">作者定义</span>
+              <span v-if="it.mention_count" class="faint">· 提及 {{ it.mention_count }}</span>
+              <span v-if="it.first_chapter" class="tag mono">
+                第 {{ it.first_chapter }}{{ it.last_chapter && it.last_chapter !== it.first_chapter ? `–${it.last_chapter}` : "" }} 章
+              </span>
+            </div>
+            <template v-if="it.source === 'defined'">
+              <div v-if="it.attrs?.类型" class="faint">类型：{{ it.attrs.类型 }}</div>
+              <div v-if="definedRealms(it).length" class="faint">
+                境界：{{ definedRealms(it).join(" → ") }}
+              </div>
+              <div v-if="definedTiers(it).length" class="faint">
+                档位：{{ definedTiers(it).join(" · ") }}
+              </div>
+              <div v-if="it.attrs?.说明" class="faint">{{ it.attrs.说明 }}</div>
+            </template>
+            <div v-if="it.aliases?.length" class="faint">别名：{{ it.aliases.join("、") }}</div>
+            <div v-if="it.evidence?.length" class="faint">
+              证据：{{ it.evidence[0].summary || it.evidence[0].event_type }}
+            </div>
+          </div>
+          <div v-if="g.items.length > 30" class="faint">… 共 {{ g.items.length }} 条，仅显示前 30</div>
+        </div>
+      </div>
+
+      <div class="timeline-head">
+        <b>剧情时间线</b>
+        <span class="faint">
+          共 {{ storyTimeline?.total ?? 0 }} 条
+          <template v-if="storyTimeline?.total">
+            · 当前 {{ storyOffset + 1 }}–{{ Math.min(storyOffset + STORY_LIMIT, storyTimeline?.total ?? 0) }}
+          </template>
+        </span>
+        <button class="btn sm" :disabled="storyOffset <= 0 || storyLoading" @click="storyPage(-1)">上一页</button>
+        <button
+          class="btn sm"
+          :disabled="storyOffset + STORY_LIMIT >= (storyTimeline?.total ?? 0) || storyLoading"
+          @click="storyPage(1)"
+        >下一页</button>
+      </div>
+      <div v-if="!(storyTimeline?.events?.length)" class="empty">
+        {{ storyIsBook
+          ? "本书在这个起点之后还没有事件（可调起始章，或先在 Worker 状态补抽 KG）。"
+          : "这个起点之后还没有事件（换本书或调起始章）。" }}
+      </div>
+      <div v-else class="list">
+        <div
+          v-for="(ev, i) in (storyTimeline?.events ?? [])"
+          :key="`ev-${i}`"
+          class="list-item"
+          style="align-items: flex-start"
+        >
+          <span class="tag mono">第 {{ ev.chapter ?? "?" }} 章</span>
+          <div style="flex: 1">
+            <div class="prose" style="font-size: var(--fs-sm)">
+              <span v-if="ev.who" class="tag">{{ ev.who }}</span>
+              <span v-if="ev.where" class="faint"> @ {{ ev.where }}</span>
+              {{ ev.what || ev.result || "（无描述）" }}
+            </div>
+            <div v-if="ev.result && ev.what" class="faint" style="font-size: var(--fs-xs)">
+              结果：{{ ev.result }}
+            </div>
+          </div>
+        </div>
+      </div>
     </template>
   </section>
 
@@ -1103,6 +1406,18 @@ function bucketChipStyle(bucket: string): Record<string, string> {
         </button>
         <span class="faint" style="font-size: var(--fs-xs)">
           仅 failed/stuck 行可重捞；自动重试只覆盖网络抖动
+        </span>
+      </div>
+
+      <div class="row" style="margin-bottom: var(--gap)">
+        <button class="btn" :disabled="backfillBusy" @click="runBackfill">
+          {{ backfillBusy ? "补抽中…" : "补抽缺失段" }}
+        </button>
+        <button class="btn" :disabled="recoverBusy" @click="runRecover">
+          {{ recoverBusy ? "恢复中…" : "恢复卡住的 running 行" }}
+        </button>
+        <span class="faint" style="font-size: var(--fs-xs)">
+          补抽 = 为「一行任务记录都没有」的已生成段补建入队；恢复 = 重捞超时的 running 行
         </span>
       </div>
 
@@ -1160,6 +1475,10 @@ function bucketChipStyle(bucket: string): Record<string, string> {
       <div class="style-summary">
         <span><b>{{ styleTotal }}</b> 条</span>
         <span v-if="styleTruncated" class="tag warn">已截断 · 仅显示最新 500 条</span>
+        <span v-if="conflicts?.conflicts.length" class="tag err">
+          档案冲突 {{ conflicts.conflicts.length }}
+        </span>
+        <button class="btn sm" :disabled="styleLoading" @click="loadStyleWarnings">刷新</button>
       </div>
     </header>
 
@@ -1171,6 +1490,36 @@ function bucketChipStyle(bucket: string): Record<string, string> {
         「偏离是否只是篇幅差异」的依据。
       </p>
     </details>
+
+    <div v-if="!styleLoading" class="conflict-block">
+      <div v-if="conflictsErr" class="notice err">读取档案冲突失败：{{ conflictsErr }}</div>
+      <template v-else-if="conflicts">
+        <div class="conflict-head">
+          <b>档案禁用词冲突</b>
+          <span class="tag" :class="conflicts.can_generate ? 'ok' : 'err'">
+            {{ conflicts.can_generate ? "不挡生成" : "会挡住生成" }}
+          </span>
+          <span v-if="!conflicts.has_archive" class="tag">无文风档案</span>
+        </div>
+        <p class="faint">{{ conflicts.note }}</p>
+        <ul v-if="conflicts.conflicts.length" class="conflict-list">
+          <li v-for="(c, i) in conflicts.conflicts" :key="`cf-${i}`">
+            <span class="tag err">{{ c.dimension }}</span>
+            <b>{{ c.word }}</b>
+            <span class="faint">规则：{{ c.rule_text }}</span>
+            <div class="faint">上下文：{{ c.context }}</div>
+          </li>
+        </ul>
+        <ul v-if="conflicts.attributive.length" class="conflict-list">
+          <li v-for="(c, i) in conflicts.attributive" :key="`at-${i}`">
+            <span class="tag warn">{{ c.dimension }}</span>
+            <b>{{ c.word }}</b>
+            <span class="faint">名词性用法 · 不挡生成</span>
+            <div class="faint">上下文：{{ c.context }}</div>
+          </li>
+        </ul>
+      </template>
+    </div>
 
     <div v-if="styleLoading" class="empty"><span class="spinner" /> 加载中…</div>
     <div v-else-if="styleErr" class="notice err">{{ styleErr }}</div>
@@ -1224,17 +1573,23 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   font: inherit;
   font-size: var(--fs-sm);
   font-weight: 600;
-  padding: 8px 14px;
+  padding: 8px 15px;
   border-radius: var(--radius-full);
   border: var(--border-w) solid var(--border);
   background: var(--bg-elev);
   color: var(--fg-muted);
   cursor: pointer;
+  transition: background .14s ease, border-color .14s ease, color .14s ease;
+}
+.tab:hover {
+  border-color: var(--accent-line);
+  color: var(--accent-ink);
 }
 .tab.active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-fg);
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent-ink);
+  box-shadow: var(--shadow-sm);
 }
 .list-item.active {
   border-color: var(--accent);
@@ -1270,7 +1625,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   font-size: var(--fs-sm);
 }
 .corpus-status__label {
-  font-size: 10px;
+  font-size: var(--fs-3xs);
   font-weight: 700;
   letter-spacing: .12em;
   text-transform: uppercase;
@@ -1337,7 +1692,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .style-head h2 { margin: 0; }
 .style-kicker {
   color: var(--accent-ink, var(--accent));
-  font-size: 10px;
+  font-size: var(--fs-3xs);
   font-weight: 700;
   letter-spacing: .15em;
   text-transform: uppercase;
@@ -1372,6 +1727,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   padding: 14px 16px;
   border: 1px solid var(--border);
   border-left: 3px solid var(--warn);
+  border-radius: var(--radius-md);
   background: var(--bg);
 }
 .warn-head {
@@ -1388,7 +1744,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .warn-time {
   color: var(--fg-muted);
   font-family: var(--mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 .warn-pct {
   padding: 2px 8px;
@@ -1396,7 +1752,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   border-radius: 999px;
   color: var(--warn);
   font-family: var(--mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
 }
 .warn-meta { color: var(--fg-muted); font-size: var(--fs-xs); }
@@ -1415,14 +1771,14 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .warn-raw { margin-top: 8px; }
 .warn-raw summary {
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   cursor: pointer;
 }
 .warn-raw span {
   margin-right: 16px;
   color: var(--fg-muted);
   font-family: var(--mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 @media (max-width: 720px) {
   .style-head { flex-direction: column; align-items: flex-start; }
@@ -1460,6 +1816,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   margin-top: 10px;
   padding: 12px;
   border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   background: var(--bg);
 }
 .judge-rule {
@@ -1471,7 +1828,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .judge-rule code {
   color: var(--fg);
   font-family: var(--mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 .judge-rule-desc { color: var(--fg-muted); }
 .judge-list { display: flex; flex-direction: column; gap: 8px; }
@@ -1479,6 +1836,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   padding: 12px 14px;
   border: 1px solid var(--border);
   border-left: 3px solid var(--warn);
+  border-radius: var(--radius-md);
   background: var(--bg);
 }
 .judge-item.err { border-left-color: var(--danger); }
@@ -1493,7 +1851,7 @@ function bucketChipStyle(bucket: string): Record<string, string> {
   border-radius: 999px;
   background: var(--warn-soft);
   color: var(--warn);
-  font-size: 10px;
+  font-size: var(--fs-3xs);
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -1501,26 +1859,26 @@ function bucketChipStyle(bucket: string): Record<string, string> {
 .judge-rule-name {
   color: var(--fg-muted);
   font-family: var(--mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 .judge-entity { font-size: var(--fs-sm); }
 .judge-seg {
   color: var(--fg-muted);
   font-family: var(--mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
-.judge-exempt { margin-left: auto; font-size: 11px; }
+.judge-exempt { margin-left: auto; font-size: var(--fs-2xs); }
 .judge-msg { margin: 8px 0 0; font-size: var(--fs-sm); line-height: 1.7; }
 .judge-evidence { margin-top: 6px; }
 .judge-evidence summary {
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   cursor: pointer;
 }
 .judge-evidence div {
   color: var(--fg-muted);
   font-family: var(--mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 .judge-exemptions { margin-top: var(--gap-lg); }
 .judge-exemptions summary {
@@ -1571,4 +1929,66 @@ function bucketChipStyle(bucket: string): Record<string, string> {
     height: calc(100dvh - 134px);
   }
 }
+.world-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: var(--gap);
+  margin-bottom: var(--gap);
+}
+.world-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+}
+.world-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.world-item {
+  padding: 5px 0;
+  border-top: 1px dashed var(--border);
+  font-size: var(--fs-xs);
+  line-height: 1.7;
+}
+.world-item:first-of-type { border-top: 0; }
+.world-name { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.timeline-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: var(--gap) 0 8px;
+  padding-top: var(--gap);
+  border-top: 1px solid var(--border);
+}
+.conflict-block {
+  margin: 10px 0 var(--gap);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.conflict-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.conflict-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.7;
+}
+.conflict-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 0;
+  border-top: 1px dashed var(--border);
+}
+.conflict-list li:first-child { border-top: 0; }
 </style>

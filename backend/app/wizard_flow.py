@@ -83,7 +83,7 @@ CUSTOM_PREFIX = "custom:"
 
 #: 受保护的步骤：不允许跳过、不允许被排序挪走。
 #: 方向是分支入口，语料决定后面问什么，确认是提交前的最后一道闸。
-PROTECTED_STEPS = {"branch", "corpus", "confirm"}
+PROTECTED_STEPS = {"branch", "corpus", "cards", "confirm"}
 
 #: 自定义问题只允许落到这些真实字段（当前只有「这本书大概讲什么」）。
 #: 想加新字段必须先改这里 + 提交流程，模型不能自己填。
@@ -125,7 +125,15 @@ def _base_step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, A
         # 再问题材与故事：此时语料已定，问答可围绕「像不像那本书」展开。
         steps.append("genre")
         steps += story.plan_steps(answers, tuple(GENRE_HINTS))
-        steps += ["style", "length", "chapters", "outline", "confirm"]
+        # 力量体系只对「有修行/能力阶梯」的题材有意义：仙侠/奇幻/游戏。
+        if (answers.get("genre") or "") in POWER_GENRES:
+            steps.append("system")
+        steps += ["style", "length", "chapters", "outline"]
+        # 先出大纲时，把刚生成的角色卡单独作为一步给用户过目/编辑，
+        # 而不是等到提交时静默生成、只能在结果气泡里看到。
+        if answers.get("outline", True):
+            steps.append("cards")
+        steps.append("confirm")
         return steps
     if kind == KIND_CONTINUATION:
         steps = [FIRST_STEP, "continue_from"]
@@ -134,6 +142,9 @@ def _base_step_order(kind: str | None, answers: dict[str, Any], ctx: dict[str, A
             steps.append("book_scope")
         if ctx.get("needs_distill"):
             steps.append("distill")
+        # 只看被续写书的题材：仙侠/奇幻/游戏才需要力量体系。
+        if book_genre(answers, ctx) in POWER_GENRES:
+            steps.append("system")
         steps += ["length", "chapters", "confirm"]
         return steps
     if kind == KIND_ROLE:
@@ -268,6 +279,8 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
         "length": _q_length,
         "chapters": _q_chapters,
         "outline": _q_outline,
+        "cards": _q_cards,
+        "system": _q_system,
         "continue_from": _q_continue_from,
         "character": _q_character,
         "scene": _q_scene,
@@ -303,6 +316,40 @@ def build_question(step: str, answers: dict[str, Any], ctx: dict[str, Any]) -> d
     return body
 
 
+#: 会生成「力量体系」的题材。其它题材不插入这一步。
+POWER_GENRES = {"仙侠", "奇幻", "游戏"}
+
+
+def book_genre(answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """取「被续写书」的题材。
+
+    语料表里的 `genre` 经常是空的（导入时没填），所以顺序是：
+    书目 genre → 书名做关键词识别（修真/修仙→仙侠、玄幻→奇幻…）→ 项目题材。
+    """
+    ids = _corpus_ids(answers, ctx)
+    book_id: int | None = None
+    if len(ids) == 1:
+        book_id = ids[0]
+    elif answers.get("book_scope") in ids:
+        book_id = int(answers["book_scope"])
+    elif ctx.get("continuation_novel_id") in ids:
+        book_id = int(ctx["continuation_novel_id"])
+    if book_id is None:
+        return str(ctx.get("project_genre") or "")
+
+    novel = next(
+        (n for n in (ctx.get("novels") or []) if int(n.get("id") or 0) == book_id),
+        None,
+    )
+    if novel is None:
+        return str(ctx.get("project_genre") or "")
+    genre = str(novel.get("genre") or "").strip()
+    if genre:
+        return genre
+    hits = story.detect_genres(str(novel.get("title") or ""), tuple(GENRE_HINTS))
+    return hits[0] if hits else str(ctx.get("project_genre") or "")
+
+
 #: 允许「跳过 = 用默认值」的步骤。方向与确认不可跳过；语料可跳过，
 #: 默认值 = 空列表（等价于「不投喂，自由生成」）。
 SKIPPABLE = {
@@ -314,6 +361,7 @@ SKIPPABLE = {
     "world",
     "power",
     "scale",
+    "system",
     "style",
     "length",
     "chapters",
@@ -553,6 +601,32 @@ def _msg_outline(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
     )
 
 
+def _msg_system(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    return (
+        "这一步决定正文里的境界阶梯与代价。选「生成」会在提交时让模型按题材、"
+        "世界观约束和金手指边界产出一套体系与档位，并直接写进项目；"
+        "之后仍可在「项目资产 → 力量体系」里逐项修改。\n\n"
+        "不想现在定就选「先跳过」——正文会只按人物与剧情推进，不写具体境界。"
+    )
+
+
+def _msg_cards(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
+    chars = ctx.get("bible_characters") or []
+    generated = sum(1 for c in chars if c.get("has_card"))
+    if not chars:
+        return (
+            "这次大纲里没有抽出角色，所以没有角色卡可以确认。直接继续就行，"
+            "之后也可以在项目工作台手动补角色。"
+        )
+    return (
+        f"大纲和 {len(chars)} 个角色已经生成，其中有 {generated} 张角色卡。"
+        "卡里写了身份、外貌、说话方式和口头禅——正文会照着这些写，"
+        "所以现在改比写完之后再改便宜。\n\n"
+        "可以直接在下面逐张编辑、重生成或移除角色；没问题就点「角色卡没问题，继续」，"
+        "进入最后一步确认。"
+    )
+
+
 def _msg_continue_from(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> str:
     segments = list(ctx.get("segments") or [])
     if segments:
@@ -645,6 +719,8 @@ _MESSAGE_BUILDERS = {
     "length": _msg_length,
     "chapters": _msg_chapters,
     "outline": _msg_outline,
+    "cards": _msg_cards,
+    "system": _msg_system,
     "continue_from": _msg_continue_from,
     "character": _msg_character,
     "scene": _msg_scene,
@@ -728,6 +804,10 @@ def ack_for(step: str, value: Any, answers: dict[str, Any], ctx: dict[str, Any])
         return f"好，这次连着写 {value} 段。" + ("（串行，时间也按倍数走）" if int(value) > 1 else "")
     if step == "outline":
         return "好，先出大纲，你确认后我再动笔。" if value else "好，直接开写，跳过大纲确认。"
+    if step == "system":
+        return "好，提交时生成力量体系与档位。" if value else "好，这次不生成力量体系。"
+    if step == "cards":
+        return "好，角色卡就按现在这样。"
     if step == "continue_from":
         return "好，从第 1 段开始。" if not value else f"好，接在第 {value} 段之后。"
     if step == "character":
@@ -951,6 +1031,23 @@ def _q_style(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> 
     }
 
 
+def _q_system(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": "要不要按题材生成一套力量体系？",
+        "why": "正文会按它写境界、代价与压制关系。现在生成可以直接用；之后也能在"
+        "「项目资产 → 力量体系」里改或重生成。选「跳过」就不注入体系。",
+        "card": {
+            "type": "confirm",
+            "field": "system",
+            "default": True,
+            "options": [
+                {"value": True, "label": "让 AI 生成体系与档位", "desc": "提交时按题材与设定生成并保存"},
+                {"value": False, "label": "先跳过", "desc": "不生成体系，正文只按人物与剧情推进"},
+            ],
+        },
+    }
+
+
 def _q_length(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     title = "这一段写多少字？" if kind == KIND_CONTINUATION else "每段写多少字？"
     return {
@@ -998,6 +1095,20 @@ def _q_outline(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -
                 {"value": True, "label": "先出大纲，我确认后再写", "desc": "更稳，多一轮确认"},
                 {"value": False, "label": "直接开写", "desc": "最快拿到正文，风险自负"},
             ],
+        },
+    }
+
+
+def _q_cards(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": "角色卡要改吗？",
+        "why": "角色卡决定正文里每个人怎么说话、知道什么。现在改最便宜，确认后就进最后一步。",
+        "card": {
+            "type": "cards",
+            "field": "cards",
+            "default": True,
+            "action_label": "角色卡没问题，继续",
+            "characters": list(ctx.get("bible_characters") or []),
         },
     }
 
@@ -1265,7 +1376,7 @@ def validate(
             raise AnswerError(f"段数需在 {CHAPTERS_MIN}–{CHAPTERS_MAX} 之间")
         return value
 
-    if step in {"outline", "confirm"}:
+    if step in {"outline", "cards", "confirm", "system"}:
         if isinstance(raw, bool):
             return raw
         if isinstance(raw, (int, float)) and raw in (0, 1):
@@ -1344,6 +1455,10 @@ def echo_label(step: str, value: Any, kind: str | None, ctx: dict[str, Any]) -> 
         return f"{value} 段"
     if step == "outline":
         return "先出大纲再写" if value else "直接开写"
+    if step == "system":
+        return "生成力量体系" if value else "跳过力量体系"
+    if step == "cards":
+        return "角色卡已确认"
     if step == "continue_from":
         return "从第 1 段开始" if not value else f"接在第 {value} 段之后"
     if step == "confirm":
@@ -1375,16 +1490,26 @@ def summary_rows(kind: str | None, answers: dict[str, Any], ctx: dict[str, Any])
             if value in (None, ""):
                 continue
             add(step, story.STORY_LABELS.get(step, step), value)
+        if (answers.get("genre") or "") in POWER_GENRES and "system" in step_order(kind, answers, ctx):
+            add("system", "力量体系", answers.get("system", True))
         add("style", "风格", answers.get("style") or "未选")
         add("length", "单段字数", answers.get("length", ctx.get("generation_length") or 3000))
         add("chapters", "本次段数", answers.get("chapters", 1))
         add("outline", "先出大纲", answers.get("outline", True))
+        if (
+            answers.get("outline", True)
+            and "cards" in step_order(kind, answers, ctx)
+            and "cards" in (ctx.get("history") or [])
+        ):
+            add("cards", "角色卡", answers.get("cards", True))
     elif kind == KIND_CONTINUATION:
         add("continue_from", "续写起点", answers.get("continue_from", 0))
         if len(_corpus_ids(answers, ctx)) > 1:
             add("book_scope", "续写书", answers.get("book_scope", BOOK_SCOPE_NONE))
         if ctx.get("needs_distill"):
             add("distill", "提炼档位", answers.get("distill"))
+        if "system" in step_order(kind, answers, ctx):
+            add("system", "力量体系", answers.get("system", True))
         add("length", "单段字数", answers.get("length", ctx.get("generation_length") or 3000))
         add("chapters", "本次段数", answers.get("chapters", 1))
     elif kind == KIND_ROLE:

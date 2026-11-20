@@ -38,6 +38,7 @@ from app.models import Generation, Project
 from app.schemas import StrictRequest
 
 router = APIRouter(prefix="/api", tags=["generation"])
+
 _logger = logging.getLogger(__name__)
 
 

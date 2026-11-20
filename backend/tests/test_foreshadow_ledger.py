@@ -209,6 +209,31 @@ def _seed_kg(db, project: Project, holes: list[tuple[str, str, int | None]]) -> 
     db.commit()
 
 
+def test_kg_linkage_skips_dialogue_questions(db):
+    """从正文对话里误抽的问句不能进台账候选（「你是谁？」不是伏笔）。"""
+    project = _seed_project(db)
+    _seed_kg(
+        db,
+        project,
+        [
+            ("铜镜为什么裂了？", "open", 3),
+            ("“你是谁？", "open", 4),
+            ("顾青梧问：“谁触发的？", "open", 5),
+            ("你是谁？", "open", 6),
+            ("还有呢？", "open", 7),
+            ("那我们现在该怎么办？", "open", 8),
+        ],
+    )
+
+    importable = list_foreshadows(project.id, db)["kg"]["importable"]
+    assert [hole["question"] for hole in importable] == ["铜镜为什么裂了？"]
+
+    created = import_from_kg(db, project.id, [])
+    db.commit()
+    assert created["created"] == 1
+    assert created["titles"] == ["铜镜为什么裂了？"]
+
+
 def test_kg_linkage_importable_only_generated_open_and_deduped(db):
     project = _seed_project(db)
     _seed_kg(

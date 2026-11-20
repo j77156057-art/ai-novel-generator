@@ -23,7 +23,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -156,3 +156,47 @@ def get_digest_verify(novel_id: int, db: Session = Depends(get_db)) -> dict:
         "checks": (row.verify_json or {}).get("checks") or {},
         "stats": row.stats_json or {},
     }
+
+
+@router.get("/books/{novel_id}/digests")
+def list_digest_versions(
+    novel_id: int,
+    limit: int = Query(default=20, ge=1, le=50),
+    db: Session = Depends(get_db),
+) -> dict:
+    """这本书的摘要历史（active + archived，新的在前）。
+
+    只回摘要字段（不带正文）；正文按需走单条详情，避免列表一次传几十份全文。
+    """
+    from sqlalchemy import select
+
+    from app.models import BookDigest
+    from app.style.digest import digest_summary
+
+    rows = db.scalars(
+        select(BookDigest)
+        .where(
+            BookDigest.novel_id == novel_id,
+            BookDigest.status.in_(("active", "archived")),
+        )
+        .order_by(BookDigest.id.desc())
+        .limit(limit)
+    ).all()
+    return {"items": [digest_summary(r) for r in rows]}
+
+
+@router.get("/books/{novel_id}/digests/{digest_id}")
+def get_digest_version(
+    novel_id: int, digest_id: int, db: Session = Depends(get_db)
+) -> dict:
+    """单条摘要详情（含正文），供历史版本对比。"""
+    from app.models import BookDigest
+    from app.style.digest import digest_summary
+
+    row = db.get(BookDigest, digest_id)
+    if row is None or row.novel_id != novel_id:
+        raise HTTPException(status_code=404, detail="摘要版本不存在")
+    out = digest_summary(row)
+    out["payload"] = row.payload or {}
+    out["text"] = row.text or ""
+    return out

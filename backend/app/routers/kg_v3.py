@@ -167,7 +167,9 @@ def get_events(
 @router.get("/worldview")
 def get_worldview(
     project_id: int,
-    novel_id: int = Query(..., description="要出的书（raw_novels.id）"),
+    novel_id: int | None = Query(
+        None, description="要出的书（raw_novels.id）；不传 = 本书（生成正文）"
+    ),
     db: Session = Depends(get_db),
 ) -> dict:
     """世界观清单：势力/组织、地点、体系与境界、资源与规则，各带证据章号。"""
@@ -180,7 +182,9 @@ def get_worldview(
 @router.get("/timeline")
 def get_timeline(
     project_id: int,
-    novel_id: int = Query(..., description="要出的书（raw_novels.id）"),
+    novel_id: int | None = Query(
+        None, description="要出的书（raw_novels.id）；不传 = 本书（生成正文）"
+    ),
     from_chapter: int = Query(1, ge=1),
     to_chapter: int | None = Query(None, ge=1),
     offset: int = Query(0, ge=0),
