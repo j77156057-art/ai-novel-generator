@@ -22,12 +22,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from copy import deepcopy
 
 from sqlalchemy import select
 
 from app.generation.planning import model_json
+
+logger = logging.getLogger(__name__)
 
 #: 一次扩展最多追加几个剧情点。
 MAX_EXTEND_COUNT = 3
@@ -327,6 +330,17 @@ def _extend_chapters(db, project, count: int) -> dict:
             "status": "outline_invalid",
             "message": "章纲写入被拒：" + str(detail.get("message") or detail)[:300],
         }
+    # 立刻把存档对齐到新的「下一章」：否则 /timeline 读到的还是旧的
+    # done=全部、current=None，界面显示「计划写完了」，和已放行的生成矛盾。
+    try:
+        from app.generation.engine import _timeline_progress, _timeline_state_for
+
+        written, chapter_based = _timeline_progress(db, project)
+        if chapter_based:
+            _timeline_state_for(project, written, None, db=db, chapter_based=True)
+    except Exception as exc:  # noqa: BLE001 - 对齐失败不推翻已写入的章纲
+        logger.warning("扩展规划后对齐时间线失败：%s", exc)
+
     return {
         "status": "extended",
         "chapters": [item["chapter"] for item in draft.get("entries") or []],
