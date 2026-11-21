@@ -16,7 +16,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 from app.db import Base  # noqa: E402
 import app.models  # noqa: F401,E402
 from app.generation.engine import _AUTO_REPLAN_FAILED_REASON  # noqa: E402
-from app.generation.timeline import plan_timeline, state_to_dict  # noqa: E402
+from app.generation.timeline import (  # noqa: E402
+    plan_timeline,
+    state_to_dict,
+    timeline_progress,
+)
 from app.models import Generation, Project  # noqa: E402
 from app.routers.assistant import _gate_fallback_action, _gate_state  # noqa: E402
 
@@ -110,6 +114,23 @@ def test_plan_exhausted_proposes_extend_plan(db):
     assert card is not None
     assert card["body"]["kind"] == "extend_plan"
     assert card["body"]["action_body"] == {"count": 1}
+
+
+def test_chapter_mode_ignores_legacy_segment_budget():
+    """章模式不看段预算：段模式遗留的 seg_counts 不能把整本书卡成 needs_review。"""
+    st = plan_timeline(19)
+    node = st.nodes[st.current_node]
+    node.title = "真实节点"
+    node.entry_condition = "进入"
+    node.exit_condition = "退出"
+    st.seg_counts[node.id] = 99  # 远超额度的历史段计数
+
+    segment = timeline_progress(st)
+    chapter = timeline_progress(st, chapter_based=True)
+
+    assert segment["status"] == "needs_review"
+    assert chapter["status"] == "active"
+    assert chapter["budget_exhausted"] is False
 
 
 def test_healthy_project_has_no_fallback_card(db):

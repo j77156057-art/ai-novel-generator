@@ -5068,7 +5068,7 @@ def _judge_and_advance(
         _persist_timeline_state(db, project, st)
         out["current_node"] = st.current_node
         out["done"] = sorted(st.done)
-        out.update(timeline_progress(st))
+        out.update(timeline_progress(st, chapter_based=True))
         return out
 
     st = _timeline_state_for(project, written_segments, provider=None, db=None)
@@ -5133,11 +5133,15 @@ def _enforce_timeline_gate(
     *,
     had_saved_plan: bool,
     strict: bool,
+    chapter_based: bool = False,
 ):
     """三种写前闸门的唯一实现（生成与开流前预检共用，避免两处漂移）。
 
     `strict=False`（重写旧章节）只放行：不抛 409、也不触发自动重规划，
     状态只通过提示块里的说明行透出。
+
+    `chapter_based=True` 时不判 `needs_review`：章模式的预算是章区间，
+    段计数 `seg_counts` 可能是从段模式遗留的旧账（见 `timeline_progress`）。
 
     返回可能被「自动重规划」改写过的 state。
     """
@@ -5155,7 +5159,7 @@ def _enforce_timeline_gate(
         })
     if not st.current_node or st.current_node not in st.nodes:
         return st
-    status = timeline_progress(st)["status"]
+    status = timeline_progress(st, chapter_based=chapter_based)["status"]
     # 占位/半填计划重试：不能只在「还没写过段落」时才救——历史上规划器允许
     # 空 exit / 占位标题，存量写到一半的项目会因此永远卡在 needs_planning。
     # 失败或重规划后仍不可用时写留痕，避免每次生成入口都重复调模型。
@@ -5180,7 +5184,7 @@ def _enforce_timeline_gate(
                 st.nodes[node.id] = node
             st.planning_status = "llm"
             st.planning_reason = ""
-        status = timeline_progress(st)["status"]
+        status = timeline_progress(st, chapter_based=chapter_based)["status"]
         if status == "needs_planning":
             # 模型没给出可用计划，或当前节点是仍缺字段的人工节点：留痕后停手。
             st.planning_status = "placeholder"
@@ -5224,11 +5228,14 @@ def preflight_timeline_gate(
         return
     if chapter is None and chapter_based:
         chapter = written_segments + 1
+    synced = False
     if chapter is not None and has_chapter_ranges(st):
         st = sync_node_for_chapter(st, chapter)
+        synced = True
     _enforce_timeline_gate(
         st, project, written_segments, provider, db,
         had_saved_plan=had_saved_plan, strict=True,
+        chapter_based=chapter_based or synced,
     )
 
 
@@ -5267,17 +5274,22 @@ def current_node_prompt(
         return None
     if chapter is None and chapter_based:
         chapter = written_segments + 1
+    synced = False
     if chapter is not None and has_chapter_ranges(st):
         st = sync_node_for_chapter(st, chapter)
+        synced = True
+    chapter_mode = chapter_based or synced
     # 三种写前闸门：与 `preflight_timeline_gate` 共用同一实现（见该函数）。
     st = _enforce_timeline_gate(
         st, project, written_segments, provider, db,
         had_saved_plan=had_saved_plan, strict=strict,
+        chapter_based=chapter_mode,
     )
     if not st.current_node or st.current_node not in st.nodes:
         return None
     prompt = build_node_prompt(
-        st.nodes[st.current_node], st.current_beat, timeline_progress(st)
+        st.nodes[st.current_node], st.current_beat,
+        timeline_progress(st, chapter_based=chapter_mode),
     )
     # 章模式：支线与主线并行——注入点仍是章号对齐的主干节点（上面那块），
     # 支线单独给一小块「本段可穿插推进」的说明；绝不把支线当当前节点。

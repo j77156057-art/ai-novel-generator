@@ -745,9 +745,11 @@ def _gate_state(db: Session, project: Project) -> dict[str, Any] | None:
                 )
             except Exception:  # noqa: BLE001 - 章号解析失败就退回段模式
                 chapter = None
+        synced = False
         if chapter is not None and has_chapter_ranges(st):
             st = sync_node_for_chapter(st, chapter)
-        prog = timeline_progress(st)
+            synced = True
+        prog = timeline_progress(st, chapter_based=chapter_based or synced)
         return {
             "status": prog["status"],
             "plan_exhausted": bool(prog["plan_exhausted"]),

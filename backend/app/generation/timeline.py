@@ -214,11 +214,17 @@ def force_complete_current(state: TimelineState, *, keep_current: bool = False) 
     return st
 
 
-def timeline_progress(state: TimelineState) -> dict:
+def timeline_progress(state: TimelineState, *, chapter_based: bool = False) -> dict:
     """双进度：主线（节点 done 比）+ 支线（额度消耗比）。分母都固定。
 
     额外给出生成入口需要的状态：`needs_planning`（节点缺起点/退出条件或还是
     占位标题）、`needs_review`（预算用尽但退出条件未被证据证实）。
+
+    `chapter_based=True`（章号驱动）时**不判** `needs_review`：段预算是
+    segment 模式的口径，章模式一个节点分到几章由 `chapter_start/end` 决定，
+    `done` 也由章区间重算。历史项目从段模式切到章模式后，`seg_counts` 里
+    残留的段数会把整本书永久卡在「预算用尽」——这正是「写到第 45 章突然
+    全是生成失败」的根因。
     """
     main_done = sum(1 for nid in state.done if state.nodes.get(nid) and state.nodes[nid].kind == "main")
     main_progress = main_done / state.total_main if state.total_main else 0.0
@@ -233,7 +239,9 @@ def timeline_progress(state: TimelineState) -> dict:
         )
     )
     exhausted = bool(
-        node and state.seg_counts.get(node.id, 0) >= node.segment_budget
+        not chapter_based
+        and node
+        and state.seg_counts.get(node.id, 0) >= node.segment_budget
     )
     main_nodes = {nid for nid, n in state.nodes.items() if n.kind == "main"}
     plan_exhausted = bool(main_nodes) and main_nodes <= state.done
