@@ -90,8 +90,9 @@ def test_chapter_mode_extends_outline_instead_of_dead_node(db, monkeypatch):
     db.commit()
     seen = {}
 
-    def fake_extend(db_, project_, count):
+    def fake_extend(db_, project_, provider_, count):
         seen["count"] = count
+        seen["provider"] = provider_ is not None
         return {"status": "extended", "chapters": [2], "message": "已补第 2 章"}
 
     monkeypatch.setattr(pe, "_extend_chapters", fake_extend)
@@ -101,26 +102,39 @@ def test_chapter_mode_extends_outline_instead_of_dead_node(db, monkeypatch):
     assert result["status"] == "extended"
     assert result["chapters"] == [2]
     assert seen["count"] == 1
+    assert seen["provider"] is True
 
 
-def test_extend_chapters_drafts_then_applies(db, monkeypatch):
-    """补章 = 起草 → 校验 → 应用；写入必须带 confirm 与来源指纹。"""
-    import app.routers.chapter_outline as co
+_NODE = {
+    "title": "门后的声音", "emotion": "悬疑",
+    "entry_condition": "沈砚回到旧院区", "exit_condition": "沈砚发现门后有人",
+    "beats": ["靠近", "听见"],
+}
 
+
+def _chapter_fixture(db):
     proj = _project(db)
     proj.outline = ["第1章 夜雨"]
     db.add(Generation(project_id=proj.id, segment_no=1,
                       chapter_range="第1章", text="正文"))
     db.commit()
-    seen = {}
+    return proj
 
-    def fake_draft(project_id, body, db_):
-        seen["draft"] = (body.from_chapter, body.to_chapter)
-        return {
-            "entries": [{"chapter": 2, "entry": "第2章《门后的声音》：沈砚听见门后有人叫他"}],
-            "validation": {"ok": True},
-            "source_fingerprint": "fp-1",
-        }
+
+def _fake_draft(project_id, body, db_):
+    return {
+        "entries": [{"chapter": 2, "entry": "第2章《门后的声音》：沈砚听见门后有人叫他"}],
+        "validation": {"ok": True},
+        "source_fingerprint": "fp-1",
+    }
+
+
+def test_extend_chapters_drafts_then_applies_with_node(db, monkeypatch):
+    """补章 = 起草 → 校验 → 应用，并同时追加一个剧情点。"""
+    import app.routers.chapter_outline as co
+
+    proj = _chapter_fixture(db)
+    seen = {}
 
     def fake_apply(project_id, body, db_):
         seen["apply"] = (
@@ -129,15 +143,59 @@ def test_extend_chapters_drafts_then_applies(db, monkeypatch):
         )
         return {"ok": True}
 
-    monkeypatch.setattr(co, "draft_chapter_outline", fake_draft)
+    monkeypatch.setattr(co, "draft_chapter_outline", _fake_draft)
     monkeypatch.setattr(co, "apply_chapter_outline", fake_apply)
+    monkeypatch.setattr(pe, "_propose", lambda *a, **k: ([dict(_NODE)], []))
+    monkeypatch.setattr(pe, "_out_of_authority", lambda *a, **k: [])
 
-    result = pe._extend_chapters(db, proj, 1)
+    result = pe._extend_chapters(db, proj, Provider(), 1)
 
     assert result["status"] == "extended"
     assert result["chapters"] == [2]
-    assert seen["draft"] == (2, 2)
+    assert [n["title"] for n in result["nodes"]] == ["门后的声音"]
     assert seen["apply"] == (2, 2, True, "fp-1", 1)
+    db.refresh(proj)
+    assert len(proj.plot_timeline["order"]) == 4
+    last_id = proj.plot_timeline["order"][-1]
+    assert proj.plot_timeline["nodes"][last_id]["title"] == "门后的声音"
+
+
+def test_extend_chapters_maps_provider_error_to_readable_status(db, monkeypatch):
+    """渠道断连要变成可读状态，不能把 500 抛给前端。"""
+    import app.routers.chapter_outline as co
+
+    proj = _chapter_fixture(db)
+    monkeypatch.setattr(co, "draft_chapter_outline", _fake_draft)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("CommandCode chat 调用失败: Remote end closed connection")
+
+    monkeypatch.setattr(pe, "_propose", boom)
+
+    result = pe._extend_chapters(db, proj, Provider(), 1)
+
+    assert result["status"] == "proposal_failed"
+    assert "调用模型" in result["message"]
+
+
+def test_extend_chapters_does_not_write_outline_when_nodes_fail(db, monkeypatch):
+    """节点不合格时整批不落库：不能出现「章纲加了、情节没加」。"""
+    import app.routers.chapter_outline as co
+
+    proj = _chapter_fixture(db)
+    applied = {"count": 0}
+
+    monkeypatch.setattr(co, "draft_chapter_outline", _fake_draft)
+    monkeypatch.setattr(
+        co, "apply_chapter_outline",
+        lambda *a, **k: applied.__setitem__("count", applied["count"] + 1),
+    )
+    monkeypatch.setattr(pe, "_propose", lambda *a, **k: ([], [{"error": "bad"}]))
+
+    result = pe._extend_chapters(db, proj, Provider(), 1)
+
+    assert result["status"] == "proposal_failed"
+    assert applied["count"] == 0
 
 
 def test_extend_appends_node_and_contract(db, monkeypatch):

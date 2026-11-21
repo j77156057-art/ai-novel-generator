@@ -112,7 +112,8 @@ def _parse_nodes(text: str, count: int) -> list[dict]:
 
 
 def _propose(provider, authority: str, nodes: dict, count: int,
-             feedback: str | None) -> tuple[list[dict], list[dict]]:
+             feedback: str | None,
+             extra: str | None = None) -> tuple[list[dict], list[dict]]:
     known = [
         f"- 「{node.get('title')}」"
         for node in (nodes or {}).values()
@@ -124,6 +125,9 @@ def _propose(provider, authority: str, nodes: dict, count: int,
         + ("\n".join(known) or "（无）")
         + f"\n\n输出 {count} 个节点的 JSON。"
     )
+    if extra:
+        # 章模式：新节点必须长在刚补的章纲上，不能另起一条故事线。
+        user += "\n\n" + extra
     if feedback:
         user += "\n\n—— 纠正上一次不合格的输出 ——\n" + feedback
     return model_json(
@@ -207,6 +211,85 @@ def _next_node_id(nodes: dict) -> str:
     return f"n{max(used) + 1 if used else 1}"
 
 
+def _check_nodes(provider, authority: str, nodes: dict, count: int,
+                 proposals: list[dict], failures: list[dict],
+                 extra: str | None = None
+                 ) -> tuple[list[dict], list[str], list[dict]]:
+    """逐个做权威核对（段模式）；不合格就回灌让模型自改一次。
+
+    返回 `(accepted, problems, failures)`。`accepted` 为空时调用方必须按失败
+    处理——**不能**先把节点写进去再发现不合格。
+    """
+    problems: list[str] = []
+    feedback = None
+    for attempt in range(MAX_PROPOSE_ATTEMPTS):
+        accepted: list[dict] = []
+        problems = []
+        for node in proposals:
+            violations = _out_of_authority(provider, authority, node)
+            if violations:
+                items = "、".join(f"{v['entity']}（{v['kind']}）" for v in violations)
+                problems.append(
+                    f"「{node['title']}」引入了保存权威之外的物件/人物/地点：{items}。"
+                    "请改用权威里已有的东西承担同样的剧情功能。"
+                )
+                continue
+            accepted.append(node)
+        if accepted:
+            return accepted, problems, failures
+        if attempt + 1 < MAX_PROPOSE_ATTEMPTS:
+            feedback = ("\n".join(problems)
+                        + f"\n请重新输出这 {count} 个节点，并严格满足上面的问题。")
+            proposals, more = _propose(
+                provider, authority, nodes, count, feedback, extra=extra
+            )
+            failures += more
+            if not proposals:
+                break
+    return [], problems, failures
+
+
+def _append_chapter_nodes(db, project, accepted, timeline, nodes, order):
+    """章模式追加节点：只写节点与顺序，不写段契约（契约是段号维度的）。
+
+    章区间不在这里算——`state_from_dict` 每次读都会按当前章纲长度重排，
+    写入 0 占位，随后 `_timeline_state_for` 会把区间与当前节点对齐并落库。
+    """
+    new_nodes = dict(nodes)
+    new_order = list(order)
+    first = new_nodes.get(new_order[0]) if new_order else None
+    budget = int(first.get("segment_budget") or 1) if isinstance(first, dict) else 1
+    added: list[dict] = []
+    for node in accepted:
+        nid = _next_node_id(new_nodes)
+        new_nodes[nid] = {
+            "id": nid,
+            "kind": "main",
+            "title": node["title"],
+            "emotion": node["emotion"],
+            "entry_condition": node["entry_condition"],
+            "exit_condition": node["exit_condition"],
+            "beats": list(node["beats"]),
+            "opens": [],
+            "closes": [],
+            "segment_budget": budget,
+            "parent": None,
+            "children": [],
+            "chapter_start": 0,
+            "chapter_end": 0,
+            "source": "llm",
+        }
+        new_order.append(nid)
+        added.append({"node_id": nid, "title": node["title"]})
+
+    new_timeline = dict(timeline)
+    new_timeline["nodes"] = new_nodes
+    new_timeline["order"] = new_order
+    project.plot_timeline = new_timeline
+    db.commit()
+    return added
+
+
 def _write_extension(db, project, accepted, authority, timeline, nodes, order,
                      written):
     """只追加：新节点进 order，预写 next_segment 起的契约，历史不动。"""
@@ -268,13 +351,14 @@ def _write_extension(db, project, accepted, authority, timeline, nodes, order,
     }
 
 
-def _extend_chapters(db, project, count: int) -> dict:
-    """章模式：按章纲补 count 章，让「当前章号」重新落进某个节点区间。
+def _extend_chapters(db, project, provider, count: int) -> dict:
+    """章模式：补 count 章章纲 + 追加 count 个剧情点，再把区间/当前节点对齐。
 
-    为什么不能直接追加节点：章模式下当前剧情点由章号决定，追加的节点没有
-    章纲条目、也就没有章区间，`node_for_chapter` 永远选不到它——那是一个
-    写不进正文的死节点。补章之后节点区间会按新大纲长度重算
-    （`state_from_dict` 每次都重算），`plan_exhausted` 自然解除。
+    只补章不补节点，等于把原有节点摊薄到更多章上：写完仍然 plan_exhausted，
+    并没有真正「扩展规划」。所以一章配一个剧情点，两者一起补。
+
+    顺序是「先起草 → 先核对 → 再写库」：节点不合格时整批不落库，
+    不会出现「章纲加了、情节没加」的半成品。
     """
     from fastapi import HTTPException
 
@@ -292,7 +376,14 @@ def _extend_chapters(db, project, count: int) -> dict:
     try:
         draft = draft_chapter_outline(
             project.id,
-            ChapterOutlineDraft(from_chapter=start, to_chapter=end),
+            ChapterOutlineDraft(
+                from_chapter=start,
+                to_chapter=end,
+                # 章纲校验会拒绝引用「权威外的专名」：提前把这个边界说清楚，
+                # 少一次「起草成功、校验失败」的往返。
+                direction="顺承前文；只使用权威里已有的人名、物件、地点，"
+                          "不要新造专名、题记或引号里的术语。",
+            ),
             db,
         )
     except HTTPException as exc:
@@ -308,6 +399,51 @@ def _extend_chapters(db, project, count: int) -> dict:
             "message": "起草出的章纲没通过校验，未写入："
                        + str(draft.get("validation"))[:300],
         }
+    timeline = project.plot_timeline if isinstance(project.plot_timeline, dict) else None
+    if not timeline:
+        return {"status": "no_plan", "message": "这个项目没有时间线状态，无法扩展规划。"}
+    authority = _authority_text(project)
+    if not authority:
+        return {
+            "status": "no_saved_authority",
+            "message": "没有保存权威，不能扩展规划：新剧情点没有可核对的依据。",
+        }
+    nodes = timeline.get("nodes") if isinstance(timeline.get("nodes"), dict) else {}
+    order = [nid for nid in (timeline.get("order") or [])
+             if nid in nodes and (nodes[nid] or {}).get("kind", "main") == "main"]
+    if not order:
+        order = [nid for nid, node in nodes.items()
+                 if isinstance(node, dict) and node.get("kind", "main") == "main"]
+
+    chapter_lines = "\n".join(
+        f"- 第{item['chapter']}章：{item['entry']}"
+        for item in draft.get("entries") or []
+    )
+    extra = (
+        "【本次新补的章纲】（新剧情点必须建立在这些章的事件之上，不得另起故事线）\n"
+        + (chapter_lines or "（无）")
+    )
+    try:
+        proposals, failures = _propose(
+            provider, authority, nodes, count, None, extra=extra
+        )
+    except Exception as exc:  # noqa: BLE001 - 渠道断连等要回可读原因，不 500
+        return {
+            "status": "proposal_failed",
+            "message": f"调用模型生成新剧情点失败：{exc}"[:300],
+        }
+    if not proposals:
+        return {
+            "status": "proposal_failed",
+            "failures": failures,
+            "message": "模型没有给出可用的新剧情点（格式或内容不合格）；章纲未写入。",
+        }
+    # 章模式不再跑封闭清单审计：那是**正文级**证据核对（多阶段模型调用，
+    # 单节点约 1 分钟），用来审规划节点不划算，会把一次扩展拖到十分钟。
+    # 规划节点的把关有两道更贴合的：章纲本身已过 authority 术语校验，
+    # 节点提案的提示词也限定「只用权威里已有的人名/物件/地点」。
+    accepted = proposals
+
     entries = [
         ChapterOutlineEntryIn(chapter=int(item["chapter"]), entry=item["entry"])
         for item in draft.get("entries") or []
@@ -330,6 +466,9 @@ def _extend_chapters(db, project, count: int) -> dict:
             "status": "outline_invalid",
             "message": "章纲写入被拒：" + str(detail.get("message") or detail)[:300],
         }
+    # 章纲已确认可用，才追加节点：两者要么一起成功，要么都不写。
+    added_nodes = _append_chapter_nodes(db, project, accepted, timeline, nodes, order)
+
     # 立刻把存档对齐到新的「下一章」：否则 /timeline 读到的还是旧的
     # done=全部、current=None，界面显示「计划写完了」，和已放行的生成矛盾。
     try:
@@ -344,9 +483,10 @@ def _extend_chapters(db, project, count: int) -> dict:
     return {
         "status": "extended",
         "chapters": [item["chapter"] for item in draft.get("entries") or []],
-        "nodes": [],
+        "nodes": added_nodes,
         "contracts": [],
-        "message": f"已补第 {start}–{end} 章章纲；剧情点区间会按新章纲长度重算。",
+        "message": f"已补第 {start}–{end} 章章纲并追加 {len(added_nodes)} 个剧情点；"
+                   "节点区间按新章纲重算。",
     }
 
 
@@ -365,9 +505,8 @@ def extend_plan(db, project, provider, *, count: int = 1) -> dict:
         }
 
     if _chapter_based(db, project):
-        # 章模式不能追加「没有章纲条目」的死节点；正确的扩展是补章，
-        # 让区间按新长度重算（见 `_extend_chapters`）。
-        return _extend_chapters(db, project, count)
+        # 章模式：补章纲 + 追加节点，一章配一个剧情点（见 `_extend_chapters`）。
+        return _extend_chapters(db, project, provider, count)
 
     nodes = timeline.get("nodes") if isinstance(timeline.get("nodes"), dict) else {}
     order = [nid for nid in (timeline.get("order") or [])
@@ -393,32 +532,14 @@ def extend_plan(db, project, provider, *, count: int = 1) -> dict:
             "message": "模型没有给出可用的新剧情点（格式或内容不合格）。",
         }
 
-    feedback = None
-    problems: list[str] = []
-    for attempt in range(MAX_PROPOSE_ATTEMPTS):
-        accepted, problems = [], []
-        for node in proposals:
-            violations = _out_of_authority(provider, authority, node)
-            if violations:
-                items = "、".join(f"{v['entity']}（{v['kind']}）" for v in violations)
-                problems.append(
-                    f"「{node['title']}」引入了保存权威之外的物件/人物/地点：{items}。"
-                    "请改用权威里已有的东西承担同样的剧情功能。"
-                )
-                continue
-            accepted.append(node)
-        if accepted:
-            return _write_extension(
-                db, project, accepted, authority, timeline, nodes, order,
-                _written_segments(db, project),
-            )
-        if attempt + 1 < MAX_PROPOSE_ATTEMPTS:
-            feedback = ("\n".join(problems)
-                        + f"\n请重新输出这 {count} 个节点，并严格满足上面的问题。")
-            proposals, more = _propose(provider, authority, nodes, count, feedback)
-            failures += more
-            if not proposals:
-                break
+    accepted, problems, failures = _check_nodes(
+        provider, authority, nodes, count, proposals, failures
+    )
+    if accepted:
+        return _write_extension(
+            db, project, accepted, authority, timeline, nodes, order,
+            _written_segments(db, project),
+        )
 
     detail = "；".join(problems) if problems else "新剧情点不合格。"
     return {
