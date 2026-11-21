@@ -706,7 +706,7 @@ export const api = {
     onChunk: (text: string) => void,
     onDone: (meta: GenerateStreamDoneMeta) => void,
     signal?: AbortSignal,
-    onReasoning?: (chars: number) => void,
+    onReasoning?: (chars: number, text?: string) => void,
     onStage?: (stage: GenerationStageEvent) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
@@ -741,12 +741,12 @@ export const api = {
               try {
                 const ev = JSON.parse(payload) as
                   | { type: "chunk"; text: string }
-                  | { type: "reasoning"; chars: number }
+                  | { type: "reasoning"; chars: number; text?: string }
                   | GenerationStageEvent
                   | ({ type: "done" } & GenerateStreamDoneMeta)
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
-                else if (ev.type === "reasoning") onReasoning?.(ev.chars);
+                else if (ev.type === "reasoning") onReasoning?.(ev.chars, ev.text);
                 else if (ev.type === "stage") onStage?.(ev);
                 else if (ev.type === "done") onDone(ev);
                 else if (ev.type === "error") reject(new ApiError(500, ev.message));
@@ -768,7 +768,7 @@ export const api = {
     onChunk: (text: string) => void,
     onDone: (meta: RegenerateStreamDoneMeta) => void,
     signal?: AbortSignal,
-    onReasoning?: (chars: number) => void,
+    onReasoning?: (chars: number, text?: string) => void,
     onStage?: (stage: GenerationStageEvent) => void,
   ): Promise<void> =>
     new Promise<void>((resolve, reject) => {
@@ -804,12 +804,12 @@ export const api = {
               try {
                 const ev = JSON.parse(payload) as
                   | { type: "chunk"; text: string }
-                  | { type: "reasoning"; chars: number }
+                  | { type: "reasoning"; chars: number; text?: string }
                   | GenerationStageEvent
                   | ({ type: "done" } & RegenerateStreamDoneMeta)
                   | { type: "error"; message: string };
                 if (ev.type === "chunk") onChunk(ev.text);
-                else if (ev.type === "reasoning") onReasoning?.(ev.chars);
+                else if (ev.type === "reasoning") onReasoning?.(ev.chars, ev.text);
                 else if (ev.type === "stage") onStage?.(ev);
                 else if (ev.type === "done") onDone(ev);
                 else if (ev.type === "error") reject(new ApiError(500, ev.message));

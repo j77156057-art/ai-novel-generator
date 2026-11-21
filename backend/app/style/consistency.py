@@ -372,7 +372,13 @@ def measure(text: str) -> dict[str, Any]:
 #: 理由：4,000 字目标下 17.5×4 = 70，与项目 6 现行值一致；而此前 1,200 字目标也
 #: 要求 70 段，空项目（无参考书）必判不合格，且没有参考带可判时重写块会格式化
 #: 一个不存在的下限。历史章不回改：第 23–43 章只读回放后段数判定逐章一致。
-GEN_GATE_VERSION = "gen-gate-v22"
+#: 2026-11-22 升 v23（**对白配比从参考线改为硬约束**）：
+#: `对白字占比` 进单章判罚带，下限取 engine 现推的**对白配比参考线 p25**
+#: （参考书连续卷口径；无卷样本时退回章级分位）。此前它是 `FINGERPRINT_METRICS`
+#: 里的只记录项，提示里也只写「参考线（非硬判罚）」，实测第 1–2 章只写到
+#: 7.8%/10.5%，远低于参考 p25 23.2%。现在低于下限即进 violations、触发重写；
+#: 无参考书/无档案时不注入该项，保持旧行为。
+GEN_GATE_VERSION = "gen-gate-v23"
 
 #: 句长口径 v2 的生效起点章号（第 33 章及以前按 v1 统计，不回改、不重算）。
 #: 这个数字会写进每章的 `quality_json.gate_limits.sentence_scope_from_chapter`，
@@ -1135,10 +1141,20 @@ def volume_reference(volume_rows: Iterable[dict[str, float]]) -> dict[str, dict[
 def gate_limits_from_percentiles(
     chapter_pct: dict[str, dict[str, float]],
     ultra_short_max: float | None = None,
+    dialogue_floor: float | None = None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
-    """章级分位 → (单章结构判罚带, 全量参考带)。"""
+    """章级分位 → (单章结构判罚带, 全量参考带)。
+
+    `dialogue_floor`（v23）：对白字占比的**单章硬下限**，由 engine 从
+    `dialogue_reference["p25"]` 现推传入。只注入 judge，不改 `full`——
+    `full` 仍是 15 项参考带的展示口径。传 None（无参考书/无档案）时不注入，
+    保持「对白配比不判单章」的旧行为。
+    """
     full = limits_from_chapter_percentiles(chapter_pct, ultra_short_max=ultra_short_max)
     judge = {k: full[k] for k in CHAPTER_GATE_METRICS if k in full}
+    if dialogue_floor is not None:
+        floor = min(1.0, max(0.0, float(dialogue_floor)))
+        judge["对白字占比"] = {"min": round(floor, 4)}
     return judge, full
 
 

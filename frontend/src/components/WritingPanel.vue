@@ -29,6 +29,7 @@ import { useRouter } from "vue-router";
 import { api, planGateStatus } from "@/api/client";
 import type { PlanGateStatus } from "@/api/client";
 import type {
+  GeneratePlan,
   GenerationOut,
   GenerationEditCascade,
   Graph,
@@ -76,7 +77,7 @@ const emit = defineEmits<{
   }): void;
 }>();
 
-type TabKey = "text" | "setting" | "plot" | "timeline" | "kg";
+type TabKey = "text" | "setting" | "plot" | "timeline" | "kg" | "context";
 
 const router = useRouter();
 
@@ -86,6 +87,7 @@ const TAB_LABELS: { key: TabKey; label: string }[] = [
   { key: "plot", label: "剧情" },
   { key: "timeline", label: "世界线" },
   { key: "kg", label: "图谱" },
+  { key: "context", label: "上下文" },
 ];
 
 // ==================================================================
@@ -110,8 +112,14 @@ const saveError = ref("");
 const generating = ref(false);
 const genMode = ref<"continue" | "regenerate" | null>(null);
 const streamText = ref("");
-/** 模型思考增量（只计数，不显示内容；用来解释「为什么还没出字」）。 */
+/** 模型思考增量：chars 用于解释「为什么还没出字」，text 供作者查看内容。 */
 const reasoningChars = ref(0);
+const reasoningText = ref("");
+
+// ---- 装配上下文（只读预览） ------------------------------------------
+const contextLoading = ref(false);
+const contextError = ref("");
+const contextPlan = ref<GeneratePlan | null>(null);
 
 // ---- 作者 Agent 轨迹 -------------------------------------------------
 // 后端在生成流的五个节点各发一次 `stage`：装配上下文 / 等待首字 / 模型思考 /
@@ -419,10 +427,29 @@ function switchKgSource(source: "generated" | "all"): void {
   void loadKg();
 }
 
+/**
+ * 读「下一次生成实际会发给模型的上下文」（只组装、不调模型）。
+ *
+ * 每次进入都重读：当前段一变，前情/世界线/检索都会变，缓存只会给出过期答案。
+ */
+async function loadContext(): Promise<void> {
+  if (contextLoading.value) return;
+  contextLoading.value = true;
+  contextError.value = "";
+  try {
+    contextPlan.value = await api.generatePlan(props.projectId);
+  } catch (err) {
+    contextError.value = `上下文读取失败：${textOf(err)}`;
+  } finally {
+    contextLoading.value = false;
+  }
+}
+
 function switchTab(key: TabKey): void {
   tab.value = key;
   if (key === "timeline" && timeline.value === null) void loadTimeline();
   if (key === "kg" && kg.value === null) void loadKg();
+  if (key === "context") void loadContext();
 }
 
 /** 正文改了，图谱就可能变：丢掉旧快照，正停在图谱页时立刻重读。 */
@@ -939,6 +966,7 @@ async function runContinue(): Promise<void> {
   genMode.value = "continue";
   streamText.value = "";
   reasoningChars.value = 0;
+  reasoningText.value = "";
   genNote.value = "";
   genError.value = "";
   genFix.value = null;
@@ -959,8 +987,9 @@ async function runContinue(): Promise<void> {
         genNote.value = `第 ${meta.segment_no} 段已落库 · ${meta.chars} 字。`;
       },
       controller.signal,
-      (chars) => {
+      (chars, text) => {
         reasoningChars.value = chars;
+        if (text) reasoningText.value += text;
       },
       (ev) => {
         applyAgentStage(ev.stage, ev.label);
@@ -1010,6 +1039,7 @@ async function runRegenerate(): Promise<void> {
   genMode.value = "regenerate";
   streamText.value = "";
   reasoningChars.value = 0;
+  reasoningText.value = "";
   genNote.value = "";
   genError.value = "";
   resetAgentSteps();
@@ -1030,8 +1060,9 @@ async function runRegenerate(): Promise<void> {
         genNote.value = `第 ${meta.segment_no} 段已重生成并落库 · ${meta.chars} 字。`;
       },
       controller.signal,
-      (chars) => {
+      (chars, text) => {
         reasoningChars.value = chars;
+        if (text) reasoningText.value += text;
       },
       (ev) => {
         applyAgentStage(ev.stage, ev.label);
@@ -1394,7 +1425,14 @@ watch(
                       <span>已收到 {{ streamChars }} 字</span>
                       <span v-if="reasoningChars > 0">模型思考 {{ reasoningChars }} 字</span>
                       <span>目标约 {{ genTargetChars }} 字</span>
+                      <button class="link-btn" type="button" @click="switchTab('context')">
+                        查看装配上下文
+                      </button>
                     </div>
+                    <details v-if="reasoningText" class="wp-thinking">
+                      <summary>模型思考内容（{{ reasoningChars }} 字）</summary>
+                      <pre>{{ reasoningText }}</pre>
+                    </details>
                   </div>
                   <p v-if="streamChars === 0 && genWaitSeconds >= 30" class="faint wp-stream-hint">
                     首字还没到：不同供应商的首字排队时间差别很大，轨迹会如实停在「等待模型首字 / 模型思考」。超过 3 分钟仍无输出可以点「停止等待」。
@@ -1490,6 +1528,49 @@ watch(
                   </p>
                 </div>
               </div>
+            </section>
+
+            <!-- 装配上下文（只读预览：下一次生成实际会发给模型的内容） -->
+            <section v-else-if="tab === 'context'" class="wp-pane">
+              <div class="wp-inline-actions">
+                <button
+                  class="btn sm"
+                  type="button"
+                  :disabled="contextLoading"
+                  @click="loadContext"
+                >
+                  {{ contextLoading ? "读取中…" : "重新读取" }}
+                </button>
+                <span class="faint">
+                  只组装、不调模型。前情、世界线、检索与约束都是本次真实下发的内容。
+                </span>
+              </div>
+              <div v-if="contextError" class="notice err">{{ contextError }}</div>
+              <div v-if="contextLoading && !contextPlan" class="wp-loading faint">
+                正在装配上下文…
+              </div>
+              <template v-if="contextPlan">
+                <div class="wp-text-meta">
+                  <span class="mono">前情块 {{ contextPlan.prior_blocks.length }}</span>
+                  <span class="mono">摘要 {{ contextPlan.prior_summaries.length }}</span>
+                  <span class="mono">检索 {{ contextPlan.rag_context.length }}</span>
+                  <span class="mono">
+                    约束 {{ contextPlan.constraints.characters.length + contextPlan.constraints.plotholes.length }}
+                  </span>
+                </div>
+                <details class="wp-context-block" open>
+                  <summary>用户提示词（本项目上下文）</summary>
+                  <pre>{{ contextPlan.user_prompt }}</pre>
+                </details>
+                <details class="wp-context-block">
+                  <summary>系统提示词</summary>
+                  <pre>{{ contextPlan.system_prompt }}</pre>
+                </details>
+                <details v-if="reasoningText" class="wp-context-block">
+                  <summary>最近一次模型思考（{{ reasoningChars }} 字）</summary>
+                  <pre>{{ reasoningText }}</pre>
+                </details>
+              </template>
             </section>
 
             <!-- 世界线 -->
@@ -1952,6 +2033,52 @@ watch(
   margin: 0 0 6px;
   font-size: var(--fs-2xs);
   line-height: 1.6;
+}
+.wp-thinking {
+  margin-top: 8px;
+  font-size: var(--fs-2xs);
+  color: var(--fg-faint);
+}
+.wp-thinking summary {
+  cursor: pointer;
+  user-select: none;
+}
+.wp-thinking pre {
+  margin: 6px 0 0;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  line-height: 1.6;
+  color: var(--fg-muted);
+  background: var(--bg-sunken, rgba(0, 0, 0, 0.03));
+  padding: 8px;
+  border-radius: 6px;
+}
+.wp-context-block {
+  margin-top: 10px;
+  font-size: var(--fs-2xs);
+  color: var(--fg-faint);
+}
+.wp-context-block summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
+.wp-context-block pre {
+  margin: 6px 0 0;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  line-height: 1.6;
+  color: var(--fg-muted);
+  background: var(--bg-sunken, rgba(0, 0, 0, 0.03));
+  padding: 10px;
+  border-radius: 6px;
 }
 
 .wp-empty {

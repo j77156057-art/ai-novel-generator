@@ -28,7 +28,7 @@ from app.generation import (
     generate_loop,
     generate_next_segment,
 )
-from app.generation.engine import _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt, preflight_timeline_gate, _timeline_progress, _chapter_ordinal
+from app.generation.engine import _apply_gate_limits, _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt, preflight_timeline_gate, _timeline_progress, _chapter_ordinal
 from app.generation.length_guard import LengthBlocked
 from app.generation.outline_notice import build_notice
 from app.generation.prompts import build_system_prompt, build_user_prompt
@@ -426,6 +426,10 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
     plan = _chapter_plan(db, proj, None)
     ctx = build_context(db, proj, novel_ids=novel_ids)
     profile = _style_profile(db, proj)
+    # 闸门带必须在拼提示**之前**写入：对白字占比的硬下限（v23）与极短纯对白段
+    # 上限都写在 system 里。不写这一句，预检页会把常量表的 6% 当成真实下限，
+    # 与实际下发的那份提示不一致。
+    _apply_gate_limits(db, proj, seg_no=_next_segment_no(db, proj.id))
     system = build_system_prompt(
         proj.title, ctx["reminders"], _style_info(proj), proj.plot_bible,
         profile, _style_narrative(db, proj),

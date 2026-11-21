@@ -56,7 +56,13 @@ from typing import Any
 #:        补完触发线仍是 3304，判罚上限仍是 4800，阈值未动。
 #:      ②逐章推进三条要求：属性 / 阵容 / 时间锚点各一条，全部对应
 #:        `progress_ledger` 的留痕，不新增判罚项。
-PROMPT_REVISION = "prompt-v18"
+#: v19（2026-11-22）：对白配比从参考线改为**硬约束**——
+#:      ①`_gate_block` 的对白带改读 `active_gate_limits()`（下限=参考线 p25），
+#:        不再印常量表里的 6%，并写明「低于下限判不合格」；
+#:      ②`_dialogue_reference_block` 改成「硬约束」措辞，给出本章硬下限、
+#:        最近若干章低于下限时明确要求把对白拉起来；
+#:      ③判罚项由 engine 注入 `judge["对白字占比"]`，无参考书时不注入（旧行为）。
+PROMPT_REVISION = "prompt-v19"
 
 #: 物品持有块的标题 / 优先级说明。生成与重写共用同一份渲染，避免两条路径各拼一份、
 #: 重写时漏块或块文本漂移。
@@ -358,7 +364,10 @@ def _gate_block() -> str:
     short = GEN_GATE_LIMITS.get("短句占比") or {}
     long40 = GEN_GATE_LIMITS.get("长句占比") or {}
     long_mid = GEN_GATE_LIMITS.get("长句31_39占比") or {}
-    dlg = GEN_GATE_LIMITS.get("对白字占比") or {}
+    # v23：对白字占比进单章硬判，下限由 engine 按参考线 p25 注入；
+    # 提示必须读**当前生效**的判罚带，否则会印出常量表里的旧下限（6%）。
+    dlg = (active_gate_limits().get("对白字占比")
+           or GEN_GATE_LIMITS.get("对白字占比") or {})
     # 极短纯对白段上限读**当前闸门**（v10 起为参考书非零章 p90），不写死 0：
     # 常量表里该项是退回值 0，直接读它会让提示要求「必须为 0」而闸门实际允许 3.2%。
     jit = active_gate_limits().get("极短纯对白段占比") or {}
@@ -434,7 +443,7 @@ def _gate_block() -> str:
         "长句要展开成分句递进，不是加逗号凑长度；长短必须在同一段内交替。\n"
         f"- 段均 {_target('段长均值', ' 字')}；段均句数 {spc_band} 句，"
         "不要把一句话拆成一段，也不要把多句硬并成一段。\n"
-        f"- 对白字占比 {dlg_band}；"
+        f"- 对白字占比 {dlg_band}（**低于下限即判不合格，会触发重写**）；"
         f"问号 {_target('问号每千字', ' 个/千字')}。"
         f"{mix_line}\n"
         "【对白校准（2026-11-13 档案实测，与闸门同一把尺；碎与平都要治）】\n"
@@ -544,12 +553,16 @@ def _chapter_quota_block(max_chars: int | None, min_chars: int | None = None) ->
 
 
 def _dialogue_reference_block() -> str:
-    """对白配比参考线（v12，**非硬判罚**）。
+    """对白配比参考 + **硬约束**（v23）。
 
     数字来源：`active_dialogue_reference()`——engine 从参考档案的章级分位现推
     p25/p50/p75，并附带本书最近一卷的实测值；未写入时退回
     `ARCHIVE_BLOCK_PERCENTILES["对白字占比"]`（此时不写本书实测）。
-    这里只给收敛方向，不新增判罚项，措辞里不出现「必须」「不合格」。
+
+    v23 起不再是「只给方向」：**章级 p25**（`hard_floor`）同时是
+    `generation_gate` 的单章下限，低于它即判不合格并触发重写。提示必须把
+    这件事说透，否则模型仍会按「对白可写可不写」的惯性，把第 1 章写成
+    7.8% 的叙述体。
     """
     from app.style.consistency import (
         ARCHIVE_BLOCK_PERCENTILES, active_dialogue_reference,
@@ -560,6 +573,7 @@ def _dialogue_reference_block() -> str:
     p25 = float(ref.get("p25", static["p25"]))
     p50 = float(ref.get("p50", static["p50"]))
     p75 = float(ref.get("p75", static["p75"]))
+    floor = float(ref.get("hard_floor", p25))
     window = int(ref.get("window") or 0)
     scale = f"卷口径（连续 {window} 章块）" if window else "章级"
     origin = (
@@ -567,27 +581,38 @@ def _dialogue_reference_block() -> str:
         if ref.get("source") else "静态参考值（未取到当前参考书分位）"
     )
     lines = [
-        "【对白配比参考线（非硬判罚，只做校准）】",
+        "【对白配比硬约束（低于下限即判不合格）】",
         f"- 参考书{scale}「对白字占比」：p25 {p25:.1%} / p50 {p50:.1%} / "
         f"p75 {p75:.1%}（{origin}）。",
+        f"- 本章**硬下限 {floor:.1%}**（参考书章级 p25）：低于它会被判不合格并重写。"
+        "场景里该说话的地方必须让人物开口，用一来一回的对话推进；"
+        "不要用「他想了想」「事情并不简单」这类叙述代替人物台词。",
     ]
     recent = ref.get("book_recent_ratio")
     n = int(ref.get("book_recent_chapters") or 0)
     if isinstance(recent, (int, float)) and n:
         recent = float(recent)
         diff = recent - p50
-        trend = "明显高于" if diff > 0 else ("低于" if diff < 0 else "接近")
         gap = f"{abs(diff) * 100:.1f} 个百分点"
-        lines.append(
-            f"- 本书最近 {n} 章实测 {recent:.1%}，{trend}参考 p50 "
-            f"{p50:.1%}（{gap}）。"
-        )
-        if diff > 0:
+        if recent < floor:
             lines.append(
-                "- 处理方式：不要再抬高对白字占比。同样的信息量优先写成"
-                "「动作 + 神态 + 旁人反应」的叙述，或把对白压短后补叙述；"
-                "此项不判违规，只看是否向参考带收敛。"
+                f"- 本书最近 {n} 章实测 {recent:.1%}，**低于硬下限 {floor:.1%}**"
+                f"（差 {(floor - recent) * 100:.1f} 个百分点）。本章必须把对白拉起来："
+                "优先写人物之间的成段对话（每个场景至少一轮完整的你来我往），"
+                "把纯叙述的信息改成由角色说出来。"
             )
+        else:
+            trend = "明显高于" if diff > 0 else ("低于" if diff < 0 else "接近")
+            lines.append(
+                f"- 本书最近 {n} 章实测 {recent:.1%}，{trend}参考 p50 "
+                f"{p50:.1%}（{gap}）。"
+            )
+            if diff > 0:
+                lines.append(
+                    "- 处理方式：不要再抬高对白字占比。同样的信息量优先写成"
+                    "「动作 + 神态 + 旁人反应」的叙述，或把对白压短后补叙述；"
+                    f"但仍不得低于硬下限 {floor:.1%}。"
+                )
     return "\n".join(lines)
 
 

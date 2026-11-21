@@ -457,6 +457,21 @@ def _dialogue_reference_fallback(project: Project) -> dict:
     }
 
 
+def _dialogue_hard_floor(reference: dict, chapter_p25: float | None = None) -> float | None:
+    """对白字占比的单章硬下限（v23）：优先取**章级** p25，退回卷级 p25。
+
+    为什么单章用章级 p25 而不是卷级：判罚单位是「一章」，章级 p25 才是参考书
+    单章分布里「偏低但正常」的那条线（本项目参考书为 17.5%）；卷级 p25
+    （23.2%）是连续 14 章块均值的分位，拿它判单章会把「某章动作戏多」误判成
+    不合格。提示里两者都写：卷级给收敛方向，章级给硬下限。
+    推不出时返回 None，调用方不注入判罚项。
+    """
+    for value in (chapter_p25, (reference or {}).get("p25")):
+        if isinstance(value, (int, float)):
+            return min(1.0, max(0.0, float(value)))
+    return None
+
+
 def _sentence_reference_fallback(project: Project) -> dict:
     """`句长均值` 参考线的退回值（v13）：配置优先，其次常量表；调用方负责留痕。"""
     configured = getattr(settings, "sentence_length_reference", None)
@@ -741,10 +756,9 @@ def _archive_gate_limits(db, project: Project) -> dict:
                 getattr(project, "id", None),
             )
 
-        judge, full = gate_limits_from_percentiles(chapter_pct, ultra_short_max=ultra_max)
-        # v12：对白配比参考线（非判罚）。与「本书最近一卷实测」同尺度，
-        # 优先取**卷级**分位（参考书连续 `vc` 章块均值的 p25/p50/p75）；
-        # 卷样本不足时退回章级分位，再退配置/常量表。
+        # v12：对白配比参考线（v23 起同时是单章硬约束的下限来源）。与「本书
+        # 最近一卷实测」同尺度，优先取**卷级**分位（参考书连续 `vc` 章块均值的
+        # p25/p50/p75）；卷样本不足时退回章级分位，再退配置/常量表。
         dlg_vol = (volume_pct or {}).get("对白字占比") or {}
         dlg_ch = chapter_pct.get("对白字占比") or {}
         vol_ok = all(dlg_vol.get(k) is not None for k in ("p25", "p50", "p75"))
@@ -767,6 +781,19 @@ def _archive_gate_limits(db, project: Project) -> dict:
                 "改用 %s（project %s）",
                 ids, dialogue_reference.get("source"), getattr(project, "id", None),
             )
+        # v23：对白配比从参考线改成**单章硬约束**——下限取参考书的**章级** p25
+        # （单章分布里「偏低但正常」的那条线），从第 1 章就生效；卷级 p25 仍写进
+        # 提示作为收敛方向。无参考书/无档案时 `_gate_fallback` 不会走到这里。
+        chapter_dlg_p25 = (chapter_pct.get("对白字占比") or {}).get("p25")
+        if isinstance(chapter_dlg_p25, (int, float)):
+            dialogue_reference["chapter_p25"] = round(float(chapter_dlg_p25), 4)
+        dialogue_floor = _dialogue_hard_floor(dialogue_reference, chapter_dlg_p25)
+        if dialogue_floor is not None:
+            dialogue_reference["hard_floor"] = round(dialogue_floor, 4)
+        judge, full = gate_limits_from_percentiles(
+            chapter_pct, ultra_short_max=ultra_max,
+            dialogue_floor=dialogue_floor,
+        )
         # v13：主因指标参考线（非判罚）。段长缺口拆成 `段均句数 × 句长均值` 后，
         # 句长均值偏离参考带最远，故用它的卷口径 p10/p50/p90 做参考线。
         # 只补参考线，不把 `段长均值` 本身变成目标。
@@ -3449,7 +3476,16 @@ def _gate_hard_block(gate_info: dict | None) -> str:
     long_40 = float(metrics.get("长句占比") or 0.0)
     single_p = float(metrics.get("叙述单句段占比") or 0.0)
     dlg_p = float(metrics.get("对白字占比") or 0.0)
-    dlg_target = _band("对白字占比")
+    # v23：对白硬下限优先取「判这条违规的那份带」——它才是本次真正生效的
+    # p25 下限；`active_full_limits` 的 6.5% 是展示带，拿它写进重写指令会自相矛盾。
+    dlg_limit = viol_limits.get("对白字占比") or active_full_limits().get("对白字占比") or {}
+    _dlg_lo, _dlg_hi = dlg_limit.get("min"), dlg_limit.get("max")
+    if _dlg_lo is not None and _dlg_hi is not None:
+        dlg_target = f"{_dlg_lo:.1%}–{_dlg_hi:.1%}"
+    elif _dlg_lo is not None:
+        dlg_target = f"≥{_dlg_lo:.1%}"
+    else:
+        dlg_target = f"≤{_dlg_hi:.1%}" if _dlg_hi is not None else "按档案分位"
     actions: list[str] = []
     if bad & {"句长均值", "句长CV", "短句占比", "叙述单句段占比"}:
         # 不再写「短句每千字 6–10 处」这类手拍配额：短句占比本身已在上面的
@@ -3470,9 +3506,11 @@ def _gate_hard_block(gate_info: dict | None) -> str:
         )
     if bad & {"对白字占比", "问号每千字"}:
         actions.append(
-            "③ 对白：每 10 句对白中，信息推进 ≤5 句、抖机灵 ≥2 句、"
-            f"套近乎或答非所问 ≥2 句；连续追问 ≤2 轮。对白字占比 {dlg_target}（当前 {dlg_p:.1%}）——"
-            "少问号不等于少对白，把追问换成陈述、动作或答非所问，不要删对白。"
+            "③ 对白：对白字占比 {target}（当前 {cur:.1%}）——低于下限时必须**增加人物对话**："
+            "把纯叙述里的人物反应、消息、争执改成由角色说出来，每个场景至少一轮完整的"
+            "你来我往；不要靠删叙述凑比例，也不要把对白写成一个人的独白。"
+            "每 10 句对白中，信息推进 ≤5 句、抖机灵 ≥2 句、套近乎或答非所问 ≥2 句，"
+            "连续追问 ≤2 轮。".format(target=dlg_target, cur=dlg_p)
         )
     # 「段长均值」自 v8 起不再进 violations，这里不再有「④ 段长」动作块。
     if bad & {"极短纯对白段占比", "消息段字数中位"}:
@@ -4254,6 +4292,7 @@ def _rewrite_rounds(
     research_notes: str | None = None,
     max_chars: int | None = None,
     chapter_range: str | None = None,
+    gate_limits: dict | None = None,
 ) -> tuple[str, str, dict | None, list[dict], dict]:
     """最多 `settings.rewrite_max_rounds` 轮重写（默认 2），每轮只针对「当前仍未过」的项。
 
@@ -4271,7 +4310,13 @@ def _rewrite_rounds(
 
     一致性层只有在 `coherence_guard_mode="rewrite"` 时才贡献重写理由；
     默认 report 模式下 `_coherence_reasons` 恒返回空，既有重写判定不变。
+
+    `gate_limits`（v23）：必须由调用方显式传入 `gate_limits_meta["chapter_limits"]`。
+    此前这里靠 `generation_gate` 读 contextvar，但重写在独立线程/上下文里执行时
+    contextvar 取不到档案判罚带，回退常量表会让「对白字占比硬下限」在重写轮失效。
     """
+
+    gate = generation_gate(text, max_chars, gate_limits=gate_limits)
     rounds: list[dict] = []
     info_last = None
     limit = length_limits(max_chars)
@@ -4396,7 +4441,7 @@ def _rewrite_rounds(
             summary = provider.summarize(rewritten)
         text = rewritten
         info_last = info
-        gate = generation_gate(text, max_chars)
+        gate = generation_gate(text, max_chars, gate_limits=gate_limits)
         need, reasons = _should_rewrite(text, forbidden)
         if not gate["passed"]:
             need = True
@@ -5496,7 +5541,9 @@ def generate_next_segment(
     rewrite_info = None
     # 生成侧硬闸门：与 AI 腔判据并列，命中任一条就重写；最多两轮，第二轮只补剩余缺口。
     # 判罚带按项目参考语料的章级分位现推（换参考书自动重推；推不出退回常量表）。
-    gate = generation_gate(text, max_chars)
+    gate = generation_gate(
+        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
+    )
 
     # —— 写后自查（2026-11-13 v2：缺口驱动；默认关闭）——
     # 只有开关打开且初稿没过闸门才查；查询词由失败项反推。3–8 轮工具调用，
@@ -5517,6 +5564,7 @@ def generate_next_segment(
         research_notes=research.get("notes_block") or None,
         max_chars=max_chars,
         chapter_range=chapter_range,
+        gate_limits=gate_limits_meta.get("chapter_limits"),
     )
 
     # 重写轮会重新排版，可能新造「整段只有引号、≤4 汉字」的对白段（第 5 章实测
@@ -5549,7 +5597,9 @@ def generate_next_segment(
         text, budget=project.generation_length)
     # 落库前对**最终正文**再量一次闸门（重写后可能已修好，也可能仍不达标）。
     # 这是观测与告警口径，不改正文；是否重写在上面已经决定过了。
-    gate_final = generation_gate(text, max_chars)
+    gate_final = generation_gate(
+        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
+    )
     quality["style_gate"] = gate_final
     # 批 6：校正链的逐道留痕（跑没跑、为什么没跑、改了哪些指标）。
     quality["style_corrections"] = style_fix
@@ -5937,7 +5987,8 @@ def generate_next_segment_stream(
             if reasoning_chars == 0:
                 yield {"type": "stage", "stage": "thinking", "label": "模型思考中"}
             reasoning_chars += len(piece)
-            yield {"type": "reasoning", "chars": reasoning_chars}
+            # text 给「作者 Agent」展示思考内容；chars 保留给旧前端做计数。
+            yield {"type": "reasoning", "chars": reasoning_chars, "text": piece}
             continue
         if not pieces:
             yield {"type": "stage", "stage": "writing", "label": "流式撰写中"}
@@ -5984,7 +6035,9 @@ def generate_next_segment_stream(
     rewrite_info = None
     # 与同步版同口径：同一函数、同一阈值、同样最多两轮。
     # 判罚带同样按参考语料章级分位现推。
-    gate = generation_gate(text, max_chars)
+    gate = generation_gate(
+        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
+    )
 
     # 缺口驱动自查：默认关闭（settings.author_research_enabled），关闭时不产生工具调用。
     if settings.author_research_enabled and not gate.get("passed"):
@@ -6002,6 +6055,7 @@ def generate_next_segment_stream(
         research_notes=research.get("notes_block") or None,
         max_chars=max_chars,
         chapter_range=chapter_range,
+        gate_limits=gate_limits_meta.get("chapter_limits"),
     )
 
     # 与同步版同口径：重写后再跑一次确定性并段（重写会新造极短纯对白段）。
@@ -6029,7 +6083,9 @@ def generate_next_segment_stream(
         text, budget=project.generation_length)
     # 落库前对**最终正文**再量一次闸门（重写后可能已修好，也可能仍不达标）。
     # 这是观测与告警口径，不改正文；是否重写在上面已经决定过了。
-    gate_final = generation_gate(text, max_chars)
+    gate_final = generation_gate(
+        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
+    )
     quality["style_gate"] = gate_final
     # 批 6：校正链逐道留痕，与同步版同口径。
     quality["style_corrections"] = style_fix
@@ -6397,6 +6453,9 @@ def regenerate_segment_stream(
 
     # 档案预检：重生成同样不该把请求挂死在同步蒸馏上
     _require_distill_ready(db, project)
+    # v23：重生成走的是独立提示词组装，同样要先把档案判罚带写入当前 context，
+    # 否则「对白字占比硬下限」只出现在续写路径、重写这一段又退回常量表。
+    gate_limits_meta = _apply_gate_limits(db, project, seg_no=segment_no)
 
     if provider is None:
         provider = get_llm_provider()
@@ -6605,7 +6664,8 @@ def regenerate_segment_stream(
                     if reasoning_chars == 0:
                         yield {"type": "stage", "stage": "thinking", "label": "模型思考中"}
                     reasoning_chars += len(piece)
-                    yield {"type": "reasoning", "chars": reasoning_chars}
+                    # text 给「作者 Agent」展示思考内容；chars 保留做计数。
+                    yield {"type": "reasoning", "chars": reasoning_chars, "text": piece}
                     continue
                 if not pieces:
                     yield {"type": "stage", "stage": "writing", "label": "流式撰写中"}
@@ -6640,7 +6700,9 @@ def regenerate_segment_stream(
     _need_rewrite, _reasons = _should_rewrite(text, _regen_forbidden)
     # 重生成是用户显式改稿，不自动再重写；但闸门结果必须随告警一起返回，
     # 否则用户看到的“AI 腔告警”会漏掉句长/段长/问号这三类硬指标。
-    _regen_gate = generation_gate(text, max_chars)
+    _regen_gate = generation_gate(
+        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
+    )
     if not _regen_gate["passed"]:
         _need_rewrite = True
         _reasons = _reasons + _regen_gate["reasons"]
@@ -6667,7 +6729,9 @@ def regenerate_segment_stream(
     # 篇幅判据：这是改写既有段落，跌幅归 detect_length_drop，本字段
     # 返回 not_applicable，不报「篇幅不足」。
     quality, repetition, warnings = _quality_check(text, is_rewrite=True)
-    quality["style_gate"] = generation_gate(text, max_chars)
+    quality["style_gate"] = generation_gate(
+        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
+    )
 
     new_summary = {
         "text": summary,
