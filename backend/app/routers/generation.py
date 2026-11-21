@@ -31,7 +31,7 @@ from app.generation import (
 from app.generation.engine import _apply_gate_limits, _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt, preflight_timeline_gate, _timeline_progress, _chapter_ordinal
 from app.generation.length_guard import LengthBlocked
 from app.generation.outline_notice import build_notice
-from app.generation.prompts import build_system_prompt, build_user_prompt
+from app.generation.prompts import build_system_prompt, build_user_prompt, chapter_outline_entry
 from app.generation.repetition import parse_quality
 from app.generation.story_cards import render_for_project as _render_story_cards
 from app.models import Generation, Project
@@ -457,6 +457,8 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         # 预检必须与真实生成同源：设定卡的增删改要能在这里直接看到效果。
         story_cards_block=_render_story_cards(db, proj.id),
         foreshadow_block=ctx.get("foreshadow_block"),
+        # v21：本章大纲点名的角色约束也要出现在预检里。
+        chapter_outline=chapter_outline_entry(proj.outline, plan["chapter"]),
     )
     return {
         "reminders": ctx["reminders"],

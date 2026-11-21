@@ -274,7 +274,20 @@ _FORM_HINT = {
     "front_dao": "说话人 + 「道」字 + 冒号 + 引语（`某人道：“原话”`）",
     "front_shuo": "说话人 + 「说」字 + 冒号 + 引语（`某人说：“原话”`）",
     "back": "引语在前、说话人在后（`“原话。”某人道。`）",
+    # 2026-11-22：参考书主导形态是 mixed 时，绝不能退化成 front_dao——
+    # 那会把所有台词统一盖成「X道：」，人物的说话方式被后处理抹平。
+    "mixed": (
+        "归属方式要混着来：动作/神态/心理句自然带出（`他把烟摁灭，“…”`）、"
+        "「说/问/答/嘟囔」等动词、引语在前归属在后；"
+        "「X道：」最多占全部归属的 1/3，且不得连续出现"
+    ),
 }
+
+#: `mixed` 形态下「道：」的占比上限（占全部带归属台词）。
+#: 超过就再跑一遍「把道：改成别的引出方式」。
+VARIETY_MAX_DAO_SHARE = 0.5
+#: 少于这么多处「道：」就不值得再花一次调用。
+VARIETY_MIN_DAO = 6
 
 _USER = """下面的正文里，**对白的说话人归属写法**与这本书的习惯不一样。
 
@@ -288,10 +301,28 @@ _USER = """下面的正文里，**对白的说话人归属写法**与这本书�
 3. 把 `“原话，”某人道，“接着说”` 这种夹在中间的，并成 {form} 的一句；
 4. 台词内容**逐字保留**，不许改、不许删、不许新增台词；
 5. 情节、动作、环境、叙述顺序都不要动。
+6. {variety}
 
 下面是**同一本书**里这种写法的原文，照它的样子写：
 
 {examples}
+
+只输出改写后的正文，不要解释，不要加标题。
+
+【原文】
+{text}"""
+
+#: 把「清一色 X道：」改成多种引出方式（只改归属写法，台词逐字不动）。
+_VARIETY_USER = """下面这段正文里，**对白的说话人归属写法太单一**：
+共 {hits} 处带归属，其中 {dao} 处都是「X道：」。
+
+请只改**归属写法**，台词逐字保留、不增不删，情节和叙述顺序都不动：
+1. 最多保留 {keep} 处「X道：」，其余改成下面三种之一：
+   - 动作/神态/心理句自然带出（`他把烟摁灭，“…”` / `她没抬头，“…”`）；
+   - 换动词：说 / 问 / 答 / 嘟囔 / 接了句 / 低声说 / 笑着回；
+   - 引语在前、归属在后（`“原话。”他说。`）。
+2. 不要连续两条都用「道：」；不要改变说话人，不要新造人物。
+3. 改写后仍要能看出每句话是谁说的（可由紧邻的动作/叙述交代）。
 
 只输出改写后的正文，不要解释，不要加标题。
 
@@ -497,10 +528,18 @@ def correct_attribution(
         return "\n".join(outs), failed, empty, last_err
 
     def _add_prompt(ch: str):
+        variety = ""
+        if convention == "mixed":
+            variety = (
+                "不要一律写成「X道：」：优先用动作/神态/心理句自然带出，"
+                "其次用说/问/答/嘟囔等不同动词；「X道：」最多占全部归属的 1/3，"
+                "且不得连续两条都用「道：」。"
+            )
         return _USER.format(
             form=form_hint,
             pct=target_rate,
             examples="\n".join(f"· {e}" for e in examples),
+            variety=variety,
             text=ch,
         )
 
@@ -559,6 +598,37 @@ def correct_attribution(
         current = out_r
         candidates.append((current, attribution_rate(current)))
 
+    # —— 去单一化：全是「X道：」时再跑一遍，把过半引号改成动作/换动词 ——
+    #
+    # 2026-11-22 真机实测：参考书 convention=mixed，但模型补归属时一律写成
+    # 「X道：」；25 处归属 25 处都是道，人物说话方式被后处理抹平。
+    # 这一遍只在「道：」占比过高时触发，只改归属写法，台词逐字不动。
+    variety_info: dict = {}
+    rc = attribution_rate(current)
+    hits = rc["front"] + rc["back"] + rc["mid"]
+    dao = rc["front_dao"]
+    if (convention == "mixed" and hits and dao >= VARIETY_MIN_DAO
+            and dao / hits >= VARIETY_MAX_DAO_SHARE):
+        variety_info = {"before_dao": dao, "before_hits": hits}
+
+        def _variety_prompt(ch: str):
+            m = attribution_rate(ch)
+            h = m["front"] + m["back"] + m["mid"]
+            if not h or m["front_dao"] < VARIETY_MIN_DAO:
+                return None
+            keep = max(1, round(h * 0.33))
+            return _VARIETY_USER.format(
+                hits=h, dao=m["front_dao"], keep=keep, text=ch)
+
+        out_v, failed_v, _empty_v, _ = _run(_split_chunks(current), _variety_prompt)
+        if failed_v < len(chunks):
+            current = out_v
+            # 插到最前：距离目标同样近时优先选「道：」更少的那版。
+            candidates.insert(0, (current, attribution_rate(current)))
+            rv = attribution_rate(current)
+            variety_info["after_dao"] = rv["front_dao"]
+            variety_info["after_hits"] = rv["front"] + rv["back"] + rv["mid"]
+
     # —— 判据 1、对白内容**守恒**（字符多重集口径，对合并/拆分免疫）——
     from app.style.form import _chars_lost, _dialogue_chars
 
@@ -579,20 +649,26 @@ def correct_attribution(
             rejects.append(f"字数涨太多 {len(text)}→{len(cand)}（上限 +{cap}）")
             continue
         dist = abs(rate["rate"] - target_rate)
-        if best is None or dist < best[0]:
-            best = (dist, cand, rate)
+        # mixed 形态：在「离目标近」之外再罚「道：占比」——否则去单一化那一版
+        # 会因为它把归属率调低一点而被整版丢掉（实测 2/12 vs 23/34 仍选了后者）。
+        dao_share = (rate["front_dao"] / (rate["front"] + rate["back"] + rate["mid"])
+                     if (rate["front"] + rate["back"] + rate["mid"]) else 0.0)
+        score = dist + (0.5 * dao_share if convention == "mixed" else 0.0)
+        if best is None or score < best[0]:
+            best = (score, dist, cand, rate)
 
     info = {"before": before, "target": target_rate, "convention": convention,
             "chunks": len(chunks), "chunks_failed": failed,
             "empty_calls": empty_calls, "trimmed": trimmed,
             "pass1_rate": r1["rate"],
+            "variety": variety_info,
             "candidates": [round(c[1]["rate"], 3) for c in candidates]}
     if best is None:
         return text, {**info, "applied": False,
                       "reason": rejects[0] if rejects else "没有可用候选",
                       "rejects": rejects}
 
-    dist, out, after = best
+    _score, dist, out, after = best
     info["after"] = after
 
     # —— 判据 3：归属率必须**向目标靠近** ——

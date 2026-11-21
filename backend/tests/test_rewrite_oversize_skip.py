@@ -36,7 +36,7 @@ def _prepare(monkeypatch, *, skip_oversize: bool) -> dict[str, int]:
         calls["rewrite"] += 1
         return "字" * 4700, {"round": 1}
 
-    def fake_compression(provider, text, max_chars):
+    def fake_compression(provider, text, max_chars, dialogue_floor=None):
         calls["compress"] += 1
         return "字" * 4000, {
             "kind": "compression",

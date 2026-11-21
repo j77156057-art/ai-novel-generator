@@ -62,7 +62,13 @@ from typing import Any
 #:      ②`_dialogue_reference_block` 改成「硬约束」措辞，给出本章硬下限、
 #:        最近若干章低于下限时明确要求把对白拉起来；
 #:      ③判罚项由 engine 注入 `judge["对白字占比"]`，无参考书时不注入（旧行为）。
-PROMPT_REVISION = "prompt-v19"
+#: v20（2026-11-22）：对白工艺与声纹样本——
+#:      ①角色行支持 `sample_lines` 渲染成「台词参考」（已有字段，本次开始真正喂样本）；
+#:      ②user 尾部新增【对白工艺（硬要求）】：引导方式去「X道：」、每角色至少 2 条
+#:        声纹台词、对话要有错位、对白平均长度与短应答占比。
+#: v21（2026-11-22）：本章大纲点名的角色注入「必须出场并开口」块，防止该出场的人
+#:      整章消失（真机：第 1 章大纲有苏见月，正文 0 次提及）。
+PROMPT_REVISION = "prompt-v21"
 
 #: 物品持有块的标题 / 优先级说明。生成与重写共用同一份渲染，避免两条路径各拼一份、
 #: 重写时漏块或块文本漂移。
@@ -1048,6 +1054,31 @@ def build_system_prompt(
     )
 
 
+def _required_cast_block(chapter_outline: str | None, plot_bible: dict | None) -> str:
+    """本章大纲点名、必须真正出场并开口的角色（v21）。
+
+    真机回归（2026-11-22）：第 1 章大纲里有苏见月，正文却 0 次提及——
+    模型把「可用角色」当成「可选角色」。这里只按**本章大纲**点名，不把整本
+    角色表都塞进来（那会让所有人都来抢戏）。
+    """
+    if not chapter_outline or not isinstance(plot_bible, dict):
+        return ""
+    names = [
+        str(c.get("name") or "").strip()
+        for c in (plot_bible.get("characters") or [])
+        if isinstance(c, dict) and str(c.get("name") or "").strip()
+    ]
+    hits = [n for n in names if n in str(chapter_outline)]
+    if not hits:
+        return ""
+    return (
+        "【本章必须出场并开口的角色】\n"
+        f"- {'、'.join(hits)}：本章大纲点名了他们，必须真正出场，每人至少 2 条台词，"
+        "并体现各自的声纹（自称/句长/句末/口头禅/说话目的）；不能只在叙述里被提到。\n"
+        "- 未被点名的在册角色本章不要抢戏；需要新角色时先由大纲/剧情点明确写出。"
+    )
+
+
 def build_user_prompt(
     prior_summaries: list[str],
     rag_context: list[str],
@@ -1301,6 +1332,26 @@ def build_user_prompt(
             "不得静默改动卡片里的设定。）",
             "",
         ]
+    # 本章大纲点名的角色必须真正出场并开口（v21）：只点名，不扩成整张角色表。
+    required_cast = _required_cast_block(chapter_outline, plot_bible)
+    if required_cast:
+        blocks += ["", required_cast]
+    # 对白工艺（v23 声纹实验）：角色卡给了「说话方式」，但实测模型只把它当属性表抄，
+    # 五章 16.5k 汉字里「道：」110 次、29.5% 的对白 ≤6 字，所有人一种短句直陈。
+    # 这里把「怎么写对白」写成可核对的要求，并配合角色行里的「台词参考」样本。
+    blocks += [
+        "【对白工艺（硬要求，写完按条自查）】",
+        "- 引导方式：不要只用「某某道：」引出对白；每 3 条引号对白至少 1 条把台词"
+        "嵌进动作/神态/心理/环境（他把烟摁灭，“……”）。本章「道：」不超过 10 次，"
+        "不得连续两条都是「某某道：」。",
+        "- 声纹落地：每个有台词的角色，本章至少 2 条台词对得上他的自称/句长/句末/"
+        "口头禅/说话目的；配角不能只报信息，要带自己的算计或口头习惯。",
+        "- 对话错位：同一场对话至少一次抢话、答非所问、反问、沉默或复述；"
+        "不要所有角色都是一种短句直陈。",
+        "- 长短：对白平均不少于 10 字；≤6 字的短应答占全部对白不超过 15%，"
+        "且不得连续三条都是短应答。",
+        "",
+    ]
     blocks += [
         "【剧情圣经·动态指引】",
         bible_block,

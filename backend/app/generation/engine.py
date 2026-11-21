@@ -2172,6 +2172,203 @@ def _dialogue_ratio_check(project: Project, metrics: dict, gate_limits_meta: dic
     }
 
 
+_VOICE_QUOTE_RE = re.compile(r"[“\"]([^”\"]{1,200})[”\"]")
+_VOICE_PARTICLES = set("吧吗啊呢嘛哦呀哈啦呗")
+
+
+def _speaker_of_quote(text: str, start: int, end: int, names: list[str]) -> str | None:
+    """按「引号前最近的已知人名」+「引号后 name+道/说/问/答」判说话人。
+
+    只用于统计，不用于改写：判错了最多让声纹报告偏一条，不会动正文。
+    """
+    pre = text[max(0, start - 40):start]
+    post = text[end:end + 30]
+    for name in names:
+        if re.search(re.escape(name) + r".{0,8}(?:道|说|问|答)[：:，。,]", post):
+            return name
+    best: tuple[int, str] | None = None
+    for name in names:
+        idx = pre.rfind(name)
+        if idx >= 0 and (best is None or idx > best[0]):
+            best = (idx, name)
+    return best[1] if best else None
+
+
+def _voice_card(project: Project) -> dict[str, dict]:
+    """剧情圣经里带声纹卡的角色：name → {card, sample_lines, role}。"""
+    bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+    out: dict[str, dict] = {}
+    for ch in bible.get("characters") or []:
+        if not isinstance(ch, dict):
+            continue
+        name = str(ch.get("name") or "").strip()
+        if not name:
+            continue
+        out[name] = {
+            "role": str(ch.get("role") or ""),
+            "card": ch.get("card") if isinstance(ch.get("card"), dict) else {},
+            "sample_lines": [
+                str(x).strip() for x in (ch.get("sample_lines") or []) if str(x).strip()
+            ][:3],
+        }
+    return out
+
+
+def _dialogue_voice_check(project: Project, text: str) -> dict:
+    """按角色统计台词，找「有出场但没立起来」的人（只读，不改正文）。
+
+    判定（可解释、可复核）：
+    - `no_lines`：本章被提到 ≥2 次却一句台词都没有；
+    - `one_line`：只有 1 条台词；
+    - `flat`：台词里既没有自称/口头禅，也没有语气词（吧吗啊呢嘛…）。
+    这三类都写进 `reasons`；`weak` 是去重后的角色名列表。
+    """
+    cards = _voice_card(project)
+    if not cards or not (text or "").strip():
+        return {"characters": {}, "weak": [], "reasons": [], "note": "没有角色声纹卡"}
+    names = sorted(cards, key=len, reverse=True)
+    lines: dict[str, list[str]] = {n: [] for n in names}
+    for m in _VOICE_QUOTE_RE.finditer(text):
+        speaker = _speaker_of_quote(text, m.start(), m.end(), names)
+        if speaker:
+            lines[speaker].append(m.group(1).strip())
+
+    chars: dict[str, dict] = {}
+    weak: list[str] = []
+    reasons: list[str] = []
+    for name, info in cards.items():
+        voice = (info["card"].get("声纹") or {}) if isinstance(info["card"], dict) else {}
+        said = lines.get(name) or []
+        mentioned = text.count(name)
+        if not mentioned and not said:
+            continue
+        tics = [
+            str(x).strip("。！？，、；：“”\"' ")
+            for x in (voice.get("口头禅") or []) if str(x).strip()
+        ]
+        self_ref = str(voice.get("自称") or "").strip()
+        tic_hit = any(
+            (self_ref and self_ref in line) or any(t and t in line for t in tics)
+            for line in said
+        )
+        particle_hit = any(set(line) & _VOICE_PARTICLES for line in said)
+        avg_len = round(sum(len(x) for x in said) / len(said), 1) if said else 0.0
+        row = {
+            "mentioned": mentioned,
+            "lines": len(said),
+            "avg_len": avg_len,
+            "tic_hit": tic_hit,
+            "particle_hit": particle_hit,
+        }
+        flag = ""
+        if mentioned >= 2 and not said:
+            flag = "no_lines"
+            reasons.append(f"{name}：本章被提到 {mentioned} 次，却没有一句台词")
+        elif len(said) == 1:
+            flag = "one_line"
+            reasons.append(f"{name}：只有 1 条台词，声纹立不住")
+        elif said and not tic_hit and not particle_hit:
+            flag = "flat"
+            reasons.append(
+                f"{name}：{len(said)} 条台词里没有自称/口头禅/语气词，听不出是谁在说"
+            )
+        row["flag"] = flag or None
+        chars[name] = row
+        if flag:
+            weak.append(name)
+    return {"characters": chars, "weak": weak, "reasons": reasons}
+
+
+def _voice_rewrite_once(db, project, provider, text, check: dict, max_chars: int | None,
+                        chapter_range: str | None) -> tuple[str, dict]:
+    """对声纹不达标的角色做一次定向改写（只改对白与引出方式）。
+
+    接受条件（全部满足才换稿）：
+    1. 章节字数在原文 85%–115% 之间，且不超过篇幅硬上限；
+    2. 声纹弱项数量下降（或弱项相同但原因条数下降）；
+    3. 台词总量不明显缩水（对白字占比不低于原文的 85%）。
+    任何异常/失败都保留原文。
+    """
+    if not check.get("reasons"):
+        return text, {"applied": False, "reason": "声纹检查通过"}
+    if not bool(getattr(settings, "voice_rewrite_enabled", True)):
+        return text, {"applied": False, "reason": "声纹重写开关关闭"}
+    cards = _voice_card(project)
+    weak_names = [n for n in check.get("weak") or [] if n in cards]
+    if not weak_names:
+        return text, {"applied": False, "reason": "没有可改的角色"}
+
+    detail: list[str] = []
+    for name in weak_names:
+        info = cards[name]
+        voice = info["card"].get("声纹") if isinstance(info["card"], dict) else {}
+        voice = voice if isinstance(voice, dict) else {}
+        bits = [
+            f"{k}：{v}" for k, v in (
+                ("自称", voice.get("自称")), ("句长", voice.get("句长")),
+                ("句末", voice.get("句末")), ("语气底色", voice.get("语气底色")),
+            ) if v
+        ]
+        tics = voice.get("口头禅") or []
+        if tics:
+            bits.append("口头禅：" + "、".join(f"“{x}”" for x in tics))
+        samples = info.get("sample_lines") or []
+        if samples:
+            bits.append("台词参考：" + " / ".join(f"“{x}”" for x in samples))
+        why = next((r for r in check["reasons"] if r.startswith(name + "：")), "")
+        detail.append(f"- {name}（{why}）\n  " + "；".join(bits))
+    limit = length_limits(max_chars)
+    lo = max(1, int(len(text) * 0.85))
+    hi = min(int(limit["max"]), max(lo + 1, int(len(text) * 1.15)))
+    system = "你是中文小说对白编辑，只负责改对白与「谁在说」的引出方式，不改情节。"
+    user = f"""下面这章正文里，以下角色的台词没有立起来：
+
+{chr(10).join(detail)}
+
+请只改**对白、说话人归属、紧邻的动作/神态**，其余一律不动：
+1. 每个列出的角色至少 2 条台词，必须体现他的自称/句长/句末习惯/口头禅/
+   说话目的；配角不能只报信息，要带自己的算计或口头习惯；
+2. 引出方式混着来：优先用动作/神态/心理句自然带出；需要「说」时，
+   说/问/答/嘟囔/接了句换着用；「X道：」全章不超过 6 次，不得连续两条都用；
+3. 不要新造人物、不要新增事件、不要改情节顺序；可以调整同一场对话的
+   先后与措辞，但不能把后面章节的材料提前写掉；
+4. 台词总量不要明显缩水；整章字数控制在 {lo}–{hi} 字；
+5. 输出完整正文，不要解释，不要加标题。
+
+【正文】
+{text}"""
+    try:
+        prov = provider.variant(thinking_off=True, max_tokens=16000)
+    except Exception:  # noqa: BLE001
+        prov = provider
+    try:
+        try:
+            got = (prov.chat(system, user, temperature=0.4) or "").strip()
+        except TypeError:
+            # 老 provider 不接 temperature
+            got = (prov.chat(system, user) or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        return text, {"applied": False, "reason": f"调用失败 {type(exc).__name__}"}
+    got = _strip_thinking(got)
+    if not got:
+        return text, {"applied": False, "reason": "空输出"}
+    if len(got) < lo or len(got) > hi:
+        return text, {"applied": False, "reason": f"字数越界 {len(got)}（允许 {lo}–{hi}）"}
+    after = _dialogue_voice_check(project, got)
+    improved = (
+        len(after["weak"]) < len(check["weak"])
+        or (len(after["weak"]) == len(check["weak"])
+            and len(after["reasons"]) < len(check["reasons"]))
+    )
+    if not improved:
+        return text, {"applied": False, "reason": "声纹没有改善", "after": after}
+    logging.getLogger(__name__).info(
+        "声纹定向重写采纳：弱项 %s → %s（project %s）",
+        check["weak"], after["weak"], getattr(project, "id", None),
+    )
+    return got, {"applied": True, "before": check, "after": after}
+
+
 def _era_channel_abuse(db, project, era_meta: dict) -> dict:
     """通道滥用聚合（v18，只判不拦）：单章阈值 + 连续章。
 
@@ -4220,69 +4417,119 @@ def _rewrite_with_evidence(db, project, provider, text: str, reasons: list[str],
     return None, None
 
 
-def _compression_prompt(text: str, max_chars: int | None) -> tuple[str, str]:
+def _dialogue_ratio_of(text: str) -> float:
+    """对白字占比（与闸门同一把尺：对白字符 ÷ 汉字数）。"""
+    h = hanzi_count(text)
+    return (stylometry.dialogue_char_count(text) / h) if h else 0.0
+
+
+def _compression_prompt(text: str, max_chars: int | None,
+                        dialogue_floor: float | None = None) -> tuple[str, str]:
     """超长压缩轮的提示：只做一件事——压进汉字硬上限。
 
     与普通重写不同，这里**允许删句、删段、删可割舍的情节**（篇幅问题，
     不是「禁止删字抬段均」那个问题），但不允许新增内容、不允许改写成新情节。
+
+    2026-11-22（真机回归）：只超上限 28 字符时，模型把 4828 压到 3910，
+    对白占比从 24.8% 掉到 16.1%。两处修正：
+    - 目标从 `上限×0.95` 改为「上限 − 40」，并写明**只需删超出部分**；
+    - 明确「对白是主干，优先删叙述」，且压缩后对白占比不得低于原文与硬下限。
     """
     lim = length_limits(max_chars)
     cur = char_count(text)
-    target = int(lim["max"] * 0.95)
+    over = max(0, cur - lim["max"])
+    target = max(1, lim["max"] - 40)
+    before_ratio = _dialogue_ratio_of(text)
+    floor_txt = (
+        f"，且不得低于硬下限 {float(dialogue_floor):.1%}"
+        if isinstance(dialogue_floor, (int, float)) else ""
+    )
     system = (
         "你是长篇小说的压缩编辑。任务只有一个：把正文压到字数上限以内。\n"
-        f"当前 {cur} 个字符（含标点），硬上限 {lim['max']} 个字符，目标约 {target} 个。\n"
+        f"当前 {cur} 个字符（含标点），硬上限 {lim['max']} 个字符，"
+        f"只需删约 {over + 40} 个字符，压到约 {target} 个即可；"
+        "**不要大幅删减**。\n"
         "1. 允许删句、删段、删掉可以割舍的过场与次要情节；这是篇幅压缩，不是改写。\n"
         "2. 不允许新增任何内容，不允许扩写、补写、改写成新情节。\n"
-        "3. 优先删：重复叙述、无信息量的动作与环境描写、重复的情绪描写、"
-        "可以合并的对话来回；保留：关键对白、转折、伏笔、本章必须发生的事件。\n"
+        f"3. **对白是本章的主干**：优先删重复叙述、无信息量的动作与环境描写、"
+        f"重复的情绪描写；关键对白、转折、伏笔、本章必须发生的事件要保留。"
+        f"压缩后对白字占比不得低于原文（当前 {before_ratio:.1%}）{floor_txt}。\n"
         "4. 只输出压缩后的正文，不要输出任何解释或标记。"
     )
     return system, f"请压缩以下正文：\n\n{text}"
 
 
-def _compression_round(provider, text: str, max_chars: int | None) -> tuple[str, dict]:
+def _compression_round(provider, text: str, max_chars: int | None,
+                       dialogue_floor: float | None = None) -> tuple[str, dict]:
     """两轮重写仍超限时追加的一次压缩轮；返回 (候选正文或原文, 留痕记录)。
 
-    接受条件只有一条：**字符数比原文少**。不受 `grew_too_much` 与段均/段数
-    相关规则约束——这一轮的目的就是删，行文结构让位于篇幅。
+    接受条件（2026-11-22 起）：
+    1. **字符数比原文少**（这是压缩的目的）；
+    2. **不能压过头**：不少于原文的 85%（避免只超 28 字却删 900 字）；
+    3. **对白不能先被删**：对白字占比不低于原文的 95%，且原文达标时不低于硬下限。
+    第 2/3 条不过就换更严格的提示重试一次；仍不过保留原文。
     """
     limit = length_limits(max_chars)
     before = char_count(text)
+    before_ratio = _dialogue_ratio_of(text)
     record: dict = {
         "round": "compression", "kind": "compression",
         "chars_before": before, "limit": limit["max"],
+        "dialogue_before": round(before_ratio, 4),
     }
-    try:
-        system, user = _compression_prompt(text, max_chars)
-        rewritten = _strip_thinking(
-            "".join(_stream_with_retry(provider, system, user)))
-    except Exception as exc:  # noqa: BLE001 —— 压缩失败不阻断，保留原文
-        record.update({
-            "failed": True, "error": f"{type(exc).__name__}: {exc}",
-            "accepted": False, "chars_after": before,
-            "still_over_limit": before > limit["max"],
+    min_after = max(int(limit["max"] * 0.85), int(before * 0.85))
+    attempts: list[dict] = []
+    for attempt in range(2):
+        try:
+            system, user = _compression_prompt(text, max_chars, dialogue_floor)
+            if attempt:
+                system += (
+                    "\n上一次压缩删得过多/删到了对白。这一次只删超出上限的部分，"
+                    "保留所有关键对白；对白占比必须不低于原文。"
+                )
+            rewritten = _strip_thinking(
+                "".join(_stream_with_retry(provider, system, user)))
+        except Exception as exc:  # noqa: BLE001 —— 压缩失败不阻断，保留原文
+            attempts.append({"attempt": attempt + 1, "error": f"{type(exc).__name__}"})
+            continue
+        if not rewritten or len(rewritten) < len(text) * 0.3:
+            attempts.append({"attempt": attempt + 1, "error": "empty_or_too_short"})
+            continue
+        after = char_count(rewritten)
+        after_ratio = _dialogue_ratio_of(rewritten)
+        reasons: list[str] = []
+        if after >= before:
+            reasons.append("no_reduction")
+        if after < min_after:
+            reasons.append(f"over_compressed（{after} < {min_after}）")
+        ratio_ok = after_ratio >= before_ratio * 0.95
+        if before_ratio >= (dialogue_floor or 0) and dialogue_floor:
+            ratio_ok = ratio_ok and after_ratio >= float(dialogue_floor)
+        if not ratio_ok:
+            reasons.append(
+                f"dialogue_dropped（{before_ratio:.1%}→{after_ratio:.1%}）"
+            )
+        attempts.append({
+            "attempt": attempt + 1, "chars": after,
+            "dialogue": round(after_ratio, 4), "reasons": reasons,
         })
-        return text, record
-    if not rewritten or len(rewritten) < len(text) * 0.3:
-        record.update({
-            "failed": True, "error": "empty_or_too_short",
-            "accepted": False, "chars_after": before,
-            "still_over_limit": before > limit["max"],
-        })
-        return text, record
-    after = char_count(rewritten)
-    accepted = after < before
+        if not reasons:
+            record.update({
+                "candidate_chars": after,
+                "dialogue_after": round(after_ratio, 4),
+                "attempts": attempts,
+                "accepted": True, "discarded": False, "discard_reasons": [],
+                "chars_after": after,
+                "still_over_limit": after > limit["max"],
+            })
+            return rewritten, record
     record.update({
-        "candidate_chars": after,
-        "accepted": accepted,
-        "discarded": not accepted,
-        "discard_reasons": [] if accepted else ["no_reduction"],
-        "chars_after": after if accepted else before,
-        "still_over_limit": (after if accepted else before) > limit["max"],
+        "failed": True, "error": "rejected_candidates",
+        "reasons": attempts[-1].get("reasons") if attempts else [],
+        "attempts": attempts,
+        "accepted": False, "chars_after": before,
+        "still_over_limit": before > limit["max"],
     })
-    if accepted:
-        return rewritten, record
     return text, record
 
 
@@ -4502,7 +4749,10 @@ def _rewrite_rounds(
     path = "direct" if not rounds else "rewrite"
     if char_count(text) > limit["max"]:
         path = "compression"
-        compressed, comp_record = _compression_round(provider, text, max_chars)
+        compressed, comp_record = _compression_round(
+            provider, text, max_chars,
+            dialogue_floor=((gate_limits or {}).get("对白字占比") or {}).get("min"),
+        )
         rounds.append(comp_record)
         if comp_record.get("accepted"):
             text = compressed
@@ -5582,6 +5832,16 @@ def generate_next_segment(
             "rewrite_info", "form_info", "attr_info", "ell_info", "beat_info")):
         summary = provider.summarize(text)
 
+    # 声纹检查 + 定向重写（v24）：归属校正会把台词统一盖成「X道：」，这里按角色
+    # 统计台词，发现有人只报信息/没有声纹，就让模型只改对白与引出方式再试一次。
+    # 不达标就保留原稿（`_voice_rewrite_once` 内部做字数与改善校验）。
+    voice_check = _dialogue_voice_check(project, text)
+    text, voice_info = _voice_rewrite_once(
+        db, project, provider, text, voice_check, max_chars, chapter_range)
+    if voice_info.get("applied"):
+        summary = provider.summarize(text)
+        voice_check = voice_info.get("after") or _dialogue_voice_check(project, text)
+
     # 时代越界自检：默认 report（只扫描、落 meta，不改正文）。
     # 显式 rewrite 模式下才可能改 text；改过就重算摘要，避免摘要与正文脱节。
     era_before = text
@@ -5603,6 +5863,8 @@ def generate_next_segment(
     quality["style_gate"] = gate_final
     # 批 6：校正链的逐道留痕（跑没跑、为什么没跑、改了哪些指标）。
     quality["style_corrections"] = style_fix
+    quality["dialogue_voice_check"] = voice_check
+    quality["voice_rewrite"] = voice_info
     # v15：结构检测（情节点覆盖 / 越章材料 / 人物性别一致），只写留痕、不改正文；
     # 是否阻断由 `structure_guard_mode` 在 `_commit_segment` 决定。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
@@ -6070,6 +6332,16 @@ def generate_next_segment_stream(
             "rewrite_info", "form_info", "attr_info", "ell_info", "beat_info")):
         summary = provider.summarize(text)
 
+    # 声纹检查 + 定向重写（v24）：归属校正会把台词统一盖成「X道：」，这里按角色
+    # 统计台词，发现有人只报信息/没有声纹，就让模型只改对白与引出方式再试一次。
+    # 不达标就保留原稿（`_voice_rewrite_once` 内部做字数与改善校验）。
+    voice_check = _dialogue_voice_check(project, text)
+    text, voice_info = _voice_rewrite_once(
+        db, project, provider, text, voice_check, max_chars, chapter_range)
+    if voice_info.get("applied"):
+        summary = provider.summarize(text)
+        voice_check = voice_info.get("after") or _dialogue_voice_check(project, text)
+
     # 时代越界自检：与同步版同口径；默认 report，不改正文。
     era_before = text
     text, era_meta = _apply_era_guard(
@@ -6089,6 +6361,8 @@ def generate_next_segment_stream(
     quality["style_gate"] = gate_final
     # 批 6：校正链逐道留痕，与同步版同口径。
     quality["style_corrections"] = style_fix
+    quality["dialogue_voice_check"] = voice_check
+    quality["voice_rewrite"] = voice_info
     # 与同步版同口径：结构检测留痕（是否阻断由 `structure_guard_mode` 决定）。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
     # 与同步版同口径：逐章推进台账（只判不拦，`mode=report`）。

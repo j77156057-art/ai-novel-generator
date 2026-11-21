@@ -372,6 +372,10 @@ class Settings(BaseSettings):
     style_lead_in: bool = True
     #: 归属校正：把「说话人归属」的写法密度掰到参考书自己的（实测差 5 倍）。
     style_attribution_correction: bool = True
+    #: 声纹检查 + 定向重写（2026-11-22）：归属校正后按角色统计台词，
+    #: 发现「有角色只报信息 / 没有声纹 / 戏份过少」就再调一次模型，只改对白与
+    #: 引出方式，不改情节。关掉只留检查报告、不花这次调用。
+    voice_rewrite_enabled: bool = True
     #: 省略号习惯校正：对白结尾省略号密度对齐参考书（机械改动，代价低）。
     style_ellipsis_correction: bool = True
     #: beat 插入：连续对白段开头补一句动作/神态叙述。默认关——它**新增**叙述，
