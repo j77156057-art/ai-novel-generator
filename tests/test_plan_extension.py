@@ -81,16 +81,63 @@ def test_requires_exhausted_plan(db):
     assert "未写" in result["message"]
 
 
-def test_chapter_mode_is_rejected_with_next_step(db):
+def test_chapter_mode_extends_outline_instead_of_dead_node(db, monkeypatch):
+    """章模式不能追加没有章区间的死节点，正确扩展是补章。"""
     proj = _project(db)
+    proj.outline = ["第1章 夜雨"]
     db.add(Generation(project_id=proj.id, segment_no=1,
                       chapter_range="第1章", text="正文"))
     db.commit()
+    seen = {}
+
+    def fake_extend(db_, project_, count):
+        seen["count"] = count
+        return {"status": "extended", "chapters": [2], "message": "已补第 2 章"}
+
+    monkeypatch.setattr(pe, "_extend_chapters", fake_extend)
 
     result = extend_plan(db, proj, Provider())
 
-    assert result["status"] == "chapter_mode_requires_outline"
-    assert "章纲" in result["message"]
+    assert result["status"] == "extended"
+    assert result["chapters"] == [2]
+    assert seen["count"] == 1
+
+
+def test_extend_chapters_drafts_then_applies(db, monkeypatch):
+    """补章 = 起草 → 校验 → 应用；写入必须带 confirm 与来源指纹。"""
+    import app.routers.chapter_outline as co
+
+    proj = _project(db)
+    proj.outline = ["第1章 夜雨"]
+    db.add(Generation(project_id=proj.id, segment_no=1,
+                      chapter_range="第1章", text="正文"))
+    db.commit()
+    seen = {}
+
+    def fake_draft(project_id, body, db_):
+        seen["draft"] = (body.from_chapter, body.to_chapter)
+        return {
+            "entries": [{"chapter": 2, "entry": "第2章《门后的声音》：沈砚听见门后有人叫他"}],
+            "validation": {"ok": True},
+            "source_fingerprint": "fp-1",
+        }
+
+    def fake_apply(project_id, body, db_):
+        seen["apply"] = (
+            body.from_chapter, body.to_chapter, body.confirm,
+            body.expected_fingerprint, len(body.entries),
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(co, "draft_chapter_outline", fake_draft)
+    monkeypatch.setattr(co, "apply_chapter_outline", fake_apply)
+
+    result = pe._extend_chapters(db, proj, 1)
+
+    assert result["status"] == "extended"
+    assert result["chapters"] == [2]
+    assert seen["draft"] == (2, 2)
+    assert seen["apply"] == (2, 2, True, "fp-1", 1)
 
 
 def test_extend_appends_node_and_contract(db, monkeypatch):

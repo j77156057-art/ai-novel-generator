@@ -680,40 +680,15 @@ def _qa_gate_block(db: Session, project: Project) -> str:
     但模型只有先调工具才可能看到 status，问答里经常不调——于是会出现
     「说可以继续写、实际生成被 409 拦下」的自相矛盾。事实在这里直接给出。
     """
-    try:
-        from app.generation.engine import _timeline_progress, _total_segments
-        from app.generation.timeline import (
-            has_chapter_ranges,
-            state_from_dict,
-            sync_node_for_chapter,
-            timeline_progress,
-        )
-
-        saved = project.plot_timeline if isinstance(project.plot_timeline, dict) else None
-        if not saved:
-            return ""
-        outline = project.outline if isinstance(project.outline, list) else []
-        st = state_from_dict(
-            saved,
-            total_segments=_total_segments(project),
-            total_chapters=len(outline) or None,
-        )
-        if st is None:
-            return ""
-        written, chapter_based = _timeline_progress(db, project)
-        if chapter_based and has_chapter_ranges(st):
-            st = sync_node_for_chapter(st, written + 1)
-        prog = timeline_progress(st)
-    except Exception as exc:  # noqa: BLE001 - 诊断块失败不拖垮问答
-        logger.warning("assistant/qa 闸门状态读取失败：%s", exc)
+    facts = _gate_state(db, project)
+    if facts is None:
         return ""
-
-    status = prog["status"]
-    plan_exhausted = bool(prog["plan_exhausted"])
+    status = facts["status"]
+    plan_exhausted = facts["plan_exhausted"]
     lines = [
         "【时间线写前闸门 · 当前事实（只读，程序判定）】",
         f"status={status}；plan_exhausted={'true' if plan_exhausted else 'false'}；"
-        f"主线进度={int(prog['main_progress'] * 100)}%",
+        f"主线进度={int(facts['main_progress'] * 100)}%",
     ]
     if plan_exhausted:
         lines.append("推荐动作：扩展规划/扩展章纲（否则每次生成都会被 409 拦下）。")
@@ -724,6 +699,110 @@ def _qa_gate_block(db: Session, project: Project) -> str:
     else:
         lines.append("推荐动作：可以直接继续写正文。")
     return "\n".join(lines)
+
+
+def _gate_state(db: Session, project: Project) -> dict[str, Any] | None:
+    """时间线写前闸门的当前事实（只读、不调模型、不落库）。
+
+    与 `/generate-stream` 的开流预检同一口径：章号能解析出来就按该章同步
+    节点，否则退回段模式。否则会出现「助手以为还能写、生成却被 409 拦下」。
+    """
+    try:
+        from app.generation import chapter_labels
+        from app.generation.engine import (
+            _chapter_ordinal,
+            _timeline_progress,
+            _total_segments,
+        )
+        from app.generation.timeline import (
+            has_chapter_ranges,
+            state_from_dict,
+            sync_node_for_chapter,
+            timeline_progress,
+        )
+
+        saved = project.plot_timeline if isinstance(project.plot_timeline, dict) else None
+        if not saved:
+            return None
+        outline = project.outline if isinstance(project.outline, list) else []
+        st = state_from_dict(
+            saved,
+            total_segments=_total_segments(project),
+            total_chapters=len(outline) or None,
+        )
+        if st is None:
+            return None
+        written, chapter_based = _timeline_progress(db, project)
+        chapter: int | None = None
+        if chapter_based:
+            chapter = written + 1
+        else:
+            # 还没写过正文的项目也可能已经能解析出「第 1 章」——
+            # 生成入口就是这么做的，闸门判定不能比它宽松。
+            try:
+                chapter = _chapter_ordinal(
+                    chapter_labels.resolve(db, project, None)["label"]
+                )
+            except Exception:  # noqa: BLE001 - 章号解析失败就退回段模式
+                chapter = None
+        if chapter is not None and has_chapter_ranges(st):
+            st = sync_node_for_chapter(st, chapter)
+        prog = timeline_progress(st)
+        return {
+            "status": prog["status"],
+            "plan_exhausted": bool(prog["plan_exhausted"]),
+            "main_progress": prog["main_progress"],
+            "chapter_based": chapter_based,
+        }
+    except Exception as exc:  # noqa: BLE001 - 诊断失败不拖垮问答
+        logger.warning("assistant/qa 闸门状态读取失败：%s", exc)
+        return None
+
+
+def _gate_fallback_action(db: Session, project: Project) -> dict[str, Any] | None:
+    """闸门拦住生成时，主动提一张「修复」动作卡（确定性，不依赖模型调工具）。
+
+    - `needs_planning` → `replan_timeline`（重新规划世界线）
+    - `plan_exhausted` → `extend_plan`（追加剧情点；章模式会先补章纲）
+    - `needs_review` 没有可自动执行的动作（要先看正文/调预算），不提卡。
+
+    仍受工序链 `STEP_WRITE_KINDS` 约束：当前这一步不许提的动作绝不越权提，
+    否则就是「提一张点了必然失败的卡」。
+    """
+    facts = _gate_state(db, project)
+    if facts is None:
+        return None
+    if facts["plan_exhausted"]:
+        kind, title = "extend_plan", "扩展规划，追加 1 个剧情点"
+        reason = "规划里的主干剧情点已经全部写完（plan_exhausted）"
+    elif facts["status"] == "needs_planning":
+        kind, title = "replan_timeline", "重新规划世界线，补全缺失的剧情点"
+        reason = "当前节点缺少有效的起点/退出条件（needs_planning）"
+    else:
+        return None
+
+    try:
+        from app.agents.action_proposals import ACTION_ENDPOINTS, build_action_body
+        from app.agents.pending_actions import build_action_proposal_action
+        from app.agents.workflow import STEP_WRITE_KINDS, evaluate
+
+        current = (evaluate(db, project) or {}).get("current_step") or ""
+        if kind not in STEP_WRITE_KINDS.get(current, ()):
+            logger.info("assistant/gate 兜底动作 %s 不在工序 %s 允许列表里，跳过", kind, current)
+            return None
+        body = build_action_body(kind, project.id, count=1, db=db, project=project)
+        endpoint = ACTION_ENDPOINTS[kind].format(project_id=project.id)
+        return build_action_proposal_action(
+            project_id=project.id,
+            kind=kind,
+            title=title,
+            detail={"reason": reason, "source": "gate_fallback"},
+            action_endpoint=endpoint,
+            action_body=body,
+        )
+    except Exception as exc:  # noqa: BLE001 - 提卡失败不拖垮问答
+        logger.warning("assistant/gate 构造兜底卡失败：%s", exc)
+        return None
 
 
 def _attachment_prompt_block(attachment_plan: dict[str, Any] | None) -> str:
@@ -2021,6 +2100,12 @@ def _collect_pending_actions(
             ).first()
             is not None
         )
+
+    # 闸门优先：生成已经被拦下时，提一张「续写下一段」的卡等于骗用户点一次必然
+    # 409 的按钮。先提修复动作（重规划 / 扩展规划），修复完再谈生成。
+    gate_action = _gate_fallback_action(db, project)
+    if gate_action is not None:
+        return [gate_action]
 
     try:
         action = propose_invoke_generation(

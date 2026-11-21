@@ -2184,6 +2184,10 @@ async function confirmCard(card: ActionCard): Promise<void> {
     void loadDesk();
     // 生成/提案会推进工序链，计划卡跟着重算。
     void loadWorkflow();
+    // 动作提案确认后要立刻出现在「等着你批准的动作」里，不让用户自己点刷新。
+    if (card.action.kind === "action_proposal") {
+      void workflowStripRef.value?.load();
+    }
   } catch (err) {
     const status = statusOf(err);
     const detail = detailOf(err);
@@ -3146,6 +3150,9 @@ async function loadWorkflow(): Promise<void> {
   }
 }
 
+/** 工序链组件（含「等着你批准的动作」）：卡片确认后要让它一起刷新。 */
+const workflowStripRef = ref<{ load: () => Promise<void> } | null>(null);
+
 /**
  * 只看本作品实际用到的工序：`skipped`（未启用/不适用）不算进度，
  * 否则 11 步里一半是「不适用」，计划卡会被噪声占满。
@@ -4038,7 +4045,13 @@ onMounted(async () => {
                     提案类卡片：确认只创建了待批提案，业务表还没动。
                     在这里补上「批准 → 写入」，用户不必再跳去项目页找。
                   -->
-                  <div v-if="proposalIdOf(card) && !card.applied" class="promote-row">
+                  <!-- 文本提案（kind=proposal）才走 /proposals 的批准+写入；
+                       动作提案（kind=action_proposal）是另一张表、另一组端点，
+                       误用这里会拿错 id 去批文本提案，必须在右侧工序链里处理。 -->
+                  <div
+                    v-if="card.action.kind === 'proposal' && proposalIdOf(card) && !card.applied"
+                    class="promote-row"
+                  >
                     <span class="faint">提案已创建，项目数据还没改。</span>
                     <button
                       class="btn primary sm"
@@ -4047,6 +4060,12 @@ onMounted(async () => {
                     >
                       {{ promoteBusy[card.key] ? "写入中…" : "批准并写入" }}
                     </button>
+                  </div>
+                  <div
+                    v-else-if="card.action.kind === 'action_proposal' && proposalIdOf(card)"
+                    class="faint"
+                  >
+                    动作提案已创建，项目数据还没改；请在右侧「等着你批准的动作」里批准并执行。
                   </div>
                   <div v-else-if="card.applied" class="faint">已写入项目。</div>
                 </div>
@@ -4306,7 +4325,12 @@ onMounted(async () => {
       </div>
 
       <!-- 工序链：全流程走到哪一步、卡在哪、哪条改动等你批（服务端每次重新评估） -->
-      <WorkflowStrip v-if="!badId" class="ctx-workflow" :project-id="projectId" />
+      <WorkflowStrip
+        v-if="!badId"
+        ref="workflowStripRef"
+        class="ctx-workflow"
+        :project-id="projectId"
+      />
 
       <div class="ctx-card">
         <h3>

@@ -265,6 +265,77 @@ def _write_extension(db, project, accepted, authority, timeline, nodes, order,
     }
 
 
+def _extend_chapters(db, project, count: int) -> dict:
+    """章模式：按章纲补 count 章，让「当前章号」重新落进某个节点区间。
+
+    为什么不能直接追加节点：章模式下当前剧情点由章号决定，追加的节点没有
+    章纲条目、也就没有章区间，`node_for_chapter` 永远选不到它——那是一个
+    写不进正文的死节点。补章之后节点区间会按新大纲长度重算
+    （`state_from_dict` 每次都重算），`plan_exhausted` 自然解除。
+    """
+    from fastapi import HTTPException
+
+    from app.generation.chapter_outline import normalize_outline
+    from app.routers.chapter_outline import (
+        ChapterOutlineApply,
+        ChapterOutlineDraft,
+        ChapterOutlineEntryIn,
+        apply_chapter_outline,
+        draft_chapter_outline,
+    )
+
+    start = len(normalize_outline(project.outline)) + 1
+    end = start + count - 1
+    try:
+        draft = draft_chapter_outline(
+            project.id,
+            ChapterOutlineDraft(from_chapter=start, to_chapter=end),
+            db,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        message = detail.get("message") or detail.get("error") or str(exc.detail)
+        return {
+            "status": "proposal_failed",
+            "message": f"起草第 {start}–{end} 章章纲失败：{message}",
+        }
+    if not (draft.get("validation") or {}).get("ok"):
+        return {
+            "status": "outline_invalid",
+            "message": "起草出的章纲没通过校验，未写入："
+                       + str(draft.get("validation"))[:300],
+        }
+    entries = [
+        ChapterOutlineEntryIn(chapter=int(item["chapter"]), entry=item["entry"])
+        for item in draft.get("entries") or []
+    ]
+    try:
+        apply_chapter_outline(
+            project.id,
+            ChapterOutlineApply(
+                from_chapter=start,
+                to_chapter=end,
+                entries=entries,
+                expected_fingerprint=draft["source_fingerprint"],
+                confirm=True,
+            ),
+            db,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return {
+            "status": "outline_invalid",
+            "message": "章纲写入被拒：" + str(detail.get("message") or detail)[:300],
+        }
+    return {
+        "status": "extended",
+        "chapters": [item["chapter"] for item in draft.get("entries") or []],
+        "nodes": [],
+        "contracts": [],
+        "message": f"已补第 {start}–{end} 章章纲；剧情点区间会按新章纲长度重算。",
+    }
+
+
 def extend_plan(db, project, provider, *, count: int = 1) -> dict:
     """在权威允许的范围内追加剧情点；失败时返回带 `message` 的状态码。"""
     count = max(1, min(int(count or 1), MAX_EXTEND_COUNT))
@@ -280,11 +351,9 @@ def extend_plan(db, project, provider, *, count: int = 1) -> dict:
         }
 
     if _chapter_based(db, project):
-        return {
-            "status": "chapter_mode_requires_outline",
-            "message": "章节项目的下一个剧情点由章纲决定：请先用章纲端点补第 N 章，"
-                       "再追加节点；段模式才支持直接扩展规划。",
-        }
+        # 章模式不能追加「没有章纲条目」的死节点；正确的扩展是补章，
+        # 让区间按新长度重算（见 `_extend_chapters`）。
+        return _extend_chapters(db, project, count)
 
     nodes = timeline.get("nodes") if isinstance(timeline.get("nodes"), dict) else {}
     order = [nid for nid in (timeline.get("order") or [])

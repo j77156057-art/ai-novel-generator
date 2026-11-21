@@ -65,6 +65,39 @@ export function pendingActionRiskMeta(
           : "确认后只创建一条待批提案，不改任何正文；可在卡片上直接「批准并写入」，或去项目页处理。改写类会覆盖目标段落。",
     };
   }
+  if (action.kind === "action_proposal") {
+    // 动作提案：确认只创建一条待批动作，业务表一个字不动；真正生效还要在
+    // 工序链里「批准 → 执行」。说成「追加新段落」会让人以为点一下就开始写。
+    const inner = typeof body.kind === "string" ? body.kind : "";
+    if (inner === "replan_timeline") {
+      return {
+        label: "中风险 · 重规划世界线",
+        tag: "warn",
+        hint:
+          typeof detail.risk_hint === "string" && detail.risk_hint
+            ? detail.risk_hint
+            : "确认后只创建待批动作提案；批准并执行才会重规划世界线（人工追加的节点保留）。",
+      };
+    }
+    if (inner === "extend_plan") {
+      return {
+        label: "中风险 · 扩展规划",
+        tag: "warn",
+        hint:
+          typeof detail.risk_hint === "string" && detail.risk_hint
+            ? detail.risk_hint
+            : "确认后只创建待批动作提案；批准并执行才会追加剧情点（章模式会先补章纲）。",
+      };
+    }
+    return {
+      label: "待确认的动作",
+      tag: "warn",
+      hint:
+        typeof detail.risk_hint === "string" && detail.risk_hint
+          ? detail.risk_hint
+          : "确认后只创建待批动作提案，业务数据还没动；批准并执行后才会生效。",
+    };
+  }
   return {
     label: "中风险 · 追加新段落",
     tag: "warn",
@@ -79,6 +112,7 @@ export function pendingActionRiskMeta(
 export function pendingActionKindLabel(kind: string): string {
   if (kind === "proposal") return "提案";
   if (kind === "invoke_generation") return "调动生成";
+  if (kind === "action_proposal") return "动作提案";
   return "待确认动作";
 }
 
