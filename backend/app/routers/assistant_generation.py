@@ -1172,6 +1172,10 @@ def assistant_invoke_generation(
         if isinstance(exc, LengthBlocked):
             raise HTTPException(
                 status_code=422, detail=exc.to_dict()) from exc
+        # 时间线规划闸门：引擎已给出可解释的 409（needs_planning / needs_review），
+        # 保留状态码与结构化 detail，不降级成 500。
+        if isinstance(exc, HTTPException):
+            raise
         raise HTTPException(
             status_code=500, detail=f"助手调动生成失败：{str(exc)[:200]}"
         )

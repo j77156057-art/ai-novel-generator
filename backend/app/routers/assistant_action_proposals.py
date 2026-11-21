@@ -76,6 +76,12 @@ def _raise_http(exc: Exception) -> None:
             'error': 'stale_precondition',
             'message': message,
         }) from exc
+    if code in ('needs_planning', 'needs_review', 'plan_exhausted'):
+        # 时间线规划闸门：与生成入口同口径的 409，保留可解释的下一步。
+        raise HTTPException(status_code=409, detail={
+            'error': code,
+            'message': message,
+        }) from exc
     if code in ('unknown_action_kind', 'unknown_status', 'unknown_risk_level'):
         raise HTTPException(status_code=422, detail=message) from exc
     raise HTTPException(status_code=400, detail=message) from exc

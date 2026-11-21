@@ -122,6 +122,7 @@ def test_stream_v25_integration():
     from app.generation.timeline import plan_timeline
     st = plan_timeline(total_segments=10)
     st.nodes["n1"].title = "入职立足"
+    st.nodes["n1"].entry_condition = "刚入职"
     st.nodes["n1"].exit_condition = "升至部门经理"
     st.nodes["n1"].emotion = "爽"
     st.nodes["n1"].segment_budget = 3
@@ -205,6 +206,7 @@ def test_regenerate_does_not_call_v25():
     # 先存 plot_timeline（让 node_prompt 能算）
     st = plan_timeline(total_segments=10)
     st.nodes["n1"].title = "n1"
+    st.nodes["n1"].entry_condition = "起点"
     st.nodes["n1"].exit_condition = "x"
     st.nodes["n1"].segment_budget = 2
     _persist_timeline_state(s, p, st)

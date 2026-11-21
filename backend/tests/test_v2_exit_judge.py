@@ -72,10 +72,10 @@ class FakeProvider:
         return self.reply
 
 
-# ── 组 1：judge_node_completion 三类返回 + 容错 ──
+# ── 组 1：judge_node_completion 三态证据 + 容错 ──
 
 def test_judge_basic_returns():
-    print("\n=== 组 1: judge_node_completion 三类返回 ===")
+    print("\n=== 组 1: judge_node_completion 三态证据 ===")
     node = PlotNode(
         id="n1", kind="main", title="入职", emotion="爽",
         entry_condition="刚入职", exit_condition="升部门经理",
@@ -83,57 +83,91 @@ def test_judge_basic_returns():
     )
     text = "林悠然通过试用期，升任部门经理。"
 
-    # True
+    # 裸布尔不能证明完成
     p = FakeProvider('{"done": true}')
-    check("True 解析", judge_node_completion(p, node, text), True)
-    check("True 时 LLM 被调一次", p.call_count, 1)
+    result = judge_node_completion(p, node, text)
+    check("裸 done=true → unknown", result["verdict"], "unknown")
+    check("裸 done=true 不产证据", result["sources"], [])
+    check("裸 done=true 仍调了一次模型", p.call_count, 1)
 
-    # False
-    p = FakeProvider('{"done": false}')
-    check("False 解析", judge_node_completion(p, node, text), False)
+    # supported + 合法来源
+    p = FakeProvider(
+        '{"verdict": "supported", "reason": "正文已写明", "source_ids": ["P001"]}'
+    )
+    result = judge_node_completion(p, node, text)
+    check("supported 解析", result["verdict"], "supported")
+    check("supported 带来源", [s.get("paragraph_id") for s in result["sources"]], ["P001"])
+    check("supported 记正文哈希", bool(result["audit"]["text_hash"]), True)
 
-    # None（缺 done 键）
-    p = FakeProvider('{"other": true}')
-    check("缺 done 键 → None", judge_node_completion(p, node, text), None)
+    # contradicted
+    p = FakeProvider(
+        '{"verdict": "contradicted", "reason": "仍在铺垫", "source_ids": ["P001"]}'
+    )
+    check("contradicted 解析", judge_node_completion(p, node, text)["verdict"], "contradicted")
 
-    # None（done 是字符串）
-    p = FakeProvider('{"done": "yes"}')
-    check("done 是 string → None", judge_node_completion(p, node, text), None)
+    # 非法 verdict
+    p = FakeProvider('{"verdict": "yes", "reason": "x", "source_ids": ["P001"]}')
+    check("非法 verdict → unknown", judge_node_completion(p, node, text)["verdict"], "unknown")
 
-    # None（裸 true/false 无 JSON 包裹 + 找不到 {} 块）
+    # 声称 supported 却没有证据
+    p = FakeProvider('{"verdict": "supported", "reason": "缺证据", "sources": []}')
+    check("supported 无证据 → unknown", judge_node_completion(p, node, text)["verdict"], "unknown")
+
+    # 非 JSON
     p = FakeProvider("判断完成。")
-    check("非 JSON → None", judge_node_completion(p, node, text), None)
+    check("非 JSON → unknown", judge_node_completion(p, node, text)["verdict"], "unknown")
 
     # ```json 包裹
-    p = FakeProvider('```json\n{"done": true}\n```')
-    check("```json 包裹 → True", judge_node_completion(p, node, text), True)
+    p = FakeProvider(
+        '```json\n{"verdict": "supported", "reason": "正文已写明", "source_ids": ["P001"]}\n```'
+    )
+    check("```json 包裹 → supported", judge_node_completion(p, node, text)["verdict"], "supported")
 
     # 异常
     p = FakeProvider(raise_exc=True)
-    check("provider 异常 → None", judge_node_completion(p, node, text), None)
+    check("provider 异常 → judge_failed",
+          judge_node_completion(p, node, text)["reason"], "judge_failed")
 
     # exit_condition 为空 → 不调 LLM
     no_exit_node = PlotNode(
         id="n1", kind="main", title="x", emotion="爽",
-        entry_condition="", exit_condition="", segment_budget=2,
+        entry_condition="刚入职", exit_condition="", segment_budget=2,
     )
-    p = FakeProvider('{"done": true}')
-    check("无 exit_condition → None（不调 LLM）", judge_node_completion(p, no_exit_node, text), None)
+    p = FakeProvider('{"verdict": "supported", "reason": "x", "source_ids": ["P001"]}')
+    check("无 exit_condition → unknown",
+          judge_node_completion(p, no_exit_node, text)["verdict"], "unknown")
     check("无 exit 时 LLM 未被调", p.call_count, 0)
 
     # recent_text 空 → 不调 LLM
-    p = FakeProvider('{"done": true}')
-    check("recent_text 空 → None", judge_node_completion(p, node, ""), None)
+    p = FakeProvider('{"verdict": "supported", "reason": "x", "source_ids": ["P001"]}')
+    check("recent_text 空 → unknown",
+          judge_node_completion(p, node, "")["verdict"], "unknown")
     check("空文本时 LLM 未被调", p.call_count, 0)
+
+
+def _supported(state: TimelineState, node_id: str, quote: str = "升任部门经理") -> TimelineState:
+    """给当前节点写入一条可核验的 supported 证据（force 的前置条件）。"""
+    state.completion[node_id] = {
+        "verdict": "supported",
+        "reason": "正文已写明",
+        "sources": [{"source_id": "generation:1", "quote": quote,
+                     "start": 0, "end": len(quote)}],
+    }
+    return state
+
 
 
 # ── 组 2：force_complete_current 纯函数行为 ──
 
 def test_force_complete_basic():
     print("\n=== 组 2: force_complete_current 行为 ===")
-    st = plan_timeline(total_segments=12)
+    st = _supported(plan_timeline(total_segments=12), "n1")
     check("初始 current_node = n1", st.current_node, "n1")
     check("初始 done 空", sorted(st.done), [])
+
+    # 没有 supported 证据 → noop（预算/时间都不是完成证明）
+    bare = plan_timeline(total_segments=12)
+    check("无证据 force = noop", sorted(force_complete_current(bare).done), [])
 
     st2 = force_complete_current(st)
     check("force 后 current_node = n2", st2.current_node, "n2")
@@ -153,8 +187,8 @@ def test_force_complete_basic():
     check("已 done 节点 force = noop（current 不变）", st3.current_node, "n1")
     check("已 done 节点 force = noop（done 不重复加）", sorted(st3.done), ["n1"])
 
-    # 正常推进路径：force n1 后 current 是 n2，再 force n2 → n3（这是按设计走的）
-    st4 = force_complete_current(st2)
+    # 正常推进路径：force n1 后 current 是 n2；给 n2 补证据后 force → n3
+    st4 = force_complete_current(_supported(st2, "n2", quote="完成2"))
     check("连续 force 推进：n2 → n3", st4.current_node, "n3")
     check("连续 force 推进：done=[n1,n2]", sorted(st4.done), ["n1", "n2"])
 
@@ -162,9 +196,9 @@ def test_force_complete_basic():
 def test_force_complete_last_node():
     print("\n=== 组 3: force 最后一节点 → current_node=None ===")
     st = plan_timeline(total_segments=12)
-    # 把 current 推到最后一节点
+    # 把 current 推到最后一节点（每一步都要先有 supported 证据）
     for _ in range(len(st.order)):
-        st = force_complete_current(st)
+        st = force_complete_current(_supported(st, st.current_node))
     check("全部 force 后 current_node = None", st.current_node, None)
     check("全部 force 后 done = 全部", sorted(st.done), sorted(st.order))
 

@@ -433,9 +433,36 @@ def _exec_invoke_generation(db: Any, project: Any, proposal: Any, *,
     body = proposal.body_json if isinstance(proposal.body_json, dict) else {}
     # 与助手入口同口径：先分配章号，再写正文；解析失败直接抛，不回落段号。
     plan = chapter_labels.resolve(db, project, None)
-    result = generate_next_segment(
-        db, project, max_chars=body.get('max_chars'),
-        chapter_range=plan['label'])
+    try:
+        result = generate_next_segment(
+            db, project, max_chars=body.get('max_chars'),
+            chapter_range=plan['label'])
+    except Exception as exc:  # noqa: BLE001 —— 转成动作域错误，由路由统一映射
+        from fastapi import HTTPException
+
+        detail = (
+            exc.detail
+            if isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
+            else {}
+        )
+        status = str(detail.get('status') or '')
+        if status == 'plan_exhausted':
+            raise ActionProposalError(
+                status,
+                '这一版的剧情点已经全部写完，不能再续写；'
+                '请先到时间线页扩展规划。',
+            ) from exc
+        if status in {'needs_planning', 'needs_review'}:
+            raise ActionProposalError(
+                status,
+                '剧情计划还没生成好，暂时不能续写；请先到时间线页重规划。'
+                if status == 'needs_planning' else
+                '当前剧情点预算已用尽、退出条件未证实；'
+                '请先检查正文或调整计划/预算后再继续。',
+            ) from exc
+        if isinstance(exc, ValueError):
+            raise ActionProposalError('generation_failed', str(exc)) from exc
+        raise
     return {
         'segment_no': result.get('segment_no'),
         'chars': len(result.get('text') or ''),

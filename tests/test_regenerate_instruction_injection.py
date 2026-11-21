@@ -39,6 +39,7 @@ from sqlalchemy import select  # noqa: E402
 import app.generation.engine as engine_mod  # noqa: E402
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.generation.engine import regenerate_segment_stream  # noqa: E402
+from app.generation.timeline import plan_timeline, state_to_dict  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.models import Generation, Project  # noqa: E402
 from app.routers import assistant_generation as ag  # noqa: E402
@@ -132,6 +133,15 @@ def _make_project(db, title: str) -> Project:
     db.add(proj)
     db.commit()
     db.refresh(proj)
+    # 时间线语义合流后，「有 outline 但计划是占位」会让生成入口 409 暂停。
+    # 本文件钉的是重写指令的注入位置，给一份可用计划让重生成正常走完。
+    st = plan_timeline(total_segments=3)
+    for i, node in enumerate(st.nodes.values(), 1):
+        node.title = f"旧宅节点{i}"
+        node.entry_condition = "林夜回到旧宅"
+        node.exit_condition = f"完成第{i}件事"
+    proj.plot_timeline = state_to_dict(st)
+    db.commit()
     db.add(
         Generation(
             project_id=proj.id,

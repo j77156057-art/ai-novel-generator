@@ -801,7 +801,10 @@ def test_model_lists_are_consistent_across_three_sources(db_session):
         )
         # 2) 运行时切换链 CSV = 下拉清单（有 CSV 的渠道）
         if provider in models_field:
-            csv_list = getattr(settings, f"{provider}_model_list")
+            # 渠道键可能带连字符（command-code），Settings 的属性用下划线，
+            # 必须先归一化再取 *_model_list 属性（返回已切分的 list）。
+            field = f"{provider.replace('-', '_')}_model_list"
+            csv_list = getattr(settings, field)
             assert csv_list == defaults, (
                 f"{provider}: config 的 {models_field[provider]} 与 PROVIDER_META 不一致"
                 f"（{csv_list} != {defaults}）"

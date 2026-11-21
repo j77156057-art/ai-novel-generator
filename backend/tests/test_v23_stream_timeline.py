@@ -55,7 +55,7 @@ class FakeStreamingProvider:
         self.judge_reply = judge_reply
         self.chat_calls = []  # [(system, user, kwargs)]
         self.stream_calls = []
-        self.judge_calls = []  # _JUDGE_NODE_DONE_SYSTEM 触发的 chat
+        self.judge_calls = []  # 证据化 judge（_JUDGE_NODE_DONE_EVIDENCE_SYSTEM）触发的 chat
         self.summarize_calls = []
         # 模拟 judge_node_completion 也用 chat 实现
         self._judge_mode = False
@@ -109,6 +109,7 @@ def make_fresh_project_setup():
     from app.generation.engine import _persist_timeline_state
     st = plan_timeline(total_segments=10)
     st.nodes["n1"].title = "入职立足"
+    st.nodes["n1"].entry_condition = "刚入职"
     st.nodes["n1"].exit_condition = "升至部门经理"
     st.nodes["n1"].emotion = "爽"
     st.nodes["n1"].segment_budget = 3

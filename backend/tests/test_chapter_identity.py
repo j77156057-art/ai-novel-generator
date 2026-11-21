@@ -257,6 +257,10 @@ def fake_next_stream(db, project, novel_ids=None, provider=None, max_chars=None,
 def fake_regenerate(db, project, segment_no, novel_ids=None, provider=None, max_chars=None,
                     chapter_label=None, **kw):
     calls.append(("regenerate", chapter_label))
+    # 桩不落正文：必须把端点先建的 pending 快照收尾，否则同一段的下一次
+    # 重写会被唯一索引挡成 SnapshotBusy（409）。
+    from app.agents.dialog.snapshot import fail_snapshot
+    fail_snapshot(db, kw.get("snapshot_id"), "fake_regenerate")
     yield {"type": "done", "segment_no": segment_no}
 
 

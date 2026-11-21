@@ -201,12 +201,21 @@ def test_bypass_fills_defaults_and_reaches_confirm(db_session):
     body = _say(client, proj.id, "别问了")
     assert body["mode"] == "answered", body
     session = body["session"]
-    assert session["step_key"] == "confirm", session
+    # 角色卡是受保护步骤（PROTECTED_STEPS）：即使「别问了」也要先过目一次，
+    # 不能被 bypass 跳过，否则用户从没见过自动生成的角色卡。
+    assert session["step_key"] == "cards", session
     answers = session["answers"]
     required = ["genre"] + story.plan_steps(answers, KEYS)
     for step in required:
         assert step in answers, f"{step} 没有被默认补齐：{answers}"
     assert "scale" in (answers.get("_auto") or []), answers
+
+    resp = client.post(
+        f"/api/assistant/wizard/{proj.id}/answer",
+        json={"step_key": "cards", "value": True},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["session"]["step_key"] == "confirm"
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +288,14 @@ def test_end_to_end_from_one_sentence_to_premise_and_bible(db_session):
     resp = client.post(
         f"/api/assistant/wizard/{proj.id}/answer",
         json={"step_key": "outline", "value": True},
+    )
+    assert resp.status_code == 200, resp.text
+    # 先出大纲时，角色卡单独作为一步给用户过目/编辑，再进最终确认。
+    assert resp.json()["session"]["step_key"] == "cards"
+
+    resp = client.post(
+        f"/api/assistant/wizard/{proj.id}/answer",
+        json={"step_key": "cards", "value": True},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["session"]["step_key"] == "confirm"

@@ -4879,7 +4879,7 @@ def _timeline_state_for(
             if isinstance(v, int) and v >= 1:
                 avg_node_segments = v
         st = plan_timeline(total_segments=total_segments, avg_node_segments=avg_node_segments)
-        if provider is not None:
+        if provider is not None and db is not None:
             filled = plan_nodes_with_llm(provider, outline_list, project.plot_bible, st.total_main)
             if filled:
                 for node in filled:
@@ -4908,14 +4908,10 @@ def _timeline_state_for(
         # 存档存在：
         # - 章号驱动模式（历史里有第N章标签）：直接按当前章同步节点，
         #   不再用 Generation 行数 advance——重写/换版本不会把大纲往后推；
-        # - 旧模式（没有章号标签）：保持原 advance 补齐行为。
+        # - 段模式：存档是权威。读取/预览不得用段号推测完成或重复补计段数，
+        #   段计数只由 `_judge_and_advance` 对刚提交的那段 +1。
         if chapter_based and has_chapter_ranges(st):
             st = sync_node_for_chapter(st, written_segments + 1)
-        else:
-            archived_written = sum(st.seg_counts.values())
-            if written_segments > archived_written:
-                for _ in range(written_segments - archived_written):
-                    st = advance(st)
 
     # 落库（db 给定 + state 有效 + 还没存过/或被改过）
     if db is not None and st is not None:
@@ -5020,14 +5016,14 @@ def _judge_and_advance(
 ) -> dict:
     """v2.1：commit 段后调一次 LLM 判定当前节点 exit_condition 是否达成。
 
-    - 判定 True：取最新 state → force_complete_current → 落库
-    - 判定 False：推进到当前章/段对应节点 → 落库
-    - 判定 None（失败/不确定/没 exit）：同上
+    - 判定 supported 且证据有效：force_complete_current → 落库
+    - 非 supported：只计数；预算用尽进入 needs_review，不自动 done
+    - 缺条件、异常、无证据：记录 unknown
     - 没 outline / state 不可用：返回 skipped=True，不动 state
+    - 同一段重复通知：`last_judged_segment` 幂等拦截，不重复计数/判定
 
-    修复项 2：`chapter_based=True` 时推进量取自**章号**（`_timeline_progress`）。
-    如果本次 commit 没有让最大章号变大（重写、换版本、重跑同一章），直接
-    `skipped_reason="rewrite_same_chapter"`，不推进会消耗大纲段位。
+    返回 dict 供 API 透传给前端（诊断/进度展示用），含 `status` 等进度字段。
+    预算与完成语义分离；引文来源和偏移经过程序核验。
     """
     out = {"called": False, "judge": None, "forced": False, "advanced": False, "skipped": True}
     if not project.outline:
@@ -5057,7 +5053,7 @@ def _judge_and_advance(
         if cur_node.exit_condition:
             judge = judge_node_completion_with_evidence(
                 provider, cur_node, judge_text,
-                source_id=f"segment:{progress_after}",
+                source_id=f"generation:{progress_after}",
             )
             st.completion[cur_id] = judge
             st.last_judged_segment = progress_after
@@ -5072,26 +5068,31 @@ def _judge_and_advance(
         _persist_timeline_state(db, project, st)
         out["current_node"] = st.current_node
         out["done"] = sorted(st.done)
+        out.update(timeline_progress(st))
         return out
 
     st = _timeline_state_for(project, written_segments, provider=None, db=None)
     if st is None or not st.current_node or st.current_node not in st.nodes:
         return out
+    # 幂等闸：同一段被重复通知（重放/重试）时不得再次计数或判定。
+    if st.last_judged_segment >= written_segments + 1:
+        return dict(out, reason="already_judged")
     cur_id = st.current_node
     cur_node = st.nodes[cur_id]
 
-    # 1) 跑正常 advance（不管 LLM 怎么判，段数 +1）
+    # 1) 跑正常 advance（不管 LLM 怎么判，刚提交的这段只 +1）
     st = advance(st)
     out["advanced"] = True
     out["called"] = True
     out["skipped"] = False
 
-    # 2) 调 LLM 判定——但只在「advance 之后该节点还未 done」时调
-    # （如果 advance 已让它 done，就没必要再让 LLM 重复判定）
-    if cur_id not in st.done and cur_node.exit_condition:
+    # 2) 未 done 就判定——**预算是否用尽不影响判定**：
+    #    「写满」是篇幅事实，「写完」必须由正文证据证明。
+    if cur_id not in st.done:
         judged_segment = max(1, written_segments + 1)
         judge = judge_node_completion_with_evidence(
-            provider, cur_node, judge_text, source_id=f"segment:{judged_segment}",
+            provider, cur_node, judge_text,
+            source_id=f"generation:{judged_segment}",
         )
         st.completion[cur_id] = judge
         st.last_judged_segment = judged_segment
@@ -5105,7 +5106,30 @@ def _judge_and_advance(
     _persist_timeline_state(db, project, st)
     out["current_node"] = st.current_node
     out["done"] = sorted(st.done)
+    out.update(timeline_progress(st))
     return out
+
+
+#: 自动重规划失败的留痕文案。命中它就不再自动重试（避免每次生成入口都白调
+#: 一次模型）；人工重规划/补全节点成功后由成功路径清空。
+_AUTO_REPLAN_FAILED_REASON = (
+    "自动重规划未产出可用计划；已停止自动重试，请手动重规划或完善起点/退出条件"
+)
+
+
+def _state_plan_exhausted(state) -> bool:
+    """state 版「规划写完」：按**同步后的** done 判断。
+
+    章号模式下 done 由 `sync_node_for_chapter` 按章区间重算（`chapter_end < 当前章`
+    或 `early_done`），不能读存档里可能过时的 done。段模式下两者的 done 同源。
+    同样只看主干节点：支线可以不写。
+    """
+    if state is None:
+        return False
+    planned = {nid for nid, node in state.nodes.items() if node.kind == "main"}
+    if not planned:
+        return False
+    return planned <= {str(x) for x in state.done}
 
 
 def current_node_prompt(
@@ -5116,6 +5140,7 @@ def current_node_prompt(
     *,
     chapter: int | None = None,
     chapter_based: bool = False,
+    strict: bool = True,
 ) -> str | None:
     """算出当前剧情点的提示块（时间线启用时）；无 outline 返回 None。
 
@@ -5125,7 +5150,16 @@ def current_node_prompt(
     修复项 2：传了 `chapter`（或 chapter_based 时用 written+1）就按**章号**
     选节点，而不是按历史行数；重跑同一章只会命中同一个节点。
     `db` 用于持久化；预检/读侧可不传（仅恢复，不写）。
+
+    状态闸（与 main 同口径）：有存档 + 有模型渠道时，`needs_planning` 允许
+    现场重规划一次（**包括已写到一半的存量项目**）；`strict=True` 且 `db`
+    给定时，`needs_planning` / `needs_review` 抛 409，把「缺计划」和
+    「预算用尽但未证实」显式交给调用方。
+
+    `strict=False` 给**重写**路径用：重写旧章节不该被当前计划状态挡住，
+    状态只通过提示块里的说明行透出，不抛错、也不触发重规划。
     """
+    had_saved_plan = bool(project.plot_timeline)
     st = _timeline_state_for(
         project, written_segments, provider, db=db, chapter_based=chapter_based
     )
@@ -5135,8 +5169,62 @@ def current_node_prompt(
         chapter = written_segments + 1
     if chapter is not None and has_chapter_ranges(st):
         st = sync_node_for_chapter(st, chapter)
+    # 规划里的主干剧情点写完了：不再无约束地往后写（main 的 plan_exhausted 口径）。
+    # 段模式 current_node 为空；章号模式 current_node 会被 sync 钉在最后一个节点，
+    # 但 done 已按章区间算出「全部主干节点完成」——两种模式同一判定。
+    # 重写（strict=False）与只读预览不受此限。
+    if strict and db is not None and _state_plan_exhausted(st):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail={
+            "status": "plan_exhausted",
+            "message": "规划已写完：这一版的剧情点都写过了。要继续写，请先扩展规划"
+                       "（否则新写的正文没有保存权威可核对）。",
+            "written_segments": written_segments,
+        })
     if not st.current_node or st.current_node not in st.nodes:
         return None
+    status = timeline_progress(st)["status"]
+    # 占位/半填计划重试：不能只在「还没写过段落」时才救——历史上规划器允许
+    # 空 exit / 占位标题，存量写到一半的项目会因此永远卡在 needs_planning。
+    # 失败或重规划后仍不可用时写留痕，避免每次生成入口都重复调模型。
+    if (
+        strict
+        and db is not None
+        and provider is not None
+        and had_saved_plan
+        and status == "needs_planning"
+        and st.planning_reason != _AUTO_REPLAN_FAILED_REASON
+    ):
+        filled = plan_nodes_with_llm(
+            provider, _outline_entries(project), project.plot_bible, st.total_main
+        )
+        if filled:
+            for node in filled:
+                old = st.nodes.get(node.id)
+                if old is not None and old.source == "user":
+                    continue  # 人工追加的节点是作者权威，自动重规划不覆盖
+                if old is not None:
+                    node.segment_budget = old.segment_budget
+                st.nodes[node.id] = node
+            st.planning_status = "llm"
+            st.planning_reason = ""
+        status = timeline_progress(st)["status"]
+        if status == "needs_planning":
+            # 模型没给出可用计划，或当前节点是仍缺字段的人工节点：留痕后停手。
+            st.planning_status = "placeholder"
+            st.planning_reason = _AUTO_REPLAN_FAILED_REASON
+        _persist_timeline_state(db, project, st)
+    if strict and db is not None and status in {"needs_planning", "needs_review"}:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail={
+            "status": status,
+            "current_node": st.current_node,
+            "message": (
+                "节点缺少有效计划，请完善起点和退出条件" if status == "needs_planning"
+                else "节点预算已用尽且退出条件尚未证实，请检查正文或调整计划/预算"
+            ),
+            "completion": st.completion.get(st.current_node),
+        })
     prompt = build_node_prompt(
         st.nodes[st.current_node], st.current_beat, timeline_progress(st)
     )
@@ -6281,6 +6369,9 @@ def regenerate_segment_stream(
     node_prompt = current_node_prompt(
         project, timeline_written, provider, db=db,
         chapter=chapter, chapter_based=chapter_based,
+        # 重写旧章节不该被当前计划状态（缺字段/预算耗尽）挡住：
+        # 状态只在提示块里说明，不抛 409、也不触发自动重规划。
+        strict=False,
     )
     evidence_up_to = chapter if chapter_based else None
     if chapter is not None:

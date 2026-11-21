@@ -236,7 +236,10 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
     plan = _chapter_plan(db, proj, body.chapter_range)
     # 在请求线程里先算好：SSE 生成器跑在线程池，不跨线程复用这个 session。
     outline_notice = build_notice(db, proj, plan["chapter"], plan["chapter_end"])
-    _begin_generation(proj.id)
+    # 生成器在依赖会话关闭后才迭代；commit 会 expire 全部字段，连 proj.id
+    # 都会触发 DetachedInstanceError，所以这里先取出纯值。
+    project_id = proj.id
+    _begin_generation(project_id)
 
     def event_stream():
         from app.db import SessionLocal
@@ -244,7 +247,7 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
 
         sdb = SessionLocal()
         try:
-            p = sdb.get(Project, proj.id)
+            p = sdb.get(Project, project_id)
             for ev in generate_next_segment_stream(
                 sdb, p, novel_ids=novel_ids, max_chars=body.max_chars,
                 chapter_range=plan["label"],
@@ -259,7 +262,7 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
             sdb.close()
-            _end_generation(proj.id)
+            _end_generation(project_id)
 
     try:
         return StreamingResponse(
@@ -272,7 +275,7 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
             },
         )
     except Exception:
-        _end_generation(proj.id)
+        _end_generation(project_id)
         raise
 
 
@@ -299,7 +302,10 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
         span = chapter_labels.label_span(target.chapter_range)
     # 没有章号（标签是「段N」）就不涉及章纲，回执整个省略，前端按缺省处理。
     outline_notice = build_notice(db, proj, span[0], span[1]) if span else None
-    _begin_generation(proj.id)
+    # 流式响应期间依赖会话已关闭：先取出纯值，生成器里绝不再读 ORM 属性
+    # （commit 会 expire 全部字段，访问 proj.id 也会触发 DetachedInstanceError）。
+    project_id = proj.id
+    _begin_generation(project_id)
 
     # 两段式写入第一段：调模型前先写 pending 快照（与助手重写同一条链路）。
     # 工作台的重写此前不建快照，导致「撤销/回滚」只对助手重写可用。
@@ -308,7 +314,7 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
     try:
         snapshot = begin_snapshot(db, proj, target)
     except SnapshotBusy as exc:
-        _end_generation(proj.id)
+        _end_generation(project_id)
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     # 生成器里不再碰 ORM 对象：流式响应期间依赖会话可能已关闭，先取出纯值。
     snapshot_id = snapshot.id
@@ -320,7 +326,7 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
 
         sdb = SessionLocal()
         try:
-            p = sdb.get(Project, proj.id)
+            p = sdb.get(Project, project_id)
             for ev in regenerate_segment_stream(
                 sdb, p, body.segment_no, novel_ids=novel_ids, max_chars=body.max_chars,
                 chapter_label=label,
@@ -337,7 +343,7 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
             yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
             sdb.close()
-            _end_generation(proj.id)
+            _end_generation(project_id)
 
     try:
         return StreamingResponse(
@@ -350,7 +356,7 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
             },
         )
     except Exception:
-        _end_generation(proj.id)
+        _end_generation(project_id)
         raise
 
 
@@ -416,7 +422,6 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         catalog_skeleton=_catalog_skeleton(db, proj),
         max_chars=proj.generation_length or 4000,
     )
-    from app.llm.provider import get_llm_provider
     user = build_user_prompt(
         ctx["prior_summaries"], ctx["rag_context"], proj.outline,
         proj.generation_length or 4000, proj.plot_bible, proj.premise,
@@ -426,8 +431,11 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         # 预检页必须与真实生成同源：漏了这块，人工审阅看到的 prompt 就不是实际下发的那份
         kg_slice=ctx.get("kg_slice") or None,
         item_holding_block=ctx.get("item_holding_block") or None,
+        # 预检是**只读**路径：不传 db/provider，既不落库也不因缺计划调模型。
+        # 缺计划/预算耗尽时把状态写进提示块（由 build_node_prompt 渲染），
+        # 真正的生成入口才用 409 暂停。
         node_prompt=current_node_prompt(
-            proj, _next_segment_no(db, body.project_id) - 1, get_llm_provider(), db=db
+            proj, _next_segment_no(db, body.project_id) - 1
         ),
         # 预检必须与真实生成同源：设定卡的增删改要能在这里直接看到效果。
         story_cards_block=_render_story_cards(db, proj.id),

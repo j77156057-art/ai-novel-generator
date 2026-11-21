@@ -4,6 +4,7 @@
 的节点集合与章区间。口径与 `app.generation.timeline` 一致。
 """
 import os
+import re
 import sys
 
 import pytest
@@ -29,7 +30,7 @@ from app.routers import timeline as timeline_router  # noqa: E402
 
 
 class _FakeProvider:
-    """返回 12 个可用节点（plan_nodes_with_llm 会按 n_main 截取）。"""
+    """按请求数量返回可用节点（plan_nodes_with_llm 要求数量精确匹配）。"""
 
     label = "fake"
 
@@ -39,9 +40,12 @@ class _FakeProvider:
     def chat(self, system, user):
         if self.payload is not None:
             return self.payload
+        match = re.search(r"切成\s*(\d+)\s*个", user)
+        n_main = int(match.group(1)) if match else 3
         items = ", ".join(
-            f'{{"title": "模型节点{i + 1}", "emotion": "爽", "beats": ["开场", "冲突"]}}'
-            for i in range(12)
+            f'{{"title": "模型节点{i + 1}", "entry_condition": "起点{i + 1}", '
+            f'"exit_condition": "完成{i + 1}", "emotion": "爽", "beats": ["开场", "冲突"]}}'
+            for i in range(n_main)
         )
         return '{"nodes": [' + items + "]}"
 

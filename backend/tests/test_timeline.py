@@ -76,15 +76,16 @@ st = plan_timeline(total_segments=30, avg_node_segments=5, branch_ratio=0.2)
 check("branch_budget = round(total*ratio)", st.branch_budget, 6)
 check("支线不计入 total_main", st.total_main, 4)
 
-# ── 3. advance 节点写满 budget → done，主线进度上升 ──
+# ── 3. advance 只计量：预算用尽不标 done，完成需要正文证据 ──
 st = mk_state(n_main=5, seg_budget=3)
 check("初始主线进度 0", timeline_progress(st)["main_progress"], 0.0)
 st = advance(st)  # n1 第 1 段
 st = advance(st)  # n1 第 2 段
-st = advance(st)  # n1 第 3 段 → 写满 budget，done
-check("n1 完成进入 n2", st.current_node, "n2")
-check("n1 标记 done", "n1" in st.done, True)
-check("主线进度 1/5", timeline_progress(st)["main_progress"], 0.2)
+st = advance(st)  # n1 第 3 段 → 写满 budget，但不标 done
+check("预算用尽仍停在 n1", st.current_node, "n1")
+check("预算用尽不标 done", "n1" in st.done, False)
+check("无证据主线进度仍为 0", timeline_progress(st)["main_progress"], 0.0)
+check("预算用尽状态 needs_review", timeline_progress(st)["status"], "needs_review")
 
 # ── 4. 支线段 → branch_used 累加，主线进度不变 ──
 st = mk_state(n_main=5, seg_budget=3)
@@ -94,13 +95,19 @@ check("支线段主线进度不变", timeline_progress(st)["main_progress"], 0.0
 check("支线段不推进节点", st.current_node, "n1")
 
 # ── 5. 高潮区 current_beat 按段数推进，不越界 ──
-# n1 有 3 拍，seg_budget=3 → 每段进一拍，第 3 段后 done 时 beat 停在 2（不越界到 3）
+# n1 有 3 拍，seg_budget=3 → 每段进一拍，第 3 段后 beat 停在 2（不越界到 3）
 st = mk_state(n_main=5, seg_budget=3)
 st = advance(st); check("beat 第1段后=1", st.current_beat, 1)
 st = advance(st); check("beat 第2段后=2", st.current_beat, 2)
-st = advance(st); check("第3段 done 后进入 n2，beat 归零", st.current_beat, 0)
-check("进入 n2", st.current_node, "n2")
-# 无 beats 的节点（n2 i%2!=0 → beats 空）：beat 保持 0
+st = advance(st); check("预算用尽 beat 不越界", st.current_beat, 2)
+check("没有证据留在 n1", st.current_node, "n1")
+# 有证据才推进到 n2；无 beats 的节点 beat 保持 0
+from app.generation.timeline import force_complete_current
+st.completion["n1"] = {"verdict": "supported", "reason": "完成1已发生", "sources": [
+    {"source_id": "generation:1", "quote": "完成1", "start": 0, "end": 3}]}
+st = force_complete_current(st)
+check("有证据后切换到 n2", st.current_node, "n2")
+check("有证据后 n1 标 done", "n1" in st.done, True)
 st = advance(st)
 check("无 beats 节点 beat 保持 0", st.current_beat, 0)
 

@@ -554,7 +554,7 @@ def test_unknown_tier_raises_instead_of_silently_defaulting():
     「静默回落默认档」和「静默返回上一档缓存」是同一族 bug：用户以为自己
     选到了 X，实际得到的是 Y，且没有任何提示。
     """
-    with pytest.raises(ValueError, match="未知蒸馏档位"):
+    with pytest.raises(ValueError, match="未知提炼档位"):
         resolve_tier("turbo")
     with pytest.raises(ValueError):
         narrative_fingerprint([1], "turbo")

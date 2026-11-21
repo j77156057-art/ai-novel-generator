@@ -69,6 +69,7 @@ from app.generation.engine import (  # noqa: E402
     generate_next_segment_stream,
     regenerate_segment_stream,
 )
+from app.generation.timeline import plan_timeline, state_to_dict  # noqa: E402
 from app.kg.build import merge_segment_into_kg  # noqa: E402
 from app.models import (  # noqa: E402
     Generation,
@@ -116,7 +117,13 @@ PLOT_BIBLE = {
 #:   已知观测：字数硬上限块上线同期，第 33 章一稿只写 2710 字；但第 34–41 章
 #:   六章均正常（3362–4123 汉字）。故判为**单次自停，不是指令性伤害**，
 #:   也**不构成「该指令有效」的证据**。
-PROMPT_SHA256 = "b6ffd53de8bd17f31029cf2f0a2abb3cc233a0e238cb28acb2d2c38c908a9132"
+#:
+#: - `7463e33a…` 2026-11-21 时间线语义合流（预算只计量、完成需证据）。**差异来源**：
+#:   夹具原先「有 outline、无可用计划」，node_prompt 是占位块（「主干节点1」，无起点/
+#:   写作目标）；合流后缺计划会在生成入口 409 暂停，因此夹具改为落一份最小可用计划。
+#:   提示词里的节点块随之从占位变为填实（新增「起点状态」「本段写作目标」两行）。
+#:   重生成路径的其余提示词口径（constraints 组装、RAG 隔离）未改动。
+PROMPT_SHA256 = "7463e33a1d82dade6e79f09adad70a7944609160e1625efcb010b31e17b16681"
 
 
 class RecordingProvider:
@@ -210,6 +217,15 @@ def _make_project(db, title: str, novel_ids: list[int] | None = None) -> Project
     db.add(proj)
     db.commit()
     db.refresh(proj)
+    # 时间线语义合流后，「有 outline 但计划是占位」会在生成入口 409 暂停。
+    # 本文件要测的是上下文/RAG 口径，给一份可用的最小计划让生成正常走完。
+    st = plan_timeline(total_segments=3)
+    for i, node in enumerate(st.nodes.values(), 1):
+        node.title = f"旧宅节点{i}"
+        node.entry_condition = "林夜回到旧宅"
+        node.exit_condition = f"完成第{i}件事"
+    proj.plot_timeline = state_to_dict(st)
+    db.commit()
     return proj
 
 

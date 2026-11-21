@@ -32,6 +32,31 @@ from fixtures import FIXTURE  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
+from app.db import SessionLocal  # noqa: E402
+from app.generation.timeline import plan_timeline, state_to_dict  # noqa: E402
+from app.models import Project  # noqa: E402
+
+
+def _seed_chapter_plan(project_id: int) -> None:
+    """落一份可用的时间线计划。
+
+    时间线语义合流后，有大纲但没有可用计划会在生成入口 409。本脚本按章标签
+    推进（/api/generate 会写「第N章」），章模式下预算只计量、不决定节点切换，
+    所以一份普通的填实计划就够走完后续所有章节。
+    """
+    s = SessionLocal()
+    try:
+        p = s.get(Project, project_id)
+        total = max((p.target_length or 5000) // max(p.generation_length or 3000, 1), 1)
+        st = plan_timeline(total_segments=total)
+        for i, node in enumerate(st.nodes.values(), 1):
+            node.title = f"旧宅节点{i}"
+            node.entry_condition = "林夜在旧宅"
+            node.exit_condition = f"完成第{i}件事"
+        p.plot_timeline = state_to_dict(st)
+        s.commit()
+    finally:
+        s.close()
 
 # 参考语料里的事实（来自 fixtures.FIXTURE）——这些一旦出现在本项目约束里即为泄漏。
 REF_CHAR_NAMES = ("林夜", "苏晚")
@@ -71,7 +96,8 @@ def main() -> int:
                 "title": "种子项目",
                 "mode": "quick",
                 "target_length": 5000,
-                "outline": ["林夜在旧宅发现一束来历不明的光", "苏晚携秘密登场"],
+                "outline": ["林夜在旧宅发现一束来历不明的光", "苏晚携秘密登场",
+                            "旧宅线索指向三十年前的旧案"],
             },
         )
         if r.status_code != 200:
@@ -80,6 +106,7 @@ def main() -> int:
             return 1
         project_id = r.json()["id"]
         print("create_project ->", r.json())
+        _seed_chapter_plan(project_id)
 
         # 3) 建参考语料图谱（source=novel:{id}）
         r = client.post(f"/api/projects/{project_id}/build-kg?novel_id={novel_id}")

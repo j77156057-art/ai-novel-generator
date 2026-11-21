@@ -28,6 +28,7 @@ from fixtures import FIXTURE  # noqa: E402
 from app.db import Base, SessionLocal  # noqa: E402
 from app.generation import build_context, generate_loop, generate_next_segment  # noqa: E402
 from app.generation.prompts import build_system_prompt, build_user_prompt  # noqa: E402
+from app.generation.timeline import PlotNode, TimelineState, state_to_dict  # noqa: E402
 from app.ingestion.chunk import chunk_text  # noqa: E402
 from app.ingestion.parse_txt import parse_txt  # noqa: E402
 from app.kg.build import build_graph  # noqa: E402
@@ -48,6 +49,30 @@ def _seed(db) -> int:
     return novel.id
 
 
+def _seed_open_timeline(project: Project) -> None:
+    """落一份「预算充足」的时间线。
+
+    时间线语义合流后：有大纲但没有可用计划时生成入口会 409 暂停；预算用尽
+    且退出条件未被正文证据证实时也会暂停。本脚本用本地兜底模型（判定必然
+    退化成 unknown），所以给一个足够大的段预算，让 M4 只验证生成/摘要链路。
+    节点 id 用 u1（不在 plan_timeline 骨架的 n1..nN 里），state_from_dict
+    才不会用骨架预算把它覆盖掉。
+    """
+    st = TimelineState(
+        nodes={
+            "u1": PlotNode(
+                id="u1", kind="main", title="旧宅",
+                emotion="悬疑",
+                entry_condition="林夜在旧宅",
+                exit_condition="写完这一段",
+                segment_budget=100_000,
+            )
+        },
+        order=["u1"], total_main=1, current_node="u1",
+    )
+    project.plot_timeline = state_to_dict(st)
+
+
 def main() -> int:
     Base.metadata.create_all(bind=SessionLocal().bind)
     db = SessionLocal()
@@ -58,6 +83,8 @@ def main() -> int:
     db.add(project)
     db.flush()
     project_id = project.id
+    _seed_open_timeline(project)
+    db.commit()
 
     summary = build_graph(db, project_id, novel_id=novel_id)
     print("build_graph ->", summary)

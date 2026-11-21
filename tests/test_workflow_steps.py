@@ -289,7 +289,7 @@ def test_distill_step_points_at_the_reusable_archive_when_it_is_not_applied():
     state = evaluate(db, p)
     by_id = {s['id']: s for s in state['steps']}
     assert by_id['distill']['state'] == 'pending', by_id['distill']
-    assert '蒸馏库' in by_id['distill']['reason']
+    assert '文风档案库' in by_id['distill']['reason']
     assert '42' in by_id['distill']['reason']
 
 
@@ -386,7 +386,7 @@ def test_the_current_step_is_the_first_unfinished_one_not_the_first_blocked_one(
     assert by_id['write_body']['state'] == 'blocked'
     # 当前步必须是**蒸馏**：先做蒸馏，不是先解决写正文
     assert state['current_step'] == 'distill', state['current_step']
-    assert '蒸馏' in state['summary']
+    assert '文风提炼' in state['summary']
     assert '写正文' in state['summary'], state['summary']
     assert state['status'] == 'blocked'
 

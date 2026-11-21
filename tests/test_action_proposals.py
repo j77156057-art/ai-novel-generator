@@ -428,3 +428,45 @@ def test_a_draft_card_reaches_the_user_from_any_propose_tool():
            'method': 'POST', 'body': {'project_id': 7}}
     assert collect_text_edit_cards(
         {'propose_text_fix': {'ok': True, 'pending_action': bad}}, 7) == []
+
+
+def test_invoke_generation_maps_timeline_gate_to_action_error(monkeypatch):
+    """引擎的时间线 409 不能裸穿到提案执行层：转成动作域错误，由路由映射。"""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from app.agents import action_proposals as ap
+    from app.agents import workflow
+    from app.generation import chapter_labels
+    from app.generation import engine as engine_mod
+
+    db, project = fixture()
+    proposal = SimpleNamespace(body_json={}, precondition_note="")
+    monkeypatch.setattr(workflow, "generation_block", lambda *a, **k: None)
+    monkeypatch.setattr(chapter_labels, "resolve", lambda *a, **k: {"label": "第1章"})
+
+    def _blocked(*args, **kwargs):
+        raise HTTPException(status_code=409, detail={
+            "status": "needs_planning", "message": "内部结构不该外泄"})
+
+    monkeypatch.setattr(engine_mod, "generate_next_segment", _blocked)
+
+    with pytest.raises(ap.ActionProposalError) as err:
+        ap._exec_invoke_generation(db, project, proposal)
+
+    assert err.value.code == "needs_planning"
+    assert "时间线" in err.value.message
+
+
+def test_needs_planning_action_error_maps_to_409():
+    """动作域错误 → HTTP：needs_planning 是 409 + 结构化 detail，不是 400。"""
+    from fastapi import HTTPException
+
+    from app.agents.action_proposals import ActionProposalError
+    from app.routers import assistant_action_proposals as routes
+
+    with pytest.raises(HTTPException) as err:
+        routes._raise_http(ActionProposalError("needs_planning", "先补计划"))
+    assert err.value.status_code == 409
+    assert err.value.detail == {"error": "needs_planning", "message": "先补计划"}

@@ -2227,6 +2227,31 @@ def run(project_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:  # 未提炼等可操作错误：如实返回，不吞成 500
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException as exc:
+        # 时间线规划闸门：引擎的 409 带内部 detail，引导页只需要「为什么不能开写
+        # ＋下一步去哪」。保留状态码，不降级成 500，也不把内部结构原样漏出去。
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        status = str(detail.get("status") or "")
+        if status == "plan_exhausted":
+            raise HTTPException(status_code=409, detail={
+                "status": status,
+                "message": "这一版的剧情点已经全部写完，不能再往后写了。"
+                           "要继续，请先到时间线页扩展规划；已写章节不受影响。",
+                "retry": f"POST /api/projects/{project.id}/plan-extension",
+            }) from exc
+        if status in {"needs_planning", "needs_review"}:
+            raise HTTPException(status_code=409, detail={
+                "status": status,
+                "message": (
+                    "剧情计划还没生成好，暂时不能开写。请先到时间线页重规划；"
+                    "仍失败就检查模型渠道后重试。已写章节不受影响。"
+                    if status == "needs_planning" else
+                    "当前剧情点的篇幅预算已用尽、退出条件还没有正文证据。"
+                    "请先检查已写正文，或调整计划/预算后再继续。"
+                ),
+                "retry": f"POST /api/projects/{project.id}/timeline/plan",
+            }) from exc
+        raise
 
     produced = []
     for row in rows:

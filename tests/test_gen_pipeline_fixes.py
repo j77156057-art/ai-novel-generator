@@ -190,7 +190,7 @@ def test_generate_requires_distill_first(db_session, monkeypatch):
     nid = _make_corpus(db_session)
     proj = _make_project(db_session, nid)  # narrative_tier=None，无缓存
 
-    with pytest.raises(ValueError, match="蒸馏"):
+    with pytest.raises(ValueError, match="文风档案"):
         generate_next_segment(db_session, proj, provider=stub)
 
     assert stub.chat_calls == 0, (

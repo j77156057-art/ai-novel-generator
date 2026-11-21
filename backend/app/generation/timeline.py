@@ -139,7 +139,8 @@ def advance(state: TimelineState, is_branch: bool = False) -> TimelineState:
 
     - 支线段：branch_used += 1，不推进主线节点；支线写完即清 branch_current
       （章模式下 current_node 本来就没被支线顶替，这里不需要"切回父节点"）
-    - 主干段：当前节点累计写满 segment_budget 段 → done，进入下一节点；
+    - 主干段：只累计 seg_counts；**预算用尽不标 done**——退出条件需要独立的
+      正文证据（见 `force_complete_current`），计数不能证明剧情已写完。
       高潮区按段数推进 current_beat（不越界 beats 长度）
     """
     st = _clone_state(state)
@@ -162,13 +163,7 @@ def advance(state: TimelineState, is_branch: bool = False) -> TimelineState:
     if node.beats and st.current_beat < len(node.beats) - 1:
         st.current_beat += 1
 
-    # 写满 budget → done，进入下一主干节点
-    if seg_count >= node.segment_budget:
-        st.done.add(node_id)
-        idx = st.order.index(node_id) if node_id in st.order else -1
-        nxt = st.order[idx + 1] if 0 <= idx < len(st.order) - 1 else None
-        st.current_node = nxt
-        st.current_beat = 0
+    # 预算只约束篇幅；退出条件需要独立的正文证据，不能由计数证明。
 
     return st
 
@@ -178,7 +173,11 @@ def force_complete_current(state: TimelineState, *, keep_current: bool = False) 
 
     与 advance 的差别：不依赖 seg_count 是否满 segment_budget，由调用方
     （LLM 判定结果）决定是否提前 done。失败/超时/不确定 → 不调本函数，
-    走 advance 的段数预算兜底。
+    保留当前节点，预算耗尽进入待复核。
+
+    **证据闸门**：只有 `completion[node_id]` 的 verdict 为 `supported` 且
+    `sources` 非空时才标 done——「写满了」是篇幅事实，「写完了」是语义事实，
+    两者不能互相顶替。
 
     两个口径（对应「提前完成允许保留」）：
 
@@ -192,6 +191,9 @@ def force_complete_current(state: TimelineState, *, keep_current: bool = False) 
     st = _clone_state(state)
     node_id = st.current_node
     if node_id is None or node_id not in st.nodes or node_id in st.done:
+        return st
+    evidence = st.completion.get(node_id) or {}
+    if evidence.get("verdict") != "supported" or not evidence.get("sources"):
         return st
     node = st.nodes[node_id]
     st.done.add(node_id)
@@ -215,11 +217,36 @@ def force_complete_current(state: TimelineState, *, keep_current: bool = False) 
 
 
 def timeline_progress(state: TimelineState) -> dict:
-    """双进度：主线（节点 done 比）+ 支线（额度消耗比）。分母都固定。"""
+    """双进度：主线（节点 done 比）+ 支线（额度消耗比）。分母都固定。
+
+    额外给出生成入口需要的状态：`needs_planning`（节点缺起点/退出条件或还是
+    占位标题）、`needs_review`（预算用尽但退出条件未被证据证实）。
+    """
     main_done = sum(1 for nid in state.done if state.nodes.get(nid) and state.nodes[nid].kind == "main")
     main_progress = main_done / state.total_main if state.total_main else 0.0
     branch_progress = state.branch_used / state.branch_budget if state.branch_budget else 0.0
+    node = state.nodes.get(state.current_node or "")
+    needs_planning = bool(
+        node
+        and (
+            not node.entry_condition.strip()
+            or not node.exit_condition.strip()
+            or node.title.startswith("主干节点")
+        )
+    )
+    exhausted = bool(
+        node and state.seg_counts.get(node.id, 0) >= node.segment_budget
+    )
+    status = (
+        "needs_planning" if needs_planning
+        else "needs_review" if exhausted
+        else "active" if node
+        else "complete"
+    )
     return {
+        "status": status,
+        "budget_exhausted": exhausted,
+        "completion": state.completion.get(state.current_node or ""),
         "main_progress": round(main_progress, 4),
         "branch_progress": round(branch_progress, 4),
         "current_node": state.current_node,
@@ -268,6 +295,12 @@ def build_node_prompt(node: PlotNode, beat: int, progress: int | float | dict) -
         return _build_branch_node_prompt(node)
 
     lines = [f"【当前剧情点】{node.title}"]
+    if isinstance(progress, dict):
+        status = progress.get("status")
+        if status == "needs_planning":
+            lines.append("时间线状态：needs_planning（节点缺少有效起点/退出条件，生成暂停等待规划）")
+        elif status == "needs_review":
+            lines.append("时间线状态：needs_review（预算已用尽，退出条件未证实；请检查正文或调整计划/预算）")
     if node.chapter_start > 0:
         span = (
             f"第{node.chapter_start}章"
@@ -342,8 +375,9 @@ def _build_branch_node_prompt(node: PlotNode) -> str:
 
 # ── §11.3 DB 持久化：TimelineState ↔ JSON 互转 ──
 
-#: 持久化 schema 版本。将来字段调整时 +1，load 时按版本分支兼容/降级。
-TIMELINE_SCHEMA_VERSION = 1
+#: 持久化 schema 版本。v2 起 `completion` 是完成判定的权威（legacy done 会补
+#: `legacy_unverified`），load 时同时接受 v1/v2 存档。
+TIMELINE_SCHEMA_VERSION = 2
 
 
 def _node_to_dict(node: PlotNode) -> dict:
@@ -566,7 +600,7 @@ def state_from_dict(
     """
     if not isinstance(d, dict):
         return None
-    if d.get("version") != TIMELINE_SCHEMA_VERSION:
+    if d.get("version") not in (1, TIMELINE_SCHEMA_VERSION):
         return None  # 版本不匹配：降级到首次规划
     nodes_raw = d.get("nodes")
     done_raw = d.get("done") or []
@@ -640,6 +674,12 @@ def state_from_dict(
         skeleton.completion = {
             str(k): v for k, v in comp.items() if isinstance(v, dict)
         }
+    # 旧存档的 done 没有证据：保留完成事实，但显式标成「未经核验」——
+    # 不能替历史补造引文，也不能把 done 直接抹掉。
+    for nid in skeleton.done:
+        skeleton.completion.setdefault(
+            nid, {"verdict": "unknown", "reason": "legacy_unverified", "sources": []}
+        )
     try:
         skeleton.last_judged_segment = int(d.get("last_judged_segment") or 0)
     except (TypeError, ValueError):
@@ -710,7 +750,21 @@ def plan_nodes_with_llm(
     except Exception:  # noqa: BLE001
         return None
     items = data.get("nodes") if isinstance(data, dict) else None
-    if not isinstance(items, list) or not items:
+    if not isinstance(items, list) or len(items) != n_main:
+        return None
+    # 计划必须可用：数量对上、节点三要素非空、且不是占位/省略。任一不满足
+    # 都整份拒绝（调用方回退占位并显式记录 planning_status），不做半截替换。
+    if any(
+        not isinstance(it, dict)
+        or any(
+            not isinstance(it.get(k), str)
+            or not it[k].strip()
+            or it[k].strip() in {"...", "待规划", "待定"}
+            or it[k].startswith("主干节点")
+            for k in ("title", "entry_condition", "exit_condition")
+        )
+        for it in items
+    ):
         return None
 
     nodes: list[PlotNode] = []
@@ -738,74 +792,10 @@ def plan_nodes_with_llm(
     return nodes
 
 
-# ── v2.1：exit_condition 的 LLM 判定（§13 待定项落地） ──
+# ── v2.1：exit_condition 的三态证据判定（§13 待定项落地） ──
 
-_JUDGE_NODE_DONE_SYSTEM = (
-    "你是严格的网文编辑。任务是判断「刚写完的这一段」是否已经达成了"
-    "当前剧情点的退出条件。\n"
-    "要求：\n"
-    "1. 仔细对照退出条件描述，看正文里是否已经发生或达成。\n"
-    "2. **宁严勿松**——只有退出条件明确达成才返回 true；还在推进中、"
-    "铺垫中、隐约触及但未落实的，返回 false。\n"
-    "3. 严格按 JSON 输出，不要解释。\n"
-    '格式：{"done": true} 或 {"done": false}\n'
-    '不要输出 true/false 之外的任何字段。'
-)
-
-
-def judge_node_completion(
-    provider,
-    node: PlotNode,
-    recent_text: str,
-) -> bool | None:
-    """v2.1：调一次 LLM 判定当前节点的 exit_condition 是否已达成。
-
-    返回值语义：
-    - True  → 退出条件明确达成，调用方应 force_complete_current 切下一节点
-    - False → 还没达成，走段数预算继续推进
-    - None  → 判定失败/超时/解析不出，回退到段数预算（不阻断生成）
-
-    失败兜底的设计动机：LLM 不可靠时不能让流程卡住；段数预算已经是
-    兜底（§7.4），LLM 只是加速判定。
-    """
-    if not node.exit_condition:
-        return None  # 没设 exit 就别让 LLM 瞎判
-    if not recent_text or not recent_text.strip():
-        return None
-
-    # 节流：只给最近 N 字，避免 prompt 过长——LLM 判不完整段也没必要
-    excerpt = recent_text[-1200:] if len(recent_text) > 1200 else recent_text
-    user = (
-        f"【当前剧情点】{node.title}\n"
-        f"【退出条件】{node.exit_condition}\n"
-        f"【最近正文】\n{excerpt}\n\n"
-        "判断：退出条件是否已达成？"
-    )
-    try:
-        raw = provider.chat(_JUDGE_NODE_DONE_SYSTEM, user)
-    except Exception:  # noqa: BLE001
-        return None
-    import json as _json
-    import re as _re
-    m = _re.search(r"\{.*\}", raw, _re.DOTALL)
-    if not m:
-        return None
-    try:
-        data = _json.loads(m.group(0))
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(data, dict):
-        return None
-    v = data.get("done")
-    if v is True:
-        return True
-    if v is False:
-        return False
-    return None  # 既不是 true 也不是 false → 兜底
-
-
-#: 三态证据判定的系统提示（`judge_node_completion_with_evidence` 专用）。
-#: 与上面那个 v2.1 布尔判定**不是同一件事**：这个要求逐字可核验的段落证据。
+#: 三态证据判定的系统提示。判定必须给出逐字、位置和来源均可核验的正文证据；
+#: 裸 `{"done": true}` 一类布尔结论无法证明完成。
 _JUDGE_NODE_DONE_EVIDENCE_SYSTEM = (
     "你是严格的正文证据审查员。只根据所给正文判断退出条件。不要把计划、愿望、否定、"
     "传闻或未落实的行动认作完成。输出 JSON："
@@ -818,7 +808,7 @@ _JUDGE_NODE_DONE_EVIDENCE_SYSTEM = (
 )
 
 
-def judge_node_completion_with_evidence(
+def judge_node_completion(
     provider,
     node: PlotNode,
     recent_text: str,
@@ -827,11 +817,10 @@ def judge_node_completion_with_evidence(
 ) -> dict:
     """三态语义判定；支持/反驳必须有逐字、位置和来源均可核验的正文证据。
 
-    与 `judge_node_completion` 并存、互不替代（批 9 前置）：
-    上面那个是生成主链用的**布尔加速器**（判不出就退回段数预算）；
-    这个给派生重建 / 工序链用，返回
-    `{"verdict": supported|contradicted|unknown, "reason", "sources", "audit"}`，
-    审计档里带正文哈希、计划哈希与错误分类，可回查「当时凭什么判完成」。
+    返回 `{"verdict": supported|contradicted|unknown, "reason", "sources", "audit"}`。
+    `supported` 才代表退出条件被正文证实；`contradicted` 是明确反驳；
+    `unknown`（含解析失败、证据不足）不构成完成声明。
+    审计档带正文哈希、计划哈希与错误分类，可回查「当时凭什么判完成」。
     """
     import json
     import re as _re
@@ -926,3 +915,16 @@ def judge_node_completion_with_evidence(
     audit["error_category"] = None
     return {"verdict": verdict, "reason": reason, "sources": validated,
             "audit": audit}
+
+
+def judge_node_completion_with_evidence(
+    provider,
+    node: PlotNode,
+    recent_text: str,
+    *,
+    source_id: str = "generation:current",
+) -> dict:
+    """`judge_node_completion` 的旧名（派生重建 / 工序链沿用），语义完全相同。"""
+    return judge_node_completion(
+        provider, node, recent_text, source_id=source_id
+    )
