@@ -2,7 +2,8 @@
 defineOptions({ name: "ProjectWorkspace" });
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { api, ApiError } from "@/api/client";
+import { api, ApiError, planGateStatus } from "@/api/client";
+import type { PlanGateStatus } from "@/api/client";
 import ProjectNav from "@/components/ProjectNav.vue";
 import type {
   AlertsResponse,
@@ -55,7 +56,12 @@ const projectId = Number(route.params.id);
 const project = ref<ProjectOut | null>(null);
 const projectLoading = ref(true);
 const loadError = ref<string | null>(null);
-const actionNotice = ref<{ kind: "ok" | "err"; text: string } | null>(null);
+const actionNotice = ref<{
+  kind: "ok" | "err";
+  text: string;
+  /** 时间线闸门的一键动作；只在 needs_planning / plan_exhausted 时出现。 */
+  fix?: PlanGateStatus | null;
+} | null>(null);
 const novels = ref<NovelOut[]>([]);
 const novelsError = ref<string | null>(null);
 
@@ -67,7 +73,43 @@ function errorText(err: unknown) {
 }
 
 function showActionError(action: string, err: unknown) {
-  actionNotice.value = { kind: "err", text: `${action}：${errorText(err)}` };
+  const status = planGateStatus(err);
+  actionNotice.value = {
+    kind: "err",
+    text: `${action}：${errorText(err)}`,
+    fix:
+      status === "needs_planning" || status === "plan_exhausted"
+        ? status
+        : null,
+  };
+}
+
+const noticeFixBusy = ref(false);
+const noticeFixLabel = computed(() => {
+  if (actionNotice.value?.fix === "needs_planning") return "重新规划并重试";
+  if (actionNotice.value?.fix === "plan_exhausted") return "去扩展章纲";
+  return "";
+});
+
+/** 工作台侧的一键动作：重规划后自动重试生成；规划写完则去章纲页扩展。 */
+async function runNoticeFix(): Promise<void> {
+  const fix = actionNotice.value?.fix;
+  if (!fix || noticeFixBusy.value) return;
+  if (fix === "plan_exhausted") {
+    actionNotice.value = null;
+    router.push(`/projects/${projectId}/outline`);
+    return;
+  }
+  noticeFixBusy.value = true;
+  try {
+    await api.planTimeline(projectId);
+    actionNotice.value = null;
+    await runGenerate();
+  } catch (err) {
+    showActionError("重新规划失败", err);
+  } finally {
+    noticeFixBusy.value = false;
+  }
 }
 
 // 当前生效的 LLM 渠道（工作台徽标，点击去模型设置）
@@ -3517,6 +3559,12 @@ onUnmounted(() => {
 
   <div v-if="actionNotice" class="notice action-notice" :class="actionNotice.kind" :role="actionNotice.kind === 'err' ? 'alert' : 'status'">
     <span>{{ actionNotice.text }}</span>
+    <button
+      v-if="actionNotice.fix"
+      class="link-btn"
+      :disabled="noticeFixBusy"
+      @click="runNoticeFix"
+    >{{ noticeFixBusy ? "处理中…" : noticeFixLabel }}</button>
     <button class="link-btn" @click="actionNotice = null">关闭</button>
   </div>
 

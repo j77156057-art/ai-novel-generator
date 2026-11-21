@@ -26,7 +26,8 @@
  */
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { api } from "@/api/client";
+import { api, planGateStatus } from "@/api/client";
+import type { PlanGateStatus } from "@/api/client";
 import type {
   GenerationOut,
   GenerationEditCascade,
@@ -218,6 +219,11 @@ function stepSeconds(step: AgentStep): string {
 
 const genNote = ref("");
 const genError = ref("");
+/** 生成被时间线闸门拒绝时的状态；非空即渲染一键动作。 */
+const genFix = ref<PlanGateStatus | null>(null);
+const genFixBusy = ref(false);
+/** 记住失败的是「续写」还是「重生成」，重规划成功后重试同一个动作。 */
+const lastGenAction = ref<"continue" | "regenerate">("continue");
 const confirmRegen = ref(false);
 /** 本次生成开始时刻 / 每秒刷新，用于「已等待 N 秒」而不是看起来卡死。 */
 const genStartedAt = ref<number | null>(null);
@@ -440,6 +446,48 @@ async function planTimeline(): Promise<void> {
     timelineError.value = `规划失败：${textOf(err)}`;
   } finally {
     timelinePlanning.value = false;
+  }
+}
+
+const genFixLabel = computed(() => {
+  if (genFix.value === "needs_planning") return "重新规划并重试";
+  if (genFix.value === "needs_review") return "查看世界线";
+  if (genFix.value === "plan_exhausted") return "去扩展章纲";
+  return "";
+});
+
+/**
+ * 时间线闸门的一键动作。
+ *
+ * - needs_planning：现场重规划，成功后**自动重试**刚才失败的那次生成；
+ * - needs_review：切到世界线页，让人看见「预算用尽但退出条件未证实」；
+ * - plan_exhausted：规划里的点写完了，去章纲页扩展故事范围。
+ */
+async function runGenFix(): Promise<void> {
+  const fix = genFix.value;
+  if (!fix || genFixBusy.value) return;
+  if (fix === "needs_review") {
+    switchTab("timeline");
+    return;
+  }
+  if (fix === "plan_exhausted") {
+    genFix.value = null;
+    router.push(`/projects/${props.projectId}/outline`);
+    return;
+  }
+  genFixBusy.value = true;
+  try {
+    await planTimeline();
+    if (timelineError.value) {
+      genError.value = timelineError.value;
+      return;
+    }
+    genError.value = "";
+    genFix.value = null;
+    if (lastGenAction.value === "regenerate") await runRegenerate();
+    else await runContinue();
+  } finally {
+    genFixBusy.value = false;
   }
 }
 
@@ -893,6 +941,7 @@ async function runContinue(): Promise<void> {
   reasoningChars.value = 0;
   genNote.value = "";
   genError.value = "";
+  genFix.value = null;
   resetAgentSteps();
   const landedRef = ref<{ segment_no: number; chars: number } | null>(null);
   const controller = new AbortController();
@@ -936,6 +985,8 @@ async function runContinue(): Promise<void> {
       emit("failed", genError.value);
     } else {
       genError.value = `生成失败：${textOf(err)}`;
+      lastGenAction.value = "continue";
+      genFix.value = planGateStatus(err);
       finishAgentSteps(true, genError.value);
       emit("failed", genError.value);
     }
@@ -1005,6 +1056,8 @@ async function runRegenerate(): Promise<void> {
       emit("failed", genError.value);
     } else {
       genError.value = `重生成失败：${textOf(err)}`;
+      lastGenAction.value = "regenerate";
+      genFix.value = planGateStatus(err);
       finishAgentSteps(true, genError.value);
       emit("failed", genError.value);
     }
@@ -1273,7 +1326,16 @@ watch(
           <div v-if="saveNote" class="notice ok">{{ saveNote }}</div>
           <div v-if="saveError" class="notice err">{{ saveError }}</div>
           <div v-if="genNote && !generating" class="notice info">{{ genNote }}</div>
-          <div v-if="genError" class="notice err">{{ genError }}</div>
+          <div v-if="genError" class="notice err">
+            <span>{{ genError }}</span>
+            <button
+              v-if="genFix"
+              class="link-btn"
+              type="button"
+              :disabled="genFixBusy"
+              @click="runGenFix"
+            >{{ genFixBusy ? "处理中…" : genFixLabel }}</button>
+          </div>
 
           <!-- 标签页 -->
           <nav class="wp-tabs" aria-label="写作面板分类">

@@ -176,6 +176,22 @@ export class ApiError extends Error {
   }
 }
 
+/** 时间线写前闸门的三种 409 状态；界面据此给一键动作。 */
+export type PlanGateStatus = "needs_planning" | "needs_review" | "plan_exhausted";
+
+/** 从 409 detail 里取时间线闸门状态；不是这三种就返回 null。 */
+export function planGateStatus(err: unknown): PlanGateStatus | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const detail = err.detail;
+  if (!detail || typeof detail !== "object") return null;
+  const status = (detail as { status?: unknown }).status;
+  return status === "needs_planning" ||
+    status === "needs_review" ||
+    status === "plan_exhausted"
+    ? status
+    : null;
+}
+
 // 短 TTL 读缓存：只缓存高频、体积大、短时间内不会变的 GET。
 // `/projects/{id}` 实测能到 14MB（plot_bible + style_narrative），页面来回
 // 切换时反复拉它是最明显的卡顿来源。任何写操作都会清空缓存，保证改完
@@ -255,6 +271,30 @@ function safeJson(text: string): unknown {
   } catch {
     return text;
   }
+}
+
+/**
+ * 流式端点非 2xx：把 FastAPI 的 detail 读出来，别退化成「HTTP 409」。
+ *
+ * `/generate-stream` 与 `/regenerate-stream` 在开流前就可能被时间线闸门拒绝
+ * （`needs_planning` / `needs_review` / `plan_exhausted`），detail 是
+ * `{status, message, retry}`。丢掉它，界面只能显示一个没有下一步的 409。
+ */
+async function streamError(res: Response, fallback: string): Promise<ApiError> {
+  let raw: unknown;
+  try {
+    const text = await res.text();
+    const data = text ? safeJson(text) : null;
+    raw =
+      data && typeof data === "object" && "detail" in data
+        ? (data as { detail: unknown }).detail
+        : data ?? undefined;
+  } catch {
+    raw = undefined;
+  }
+  const message =
+    raw === undefined ? `${fallback} HTTP ${res.status}` : detailText(raw);
+  return new ApiError(res.status, message, raw);
 }
 
 function jsonInit(method: string, body?: unknown): RequestInit {
@@ -678,7 +718,7 @@ export const api = {
         ...(signal ? { signal } : {}),
       }).then(async (res) => {
         if (!res.ok) {
-          reject(new ApiError(res.status, `生成失败 HTTP ${res.status}`));
+          reject(await streamError(res, "生成失败"));
           return;
         }
         const reader = res.body!.getReader();
@@ -741,7 +781,7 @@ export const api = {
         ...(signal ? { signal } : {}),
       }).then(async (res) => {
         if (!res.ok) {
-          reject(new ApiError(res.status, `重生成失败 HTTP ${res.status}`));
+          reject(await streamError(res, "重生成失败"));
           return;
         }
         const reader = res.body!.getReader();
