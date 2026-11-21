@@ -1,7 +1,5 @@
 """时间线规划器：把故事线拆成剧情节点（主干 + 支线），按段数预算驱动进度。
 
-设计见 docs/timeline-pacing-design.md。
-
 首轮范围（纯函数，可测，不依赖 LLM 判定）：
 - PlotNode / TimelineState 数据结构
 - plan_timeline：从章节预算反推主干节点数与支线额度

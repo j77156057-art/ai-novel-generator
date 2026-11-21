@@ -3083,7 +3083,7 @@ def _style_source_ids(project: Project) -> set[int] | None:
 #: 数少是工程边界，不应让 100% 触发常态化；(2) 高于 99.5% 才是真异常
 #: （参考语料历史样本里都没有这种程度的距离）。
 #: 真要回到 97.5 阈值，需参考 50+ 章 30 万字让 long bucket 留出 20+ 单元
-#: —— 留出分布 max 自然扩大。详见 docs/style_log_buckets_design.md 风险评估节。
+#: —— 留出分布 max 自然扩大（留出样本越多，max 越长，99.5% 阈值越稳）。
 STYLE_WARN_PERCENTILE = 99.5
 
 #: 留出样本不足时的绝对距离阈值（v2.231）。
@@ -6567,7 +6567,7 @@ def regenerate_segment_stream(
 
     summary = provider.summarize(text)
 
-    # —— 零成本 AI 腔检测 + 告警（方案 b，见 docs/architecture/2026-10-17-phase1-writer-tool-calling-assessment.md §4.2 ③）——
+    # —— 零成本 AI 腔检测 + 告警（方案 b：只检测、不自动重写）——
     # 复用 _should_rewrite 的纯计数判据（与续写路径口径一致，零 LLM 调用、不加载语料）。
     # 命中即带 rewrite_info 告警信号，提示「本段可能残留 AI 腔，未自动修」。
     # 故意不做自动重写：重写 B 路会全量加载语料（undo §8.1 的节省），留作后续 opt-in（方案 c）。
