@@ -29,6 +29,7 @@ ACTION_KINDS: tuple[str, ...] = (
     "start_distill",
     "plan_outline",
     "extend_plan",
+    "replan_timeline",
     "invoke_generation",
     # —— 闭环四类（片 3）——
     "close_acceptance",
@@ -129,6 +130,23 @@ def _precondition_extend_plan(db: Any, project: Any,
         'written': _written_segments(db, project),
     }
     return _digest(payload), '规划用量与已写段数（推进了就接不上）'
+
+
+def _precondition_replan_timeline(db: Any, project: Any,
+                                  params: Mapping[str, Any]) -> tuple[str, str]:
+    """重规划世界线的前提：**节点集合/完成状态与已写段数**没变。
+
+    重规划只覆盖非 `user` 节点；期间追加/删了节点、或又写了一段，
+    这条「重新规划」的前提就变了（要重新提）。
+    """
+    timeline = project.plot_timeline if isinstance(project.plot_timeline, dict) else {}
+    payload = {
+        'nodes': sorted((timeline.get('nodes') or {}).keys()),
+        'done': sorted(timeline.get('done') or []),
+        'planning_status': timeline.get('planning_status') or '',
+        'written': _written_segments(db, project),
+    }
+    return _digest(payload), '世界线节点/完成状态与已写段数（变了就重新提）'
 
 
 def _precondition_invoke_generation(db: Any, project: Any,
@@ -255,6 +273,7 @@ PRECONDITIONS: dict[str, Callable[[Any, Any, Mapping[str, Any]], tuple[str, str]
     'start_distill': _precondition_start_distill,
     'plan_outline': _precondition_plan_outline,
     'extend_plan': _precondition_extend_plan,
+    'replan_timeline': _precondition_replan_timeline,
     'invoke_generation': _precondition_invoke_generation,
     'close_acceptance': _precondition_close_acceptance,
     'apply_body_repair': _precondition_apply_body_repair,
@@ -411,6 +430,33 @@ def _exec_extend_plan(db: Any, project: Any, proposal: Any, *,
         raise ActionProposalError('extend_plan_failed',
                                   str(result.get('message') or '扩展规划失败。'))
     return dict(result)
+
+
+def _exec_replan_timeline(db: Any, project: Any, proposal: Any, *,
+                          actor: str | None = None,
+                          background_tasks: Any = None) -> dict[str, Any]:
+    """重规划世界线：复用既有 `/timeline/plan` 服务，不另起一套规划逻辑。
+
+    与 `/timeline/plan` 同口径：只覆盖非 `user` 节点，进度字段原样保留；
+    渠道缺失 / 模型给不出可用计划时，把 HTTP 原因转成动作域错误。
+    """
+    from fastapi import HTTPException
+
+    from app.routers.timeline import TimelinePlanIn, replan_timeline
+
+    body = proposal.body_json if isinstance(proposal.body_json, dict) else {}
+    try:
+        out = replan_timeline(
+            project.id,
+            TimelinePlanIn(keep_user_nodes=bool(body.get('keep_user_nodes', True))),
+            db,
+        )
+    except HTTPException as exc:
+        raise ActionProposalError(
+            'replan_timeline_failed', str(exc.detail)
+        ) from exc
+    replaced = int((out or {}).get('replaced') or 0)
+    return {'replaced': replaced, 'note': f'世界线已重规划：{replaced} 个剧情点。'}
 
 
 def _exec_invoke_generation(db: Any, project: Any, proposal: Any, *,
@@ -574,6 +620,7 @@ EXECUTORS: dict[str, Callable[..., dict[str, Any]]] = {
     'plan_outline': _exec_plan_outline,
     'start_distill': _exec_start_distill,
     'extend_plan': _exec_extend_plan,
+    'replan_timeline': _exec_replan_timeline,
     'invoke_generation': _exec_invoke_generation,
     'close_acceptance': _exec_close_acceptance,
     'apply_body_repair': _exec_apply_body_repair,
@@ -624,6 +671,7 @@ ACTION_ENDPOINTS: dict[str, str] = {
     'start_distill': '/api/projects/{project_id}/distill',
     'plan_outline': '/api/projects/{project_id}',
     'extend_plan': '/api/projects/{project_id}/plan-extension',
+    'replan_timeline': '/api/projects/{project_id}/timeline/plan',
     'invoke_generation': '/api/assistant/invoke-generation',
     # —— 闭环四类：端点都是**既有**的那几个（不新开旁路）——
     'close_acceptance': '/api/assistant/body-acceptance',
@@ -660,6 +708,9 @@ def build_action_body(kind: str, project_id: int, *,
         return {'outline': [str(item) for item in outline]}
     if kind == 'extend_plan':
         return {'count': int(count or 1)}
+    if kind == 'replan_timeline':
+        # 人工追加的节点是作者权威，重规划不覆盖；与 /timeline/plan 默认一致。
+        return {'keep_user_nodes': True}
     if kind == 'invoke_generation':
         if not (instruction or '').strip():
             raise ActionProposalError('empty_instruction',

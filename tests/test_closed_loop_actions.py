@@ -106,7 +106,8 @@ def test_each_closed_loop_action_is_allowed_at_exactly_its_own_step():
     # 「正文审查」能提两个：跑验收、或提一个定点修复（审出问题后的两个正当回应）。
     # 只在「修复待批」那步才许提修复是不行的 —— 那步说的是「已经有东西等着批」，
     # 审出问题时它还是「没有待批项」，agent 会被卡住（实测：真书项目 8）。
-    assert STEP_WRITE_KINDS['review_body'] == ('close_acceptance', 'apply_body_repair')
+    assert STEP_WRITE_KINDS['review_body'] == (
+        'close_acceptance', 'apply_body_repair', 'extend_plan', 'replan_timeline')
     assert STEP_WRITE_KINDS['repair'] == ('apply_body_repair',)
     assert STEP_WRITE_KINDS['derived_rebuild'] == ('derived_rebuild',)
     assert STEP_WRITE_KINDS['unlock'] == ('unlock_generation',)

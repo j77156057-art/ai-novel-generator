@@ -55,6 +55,41 @@ class StyleDistillApplyRequest(StrictRequest):
     distill_id: int
 
 
+class PlanExtensionRequest(StrictRequest):
+    """`POST /api/projects/{id}/plan-extension` 的请求体。"""
+
+    #: 追加几个剧情点（服务端会再夹到 [1, MAX_EXTEND_COUNT]）。
+    count: int = 1
+
+
+@router.post("/{project_id}/plan-extension")
+def extend_project_plan(
+    project_id: int,
+    body: PlanExtensionRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """扩展规划：在保存权威允许的范围内追加剧情点并冻结新段契约。
+
+    与 agent 的 `extend_plan` 动作共用同一个服务函数（`plan_extension.extend_plan`）；
+    规划没写完 / 没有保存权威 / 章号模式 / 模型不合格时返回可读的 400，不静默追加。
+    """
+    proj = db.get(Project, project_id)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project 不存在")
+
+    from app.agents.plan_extension import extend_plan
+    from app.llm.registry import get_provider_registry
+
+    provider = get_provider_registry().get("assistant")
+    result = extend_plan(db, proj, provider, count=body.count)
+    if result.get("status") != "extended":
+        raise HTTPException(
+            status_code=400,
+            detail=str(result.get("message") or "扩展规划失败"),
+        )
+    return result
+
+
 @router.post("", response_model=ProjectOut)
 def create_project(body: ProjectCreate, db: Session = Depends(get_db)) -> Project:
     proj = Project(

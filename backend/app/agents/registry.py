@@ -2061,10 +2061,12 @@ _MODEL_TOOL_PARAMETERS: dict[str, dict] = {
             "kind": {
                 "type": "string",
                 "enum": ["start_distill", "plan_outline", "extend_plan",
+                         "replan_timeline",
                          "invoke_generation", "close_acceptance",
                          "apply_body_repair", "derived_rebuild",
                          "unlock_generation"],
-                "description": "要做的动作。只能提当前这一步允许的那几种。",
+                "description": "要做的动作。只能提当前这一步允许的那几种；"
+                               "时间线半填/占位时用 replan_timeline 重规划。",
             },
             "title": {"type": "string",
                       "description": "一句话说清要做什么（人靠它判断要不要批）"},

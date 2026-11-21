@@ -139,7 +139,7 @@ STEP_BY_ID: dict[str, Step] = {s.id: s for s in STEPS}
 STEP_WRITE_KINDS: dict[str, tuple[str, ...]] = {
     'distill': ('start_distill',),
     'review_narrative': ('start_distill',),
-    'write_body': ('plan_outline', 'extend_plan', 'invoke_generation'),
+    'write_body': ('plan_outline', 'extend_plan', 'replan_timeline', 'invoke_generation'),
     # —— 闭环四类：验收 / 修复 / 重建 / 解锁 ——
     #
     # 「正文审查」这一步能提**两个**动作：跑整段验收、提一个定点修复。
@@ -147,7 +147,12 @@ STEP_WRITE_KINDS: dict[str, tuple[str, ...]] = {
     # 而「修复待批」那一步说的是「**已经**有东西等着批」—— 审出问题时
     # 那一步还是「没有待批项」，agent 若只能站在那一步才许提修复，
     # 就被卡在「明明查出了问题却提不了修复」（实测：真书项目 8 就是这样）。
-    'review_body': ('close_acceptance', 'apply_body_repair'),
+    'review_body': (
+        'close_acceptance', 'apply_body_repair',
+        # 正文写完/审完仍可能缺计划（规划写完 / 半填）：规划修复是用户批准的
+        # 动作，在这里给 agent 一个正当出口，否则它只能卡在「写不下去」。
+        'extend_plan', 'replan_timeline',
+    ),
     'repair': ('apply_body_repair',),
     'derived_rebuild': ('derived_rebuild',),
     'unlock': ('unlock_generation',),

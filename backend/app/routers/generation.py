@@ -28,7 +28,7 @@ from app.generation import (
     generate_loop,
     generate_next_segment,
 )
-from app.generation.engine import _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt
+from app.generation.engine import _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt, preflight_timeline_gate, _timeline_progress, _chapter_ordinal
 from app.generation.length_guard import LengthBlocked
 from app.generation.outline_notice import build_notice
 from app.generation.prompts import build_system_prompt, build_user_prompt
@@ -234,6 +234,19 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
     _require_workflow_ready(db, proj)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
     plan = _chapter_plan(db, proj, body.chapter_range)
+    # 开流前预检时间线写前闸门：一旦返回 StreamingResponse，生成器里抛的 409
+    # 只能被吞成 SSE error 事件，前端拿不到状态码与结构化 detail，三种一键
+    # 修复按钮就不会出现（浏览器实测：HTTP 200 + data:{"type":"error",...}）。
+    timeline_written, chapter_based = _timeline_progress(db, proj)
+    chapter = _chapter_ordinal(plan["label"])
+    if chapter is None and chapter_based:
+        chapter = timeline_written + 1
+    from app.llm.provider import get_llm_provider
+
+    preflight_timeline_gate(
+        proj, timeline_written, get_llm_provider(), db,
+        chapter=chapter, chapter_based=chapter_based,
+    )
     # 在请求线程里先算好：SSE 生成器跑在线程池，不跨线程复用这个 session。
     outline_notice = build_notice(db, proj, plan["chapter"], plan["chapter_end"])
     # 生成器在依赖会话关闭后才迭代；commit 会 expire 全部字段，连 proj.id

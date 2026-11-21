@@ -235,6 +235,8 @@ def timeline_progress(state: TimelineState) -> dict:
     exhausted = bool(
         node and state.seg_counts.get(node.id, 0) >= node.segment_budget
     )
+    main_nodes = {nid for nid, n in state.nodes.items() if n.kind == "main"}
+    plan_exhausted = bool(main_nodes) and main_nodes <= state.done
     status = (
         "needs_planning" if needs_planning
         else "needs_review" if exhausted
@@ -244,6 +246,10 @@ def timeline_progress(state: TimelineState) -> dict:
     return {
         "status": status,
         "budget_exhausted": exhausted,
+        # 规划里的主干节点是否已全部写完。与 status 分开：status 管「当前节点
+        # 能不能继续写」，这个管「计划本身是否还有点可写」——诊断/agent 用来
+        # 判断是否需要扩展规划。
+        "plan_exhausted": plan_exhausted,
         "completion": state.completion.get(state.current_node or ""),
         "main_progress": round(main_progress, 4),
         "branch_progress": round(branch_progress, 4),

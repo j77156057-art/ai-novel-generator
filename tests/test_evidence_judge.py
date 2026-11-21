@@ -291,6 +291,16 @@ def test_free_continuation_is_not_plan_exhausted():
     assert _state_plan_exhausted(branch_only) is False
 
 
+def test_timeline_progress_exposes_plan_exhausted_for_agent():
+    """诊断/agent 读的 progress 必须能直接看到「计划写完了」。"""
+    from app.generation.timeline import timeline_progress
+
+    state = plan_timeline(total_segments=10)
+    assert timeline_progress(state)["plan_exhausted"] is False
+    state.done.update(state.order)
+    assert timeline_progress(state)["plan_exhausted"] is True
+
+
 def test_chapter_mode_plan_exhausted_after_last_chapter(db):
     """章号模式：越过最后一个节点覆盖的章之后，同样 409 plan_exhausted。"""
     from app.generation.timeline import (

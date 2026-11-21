@@ -470,3 +470,40 @@ def test_needs_planning_action_error_maps_to_409():
         routes._raise_http(ActionProposalError("needs_planning", "先补计划"))
     assert err.value.status_code == 409
     assert err.value.detail == {"error": "needs_planning", "message": "先补计划"}
+
+
+def test_replan_timeline_action_is_registered_and_executes(monkeypatch):
+    """agent 的「重新规划世界线」：注册齐、复用既有 /timeline/plan、错误可读。"""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from app.agents import action_proposals as ap
+    from app.agents.workflow import STEP_WRITE_KINDS
+    from app.routers import timeline as timeline_router
+
+    assert "replan_timeline" in ap.ACTION_KINDS
+    assert "replan_timeline" in ap.PRECONDITIONS
+    assert "replan_timeline" in ap.EXECUTORS
+    assert ap.ACTION_ENDPOINTS["replan_timeline"].endswith("/timeline/plan")
+    assert ap.build_action_body("replan_timeline", 1) == {"keep_user_nodes": True}
+    assert "replan_timeline" in STEP_WRITE_KINDS["write_body"]
+
+    db, project = fixture()
+    proposal = SimpleNamespace(body_json={})
+
+    monkeypatch.setattr(
+        timeline_router, "replan_timeline",
+        lambda *a, **k: {"replaced": 2, "timeline": {}},
+    )
+    out = ap._exec_replan_timeline(db, project, proposal)
+    assert out["replaced"] == 2
+
+    def _fail(*args, **kwargs):
+        raise HTTPException(status_code=503, detail="TIMELINE_NO_CHANNEL")
+
+    monkeypatch.setattr(timeline_router, "replan_timeline", _fail)
+    with pytest.raises(ap.ActionProposalError) as err:
+        ap._exec_replan_timeline(db, project, proposal)
+    assert err.value.code == "replan_timeline_failed"
+    assert "TIMELINE_NO_CHANNEL" in err.value.message

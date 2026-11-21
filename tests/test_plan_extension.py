@@ -133,3 +133,21 @@ def test_out_of_authority_is_rejected_and_not_written(db, monkeypatch):
     db.refresh(proj)
     after = json.dumps(proj.plot_timeline, ensure_ascii=False, sort_keys=True)
     assert after == before
+
+
+def test_plan_extension_endpoint_exists_and_maps_failures_to_400(db):
+    """动作卡的 `extend_plan` 端点必须真实存在：无规划 → 可读 400。"""
+    from fastapi import HTTPException
+
+    from app.routers.projects import PlanExtensionRequest, extend_project_plan
+
+    proj = Project(title="no-plan")
+    db.add(proj)
+    db.commit()
+    db.refresh(proj)
+
+    with pytest.raises(HTTPException) as err:
+        extend_project_plan(proj.id, PlanExtensionRequest(count=1), db)
+
+    assert err.value.status_code == 400
+    assert "没有时间线状态" in str(err.value.detail)

@@ -1876,7 +1876,7 @@ class ActionProposal(Base):
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
     # 提它的那一轮 agent 运行（审计链）。nullable：管理操作也可预置。
     run_id = Column(Integer, ForeignKey("agent_runs.id"), nullable=True)
-    # 动作类别：start_distill | plan_outline | extend_plan | invoke_generation
+    # 动作类别：start_distill | plan_outline | extend_plan | replan_timeline | invoke_generation
     kind = Column(String(32), nullable=False)
     # 一句话说清要做什么（人靠它判断要不要批）。
     title = Column(String(255), nullable=False)

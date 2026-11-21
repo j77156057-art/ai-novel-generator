@@ -5118,57 +5118,29 @@ _AUTO_REPLAN_FAILED_REASON = (
 
 
 def _state_plan_exhausted(state) -> bool:
-    """state 版「规划写完」：按**同步后的** done 判断。
-
-    章号模式下 done 由 `sync_node_for_chapter` 按章区间重算（`chapter_end < 当前章`
-    或 `early_done`），不能读存档里可能过时的 done。段模式下两者的 done 同源。
-    同样只看主干节点：支线可以不写。
-    """
+    """state 版「规划写完」：与 `timeline_progress` 同一口径，避免两处漂移。"""
     if state is None:
         return False
-    planned = {nid for nid, node in state.nodes.items() if node.kind == "main"}
-    if not planned:
-        return False
-    return planned <= {str(x) for x in state.done}
+    return bool(timeline_progress(state).get("plan_exhausted"))
 
 
-def current_node_prompt(
+def _enforce_timeline_gate(
+    st,
     project: Project,
     written_segments: int,
-    provider=None,
-    db=None,
+    provider,
+    db,
     *,
-    chapter: int | None = None,
-    chapter_based: bool = False,
-    strict: bool = True,
-) -> str | None:
-    """算出当前剧情点的提示块（时间线启用时）；无 outline 返回 None。
+    had_saved_plan: bool,
+    strict: bool,
+):
+    """三种写前闸门的唯一实现（生成与开流前预检共用，避免两处漂移）。
 
-    供 generate_next_segment 与 generate-plan 共用——两条路径必须下发同一份提示，
-    否则预检看到的不算数。written_segments = 已写段数 / 已写章数（chapter_based）。
+    `strict=False`（重写旧章节）只放行：不抛 409、也不触发自动重规划，
+    状态只通过提示块里的说明行透出。
 
-    修复项 2：传了 `chapter`（或 chapter_based 时用 written+1）就按**章号**
-    选节点，而不是按历史行数；重跑同一章只会命中同一个节点。
-    `db` 用于持久化；预检/读侧可不传（仅恢复，不写）。
-
-    状态闸（与 main 同口径）：有存档 + 有模型渠道时，`needs_planning` 允许
-    现场重规划一次（**包括已写到一半的存量项目**）；`strict=True` 且 `db`
-    给定时，`needs_planning` / `needs_review` 抛 409，把「缺计划」和
-    「预算用尽但未证实」显式交给调用方。
-
-    `strict=False` 给**重写**路径用：重写旧章节不该被当前计划状态挡住，
-    状态只通过提示块里的说明行透出，不抛错、也不触发重规划。
+    返回可能被「自动重规划」改写过的 state。
     """
-    had_saved_plan = bool(project.plot_timeline)
-    st = _timeline_state_for(
-        project, written_segments, provider, db=db, chapter_based=chapter_based
-    )
-    if st is None:
-        return None
-    if chapter is None and chapter_based:
-        chapter = written_segments + 1
-    if chapter is not None and has_chapter_ranges(st):
-        st = sync_node_for_chapter(st, chapter)
     # 规划里的主干剧情点写完了：不再无约束地往后写（main 的 plan_exhausted 口径）。
     # 段模式 current_node 为空；章号模式 current_node 会被 sync 钉在最后一个节点，
     # 但 done 已按章区间算出「全部主干节点完成」——两种模式同一判定。
@@ -5182,7 +5154,7 @@ def current_node_prompt(
             "written_segments": written_segments,
         })
     if not st.current_node or st.current_node not in st.nodes:
-        return None
+        return st
     status = timeline_progress(st)["status"]
     # 占位/半填计划重试：不能只在「还没写过段落」时才救——历史上规划器允许
     # 空 exit / 占位标题，存量写到一半的项目会因此永远卡在 needs_planning。
@@ -5225,6 +5197,85 @@ def current_node_prompt(
             ),
             "completion": st.completion.get(st.current_node),
         })
+    return st
+
+
+def preflight_timeline_gate(
+    project: Project,
+    written_segments: int,
+    provider=None,
+    db=None,
+    *,
+    chapter: int | None = None,
+    chapter_based: bool = False,
+) -> None:
+    """开流前先过一遍时间线写前闸门：不通过直接抛 HTTP 409。
+
+    `/generate-stream` 一旦返回 `StreamingResponse`，生成器里抛的 409 只能被
+    吞成 SSE `error` 事件（实测 HTTP 200 + `data: {"type":"error",...}`），
+    前端拿不到状态码与结构化 `detail`，三种一键修复按钮就不会出现。
+    所以在请求线程里先走同一份实现，把 409 如实回给客户端。
+    """
+    had_saved_plan = bool(project.plot_timeline)
+    st = _timeline_state_for(
+        project, written_segments, provider, db=db, chapter_based=chapter_based
+    )
+    if st is None:
+        return
+    if chapter is None and chapter_based:
+        chapter = written_segments + 1
+    if chapter is not None and has_chapter_ranges(st):
+        st = sync_node_for_chapter(st, chapter)
+    _enforce_timeline_gate(
+        st, project, written_segments, provider, db,
+        had_saved_plan=had_saved_plan, strict=True,
+    )
+
+
+def current_node_prompt(
+    project: Project,
+    written_segments: int,
+    provider=None,
+    db=None,
+    *,
+    chapter: int | None = None,
+    chapter_based: bool = False,
+    strict: bool = True,
+) -> str | None:
+    """算出当前剧情点的提示块（时间线启用时）；无 outline 返回 None。
+
+    供 generate_next_segment 与 generate-plan 共用——两条路径必须下发同一份提示，
+    否则预检看到的不算数。written_segments = 已写段数 / 已写章数（chapter_based）。
+
+    修复项 2：传了 `chapter`（或 chapter_based 时用 written+1）就按**章号**
+    选节点，而不是按历史行数；重跑同一章只会命中同一个节点。
+    `db` 用于持久化；预检/读侧可不传（仅恢复，不写）。
+
+    状态闸（与 main 同口径）：有存档 + 有模型渠道时，`needs_planning` 允许
+    现场重规划一次（**包括已写到一半的存量项目**）；`strict=True` 且 `db`
+    给定时，`needs_planning` / `needs_review` 抛 409，把「缺计划」和
+    「预算用尽但未证实」显式交给调用方。
+
+    `strict=False` 给**重写**路径用：重写旧章节不该被当前计划状态挡住，
+    状态只通过提示块里的说明行透出，不抛错、也不触发重规划。
+    """
+    had_saved_plan = bool(project.plot_timeline)
+    st = _timeline_state_for(
+        project, written_segments, provider, db=db, chapter_based=chapter_based
+    )
+    if st is None:
+        return None
+    if chapter is None and chapter_based:
+        chapter = written_segments + 1
+    if chapter is not None and has_chapter_ranges(st):
+        st = sync_node_for_chapter(st, chapter)
+    # 三种写前闸门：与 `preflight_timeline_gate` 共用同一实现（见该函数）。
+    st = _enforce_timeline_gate(
+        st, project, written_segments, provider, db,
+        had_saved_plan=had_saved_plan, strict=strict,
+    )
+    if not st.current_node or st.current_node not in st.nodes:
+        return None
     prompt = build_node_prompt(
         st.nodes[st.current_node], st.current_beat, timeline_progress(st)
     )

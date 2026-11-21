@@ -112,6 +112,7 @@ const ACTION_KIND_LABELS: Record<string, string> = {
   start_distill: "启动文风提炼",
   plan_outline: "规划剧情大纲",
   extend_plan: "扩展规划",
+  replan_timeline: "重新规划世界线",
   invoke_generation: "写正文",
   // —— 闭环四类 ——
   close_acceptance: "整段验收",
