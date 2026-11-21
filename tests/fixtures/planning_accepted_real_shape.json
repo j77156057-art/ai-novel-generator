@@ -1,0 +1,630 @@
+{
+  "model": "MiniMax-M3",
+  "dimension": "evidence_responsibility",
+  "scope": {
+    "character": "",
+    "cursor": 2,
+    "limit": 5
+  },
+  "sources": {
+    "S001": {
+      "path": "/premise",
+      "text": "一场暴雨封住旧城石桥。档案修复员沈砚必须在清晨六点前，查清桥梁加固拨款签收记录的两处矛盾，否则守桥员陆禾会因错误记录承担侵吞款项的责任。全篇只用沈砚、陆禾、档案值班员周宁三人；不超自然、不死亡、不引入幕后新组织。当前凌晨三点，桥与档案室步行二十分钟，暴雨中来回至少四十分钟，电话断线；关键账册不能无代价取得。动机、行动、信息来源、结果与代价须明确，证据不能凭空出现。",
+      "start": 0,
+      "end": 183
+    },
+    "S002": {
+      "path": "/bible/characters/0/motivation",
+      "text": "在六点前确认矛盾来源，避免陆禾因错误记录承担侵吞责任，并保全档案证据链",
+      "start": 0,
+      "end": 35
+    },
+    "S003": {
+      "path": "/bible/characters/0/name",
+      "text": "沈砚",
+      "start": 0,
+      "end": 2
+    },
+    "S004": {
+      "path": "/bible/characters/0/role",
+      "text": "档案修复员，负责材料、笔迹与档案流程核验",
+      "start": 0,
+      "end": 20
+    },
+    "S005": {
+      "path": "/bible/characters/1/motivation",
+      "text": "证明自己未侵吞拨款，同时阻止未经核实的更正再次破坏档案真实性",
+      "start": 0,
+      "end": 30
+    },
+    "S006": {
+      "path": "/bible/characters/1/name",
+      "text": "陆禾",
+      "start": 0,
+      "end": 2
+    },
+    "S007": {
+      "path": "/bible/characters/1/role",
+      "text": "旧城石桥守桥员，熟悉桥务签收惯例与现场状况",
+      "start": 0,
+      "end": 21
+    },
+    "S008": {
+      "path": "/bible/characters/2/motivation",
+      "text": "维持值班和档案安全，拒绝让受潮、缺页或程序瑕疵的责任落到自己身上",
+      "start": 0,
+      "end": 32
+    },
+    "S009": {
+      "path": "/bible/characters/2/name",
+      "text": "周宁",
+      "start": 0,
+      "end": 2
+    },
+    "S010": {
+      "path": "/bible/characters/2/role",
+      "text": "档案室夜间值班员，掌管入库、调阅与原件保管权限",
+      "start": 0,
+      "end": 23
+    },
+    "S011": {
+      "path": "/bible/conflicts/0",
+      "text": "桥边两处矛盾可能来自记录填写错误、补签时间错位或笔迹归属误读，沈砚必须在有限原件核验前区分事实与推断",
+      "start": 0,
+      "end": 50
+    },
+    "S012": {
+      "path": "/bible/conflicts/1",
+      "text": "周宁担心调阅导致受潮、缺页或责任倒查，坚持程序与限时要求；沈砚又必须取得足以支持纠错的原始依据",
+      "start": 0,
+      "end": 47
+    },
+    "S013": {
+      "path": "/bible/conflicts/2",
+      "text": "暴雨和步行往返压缩时间，电话断线使沈砚无法即时求证，任何决定都可能在六点前留下不可补救的证据缺口",
+      "start": 0,
+      "end": 48
+    },
+    "S014": {
+      "path": "/bible/conflicts/3",
+      "text": "陆禾急于洗清嫌疑，沈砚却不能在证据未闭合时替她修改记录，二人必须在事实、责任和程序之间达成暂时一致",
+      "start": 0,
+      "end": 49
+    },
+    "S015": {
+      "path": "/bible/degraded",
+      "text": "false",
+      "start": 0,
+      "end": 5
+    },
+    "S016": {
+      "path": "/bible/direction",
+      "text": "全篇严格分为凌晨三点至四点的桥边核对、四点至五点二十分步行赴档案室核对原件、五点二十分至六点步行返桥拟定纠错办法三个连续场景。沈砚先依据现有签收簿、陆禾记忆和现场痕迹确认矛盾，但不能据此取得原件；往返途中因暴雨、封路与时间限制，只能携带有限线索。档案室内，周宁要求沈砚履行调阅登记、限时阅览和防潮隔离手续，沈砚必须牺牲一项复核机会或承担档案受潮风险，才能接触关键账册。返桥后，她只能提出有证据边界的纠错与申诉方案，不能让记录自动消失，更不能等同最终申诉成功。",
+      "start": 0,
+      "end": 229
+    },
+    "S017": {
+      "path": "/bible/error",
+      "text": "null",
+      "start": 0,
+      "end": 4
+    },
+    "S018": {
+      "path": "/bible/foreshadowing/0",
+      "text": "签收簿上两处矛盾之间存在一段无法由现有记录解释的时间空档，真正的经手顺序尚未核清",
+      "start": 0,
+      "end": 40
+    },
+    "S019": {
+      "path": "/bible/foreshadowing/1",
+      "text": "陆禾对某个日期或签收地点的坚持与纸面记录不完全吻合，可能源于记忆偏差，也可能指向一次未被记录的现场交接",
+      "start": 0,
+      "end": 51
+    },
+    "S020": {
+      "path": "/bible/foreshadowing/2",
+      "text": "周宁掌握的一項入库或封存细节暂不能说明账册为何出现异常，但会改变对两处矛盾关系的判断",
+      "start": 0,
+      "end": 42
+    },
+    "S021": {
+      "path": "/bible/foreshadowing/3",
+      "text": "暴雨造成的返程延迟将迫使沈砚在证据完整性与六点前提交说明之间作出取舍，最终方案仍可能只达到启动复核而非完成纠错",
+      "start": 0,
+      "end": 55
+    },
+    "S022": {
+      "path": "/bible/model_participated",
+      "text": "true",
+      "start": 0,
+      "end": 4
+    },
+    "S023": {
+      "path": "/bible/note",
+      "text": "null",
+      "start": 0,
+      "end": 4
+    },
+    "S024": {
+      "path": "/bible/relationships/0/a",
+      "text": "沈砚",
+      "start": 0,
+      "end": 2
+    },
+    "S025": {
+      "path": "/bible/relationships/0/b",
+      "text": "陆禾",
+      "start": 0,
+      "end": 2
+    },
+    "S026": {
+      "path": "/bible/relationships/0/relation",
+      "text": "沈砚负责核验签收记录，陆禾是被记录指向的责任人；两人既相互信任又因证据标准产生张力",
+      "start": 0,
+      "end": 41
+    },
+    "S027": {
+      "path": "/bible/relationships/1/a",
+      "text": "沈砚",
+      "start": 0,
+      "end": 2
+    },
+    "S028": {
+      "path": "/bible/relationships/1/b",
+      "text": "周宁",
+      "start": 0,
+      "end": 2
+    },
+    "S029": {
+      "path": "/bible/relationships/1/relation",
+      "text": "沈砚需凭修复员身份与紧急核验理由调阅原件，周宁则必须监督她按权限、登记和防潮程序取件",
+      "start": 0,
+      "end": 42
+    },
+    "S030": {
+      "path": "/bible/relationships/2/a",
+      "text": "陆禾",
+      "start": 0,
+      "end": 2
+    },
+    "S031": {
+      "path": "/bible/relationships/2/b",
+      "text": "周宁",
+      "start": 0,
+      "end": 2
+    },
+    "S032": {
+      "path": "/bible/relationships/2/relation",
+      "text": "陆禾熟悉桥务记录形成过程，周宁掌握档案入库与调阅事实；两人掌握的局部信息彼此印证却不能替代原件",
+      "start": 0,
+      "end": 47
+    },
+    "S033": {
+      "path": "/bible/relationships/3/a",
+      "text": "沈砚",
+      "start": 0,
+      "end": 2
+    },
+    "S034": {
+      "path": "/bible/relationships/3/b",
+      "text": "石桥",
+      "start": 0,
+      "end": 2
+    },
+    "S035": {
+      "path": "/bible/relationships/3/relation",
+      "text": "石桥既是拨款所指向的工程现场，也是陆禾承担嫌疑的现实场所；沈砚必须往返桥边、档案室完成核验",
+      "start": 0,
+      "end": 45
+    },
+    "S036": {
+      "path": "/bible/relationships/4/a",
+      "text": "陆禾",
+      "start": 0,
+      "end": 2
+    },
+    "S037": {
+      "path": "/bible/relationships/4/b",
+      "text": "加固拨款签收记录",
+      "start": 0,
+      "end": 8
+    },
+    "S038": {
+      "path": "/bible/relationships/4/relation",
+      "text": "陆禾因该记录被怀疑侵吞款项，能否纠正记录直接关系到她的名誉与责任",
+      "start": 0,
+      "end": 32
+    },
+    "S039": {
+      "path": "/bible/status",
+      "text": "bible_draft",
+      "start": 0,
+      "end": 11
+    },
+    "S040": {
+      "path": "/bible/synopsis",
+      "text": "凌晨三点，暴雨封住石桥，档案修复员沈砚发现加固拨款签收簿存在日期与经手笔迹矛盾，错误记录将指向守桥员陆禾。她决定步行赴档案室核验原件，再返回拟定纠错方案；关键账册受潮险与值班权限牵制，任何取得都须付出代价。",
+      "start": 0,
+      "end": 103
+    },
+    "S044": {
+      "path": "/timeline/branch_used",
+      "text": "0",
+      "start": 0,
+      "end": 1
+    },
+    "S045": {
+      "path": "/timeline/completion",
+      "text": "{}",
+      "start": 0,
+      "end": 2
+    },
+    "S046": {
+      "path": "/timeline/current_beat",
+      "text": "0",
+      "start": 0,
+      "end": 1
+    },
+    "S047": {
+      "path": "/timeline/current_node",
+      "text": "n1",
+      "start": 0,
+      "end": 2
+    },
+    "S048": {
+      "path": "/timeline/done",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S049": {
+      "path": "/timeline/last_judged_segment",
+      "text": "0",
+      "start": 0,
+      "end": 1
+    },
+    "S050": {
+      "path": "/timeline/nodes/n1/beats",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S051": {
+      "path": "/timeline/nodes/n1/children",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S052": {
+      "path": "/timeline/nodes/n1/closes",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S053": {
+      "path": "/timeline/nodes/n1/emotion",
+      "text": "",
+      "start": 0,
+      "end": 0
+    },
+    "S054": {
+      "path": "/timeline/nodes/n1/entry_condition",
+      "text": "03:00-04:00；旧城石桥；参与者：沈砚、陆禾；前提：凌晨三点至四点，暴雨封住旧城石桥，沈砚只能使用桥边现有签收簿、陆禾陈述和现场痕迹核对加固拨款签收记录。；动机：沈砚要在六点前确定矛盾的具体形态，避免把尚未核实的记录直接当作陆禾侵吞拨款的事实；陆禾要证明自己没有经手款项，并阻止沈砚依据记忆贸然改写记录。；起始状态：现有签收记录把两处异常指向陆禾，沈砚尚未确认矛盾来源，原件尚未接触。",
+      "start": 0,
+      "end": 196
+    },
+    "S055": {
+      "path": "/timeline/nodes/n1/exit_condition",
+      "text": "行动：沈砚先抄录桥边签收簿中两处冲突的原值、冲突值和可辨识的书写特征，再逐项询问陆禾；第一处表现为纸面经手笔迹与陆禾本人书写习惯不一致，第二处表现为纸面日期与陆禾记忆中的签收地点或交接顺序不一致。陆禾说明记忆依据，沈砚用现场痕迹和签收簿进行有限比对，不用记忆替代原件证据。；结果：沈砚取得两项待核矛盾及桥边记录抄录：笔迹归属异常，以及日期或交接顺序不一致；两项均只能标记为桥边线索，不能据此排除陆禾责任，也不能直接认定形成原因。周宁掌握的一项入库或封存细节仍为unknown。；代价：沈砚放弃继续追查现场细节，把时间留给赴档案室；桥边抄录不能单独形成完整的原件证据链。陆禾的嫌疑仍未解除。；结束状态：两处矛盾被具体化为待原件核验的冲突项，并记录了原值、冲突值和证据来源；事实与陆禾记忆之间的差异仍未裁定。",
+      "start": 0,
+      "end": 352
+    },
+    "S056": {
+      "path": "/timeline/nodes/n1/id",
+      "text": "n1",
+      "start": 0,
+      "end": 2
+    },
+    "S057": {
+      "path": "/timeline/nodes/n1/kind",
+      "text": "main",
+      "start": 0,
+      "end": 4
+    },
+    "S058": {
+      "path": "/timeline/nodes/n1/opens",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S059": {
+      "path": "/timeline/nodes/n1/parent",
+      "text": "null",
+      "start": 0,
+      "end": 4
+    },
+    "S060": {
+      "path": "/timeline/nodes/n1/segment_budget",
+      "text": "1",
+      "start": 0,
+      "end": 1
+    },
+    "S061": {
+      "path": "/timeline/nodes/n1/title",
+      "text": "桥边锁定两处矛盾",
+      "start": 0,
+      "end": 8
+    },
+    "S062": {
+      "path": "/timeline/nodes/n2/beats",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S063": {
+      "path": "/timeline/nodes/n2/children",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S064": {
+      "path": "/timeline/nodes/n2/closes",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S065": {
+      "path": "/timeline/nodes/n2/emotion",
+      "text": "",
+      "start": 0,
+      "end": 0
+    },
+    "S066": {
+      "path": "/timeline/nodes/n2/entry_condition",
+      "text": "04:00-05:20；档案室；参与者：沈砚、周宁；前提：四点至五点二十分，沈砚沿暴雨中可通行的旧路步行至少二十分钟抵达档案室，档案室与石桥之间的往返交通和电话均不能提供即时外部求证。周宁掌管调阅、原件保管和防潮隔离。；动机：沈砚要用原始账册核验桥边两处冲突，保全调阅证据链；周宁要确保原件在暴雨后的湿度环境中不被调阅程序再次损害，并避免任何缺页或受潮责任落到自己身上；陆禾只能等待核验结果。；起始状态：沈砚带着桥边原值、冲突值和抄录到档案室，关键账册尚未取得，证据链不完整。",
+      "start": 0,
+      "end": 238
+    },
+    "S067": {
+      "path": "/timeline/nodes/n2/exit_condition",
+      "text": "行动：沈砚以修复员身份说明两处冲突，申请限时调阅并由周宁登记。周宁要求她记录开箱时间、页码、查看顺序和归还时间，将账册置于防潮隔离条件下限时阅览。沈砚先核验笔迹异常对应的原始签收页，再核验日期、地点和交接顺序；她只能抄录可核对的页码、笔迹特征、日期和登记信息，不能带走原件。若环境湿度使阅览窗口缩短，沈砚选择放弃对第三项封存细节的复核，以换取两项核心冲突的必要核对。；结果：原件核验确认或否定桥边两项中的具体冲突值，并产生带页码、登记编号和阅览记录的抄录；如果原件只支持其中一项，另一项仍保留为未闭合推断。第二项冲突之间的裁定依据由原件的原始记载、入库登记和封存细节共同决定；封存细节具体内容及其对冲突的影响为unknown。周宁留下了调阅登记和防潮隔离记录，但登记本身不等于最终免责或责任认定。；代价：沈砚牺牲第三项封存细节的复核，并承担暴雨环境下原件受潮风险中的一种实际后果：缩短阅览时间，不能保证未核细节完整取得。周宁承担登记、限时监督和原件安全责任；陆禾无法参与原件核验，嫌疑仍未自动消失。；结束状态：两项核心冲突完成有限原件核验，调阅登记、页码和防潮隔离信息可被后续说明引用；至少一项封存细节未复核，最终责任和完整证据链仍unknown。",
+      "start": 0,
+      "end": 524
+    },
+    "S068": {
+      "path": "/timeline/nodes/n2/id",
+      "text": "n2",
+      "start": 0,
+      "end": 2
+    },
+    "S069": {
+      "path": "/timeline/nodes/n2/kind",
+      "text": "main",
+      "start": 0,
+      "end": 4
+    },
+    "S070": {
+      "path": "/timeline/nodes/n2/opens",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S071": {
+      "path": "/timeline/nodes/n2/parent",
+      "text": "null",
+      "start": 0,
+      "end": 4
+    },
+    "S072": {
+      "path": "/timeline/nodes/n2/segment_budget",
+      "text": "1",
+      "start": 0,
+      "end": 1
+    },
+    "S073": {
+      "path": "/timeline/nodes/n2/title",
+      "text": "档案室限时核验",
+      "start": 0,
+      "end": 7
+    },
+    "S074": {
+      "path": "/timeline/nodes/n3/beats",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S075": {
+      "path": "/timeline/nodes/n3/children",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S076": {
+      "path": "/timeline/nodes/n3/closes",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S077": {
+      "path": "/timeline/nodes/n3/emotion",
+      "text": "",
+      "start": 0,
+      "end": 0
+    },
+    "S078": {
+      "path": "/timeline/nodes/n3/entry_condition",
+      "text": "05:20-06:00；旧城石桥；参与者：沈砚、陆禾；前提：五点二十分至六点，沈砚从档案室沿暴雨封路返回旧城石桥，往返步行至少二十分钟；她只能携带有限原件信息、桥边记录和陆禾陈述，原件留在档案室并由周宁保管。；动机：沈砚要在六点前形成可执行的纠错与申诉说明，既不把未闭合的推断写成事实，也不让周宁的登记承担超出其权限的免责功能；陆禾要阻止未经核实的更正，并保留原记录和异议。；起始状态：原件核验已完成有限范围，证据链存在缺口，沈砚尚无符合权限边界的纠错方案。",
+      "start": 0,
+      "end": 229
+    },
+    "S079": {
+      "path": "/timeline/nodes/n3/exit_condition",
+      "text": "行动：沈砚返回桥边，与陆禾逐项标明两处矛盾的原值、冲突值、原件页码、调阅登记编号和仍然存在的证据缺口。她按原件记录、入库登记、封存细节和桥边陈述的证明力分别说明：原件支持的冲突列为已核实，桥边记忆或现场推断列为待核，不以登记记录替代原件事实。陆禾签署或确认异议；沈砚拟定启动正式复核、附注原始依据、保留原记录并请求暂缓归责的方案。由于接收说明的具体人员、权限和签收机制未在已知事实中确认，她只能将说明交由陆禾保管或按周宁留下的程序信息提出转交请求，不能声称已成功提交、已启动复核或已免除责任。；结果：沈砚在六点前形成一份有证据边界的纠错与申诉说明，足以支持启动正式复核的程序请求；两处冲突分别有原件证据标识，未闭合处明确标为推断或unknown。原记录不被涂改、销毁或自动更正，陆禾责任未被最终洗清，复核、归责和申诉结果均仍unknown。；代价：沈砚没有足够时间补足被牺牲的封存细节，也不能确保说明在六点前由有权人员接收；陆禾继续面临错误记录带来的程序压力，周宁的登记和隔离记录只证明程序事实。；结束状态：说明已形成并可执行地提出启动复核、附注依据和保留原记录的请求；原件仍在档案室，说明可能尚待有权接收，未产生最终纠错或免责。",
+      "start": 0,
+      "end": 515
+    },
+    "S080": {
+      "path": "/timeline/nodes/n3/id",
+      "text": "n3",
+      "start": 0,
+      "end": 2
+    },
+    "S081": {
+      "path": "/timeline/nodes/n3/kind",
+      "text": "main",
+      "start": 0,
+      "end": 4
+    },
+    "S082": {
+      "path": "/timeline/nodes/n3/opens",
+      "text": "[]",
+      "start": 0,
+      "end": 2
+    },
+    "S083": {
+      "path": "/timeline/nodes/n3/parent",
+      "text": "null",
+      "start": 0,
+      "end": 4
+    },
+    "S084": {
+      "path": "/timeline/nodes/n3/segment_budget",
+      "text": "1",
+      "start": 0,
+      "end": 1
+    },
+    "S085": {
+      "path": "/timeline/nodes/n3/title",
+      "text": "返桥形成复核说明",
+      "start": 0,
+      "end": 8
+    },
+    "S086": {
+      "path": "/timeline/planning/degraded",
+      "text": "false",
+      "start": 0,
+      "end": 5
+    },
+    "S087": {
+      "path": "/timeline/planning/error",
+      "text": "null",
+      "start": 0,
+      "end": 4
+    },
+    "S088": {
+      "path": "/timeline/planning/goals/0",
+      "text": "只修订当前三节点规划，保持premise与圣经事实边界，保持三人及凌晨三至六点、两次步行至少二十分钟。根据独立诊断最小补全具体矛盾、可取得证据和责任机制。若圣经不能支持一个机制，写unknown并指出需作者确认；不可自称已免除责任。不要生成正文。",
+      "start": 0,
+      "end": 123
+    },
+    "S089": {
+      "path": "/timeline/planning/goals/1",
+      "text": "{\"diagnostic_checks\": [{\"id\": \"evidence_responsibility_1\", \"status\": \"supported\", \"reason\": \"第三节点要求逐项标明原件支持与推断，形成附依据、保留原记录并启动复核的方案，且不直接改写原记录。\", \"citations\": [{\"source_id\": \"S114\", \"path\": \"/timeline/planning/nodes/2/action\", \"quote\": \"沈砚返回桥边，与陆禾逐项标明哪些矛盾有原件支持、哪些仍属推断，并拟定启动复核、附注原始依据和保留原记录的具体纠错方案；她不在证据未闭合时直接涂改或销毁原记录，而是向周宁留下的登记与隔离事实寻求核验衔接。\", \"start\": 0, \"end\": 101, \"location_verified\": true}, {\"source_id\": \"S121\", \"path\": \"/timeline/planning/nodes/2/result\", \"quote\": \"沈砚在六点前形成一份有证据边界的纠错或申诉说明，足以启动对两处矛盾的正式复核并避免立即把责任归于陆禾；原始记录仍然存在，未自动更正，最终责任认定和申诉结果仍未知。\", \"start\": 0, \"end\": 81, \"location_verified\": true}, {\"source_id\": \"S122\", \"path\": \"/timeline/planning/nodes/2/state_after\", \"quote\": \"沈砚提出启动复核、附注依据并保留原记录的可执行方案；陆禾责任未被最终洗清，但错误记录不再被沈砚直接视为既定事实，周宁的登记与隔离记录成为程序依据。\", \"start\": 0, \"end\": 73, \"location_verified\": true}]}, {\"id\": \"evidence_responsibility_2\", \"status\": \"unknown\", \"reason\": \"未明确逐项记录每处矛盾的原值、冲突值及其证据标识，也未规定冲突值之间如何裁定。\", \"citations\": [{\"source_id\": \"S078\", \"path\": \"/timeline/nodes/n3/entry_condition\", \"quote\": \"05:20-06:00；档案室至旧城石桥的暴雨封路路线、旧城石桥；参与者：沈砚、陆禾；前提：05:20-06:00，沈砚从档案室步行返回旧城石桥，暴雨和封路继续压缩时间；她只能依据已取得的有限原件信息、桥边记录和陆禾陈述拟定办法。；动机：沈砚要在六点前提交可执行的纠错与申诉方案，同时保全证据链；陆禾要阻止未经核实的再次更正；周宁只能依靠已完成的调阅登记和隔离记录说明程序事实。；起始状态：原件只完成有限核对，证据链未闭合；陆禾仍面临错误记录责任，沈砚尚无最终纠错方案。\", \"start\": 0, \"end\": 235, \"location_verified\": true}, {\"source_id\": \"S114\", \"path\": \"/timeline/planning/nodes/2/action\", \"quote\": \"沈砚返回桥边，与陆禾逐项标明哪些矛盾有原件支持、哪些仍属推断，并拟定启动复核、附注原始依据和保留原记录的具体纠错方案；她不在证据未闭合时直接涂改或销毁原记录，而是向周宁留下的登记与隔离事实寻求核验衔接。\", \"start\": 0, \"end\": 101, \"location_verified\": true}, {\"source_id\": \"S120\", \"path\": \"/timeline/planning/nodes/2/premise\", \"quote\": \"05:20-06:00，沈砚从档案室步行返回旧城石桥，暴雨和封路继续压缩时间；她只能依据已取得的有限原件信息、桥边记录和陆禾陈述拟定办法。\", \"start\": 0, \"end\": 69, \"location_verified\": true}]}, {\"id\": \"evidence_responsibility_3\", \"status\": \"unknown\", \"reason\": \"周宁掌握登记和隔离权限，但未规定说明由谁接收、接收权限如何验证，也无具体归责启动、复核与免责规则；登记本身不足以证明避免归责。\", \"citations\": [{\"source_id\": \"S117\", \"path\": \"/timeline/planning/nodes/2/motivation\", \"quote\": \"沈砚要在六点前提交可执行的纠错与申诉方案，同时保全证据链；陆禾要阻止未经核实的再次更正；周宁只能依靠已完成的调阅登记和隔离记录说明程序事实。\", \"start\": 0, \"end\": 70, \"location_verified\": true}, {\"source_id\": \"S121\", \"path\": \"/timeline/planning/nodes/2/result\", \"quote\": \"沈砚在六点前形成一份有证据边界的纠错或申诉说明，足以启动对两处矛盾的正式复核并避免立即把责任归于陆禾；原始记录仍然存在，未自动更正，最终责任认定和申诉结果仍未知。\", \"start\": 0, \"end\": 81, \"location_verified\": true}, {\"source_id\": \"S122\", \"path\": \"/timeline/planning/nodes/2/state_after\", \"quote\": \"沈砚提出启动复核、附注依据并保留原记录的可执行方案；陆禾责任未被最终洗清，但错误记录不再被沈砚直接视为既定事实，周宁的登记与隔离记录成为程序依据。\", \"start\": 0, \"end\": 73, \"location_verified\": true}]}], \"proposal\": [{\"kind\": \"planning_candidate_proposal\", \"requires_confirmation\": true, \"source_fingerprint\": \"c674557928f0abd038431c4d585fa429862d802adbd35697045e26c776875ff1\", \"text\": \"未明确逐项记录每处矛盾的原值、冲突值及其证据标识，也未规定冲突值之间如何裁定。\"}, {\"kind\": \"planning_candidate_proposal\", \"requires_confirmation\": true, \"source_fingerprint\": \"c674557928f0abd038431c4d585fa429862d802adbd35697045e26c776875ff1\", \"text\": \"周宁掌握登记和隔离权限，但未规定说明由谁接收、接收权限如何验证，也无具体归责启动、复核与免责规则；登记本身不足以证明避免归责。\"}]}",
+      "start": 0,
+      "end": 2982
+    },
+    "S090": {
+      "path": "/timeline/planning/model_participated",
+      "text": "true",
+      "start": 0,
+      "end": 4
+    },
+    "S115": {
+      "path": "/timeline/planning/nodes/2/action",
+      "text": "沈砚返回桥边，与陆禾逐项标明两处矛盾的原值、冲突值、原件页码、调阅登记编号和仍然存在的证据缺口。她按原件记录、入库登记、封存细节和桥边陈述的证明力分别说明：原件支持的冲突列为已核实，桥边记忆或现场推断列为待核，不以登记记录替代原件事实。陆禾签署或确认异议；沈砚拟定启动正式复核、附注原始依据、保留原记录并请求暂缓归责的方案。由于接收说明的具体人员、权限和签收机制未在已知事实中确认，她只能将说明交由陆禾保管或按周宁留下的程序信息提出转交请求，不能声称已成功提交、已启动复核或已免除责任。",
+      "start": 0,
+      "end": 243
+    },
+    "S116": {
+      "path": "/timeline/planning/nodes/2/cost",
+      "text": "沈砚没有足够时间补足被牺牲的封存细节，也不能确保说明在六点前由有权人员接收；陆禾继续面临错误记录带来的程序压力，周宁的登记和隔离记录只证明程序事实。",
+      "start": 0,
+      "end": 74
+    },
+    "S117": {
+      "path": "/timeline/planning/nodes/2/location",
+      "text": "旧城石桥",
+      "start": 0,
+      "end": 4
+    },
+    "S118": {
+      "path": "/timeline/planning/nodes/2/motivation",
+      "text": "沈砚要在六点前形成可执行的纠错与申诉说明，既不把未闭合的推断写成事实，也不让周宁的登记承担超出其权限的免责功能；陆禾要阻止未经核实的更正，并保留原记录和异议。",
+      "start": 0,
+      "end": 79
+    },
+    "S119": {
+      "path": "/timeline/planning/nodes/2/participants/0",
+      "text": "沈砚",
+      "start": 0,
+      "end": 2
+    },
+    "S120": {
+      "path": "/timeline/planning/nodes/2/participants/1",
+      "text": "陆禾",
+      "start": 0,
+      "end": 2
+    },
+    "S121": {
+      "path": "/timeline/planning/nodes/2/premise",
+      "text": "五点二十分至六点，沈砚从档案室沿暴雨封路返回旧城石桥，往返步行至少二十分钟；她只能携带有限原件信息、桥边记录和陆禾陈述，原件留在档案室并由周宁保管。",
+      "start": 0,
+      "end": 74
+    },
+    "S122": {
+      "path": "/timeline/planning/nodes/2/result",
+      "text": "沈砚在六点前形成一份有证据边界的纠错与申诉说明，足以支持启动正式复核的程序请求；两处冲突分别有原件证据标识，未闭合处明确标为推断或unknown。原记录不被涂改、销毁或自动更正，陆禾责任未被最终洗清，复核、归责和申诉结果均仍unknown。",
+      "start": 0,
+      "end": 120
+    },
+    "S123": {
+      "path": "/timeline/planning/nodes/2/state_after",
+      "text": "说明已形成并可执行地提出启动复核、附注依据和保留原记录的请求；原件仍在档案室，说明可能尚待有权接收，未产生最终纠错或免责。",
+      "start": 0,
+      "end": 61
+    },
+    "S124": {
+      "path": "/timeline/planning/nodes/2/state_before",
+      "text": "原件核验已完成有限范围，证据链存在缺口，沈砚尚无符合权限边界的纠错方案。",
+      "start": 0,
+      "end": 36
+    },
+    "S125": {
+      "path": "/timeline/planning/nodes/2/time",
+      "text": "05:20-06:00",
+      "start": 0,
+      "end": 11
+    },
+    "S126": {
+      "path": "/timeline/planning/nodes/2/title",
+      "text": "返桥形成复核说明",
+      "start": 0,
+      "end": 8
+    },
+    "S127": {
+      "path": "/timeline/planning/source_fingerprint",
+      "text": "1d299c63fa3518f382d9ca77602e8e3c4bcdf2b6dd5345f6b66c48bb900d82cb",
+      "start": 0,
+      "end": 64
+    },
+    "S128": {
+      "path": "/timeline/planning/status",
+      "text": "outline_draft",
+      "start": 0,
+      "end": 13
+    },
+    "S129": {
+      "path": "/timeline/seg_counts",
+      "text": "{}",
+      "start": 0,
+      "end": 2
+    },
+    "S130": {
+      "path": "/timeline/version",
+      "text": "2",
+      "start": 0,
+      "end": 1
+    }
+  },
+  "raw": "{\"assessment\":\"observed\",\"reason\":\"第三节点已明确逐项记录原值、冲突值、页码、登记编号及证据缺口，并区分原件支持与推断；但接收人员权限、签收机制及归责启动、复核与免责规则仍未确认，故责任机制整体证据不足。\",\"findings\":[{\"assessment\":\"supported\",\"reason\":\"已规定逐项标明原值、冲突值、原件页码、登记编号和证据缺口，并按证明力区分已核实与待核，未闭合处保留unknown。\",\"source_ids\":[\"S115\",\"S122\"]},{\"assessment\":\"unknown\",\"reason\":\"说明接收人、接收权限及签收机制未确认，只能保管或提出转交请求，无法证明已由有权人员接收。\",\"source_ids\":[\"S115\",\"S116\",\"S123\"]},{\"assessment\":\"unknown\",\"reason\":\"仅提出启动复核、附注依据、保留原记录并请求暂缓归责；具体归责启动、复核及免责规则未载明，登记不证明避免归责。\",\"source_ids\":[\"S115\",\"S116\",\"S122\"]}]}"
+}

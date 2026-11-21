@@ -12,10 +12,6 @@
     {
       "id": "inspect_text_quality",
       "min_version": 1
-    },
-    {
-      "id": "prepare_text_repair",
-      "min_version": 1
     }
   ],
   "steps": [
@@ -25,18 +21,8 @@
       "requires": [],
       "observe": [
         "只认规则算得出来的机械修法：半角标点换全角、连续重复标点收成一个",
-        "改法由规则算出，模型不重新措辞、不改语序、不动风格"
-      ]
-    },
-    {
-      "id": "repair",
-      "capability": "prepare_text_repair",
-      "requires": [
-        "scan"
-      ],
-      "observe": [
-        "按段构造待确认卡；此刻什么也不写进正文",
-        "用户在卡上确认或再改后，才存成待批提案；批准并应用后才生效"
+        "改法由规则算出，模型不重新措辞、不改语序、不动风格",
+        "本技能只产出修复清单；不在诊断内写卡，写卡由主 agent 的 propose_text_fix 完成"
       ]
     }
   ],

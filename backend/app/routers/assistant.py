@@ -1062,39 +1062,54 @@ def assistant_qa(body: AssistantQARequest, db: Session = Depends(get_db)) -> dic
     memory_block = memory_prompt_block(
         db, project.id, query=body.query, exclude_text=body.query
     )
+    # —— 实验性诊断的用户授权：凭据是**用户这条消息的原话** ——
+    # 模型能传的 `allow_experimental` 只是「请求」，放行与否由这里定。
+    # （模型伪造不了请求体里的 query —— 那是客户端发来的。）
+    from app.agents.consent import (
+        reset_experimental_consent,
+        set_experimental_consent,
+        user_granted_experimental,
+    )
+
+    consent_token = set_experimental_consent(
+        user_granted_experimental(body.query)
+    )
     try:
-        outcome = _qa_answer_with_tools(
-            db=db,
-            project=project,
-            run_id=run_id,
-            query=body.query,
-            action_block=action_block,
-            trace_ctx=trace_ctx,
-            attachment_plan=attachment_plan,
-            memory_block=memory_block,
-        )
-    except PermissionError:
-        # 黑名单工具被 Assistant 误调：直接 fail-fast（绝不静默）
-        run.status = "failed"
-        run.finished_at = _now_utc()
-        run.model = "(blocked_by_registry)"
-        db.commit()
-        raise HTTPException(status_code=403, detail="Assistant 越权调用写工具")
-    except Exception as exc:  # noqa: BLE001 - 工具调用不可用时回落，不让问答失败
-        fallback_reason = f"{type(exc).__name__}: {exc}"[:200]
-        logger.warning("assistant/qa 自主工具调用不可用，回落确定性路径：%s", exc)
-        outcome = _qa_answer_deterministic(
-            db=db,
-            project=project,
-            run_id=run_id,
-            query=body.query,
-            target_segment_no=target_segment_no,
-            action_block=action_block,
-            trace_ctx=trace_ctx,
-            fallback_reason=fallback_reason,
-            attachment_plan=attachment_plan,
-            memory_block=memory_block,
-        )
+        try:
+            outcome = _qa_answer_with_tools(
+                db=db,
+                project=project,
+                run_id=run_id,
+                query=body.query,
+                action_block=action_block,
+                trace_ctx=trace_ctx,
+                attachment_plan=attachment_plan,
+                memory_block=memory_block,
+            )
+        except PermissionError:
+            # 黑名单工具被 Assistant 误调：直接 fail-fast（绝不静默）
+            run.status = "failed"
+            run.finished_at = _now_utc()
+            run.model = "(blocked_by_registry)"
+            db.commit()
+            raise HTTPException(status_code=403, detail="Assistant 越权调用写工具")
+        except Exception as exc:  # noqa: BLE001 - 工具调用不可用时回落，不让问答失败
+            fallback_reason = f"{type(exc).__name__}: {exc}"[:200]
+            logger.warning("assistant/qa 自主工具调用不可用，回落确定性路径：%s", exc)
+            outcome = _qa_answer_deterministic(
+                db=db,
+                project=project,
+                run_id=run_id,
+                query=body.query,
+                target_segment_no=target_segment_no,
+                action_block=action_block,
+                trace_ctx=trace_ctx,
+                fallback_reason=fallback_reason,
+                attachment_plan=attachment_plan,
+                memory_block=memory_block,
+            )
+    finally:
+        reset_experimental_consent(consent_token)
 
     answer = (outcome["answer"] or "").strip()
     empty_answer = not answer

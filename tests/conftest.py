@@ -286,3 +286,18 @@ def test_database_url() -> str:
 def real_db_snapshot() -> dict[str, dict | None]:
     """会话开始时对真实库打的指纹快照（供护栏测试比对）。"""
     return REAL_DB_SNAPSHOT
+
+
+@pytest.fixture
+def experimental_consent():
+    """在用例期间显式授予实验性诊断权限（对应 /qa 里按用户原话设置的上下文）。"""
+    from app.agents.consent import (
+        reset_experimental_consent,
+        set_experimental_consent,
+    )
+
+    token = set_experimental_consent(True)
+    try:
+        yield
+    finally:
+        reset_experimental_consent(token)

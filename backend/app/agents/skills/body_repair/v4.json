@@ -3,7 +3,7 @@
   "version": 4,
   "status": "experimental",
   "applicable_tasks": [
-    "body_consistency",
+    "body_repair_plan",
     "repair_verification"
   ],
   "agent_roles": [

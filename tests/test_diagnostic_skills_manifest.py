@@ -1,10 +1,11 @@
-"""skill 清单加载机制：18 个版本文件必须能被 `load_skill()` 按目录 + 版本加载并过校验。
+"""skill 清单加载机制：活跃版 8 份 + 归档版 10 份都必须能被 `load_skill()` 加载。
 
-单独搬 JSON 等于搬了一堆没人读的文件，所以这里钉住的是**加载机制**：
-- 目录布局 `agents/skills/<skill_id>/v<version>.json`，按 id + version 定位；
-- 每个清单都要过 `validate_manifest`（字段集、角色、能力依赖、步骤顺序、验收条款）；
-- 版本不存在 / 技能不存在要报**可自愈**的话（列出可用项），不能一律 `invalid_manifest`；
-- 全部清单当前是 `experimental`：不给 `allow_experimental=True` 一律拒绝。
+收敛后（2026-11-21）：
+- `skills/` 只保留每个技能的最新版（8 份），`discover_skills` 只扫这里；
+- 历史版本移到 `skills_archive/`（10 份），不参与发现，但显式指定
+  `skill_id + version` 时仍可加载，用于复现旧 run；
+- 两类清单都必须过 `validate_manifest`（字段集、角色、能力依赖、步骤顺序、验收）；
+- 版本不存在 / 技能不存在要报**可自愈**的话（列出可用项），不能一律 `invalid_manifest`。
 """
 
 from __future__ import annotations
@@ -23,23 +24,32 @@ if _BACKEND not in sys.path:
 from app.agents import diagnostic_skills as ds  # noqa: E402
 
 SKILLS_ROOT = Path(_BACKEND) / "app" / "agents" / "skills"
-PACKED = sorted(
+ARCHIVE_ROOT = Path(_BACKEND) / "app" / "agents" / "skills_archive"
+
+ACTIVE = sorted(
     (p.parent.name, int(p.stem[1:]))
     for p in SKILLS_ROOT.glob("*/v*.json")
 )
+ARCHIVED = sorted(
+    (p.parent.name, int(p.stem[1:]))
+    for p in ARCHIVE_ROOT.glob("*/v*.json")
+)
 
 
-def test_all_eighteen_version_files_are_present():
-    assert len(PACKED) == 18, PACKED
-    # 用户点名的几个：closed_inventory 8 版、body_consistency 2 版、body_repair 2 版
-    assert sum(1 for s, _ in PACKED if s == "closed_inventory") == 8
-    assert sum(1 for s, _ in PACKED if s == "body_consistency") == 2
-    assert sum(1 for s, _ in PACKED if s == "body_repair") == 2
+def test_active_catalog_has_exactly_one_latest_version_per_skill():
+    assert len(ACTIVE) == 8, ACTIVE
+    assert len({skill_id for skill_id, _ in ACTIVE}) == 8
+    # 归档保留历史版本，且不与活跃目录重叠。
+    assert len(ARCHIVED) == 10, ARCHIVED
+    assert sum(1 for s, _ in ARCHIVED if s == "closed_inventory") == 7
+    assert sum(1 for s, _ in ARCHIVED if s == "body_consistency") == 1
+    assert sum(1 for s, _ in ARCHIVED if s == "body_repair") == 1
+    assert not set(ACTIVE) & set(ARCHIVED)
 
 
-@pytest.mark.parametrize("skill_id,version", PACKED)
+@pytest.mark.parametrize("skill_id,version", ACTIVE + ARCHIVED)
 def test_every_version_loads_and_validates(skill_id: str, version: int):
-    """随便取一个 skill 名和版本号，都要能按目录加载出来并校验清单。"""
+    """活跃版与归档版都要能按目录加载出来并校验清单。"""
     manifest = ds.load_skill(skill_id, version, allow_experimental=True)
     assert manifest["id"] == skill_id
     assert manifest["version"] == version
@@ -53,17 +63,24 @@ def test_every_version_loads_and_validates(skill_id: str, version: int):
         assert step["capability"] in ds.CAPABILITIES
 
 
-@pytest.mark.parametrize("skill_id,version", PACKED)
+@pytest.mark.parametrize("skill_id,version", ACTIVE + ARCHIVED)
 def test_experimental_skills_need_the_explicit_switch(skill_id: str, version: int):
     with pytest.raises(ValueError, match="skill_status_not_allowed:experimental"):
         ds.load_skill(skill_id, version)
 
 
-def test_discovery_catalog_agrees_with_the_directory():
+def test_discovery_catalog_only_lists_active_versions():
     found = {(e["id"], e["version"]) for e in ds.discover_skills(allow_experimental=True)}
-    assert found == set(PACKED)
+    assert found == set(ACTIVE)
+    assert not found & set(ARCHIVED)
     # 默认不带实验开关 → 一个都不给（全部是 experimental）
     assert ds.discover_skills() == []
+
+
+def test_archived_versions_still_load_explicitly():
+    """旧 run 的复验需要原版本：归档文件不能删，也不能不可读。"""
+    manifest = ds.load_skill("closed_inventory", 7, allow_experimental=True)
+    assert manifest["version"] == 7
 
 
 # ----------------------------------------------------------------------

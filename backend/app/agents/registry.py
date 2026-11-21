@@ -93,7 +93,12 @@ ALLOWED_READ_ONLY_TOOLS: tuple[str, ...] = (
     "get_text_gate_no_generation",
     # 诊断 / 运行记录 / 提案 / 版本 / 提示词 / 快照（2026-11-21）：全部只读投影，
     # 写动作（审批、应用、回滚、恢复）仍只在前端显式确认后执行。
-    "diagnose_project",
+    "run_diagnosis",
+    "run_diagnostic_task",
+    "list_diagnostic_skills",
+    # 定点修订卡：只构造待确认卡，不调 Writer、不落库；写路径由用户确认后的
+    # 端点负责。诊断报告的 proposed_actions 引用它，必须真的可调用。
+    "prepare_body_repair",
     "list_assistant_runs",
     "list_proposals",
     "list_versions",
@@ -837,15 +842,29 @@ def _impl_get_text_gate_no_generation(*, db: Any, project_id: int) -> dict:
     return text_gate_no_generation_summary(db, project_id)
 
 
-def _impl_diagnose_project(*, db: Any, project_id: int) -> dict:
-    """项目体检：只跑确定性诊断规则（不调模型、不开 AgentRun）。"""
+def _impl_run_diagnosis(*, db: Any, project_id: int, scope: str = "all",
+                        query: str = "") -> dict[str, Any]:
+    """跑**确定性诊断规则**（只读、零模型调用）。
+
+    跑的是 `POST /api/assistant/diagnose` 用的那一套规则引擎
+    （`app.agents.diagnosis.run_diagnostic_rules`）：伏笔堆积、低置信事实、
+    名字冲突、已死角色复活、文风偏离（句子被切碎）。
+
+    规则是确定性的：同一个库跑两次逐字节相同，且不花钱。返回的 issue id
+    可以直接当 `propose_text_edit` 的 `from_issue`。
+    """
+    from fastapi import HTTPException
+
     from app.agents.diagnosis import run_diagnostic_rules
     from app.models import Project
 
     project = db.get(Project, project_id)
     if project is None:
-        return {"error": f"project {project_id} 不存在"}
-    return run_diagnostic_rules(db, project).to_dict()
+        raise HTTPException(status_code=404, detail="project 不存在")
+    report = run_diagnostic_rules(
+        db, project, scope=scope or "all", query=(query or None),
+    )
+    return _report_to_tool_result(report, dict(report.tool_results or {}))
 
 
 def _impl_list_assistant_runs(*, db: Any, project_id: int,
@@ -957,6 +976,79 @@ def _impl_list_snapshots(*, db: Any, project_id: int,
         limit=max(1, min(int(limit or 20), 100)),
     )
     return {"items": items, "count": len(items)}
+
+
+def list_diagnostic_skills(db: Any, project_id: int) -> dict:
+    """发现已注册的诊断技能：每个技能只列**最新版**，历史版本不主动暴露。
+
+    目录读取不等于授权执行。历史版本仍可按 `skill_id + skill_version` 显式
+    加载（复现旧 run 时需要），但不进入模型默认可见的目录——否则 19 条版本
+    会把选择成本抬上去。归档版本号只在 `superseded_versions` 里提示。
+    """
+    from dataclasses import asdict
+
+    from app.agents.diagnostic_skills import (
+        ARCHIVE_ROOT,
+        CAPABILITIES,
+        ROOT,
+        discover_skills,
+        load_skill,
+    )
+
+    entries = discover_skills(allow_experimental=True)
+    # 最新版看活跃目录；归档版本只用于告诉模型「还有哪些历史可显式加载」。
+    all_versions: dict[str, set[int]] = {}
+    for base in (ROOT, ARCHIVE_ROOT):
+        for path in base.glob("*/v*.json"):
+            all_versions.setdefault(path.parent.name, set()).add(
+                int(path.stem[1:])
+            )
+
+    skills = []
+    for entry in sorted(entries, key=lambda e: (e["id"], e["version"])):
+        latest = max(all_versions[entry["id"]])
+        if entry["version"] != latest:
+            continue
+        manifest = load_skill(
+            entry["id"], entry["version"], allow_experimental=True,
+        )
+        skills.append({
+            **entry,
+            "latest_version": latest,
+            "superseded_versions": sorted(
+                v for v in all_versions[entry["id"]] if v < latest
+            ),
+            "required_capabilities": manifest["required_capabilities"],
+            "requires_experimental_opt_in": entry["status"] == "experimental",
+            "allowed_actions": manifest["allowed_actions"],
+        })
+    return {
+        "skills": skills,
+        "capabilities": [asdict(c) for c in CAPABILITIES.values()],
+        "business_read_only": True,
+        "hidden_versions_note": (
+            "只列各技能最新版；历史版本仍可显式传 skill_id/skill_version 复现旧 run。"
+        ),
+        "authorization_note": (
+            "实验技能未证明质量改善；要执行须在 run_diagnostic_task 里显式传 "
+            "allow_experimental=true，且是否放行由服务端按**用户原话的明确授权**决定。"
+            "未知责任规则须澄清或提出待确认规划草案；禁止自动 apply。"
+        ),
+    }
+
+
+def _impl_run_diagnostic_task(*, db: Any, project_id: int, **kwargs: Any) -> dict:
+    """独立诊断子任务入口：复用 `diagnostic_tool` 的授权闸门与报告裁剪。"""
+    from app.agents.diagnostic import diagnostic_tool
+
+    return diagnostic_tool(db, project_id, **kwargs)
+
+
+def _impl_prepare_body_repair(*, db: Any, project_id: int, **kwargs: Any) -> dict:
+    """定点修订卡：只构造待确认卡，不调 Writer、不落库。"""
+    from app.agents.body_repair import prepare_body_repair
+
+    return prepare_body_repair(db, project_id, **kwargs)
 
 
 # ====================================================================
@@ -1773,7 +1865,96 @@ _MODEL_TOOL_PARAMETERS: dict[str, dict] = {
         }
     ),
     "get_text_gate_no_generation": _obj(),
-    "diagnose_project": _obj(),
+    "run_diagnosis": _obj(
+        {
+            "scope": {"type": "string", "description": "诊断范围（默认 all=全部）"},
+            "query": {
+                "type": "string",
+                "description": "用户问的具体问题；给了会额外做一次参考语料检索并附上证据",
+            },
+        }
+    ),
+    "run_diagnostic_task": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [],
+        "properties": {
+            "task_type": {
+                "type": "string",
+                "enum": [
+                    "foundation_diagnosis", "timeline_review", "binding_review",
+                    "claim_review", "planning_review", "body_consistency",
+                    "body_repair_plan",
+                    "repair_verification", "text_quality_audit",
+                    "text_quality_repair", "prompt_health_audit",
+                ],
+            },
+            "question": {"type": "string"},
+            "novel_ids": {"type": "array", "items": {"type": "integer"}},
+            "character": {"type": "string"},
+            "cursor": {"type": "integer"},
+            "limit": {"type": "integer"},
+            "segment_nos": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1},
+                "minItems": 1, "maxItems": 10, "uniqueItems": True,
+            },
+            "allow_experimental": {
+                "type": "boolean",
+                "description": (
+                    "要使用实验性技能就置 true —— 这是你的**请求**，"
+                    "是否放行由服务端按用户的明确授权决定；没有授权会被拒"
+                    "并告诉你该请用户怎么说"
+                ),
+            },
+            "skill_id": {"type": "string"},
+            "skill_version": {"type": "integer"},
+            "inventory_kinds": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["person", "place", "object"]},
+                "minItems": 1, "maxItems": 3, "uniqueItems": True,
+                "description": "closed_inventory v2 分维度范围；未选维度保持 unknown",
+            },
+            "inventory_verdict_source_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1, "maxItems": 10, "uniqueItems": True,
+                "description": "有界裁决来源；与 previous_run_id 复用同输入提及",
+            },
+            "parent_run_id": {"type": "integer"},
+            "previous_run_id": {"type": "integer"},
+        },
+    },
+    "prepare_body_repair": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["diagnostic_run_id", "conflict_source_id", "objective"],
+        "properties": {
+            "diagnostic_run_id": {"type": "integer"},
+            "conflict_source_id": {
+                "type": "string",
+                "description": "矛盾落在哪个来源（诊断报告里的 source id，如 G1P015）",
+            },
+            "objective": {
+                "type": "string",
+                "description": "这次修订要达成什么（保留哪些事实）",
+            },
+            "generation_id": {
+                "type": "integer",
+                "description": "要修的那一段正文 id；不给则按矛盾所在来源推断",
+            },
+            "start": {"type": "integer"},
+            "end": {"type": "integer"},
+            "preserve_source_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1, "maxItems": 12,
+                "description": "必须保留的事实来源 id；不给则取该矛盾引用的另一端",
+            },
+            "allow_delete": {"type": "boolean"},
+            "dependency_note": {"type": "string"},
+        },
+    },
     "list_assistant_runs": _obj(
         {
             # 与 routers/assistant.py 的 _RUN_STATUSES 同口径。
@@ -2150,13 +2331,55 @@ _DEFAULT_SPECS: tuple[ToolSpec, ...] = (
         callable=_impl_get_text_gate_no_generation,
     ),
     ToolSpec(
-        name="diagnose_project",
+        name="run_diagnosis",
         description=(
-            "项目体检（规则先行、只读、不调模型）：跑未填坑/别名冲突/哨兵/"
-            "无正文段等确定性规则，返回 issues。用户问「项目哪里有问题」时调用。"
+            "跑**确定性诊断规则**（只读、不花钱）：伏笔堆积、低置信事实、名字冲突、"
+            "已死角色又出现、文风偏离（句子被切碎）。要判断「正文/伏笔/事实/文风"
+            "有没有确定性问题」时先调它；返回的 issue id 可以直接当 "
+            "propose_text_edit 的 from_issue。"
         ),
         read_only=True,
-        callable=_impl_diagnose_project,
+        callable=_impl_run_diagnosis,
+        parameters=_MODEL_TOOL_PARAMETERS["run_diagnosis"],
+    ),
+    ToolSpec(
+        name="list_diagnostic_skills",
+        description=(
+            "列出可用诊断技能、版本、实验状态、required_capabilities 与授权要求。"
+            "目录读取不授权执行实验技能；要执行先看 authorization_note。"
+        ),
+        read_only=True,
+        callable=list_diagnostic_skills,
+    ),
+    ToolSpec(
+        name="run_diagnostic_task",
+        description=(
+            "独立诊断子任务（业务只读，写自身审计日志）：task_type 为 "
+            "foundation_diagnosis、timeline_review、binding_review、claim_review、"
+            "planning_review、body_consistency、body_repair_plan、"
+            "text_quality_audit、text_quality_repair、prompt_health_audit 或 "
+            "repair_verification。"
+            "选择口径：body_consistency=只评估正文是否自相矛盾；"
+            "body_repair_plan=已确认矛盾后规划有界修复（只出草案，不写正文）。"
+            "不传 skill_id 时按 task_type 自动选最新技能；experimental 需显式 "
+            "allow_experimental，且**必须由用户原话授权**。"
+            "text_quality_repair 只给规则算得出来的机械修法，要改仍走 propose_text_fix。"
+        ),
+        read_only=True,
+        callable=_impl_run_diagnostic_task,
+        parameters=_MODEL_TOOL_PARAMETERS["run_diagnostic_task"],
+    ),
+    ToolSpec(
+        name="prepare_body_repair",
+        description=(
+            "构造**定点修订待确认卡**（只读，不调 Writer、不落库）：只需说清"
+            "哪个矛盾（conflict_source_id）与修订目标（objective），要改的区间"
+            "与要保留的事实由服务端从诊断报告里解析，不用你算字符偏移。"
+            "用户确认后才会生成待批提案并做独立复验，不会自动应用。"
+        ),
+        read_only=True,
+        callable=_impl_prepare_body_repair,
+        parameters=_MODEL_TOOL_PARAMETERS["prepare_body_repair"],
     ),
     ToolSpec(
         name="list_assistant_runs",

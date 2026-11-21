@@ -114,12 +114,10 @@ def read_capability(db, project_id: int, capability_id: str, scope: dict) -> dic
                 raise PermissionError('binding_requires_full_reference_scope')
             content = corpus_content_hash(ids, db)
             cfg = resolve_tier(project.narrative_tier)
-            # 范围与生成链路同口径：项目上存的蒸馏范围（见 resolve_project_scope）。
-            # 少了这一项，诊断会把「全量蒸出来的档案」判成失效 —— 而生成链路
-            # 恰恰是认这个范围的，两边口径必须一致。
-            from app.style.scope import resolve_project_scope
-            want = narrative_fingerprint(ids, cfg, corpus_hash=content,
-                                         scope=resolve_project_scope(project))
+            # 与生成链路同一口径：指纹 = 语料集合 + 提炼版本 + 档位签名。
+            # （旧代码还给 narrative_fingerprint 传 corpus_hash/scope，签名已不再
+            # 接受这两个参数，会在运行时抛 TypeError，导致默认技能不可用。）
+            want = narrative_fingerprint(ids, cfg)
             cached = project.style_narrative or {}
             shared = find_style_distill(db, ids, cfg.key, want['tier_signature'], content) if ids else None
             match = bool(ids and cached.get('fingerprint') == want and cached.get('narrative_version') == NARRATIVE_VERSION)
@@ -214,11 +212,71 @@ def read_capability(db, project_id: int, capability_id: str, scope: dict) -> dic
                 'input_fingerprint':fingerprint, 'coverage':coverage, 'data':data}
 
 
+#: 任务 → 默认技能。调用方不传 skill_id 时按任务自动选，避免「只传 task_type
+#: 却撞上默认技能」的 task_not_applicable。
+TASK_DEFAULT_SKILL: dict[str, str] = {
+    'foundation_diagnosis': 'foundation_input_health',
+    'timeline_review': 'foundation_input_health',
+    'binding_review': 'foundation_input_health',
+    'claim_review': 'foundation_input_health',
+    'planning_review': 'planning_review',
+    'body_consistency': 'body_consistency',
+    'body_repair_plan': 'body_repair',
+    'text_quality_audit': 'text_quality_audit',
+    'text_quality_repair': 'text_quality_repair',
+    'prompt_health_audit': 'prompt_health_audit',
+}
+
+
+def _latest_skill_version(skill_id: str) -> int:
+    from app.agents.diagnostic_skills import ROOT
+
+    versions = [int(p.stem[1:]) for p in (ROOT / skill_id).glob('v*.json')]
+    if not versions:
+        raise ValueError('unknown_skill:' + skill_id)
+    return max(versions)
+
+
+def resolve_skill_selection(
+    task_type: str,
+    skill_id: str | None,
+    skill_version: int | None,
+    previous: dict | None = None,
+) -> tuple[str, int]:
+    """任务 + 可选显式技能 → `(skill_id, skill_version)`。
+
+    选择口径（避免 body_consistency / body_repair 二选一靠猜）：
+
+    - `body_consistency`：评估正文是否自相矛盾（只报矛盾，不提修法）；
+    - `body_repair_plan`：在已确认矛盾后规划有界修复（只出草案，不写正文）；
+    - 未显式给技能时按任务自动选；未给版本时取最新版；
+    - `repair_verification` 必须沿用上一次 run 的技能与版本（换技能等于换判官）。
+    """
+    if task_type == 'repair_verification' and previous is not None:
+        pinned = previous.get('skill') or {}
+        sid, version = pinned.get('id'), pinned.get('version')
+        if not sid or type(version) is not int:
+            raise ValueError('invalid_previous_report')
+        # 显式传了别的技能/版本 = 换判官，必须 fail loud，不能静默沿用。
+        if skill_id and skill_id != sid:
+            raise ValueError('verification_requires_pinned_previous_run')
+        if skill_version is not None and skill_version != version:
+            raise ValueError('verification_requires_pinned_previous_run')
+        return sid, version
+    sid = skill_id or TASK_DEFAULT_SKILL.get(task_type)
+    if not sid:
+        raise ValueError('unknown_task_type')
+    version = skill_version
+    if version is None:
+        version = _latest_skill_version(sid)
+    return sid, int(version)
+
+
 def run_diagnostic_task(db, project_id: int, *, task_type: str = 'foundation_diagnosis',
                         question: str = '', novel_ids: list[int] | None = None,
                         character: str = '', cursor: int = 0, limit: int = 5,
-                        allow_experimental: bool = False, skill_id: str = 'foundation_input_health',
-                        skill_version: int = 1, parent_run_id: int | None = None,
+                        allow_experimental: bool = False, skill_id: str | None = None,
+                        skill_version: int | None = None, parent_run_id: int | None = None,
                         previous_run_id: int | None = None, segment_nos: list[int] | None = None, candidate_overlay: dict | None = None, provider=None,
                         inventory_kinds: list[str] | None = None, inventory_checkpoint_dir: str | None = None,
                         inventory_split_truncated: bool = True,
@@ -234,12 +292,6 @@ def run_diagnostic_task(db, project_id: int, *, task_type: str = 'foundation_dia
     scope={'character':character,'cursor':cursor,'limit':limit}
     if novel_ids is not None: scope['novel_ids']=novel_ids
     if segment_nos is not None: scope['segment_nos']=segment_nos
-    if inventory_kinds is not None:
-        if (skill_id != 'closed_inventory' or skill_version < 2 or not isinstance(inventory_kinds,list)
-                or not inventory_kinds or any(not isinstance(k,str) for k in inventory_kinds)
-                or len(set(inventory_kinds)) != len(inventory_kinds) or not set(inventory_kinds) <= {'person','place','object'}):
-            raise ValueError('invalid_inventory_dimensions')
-        scope['inventory_kinds']=inventory_kinds
     report={'task_id':task_id,'parent_run_id':parent_run_id,'project_id':project_id,
             'task_type':task_type,'agent_role':'diagnostic','provider_role':'assistant',
             'scope':scope,'status':'failed','assessment':'unknown','model_participated':False,
@@ -261,8 +313,20 @@ def run_diagnostic_task(db, project_id: int, *, task_type: str = 'foundation_dia
     if parent_run_id is not None:
         parent=db.get(AgentRun,parent_run_id)
         if not parent or parent.project_id!=project_id: raise PermissionError('parent_run_scope_denied')
+    # 维度参数只对 closed_inventory v2+ 有意义；先按任务解析出真实技能再校验，
+    # 避免调用方省略 skill_id 时被误判成 invalid_inventory_dimensions。
+    if inventory_kinds is not None:
+        inv_id, inv_version = resolve_skill_selection(
+            task_type, skill_id, skill_version, previous)
+        if (inv_id != 'closed_inventory' or inv_version < 2 or not isinstance(inventory_kinds,list)
+                or not inventory_kinds or any(not isinstance(k,str) for k in inventory_kinds)
+                or len(set(inventory_kinds)) != len(inventory_kinds) or not set(inventory_kinds) <= {'person','place','object'}):
+            raise ValueError('invalid_inventory_dimensions')
+        scope['inventory_kinds']=inventory_kinds
     try:
-        skill=load_skill(skill_id,skill_version,allow_experimental=allow_experimental)
+        resolved_id, resolved_version = resolve_skill_selection(
+            task_type, skill_id, skill_version, previous)
+        skill=load_skill(resolved_id,resolved_version,allow_experimental=allow_experimental)
         if task_type not in skill['applicable_tasks']: raise ValueError('task_not_applicable')
         report['skill']={k:skill[k] for k in ('id','version','status')}
         report['acceptance']=skill['acceptance']
@@ -275,6 +339,7 @@ def run_diagnostic_task(db, project_id: int, *, task_type: str = 'foundation_dia
         task_caps={'foundation_diagnosis':['inspect_narrative_binding','inspect_timeline_state'],
                    'timeline_review':['inspect_timeline_state'], 'binding_review':['inspect_narrative_binding'],
                    'claim_review':['read_distill_evidence'],
+                   'body_repair_plan':['read_body_consistency'],
                    'text_quality_audit':['inspect_text_quality'],
                    'text_quality_repair':['inspect_text_quality'],
                    'prompt_health_audit':['inspect_prompt_health']}
@@ -338,14 +403,14 @@ def run_diagnostic_task(db, project_id: int, *, task_type: str = 'foundation_dia
                 from app.agents.body_consistency import BODY_SYSTEM
                 system += BODY_SYSTEM
             if 'read_closed_inventory' in ids:
-                if skill_version >= 2:
+                if resolved_version >= 2:
                     from app.agents.closed_inventory_v2 import inspect_inventory
                     answer = inspect_inventory(provider, report['observations'][0], report,
                         kinds=inventory_kinds, checkpoint_dir=inventory_checkpoint_dir,
-                        split_truncated=inventory_split_truncated, protocol=skill_version,
+                        split_truncated=inventory_split_truncated, protocol=resolved_version,
                         resume_checkpoint_dir=inventory_resume_checkpoint_dir,
                         verdict_source_ids=inventory_verdict_source_ids,
-                        previous_report=previous if skill_version >= 4 else None)
+                        previous_report=previous if resolved_version >= 4 else None)
                 else:
                     from app.agents.closed_inventory import inspect_inventory
                     answer = inspect_inventory(provider, report['observations'][0], report)
@@ -412,7 +477,7 @@ def run_diagnostic_task(db, project_id: int, *, task_type: str = 'foundation_dia
                 if task_type == 'repair_verification' and candidate_overlay is not None:
                     report['unresolved'] = [u for u in report['unresolved'] if u not in
                         {'independent_semantic_acceptance_required','input_changed'}]
-                if skill_version >= 2:
+                if resolved_version >= 2:
                     report['proposed_actions'] = [{'kind':'body_repair_candidate',
                         'tool':'prepare_body_repair','requires_confirmation':True,
                         'repair_objective':c['reason']+'；保留来源支持的既有事实，消除冲突，不添加动作或结果。',
@@ -530,7 +595,7 @@ def _rebind_pending_acceptance(db, project_id, report) -> None:
 def diagnostic_tool(db, project_id: int, task_type: str = 'foundation_diagnosis', question: str = '',
                     novel_ids: list[int] | None = None, character: str = '', cursor: int = 0,
                     limit: int = 5, allow_experimental: bool = False,
-                    skill_id: str = 'foundation_input_health', skill_version: int = 1,
+                    skill_id: str | None = None, skill_version: int | None = None,
                     parent_run_id: int | None = None, previous_run_id: int | None = None,
                     segment_nos: list[int] | None = None, inventory_kinds: list[str] | None = None,
                     inventory_verdict_source_ids: list[str] | None = None) -> dict:

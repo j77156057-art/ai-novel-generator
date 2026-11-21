@@ -6,6 +6,9 @@ from pathlib import Path
 from dataclasses import dataclass
 
 ROOT = Path(__file__).resolve().parent / 'skills'
+#: 历史版本归档。**不参与发现**（discover_skills 只扫 ROOT），但显式指定
+#: `skill_id + version` 时仍可加载——旧 run 的复验需要原版本。
+ARCHIVE_ROOT = Path(__file__).resolve().parent / 'skills_archive'
 
 @dataclass(frozen=True)
 class Capability:
@@ -49,10 +52,8 @@ register_capability(Capability('prepare_body_repair',1,'pending_card',
     output_schema=('pending_action',)))
 # 同上：只构造卡。文字修复的卡由助理 agent 用 propose_text_fix 发起，
 # 卡落到人手上之后才落库。
-register_capability(Capability('prepare_text_repair',1,'pending_card',
-    scope_policy='diagnosed_generation_fixed_range',
-    input_schema=('diagnostic_run_id','generation_id'),
-    output_schema=('pending_action',)))
+# （`prepare_text_repair` 曾作为 text_quality_repair 的第二步注册，但诊断
+# 子任务不负责写卡、该步骤也从未被执行；已随 2026-11-21 收敛移除。）
 # 文字质量与提示词体检：确定性规则，只读。
 register_capability(Capability('inspect_text_quality', 1, 'text_quality'))
 register_capability(Capability('inspect_prompt_health', 1, 'prompt_health'))
@@ -112,25 +113,30 @@ def load_skill(skill_id: str, version: int, *, allow_experimental: bool = False,
     if not isinstance(skill_id, str) or not re.fullmatch(r'[a-z][a-z0-9_]*', skill_id) or type(version) is not int or version < 1:
         raise ValueError('invalid_skill_identifier')
     path = ROOT / skill_id / f'v{version}.json'
-    if ROOT.resolve() not in path.resolve().parents:
+    archived = ARCHIVE_ROOT / skill_id / f'v{version}.json'
+    source = path if path.exists() else archived if archived.exists() else None
+    # 只信任 skills / skills_archive 两个根下的文件，防止路径逃逸。
+    roots = (ROOT.resolve(), ARCHIVE_ROOT.resolve())
+    if source is not None and not any(r in source.resolve().parents for r in roots):
         raise ValueError('untrusted_skill')
     # 版本/技能不存在要说清楚是「**没有这个版本**」，不是「清单坏了」。
     # 实测（真实通道）：模型传了 body_consistency v4（只有 v1/v2），
     # 旧口径报 `invalid_manifest` —— 模型以为自己把清单搞坏了，
     # 实际上只是版本号写错，报错得让它能自愈（把可用版本列出来）。
-    if not path.exists():
-        skill_dir = ROOT / skill_id
-        if not skill_dir.is_dir():
-            available = sorted(p.parent.name for p in ROOT.glob('*/v*.json'))
+    if source is None:
+        dirs = [d for d in (ROOT / skill_id, ARCHIVE_ROOT / skill_id) if d.is_dir()]
+        if not dirs:
+            available = sorted(p.parent.name for p in list(ROOT.glob('*/v*.json'))
+                               + list(ARCHIVE_ROOT.glob('*/v*.json')))
             raise ValueError(
                 'unknown_skill:%s（可用技能：%s）' % (
                     skill_id, '、'.join(sorted(set(available))) or '无'))
-        versions = sorted(p.stem for p in skill_dir.glob('v*.json'))
+        versions = sorted({p.stem for d in dirs for p in d.glob('v*.json')})
         raise ValueError(
             'skill_version_not_found:%s v%s（可用版本：%s）' % (
                 skill_id, version, '、'.join(versions) or '无'))
     try:
-        value = validate_manifest(json.loads(path.read_text(encoding='utf-8')), capabilities)
+        value = validate_manifest(json.loads(source.read_text(encoding='utf-8')), capabilities)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError('invalid_manifest') from exc
     if value['id'] != skill_id or value['version'] != version:

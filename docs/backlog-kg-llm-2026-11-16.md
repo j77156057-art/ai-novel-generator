@@ -88,10 +88,33 @@
 
 ## 条目 3｜skills 诊断体系接线（18 份 playbook + `diagnostic_skills` 加载链）
 
-- **状态**：只记账，**未接线、未排期**（2026-11-16 只读复核；决定 A）。
-- **决策**：现在不接。成本是 3 个缺失模块 + registry 三处 + 14 份测试 + 4 个 fixture；
-  且技能体系依赖「生成 → 落库 → KG」主线先稳定。18 份 JSON 已在仓库里作为数据资产与
-  测试夹具，不接线不会丢能力。
+- **状态**：**已接线（2026-11-21）**。`consent.py` 已补，`prompt_audit.py` 与
+  `style/scope.py` 在库内已存在；`run_diagnosis` / `run_diagnostic_task` /
+  `list_diagnostic_skills` 已注册进只读白名单与动作目录，`/qa` 按用户原话设置
+  实验授权上下文。回归见 `tests/test_diagnostic_skills_wiring.py`。
+- **仍需补 → 部分已搬入（2026-11-21）**：已从 main 导入并通过 **48 条行为测试**：
+  `test_diagnostic_discovery`（改写为注册表版，去掉 react_loop 依赖）、
+  `test_diagnostic_subagent`、`test_diagnostic_tool_observation`、
+  `test_closed_inventory_v3/v4/v4_tool`、`test_merge_diagnosis`、
+  `test_planning_diagnostic`；fixtures 已带 `closed_inventory_v4_real_verdict`、
+  `planning_accepted_real_shape`、`closed_inventory_v3_source_mismatch` 与两个 probe 脚本。
+  未搬入的 6 份依赖本分支尚不存在的产品 API：`test_causal_timeline`（时间线
+  `judge_node_completion(source_id=...)`）及其下游 `test_body_repair_decoupling`、
+  `test_body_repair_delivery`、`test_body_repair_multirange`、`test_body_repair_scope`；
+  以及 `test_authority_repair_protocol`（缺 `authority_fixture` 与 `BodyRepairRequest`）、
+  `test_diagnosis_plain_dialogue`（缺 `_zero_window_ratio` 等规则）。需先回填对应产品代码再补测试。
+- **2026-11-21 收敛**：历史版本已移到 `skills_archive/`（10 份，不参与发现，
+  但显式 `skill_id+version` 仍可加载复现）；`skills/` 只留 8 份最新版；
+  `list_diagnostic_skills` 只列最新版并在 `superseded_versions` 标出归档版本；
+  `text_quality_repair` 的 `prepare_text_repair` 死步骤与能力注册已移除，修复卡
+  统一由主 agent 的 `propose_text_fix` 发起；`body_repair` 改用独立任务
+  `body_repair_plan`，与 `body_consistency`（只评估矛盾）分开；不传 `skill_id`
+  时按任务自动选最新技能；诊断报告引用的 `prepare_body_repair` 已注册为只读
+  工具，不再指向不存在的调用。
+- 以下 3.1–3.7 是接线前的只读复核记录，保留作历史依据。
+- **当时的决策（已于 2026-11-21 推翻）**：暂不接。成本是 3 个缺失模块 + registry 三处
+  + 14 份测试 + 4 个 fixture；且技能体系依赖「生成 → 落库 → KG」主线先稳定。
+  18 份 JSON 已在仓库里作为数据资产与测试夹具，不接线不会丢能力。
 
 ### 3.1 现状结论
 
