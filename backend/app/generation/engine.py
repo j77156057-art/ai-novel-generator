@@ -30,6 +30,7 @@ from app.generation.prompts import (
     merged_constraint_items,
     render_item_holding_section,
 )
+from app.generation.paragraph_floor import ensure_min_paragraphs
 from app.generation.replay_guard import (
     build_replay_guard_block,
     replay_rewrite_once,
@@ -2416,6 +2417,7 @@ def _voice_rewrite_once(db, project, provider, text, check: dict, max_chars: int
     # 单次尝试在真机上 3/5 失败（空输出、越界），失败原因是偶发的；
     # 再给一次机会，提示里明确上一次不合格的地方。
     last: dict = {"applied": False, "reason": "未执行"}
+    compressed = False
     for attempt in (1, 2):
         user_try = user if attempt == 1 else user + (
             f"\n\n【重试】上一次输出不合格（{last.get('reason')}）。"
@@ -2434,10 +2436,23 @@ def _voice_rewrite_once(db, project, provider, text, check: dict, max_chars: int
         if not got:
             last = {"applied": False, "reason": "空输出"}
             continue
-        if len(got) < lo or len(got) > hi:
+        if len(got) < lo:
             last = {"applied": False,
-                    "reason": f"字数越界 {len(got)}（允许 {lo}–{hi}）"}
+                    "reason": f"字数不足 {len(got)}（允许 {lo}–{hi}）"}
             continue
+        if len(got) > hi:
+            # 长度兜底：声纹改写常因新增归属/台词而超上限。用压缩轮把超出部分
+            # 删掉（优先删叙述、保对白），压进上限后再验收；压缩失败保留原稿。
+            floor = (active_gate_limits() or {}).get("对白字占比") or {}
+            compact, cinfo = _compression_round(
+                provider, got, hi, dialogue_floor=floor.get("min"))
+            if cinfo.get("accepted") and len(compact) <= hi:
+                got = compact
+                compressed = True
+            else:
+                last = {"applied": False,
+                        "reason": f"字数越界 {len(got)}（允许 {lo}–{hi}）"}
+                continue
         after = _dialogue_voice_check(project, got)
         improved = (
             len(after["weak"]) < len(check["weak"])
@@ -2452,7 +2467,7 @@ def _voice_rewrite_once(db, project, provider, text, check: dict, max_chars: int
             check["weak"], after["weak"], getattr(project, "id", None), attempt,
         )
         return got, {"applied": True, "before": check, "after": after,
-                     "attempt": attempt}
+                     "attempt": attempt, "compressed": compressed}
     return text, last
 
 
@@ -4534,9 +4549,159 @@ def _rewrite_with_evidence(db, project, provider, text: str, reasons: list[str],
 
 
 def _dialogue_ratio_of(text: str) -> float:
-    """对白字占比（与闸门同一把尺：对白字符 ÷ 汉字数）。"""
-    h = hanzi_count(text)
-    return (stylometry.dialogue_char_count(text) / h) if h else 0.0
+    """对白字占比——**必须与闸门同一把尺**：对白字符 ÷ 去空白字符数。
+
+    2026-11-22 复跑踩坑：此前除的是汉字数，量出 18.6%，而闸门用去空白字符数
+    量出 15.3% ⇒ 对白下限兜底以为已经达标、根本不触发。两个口径必须同源。
+    """
+    n = len(re.sub(r"\s+", "", text or ""))
+    return (stylometry.dialogue_char_count(text) / n) if n else 0.0
+
+
+_FLOOR_BLOCK_RE = re.compile(r"【\s*(\d+)\s*】")
+
+
+def _dialogue_floor_rewrite_once(provider, text: str, floor: float,
+                                 max_chars: int | None) -> tuple[str, dict]:
+    """对白占比低于硬下限时的**逐段**定向改写（最多两次）。
+
+    真机回归（2026-11-22）：
+    - 重写轮没把对白拉到下限 17.47%，正文以 15.3% 落库；
+    - 整章重写版试过：一次缩到 2365 字、一次涨到 5639 字，都不可用。
+
+    ⇒ 只挑几段**叙述多、对白少**的段落改写，其余逐字不动。这样篇幅和情节
+    都不会被整章重写带偏；新增对白来自把叙述转成对话，不改事件。
+    """
+    before = _dialogue_ratio_of(text)
+    info = {"floor": round(float(floor), 4), "before": round(before, 4),
+            "applied": False, "attempts": [], "reason": None}
+    if before >= floor:
+        info["reason"] = "already_met"
+        return text, info
+    if not text.strip():
+        info["reason"] = "empty"
+        return text, info
+
+    lines = text.split("\n")
+    idxs = [i for i, line in enumerate(lines) if line.strip()]
+    if not idxs:
+        info["reason"] = "no_paragraph"
+        return text, info
+
+    total_chars = len(re.sub(r"\s+", "", text))
+    before_dialogue = stylometry.dialogue_char_count(text)
+    need = max(1, int(floor * total_chars) - before_dialogue)
+    limit = length_limits(max_chars)
+    lo = int(len(text) * 0.85)
+    hi = min(int(limit["max"]), int(len(text) * 1.15))
+
+    # 优先挑「没有对白、且较长」的段落：改写空间最大，也不容易破坏已有对话。
+    ranked = sorted(
+        idxs,
+        key=lambda i: ("“" in lines[i] or "「" in lines[i], -len(lines[i])),
+    )
+    ranked = [i for i in ranked if len(lines[i]) >= 50]
+    if not ranked:
+        info["reason"] = "no_suitable_paragraph"
+        return text, info
+
+    try:
+        prov = provider.variant(thinking_off=True, max_tokens=16000)
+    except Exception:  # noqa: BLE001
+        prov = provider
+
+    system = "你是中文小说编辑，只负责把指定段落里的叙述改写成人物对白。"
+    last: dict = {"applied": False, "reason": "未执行"}
+    for attempt in (1, 2):
+        take = 4 if attempt == 1 else 8
+        sel = ranked[:take]
+        blocks = "\n\n".join(f"【{k + 1}】{lines[i]}" for k, i in enumerate(sel))
+        strict = "" if attempt == 1 else (
+            f"\n\n【重试】上一次不合格（{last.get('reason')}）。"
+            f"这次必须让改写后整章对白占比达到 {floor:.0%} 以上。")
+        user = f"""这段正文的对白字占比是 {before:.1%}，低于本书硬下限 {floor:.1%}。
+需要新增约 {need} 字对白（只靠把叙述改成对话，不得新增事件）。
+
+下面 {len(sel)} 段请你**逐段改写**：
+1. 把段落里的部分叙述改成人物对白；对白要符合人物声纹，不能是信息播报；
+2. 不新增事件、不改变情节顺序、不改变人物行为结果；
+3. 原有对白不得删减；
+4. 每段改写后字数与原文相差不超过 ±20%；
+5. 只输出这几段，用【序号】开头，序号与下面一致；不要输出其它段落。
+
+{blocks}{strict}"""
+        try:
+            try:
+                reply = (prov.chat(system, user, temperature=0.4) or "").strip()
+            except TypeError:
+                reply = (prov.chat(system, user) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            last = {"applied": False, "reason": f"调用失败 {type(exc).__name__}"}
+            info["attempts"].append(last)
+            continue
+
+        reply = _strip_thinking(reply)
+        pieces = _parse_floor_blocks(reply)
+        if not pieces:
+            last = {"applied": False, "reason": "改写结果无法解析"}
+            info["attempts"].append(last)
+            continue
+
+        new_lines = list(lines)
+        replaced = 0
+        for k, idx in enumerate(sel):
+            piece = pieces.get(k + 1)
+            if piece:
+                new_lines[idx] = piece
+                replaced += 1
+        got = "\n".join(new_lines)
+        after = _dialogue_ratio_of(got)
+        # 逐段改写仍可能把全章顶过字数硬上限（第 2 章原文 4790，改完 5231）。
+        # 超出时用压缩轮删叙述、保对白，压回上限内再验收。
+        if replaced and len(got) > hi:
+            compact, cinfo = _compression_round(
+                provider, got, hi, dialogue_floor=floor)
+            if cinfo.get("accepted") and len(compact) <= hi:
+                got = compact
+                after = _dialogue_ratio_of(got)
+                info["compressed"] = True
+            else:
+                last = {"applied": False,
+                        "reason": f"整章字数越界 {len(got)}（上限 {hi}）",
+                        "after": round(after, 4)}
+                info["attempts"].append(last)
+                continue
+        if replaced == 0:
+            last = {"applied": False, "reason": "没有可用段落"}
+        elif after < floor:
+            last = {"applied": False,
+                    "reason": f"对白占比仍不足 {after:.1%}（下限 {floor:.1%}）"}
+        elif len(got) < lo or len(got) > hi:
+            last = {"applied": False,
+                    "reason": f"整章字数越界 {len(got)}（允许 {lo}–{hi}）",
+                    "after": round(after, 4)}
+        elif stylometry.dialogue_char_count(got) < before_dialogue * 0.9:
+            last = {"applied": False, "reason": "原有对白被删减"}
+        else:
+            info.update({"applied": True, "after": round(after, 4),
+                         "replaced": replaced, "attempt": attempt})
+            return got, info
+        info["attempts"].append(last)
+    info.update({"reason": last.get("reason"), "after": round(before, 4)})
+    return text, info
+
+
+def _parse_floor_blocks(reply: str) -> dict[int, str]:
+    """解析 `【1】段落…【2】段落…`；解析不出返回空 dict。"""
+    marks = list(_FLOOR_BLOCK_RE.finditer(reply or ""))
+    out: dict[int, str] = {}
+    for pos, m in enumerate(marks):
+        start = m.end()
+        end = marks[pos + 1].start() if pos + 1 < len(marks) else len(reply)
+        body = (reply[start:end] or "").strip()
+        if body:
+            out[int(m.group(1))] = body
+    return out
 
 
 def _compression_prompt(text: str, max_chars: int | None,
@@ -5987,6 +6152,17 @@ def generate_next_segment(
             if replay_info.get("applied"):
                 summary = provider.summarize(text)
 
+    # 对白下限兜底：重写轮没把对白拉到硬下限时，落库前再专攻一次。
+    dialogue_floor_info = None
+    dialogue_floor = (
+        (gate_limits_meta.get("chapter_limits") or {}).get("对白字占比") or {}
+    ).get("min")
+    if dialogue_floor:
+        text, dialogue_floor_info = _dialogue_floor_rewrite_once(
+            provider, text, float(dialogue_floor), max_chars)
+        if dialogue_floor_info.get("applied"):
+            summary = provider.summarize(text)
+
     # 时代越界自检：默认 report（只扫描、落 meta，不改正文）。
     # 显式 rewrite 模式下才可能改 text；改过就重算摘要，避免摘要与正文脱节。
     era_before = text
@@ -5995,6 +6171,14 @@ def generate_next_segment(
     )
     if text != era_before:
         summary = provider.summarize(text)
+
+    # 段数下限兜底：只差一两段时按句末切分，不为一个排版指标再调模型。
+    min_paras = (
+        (gate_limits_meta.get("chapter_limits") or {}).get("段数") or {}
+    ).get("min")
+    paragraph_info = {"applied": False, "reason": "no_limit"}
+    if min_paras:
+        text, paragraph_info = ensure_min_paragraphs(text, int(min_paras))
 
     # 最终引号口径：声纹/复述等 LLM 改写可能又漂回「」，落库前再统一一次。
     text, quote_final = normalize_to_reference(db, project, text, novel_ids)
@@ -6017,6 +6201,8 @@ def generate_next_segment(
     quality["voice_rewrite"] = voice_info
     quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
     quality["quote_final"] = quote_final
+    quality["dialogue_floor"] = dialogue_floor_info
+    quality["paragraph_floor"] = paragraph_info
     # v15：结构检测（情节点覆盖 / 越章材料 / 人物性别一致），只写留痕、不改正文；
     # 是否阻断由 `structure_guard_mode` 在 `_commit_segment` 决定。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
@@ -6524,6 +6710,17 @@ def generate_next_segment_stream(
             if replay_info.get("applied"):
                 summary = provider.summarize(text)
 
+    # 对白下限兜底：重写轮没把对白拉到硬下限时，落库前再专攻一次。
+    dialogue_floor_info = None
+    dialogue_floor = (
+        (gate_limits_meta.get("chapter_limits") or {}).get("对白字占比") or {}
+    ).get("min")
+    if dialogue_floor:
+        text, dialogue_floor_info = _dialogue_floor_rewrite_once(
+            provider, text, float(dialogue_floor), max_chars)
+        if dialogue_floor_info.get("applied"):
+            summary = provider.summarize(text)
+
     # 时代越界自检：与同步版同口径；默认 report，不改正文。
     era_before = text
     text, era_meta = _apply_era_guard(
@@ -6531,6 +6728,14 @@ def generate_next_segment_stream(
     )
     if text != era_before:
         summary = provider.summarize(text)
+
+    # 段数下限兜底：与同步版同口径，只差一两段时按句末切分。
+    min_paras = (
+        (gate_limits_meta.get("chapter_limits") or {}).get("段数") or {}
+    ).get("min")
+    paragraph_info = {"applied": False, "reason": "no_limit"}
+    if min_paras:
+        text, paragraph_info = ensure_min_paragraphs(text, int(min_paras))
 
     # 最终引号口径：与同步版同口径，LLM 改写后再统一一次。
     text, quote_final = normalize_to_reference(db, project, text, novel_ids)
@@ -6552,6 +6757,8 @@ def generate_next_segment_stream(
     quality["voice_rewrite"] = voice_info
     quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
     quality["quote_final"] = quote_final
+    quality["dialogue_floor"] = dialogue_floor_info
+    quality["paragraph_floor"] = paragraph_info
     # 与同步版同口径：结构检测留痕（是否阻断由 `structure_guard_mode` 决定）。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
     # 与同步版同口径：逐章推进台账（只判不拦，`mode=report`）。
@@ -7191,6 +7398,18 @@ def regenerate_segment_stream(
                 if replay_info.get("applied"):
                     summary = provider.summarize(text)
 
+    # 对白下限兜底（局部补丁跳过：它逐字保留未修改的正文）。
+    dialogue_floor_info = None
+    if not local_patch:
+        floor = (
+            (gate_limits_meta.get("chapter_limits") or {}).get("对白字占比") or {}
+        ).get("min")
+        if floor:
+            text, dialogue_floor_info = _dialogue_floor_rewrite_once(
+                provider, text, float(floor), max_chars)
+            if dialogue_floor_info.get("applied"):
+                summary = provider.summarize(text)
+
     # —— 零成本 AI 腔检测 + 告警（方案 b：只检测、不自动重写）——
     # 复用 _should_rewrite 的纯计数判据（与续写路径口径一致，零 LLM 调用、不加载语料）。
     # 命中即带 rewrite_info 告警信号，提示「本段可能残留 AI 腔，未自动修」。
@@ -7225,6 +7444,15 @@ def regenerate_segment_stream(
     if text != era_before:
         summary = provider.summarize(text)
 
+    # 段数下限兜底（局部补丁跳过，避免改动未修改的排版）。
+    paragraph_info = None
+    if not local_patch:
+        min_paras = (
+            (gate_limits_meta.get("chapter_limits") or {}).get("段数") or {}
+        ).get("min")
+        if min_paras:
+            text, paragraph_info = ensure_min_paragraphs(text, int(min_paras))
+
     # 最终引号口径：复述改写/时代改写可能又漂回「」，落库前再统一一次。
     # 局部补丁不碰未修改的字符，跳过。
     quote_final = None
@@ -7245,6 +7473,8 @@ def regenerate_segment_stream(
     quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
     quality["quote_info"] = quote_info
     quality["quote_final"] = quote_final
+    quality["dialogue_floor"] = dialogue_floor_info
+    quality["paragraph_floor"] = paragraph_info
 
     new_summary = {
         "text": summary,

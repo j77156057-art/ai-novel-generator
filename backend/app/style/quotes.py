@@ -14,8 +14,9 @@
 2. 参考语料量不出来（没参考书 / 全是英文引号）⇒ 退回**本文自身**的主导形态；
 3. 两者都量不出来 ⇒ 不动正文。
 
-只做「成对引号」之间的转换（“”‘’ ↔ 「」『』），不碰半角 `"` `'`：
-半角单引号同时是英文撇号，盲转会破坏正文。
+只做「成对引号」之间的转换（“”‘’ ↔ 「」『』），并把半角双引号 `"` 按行内
+顺序配对改成目标形态（真机实测：模型改写对白时会写成 `"..."`）。半角单引号
+`'` 同时是英文撇号，不做转换。
 """
 from __future__ import annotations
 
@@ -53,10 +54,37 @@ def detect_quote_style(text: str) -> str | None:
     return best if scores[best] > 0 else None
 
 
+def _pair_straight_quotes(line: str, dst: tuple[str, str, str, str]) -> tuple[str, int]:
+    """把一行里的半角双引号按出现顺序两两改成 `dst` 的开/闭引号。
+
+    只处理双引号 `"`；半角单引号同时是英文撇号，盲转会破坏正文。
+    落单的最后一个 `"` 保持不变（无法判断开闭）。
+    """
+    if '"' not in line:
+        return line, 0
+    count = line.count('"')
+    usable = count if count % 2 == 0 else count - 1
+    if usable <= 0:
+        return line, 0
+    out: list[str] = []
+    opened = False
+    used = 0
+    for ch in line:
+        if ch == '"' and used < usable:
+            out.append(dst[0] if not opened else dst[1])
+            opened = not opened
+            used += 1
+        else:
+            out.append(ch)
+    return "".join(out), usable
+
+
 def normalize_quotes(text: str, target: str) -> tuple[str, int]:
     """把成对引号统一成 `target` 形态，返回 `(新文本, 替换字符数)`。
 
-    `target` 不是 `curly` / `corner` 时原样返回（半角形态不转，理由见模块文档）。
+    处理两件事：①成对的中文引号互转（“”‘’ ↔ 「」『』）；
+    ②半角双引号按行内顺序配对转成目标形态。半角单引号不动。
+    `target` 不是 `curly` / `corner` 时原样返回。
     """
     if target not in _PAIR_STYLES or not text:
         return text, 0
@@ -68,12 +96,17 @@ def normalize_quotes(text: str, target: str) -> tuple[str, int]:
         for src, out in zip(chars, dst):
             if src != out:
                 mapping[ord(src)] = out
-    if not mapping:
+    replaced = sum(text.count(chr(code)) for code in mapping) if mapping else 0
+    got = text.translate(mapping) if mapping and replaced else text
+    lines: list[str] = []
+    straight = 0
+    for line in got.split("\n"):
+        fixed, n = _pair_straight_quotes(line, dst)
+        lines.append(fixed)
+        straight += n
+    if not replaced and not straight:
         return text, 0
-    replaced = sum(text.count(chr(code)) for code in mapping)
-    if not replaced:
-        return text, 0
-    return text.translate(mapping), replaced
+    return "\n".join(lines), replaced + straight
 
 
 def reference_quote_style(db, novel_ids) -> str | None:

@@ -47,10 +47,14 @@ def test_normalize_quotes_between_paired_styles():
     back, n2 = normalize_quotes(got, "corner")
     assert back == "他说：「走。」又说：『好』。"
     assert n2 == 4
-    # 半角形态不转
-    same, n3 = normalize_quotes('他说："走。"', "curly")
-    assert same == '他说："走。"'
-    assert n3 == 0
+    # 半角双引号按顺序配对转成目标形态（模型改写对白时常写成 "..."）
+    straight, n3 = normalize_quotes('他说："走。"', "curly")
+    assert straight == "他说：“走。”"
+    assert n3 == 2
+    # 落单的最后一个半角引号不动
+    odd, n4 = normalize_quotes('他说："走。', "curly")
+    assert odd == '他说："走。'
+    assert n4 == 0
 
 
 def test_normalize_to_reference_uses_reference_style():

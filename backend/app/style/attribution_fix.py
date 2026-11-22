@@ -296,6 +296,18 @@ DAO_SHARE_PENALTY = 0.05
 #: 少于这么多处「道：」就不值得再花一次调用。
 VARIETY_MIN_DAO = 6
 
+#: 去单一化后，带归属的台词总数至少要保留原数的这个比例。
+#: 低于它说明模型是在**删归属**（实测 25→13），不是换引出方式。
+VARIETY_MIN_KEEP_RATIO = 0.9
+
+
+def variety_preserves(hits_before: int, hits_after: int) -> bool:
+    """去单一化候选是否保住了归属总数（只换写法，不删归属）。"""
+    if hits_before <= 0:
+        return int(hits_after) >= 0
+    need = max(1, int(round(int(hits_before) * VARIETY_MIN_KEEP_RATIO)))
+    return int(hits_after) >= need
+
 _USER = """下面的正文里，**对白的说话人归属写法**与这本书的习惯不一样。
 
 这本书的习惯是：**{form}**，
@@ -323,7 +335,10 @@ _USER = """下面的正文里，**对白的说话人归属写法**与这本书�
 _VARIETY_USER = """下面这段正文里，**对白的说话人归属写法太单一**：
 共 {hits} 处带归属，其中 {dao} 处都是「X道：」。
 
-请只改**归属写法**，台词逐字保留、不增不删，情节和叙述顺序都不动：
+请只改**归属写法**，台词逐字保留、不增不删，情节和叙述顺序都不动。
+**带归属的台词总数不得减少**：现在是 {hits} 处，改写后仍应约 {hits} 处——
+只换引出方式，不许把归属直接删掉。
+
 1. 最多保留 {keep} 处「X道：」，其余改成下面三种之一：
    - 动作/神态/心理句自然带出（`他把烟摁灭，“…”` / `她没抬头，“…”`）；
    - 换动词：说 / 问 / 答 / 嘟囔 / 接了句 / 低声说 / 笑着回；
@@ -640,12 +655,21 @@ def correct_attribution(
 
         out_v, failed_v, _empty_v, _ = _run(_split_chunks(current), _variety_prompt)
         if failed_v < len(chunks):
-            current = out_v
-            # 插到最前：距离目标同样近时优先选「道：」更少的那版。
-            candidates.insert(0, (current, attribution_rate(current)))
-            rv = attribution_rate(current)
+            rv = attribution_rate(out_v)
+            rv_hits = rv["front"] + rv["back"] + rv["mid"]
             variety_info["after_dao"] = rv["front_dao"]
-            variety_info["after_hits"] = rv["front"] + rv["back"] + rv["mid"]
+            variety_info["after_hits"] = rv_hits
+            # 模型常把「道：」直接删掉来降低占比（实测 25 处 → 13 处）。
+            # 归属总数掉太多就不是「换写法」而是「删归属」⇒ 整版不采纳。
+            if variety_preserves(hits, rv_hits):
+                current = out_v
+                # 插到最前：距离目标同样近时优先选「道：」更少的那版。
+                candidates.insert(0, (current, rv))
+                variety_info["accepted"] = True
+            else:
+                variety_info["accepted"] = False
+                variety_info["reason"] = (
+                    f"归属总数下降 {hits}→{rv_hits}，只是删归属而非换写法")
 
     # —— 判据 1、对白内容**守恒**（字符多重集口径，对合并/拆分免疫）——
     from app.style.form import _chars_lost, _dialogue_chars
