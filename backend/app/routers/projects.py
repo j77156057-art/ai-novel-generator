@@ -1045,6 +1045,29 @@ def reminders(
     return get_reminders(db, project_id, source=source, top_k=None)
 
 
+#: 导出时识别章标题行：`第12章《标题》` / `第 12 章`。
+_EXPORT_CHAPTER_RE = re.compile(r"^\s*第\s*\d+\s*章")
+
+
+def _export_body(rows) -> str:
+    """把 `(chapter_range, text)` 拼成带章标题的正文。
+
+    同一章多段只写一次标题；段模式（`段N`）不写标题，保持旧行为。
+    """
+    parts: list[str] = []
+    last_label: str | None = None
+    for label, text in rows:
+        body = (text or "").strip()
+        if not body:
+            continue
+        label = (label or "").strip()
+        if label and label != last_label and _EXPORT_CHAPTER_RE.match(label):
+            parts.append(label)
+            last_label = label
+        parts.append(body)
+    return "\n\n".join(parts).strip()
+
+
 @router.get("/{project_id}/export-txt")
 def export_txt(project_id: int, db: Session = Depends(get_db)) -> PlainTextResponse:
     """把所有已生成段落拼接成一份 txt 文档，直接触发浏览器下载。
@@ -1059,7 +1082,7 @@ def export_txt(project_id: int, db: Session = Depends(get_db)) -> PlainTextRespo
         .where(Generation.project_id == project_id)
         .order_by(Generation.segment_no)
     ).all()
-    body = "\n\n".join((g.text or "") for g in gens).strip()
+    body = _export_body([(g.chapter_range, g.text) for g in gens])
     if not body:
         raise HTTPException(status_code=400, detail="尚无生成内容，无法导出")
 

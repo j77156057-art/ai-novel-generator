@@ -96,6 +96,7 @@ from app.models import (
 )
 from app.retrieval.search import hybrid_search
 from app.style import stylometry
+from app.style.quotes import normalize_to_reference
 from app.style.consistency import (
     ARCHIVE_BLOCK_PERCENTILES,
     ARCHIVE_CHAPTER_PERCENTILES,
@@ -1915,17 +1916,23 @@ def _ledger_prior_rows(db, project: Project,
 
 
 def _replay_prior_rows(db, project: Project, chapter: int | None,
-                       limit: int = 2) -> list[dict]:
-    """复述闸门用：当前章之前最近几章（标签 / 正文 / 摘要 / 本章大纲条目）。
+                       limit: int = 2,
+                       before_segment: int | None = None) -> list[dict]:
+    """复述闸门用：当前段/章之前最近的已落库内容（正文 / 摘要 / 大纲）。
+
+    - 分章项目：按章号取 `< chapter` 的章节，`label` 是章标签；
+    - 段模式：按段号取 `< before_segment` 的段落，`label` 是 `段N`。
+      （此前段模式直接返回空 ⇒ 复述闸门形同不存在。）
 
     `text` 供写后片段比对，`summary`+`outline` 供写前「禁止重写」清单。
     读不到历史时返回空列表，闸门自动跳过。
     """
-    if db is None or chapter is None:
+    if db is None or (chapter is None and before_segment is None):
         return []
     try:
         rows = db.execute(
-            select(Generation.chapter_range, Generation.text, Generation.summary)
+            select(Generation.segment_no, Generation.chapter_range,
+                   Generation.text, Generation.summary)
             .where(Generation.project_id == project.id)
             .order_by(Generation.segment_no)
         ).all()
@@ -1934,11 +1941,21 @@ def _replay_prior_rows(db, project: Project, chapter: int | None,
             "replay guard history skipped（project %s）",
             getattr(project, "id", None), exc_info=True)
         return []
-    by_chapter: dict[int, dict] = {}
-    for label, text, summary in rows:
-        idx = _chapter_ordinal(label)
-        if idx is None or idx >= chapter or not str(text or "").strip():
+    by_key: dict[int, dict] = {}
+    for seg_no, label, text, summary in rows:
+        if not str(text or "").strip():
             continue
+        if chapter is not None:
+            idx = _chapter_ordinal(label)
+            if idx is None or idx >= chapter:
+                continue
+            key, out_label = idx, (label or f"第{idx}章")
+            outline = chapter_outline_entry(project.outline, idx) or ""
+        else:
+            if before_segment is not None and int(seg_no) >= int(before_segment):
+                continue
+            key, out_label = int(seg_no), f"段{seg_no}"
+            outline = ""
         # `Generation.summary` 是 JSON 列：正常取出就是 dict
         # `{"text": "...", "era": ...}`；旧存档/测试夹具可能是字符串。
         summary_text = ""
@@ -1952,14 +1969,14 @@ def _replay_prior_rows(db, project: Project, chapter: int | None,
             summary_text = str(parsed.get("text") or "")
         elif isinstance(parsed, str):
             summary_text = parsed
-        by_chapter[idx] = {
-            "chapter": idx,
-            "label": label or f"第{idx}章",
+        by_key[key] = {
+            "chapter": key,
+            "label": out_label,
             "text": text,
             "summary": summary_text,
-            "outline": chapter_outline_entry(project.outline, idx) or "",
+            "outline": outline,
         }
-    return [by_chapter[i] for i in sorted(by_chapter)][-max(1, limit):]
+    return [by_key[i] for i in sorted(by_key)][-max(1, limit):]
 
 
 def _run_progress_ledger(db, project: Project, text: str,
@@ -2225,7 +2242,9 @@ def _dialogue_ratio_check(project: Project, metrics: dict, gate_limits_meta: dic
     }
 
 
-_VOICE_QUOTE_RE = re.compile(r"[“\"]([^”\"]{1,200})[”\"]")
+#: 台词引号：三种形态都认。模型偶尔整章漂成「」（真机第 3 章），
+#: 只认“”会让声纹检查把所有角色判成「没有台词」，后续定向重写全错。
+_VOICE_QUOTE_RE = re.compile(r"[“「『]([^”」』]{1,200})[”」』]")
 _VOICE_PARTICLES = set("吧吗啊呢嘛哦呀哈啦呗")
 
 
@@ -2394,32 +2413,47 @@ def _voice_rewrite_once(db, project, provider, text, check: dict, max_chars: int
         prov = provider.variant(thinking_off=True, max_tokens=16000)
     except Exception:  # noqa: BLE001
         prov = provider
-    try:
+    # 单次尝试在真机上 3/5 失败（空输出、越界），失败原因是偶发的；
+    # 再给一次机会，提示里明确上一次不合格的地方。
+    last: dict = {"applied": False, "reason": "未执行"}
+    for attempt in (1, 2):
+        user_try = user if attempt == 1 else user + (
+            f"\n\n【重试】上一次输出不合格（{last.get('reason')}）。"
+            f"这次必须输出完整正文，字数严格控制在 {lo}–{hi} 字，"
+            "不要任何解释、标题或【本节完】。")
         try:
-            got = (prov.chat(system, user, temperature=0.4) or "").strip()
-        except TypeError:
-            # 老 provider 不接 temperature
-            got = (prov.chat(system, user) or "").strip()
-    except Exception as exc:  # noqa: BLE001
-        return text, {"applied": False, "reason": f"调用失败 {type(exc).__name__}"}
-    got = _strip_thinking(got)
-    if not got:
-        return text, {"applied": False, "reason": "空输出"}
-    if len(got) < lo or len(got) > hi:
-        return text, {"applied": False, "reason": f"字数越界 {len(got)}（允许 {lo}–{hi}）"}
-    after = _dialogue_voice_check(project, got)
-    improved = (
-        len(after["weak"]) < len(check["weak"])
-        or (len(after["weak"]) == len(check["weak"])
-            and len(after["reasons"]) < len(check["reasons"]))
-    )
-    if not improved:
-        return text, {"applied": False, "reason": "声纹没有改善", "after": after}
-    logging.getLogger(__name__).info(
-        "声纹定向重写采纳：弱项 %s → %s（project %s）",
-        check["weak"], after["weak"], getattr(project, "id", None),
-    )
-    return got, {"applied": True, "before": check, "after": after}
+            try:
+                got = (prov.chat(system, user_try, temperature=0.4) or "").strip()
+            except TypeError:
+                # 老 provider 不接 temperature
+                got = (prov.chat(system, user_try) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            last = {"applied": False, "reason": f"调用失败 {type(exc).__name__}"}
+            continue
+        got = _strip_thinking(got)
+        if not got:
+            last = {"applied": False, "reason": "空输出"}
+            continue
+        if len(got) < lo or len(got) > hi:
+            last = {"applied": False,
+                    "reason": f"字数越界 {len(got)}（允许 {lo}–{hi}）"}
+            continue
+        after = _dialogue_voice_check(project, got)
+        improved = (
+            len(after["weak"]) < len(check["weak"])
+            or (len(after["weak"]) == len(check["weak"])
+                and len(after["reasons"]) < len(check["reasons"]))
+        )
+        if not improved:
+            last = {"applied": False, "reason": "声纹没有改善", "after": after}
+            continue
+        logging.getLogger(__name__).info(
+            "声纹定向重写采纳：弱项 %s → %s（project %s，第 %s 次尝试）",
+            check["weak"], after["weak"], getattr(project, "id", None), attempt,
+        )
+        return got, {"applied": True, "before": check, "after": after,
+                     "attempt": attempt}
+    return text, last
 
 
 def _era_channel_abuse(db, project, era_meta: dict) -> dict:
@@ -2637,6 +2671,11 @@ def _commit_segment(db, project: Project, text: str, summary: str,
     合法标签，否则在写库前抛 `ChapterIdentityError`；`None` 表示调用方明确
     走段模式（写 `段N`），**不是**「解析失败后用段号顶替」。
     """
+    # 空正文防线（2026-11-22）：模型偶发「只有 reasoning、没有 content」。
+    # 落一条 0 字段会污染摘要链、段号与后续前情，且外部只能靠手工删库清理。
+    # 生成路径已重试过；这里再拦一次，任何调用方都写不进空段。
+    if not str(text or "").strip():
+        raise ValueError("正文为空，拒绝落库（空段会污染摘要链与段号）")
     segment_no = _next_segment_no(db, project.id)
     if chapter_range is None:
         label = f"段{segment_no}"
@@ -4168,6 +4207,30 @@ def _regenerate_if_truncated(provider, text: str, finish_reason: str | None,
     if not info["degrade_reason"]:
         info["degrade_reason"] = "regenerated_but_still_truncated"
     return text, info
+
+
+def _retry_empty_draft(provider, system: str, user: str,
+                       *, constraints: dict | None = None) -> str:
+    """空稿重试：一次，优先关思考。
+
+    真机复现（2026-11-22 五章）：模型把 token 预算全花在 reasoning 上，
+    `finish_reason=stop` 但正文 0 字。这种稿子既没截断也不是网络错误，
+    `_regenerate_if_truncated` 不会触发；必须单独重试，且**关思考**才有效。
+    仍拿不到正文就返回空串，由调用方拒绝落库。
+    """
+    try:
+        prov = provider.variant(thinking_off=True, max_tokens=16000)
+    except Exception:  # noqa: BLE001 —— 老 provider 不接 variant 就用原实例
+        prov = provider
+    try:
+        got = _chat_with_retry(
+            prov, system, user, constraints=constraints,
+            stop_sequences=get_section_stop_sequences(),
+        )
+    except Exception:  # noqa: BLE001 —— 重试失败不吞掉上层已判定的空稿错误
+        logging.getLogger(__name__).warning("空稿重试失败", exc_info=True)
+        return ""
+    return _strip_thinking(got or "").strip()
 
 
 def _stream_with_retry(provider, system: str, user: str, **kwargs):
@@ -5740,7 +5803,7 @@ def generate_next_segment(
     gate_limits_meta = _apply_gate_limits(db, project, seg_no=written + 1)
     # 复述闸门（写前）：最近已落库章节的摘要 + 大纲，明确禁止重写。
     replay_prior = (
-        _replay_prior_rows(db, project, chapter)
+        _replay_prior_rows(db, project, chapter, before_segment=written + 1)
         if bool(getattr(settings, "replay_guard_enabled", True)) else []
     )
     replay_block = build_replay_guard_block(replay_prior)
@@ -5820,6 +5883,15 @@ def generate_next_segment(
             stop_sequences=get_section_stop_sequences(),
         ),
     )
+    # 空稿（reasoning 吃光预算、正文 0 字）不重试就会落一条空段：
+    # 既污染摘要链，又让下一次生成的「前情」出现空条目。
+    if not text.strip():
+        text = _retry_empty_draft(
+            provider, system, draft_user, constraints=ctx["constraints"])
+        truncation_info["empty_draft_retry"] = bool(text.strip())
+        if not text.strip():
+            raise ValueError(
+                "模型返回空正文（重试后仍为空）；本段不落库，请重试生成")
     # 截断判据两条独立：`finish_reason=length`（供给侧硬顶）与 `ends_complete`
     # （末字符不是句末标点）。后者在补写/并段/重写之前对**初稿**取一次。
     draft_ends_complete = bool(
@@ -5924,6 +5996,11 @@ def generate_next_segment(
     if text != era_before:
         summary = provider.summarize(text)
 
+    # 最终引号口径：声纹/复述等 LLM 改写可能又漂回「」，落库前再统一一次。
+    text, quote_final = normalize_to_reference(db, project, text, novel_ids)
+    if quote_final.get("applied"):
+        summary = provider.summarize(text)
+
     # 复读闸门（P1 · I2）：落库前算好，与正文同一次 INSERT 落 quality_json。
     # 篇幅判据用整段预算；P1 是新段生成，不是改写。
     quality, repetition, warnings = _quality_check(
@@ -5939,6 +6016,7 @@ def generate_next_segment(
     quality["dialogue_voice_check"] = voice_check
     quality["voice_rewrite"] = voice_info
     quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
+    quality["quote_final"] = quote_final
     # v15：结构检测（情节点覆盖 / 越章材料 / 人物性别一致），只写留痕、不改正文；
     # 是否阻断由 `structure_guard_mode` 在 `_commit_segment` 决定。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
@@ -6255,7 +6333,7 @@ def generate_next_segment_stream(
     gate_limits_meta = _apply_gate_limits(db, project, seg_no=written + 1)
     # 复述闸门（写前）：最近已落库章节的摘要 + 大纲，明确禁止重写。
     replay_prior = (
-        _replay_prior_rows(db, project, chapter)
+        _replay_prior_rows(db, project, chapter, before_segment=written + 1)
         if bool(getattr(settings, "replay_guard_enabled", True)) else []
     )
     replay_block = build_replay_guard_block(replay_prior)
@@ -6352,6 +6430,16 @@ def generate_next_segment_stream(
             stop_sequences=get_section_stop_sequences(),
         ),
     )
+    # 空稿重试（与同步版同口径）：流式已经下发过 chunk 时正文不会是空的；
+    # 真出现空稿说明一个 chunk 都没吐，重试后的正文一次性补发给前端。
+    if not text.strip():
+        text = _retry_empty_draft(
+            provider, system, draft_user, constraints=ctx["constraints"])
+        truncation_info["empty_draft_retry"] = bool(text.strip())
+        if not text.strip():
+            raise ValueError(
+                "模型返回空正文（重试后仍为空）；本段不落库，请重试生成")
+        yield {"type": "chunk", "text": text}
     draft_ends_complete = bool(
         analyze_repetition(text).metrics.ends_complete if text.strip() else False
     )
@@ -6444,6 +6532,11 @@ def generate_next_segment_stream(
     if text != era_before:
         summary = provider.summarize(text)
 
+    # 最终引号口径：与同步版同口径，LLM 改写后再统一一次。
+    text, quote_final = normalize_to_reference(db, project, text, novel_ids)
+    if quote_final.get("applied"):
+        summary = provider.summarize(text)
+
     # 复读闸门（P2 · I2）：与同步版同口径，落库前算好、随正文同一次 INSERT 落。
     quality, repetition, warnings = _quality_check(
         text, budget=project.generation_length)
@@ -6458,6 +6551,7 @@ def generate_next_segment_stream(
     quality["dialogue_voice_check"] = voice_check
     quality["voice_rewrite"] = voice_info
     quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
+    quality["quote_final"] = quote_final
     # 与同步版同口径：结构检测留痕（是否阻断由 `structure_guard_mode` 决定）。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
     # 与同步版同口径：逐章推进台账（只判不拦，`mode=report`）。
@@ -6772,10 +6866,11 @@ def _build_generation_prompts(
         min_chars=prompt_min_chars,
         story_cards_block=_render_story_cards(db, project.id),
         foreshadow_block=foreshadow_block,
-        # 重生成同样禁止复述更早章节（写后检测只在新增章路径跑——
-        # 重生成的正文基线本来就是本章自己的剧情，不做自动替换）。
+        # 重生成同样禁止复述更早章节；写后检测在 regenerate_segment_stream
+        # 里另跑（局部补丁跳过）。
         replay_guard_block=(
-            build_replay_guard_block(_replay_prior_rows(db, project, chapter))
+            build_replay_guard_block(_replay_prior_rows(
+                db, project, chapter, before_segment=before_segment))
             if bool(getattr(settings, "replay_guard_enabled", True)) else ""
         ),
     )
@@ -7063,6 +7158,20 @@ def regenerate_segment_stream(
 
         text = _strip_thinking("".join(pieces))
 
+    # 引号口径（确定性）：整段重写按参考书统一；局部补丁逐字保留原文，
+    # 不能在这里改它没碰过的字符。
+    quote_info = None
+    if not local_patch:
+        text, quote_info = normalize_to_reference(
+            db, project, text, project.reference_novel_ids or [])
+        # 空稿不落库：重写后拿到 0 字会把原段正文直接抹掉。
+        if not text.strip():
+            text = _retry_empty_draft(
+                provider, system, user, constraints=constraints)
+            if not text.strip():
+                raise ValueError(
+                    "模型返回空正文（重试后仍为空）；本次重生成不落库，请重试")
+
     summary = provider.summarize(text)
 
     # 复述闸门（重生成路径）：整段重写可能与「本章之前的章节」重演同一场戏。
@@ -7071,7 +7180,8 @@ def regenerate_segment_stream(
     replay_info = None
     replay_prior: list[dict] = []
     if not local_patch and bool(getattr(settings, "replay_guard_enabled", True)):
-        replay_prior = _replay_prior_rows(db, project, chapter)
+        replay_prior = _replay_prior_rows(
+            db, project, chapter, before_segment=segment_no)
         if replay_prior:
             replay_check = scene_replay_check(
                 text, [r.get("text") or "" for r in replay_prior])
@@ -7115,6 +7225,15 @@ def regenerate_segment_stream(
     if text != era_before:
         summary = provider.summarize(text)
 
+    # 最终引号口径：复述改写/时代改写可能又漂回「」，落库前再统一一次。
+    # 局部补丁不碰未修改的字符，跳过。
+    quote_final = None
+    if not local_patch:
+        text, quote_final = normalize_to_reference(
+            db, project, text, project.reference_novel_ids or [])
+        if quote_final.get("applied"):
+            summary = provider.summarize(text)
+
     # 复读闸门（P3 · I3）：落库前算好，两条子路径都必须带同一份报告。
     # 重写路径不合并 KG，所以这里没有「跳过 KG」的动作（详见方案稿 §3.2）。
     # 篇幅判据：这是改写既有段落，跌幅归 detect_length_drop，本字段
@@ -7124,6 +7243,8 @@ def regenerate_segment_stream(
         text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
     )
     quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
+    quality["quote_info"] = quote_info
+    quality["quote_final"] = quote_final
 
     new_summary = {
         "text": summary,
@@ -8375,6 +8496,10 @@ def _apply_style_corrections(
                else (project.reference_novel_ids or []))
     profile = _style_profile(db, project)
     diag: dict = {}
+
+    # 引号口径（确定性，零模型调用）：必须在所有 LLM 校正**之前**跑——
+    # 声纹检查、归属校正都按引号切台词；引号形态不统一会让它们看到两套文本。
+    text, diag["quote_info"] = normalize_to_reference(db, project, text, ids)
 
     text, diag["rewrite_info"] = _maybe_rewrite_style(
         project, text, provider, profile=profile)

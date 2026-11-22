@@ -286,6 +286,13 @@ _FORM_HINT = {
 #: `mixed` 形态下「道：」的占比上限（占全部带归属台词）。
 #: 超过就再跑一遍「把道：改成别的引出方式」。
 VARIETY_MAX_DAO_SHARE = 0.5
+
+#: 选稿时对「道：占比」的罚分系数，与归属率**同一量纲**（1.0 = 100 个百分点）。
+#:
+#: 2026-11-22 五章回归：原来取 0.5，等于 50 个百分点，压过了归属率本身的差异——
+#: 候选里明明有 30.4% 的版本（目标 32.6%），却被 10.1% 的低道占比版本选中，
+#: 五章最终归属率只有 1.9%–10%。改成 0.05 后只起「离目标同样近时破平」的作用。
+DAO_SHARE_PENALTY = 0.05
 #: 少于这么多处「道：」就不值得再花一次调用。
 VARIETY_MIN_DAO = 6
 
@@ -450,6 +457,17 @@ def _trim_attribution_to_count(text: str, keep: int) -> tuple[str, int]:
         s, e = spans[i]
         out = out[:s] + out[e:]
     return out, len(drop)
+
+
+def candidate_score(dist: float, rate: dict, convention: str) -> float:
+    """候选稿的排序分：离目标越近越好；mixed 形态再轻微惩罚「道：」占比。
+
+    罚分必须与 `dist`（同样是 0–1 的比例）同量纲且**小**，否则会压过归属率
+    本身的差距——这正是 2026-11-22 五章归属率只有 2%–10% 的原因。
+    """
+    hits = rate["front"] + rate["back"] + rate["mid"]
+    dao_share = (rate["front_dao"] / hits) if hits else 0.0
+    return dist + (DAO_SHARE_PENALTY * dao_share if convention == "mixed" else 0.0)
 
 
 def correct_attribution(
@@ -651,9 +669,7 @@ def correct_attribution(
         dist = abs(rate["rate"] - target_rate)
         # mixed 形态：在「离目标近」之外再罚「道：占比」——否则去单一化那一版
         # 会因为它把归属率调低一点而被整版丢掉（实测 2/12 vs 23/34 仍选了后者）。
-        dao_share = (rate["front_dao"] / (rate["front"] + rate["back"] + rate["mid"])
-                     if (rate["front"] + rate["back"] + rate["mid"]) else 0.0)
-        score = dist + (0.5 * dao_share if convention == "mixed" else 0.0)
+        score = candidate_score(dist, rate, convention)
         if best is None or score < best[0]:
             best = (score, dist, cand, rate)
 

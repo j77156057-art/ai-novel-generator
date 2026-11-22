@@ -236,29 +236,44 @@ def replay_rewrite_once(
 【正文】
 {text}"""
     try:
+        prov = provider.variant(thinking_off=True, max_tokens=16000)
+    except Exception:  # noqa: BLE001
+        prov = provider
+
+    # 空输出/字数越界是偶发失败（与主生成同源），再给一次机会。
+    last: dict = {"applied": False, "reason": "未执行"}
+    for attempt in (1, 2):
+        user_try = user if attempt == 1 else user + (
+            f"\n\n【重试】上一次输出不合格（{last.get('reason')}）。"
+            f"这次必须输出完整正文，字数严格控制在 {lo}–{hi} 字；"
+            "开头不得再出现上述重复片段，不要解释、不要标题。")
         try:
-            prov = provider.variant(thinking_off=True, max_tokens=16000)
-        except Exception:  # noqa: BLE001
-            prov = provider
-        try:
-            got = (prov.chat(_SYSTEM, user, temperature=0.3) or "").strip()
-        except TypeError:
-            got = (prov.chat(_SYSTEM, user) or "").strip()
-    except Exception as exc:  # noqa: BLE001
-        return text, {"applied": False, "reason": f"调用失败 {type(exc).__name__}"}
+            try:
+                got = (prov.chat(_SYSTEM, user_try, temperature=0.3) or "").strip()
+            except TypeError:
+                got = (prov.chat(_SYSTEM, user_try) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            last = {"applied": False, "reason": f"调用失败 {type(exc).__name__}"}
+            continue
 
-    got = _strip_think_tags(got)
-    if not got:
-        return text, {"applied": False, "reason": "空输出"}
-    if len(got) < lo or len(got) > hi:
-        return text, {"applied": False, "reason": f"字数越界 {len(got)}（允许 {lo}–{hi}）"}
+        got = _strip_think_tags(got)
+        if not got:
+            last = {"applied": False, "reason": "空输出"}
+            continue
+        if len(got) < lo or len(got) > hi:
+            last = {"applied": False,
+                    "reason": f"字数越界 {len(got)}（允许 {lo}–{hi}）"}
+            continue
 
-    after = scene_replay_check(got, [p.get("text") or "" for p in (prior or [])])
-    if after.get("replay"):
-        return text, {"applied": False, "reason": "复述仍在", "after": after}
+        after = scene_replay_check(got, [p.get("text") or "" for p in (prior or [])])
+        if after.get("replay"):
+            last = {"applied": False, "reason": "复述仍在", "after": after}
+            continue
 
-    logger.info(
-        "复述闸门改写采纳：hits %s → %s（project %s）",
-        check.get("hits"), after.get("hits"), None,
-    )
-    return got, {"applied": True, "before": check, "after": after}
+        logger.info(
+            "复述闸门改写采纳：hits %s → %s（第 %s 次尝试）",
+            check.get("hits"), after.get("hits"), attempt,
+        )
+        return got, {"applied": True, "before": check, "after": after,
+                     "attempt": attempt}
+    return text, last
