@@ -30,6 +30,11 @@ from app.generation.prompts import (
     merged_constraint_items,
     render_item_holding_section,
 )
+from app.generation.replay_guard import (
+    build_replay_guard_block,
+    replay_rewrite_once,
+    scene_replay_check,
+)
 from app.generation.repetition import (
     analyze_length,
     analyze_repetition,
@@ -1907,6 +1912,54 @@ def _ledger_prior_rows(db, project: Project,
         by_chapter[idx] = {"chapter": idx, "text": text,
                            "structure_check": stored}
     return [by_chapter[idx] for idx in sorted(by_chapter)]
+
+
+def _replay_prior_rows(db, project: Project, chapter: int | None,
+                       limit: int = 2) -> list[dict]:
+    """复述闸门用：当前章之前最近几章（标签 / 正文 / 摘要 / 本章大纲条目）。
+
+    `text` 供写后片段比对，`summary`+`outline` 供写前「禁止重写」清单。
+    读不到历史时返回空列表，闸门自动跳过。
+    """
+    if db is None or chapter is None:
+        return []
+    try:
+        rows = db.execute(
+            select(Generation.chapter_range, Generation.text, Generation.summary)
+            .where(Generation.project_id == project.id)
+            .order_by(Generation.segment_no)
+        ).all()
+    except Exception:  # noqa: BLE001 —— 历史读不到不能拖垮生成
+        logging.getLogger(__name__).warning(
+            "replay guard history skipped（project %s）",
+            getattr(project, "id", None), exc_info=True)
+        return []
+    by_chapter: dict[int, dict] = {}
+    for label, text, summary in rows:
+        idx = _chapter_ordinal(label)
+        if idx is None or idx >= chapter or not str(text or "").strip():
+            continue
+        # `Generation.summary` 是 JSON 列：正常取出就是 dict
+        # `{"text": "...", "era": ...}`；旧存档/测试夹具可能是字符串。
+        summary_text = ""
+        parsed = summary
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except (TypeError, ValueError):
+                parsed = None
+        if isinstance(parsed, dict):
+            summary_text = str(parsed.get("text") or "")
+        elif isinstance(parsed, str):
+            summary_text = parsed
+        by_chapter[idx] = {
+            "chapter": idx,
+            "label": label or f"第{idx}章",
+            "text": text,
+            "summary": summary_text,
+            "outline": chapter_outline_entry(project.outline, idx) or "",
+        }
+    return [by_chapter[i] for i in sorted(by_chapter)][-max(1, limit):]
 
 
 def _run_progress_ledger(db, project: Project, text: str,
@@ -5685,6 +5738,12 @@ def generate_next_segment(
     # v12：闸门带（含对白配比参考线）必须在拼提示**之前**写入当前 context——
     # 提示里的极短纯对白段上限与对白参考线都读它；并段仍在其后，硬上限不变。
     gate_limits_meta = _apply_gate_limits(db, project, seg_no=written + 1)
+    # 复述闸门（写前）：最近已落库章节的摘要 + 大纲，明确禁止重写。
+    replay_prior = (
+        _replay_prior_rows(db, project, chapter)
+        if bool(getattr(settings, "replay_guard_enabled", True)) else []
+    )
+    replay_block = build_replay_guard_block(replay_prior)
     # 初稿提示的字数下限与补完触发线同源（见 `_draft_prompt_min_chars`）；
     # 节奏口径缓存命中时零成本，提前到这里只为拼提示时能取到同一个值。
     rhythm = _archive_rhythm(db, project)
@@ -5723,6 +5782,7 @@ def generate_next_segment(
         min_chars=prompt_min_chars,
         advance_block=_advance_block(db, project, chapter),
         story_cards_block=_render_story_cards(db, project.id),
+        replay_guard_block=replay_block,
         foreshadow_block=ctx.get("foreshadow_block"),
     )
 
@@ -5842,6 +5902,19 @@ def generate_next_segment(
         summary = provider.summarize(text)
         voice_check = voice_info.get("after") or _dialogue_voice_check(project, text)
 
+    # 复述闸门（写后）：本章开头若在重演上一章场景，只改开头一次。
+    # 判据不命中（绝大多数章）时零模型调用；改写不达标保留原稿。
+    replay_check = None
+    replay_info = None
+    if replay_prior:
+        replay_check = scene_replay_check(
+            text, [r.get("text") or "" for r in replay_prior])
+        if replay_check.get("replay"):
+            text, replay_info = replay_rewrite_once(
+                provider, text, replay_check, replay_prior, max_chars)
+            if replay_info.get("applied"):
+                summary = provider.summarize(text)
+
     # 时代越界自检：默认 report（只扫描、落 meta，不改正文）。
     # 显式 rewrite 模式下才可能改 text；改过就重算摘要，避免摘要与正文脱节。
     era_before = text
@@ -5865,6 +5938,7 @@ def generate_next_segment(
     quality["style_corrections"] = style_fix
     quality["dialogue_voice_check"] = voice_check
     quality["voice_rewrite"] = voice_info
+    quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
     # v15：结构检测（情节点覆盖 / 越章材料 / 人物性别一致），只写留痕、不改正文；
     # 是否阻断由 `structure_guard_mode` 在 `_commit_segment` 决定。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
@@ -6179,6 +6253,12 @@ def generate_next_segment_stream(
     # v12：闸门带（含对白配比参考线）必须在拼提示**之前**写入当前 context——
     # 提示里的极短纯对白段上限与对白参考线都读它；并段仍在其后，硬上限不变。
     gate_limits_meta = _apply_gate_limits(db, project, seg_no=written + 1)
+    # 复述闸门（写前）：最近已落库章节的摘要 + 大纲，明确禁止重写。
+    replay_prior = (
+        _replay_prior_rows(db, project, chapter)
+        if bool(getattr(settings, "replay_guard_enabled", True)) else []
+    )
+    replay_block = build_replay_guard_block(replay_prior)
     # 初稿提示的字数下限与补完触发线同源（见 `_draft_prompt_min_chars`）；
     # 节奏口径缓存命中时零成本，提前到这里只为拼提示时能取到同一个值。
     rhythm = _archive_rhythm(db, project)
@@ -6217,6 +6297,7 @@ def generate_next_segment_stream(
         min_chars=prompt_min_chars,
         advance_block=_advance_block(db, project, chapter),
         story_cards_block=_render_story_cards(db, project.id),
+        replay_guard_block=replay_block,
         foreshadow_block=ctx.get("foreshadow_block"),
     )
 
@@ -6342,6 +6423,19 @@ def generate_next_segment_stream(
         summary = provider.summarize(text)
         voice_check = voice_info.get("after") or _dialogue_voice_check(project, text)
 
+    # 复述闸门（写后）：本章开头若在重演上一章场景，只改开头一次。
+    # 判据不命中（绝大多数章）时零模型调用；改写不达标保留原稿。
+    replay_check = None
+    replay_info = None
+    if replay_prior:
+        replay_check = scene_replay_check(
+            text, [r.get("text") or "" for r in replay_prior])
+        if replay_check.get("replay"):
+            text, replay_info = replay_rewrite_once(
+                provider, text, replay_check, replay_prior, max_chars)
+            if replay_info.get("applied"):
+                summary = provider.summarize(text)
+
     # 时代越界自检：与同步版同口径；默认 report，不改正文。
     era_before = text
     text, era_meta = _apply_era_guard(
@@ -6363,6 +6457,7 @@ def generate_next_segment_stream(
     quality["style_corrections"] = style_fix
     quality["dialogue_voice_check"] = voice_check
     quality["voice_rewrite"] = voice_info
+    quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
     # 与同步版同口径：结构检测留痕（是否阻断由 `structure_guard_mode` 决定）。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
     # 与同步版同口径：逐章推进台账（只判不拦，`mode=report`）。
@@ -6677,6 +6772,12 @@ def _build_generation_prompts(
         min_chars=prompt_min_chars,
         story_cards_block=_render_story_cards(db, project.id),
         foreshadow_block=foreshadow_block,
+        # 重生成同样禁止复述更早章节（写后检测只在新增章路径跑——
+        # 重生成的正文基线本来就是本章自己的剧情，不做自动替换）。
+        replay_guard_block=(
+            build_replay_guard_block(_replay_prior_rows(db, project, chapter))
+            if bool(getattr(settings, "replay_guard_enabled", True)) else ""
+        ),
     )
     return system, user, max_chars
 
@@ -6964,6 +7065,22 @@ def regenerate_segment_stream(
 
     summary = provider.summarize(text)
 
+    # 复述闸门（重生成路径）：整段重写可能与「本章之前的章节」重演同一场戏。
+    # 局部补丁（用户只改某一句）不跑——它逐字保留其余正文，不会整体复述。
+    replay_check = None
+    replay_info = None
+    replay_prior: list[dict] = []
+    if not local_patch and bool(getattr(settings, "replay_guard_enabled", True)):
+        replay_prior = _replay_prior_rows(db, project, chapter)
+        if replay_prior:
+            replay_check = scene_replay_check(
+                text, [r.get("text") or "" for r in replay_prior])
+            if replay_check.get("replay"):
+                text, replay_info = replay_rewrite_once(
+                    provider, text, replay_check, replay_prior, max_chars)
+                if replay_info.get("applied"):
+                    summary = provider.summarize(text)
+
     # —— 零成本 AI 腔检测 + 告警（方案 b：只检测、不自动重写）——
     # 复用 _should_rewrite 的纯计数判据（与续写路径口径一致，零 LLM 调用、不加载语料）。
     # 命中即带 rewrite_info 告警信号，提示「本段可能残留 AI 腔，未自动修」。
@@ -7006,6 +7123,7 @@ def regenerate_segment_stream(
     quality["style_gate"] = generation_gate(
         text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
     )
+    quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
 
     new_summary = {
         "text": summary,
@@ -7144,6 +7262,8 @@ def regenerate_segment_stream(
         "kg": kg_stats,
         # 复读闸门（D7）：verdict / triggers / reason_text + 提示。
         "repetition": repetition,
+        # 复述闸门：检测结果与是否采纳了开头重写（局部补丁路径恒为 None）。
+        "replay_guard": {"check": replay_check, "rewrite": replay_info},
         "length": (quality or {}).get("length"),
         "summary_style": (quality or {}).get("summary_style"),
         "warnings": warnings,

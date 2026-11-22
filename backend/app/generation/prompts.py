@@ -68,7 +68,9 @@ from typing import Any
 #:        声纹台词、对话要有错位、对白平均长度与短应答占比。
 #: v21（2026-11-22）：本章大纲点名的角色注入「必须出场并开口」块，防止该出场的人
 #:      整章消失（真机：第 1 章大纲有苏见月，正文 0 次提及）。
-PROMPT_REVISION = "prompt-v21"
+#: v22（2026-11-22）：注入【不得复述已写场景】块——最近两章的标签/摘要/大纲列成
+#:      「禁止重写」清单（真机：第 3 章开头把第 2 章的子时搬货整场戏又演了一遍）。
+PROMPT_REVISION = "prompt-v22"
 
 #: 物品持有块的标题 / 优先级说明。生成与重写共用同一份渲染，避免两条路径各拼一份、
 #: 重写时漏块或块文本漂移。
@@ -1101,6 +1103,7 @@ def build_user_prompt(
     advance_block: str | None = None,
     story_cards_block: str | None = None,
     foreshadow_block: str | None = None,
+    replay_guard_block: str | None = None,
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -1336,6 +1339,11 @@ def build_user_prompt(
     required_cast = _required_cast_block(chapter_outline, plot_bible)
     if required_cast:
         blocks += ["", required_cast]
+    # 章节复述闸门（v25）：把最近已落库章节列成「禁止重写」清单。
+    # 五章真机回归：第 3 章开头把第 2 章的整场戏又演了一遍——摘要里明明写了，
+    # 模型仍把「上一章结尾」当成本章起点。这里把「已发生」显式钉死。
+    if replay_guard_block:
+        blocks += ["", replay_guard_block]
     # 对白工艺（v23 声纹实验）：角色卡给了「说话方式」，但实测模型只把它当属性表抄，
     # 五章 16.5k 汉字里「道：」110 次、29.5% 的对白 ≤6 字，所有人一种短句直陈。
     # 这里把「怎么写对白」写成可核对的要求，并配合角色行里的「台词参考」样本。
