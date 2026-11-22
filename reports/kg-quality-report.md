@@ -323,3 +323,22 @@ _生成时间 2026-11-18 23:53:55（自动生成，口径见文件头）_
 
 <!-- kg-quality:p6:ch41-ch45:end -->
 
+<!-- kg-quality:p11:ch1-ch5:start -->
+## 第 1–5 章（项目 11）
+
+_生成时间 2026-11-22 09:02:28（自动生成，口径见文件头）_
+
+| 章 | seg | 事件(总/当前) | 版本 | 章归属错 | 角色状态 | 关系 | mentions 本书/当前 | 脏行 | run |
+|---|---|---|---|---|---|---|---|---|---|
+| ch1 | 1 | 35/0 | v0 | 0 | 5/0 | 50/5 | 111/96 | 0 | run342/success |
+| ch2 | 2 | 28/0 | v0 | 0 | 8/0 | 19/1 | 72/72 | 0 | run343/success |
+| ch3 | 3 | 19/0 | v0 | 0 | 4/0 | 6/0 | 57/57 | 0 | run344/success |
+| ch4 | 4 | 4/4 | v1 | 0 | 2/2 | 14/4 | 74/74 | 0 | run345/success |
+| ch5 | 5 | 22/11 | v1 | 0 | 5/2 | 10/4 | 42/42 | 0 | run346/success |
+
+**异常**：ch1: run326 空事件（success 但 events_added=0）；ch1: run342 空事件（success 但 events_added=0）；ch2: run322 空事件（success 但 events_added=0）；ch2: run343 空事件（success 但 events_added=0）；ch3: run344 空事件（success 但 events_added=0）；ch4: run324 空事件（success 但 events_added=0）；ch4: run330 空事件（success 但 events_added=0）
+
+<!-- kg-quality:p11:ch1-ch5:end -->
+
+
+
