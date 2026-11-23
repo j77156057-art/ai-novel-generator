@@ -38,6 +38,10 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from app.generation.coerce import as_list as _as_list, as_text as _as_text
+
+from app.generation.model_json import safe_json
+
 #: persona 的四个字段（与 `character_profile.py` 同形）。
 PERSONA_FIELDS: tuple[str, ...] = ("说话方式", "行为倾向", "性格底线", "关键经历")
 
@@ -53,24 +57,6 @@ SOURCE_USER = "user"
 _QUOTE_RE = re.compile(r"[「『“\"]([^」』”\"]{2,60})[」』”\"]")
 
 
-def _as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return "；".join(str(v).strip() for v in value if str(v).strip())
-    return str(value).strip()
-
-
-def _as_list(value: Any, limit: int = 6) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        items = [value] if value.strip() else []
-    elif isinstance(value, (list, tuple)):
-        items = [str(v).strip() for v in value if str(v).strip()]
-    else:
-        items = [str(value).strip()]
-    return items[:limit]
 
 
 def normalize_persona(raw: Any) -> dict:
@@ -84,7 +70,7 @@ def normalize_persona(raw: Any) -> dict:
     for field in PERSONA_FIELDS:
         val = raw.get(field)
         if field in _FIELD_LISTS:
-            items = _as_list(val)
+            items = _as_list(val, limit=6)
             if items:
                 out[field] = items
         else:
@@ -114,13 +100,13 @@ def render_persona(persona: Any) -> str:
     voice = _as_text(persona.get("说话方式"))
     if voice:
         parts.append(f"说话：{voice}")
-    beh = _as_list(persona.get("行为倾向"))
+    beh = _as_list(persona.get("行为倾向"), limit=6)
     if beh:
         parts.append("会：" + "；".join(beh[:3]))
-    lines = _as_list(persona.get("性格底线"))
+    lines = _as_list(persona.get("性格底线"), limit=6)
     if lines:
         parts.append("不会：" + "；".join(lines[:3]))
-    events = _as_list(persona.get("关键经历"))
+    events = _as_list(persona.get("关键经历"), limit=6)
     if events:
         parts.append("经历：" + "；".join(events[:2]))
     return " ｜ ".join(parts)
@@ -189,29 +175,6 @@ def _drop_ungrounded(persona: dict, source_text: str) -> dict:
     return out
 
 
-def _safe_json(raw: Any) -> Any:
-    """从模型输出里抠出 JSON（容忍 ```json 包裹与前后废话）。"""
-    if isinstance(raw, (dict, list)):
-        return raw
-    text = str(raw or "").strip()
-    if not text:
-        return {}
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except Exception:  # noqa: BLE001
-        pass
-    m = re.search(r"\{.*\}", text, re.S)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:  # noqa: BLE001
-            return {}
-    return {}
-
-
 def derive_personas(provider: Any, sources: dict[str, list[str]]) -> dict[str, dict]:
     """从**已经写出来的正文**反推一批角色的写作特征（**一次调用**）。
 
@@ -248,7 +211,7 @@ def derive_personas(provider: Any, sources: dict[str, list[str]]) -> dict[str, d
             body_parts.append(f"—— 角色「{name}」的正文片段 ——\n" + "\n".join(snips))
         user = "\n\n".join(body_parts) + "\n\n按上述 JSON 输出（每个角色一条）。"
         raw = provider.chat(sys_p, user)
-        parsed = _safe_json(raw)
+        parsed = safe_json(raw)
         out: dict[str, dict] = {}
         for item in (parsed.get("characters") or []):
             if not isinstance(item, dict):
@@ -373,8 +336,8 @@ def _merge_field(field: str, user_value: Any, ai_extra: Any) -> Any:
     拼接前先把 AI 补充里与用户原文重复的那部分**去掉**，否则提示词里会出现同一句话两遍。
     """
     if field in _FIELD_LISTS:
-        user_items = _as_list(user_value)
-        extra_items = _as_list(ai_extra)
+        user_items = _as_list(user_value, limit=6)
+        extra_items = _as_list(ai_extra, limit=6)
         out = list(user_items)
         for x in extra_items:
             if x and x not in out:
@@ -489,7 +452,7 @@ def complete_persona(provider: Any, character: dict, user_persona: Any = None,
                + json.dumps(user_norm, ensure_ascii=False))
             + (("\n\n作者的要求：\n" + note[:400]) if note else ""))
         raw = provider.chat(sys_p, user)
-        parsed = _safe_json(raw)
+        parsed = safe_json(raw)
         extra = normalize_persona(parsed.get("补充") if isinstance(parsed, dict) else None)
         if not extra:
             return {}

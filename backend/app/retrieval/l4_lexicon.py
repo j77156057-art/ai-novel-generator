@@ -65,7 +65,6 @@ DEFAULT_MIN_RATIO = 0.002
 #: 又保留新词对「未细分」卡的兜底覆盖。设为 0 则退化为「只做兜底填充」。
 DEFAULT_SEED_WEIGHT = 2
 
-_EVIDENCE_BLOCK = re.compile(r"[（(]\s*证据\s*[:：]\s*(.*?)[）)]", re.S)
 _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
 
 #: 写作说明里的通用词，不能指向某一技法。
@@ -117,25 +116,6 @@ def _require_jieba() -> None:
             "L4 词表推导需要 jieba：请在 backend/ 下执行 "
             "`pip install -r requirements.txt`（jieba==0.42.1）后重试。"
         )
-
-
-def rule_body(text: str) -> str:
-    """剥掉规则正文末尾的「（证据：……）」及单独回传的证据行。"""
-    raw = text or ""
-    evidence = [m.strip() for m in _EVIDENCE_BLOCK.findall(raw)]
-    body = _EVIDENCE_BLOCK.sub("", raw)
-    if evidence:
-        kept = []
-        for line in body.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if any(ev and (stripped in ev or ev.startswith(stripped[:12]))
-                   for ev in evidence):
-                continue
-            kept.append(line)
-        body = "\n".join(kept)
-    return body.strip()
 
 
 def _candidates(text: str) -> set[str]:

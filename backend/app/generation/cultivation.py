@@ -33,6 +33,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.generation.coerce import as_list as _as_list, as_text as _as_text
+
 from app.generation.power_system import (
     bands_of, find_realm, realm_index, realm_rank, systems_of,
 )
@@ -43,24 +45,6 @@ REALM_PROFILE_FIELDS: tuple[str, ...] = (
 )
 
 
-def _as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return "；".join(str(v).strip() for v in value if str(v).strip())
-    return str(value).strip()
-
-
-def _as_list(value: Any, limit: int = 8) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        items = [value] if value.strip() else []
-    elif isinstance(value, (list, tuple)):
-        items = [str(v).strip() for v in value if str(v).strip()]
-    else:
-        items = [str(value).strip()]
-    return items[:limit]
 
 
 def normalize_profile(raw: Any) -> dict:

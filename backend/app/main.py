@@ -34,6 +34,9 @@ from app.routers import timeline as timeline_router
 from app.routers import story_cards as story_cards_router
 from app.routers import foreshadow_ledger as foreshadow_ledger_router
 from app.routers import style_repair as style_repair_router
+from app.routers import auto_repair as auto_repair_router
+from app.routers import writing_assist as writing_assist_router
+from app.routers import materials as materials_router
 from app.routers import web_search_settings as web_search_settings_router
 
 # uvicorn 默认只配自己的 logger，不接管 root；不显式配置的话，模块里的
@@ -134,6 +137,23 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:  # noqa: BLE001 —— 收割是增强，不是启动的前提
         logging.getLogger(__name__).warning("重写快照启动收割失败（已忽略）：%s", exc)
+    # —— 素材调研后台 worker：启动恢复 ——
+    # 与 KG 批抽同纪律：任务行在库里，线程重启后由心跳判断哪些要重捞；
+    # 失败只告警，不拖垮启动（最坏结果是任务停在 queued，下次生成再触发）。
+    try:
+        from app.materials import worker as material_worker
+
+        material_worker.ensure_worker()
+        with SessionLocal() as db:
+            recovered = material_worker.recover_running(db)
+        if recovered["requeued"] or recovered["stale"]:
+            logging.getLogger(__name__).info(
+                "启动恢复素材调研：queued 重新入队 %s，过期 running 重排 %s",
+                recovered["requeued"], recovered["stale"],
+            )
+    except Exception as exc:  # noqa: BLE001 —— 恢复失败不影响服务启动
+        logging.getLogger(__name__).warning("素材调研 worker 启动失败（已忽略）：%s", exc)
+
     try:
         yield
     finally:
@@ -149,6 +169,13 @@ async def lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001 —— 停线程失败不掩盖退出本身
             logging.getLogger(__name__).warning(
                 "停止 KG 批抽线程失败（已忽略）：%s", exc)
+        try:
+            from app.materials.worker import stop_worker as stop_material_worker
+
+            stop_material_worker()
+        except Exception as exc:  # noqa: BLE001 —— 停线程失败不掩盖退出本身
+            logging.getLogger(__name__).warning(
+                "停止素材调研线程失败（已忽略）：%s", exc)
 
 
 app = FastAPI(title="AI 小说生成器 · M1–M4", lifespan=lifespan)
@@ -198,6 +225,9 @@ app.include_router(rhythm_router.router)
 app.include_router(story_cards_router.router)
 app.include_router(foreshadow_ledger_router.router)
 app.include_router(style_repair_router.router)
+app.include_router(auto_repair_router.router)
+app.include_router(writing_assist_router.router)
+app.include_router(materials_router.router)
 app.include_router(web_search_settings_router.router)
 
 

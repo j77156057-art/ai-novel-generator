@@ -12,6 +12,7 @@ defineOptions({ name: "PowerSystemView" });
 import { computed, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { api } from "@/api/client";
+import { errorText as textOf } from "@/utils/errors";
 import ProjectNav from "@/components/ProjectNav.vue";
 import type {
   CharacterCardItem,
@@ -59,10 +60,6 @@ const cultivationSaving = ref(false);
 const cultivationError = ref("");
 const cultivationNote = ref("");
 const situation = ref("");
-
-function textOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 function syncJson(): void {
   systemsJson.value = JSON.stringify(systems.value, null, 2);

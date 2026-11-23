@@ -59,6 +59,8 @@ import json
 import re
 from typing import Any, Iterable
 
+from app.generation.coerce import as_list as _as_list, as_text as _as_text
+
 #: 身份组字段（写作时按这个顺序渲染）。
 IDENTITY_FIELDS: tuple[str, ...] = (
     "性别", "年龄", "外貌", "身份职业", "出身背景",
@@ -97,24 +99,6 @@ ENDING_STYLES: tuple[str, ...] = (
 )
 
 
-def _as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return "；".join(str(v).strip() for v in value if str(v).strip())
-    return str(value).strip()
-
-
-def _as_list(value: Any, limit: int = 8) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        items = [value] if value.strip() else []
-    elif isinstance(value, (list, tuple)):
-        items = [str(v).strip() for v in value if str(v).strip()]
-    else:
-        items = [str(value).strip()]
-    return items[:limit]
 
 
 def _as_items(value: Any, limit: int = 6) -> list[dict]:
@@ -273,7 +257,7 @@ def voice_signature(card: Any) -> dict:
         "句长": _as_text(voice.get("句长")),
         "句末": _as_text(voice.get("句末")),
         "语气底色": _as_text(voice.get("语气底色")),
-        "口头禅数": len(_as_list(voice.get("口头禅"))),
+        "口头禅数": len(_as_list(voice.get("口头禅"), limit=8)),
     }
     return {k: v for k, v in sig.items() if v}
 
@@ -332,7 +316,7 @@ def _forbidden_set(card: Any) -> set[str]:
     voice = (card or {}).get("声纹") if isinstance(card, dict) else {}
     if not isinstance(voice, dict):
         return set()
-    return {str(x).strip() for x in _as_list(voice.get("禁用词")) if str(x).strip()}
+    return {str(x).strip() for x in _as_list(voice.get("禁用词"), limit=8) if str(x).strip()}
 
 
 def strict_voice_collisions(cards: dict[str, Any], *, min_shared: int = 3) -> list[dict]:

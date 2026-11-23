@@ -16,6 +16,12 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from app.style.deterministic_repair import (
+    find_dialogue_punctuation_issues,
+    find_multi_speaker_paragraphs,
+    find_number_word_mismatch,
+    find_tics,
+)
 from app.style.stylometry import FEATURE_NOTES, band_check
 
 #: 参与诊断的特征 → (维度, 标题, 方向, 修法)。
@@ -33,20 +39,20 @@ _FEATURE_RULES: dict[str, tuple[str, str, str, str]] = {
         "节奏控制",
         "句子偏碎",
         "low",
-        "把连续短句合并成有停顿、有呼吸的长句；用动作、场景或旁人反应承载节奏，"
+        "把叙述里的连续短句合并成有停顿、有呼吸的长句；用动作、场景或旁人反应承载节奏，"
         "不要靠删内容来凑长度。",
     ),
     "句号密度": (
         "节奏控制",
         "断句过密",
         "high",
-        "减少一句一断的碎句，把同一动作链上的短句合成一句。",
+        "减少叙述里一句一断的碎句，把同一动作链上的短句合成一句。",
     ),
     "短句占比": (
         "节奏控制",
         "短句扎堆",
         "high",
-        "把连续短句并成完整动作句，留少量短句做顿挫。",
+        "把叙述里的连续短句并成完整动作句，留少量短句做顿挫。",
     ),
     "句长CV": (
         "节奏控制",
@@ -246,9 +252,89 @@ def _sanitize_instruction(text: str) -> str:
     return text
 
 
+def _hard_issues(text: str) -> list[dict[str, Any]]:
+    """不依赖文风档案的硬伤诊断：标点、双人同段、口头禅、数字自洽。
+
+    这些项修法明确、可验证，排在量化偏离之前。``deterministic_repair``
+    能先修掉前两项；自动返修链路跑完确定性修复后，这里通常只剩口头禅
+    与数字两项，交给模型改。
+    """
+    issues: list[dict[str, Any]] = []
+
+    punct = find_dialogue_punctuation_issues(text)
+    if punct:
+        issues.append({
+            "kind": "hard",
+            "dimension": "标点硬伤",
+            "title": "引语标点不完整",
+            "detail": (
+                f"{len(punct)} 处引语缺句末标点、或引号外多一个逗号，"
+                f"如「{punct[0][:40]}」"
+            ),
+            "fix": "给引语补上句末标点（问句用问号），并去掉引号外多余的逗号。",
+            "severity": "high",
+            "z": 6.0,
+        })
+
+    multi = find_multi_speaker_paragraphs(text)
+    if multi:
+        issues.append({
+            "kind": "hard",
+            "dimension": "对白归属",
+            "title": "两个说话人挤在同一段",
+            "detail": f"{len(multi)} 段里有两个人的台词，如「{multi[0][:40]}」",
+            "fix": "按说话人拆成独立段落，每段承载一个人的台词与紧邻动作。",
+            "severity": "high",
+            "z": 6.0,
+        })
+
+    tics = find_tics(text)
+    for item in tics:
+        if item["limit"] <= 1:
+            keep = "一处"
+        elif item["limit"] == 2:
+            keep = "一两处"
+        else:
+            keep = "两三处"
+        issues.append({
+            "kind": "hard",
+            "dimension": "人物声纹",
+            "title": f"口头禅「{item['word']}」过密",
+            "detail": (
+                f"当前出现 {item['count']} 次，建议不超过 {item['limit']} 次"
+            ),
+            "fix": (
+                f"把「{item['word']}」压到 {item['limit']} 次以内，"
+                f"{keep}留作人物声纹，其余改成动作、语气或直接删，"
+                "不要换一个同义词继续堆。"
+            ),
+            "severity": "high",
+            "z": 4.0,
+        })
+
+    mismatches = find_number_word_mismatch(text)
+    for item in mismatches:
+        issues.append({
+            "kind": "hard",
+            "dimension": "事实自洽",
+            "title": "字数回指对不上",
+            "detail": (
+                f"写「{item['declared']} 个字」，但前文引语实际是 "
+                f"{item['actual']} 个字：「{item['quote'][:20]}」"
+            ),
+            "fix": "把数字改成与引语实际字数一致，或改成不写具体数字的说法。",
+            "severity": "high",
+            "z": 5.0,
+        })
+
+    return issues
+
+
 def _build_instruction(issues: list[dict[str, Any]]) -> str:
     lines = [
-        "这是定向返修。保持剧情、人物、事实和对白内容不变，"
+        "这是定向返修。保持剧情、人物、事实不变；对白内容与说话人归属必须"
+        "原样带过来，不删台词，对白字占比不得低于改前。"
+        "不要改变段落数量与顺序，不要合并或拆分段落；对白段保持原样。"
         "按下列问题调整表达；不要新增情节，输出修改后的正文。",
     ]
     for index, issue in enumerate(issues, 1):
@@ -274,7 +360,8 @@ def build_repair_plan(
     """生成定向返修计划（不调模型）。"""
     narrative = narrative if isinstance(narrative, dict) else {}
     text = text or ""
-    issues: list[dict[str, Any]] = []
+    # 硬伤不依赖文风档案；放最前面，避免被 6 条上限挤掉。
+    issues: list[dict[str, Any]] = _hard_issues(text)
 
     if profile and text.strip() and len(text.strip()) >= _MIN_TEXT_CHARS:
         try:

@@ -13,12 +13,15 @@ from __future__ import annotations
 import json
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.db import Base
+from app.db import Base, SessionLocal, init_db
+from app.main import app
 from app.models import Generation, Project
+from app.routers import assistant as assistant_router
 from app.routers.assistant import (
     _build_chat_context,
     _sse_event,
@@ -165,3 +168,109 @@ def test_thinking_meta_is_none_without_reasoning():
 def test_thinking_meta_keeps_chars_when_duration_unknown():
     provider = _FakeProvider({"reasoning_chars": 88, "first_content_ms": 900})
     assert _thinking_meta(provider) == {"chars": 88, "duration_ms": None}
+
+
+# ====================================================================
+# 端点级：先工具轮、再流式（2026-11-23）
+# ====================================================================
+
+
+class _GatherProvider:
+    """第一次 complete_message 调工具，第二次表示「证据够了」；正文走 stream_chat。"""
+
+    model = "fake-stream"
+
+    def __init__(self):
+        self.complete_calls = 0
+
+    def complete_message(self, messages, *, tools=None, tool_choice=None,
+                         stop_sequences=None):
+        self.complete_calls += 1
+        if self.complete_calls == 1:
+            return {
+                "content": "",
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_generation_segments",
+                        "arguments": '{"limit": 1}',
+                    },
+                }],
+                "finish_reason": "tool_calls",
+                "usage": None,
+                "model": self.model,
+            }
+        return {"content": "", "tool_calls": [], "finish_reason": "stop",
+                "usage": None, "model": self.model}
+
+    def stream_chat(self, system, user):
+        yield "第 1 段写的是雨夜。"
+
+    def summarize(self, text):
+        return "摘要"
+
+
+def _seed_global_project(title: str) -> int:
+    """写进本进程的临时测试库（不是本文件的内存 fixture）。"""
+    init_db()  # TestClient 不跑 lifespan：确保全局 engine 上表已建好
+    with SessionLocal() as db:
+        project = Project(title=title, genre="都市", generation_length=3000)
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+        db.add(Generation(
+            project_id=project.id, segment_no=1, chapter_range="第1章",
+            text="第一段正文：" + "雨夜" * 80,
+        ))
+        db.commit()
+        return project.id
+
+
+def _collect_sse(client: TestClient, project_id: int, query: str):
+    events: list[dict] = []
+    with client.stream(
+        "POST", "/api/assistant/chat/stream",
+        json={"project_id": project_id, "query": query},
+    ) as res:
+        assert res.status_code == 200
+        for line in res.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            events.append(json.loads(line[len("data:"):].strip()))
+    return events
+
+
+def test_chat_stream_endpoint_runs_tool_round_then_streams(monkeypatch):
+    """带意图词的问题：先跑工具轮，done 里回传 tool_mode/trace/steps，正文仍逐字流式。"""
+    project_id = _seed_global_project("流式工具轮端点测试")
+    provider = _GatherProvider()
+    monkeypatch.setattr(
+        assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    events = _collect_sse(TestClient(app), project_id, "第1段写了什么？")
+    done = next(e for e in events if e["type"] == "done")
+
+    assert done["tool_mode"] == "model"
+    assert done["tool_steps"] == 2
+    assert done["forced_wrap_up"] is False
+    assert [t["name"] for t in done["tool_trace"]] == ["read_generation_segments"]
+    assert any(e["type"] == "delta" for e in events)
+    assert done["answer"].startswith("第 1 段")
+
+
+def test_chat_stream_endpoint_skips_tool_round_for_short_casual(monkeypatch):
+    """短句且无意图词：不跑工具轮（complete_message 零调用），done.tool_mode=chat。"""
+    project_id = _seed_global_project("流式寒暄端点测试")
+    provider = _GatherProvider()
+    monkeypatch.setattr(
+        assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    events = _collect_sse(TestClient(app), project_id, "今天天气不错")
+    done = next(e for e in events if e["type"] == "done")
+
+    assert provider.complete_calls == 0
+    assert done["tool_mode"] == "chat"
+    assert done["tool_steps"] == 0
+    assert done["tool_trace"] == []
+

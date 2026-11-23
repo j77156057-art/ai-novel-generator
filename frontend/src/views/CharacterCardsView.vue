@@ -14,6 +14,7 @@ defineOptions({ name: "CharacterCardsView" });
 import { computed, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { api } from "@/api/client";
+import { errorText as textOf } from "@/utils/errors";
 import ProjectNav from "@/components/ProjectNav.vue";
 import type {
   CardAbilityItem,
@@ -34,10 +35,6 @@ const flash = ref("");
 
 const cards = computed(() => data.value?.characters ?? []);
 const collisions = computed(() => data.value?.voice_collisions ?? []);
-
-function textOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 // ==================================================================
 // 草稿（把嵌套卡摊平成一组输入框，避免深层 v-model）

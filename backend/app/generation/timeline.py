@@ -392,7 +392,7 @@ def _build_branch_node_prompt(node: PlotNode) -> str:
 TIMELINE_SCHEMA_VERSION = 2
 
 
-def _node_to_dict(node: PlotNode) -> dict:
+def node_to_dict(node: PlotNode) -> dict:
     return {
         "id": node.id, "kind": node.kind, "title": node.title,
         "emotion": node.emotion,
@@ -572,7 +572,7 @@ def state_to_dict(state: TimelineState) -> dict:
     """
     return {
         "version": TIMELINE_SCHEMA_VERSION,
-        "nodes": {nid: _node_to_dict(n) for nid, n in state.nodes.items()},
+        "nodes": {nid: node_to_dict(n) for nid, n in state.nodes.items()},
         "order": list(state.order),
         "done": sorted(state.done),  # set → list，JSON 友好
         "current_node": state.current_node,

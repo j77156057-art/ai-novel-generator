@@ -2077,3 +2077,100 @@ class StoryCard(Base):
     __table_args__ = (
         Index("ix_story_card_project_kind", "project_id", "kind", "sort_order"),
     )
+
+
+class ProjectMaterial(Base):
+    """每本书专属素材包中的一条素材。
+
+    与 `retrieval/brief` 的 JSON 素材库分工：那是「单次生成临时用」的进程侧缓存；
+    本表是**项目级、可跨章长期复用**的素材包，带年份、用途、目录分类与使用次数，
+    支持模型调研写入与用户手动增删改。
+
+    字段语义：
+    - `status`: raw（刚入库、未整理）/ usable（可注入/可被工具取用）/ hidden（用户隐藏）；
+    - `published_year`: NULL = 未知（展示「未知」），不参与年份降权；
+    - `use_case`: 这条素材适合用在什么地方（章节/场景/用途），供模型按需取用；
+    - `use_count/last_used_at`: 被注入正文或工具读取的次数，用于判断是否过旧/无用；
+    - `fingerprint`: project 内去重键（标题+URL/摘要归一哈希）。
+    """
+
+    __tablename__ = "project_materials"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, nullable=False, index=True)
+    job_id = Column(Integer, nullable=True)
+    origin = Column(
+        String(16), nullable=False, default="research", server_default="research"
+    )  # research | manual
+    title = Column(String(500), nullable=False)
+    url = Column(Text, nullable=True)
+    snippet = Column(Text, nullable=True)
+    summary = Column(Text, nullable=True)
+    use_case = Column(Text, nullable=True)
+    chapter_hint = Column(Integer, nullable=True)
+    category = Column(String(64), nullable=True)
+    published_year = Column(Integer, nullable=True)
+    published_at = Column(String(64), nullable=True)
+    provider = Column(String(32), nullable=True)
+    query = Column(String(500), nullable=True)
+    tags = Column(JSON, nullable=True)
+    status = Column(
+        String(16), nullable=False, default="raw", server_default="raw"
+    )  # raw | usable | hidden
+    consolidated_by = Column(String(16), nullable=True)  # model | heuristic
+    use_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_used_at = Column(DateTime, nullable=True)
+    fingerprint = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "fingerprint", name="uq_project_material_fingerprint"
+        ),
+        Index("ix_project_material_project_status", "project_id", "status"),
+        Index("ix_project_material_project_year", "project_id", "published_year"),
+        Index("ix_project_material_project_category", "project_id", "category"),
+        Index("ix_project_material_job", "job_id"),
+    )
+
+
+class MaterialResearchJob(Base):
+    """一次后台素材调研任务（按项目/章触发，可恢复、可取消）。
+
+    `status` 状态机：queued → running → consolidating → done / partial / failed；
+    用户可把 queued/running 置为 cancelled。`owner/heartbeat_at` 用于多进程认领与
+    重启收割；`raw_count/usable_count` 是进度，前端轮询展示。
+    """
+
+    __tablename__ = "material_research_jobs"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, nullable=False, index=True)
+    chapter_no = Column(Integer, nullable=True)
+    trigger = Column(String(16), nullable=False, default="manual", server_default="manual")
+    topics = Column(JSON, nullable=True)
+    queries = Column(JSON, nullable=True)
+    status = Column(
+        String(16), nullable=False, default="queued", server_default="queued"
+    )
+    target_raw = Column(Integer, nullable=False, default=40, server_default="40")
+    target_usable = Column(Integer, nullable=False, default=20, server_default="20")
+    raw_count = Column(Integer, nullable=False, default=0, server_default="0")
+    usable_count = Column(Integer, nullable=False, default=0, server_default="0")
+    zero_streak = Column(Integer, nullable=False, default=0, server_default="0")
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    owner = Column(String(64), nullable=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+    dedupe_key = Column(String(64), nullable=True)
+    error = Column(Text, nullable=True)
+    meta = Column(JSON, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_material_job_project_status", "project_id", "status"),
+        Index("ix_material_job_dedupe", "dedupe_key"),
+    )

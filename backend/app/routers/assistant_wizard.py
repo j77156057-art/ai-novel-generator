@@ -639,6 +639,54 @@ def get_messages(
     }
 
 
+class AppendMessageIn(StrictRequest):
+    """追加一条对话消息（目前只给「章节卡」与只读通知用）。
+
+    正文不写进 `payload`：`chapter` 卡只存 `generation_id / segment_no /
+    chapter_range / chars`，渲染时从 `generations` 读，避免同一段正文存两份。
+    """
+
+    role: str = "assistant"
+    kind: str = "plain"
+    text: str = ""
+    payload: dict[str, Any] | None = None
+    dedupe_key: str | None = None
+
+
+@router.post("/{project_id}/messages")
+def append_message(
+    project_id: int, body: AppendMessageIn, db: Session = Depends(get_db)
+) -> dict:
+    """追加一条消息（幂等：同 `dedupe_key` 重复提交返回原行）。"""
+    _require_project(db, project_id)
+    if body.role not in ("user", "assistant"):
+        raise HTTPException(status_code=422, detail="role 只接受 user/assistant")
+    if body.kind not in ("plain", "chapter", "notice"):
+        raise HTTPException(
+            status_code=422, detail="kind 只接受 plain/chapter/notice"
+        )
+    row = record_message(
+        db,
+        project_id,
+        role=body.role,
+        kind=body.kind,
+        text=body.text,
+        payload=body.payload,
+        dedupe_key=body.dedupe_key,
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="消息落库失败")
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "role": row.role,
+        "kind": row.kind,
+        "text": row.text or "",
+        "payload": row.payload or {},
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
 @router.get("/{project_id}/notices")
 def list_notices(project_id: int, db: Session = Depends(get_db)) -> dict:
     """未消费的提炼通知 + 最近一条任务状态（一次轮询同时更新进度和回执）。

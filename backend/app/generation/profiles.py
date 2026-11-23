@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+from app.style_dims import METHOD_DIMS
+
 #: 三种模式
 ContextProfile = Literal["original", "continuation", "roleplay"]
 
@@ -65,21 +67,6 @@ STYLE_REFERENCE_PATHS: frozenset[str] = frozenset({"original"})
 #: `文笔量化审计` 分块统计互相矛盾（句长同时是 53.0/44.0/50.2），
 #: 任何模式都不注入——只会让模型在四个数字之间摇摆。
 #: 续写时若需要数字锚定，用 L1 统计指纹（stylometry），那份是全篇汇总的。
-METHOD_DIMS: tuple[str, ...] = (
-    "人物描写手法",
-    "对白风格",
-    "段落编排",
-    "场景构建",
-    "情绪表达",
-    "节奏控制",
-    "世界观呈现",
-    "剧情编排模式",
-    "伏笔与悬念设计",
-    "节拍序列",
-    "高频场景模板",
-    "潜台词模式",
-    "语序编排",
-)
 
 PROFILE_RULES: dict[str, dict] = {
     # ── 原创：只给方法，不给任何实体 ─────────────────────────────

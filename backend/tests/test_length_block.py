@@ -193,6 +193,102 @@ def test_no_budget_and_no_path_does_not_guess():
     assert ev is None
 
 
+def test_compression_uses_true_hard_limit(monkeypatch):
+    """最终守卫传的 4800 是硬上限，不能再被乘成 5712（2026-11-23 真机问题）。"""
+    calls: dict[str, str] = {}
+
+    def fake_stream(provider, system, user):
+        calls["system"] = system
+        return [_text(4700)]
+
+    monkeypatch.setattr(engine, "_stream_with_retry", fake_stream)
+    got, rec = engine._compression_round(
+        SimpleNamespace(), _text(5844), 4000, hard_limit=4800)
+
+    assert "硬上限 4800 个字符" in calls["system"]
+    assert rec["accepted"] is True
+    assert rec["still_over_limit"] is False
+    assert rec["limit"] == 4800
+    assert char_count(got) == 4700
+
+
+def test_compression_rejects_candidate_still_over_limit(monkeypatch):
+    """「少了一点但仍超限」不再算压缩成功：必须重试，最终取压进上限的候选。"""
+    replies = iter([_text(5000), _text(4700)])
+
+    def fake_stream(provider, system, user):
+        return [next(replies)]
+
+    monkeypatch.setattr(engine, "_stream_with_retry", fake_stream)
+    got, rec = engine._compression_round(
+        SimpleNamespace(), _text(5844), 4000, hard_limit=4800)
+
+    first = rec["attempts"][0]
+    assert any(str(r).startswith("still_over_limit") for r in first["reasons"])
+    assert rec["accepted"] is True
+    assert rec["attempts"][1]["chars"] == 4700
+    assert rec["still_over_limit"] is False
+    assert char_count(got) == 4700
+
+
+def test_compression_floor_is_limit_based_when_original_oversized(monkeypatch):
+    """原文已超限时，85% 地板按上限算：压到 3000 才算过头，4700 可通过。"""
+    replies = iter([_text(3000), _text(4700)])
+
+    def fake_stream(provider, system, user):
+        return [next(replies)]
+
+    monkeypatch.setattr(engine, "_stream_with_retry", fake_stream)
+    got, rec = engine._compression_round(
+        SimpleNamespace(), _text(5844), 4000, hard_limit=4800)
+
+    assert any(
+        str(r).startswith("over_compressed") for r in rec["attempts"][0]["reasons"]
+    )
+    assert rec["accepted"] is True
+    assert char_count(got) == 4700
+
+
+def test_final_length_cap_passes_hard_limit(monkeypatch):
+    """守卫必须把 cap 作为 hard_limit 传下去，而不是当成新的 max_chars。"""
+    seen: dict[str, int | None] = {}
+
+    def fake_round(provider, text, max_chars, dialogue_floor=None, hard_limit=None):
+        seen["max_chars"] = max_chars
+        seen["hard_limit"] = hard_limit
+        return _text(4700), {"accepted": True}
+
+    monkeypatch.setattr(engine, "_compression_round", fake_round)
+    got, info = engine._enforce_length_cap(SimpleNamespace(), _text(5844), 4000)
+
+    assert seen == {"max_chars": 4000, "hard_limit": 4800}
+    assert info["applied"] is True
+    assert info["still_over"] is False
+    assert char_count(got) == 4700
+
+
+def test_final_length_cap_respects_max_attempts(monkeypatch):
+    """重写轮刚压过且失败时守卫只再试一次，不把同一提示重复两遍。"""
+    calls = {"n": 0}
+
+    def fake_round(provider, text, max_chars, dialogue_floor=None, hard_limit=None):
+        calls["n"] += 1
+        return _text(5000), {"accepted": True}
+
+    monkeypatch.setattr(engine, "_compression_round", fake_round)
+    _got, info = engine._enforce_length_cap(
+        SimpleNamespace(), _text(5844), 4000, max_attempts=1)
+    assert calls["n"] == 1
+    assert info["attempts"] == 1
+    assert info["still_over"] is True
+
+    calls["n"] = 0
+    _got, info = engine._enforce_length_cap(
+        SimpleNamespace(), _text(5844), 4000)
+    assert calls["n"] == 2
+    assert info["attempts"] == 2
+
+
 def test_commit_raises_and_persists_nothing(db, project):
     quality = {"length_path": {"path": "compression", "limit": 4800,
                                "compression_accepted": False}}

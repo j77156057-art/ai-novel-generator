@@ -16,6 +16,7 @@ import type {
   KgV3Slice,
   KgWorldviewEntity,
   KgWorldviewResponse,
+  KgV3WorkerStatus,
   NovelOut,
   ProjectOut,
   StyleNarrativeConflictsResponse,
@@ -400,24 +401,7 @@ function storyPage(dir: -1 | 1) {
 // ---------- Tab 6 Worker 状态 ----------
 // 视图层只关心「线程活没活/有没有积压/failed/stuck/empty」——后端 summary 已聚合，
 // 前端只负责展示 + 失败行手动重捞的二次确认。
-type WorkerRun = {
-  id: number;
-  segment_no: number | null;
-  status: string;
-  stuck: boolean;
-  empty: boolean;
-  duration_ms: number | null;
-  batch_stats: Record<string, unknown> | null;
-  error: string | null;
-  started_at: string | null;
-};
-type WorkerStatus = {
-  worker_alive: boolean;
-  pending: number;
-  summary: { success: number; failed: number; running: number; stuck: number; empty: number };
-  recent_runs: WorkerRun[];
-};
-const worker = ref<WorkerStatus | null>(null);
+const worker = ref<KgV3WorkerStatus | null>(null);
 const workerLoading = ref(false);
 const workerErr = ref<string | null>(null);
 const requeueBusy = ref(false);

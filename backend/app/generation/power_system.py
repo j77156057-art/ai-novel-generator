@@ -55,6 +55,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.generation.coerce import as_list as _as_list, as_text as _as_text
+
 #: 体系层的键。
 SYSTEM_KEYS = ("名称", "说明", "境界")
 
@@ -73,24 +75,6 @@ STAGE_KEYS = ("名称", "说明")
 DEFAULT_BANDS: tuple[str, ...] = ("凡境", "初入", "小成", "登堂", "一方", "顶尖")
 
 
-def _as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return "；".join(str(v).strip() for v in value if str(v).strip())
-    return str(value).strip()
-
-
-def _as_list(value: Any, limit: int = 30) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        items = [value] if value.strip() else []
-    elif isinstance(value, (list, tuple)):
-        items = [str(v).strip() for v in value if str(v).strip()]
-    else:
-        items = [str(value).strip()]
-    return items[:limit]
 
 
 def normalize_stage(raw: Any) -> dict:

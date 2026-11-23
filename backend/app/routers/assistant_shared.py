@@ -158,6 +158,43 @@ def evidence_rows_to_dicts(rows: list[Evidence]) -> list[dict]:
     ]
 
 
+def finish_rule_run(
+    db: Session,
+    run: Any,
+    *,
+    answer: str,
+    model_label: str,
+    issues: list[dict],
+    evidence_rows: list[Evidence],
+    tool_results: dict[str, Any],
+    rules_evaluated: list[str],
+    version_id: Any,
+) -> dict[str, Any]:
+    """「规则先行」端点共用的收尾：写 AgentRun 终态 + 组装响应体。
+
+    `model_label` 为空串 = 没过模型，`run.model` 记 `(local_fallback)`。
+    诊断 / 日志分析 / 审核三类端点的响应形状本来就同构，收口在这里避免
+    `findings` 别名与 confidence 口径各自漂移。
+    """
+    run.status = "success"
+    run.finished_at = _now_utc()
+    run.model = model_label or "(local_fallback)"
+    db.commit()
+    return {
+        "answer": answer,
+        "issues": issues,
+        # findings 保留为 issues 的兼容别名：既有调用方按 findings 读，
+        # 直接删掉会静默变成空列表。
+        "findings": issues,
+        "evidence": evidence_rows_to_dicts(evidence_rows),
+        "confidence": _confidence_from_evidence(evidence_rows),
+        "agent_run_id": run.id,
+        "tool_results": tool_results,
+        "rules_evaluated": list(rules_evaluated),
+        "version_id": version_id,
+    }
+
+
 def persist_evidence(
     db: Session, run_id: int, report: Any
 ) -> list[Evidence]:

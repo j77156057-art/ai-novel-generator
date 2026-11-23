@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass
 
 from sqlalchemy import func, or_, select
 
@@ -19,6 +20,10 @@ from app.agents.prompt_overrides import PromptKey, resolve_prompt_block
 from app.config import settings
 from app.generation.chapter_labels import commit_meta as _chapter_commit_meta
 from app.generation.chapter_labels import require_label as _require_chapter_label
+from app.generation.compression import (
+    _compression_round,
+    _enforce_length_cap,
+)
 from app.generation.length_guard import LengthBlocked
 from app.generation.length_guard import length_block_evidence as _length_block_evidence
 from app.generation.prompts import (
@@ -109,6 +114,7 @@ from app.style.consistency import (
     active_full_limits,
     active_gate_limits,
     char_count,
+    first_positive_percentile,
     gate_limits_from_percentiles,
     generation_gate,
     hanzi_count,
@@ -527,15 +533,6 @@ def _rhythm_reference_fallback(project: Project) -> dict:
     }
 
 
-def _first_positive(row: dict) -> float:
-    """分位行里第一个大于 0 的分位（p10 常为 0 的指标用它当有效下沿）。"""
-    for key in ("p10", "p25", "p50", "p75", "p90"):
-        v = row.get(key)
-        if isinstance(v, (int, float)) and float(v) > 0:
-            return float(v)
-    return 0.0
-
-
 def _dialogue_mix_fallback(project: Project) -> dict:
     """对白句类配比的退回值（v14）：配置优先，其次参考书**章级**常量表。
 
@@ -556,8 +553,8 @@ def _dialogue_mix_fallback(project: Project) -> dict:
         "陈述p50": float(stmt_row["p50"]),
         "问句p25": float(q_row["p25"]),
         "问句p90": float(q_row["p90"]),
-        "感叹p25": _first_positive(ARCHIVE_CHAPTER_PERCENTILES["对白感叹句占比"]),
-        "叹词p50": _first_positive(ARCHIVE_CHAPTER_PERCENTILES["对白叹词起头占比"]),
+        "感叹p25": first_positive_percentile(ARCHIVE_CHAPTER_PERCENTILES["对白感叹句占比"]),
+        "叹词p50": first_positive_percentile(ARCHIVE_CHAPTER_PERCENTILES["对白叹词起头占比"]),
         "source": "constant",
     }
 
@@ -866,8 +863,8 @@ def _archive_gate_limits(db, project: Project) -> dict:
         stmt = (chapter_pct.get("对白陈述句占比") or {}).get("p50")
         q25 = (chapter_pct.get("对白问句占比") or {}).get("p25")
         q90 = (chapter_pct.get("对白问句占比") or {}).get("p90")
-        exc = _first_positive(chapter_pct.get("对白感叹句占比") or {})
-        tan = _first_positive(chapter_pct.get("对白叹词起头占比") or {})
+        exc = first_positive_percentile(chapter_pct.get("对白感叹句占比") or {})
+        tan = first_positive_percentile(chapter_pct.get("对白叹词起头占比") or {})
         if stmt is not None and q25 is not None and q90 is not None and exc > 0 and tan > 0:
             dialogue_mix_reference = {
                 "陈述p50": float(stmt), "问句p25": float(q25),
@@ -3896,154 +3893,6 @@ def _chat_with_retry(provider, system: str, user: str, **kwargs) -> str:
         return provider.chat(system, user, **kwargs)
 
 
-def _brief_settings():
-    """读取外部素材工具的配置（全部走 `BriefSettings`，调用点不写死数值）。"""
-    from app.retrieval.brief.settings import BriefSettings
-
-    return BriefSettings.from_env()
-
-
-def _brief_backend_ready(cfg) -> tuple[bool, str]:
-    """是否有可用检索后端；返回 `(可用, 不可用原因)`。
-
-    免费后端（含无头模式）本来就不需要 `search_url`，之前拿 `search_url` 非空当
-    可见条件，会把免费路径整体藏掉、链路根本跑不起来。JSON 后端仍要求地址；
-    无头模式额外要求 playwright 已安装——否则给了工具也只会每轮报错。
-    """
-    kind = str(cfg.backend or "auto").strip().lower()
-    if kind == "json":
-        if str(cfg.search_url or "").strip():
-            return True, ""
-        return False, "no_search_url"
-    if getattr(cfg, "headless", False):
-        try:
-            import importlib.util
-
-            if importlib.util.find_spec("playwright") is None:
-                return False, "no_playwright"
-        except Exception:  # noqa: BLE001 —— 探测失败按不可用处理，保守
-            return False, "no_playwright"
-    return True, ""
-
-
-def _brief_visibility(cfg) -> str:
-    """工具可见性三态：`disabled` / `no_backend` / `visible`。
-
-    `no_backend` 涵盖 JSON 后端缺地址、无头模式缺 playwright、以及配置/初始化
-    异常——都是「开关开了但没有能干活的后端」，与「开关没开」必须分开看。
-    """
-    if not cfg.enabled:
-        return "disabled"
-    return "visible" if _brief_backend_ready(cfg)[0] else "no_backend"
-
-
-def _brief_tool_visible(cfg) -> bool:
-    """工具是否进初稿的 tools 列表：开关打开 + 有可用后端。
-
-    只把工具藏起来、而不是「先给出去再永远返回空串」：后者会让模型反复调用
-    一个死工具，每轮都烧 prompt 与回合，还把上下文塞满「无结果」。
-    """
-    return _brief_visibility(cfg) == "visible"
-
-
-def _start_brief_tool(db, project: Project, segment_no: int):
-    """每章开始时建工具并重置计数/秒数预算；不可见时返回 `(None, 留痕)`。
-
-    `state` 固定三种：`disabled`（开关没开）/ `no_backend`（开了但没有可用后端）/
-    `visible`（已给出工具）。`reason` 只做诊断细分，不参与判断。
-    """
-    meta: dict = {"enabled": False, "visible": False, "state": "disabled",
-                  "reason": "disabled"}
-    try:
-        cfg = _brief_settings()
-    except Exception:  # noqa: BLE001 —— 配置读不到就不给工具，不阻断生成
-        logging.getLogger(__name__).warning(
-            "读取外部素材工具配置失败，本章不提供该工具", exc_info=True)
-        return None, {**meta, "state": "no_backend", "reason": "settings_error"}
-    meta["enabled"] = bool(cfg.enabled)
-    if not cfg.enabled:
-        return None, meta
-    ready, reason = _brief_backend_ready(cfg)
-    if not ready:
-        return None, {**meta, "state": "no_backend", "reason": reason}
-    try:
-        from app.retrieval.brief.tool import BriefTool
-
-        tool = BriefTool(cfg, db=db)
-        tool.start_chapter(
-            session_id=f"gen-{project.id}-{segment_no}",
-            project_id=project.id,
-            novel_id=project.active_novel_id or None,
-            segment_no=segment_no,
-        )
-    except Exception:  # noqa: BLE001 —— 初始化失败只降级为「无工具」
-        logging.getLogger(__name__).warning(
-            "外部素材工具初始化失败，本章不提供该工具", exc_info=True)
-        return None, {**meta, "state": "no_backend", "reason": "init_error"}
-    return tool, {**meta, "visible": True, "state": "visible", "reason": None}
-
-
-def _brief_tool_quality(tool, meta: dict) -> dict:
-    """章末留痕：问了几次、问了什么、拿回多少字、缓存命中几次。
-
-    字段全部沿用 `BriefTool.chapter_stats()` 的键名，不另造一套；未启用时
-    只落「为什么没给工具」，便于事后区分「没开」与「开了但模型没问」。
-    """
-    if tool is None:
-        return dict(meta)
-    return {
-        **meta,
-        **tool.chapter_stats(),
-        "max_calls": tool.settings.max_calls_per_chapter,
-        "budget_s": tool.settings.chapter_budget_s,
-    }
-
-
-def _parse_tool_arguments(raw) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    try:
-        data = json.loads(str(raw or "{}"))
-    except (TypeError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-#: 素材轮的系统后缀：这一轮只判断「要不要查素材 + 取哪几条」，不写正文。
-#: 末轮成文走正常的 chat / stream_chat（流式），不把整章退化成一次性下发。
-#: 预算是硬上限：素材只是增强项，不能让「等待首字」被它拖到几十秒。
-_BRIEF_ROUND_BUDGET_S = 15.0
-
-
-def _complete_with_budget(provider, messages, *, tools, tool_choice, budget):
-    """给素材轮的结构化补全加预算；provider 不认这个参数时退回原签名。"""
-    try:
-        return provider.complete_message(
-            messages, tools=tools, tool_choice=tool_choice,
-            budget_seconds=budget,
-        )
-    except TypeError:
-        return provider.complete_message(
-            messages, tools=tools, tool_choice=tool_choice,
-        )
-
-_BRIEF_DECISION_SUFFIX = (
-    "\n\n【本轮只做素材判断】\n"
-    "先不要写正文。若本章需要补充具体细节（环境、器物、职业流程、专业信息等），"
-    "调用 search_external_material；它返回的是素材库候选清单（含 id、入库天数、"
-    "来源查询、标题与 ≤40 字摘要，不含正文）。随后调用 select_external_material，用方括号内的 id "
-    "挑选本章真正要用的条目；候选里没有合适的、或本章不需要素材，就直接回复「无」。"
-    "没被选中的条目会留在素材库里给后面的章节用。拿到素材后会在下一轮再请你写正文。"
-)
-
-#: 候选已就绪但模型没点名时的补充指令：只做选择，不再检索。
-_BRIEF_SELECT_SUFFIX = (
-    "\n\n【选素材】以上是素材库候选清单。"
-    "调用 select_external_material，用方括号内的 id 指定本章要用的条目；"
-    "若一条都用不上，直接回复「无」，不要硬选。"
-)
-
-
 def _material_suffix(blocks: list[str]) -> str:
     """把工具拿回的素材块拼到初稿 user prompt 末尾；没有素材时返回空串。
 
@@ -4058,110 +3907,6 @@ def _material_suffix(blocks: list[str]) -> str:
         "只能用于补充细节，不得改变人物、设定与章纲。\n\n"
         + "\n\n".join(chunks)
     )
-
-
-def _gather_brief_materials(provider, brief_tool, system: str, user: str, *,
-                            constraints: dict | None) -> list[str]:
-    """两阶段素材轮：先检索入库、再由模型点名取哪几条。
-
-    第一阶段 `search_external_material` 只把候选清单（id/入库时间/标题）回给模型；
-    第二阶段 `select_external_material` 选中的条目才作为素材块返回给调用方拼进初稿。
-    未选中的条目留在素材库，后续章节可再取；模型一次都不调用时，不联网、不写轨迹。
-
-    只在初稿阶段调用：重写轮与压缩轮不碰这里，避免同一章重复联网/计费。
-    任何异常都降级为「没有素材」，不阻断正文生成。
-    """
-    if brief_tool is None:
-        return []
-    from app.llm.provider import ToolsUnsupportedError, _apply_constraints
-    from app.retrieval.brief.tool import SELECT_TOOL_NAME
-
-    messages = [
-        {"role": "system", "content": system + _BRIEF_DECISION_SUFFIX},
-        {"role": "user", "content": _apply_constraints(user, constraints)},
-    ]
-    specs = [brief_tool.spec(), brief_tool.select_spec()]
-    blocks: list[str] = []
-    # 轮数 = 检索次数上限 + 选择轮 + 「不需要素材」的收尾判断。
-    rounds = max(1, int(brief_tool.settings.max_calls_per_chapter)) + 2
-    # 整段素材轮共享一份时长预算：每轮只能用「剩余额度」，
-    # 避免 rounds 轮各自吃满预算把首字拖到几十秒（实测单轮曾耗时 49s）。
-    deadline = time.monotonic() + _BRIEF_ROUND_BUDGET_S
-    try:
-        for _ in range(rounds):
-            remaining = deadline - time.monotonic()
-            if remaining <= 1:
-                break
-            message = _complete_with_budget(
-                provider, messages, tools=specs, tool_choice="auto",
-                budget=remaining,
-            )
-            calls = list(message.get("tool_calls") or [])
-            if not calls:
-                break
-            messages.append({
-                "role": "assistant",
-                "content": str(message.get("content") or ""),
-                "tool_calls": calls,
-            })
-            for call in calls:
-                fn = call.get("function") or {}
-                name = str(fn.get("name") or "")
-                result = brief_tool.dispatch(
-                    _parse_tool_arguments(fn.get("arguments")),
-                    name=name,
-                )
-                # 只有「选中」阶段返回的才是可注入正文的素材；检索阶段返回候选清单。
-                if result and name == SELECT_TOOL_NAME:
-                    blocks.append(result)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": str(call.get("id") or ""),
-                    "content": result,
-                })
-        # 模型常拿到候选后直接回复「无」；不补这一轮，两阶段会退化成「只查不选」。
-        if not blocks and brief_tool.chapter_stats().get("candidates", 0) > 0:
-            blocks = _ask_brief_selection(
-                provider, brief_tool, messages,
-                budget=deadline - time.monotonic(),
-            )
-    except ToolsUnsupportedError:
-        logging.getLogger(__name__).warning(
-            "当前模型链不支持 function calling，本章退化为无素材初稿")
-        return []
-    except Exception:  # noqa: BLE001 —— 素材是增强项，失败不阻断正文
-        logging.getLogger(__name__).warning(
-            "外部素材轮失败，本章按无素材继续", exc_info=True)
-        return []
-    return blocks
-
-
-def _ask_brief_selection(provider, brief_tool, messages: list[dict], *, budget: float) -> list[str]:
-    """候选已就绪但模型没点名时的补选轮：只给选择工具，不给检索工具。
-
-    单独留一个函数而不是塞进主循环，是为了让「是否真的走到选择」在代码上可读：
-    主循环里的选择调用与这里是同一个 `dispatch` 入口，留痕落在同一处。
-    """
-    from app.retrieval.brief.tool import SELECT_TOOL_NAME
-
-    if budget <= 1:
-        return []
-    convo = list(messages) + [{"role": "user", "content": _BRIEF_SELECT_SUFFIX}]
-    blocks: list[str] = []
-    message = _complete_with_budget(
-        provider, convo, tools=[brief_tool.select_spec()], tool_choice="auto",
-        budget=budget,
-    )
-    for call in list(message.get("tool_calls") or []):
-        fn = call.get("function") or {}
-        if str(fn.get("name") or "") != SELECT_TOOL_NAME:
-            continue
-        result = brief_tool.dispatch(
-            _parse_tool_arguments(fn.get("arguments")), name=SELECT_TOOL_NAME,
-        )
-        if result:
-            blocks.append(result)
-    return blocks
 
 
 def _truncation_regen_attempts() -> int:
@@ -4293,6 +4038,35 @@ def _stream_events_with_retry(provider, system: str, user: str, **kwargs):
             logging.getLogger(__name__).warning(
                 "流式生成命中可重试 HTTP 错误，1 次重试（复用同一 prompt）: %s", exc)
             time.sleep(1.5)
+
+
+def _stream_draft_events(
+    source,
+    pieces: list[str],
+    *,
+    on_chunk=None,
+):
+    """把 provider 的 (kind, piece) 事件流翻译成前端的 SSE 事件。
+
+    续写与重生成两条流式路径共用：`thinking / writing / chunk` 的推进口径
+    只有这一处。`pieces` 由调用方持有，循环结束后自行 join + `_strip_thinking`；
+    `on_chunk` 供重生成在每块正文到达时刷新快照租约心跳。
+    """
+    reasoning_chars = 0
+    for kind, piece in source:
+        if kind == "reasoning":
+            if reasoning_chars == 0:
+                yield {"type": "stage", "stage": "thinking", "label": "模型思考中"}
+            reasoning_chars += len(piece)
+            # text 给「作者 Agent」展示思考内容；chars 保留给旧前端做计数。
+            yield {"type": "reasoning", "chars": reasoning_chars, "text": piece}
+            continue
+        if not pieces:
+            yield {"type": "stage", "stage": "writing", "label": "流式撰写中"}
+        if on_chunk is not None:
+            on_chunk()
+        pieces.append(piece)
+        yield {"type": "chunk", "text": piece}
 
 
 def _sentence_quota_block(gate_info: dict | None, text: str,
@@ -4613,7 +4387,7 @@ def _dialogue_floor_rewrite_once(provider, text: str, floor: float,
     system = "你是中文小说编辑，只负责把指定段落里的叙述改写成人物对白。"
     last: dict = {"applied": False, "reason": "未执行"}
     for attempt in (1, 2):
-        take = 4 if attempt == 1 else 8
+        take = 4 if attempt == 1 else 12
         sel = ranked[:take]
         blocks = "\n\n".join(f"【{k + 1}】{lines[i]}" for k, i in enumerate(sel))
         strict = "" if attempt == 1 else (
@@ -4626,7 +4400,7 @@ def _dialogue_floor_rewrite_once(provider, text: str, floor: float,
 1. 把段落里的部分叙述改成人物对白；对白要符合人物声纹，不能是信息播报；
 2. 不新增事件、不改变情节顺序、不改变人物行为结果；
 3. 原有对白不得删减；
-4. 每段改写后字数与原文相差不超过 ±20%；
+4. **每段改写后不得超过原文长度**（只把叙述换成对白，不要把段落加长）；
 5. 只输出这几段，用【序号】开头，序号与下面一致；不要输出其它段落。
 
 {blocks}{strict}"""
@@ -4692,8 +4466,13 @@ def _dialogue_floor_rewrite_once(provider, text: str, floor: float,
 
 
 def _parse_floor_blocks(reply: str) -> dict[int, str]:
-    """解析 `【1】段落…【2】段落…`；解析不出返回空 dict。"""
-    marks = list(_FLOOR_BLOCK_RE.finditer(reply or ""))
+    """解析模型返回的逐段改写结果。
+
+    优先认 `【1】段落…`；模型不按格式返回时，退回「空行分段、按顺序编号」。
+    真机第 1 章就是格式漂移导致第一次改写被判「无法解析」。
+    """
+    reply = reply or ""
+    marks = list(_FLOOR_BLOCK_RE.finditer(reply))
     out: dict[int, str] = {}
     for pos, m in enumerate(marks):
         start = m.end()
@@ -4701,117 +4480,17 @@ def _parse_floor_blocks(reply: str) -> dict[int, str]:
         body = (reply[start:end] or "").strip()
         if body:
             out[int(m.group(1))] = body
-    return out
-
-
-def _compression_prompt(text: str, max_chars: int | None,
-                        dialogue_floor: float | None = None) -> tuple[str, str]:
-    """超长压缩轮的提示：只做一件事——压进汉字硬上限。
-
-    与普通重写不同，这里**允许删句、删段、删可割舍的情节**（篇幅问题，
-    不是「禁止删字抬段均」那个问题），但不允许新增内容、不允许改写成新情节。
-
-    2026-11-22（真机回归）：只超上限 28 字符时，模型把 4828 压到 3910，
-    对白占比从 24.8% 掉到 16.1%。两处修正：
-    - 目标从 `上限×0.95` 改为「上限 − 40」，并写明**只需删超出部分**；
-    - 明确「对白是主干，优先删叙述」，且压缩后对白占比不得低于原文与硬下限。
-    """
-    lim = length_limits(max_chars)
-    cur = char_count(text)
-    over = max(0, cur - lim["max"])
-    target = max(1, lim["max"] - 40)
-    before_ratio = _dialogue_ratio_of(text)
-    floor_txt = (
-        f"，且不得低于硬下限 {float(dialogue_floor):.1%}"
-        if isinstance(dialogue_floor, (int, float)) else ""
-    )
-    system = (
-        "你是长篇小说的压缩编辑。任务只有一个：把正文压到字数上限以内。\n"
-        f"当前 {cur} 个字符（含标点），硬上限 {lim['max']} 个字符，"
-        f"只需删约 {over + 40} 个字符，压到约 {target} 个即可；"
-        "**不要大幅删减**。\n"
-        "1. 允许删句、删段、删掉可以割舍的过场与次要情节；这是篇幅压缩，不是改写。\n"
-        "2. 不允许新增任何内容，不允许扩写、补写、改写成新情节。\n"
-        f"3. **对白是本章的主干**：优先删重复叙述、无信息量的动作与环境描写、"
-        f"重复的情绪描写；关键对白、转折、伏笔、本章必须发生的事件要保留。"
-        f"压缩后对白字占比不得低于原文（当前 {before_ratio:.1%}）{floor_txt}。\n"
-        "4. 只输出压缩后的正文，不要输出任何解释或标记。"
-    )
-    return system, f"请压缩以下正文：\n\n{text}"
-
-
-def _compression_round(provider, text: str, max_chars: int | None,
-                       dialogue_floor: float | None = None) -> tuple[str, dict]:
-    """两轮重写仍超限时追加的一次压缩轮；返回 (候选正文或原文, 留痕记录)。
-
-    接受条件（2026-11-22 起）：
-    1. **字符数比原文少**（这是压缩的目的）；
-    2. **不能压过头**：不少于原文的 85%（避免只超 28 字却删 900 字）；
-    3. **对白不能先被删**：对白字占比不低于原文的 95%，且原文达标时不低于硬下限。
-    第 2/3 条不过就换更严格的提示重试一次；仍不过保留原文。
-    """
-    limit = length_limits(max_chars)
-    before = char_count(text)
-    before_ratio = _dialogue_ratio_of(text)
-    record: dict = {
-        "round": "compression", "kind": "compression",
-        "chars_before": before, "limit": limit["max"],
-        "dialogue_before": round(before_ratio, 4),
-    }
-    min_after = max(int(limit["max"] * 0.85), int(before * 0.85))
-    attempts: list[dict] = []
-    for attempt in range(2):
-        try:
-            system, user = _compression_prompt(text, max_chars, dialogue_floor)
-            if attempt:
-                system += (
-                    "\n上一次压缩删得过多/删到了对白。这一次只删超出上限的部分，"
-                    "保留所有关键对白；对白占比必须不低于原文。"
-                )
-            rewritten = _strip_thinking(
-                "".join(_stream_with_retry(provider, system, user)))
-        except Exception as exc:  # noqa: BLE001 —— 压缩失败不阻断，保留原文
-            attempts.append({"attempt": attempt + 1, "error": f"{type(exc).__name__}"})
-            continue
-        if not rewritten or len(rewritten) < len(text) * 0.3:
-            attempts.append({"attempt": attempt + 1, "error": "empty_or_too_short"})
-            continue
-        after = char_count(rewritten)
-        after_ratio = _dialogue_ratio_of(rewritten)
-        reasons: list[str] = []
-        if after >= before:
-            reasons.append("no_reduction")
-        if after < min_after:
-            reasons.append(f"over_compressed（{after} < {min_after}）")
-        ratio_ok = after_ratio >= before_ratio * 0.95
-        if before_ratio >= (dialogue_floor or 0) and dialogue_floor:
-            ratio_ok = ratio_ok and after_ratio >= float(dialogue_floor)
-        if not ratio_ok:
-            reasons.append(
-                f"dialogue_dropped（{before_ratio:.1%}→{after_ratio:.1%}）"
-            )
-        attempts.append({
-            "attempt": attempt + 1, "chars": after,
-            "dialogue": round(after_ratio, 4), "reasons": reasons,
-        })
-        if not reasons:
-            record.update({
-                "candidate_chars": after,
-                "dialogue_after": round(after_ratio, 4),
-                "attempts": attempts,
-                "accepted": True, "discarded": False, "discard_reasons": [],
-                "chars_after": after,
-                "still_over_limit": after > limit["max"],
-            })
-            return rewritten, record
-    record.update({
-        "failed": True, "error": "rejected_candidates",
-        "reasons": attempts[-1].get("reasons") if attempts else [],
-        "attempts": attempts,
-        "accepted": False, "chars_after": before,
-        "still_over_limit": before > limit["max"],
-    })
-    return text, record
+    if out:
+        return out
+    parts = [p.strip() for p in re.split(r"\n\s*\n", reply.strip()) if p.strip()]
+    if len(parts) <= 1:
+        return {}
+    cleaned = []
+    for p in parts:
+        p = re.sub(r"^\s*(?:\d+\s*[.、)）]|第\s*\d+\s*段\s*[:：]?)\s*", "", p)
+        if p.strip():
+            cleaned.append(p.strip())
+    return {i + 1: p for i, p in enumerate(cleaned)}
 
 
 def _rewrite_rounds(
@@ -4821,6 +4500,7 @@ def _rewrite_rounds(
     max_chars: int | None = None,
     chapter_range: str | None = None,
     gate_limits: dict | None = None,
+    round_cap: int | None = None,
 ) -> tuple[str, str, dict | None, list[dict], dict]:
     """最多 `settings.rewrite_max_rounds` 轮重写（默认 2），每轮只针对「当前仍未过」的项。
 
@@ -4849,6 +4529,8 @@ def _rewrite_rounds(
     info_last = None
     limit = length_limits(max_chars)
     max_rounds = _rewrite_max_rounds()
+    if round_cap is not None:
+        max_rounds = max(0, min(max_rounds, int(round_cap)))
     stop_without_gain = _rewrite_stop_without_gain()
     skip_oversize = _rewrite_skip_oversize()
     oversize_at_entry = char_count(text) > limit["max"]
@@ -5878,20 +5560,116 @@ def current_node_prompt(
     return prompt
 
 
-def generate_next_segment(
+#: `_assemble_quality` 的哨兵：区分「同步路径不写 draft_stream」与
+#: 「流式路径写入了 draft_stream，但 provider 没回统计（值为 null）」。
+_NO_DRAFT_STREAM = object()
+
+
+@dataclass
+class _GenerationPrep:
+    """续写（同步 / 流式）共用的「装配上下文 + 拼提示词」结果。
+
+    两条路径此前各抄一份近 120 行的装配代码，口径靠人肉同步。集中到这里后，
+    「首段判定 / 章号 / 闸门带 / 复述闸门 / 节奏参考」只有一处实现。
+    """
+
+    provider: object
+    max_chars: int
+    ctx: dict
+    written: int
+    timeline_written: int
+    chapter_based: bool
+    chapter: int | None
+    node_prompt: str | None
+    appeared_names: list[str] | None
+    era_prompt_meta: dict
+    power_meta: dict
+    gate_limits_meta: dict
+    replay_prior: list
+    rhythm: dict
+    merge_cap: float | None
+    system: str
+    user: str
+
+
+@dataclass
+class _RefinedDraft:
+    """初稿经过「重写轮 + 确定性校正链」后的结果（同步 / 流式共用）。"""
+
+    text: str
+    summary: str
+    rewrite_info: dict | None
+    rewrite_rounds: list
+    length_path: dict
+    merge_after: dict
+    style_fix: dict
+    dialogue_floor_info: dict | None
+    voice_check: dict
+    voice_info: dict
+    replay_check: dict | None
+    replay_info: dict | None
+    era_meta: dict
+    merge_final: dict
+    paragraph_info: dict
+    quote_final: dict
+    final_length_info: dict | None
+
+
+def _character_scope(
     db,
     project: Project,
+    reminders: dict,
+    *,
+    chapter: int | None,
+    chapter_based: bool,
+    node_prompt: str | None,
+) -> tuple[list[str] | None, list[dict] | None, str | None, str]:
+    """回写角色卡 → 合并性别 → 算已出现人名 → 收窄本章可用阵容。
+
+    续写与重生成共用这一段口径；返回
+    `(appeared_names, eligible_chars, chapter_outline, chapter_context)`。
+    「收窄结果落到哪个结构」由调用方决定：续写写
+    `ctx["constraints"]["characters"]`，重生成过滤 `reminders["character_constraints"]`
+    ——两者的容器不同，但「谁有资格出场」的判断必须同源。
+    """
+    evidence_up_to = chapter if chapter_based else None
+    if chapter is not None:
+        _backfill_character_cards(db, project, up_to_chapter=evidence_up_to)
+    _merge_gender_into_reminders(reminders, project.plot_bible)
+    appeared_names = (
+        _appeared_character_names(db, project, reminders, up_to_chapter=evidence_up_to)
+        if chapter is not None else None
+    )
+    chapter_outline = chapter_outline_entry(project.outline, chapter)
+    chapter_context = "\n".join(x for x in (chapter_outline, node_prompt) if x)
+    eligible_chars = None
+    if chapter is not None:
+        all_chars, _ = merged_constraint_items(reminders, project.plot_bible)
+        eligible_chars, _ = filter_available_characters(
+            all_chars,
+            chapter=chapter,
+            chapter_context=chapter_context or None,
+            appeared_names=appeared_names,
+        )
+    return appeared_names, eligible_chars, chapter_outline, chapter_context
+
+
+def _prepare_generation(
+    db,
+    project: Project,
+    *,
     novel_ids: list[int] | None = None,
     provider=None,
     max_chars: int | None = None,
     chapter_range: str | None = None,
     fresh_start: bool = False,
-) -> dict:
-    """续写下一段（长文单段）：组装上下文 → 调用 LLM → 段级总结 → 落库 → 更新主线摘要链。
+    fast_mode: bool = False,
+    chapter_opening: str | None = None,
+) -> _GenerationPrep:
+    """装配续写所需的全部上下文，并把 system / user 提示词一次拼好。
 
-    长文策略：默认一次生成 project.generation_length 字（前端可改），而非多段短循环。
-    多段短循环会把前情/大纲反复塞进上下文，既压低缓存命中率又易触发会话压缩；
-    改为「用户每点一次生成 = 一次长段」，续写环靠段级总结链（短摘要）衔接，不重复搬运正文。
+    同步与流式两条路径共用同一份实现：任何口径调整只改这里，避免
+    「同步版修了、流式版没修」的历史漂移。
     """
     from app.llm.provider import get_llm_provider
 
@@ -5900,6 +5678,11 @@ def generate_next_segment(
 
     if provider is None:
         provider = get_llm_provider()
+    if fast_mode:
+        try:
+            provider = provider.variant(thinking_off=True, max_tokens=16000)
+        except Exception:  # noqa: BLE001 —— 不支持 variant 就保持原实例
+            pass
 
     # 字数：前端/项目配置优先；未配则回退长文默认 3000，彻底告别 800/1200 的碎段
     if max_chars is None:
@@ -5939,26 +5722,13 @@ def generate_next_segment(
     # 修复项 3/4：从已定稿正文回写性别/首次出场章节；再算「前序已出现的人名」。
     # 章号驱动项目只取当前章之前的稿（避免重写时用上一稿给自己作证）；
     # 无章节标签的老项目取全部历史，保持旧行为。
-    evidence_up_to = chapter if chapter_based else None
-    if chapter is not None:
-        _backfill_character_cards(db, project, up_to_chapter=evidence_up_to)
-    _merge_gender_into_reminders(ctx["reminders"], project.plot_bible)
-    appeared_names = (
-        _appeared_character_names(db, project, ctx["reminders"], up_to_chapter=evidence_up_to)
-        if chapter is not None else None
+    appeared_names, eligible_chars, chapter_outline, chapter_context = _character_scope(
+        db, project, ctx["reminders"],
+        chapter=chapter, chapter_based=chapter_based, node_prompt=node_prompt,
     )
-    chapter_outline = chapter_outline_entry(project.outline, chapter)
-    chapter_context = "\n".join(x for x in (chapter_outline, node_prompt) if x)
     # user 尾部的锁定名单也要按同一口径收窄，否则 system 说「未列出不要出场」、
     # 尾部 constraints 又把全量名字念一遍，两条约束继续打架。
-    if chapter is not None:
-        all_chars, _ = merged_constraint_items(ctx["reminders"], project.plot_bible)
-        eligible_chars, _ = filter_available_characters(
-            all_chars,
-            chapter=chapter,
-            chapter_context=chapter_context or None,
-            appeared_names=appeared_names,
-        )
+    if eligible_chars is not None:
         ctx["constraints"]["characters"] = [
             c.get("name") for c in eligible_chars if c.get("name")
         ]
@@ -6012,61 +5782,46 @@ def generate_next_segment(
         story_cards_block=_render_story_cards(db, project.id),
         replay_guard_block=replay_block,
         foreshadow_block=ctx.get("foreshadow_block"),
+        chapter_opening_block=chapter_opening,
+    )
+    return _GenerationPrep(
+        provider=provider,
+        max_chars=max_chars,
+        ctx=ctx,
+        written=written,
+        timeline_written=timeline_written,
+        chapter_based=chapter_based,
+        chapter=chapter,
+        node_prompt=node_prompt,
+        appeared_names=appeared_names,
+        era_prompt_meta=era_prompt_meta,
+        power_meta=power_meta,
+        gate_limits_meta=gate_limits_meta,
+        replay_prior=replay_prior,
+        rhythm=rhythm,
+        merge_cap=_merge_spc_cap(gate_limits_meta),
+        system=system,
+        user=user,
     )
 
-    from app.generation.author_research import (
-        backfill_adoption,
-        public_summary,
-        run_author_research,
-    )
 
-    # 自查默认关闭（settings.author_research_enabled）。关闭时只落一个
-    # `status="disabled"` 的占位，不跑工具、不调模型、不写 retrieval_logs。
-    research: dict = {
-        "enabled": False, "status": "disabled", "calls": [], "notes_block": "",
-    }
-    # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
-    # 重写/重生成是 AI 味修复，不传 stop
-    # v16：外部素材工具只在初稿的**素材轮**可见（结构化返回）；重写轮/压缩轮不碰。
-    brief_tool, brief_meta = _start_brief_tool(db, project, written + 1)
-    # 素材轮非流式（要结构化 tool_calls）；末轮成文仍走原来的 chat / stream_chat。
-    brief_blocks = _gather_brief_materials(
-        provider, brief_tool, system, user, constraints=ctx["constraints"])
-    draft_user = user + _material_suffix(brief_blocks)
-    text = _chat_with_retry(
-        provider, system, draft_user,
-        constraints=ctx["constraints"],
-        stop_sequences=get_section_stop_sequences(),
-    )
-    # v15：初稿撞 `max_tokens`（finish_reason=length）时**优先重生成**，
-    # 不在断头稿上直接压缩——压缩只会按比例缩短，断在半路的剧情不会自己接上。
-    draft_finish_reason = getattr(provider, "last_finish_reason", None)
-    text, truncation_info = _regenerate_if_truncated(
-        provider, text, draft_finish_reason,
-        lambda: _chat_with_retry(
-            provider, system, draft_user, constraints=ctx["constraints"],
-            stop_sequences=get_section_stop_sequences(),
-        ),
-    )
-    # 空稿（reasoning 吃光预算、正文 0 字）不重试就会落一条空段：
-    # 既污染摘要链，又让下一次生成的「前情」出现空条目。
-    if not text.strip():
-        text = _retry_empty_draft(
-            provider, system, draft_user, constraints=ctx["constraints"])
-        truncation_info["empty_draft_retry"] = bool(text.strip())
-        if not text.strip():
-            raise ValueError(
-                "模型返回空正文（重试后仍为空）；本段不落库，请重试生成")
-    # 截断判据两条独立：`finish_reason=length`（供给侧硬顶）与 `ends_complete`
-    # （末字符不是句末标点）。后者在补写/并段/重写之前对**初稿**取一次。
-    draft_ends_complete = bool(
-        analyze_repetition(text).metrics.ends_complete if text.strip() else False
-    )
-    # 1) 篇幅缺口先补写，再进闸门（重写轮不负责补篇幅，见 _complete_short_draft）。
-    #    补写门槛与极短对白上限都从参考档案的分位推（_archive_rhythm），换书自动适配。
-    #    rhythm 已在拼提示前取过（缓存命中），此处直接复用。
-    # 并段的硬上限是参考语料章级「段均句数」p90（闸门带已在拼提示前写入）。
-    merge_cap = _merge_spc_cap(gate_limits_meta)
+def _complete_draft(
+    provider,
+    text: str,
+    max_chars: int,
+    *,
+    ctx: dict,
+    rhythm: dict,
+    appeared_names: list[str] | None,
+    merge_cap: float | None,
+) -> tuple[str, str, dict, dict]:
+    """初稿的确定性前置处理：补篇幅缺口 → 合并极短纯对白段 → 出摘要。
+
+    重写轮不负责补篇幅（见 `_complete_short_draft`），所以必须放在闸门与
+    重写之前；合并上限用参考语料章级「段均句数」p90（闸门带已在拼提示前写入）。
+    """
+    # 1) 篇幅缺口先补写，再进闸门。补写门槛与极短对白上限都从参考档案的分位推
+    #    （_archive_rhythm），换书自动适配。
     text, completion_info = _complete_short_draft(
         provider, text, max_chars,
         min_ratio=rhythm.get("completion_min_ratio"),
@@ -6080,38 +5835,43 @@ def generate_next_segment(
         max_hanzi=rhythm.get("ultra_dialogue_max"),
         spc_cap=merge_cap,
     )
-    summary = provider.summarize(text)
+    return text, provider.summarize(text), completion_info, merge_info
 
-    # AI 味检测 + 针对性重写
-    narrative = _style_narrative(db, project)
-    forbidden = (narrative or {}).get("forbidden") or {}
-    rewrite_info = None
-    # 生成侧硬闸门：与 AI 腔判据并列，命中任一条就重写；最多两轮，第二轮只补剩余缺口。
-    # 判罚带按项目参考语料的章级分位现推（换参考书自动重推；推不出退回常量表）。
-    gate = generation_gate(
-        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
-    )
 
-    # —— 写后自查（2026-11-13 v2：缺口驱动；默认关闭）——
-    # 只有开关打开且初稿没过闸门才查；查询词由失败项反推。3–8 轮工具调用，
-    # 笔记只进重写轮。默认 `author_research_enabled=False`：段 11 实测 1/58 的
-    # 自查 token 只换来与段 9 持平的闸门表现，且段落类缺口方向相反，故不默认跑。
-    if settings.author_research_enabled and not gate.get("passed"):
-        research = run_author_research(
-            db, project, provider, ctx,
-            segment_no=written + 1,
-            gate=gate,
-            max_chars=max_chars,
-            node_prompt=node_prompt,
-            skeleton=_catalog_skeleton(db, project),
-        )
+def _refine_draft(
+    db,
+    project: Project,
+    ctx: dict,
+    provider,
+    text: str,
+    summary: str,
+    *,
+    forbidden: dict,
+    gate: dict,
+    research_notes: str | None,
+    max_chars: int,
+    chapter_range: str | None,
+    gate_limits_meta: dict,
+    merge_cap: float | None,
+    replay_prior: list,
+    appeared_names: list[str] | None,
+    written: int,
+    novel_ids: list[int] | None = None,
+    fast_mode: bool = False,
+) -> _RefinedDraft:
+    """初稿进闸门后的「重写轮 + 文风校正链」，同步 / 流式共用。
 
+    顺序是硬约束（每一步都可能新造下一道要修的问题）：
+    重写轮 → 并段 → 对白下限 → 形态/归属/省略号/beat/照搬 → 声纹 → 复述 →
+    时代自检 → 并段 → 段数下限 → 引号 → 字数守卫。
+    """
     text, summary, rewrite_info, rewrite_rounds, length_path = _rewrite_rounds(
         db, project, ctx, provider, text, summary, forbidden, gate,
-        research_notes=research.get("notes_block") or None,
+        research_notes=research_notes,
         max_chars=max_chars,
         chapter_range=chapter_range,
         gate_limits=gate_limits_meta.get("chapter_limits"),
+        round_cap=1 if fast_mode else None,
     )
 
     # 重写轮会重新排版，可能新造「整段只有引号、≤4 汉字」的对白段（第 5 章实测
@@ -6123,8 +5883,25 @@ def generate_next_segment(
 
     # 批 6：文风形态校正链（改写 → 形态 → 归属 → 省略号 → beat → 照搬）。
     # 放在并段之后、时代自检之前：它量的是「即将落库的正文」。
-    text, style_fix = _apply_style_corrections(
-        db, project, provider, text, novel_ids=novel_ids)
+    # 对白下限兜底必须在归属/声纹校正**之前**：先有足够对白，后面才有东西可改。
+    dialogue_floor_info = None
+    if fast_mode:
+        # 快速模式：跳过对白下限与整条文风校正链（归属/形态/省略号/照搬），
+        # 只保留确定性的并段、段数、引号与字数守卫。
+        dialogue_floor_info = {"applied": False, "reason": "fast_mode"}
+        style_fix = {"skipped": "fast_mode"}
+    else:
+        dialogue_floor = (
+            (gate_limits_meta.get("chapter_limits") or {}).get("对白字占比") or {}
+        ).get("min")
+        if dialogue_floor:
+            text, dialogue_floor_info = _dialogue_floor_rewrite_once(
+                provider, text, float(dialogue_floor), max_chars)
+            if dialogue_floor_info.get("applied"):
+                summary = provider.summarize(text)
+
+        text, style_fix = _apply_style_corrections(
+            db, project, provider, text, novel_ids=novel_ids)
     if any((style_fix.get(k) or {}).get("applied") for k in (
             "rewrite_info", "form_info", "attr_info", "ell_info", "beat_info")):
         summary = provider.summarize(text)
@@ -6133,11 +5910,14 @@ def generate_next_segment(
     # 统计台词，发现有人只报信息/没有声纹，就让模型只改对白与引出方式再试一次。
     # 不达标就保留原稿（`_voice_rewrite_once` 内部做字数与改善校验）。
     voice_check = _dialogue_voice_check(project, text)
-    text, voice_info = _voice_rewrite_once(
-        db, project, provider, text, voice_check, max_chars, chapter_range)
-    if voice_info.get("applied"):
-        summary = provider.summarize(text)
-        voice_check = voice_info.get("after") or _dialogue_voice_check(project, text)
+    if fast_mode:
+        voice_info = {"applied": False, "reason": "fast_mode"}
+    else:
+        text, voice_info = _voice_rewrite_once(
+            db, project, provider, text, voice_check, max_chars, chapter_range)
+        if voice_info.get("applied"):
+            summary = provider.summarize(text)
+            voice_check = voice_info.get("after") or _dialogue_voice_check(project, text)
 
     # 复述闸门（写后）：本章开头若在重演上一章场景，只改开头一次。
     # 判据不命中（绝大多数章）时零模型调用；改写不达标保留原稿。
@@ -6146,22 +5926,11 @@ def generate_next_segment(
     if replay_prior:
         replay_check = scene_replay_check(
             text, [r.get("text") or "" for r in replay_prior])
-        if replay_check.get("replay"):
+        if replay_check.get("replay") and not fast_mode:
             text, replay_info = replay_rewrite_once(
                 provider, text, replay_check, replay_prior, max_chars)
             if replay_info.get("applied"):
                 summary = provider.summarize(text)
-
-    # 对白下限兜底：重写轮没把对白拉到硬下限时，落库前再专攻一次。
-    dialogue_floor_info = None
-    dialogue_floor = (
-        (gate_limits_meta.get("chapter_limits") or {}).get("对白字占比") or {}
-    ).get("min")
-    if dialogue_floor:
-        text, dialogue_floor_info = _dialogue_floor_rewrite_once(
-            provider, text, float(dialogue_floor), max_chars)
-        if dialogue_floor_info.get("applied"):
-            summary = provider.summarize(text)
 
     # 时代越界自检：默认 report（只扫描、落 meta，不改正文）。
     # 显式 rewrite 模式下才可能改 text；改过就重算摘要，避免摘要与正文脱节。
@@ -6171,6 +5940,10 @@ def generate_next_segment(
     )
     if text != era_before:
         summary = provider.summarize(text)
+
+    # 声纹/复述等改写可能新造「整段只有引号」的极短对白段，落库前再并一次。
+    text, merge_final = merge_ultra_short_dialogue(
+        text, names=list(appeared_names or []), spc_cap=merge_cap)
 
     # 段数下限兜底：只差一两段时按句末切分，不为一个排版指标再调模型。
     min_paras = (
@@ -6185,6 +5958,73 @@ def generate_next_segment(
     if quote_final.get("applied"):
         summary = provider.summarize(text)
 
+    # 最终字数守卫：并段/切分等后处理可能把正文顶过上限，落库前再压一次。
+    final_length_info = None
+    if char_count(text) > int(length_limits(max_chars)["max"]):
+        text, final_length_info = _enforce_length_cap(
+            provider, text, max_chars,
+            dialogue_floor=(
+                (gate_limits_meta.get("chapter_limits") or {}).get("对白字占比") or {}
+            ).get("min"),
+            # 重写轮刚压过且失败时只再试一次：同提示重复两次没有收益。
+            max_attempts=(
+                1 if length_path.get("path") == "compression"
+                and not length_path.get("compression_accepted") else 2
+            ),
+        )
+        if final_length_info.get("applied"):
+            summary = provider.summarize(text)
+
+    return _RefinedDraft(
+        text=text,
+        summary=summary,
+        rewrite_info=rewrite_info,
+        rewrite_rounds=rewrite_rounds,
+        length_path=length_path,
+        merge_after=merge_after,
+        style_fix=style_fix,
+        dialogue_floor_info=dialogue_floor_info,
+        voice_check=voice_check,
+        voice_info=voice_info,
+        replay_check=replay_check,
+        replay_info=replay_info,
+        era_meta=era_meta,
+        merge_final=merge_final,
+        paragraph_info=paragraph_info,
+        quote_final=quote_final,
+        final_length_info=final_length_info,
+    )
+
+
+def _assemble_quality(
+    db,
+    project: Project,
+    text: str,
+    *,
+    max_chars: int,
+    gate_limits_meta: dict,
+    refined: _RefinedDraft,
+    chapter: int | None,
+    ctx: dict,
+    era_prompt_meta: dict,
+    written: int,
+    truncation_info: dict,
+    draft_ends_complete: bool,
+    completion_info: dict,
+    merge_info: dict,
+    draft_stream_stats: dict | None | object = _NO_DRAFT_STREAM,
+) -> tuple[dict, list[str], dict]:
+    """把终稿的所有度量与留痕装进 quality（同步 / 流式共用）。
+
+    `draft_stream_stats`：流式版独有的初稿增量留痕；同步版不传（保持 key 不出现）。
+    """
+    rewrite_info = refined.rewrite_info
+    rewrite_rounds = refined.rewrite_rounds
+    length_path = refined.length_path
+    era_meta = refined.era_meta
+    merge_after = refined.merge_after
+    merge_final = refined.merge_final
+
     # 复读闸门（P1 · I2）：落库前算好，与正文同一次 INSERT 落 quality_json。
     # 篇幅判据用整段预算；P1 是新段生成，不是改写。
     quality, repetition, warnings = _quality_check(
@@ -6196,13 +6036,17 @@ def generate_next_segment(
     )
     quality["style_gate"] = gate_final
     # 批 6：校正链的逐道留痕（跑没跑、为什么没跑、改了哪些指标）。
-    quality["style_corrections"] = style_fix
-    quality["dialogue_voice_check"] = voice_check
-    quality["voice_rewrite"] = voice_info
-    quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
-    quality["quote_final"] = quote_final
-    quality["dialogue_floor"] = dialogue_floor_info
-    quality["paragraph_floor"] = paragraph_info
+    quality["style_corrections"] = refined.style_fix
+    quality["dialogue_voice_check"] = refined.voice_check
+    quality["voice_rewrite"] = refined.voice_info
+    quality["replay_guard"] = {
+        "check": refined.replay_check, "rewrite": refined.replay_info,
+    }
+    quality["quote_final"] = refined.quote_final
+    quality["dialogue_floor"] = refined.dialogue_floor_info
+    quality["paragraph_floor"] = refined.paragraph_info
+    quality["merge_final"] = merge_final
+    quality["final_length"] = refined.final_length_info
     # v15：结构检测（情节点覆盖 / 越章材料 / 人物性别一致），只写留痕、不改正文；
     # 是否阻断由 `structure_guard_mode` 在 `_commit_segment` 决定。
     quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
@@ -6234,12 +6078,6 @@ def generate_next_segment(
         "still_over_limit": _final_chars > length_path["limit"],
         "compression_accepted": length_path["compression_accepted"],
     }
-    # v16：外部素材工具留痕（问了几次/问了什么/拿回多少字/缓存命中几次）。
-    # 未启用时只落「为什么没给工具」，与「开了但模型一次没问」可区分。
-    # 采纳粗判必须用**最终正文**：只记注入条数看不出素材有没有帮上忙。
-    if brief_tool is not None:
-        brief_tool.note_chapter_text(text)
-    quality["brief_tool"] = _brief_tool_quality(brief_tool, brief_meta)
     # v15：截断留痕。两条判据独立：供给侧的 `finish_reason=length`，与正文末字符
     # 是否收束（`ends_complete`）。`final_from_truncated_draft` 为真 = 终稿源自
     # 被截断的初稿（典型是压缩轮在断头稿上收口）；此时 `passed` 一律压为 False，
@@ -6295,6 +6133,10 @@ def generate_next_segment(
     # C（2026-11-13）：重写轮次随正文落库。此前只进接口返回值，事后查不到
     # 「跑了几轮、哪轮失败、为什么没修好」——第 4 章第 2 轮 HTTP 400 就是这样丢的。
     quality["rewrite_rounds"] = rewrite_rounds
+    if draft_stream_stats is not _NO_DRAFT_STREAM:
+        # 流式初稿的 reasoning/正文增量留痕：首字等待到底是供应商排队、思考还是
+        # 网络抖动。拿不到（不回 reasoning 字段）就是 null，不会被读成「没思考」。
+        quality["draft_stream"] = _draft_stream_quality(draft_stream_stats)
     # 补写与并段都是「生成后确定性处理」，必须随正文留痕：补了多少、并了几段、
     # 有没有因为复述/复读被丢弃，否则事后无法区分「模型写够的」和「补出来的」。
     if completion_info.get("triggered"):
@@ -6313,23 +6155,32 @@ def generate_next_segment(
     if not gate_final["passed"]:
         warnings.append("文风硬指标未达标：" + "；".join(gate_final["reasons"]))
 
-    # 段末回填「查了有没有用」：能程序判的判（规则参数是否出现在正文、anchor 原文
-    # 是否有字面重合），判不了的显式记 unjudgeable；同时把判定的 adopted_rule_ids
-    # 写回 retrieval_logs（未回填 = 未统计，不能当成「查了不用」）。
-    author_research = public_summary(
-        research, backfill_adoption(db, research, text)
-    )
-    quality["author_research"] = author_research
+    return quality, warnings, repetition
 
-    gen, segment_no = _commit_segment(
-        db, project, text, summary,
-        meta={"era": {**era_prompt_meta, **era_meta}, "power": power_meta},
-        quality=quality,
-        chapter_range=chapter_range,
-        prompt_json=_prompt_snapshot(system, draft_user),
-        authority_json=_authority_snapshot(project, ctx, chapter_range),
-    )
 
+def _after_commit(
+    db,
+    project: Project,
+    provider,
+    text: str,
+    *,
+    gen: Generation,
+    segment_no: int,
+    quality: dict,
+    written: int,
+    timeline_written: int,
+    chapter_based: bool,
+    power_meta: dict,
+    chapter_range: str | None,
+    ctx: dict,
+    fresh_start: bool = False,
+    kg_swallow_errors: bool = False,
+) -> dict:
+    """落库后的簿记：节点判定 → KG → v3 → 支线 → 摘要滚上 → 观测。
+
+    `kg_swallow_errors`：流式路径必须吞掉簿记异常（正文已落库，done 事件
+    必须照发），同步路径仍让异常抛出，保持旧行为。
+    """
     # —— v2.1：exit_condition LLM 判定 → 必要时提前切节点（§13 待定项落地）——
     # 此时本段刚 commit 完，state 还没 advance（advance 是下次预检时触发的）。
     # 在「commit 之前」的 current_node + 刚生成的正文上判定。
@@ -6352,6 +6203,14 @@ def generate_next_segment(
             "skipped": "repetition_degenerate",
             "reason": "本段疑似复读，已跳过 KG 抽取",
         }
+    elif kg_swallow_errors:
+        # 簿记异常绝不打断 SSE：正文已落库，done 事件必须照样发出，
+        # 否则前端表现为「生成卡住且无结果」。
+        try:
+            kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("流式 KG 簿记失败，段落已落库: %s", exc)
+            kg_stats = {"merged": False, "reason": f"KG 簿记失败：{str(exc)[:100]}"}
     else:
         kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
     power_meta = _attach_power_meta(db, gen, power_meta, kg_stats)
@@ -6366,20 +6225,13 @@ def generate_next_segment(
     # —— v2.5：支线滚动触发 ——
     # 在 KG 合并后跑——这样能查到本段新产生的角色/钩子。
     # roll_branch 读存档 state、判断 signal、切支线、落库——失败静默兜底。
-    # last_branch_written: 上次切支线时的已写段数——state 里没有存这个，
-    # 简化方案：从当前存档 plot_timeline 里读"分支段已写"（粗略：state.current_node
-    # 是否为分支 kind），如果当前是分支段已写过 MIN_GAP_SEGMENTS 才允许再切。
-    # 第一版简化：last_branch_written=None 总是允许切（最宽松）。
-    # 后续可优化：把 last_branch_written 存到 plot_timeline 顶层。
-    # 注：roll_branch 返回 (new_state, info_dict)——新 state 用于 state 推进，
-    # info_dict 透传给前端。这里 _new_state 不需要（roll_branch 内部已落库），
-    # 取 info_dict 当作 branch_roll。
-    from app.generation.branch import roll_branch as _roll_branch
+    # 开篇没有时间线 state（judge 已跳过），支线滚动无状态可读。
     _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
     if fresh_start:
-        # 开篇没有时间线 state（judge 已跳过），支线滚动无状态可读。
         branch_info = None
     else:
+        from app.generation.branch import roll_branch as _roll_branch
+
         _new_state, branch_info = _roll_branch(
             db, project, _load_timeline_state_for_branch(db, project, written),
             provider, _post_commit_written, last_branch_written=None,
@@ -6391,17 +6243,6 @@ def generate_next_segment(
 
     # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
     style_warning = _style_warning(text, _style_profile(db, project))
-    # v2.1：style_warning 落库（段级历史，>500 截断）
-    if style_warning:
-        try:
-            from app.style import append_style_warning
-            append_style_warning(db, project, segment_no, style_warning)
-        except Exception:  # noqa: BLE001 —— 落库失败绝不能阻断生成主流程
-            logging.getLogger(__name__).warning(
-                "style_warning 落库失败 (seg %s): %s", segment_no, style_warning, exc_info=True)
-    # v2.1：每 AUTO_AUDIT_INTERVAL 段异步触发 audit_kg（不阻塞 generate）
-    if segment_no and segment_no % AUTO_AUDIT_INTERVAL == 0:
-        _schedule_async_audit_kg(db, project.id)
 
     # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换（旁路观测）
     # 启发式会有假阳性（普通词组也报），调用方拿到列表后可聚合展示
@@ -6418,11 +6259,226 @@ def generate_next_segment(
         )
 
     return {
-        "kg_update": kg_stats,
-        "v3_extraction": v3_extraction,
-        "summary_tree": tree_stats,
         "node_judge": node_judge,
-        "branch_roll": branch_info,
+        "kg_stats": kg_stats,
+        "power_meta": power_meta,
+        "v3_extraction": v3_extraction,
+        "branch_info": branch_info,
+        "tree_stats": tree_stats,
+        "style_warning": style_warning,
+        "unlisted": unlisted,
+    }
+
+
+def generate_next_segment(
+    db,
+    project: Project,
+    novel_ids: list[int] | None = None,
+    provider=None,
+    max_chars: int | None = None,
+    chapter_range: str | None = None,
+    fresh_start: bool = False,
+    fast_mode: bool = False,
+    chapter_opening: str | None = None,
+) -> dict:
+    """续写下一段（长文单段）：组装上下文 → 调用 LLM → 段级总结 → 落库 → 更新主线摘要链。
+
+    长文策略：默认一次生成 project.generation_length 字（前端可改），而非多段短循环。
+    多段短循环会把前情/大纲反复塞进上下文，既压低缓存命中率又易触发会话压缩；
+    改为「用户每点一次生成 = 一次长段」，续写环靠段级总结链（短摘要）衔接，不重复搬运正文。
+    """
+    # 装配上下文 + 拼提示词：与流式版共用同一份实现（见 _prepare_generation）。
+    prep = _prepare_generation(
+        db, project, novel_ids=novel_ids, provider=provider, max_chars=max_chars,
+        chapter_range=chapter_range, fresh_start=fresh_start, fast_mode=fast_mode,
+        chapter_opening=chapter_opening,
+    )
+    provider = prep.provider
+    max_chars = prep.max_chars
+    ctx = prep.ctx
+    system, user = prep.system, prep.user
+    # 局部变量保持旧名：后面的流水线与返回值读起来和拆分前一致。
+    written = prep.written
+    timeline_written = prep.timeline_written
+    chapter_based = prep.chapter_based
+    chapter = prep.chapter
+    node_prompt = prep.node_prompt
+    appeared_names = prep.appeared_names
+    era_prompt_meta = prep.era_prompt_meta
+    power_meta = prep.power_meta
+    gate_limits_meta = prep.gate_limits_meta
+    replay_prior = prep.replay_prior
+    rhythm = prep.rhythm
+    merge_cap = prep.merge_cap
+
+    from app.generation.author_research import (
+        backfill_adoption,
+        public_summary,
+        run_author_research,
+    )
+
+    # 自查默认关闭（settings.author_research_enabled）。关闭时只落一个
+    # `status="disabled"` 的占位，不跑工具、不调模型、不写 retrieval_logs。
+    research: dict = {
+        "enabled": False, "status": "disabled", "calls": [], "notes_block": "",
+    }
+    # v2.6：节点粒度根治——per-request 传 stop token（不用单例 setter，避免跨请求污染）
+    # 重写/重生成是 AI 味修复，不传 stop
+    # 外部素材只走「本书素材包」（materials/hook）；旧 brief 工具轮已删除
+    # （2026-11-23：它会在慢模型上撞 960s 总时长，且与素材包功能重叠）。
+    brief_blocks: list[str] = []
+    # 本书素材包：注入已整理素材 + 排队后台调研；包太大时追加一轮按需工具调用。
+    # 全部失败都只降级为「无素材」，不阻断正文。
+    try:
+        from app.materials.hook import collect as _collect_material_pack
+
+        brief_blocks = _collect_material_pack(
+            db, project, written + 1,
+            provider=provider, brief_blocks=brief_blocks,
+            allow_tool_round=not fast_mode,
+        )
+    except Exception:  # noqa: BLE001 —— 素材是增强项
+        logging.getLogger(__name__).warning(
+            "本书素材包注入失败，本章按无素材继续", exc_info=True)
+    draft_user = user + _material_suffix(brief_blocks)
+    text = _chat_with_retry(
+        provider, system, draft_user,
+        constraints=ctx["constraints"],
+        stop_sequences=get_section_stop_sequences(),
+    )
+    # v15：初稿撞 `max_tokens`（finish_reason=length）时**优先重生成**，
+    # 不在断头稿上直接压缩——压缩只会按比例缩短，断在半路的剧情不会自己接上。
+    draft_finish_reason = getattr(provider, "last_finish_reason", None)
+    text, truncation_info = _regenerate_if_truncated(
+        provider, text, draft_finish_reason,
+        lambda: _chat_with_retry(
+            provider, system, draft_user, constraints=ctx["constraints"],
+            stop_sequences=get_section_stop_sequences(),
+        ),
+    )
+    # 空稿（reasoning 吃光预算、正文 0 字）不重试就会落一条空段：
+    # 既污染摘要链，又让下一次生成的「前情」出现空条目。
+    if not text.strip():
+        text = _retry_empty_draft(
+            provider, system, draft_user, constraints=ctx["constraints"])
+        truncation_info["empty_draft_retry"] = bool(text.strip())
+        if not text.strip():
+            raise ValueError(
+                "模型返回空正文（重试后仍为空）；本段不落库，请重试生成")
+    # 截断判据两条独立：`finish_reason=length`（供给侧硬顶）与 `ends_complete`
+    # （末字符不是句末标点）。后者在补写/并段/重写之前对**初稿**取一次。
+    draft_ends_complete = bool(
+        analyze_repetition(text).metrics.ends_complete if text.strip() else False
+    )
+    # 1) 补篇幅缺口 + 合并极短纯对白段 + 出摘要（同步/流式共用）。
+    text, summary, completion_info, merge_info = _complete_draft(
+        provider, text, max_chars,
+        ctx=ctx, rhythm=rhythm, appeared_names=appeared_names, merge_cap=merge_cap,
+    )
+
+    # AI 味检测 + 针对性重写
+    narrative = _style_narrative(db, project)
+    forbidden = (narrative or {}).get("forbidden") or {}
+    # 生成侧硬闸门：与 AI 腔判据并列，命中任一条就重写；最多两轮，第二轮只补剩余缺口。
+    # 判罚带按项目参考语料的章级分位现推（换参考书自动重推；推不出退回常量表）。
+    gate = generation_gate(
+        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
+    )
+
+    # —— 写后自查（2026-11-13 v2：缺口驱动；默认关闭）——
+    # 只有开关打开且初稿没过闸门才查；查询词由失败项反推。3–8 轮工具调用，
+    # 笔记只进重写轮。默认 `author_research_enabled=False`：段 11 实测 1/58 的
+    # 自查 token 只换来与段 9 持平的闸门表现，且段落类缺口方向相反，故不默认跑。
+    if settings.author_research_enabled and not gate.get("passed"):
+        research = run_author_research(
+            db, project, provider, ctx,
+            segment_no=written + 1,
+            gate=gate,
+            max_chars=max_chars,
+            node_prompt=node_prompt,
+            skeleton=_catalog_skeleton(db, project),
+        )
+
+    # 重写轮 + 确定性校正链（同步/流式共用；顺序见 _refine_draft docstring）。
+    refined = _refine_draft(
+        db, project, ctx, provider, text, summary,
+        forbidden=forbidden,
+        gate=gate,
+        research_notes=research.get("notes_block") or None,
+        max_chars=max_chars,
+        chapter_range=chapter_range,
+        gate_limits_meta=gate_limits_meta,
+        merge_cap=merge_cap,
+        replay_prior=replay_prior,
+        appeared_names=appeared_names,
+        written=written,
+        novel_ids=novel_ids,
+        fast_mode=fast_mode,
+    )
+    text = refined.text
+    summary = refined.summary
+
+    # 终稿度量与留痕（同步 / 流式共用，见 _assemble_quality）。
+    quality, warnings, repetition = _assemble_quality(
+        db, project, text,
+        max_chars=max_chars,
+        gate_limits_meta=gate_limits_meta,
+        refined=refined,
+        chapter=chapter,
+        ctx=ctx,
+        era_prompt_meta=era_prompt_meta,
+        written=written,
+        truncation_info=truncation_info,
+        draft_ends_complete=draft_ends_complete,
+        completion_info=completion_info,
+        merge_info=merge_info,
+    )
+
+    # 段末回填「查了有没有用」：能程序判的判（规则参数是否出现在正文、anchor 原文
+    # 是否有字面重合），判不了的显式记 unjudgeable；同时把判定的 adopted_rule_ids
+    # 写回 retrieval_logs（未回填 = 未统计，不能当成「查了不用」）。
+    author_research = public_summary(
+        research, backfill_adoption(db, research, text)
+    )
+    quality["author_research"] = author_research
+
+    gen, segment_no = _commit_segment(
+        db, project, text, summary,
+        meta={"era": {**era_prompt_meta, **refined.era_meta}, "power": power_meta},
+        quality=quality,
+        chapter_range=chapter_range,
+        prompt_json=_prompt_snapshot(system, draft_user),
+        authority_json=_authority_snapshot(project, ctx, chapter_range),
+    )
+
+    # 落库后的簿记（同步 / 流式共用，见 _after_commit）。
+    after = _after_commit(
+        db, project, provider, text,
+        gen=gen, segment_no=segment_no, quality=quality,
+        written=written, timeline_written=timeline_written,
+        chapter_based=chapter_based, power_meta=power_meta,
+        chapter_range=chapter_range, ctx=ctx,
+        fresh_start=fresh_start, kg_swallow_errors=False,
+    )
+    style_warning = after["style_warning"]
+    # v2.1：style_warning 落库（段级历史，>500 截断）
+    if style_warning:
+        try:
+            from app.style import append_style_warning
+            append_style_warning(db, project, segment_no, style_warning)
+        except Exception:  # noqa: BLE001 —— 落库失败绝不能阻断生成主流程
+            logging.getLogger(__name__).warning(
+                "style_warning 落库失败 (seg %s): %s", segment_no, style_warning, exc_info=True)
+    # v2.1：每 AUTO_AUDIT_INTERVAL 段异步触发 audit_kg（不阻塞 generate）
+    if segment_no and segment_no % AUTO_AUDIT_INTERVAL == 0:
+        _schedule_async_audit_kg(db, project.id)
+
+    return {
+        "kg_update": after["kg_stats"],
+        "v3_extraction": after["v3_extraction"],
+        "summary_tree": after["tree_stats"],
+        "node_judge": after["node_judge"],
+        "branch_roll": after["branch_info"],
         "segment_no": segment_no,
         "chapter_range": gen.chapter_range,
         "text": text,
@@ -6432,9 +6488,9 @@ def generate_next_segment(
         "constraints": ctx["constraints"],
         "rag_context": ctx["rag_context"],
         "style_warning": style_warning,
-        "unlisted_characters": unlisted,
-        "rewrite_info": rewrite_info,
-        "rewrite_rounds": rewrite_rounds,
+        "unlisted_characters": after["unlisted"],
+        "rewrite_info": refined.rewrite_info,
+        "rewrite_rounds": refined.rewrite_rounds,
         "author_research": author_research,
         "repetition": repetition,
         "length": (quality or {}).get("length"),
@@ -6453,6 +6509,8 @@ def generate_next_segment_stream(
     provider=None,
     max_chars: int | None = None,
     chapter_range: str | None = None,
+    fast_mode: bool = False,
+    chapter_opening: str | None = None,
 ):
     """流式续写生成器：逐 delta 产出 {type:chunk} 事件，完成后落库并返回 {type:done}。
 
@@ -6463,107 +6521,30 @@ def generate_next_segment_stream(
     剔除 plot_bible 全字段 + premise。commit 段后调 `_judge_and_advance`
     （与同步版同口径）—— yield 一个 `node_judge` 事件。
     """
-    from app.llm.provider import get_llm_provider
-
     yield {"type": "stage", "stage": "prepare", "label": "装配上下文"}
 
-    # 档案预检：与 generate_next_segment 同——无缓存档案时明确失败，
-    # 不把请求挂死在同步蒸馏上（流式下作为 SSE error 事件下发）。
-    _require_distill_ready(db, project)
-
-    if provider is None:
-        provider = get_llm_provider()
-    if max_chars is None:
-        max_chars = project.generation_length or 4000
-
-    # 同 generate_next_segment：先补齐粗层，再拼有界前情（幂等，常态零开销）
-    _rollup_summary_tree(db, project, provider)
-
-    ctx = build_context(db, project, novel_ids)
-    overrides = _prompt_overrides(db, project.id)
-    is_opening = not ctx["prior_blocks"] and not ctx["prior_summaries"]
-    # —— 时间线：算出当前剧情点提示（与同步版同口径，db 用于落库）——
-    written = _next_segment_no(db, project.id) - 1
-    timeline_written, chapter_based = _timeline_progress(db, project)
-    chapter = _chapter_ordinal(chapter_range)
-    if chapter is None and chapter_based:
-        chapter = timeline_written + 1
-    node_prompt = current_node_prompt(
-        project, timeline_written, provider, db=db,
-        chapter=chapter, chapter_based=chapter_based,
+    # 装配上下文 + 拼提示词：与同步版共用同一份实现（见 _prepare_generation）。
+    prep = _prepare_generation(
+        db, project, novel_ids=novel_ids, provider=provider, max_chars=max_chars,
+        chapter_range=chapter_range, fast_mode=fast_mode,
+        chapter_opening=chapter_opening,
     )
-    evidence_up_to = chapter if chapter_based else None
-    if chapter is not None:
-        _backfill_character_cards(db, project, up_to_chapter=evidence_up_to)
-    _merge_gender_into_reminders(ctx["reminders"], project.plot_bible)
-    appeared_names = (
-        _appeared_character_names(db, project, ctx["reminders"], up_to_chapter=evidence_up_to)
-        if chapter is not None else None
-    )
-    chapter_outline = chapter_outline_entry(project.outline, chapter)
-    chapter_context = "\n".join(x for x in (chapter_outline, node_prompt) if x)
-    if chapter is not None:
-        all_chars, _ = merged_constraint_items(ctx["reminders"], project.plot_bible)
-        eligible_chars, _ = filter_available_characters(
-            all_chars,
-            chapter=chapter,
-            chapter_context=chapter_context or None,
-            appeared_names=appeared_names,
-        )
-        ctx["constraints"]["characters"] = [
-            c.get("name") for c in eligible_chars if c.get("name")
-        ]
-    era_block, era_prompt_meta, power_block, power_meta = _guard_blocks(project)
-    # v12：闸门带（含对白配比参考线）必须在拼提示**之前**写入当前 context——
-    # 提示里的极短纯对白段上限与对白参考线都读它；并段仍在其后，硬上限不变。
-    gate_limits_meta = _apply_gate_limits(db, project, seg_no=written + 1)
-    # 复述闸门（写前）：最近已落库章节的摘要 + 大纲，明确禁止重写。
-    replay_prior = (
-        _replay_prior_rows(db, project, chapter, before_segment=written + 1)
-        if bool(getattr(settings, "replay_guard_enabled", True)) else []
-    )
-    replay_block = build_replay_guard_block(replay_prior)
-    # 初稿提示的字数下限与补完触发线同源（见 `_draft_prompt_min_chars`）；
-    # 节奏口径缓存命中时零成本，提前到这里只为拼提示时能取到同一个值。
-    rhythm = _archive_rhythm(db, project)
-    prompt_min_chars = _draft_prompt_min_chars(max_chars, rhythm)
-    system = build_system_prompt(
-        project.title, ctx["reminders"], _style_info(project), project.plot_bible,
-        _style_profile(db, project), _style_narrative(db, project),
-        style_suffix=overrides[PromptKey.STYLE],
-        constraint_note=overrides[PromptKey.CONSTRAINT],
-        era_constraint=era_block,
-        power_constraint=power_block,
-        style_source_ids=_style_source_ids(project),
-        is_opening=is_opening,
-        narrative_mode="original",
-        catalog_skeleton=_catalog_skeleton(db, project),
-        max_chars=max_chars,
-        chapter=chapter,
-        chapter_context=chapter_context or None,
-        appeared_names=appeared_names,
-    )
-    user = build_user_prompt(
-        ctx["prior_summaries"],
-        ctx["rag_context"],
-        project.outline,
-        max_chars,
-        project.plot_bible,
-        project.premise,
-        prior_blocks=ctx["prior_blocks"],
-        style_exemplars=ctx.get("style_exemplars"),
-        rag_has_forbidden=ctx.get("rag_has_forbidden", False),
-        directive_suffix=overrides[PromptKey.DIRECTIVE],
-        node_prompt=node_prompt,
-        kg_slice=ctx.get("kg_slice") or None,
-        item_holding_block=ctx.get("item_holding_block") or None,
-        chapter_outline=chapter_outline,
-        min_chars=prompt_min_chars,
-        advance_block=_advance_block(db, project, chapter),
-        story_cards_block=_render_story_cards(db, project.id),
-        replay_guard_block=replay_block,
-        foreshadow_block=ctx.get("foreshadow_block"),
-    )
+    provider = prep.provider
+    max_chars = prep.max_chars
+    ctx = prep.ctx
+    system, user = prep.system, prep.user
+    written = prep.written
+    timeline_written = prep.timeline_written
+    chapter_based = prep.chapter_based
+    chapter = prep.chapter
+    node_prompt = prep.node_prompt
+    appeared_names = prep.appeared_names
+    era_prompt_meta = prep.era_prompt_meta
+    power_meta = prep.power_meta
+    gate_limits_meta = prep.gate_limits_meta
+    replay_prior = prep.replay_prior
+    rhythm = prep.rhythm
+    merge_cap = prep.merge_cap
 
     # —— 写后自查（与同步版同口径：缺口驱动，只查不过的项）——
     from app.generation.author_research import (
@@ -6577,30 +6558,30 @@ def generate_next_segment_stream(
     }
 
     # v2.6：节点粒度根治——流式版同步传 per-request stop token
-    # v16：工具可见时，先用非流式素材轮取素材，末轮成文仍走 stream_chat 逐块下发。
-    brief_tool, brief_meta = _start_brief_tool(db, project, written + 1)
-    # 素材轮非流式（要结构化 tool_calls）；末轮成文仍走 stream_chat 逐块下发。
-    brief_blocks = _gather_brief_materials(
-        provider, brief_tool, system, user, constraints=ctx["constraints"])
+    # 外部素材只走「本书素材包」（materials/hook）；旧 brief 工具轮已删除。
+    brief_blocks: list[str] = []
+    # 本书素材包：与同步版同口径；包太大时追加一轮按需工具调用。
+    try:
+        from app.materials.hook import collect as _collect_material_pack
+
+        brief_blocks = _collect_material_pack(
+            db, project, written + 1,
+            provider=provider, brief_blocks=brief_blocks,
+            allow_tool_round=True,
+        )
+    except Exception:  # noqa: BLE001 —— 素材是增强项
+        logging.getLogger(__name__).warning(
+            "本书素材包注入失败，本章按无素材继续", exc_info=True)
     draft_user = user + _material_suffix(brief_blocks)
     pieces: list[str] = []
-    reasoning_chars = 0
     yield {"type": "stage", "stage": "model", "label": "等待模型首字"}
-    for kind, piece in _stream_events_with_retry(
-        provider, system, draft_user, constraints=ctx["constraints"],
-        stop_sequences=get_section_stop_sequences(),
-    ):
-        if kind == "reasoning":
-            if reasoning_chars == 0:
-                yield {"type": "stage", "stage": "thinking", "label": "模型思考中"}
-            reasoning_chars += len(piece)
-            # text 给「作者 Agent」展示思考内容；chars 保留给旧前端做计数。
-            yield {"type": "reasoning", "chars": reasoning_chars, "text": piece}
-            continue
-        if not pieces:
-            yield {"type": "stage", "stage": "writing", "label": "流式撰写中"}
-        pieces.append(piece)
-        yield {"type": "chunk", "text": piece}
+    yield from _stream_draft_events(
+        _stream_events_with_retry(
+            provider, system, draft_user, constraints=ctx["constraints"],
+            stop_sequences=get_section_stop_sequences(),
+        ),
+        pieces,
+    )
     yield {"type": "stage", "stage": "post", "label": "重算摘要与图谱"}
     # 初稿流刚结束就取：后续补完/重写走非流式 chat，不会覆盖这份留痕。
     # 取不到（非 OpenAI 兼容 provider / 测试桩）就是 None → 落库写 null。
@@ -6629,27 +6610,15 @@ def generate_next_segment_stream(
     draft_ends_complete = bool(
         analyze_repetition(text).metrics.ends_complete if text.strip() else False
     )
-    # 与同步版同口径：先补篇幅缺口，再确定性合并极短纯对白段，最后进闸门。
-    # 两个门槛都取参考档案分位（_archive_rhythm），换书自动适配；rhythm 已在拼提示前取过。
-    # 并段上限用参考语料章级「段均句数」p90（闸门带已在拼提示前写入）。
-    merge_cap = _merge_spc_cap(gate_limits_meta)
-    text, completion_info = _complete_short_draft(
+    # 与同步版同口径：补篇幅缺口 + 合并极短纯对白段 + 出摘要（共用实现）。
+    text, summary, completion_info, merge_info = _complete_draft(
         provider, text, max_chars,
-        min_ratio=rhythm.get("completion_min_ratio"),
-        stop_ratio=rhythm.get("completion_stop_ratio"),
-        constraints=ctx["constraints"],
+        ctx=ctx, rhythm=rhythm, appeared_names=appeared_names, merge_cap=merge_cap,
     )
-    text, merge_info = merge_ultra_short_dialogue(
-        text, names=list(appeared_names or []),
-        max_hanzi=rhythm.get("ultra_dialogue_max"),
-        spc_cap=merge_cap,
-    )
-    summary = provider.summarize(text)
 
     # AI 味检测 + 针对性重写（补救措施，与 system prompt 的预防互补）
     narrative = _style_narrative(db, project)
     forbidden = (narrative or {}).get("forbidden") or {}
-    rewrite_info = None
     # 与同步版同口径：同一函数、同一阈值、同样最多两轮。
     # 判罚带同样按参考语料章级分位现推。
     gate = generation_gate(
@@ -6667,199 +6636,41 @@ def generate_next_segment_stream(
             skeleton=_catalog_skeleton(db, project),
         )
 
-    text, summary, rewrite_info, rewrite_rounds, length_path = _rewrite_rounds(
-        db, project, ctx, provider, text, summary, forbidden, gate,
+    # 重写轮 + 确定性校正链（与同步版共用实现；顺序见 _refine_draft docstring）。
+    refined = _refine_draft(
+        db, project, ctx, provider, text, summary,
+        forbidden=forbidden,
+        gate=gate,
         research_notes=research.get("notes_block") or None,
         max_chars=max_chars,
         chapter_range=chapter_range,
-        gate_limits=gate_limits_meta.get("chapter_limits"),
+        gate_limits_meta=gate_limits_meta,
+        merge_cap=merge_cap,
+        replay_prior=replay_prior,
+        appeared_names=appeared_names,
+        written=written,
+        novel_ids=novel_ids,
+        fast_mode=fast_mode,
     )
+    text = refined.text
+    summary = refined.summary
 
-    # 与同步版同口径：重写后再跑一次确定性并段（重写会新造极短纯对白段）。
-    text, merge_after = merge_ultra_short_dialogue(
-        text, names=list(appeared_names or []), spc_cap=merge_cap
+    # 终稿度量与留痕（与同步版共用实现；流式多一项 draft_stream）。
+    quality, warnings, repetition = _assemble_quality(
+        db, project, text,
+        max_chars=max_chars,
+        gate_limits_meta=gate_limits_meta,
+        refined=refined,
+        chapter=chapter,
+        ctx=ctx,
+        era_prompt_meta=era_prompt_meta,
+        written=written,
+        truncation_info=truncation_info,
+        draft_ends_complete=draft_ends_complete,
+        completion_info=completion_info,
+        merge_info=merge_info,
+        draft_stream_stats=draft_stream_stats,
     )
-
-    # 批 6：文风形态校正链，与同步版同口径（放在并段之后、时代自检之前）。
-    text, style_fix = _apply_style_corrections(
-        db, project, provider, text, novel_ids=novel_ids)
-    if any((style_fix.get(k) or {}).get("applied") for k in (
-            "rewrite_info", "form_info", "attr_info", "ell_info", "beat_info")):
-        summary = provider.summarize(text)
-
-    # 声纹检查 + 定向重写（v24）：归属校正会把台词统一盖成「X道：」，这里按角色
-    # 统计台词，发现有人只报信息/没有声纹，就让模型只改对白与引出方式再试一次。
-    # 不达标就保留原稿（`_voice_rewrite_once` 内部做字数与改善校验）。
-    voice_check = _dialogue_voice_check(project, text)
-    text, voice_info = _voice_rewrite_once(
-        db, project, provider, text, voice_check, max_chars, chapter_range)
-    if voice_info.get("applied"):
-        summary = provider.summarize(text)
-        voice_check = voice_info.get("after") or _dialogue_voice_check(project, text)
-
-    # 复述闸门（写后）：本章开头若在重演上一章场景，只改开头一次。
-    # 判据不命中（绝大多数章）时零模型调用；改写不达标保留原稿。
-    replay_check = None
-    replay_info = None
-    if replay_prior:
-        replay_check = scene_replay_check(
-            text, [r.get("text") or "" for r in replay_prior])
-        if replay_check.get("replay"):
-            text, replay_info = replay_rewrite_once(
-                provider, text, replay_check, replay_prior, max_chars)
-            if replay_info.get("applied"):
-                summary = provider.summarize(text)
-
-    # 对白下限兜底：重写轮没把对白拉到硬下限时，落库前再专攻一次。
-    dialogue_floor_info = None
-    dialogue_floor = (
-        (gate_limits_meta.get("chapter_limits") or {}).get("对白字占比") or {}
-    ).get("min")
-    if dialogue_floor:
-        text, dialogue_floor_info = _dialogue_floor_rewrite_once(
-            provider, text, float(dialogue_floor), max_chars)
-        if dialogue_floor_info.get("applied"):
-            summary = provider.summarize(text)
-
-    # 时代越界自检：与同步版同口径；默认 report，不改正文。
-    era_before = text
-    text, era_meta = _apply_era_guard(
-        text, project, provider, written + 1, ctx["reminders"]
-    )
-    if text != era_before:
-        summary = provider.summarize(text)
-
-    # 段数下限兜底：与同步版同口径，只差一两段时按句末切分。
-    min_paras = (
-        (gate_limits_meta.get("chapter_limits") or {}).get("段数") or {}
-    ).get("min")
-    paragraph_info = {"applied": False, "reason": "no_limit"}
-    if min_paras:
-        text, paragraph_info = ensure_min_paragraphs(text, int(min_paras))
-
-    # 最终引号口径：与同步版同口径，LLM 改写后再统一一次。
-    text, quote_final = normalize_to_reference(db, project, text, novel_ids)
-    if quote_final.get("applied"):
-        summary = provider.summarize(text)
-
-    # 复读闸门（P2 · I2）：与同步版同口径，落库前算好、随正文同一次 INSERT 落。
-    quality, repetition, warnings = _quality_check(
-        text, budget=project.generation_length)
-    # 落库前对**最终正文**再量一次闸门（重写后可能已修好，也可能仍不达标）。
-    # 这是观测与告警口径，不改正文；是否重写在上面已经决定过了。
-    gate_final = generation_gate(
-        text, max_chars, gate_limits=gate_limits_meta.get("chapter_limits")
-    )
-    quality["style_gate"] = gate_final
-    # 批 6：校正链逐道留痕，与同步版同口径。
-    quality["style_corrections"] = style_fix
-    quality["dialogue_voice_check"] = voice_check
-    quality["voice_rewrite"] = voice_info
-    quality["replay_guard"] = {"check": replay_check, "rewrite": replay_info}
-    quality["quote_final"] = quote_final
-    quality["dialogue_floor"] = dialogue_floor_info
-    quality["paragraph_floor"] = paragraph_info
-    # 与同步版同口径：结构检测留痕（是否阻断由 `structure_guard_mode` 决定）。
-    quality["structure_check"] = _run_structure_check(project, text, chapter, ctx)
-    # 与同步版同口径：逐章推进台账（只判不拦，`mode=report`）。
-    quality["progress_ledger"] = _run_progress_ledger(
-        db, project, text, chapter, quality.get("structure_check"))
-    # 与同步版同口径：短句占比偏低只判不拦（章级口径）。
-    quality["short_sentence_check"] = _short_sentence_check(
-        gate_final.get("metrics") or {}, gate_limits_meta)
-    # 与同步版同口径：对白配比 + 时代越界扫描，均只判不拦。
-    quality["dialogue_ratio_check"] = _dialogue_ratio_check(
-        project, gate_final.get("metrics") or {}, gate_limits_meta)
-    # v19：句长形状（中段拥挤度 / 上尾占比，只判不拦），与同步版同口径。
-    quality["sentence_shape_check"] = _sentence_shape_check(
-        text, gate_final.get("metrics") or {}, gate_limits_meta)
-    quality["era_check"] = _era_check_quality(
-        era_meta, era_prompt_meta, _era_channel_abuse(db, project, era_meta))
-    # 与同步版同口径：长度路径留痕 + 终稿字数/是否仍超限按最终正文重算
-    # （字数 = `char_count`，字符含标点，与下限同一个数）。
-    _final_chars = char_count(text)
-    quality["length_path"] = {
-        "path": length_path["path"],
-        "limit": length_path["limit"],
-        "final_chars": _final_chars,
-        "final_hanzi": gate_final.get("hanzi"),
-        "still_over_limit": _final_chars > length_path["limit"],
-        "compression_accepted": length_path["compression_accepted"],
-    }
-    # 与同步版同口径：外部素材工具留痕（键名沿用 `chapter_stats()`）。
-    # 采纳统计用**最终正文**，与同步版落在同一个调用点。
-    if brief_tool is not None:
-        brief_tool.note_chapter_text(text)
-    quality["brief_tool"] = _brief_tool_quality(brief_tool, brief_meta)
-    # 与同步版同口径：截断留痕 + 截断稿不得冒充合格章。
-    final_ends_complete = quality.get("truncated") is False
-    truncated_source = bool(
-        (truncation_info.get("draft_truncated_by_tokens")
-         or not draft_ends_complete)
-        and not truncation_info.get("accepted_regenerated")
-    )
-    quality["truncation"] = {
-        **truncation_info,
-        "draft_ends_complete": draft_ends_complete,
-        "final_ends_complete": final_ends_complete,
-        "final_from_truncated_draft": truncated_source,
-        "final_from_truncated_draft_via_compression": bool(
-            truncated_source and length_path.get("compression_accepted")),
-        "degrade_note": (
-            "终稿来自截断稿：初稿被 max_tokens 截断，压缩轮在断头稿上收口"
-            if truncated_source and length_path.get("compression_accepted")
-            else ("终稿正文本身未收束" if not final_ends_complete else None)
-        ),
-    }
-    quality["passed"] = bool(
-        gate_final.get("passed") and final_ends_complete and not truncated_source
-    )
-    if truncated_source:
-        warnings.append("初稿被截断，终稿来自截断稿，本章按不合格章记录")
-    # 提示版本留痕：这一章是在哪套提示下生成的（与闸门 v11 口径对齐）。
-    quality["prompt_revision"] = PROMPT_REVISION
-    # 单章只判结构合规；指纹 13 项单章只记录，卷末再与参考卷均值对照。
-    quality["gate_limits"] = {
-        k: gate_limits_meta.get(k)
-        for k in ("source", "chapters", "volumes", "volume_chapters",
-                  "volume_chapters_source", "reference_novels", "chapter_limits",
-                  "volume_reference", "ultra_short_limit", "dialogue_reference",
-                  "sentence_reference", "rhythm_reference",
-                  "dialogue_mix_reference",
-                  # v20：句子口径与形状带随章落库，否则跨章无法按 scope 分组比较
-                  # （第 35 章之前这四项在库里全是 null，只有内存里有值）。
-                  # `sentence_scope_from_chapter` 仅记录、无判罚效力（无任何分支读取）。
-                  "sentence_scope", "sentence_scope_from_chapter",
-                  "short_sentence_max_len", "sentence_shape",
-                  # v22：段数下限的折算结果与来源（同步版同款）。
-                  "段数",
-                  "fallback_used", "fallback_reason")
-    }
-    _attach_volume_gate(db, project, quality, written + 1, chapter or written + 1,
-                        gate_final["metrics"], gate_limits_meta)
-    # 软档观测（与同步版同口径）：只记录，不影响 passed、不触发重写。
-    quality["soft_deviations"] = gate_final.get("soft_deviations") or []
-    # C（2026-11-13）：与同步版同口径，重写轮次随正文落库，失败轮也要留痕。
-    quality["rewrite_rounds"] = rewrite_rounds
-    # 流式初稿的 reasoning/正文增量留痕：首字等待到底是供应商排队、思考还是
-    # 网络抖动。拿不到（不回 reasoning 字段）就是 null，不会被读成「没思考」。
-    quality["draft_stream"] = _draft_stream_quality(draft_stream_stats)
-    # 与同步版同口径：补写/并段留痕 + 重写失败时显式告警，不再静默降级。
-    if completion_info.get("triggered"):
-        quality["draft_completion"] = completion_info
-    # 留痕条件含 `skipped_single_neighbor`（为保住单句段峰而主动放弃）与
-    # `stopped_by_spc_cap`（段均句数已到参考 p90）：否则事后只看到「并了 0 段」，
-    # 分不清是模型没造碎段、还是护栏挡住的。
-    if _merge_touched(merge_info):
-        quality["dialogue_merge"] = merge_info
-    if _merge_touched(merge_after):
-        quality["dialogue_merge_after_rewrite"] = merge_after
-    if rewrite_info:
-        quality["rewrite_info"] = rewrite_info
-    if any(r.get("failed") for r in rewrite_rounds):
-        warnings.append("重写轮失败，终稿降级为首轮稿（详见 quality.rewrite_rounds）")
-    if not gate_final["passed"]:
-        warnings.append("文风硬指标未达标：" + "；".join(gate_final["reasons"]))
 
     # 段末回填采纳判定（与同步版同口径、同一函数）。
     author_research = public_summary(
@@ -6869,98 +6680,47 @@ def generate_next_segment_stream(
 
     gen, segment_no = _commit_segment(
         db, project, text, summary,
-        meta={"era": {**era_prompt_meta, **era_meta}, "power": power_meta},
+        meta={"era": {**era_prompt_meta, **refined.era_meta}, "power": power_meta},
         quality=quality,
         chapter_range=chapter_range,
         prompt_json=_prompt_snapshot(system, draft_user),
         authority_json=_authority_snapshot(project, ctx, chapter_range),
     )
-    # v2.3：v2.1 集成到流式版——commit 段后调 judge_and_advance（与同步版同口径）
-    node_judge = _judge_and_advance(
-        db, project, provider, text, written,
-        progress_before=timeline_written,
-        chapter_based=chapter_based,
+
+    # 落库后的簿记（与同步版共用；流式必须吞掉簿记异常，正文已落库）。
+    after = _after_commit(
+        db, project, provider, text,
+        gen=gen, segment_no=segment_no, quality=quality,
+        written=written, timeline_written=timeline_written,
+        chapter_based=chapter_based, power_meta=power_meta,
+        chapter_range=chapter_range, ctx=ctx,
+        kg_swallow_errors=True,
     )
-
-    # —— 图谱进入生成闭环（与 generate_next_segment 顺序对齐）——
-    # 必须放在 _commit_segment 之后、_rollup_summary_tree 之前：正文已落库才归档，
-    # 且摘要滚上失败不该牵连簿记（滚上后置，失败只影响它自己）。
-    # 复用 _merge_segment_into_graph（它已委托到 app.kg.build.merge_segment_into_kg
-    # 做图谱+账本+别名归一+哨兵四步）——**不另写一套实现**：7416114 才把四步编排
-    # 收归唯一入口，重写的结果就是又出现"只更一半"的路径。
-    # 保留 try/except：簿记异常绝不打断 SSE（正文已落库，done 必须照样发）。
-    kg_stats = None
-    if _is_degenerate(quality):
-        # 复读退化段跳过 KG（标记而非拒绝）：循环对白不并入 facts。
-        kg_stats = {
-            "merged": False,
-            "skipped": "repetition_degenerate",
-            "reason": "本段疑似复读，已跳过 KG 抽取",
-        }
-    else:
-        try:
-            kg_stats = _merge_segment_into_graph(db, project.id, text, segment_no)
-        except Exception as exc:  # noqa: BLE001 —— 簿记异常绝不打断 SSE：正文已落库，
-            # done 事件必须照样发出，否则前端表现为"生成卡住且无结果"。
-            logging.getLogger(__name__).warning("流式 KG 簿记失败，段落已落库: %s", exc)
-            kg_stats = {"merged": False, "reason": f"KG 簿记失败：{str(exc)[:100]}"}
-    power_meta = _attach_power_meta(db, gen, power_meta, kg_stats)
-
-    # v3.0 异步批抽：与同步版同口径入队
-    v3_extraction = _enqueue_v3_extraction(
-        db, project, segment_no, text, chapter=_chapter_ordinal(chapter_range))
-    # KG 分层影子抽取（默认关闭）：与同步版同口径，独立库、不参与注入。
-    _shadow_ingest(project, segment_no, text)
-    _post_commit_written = _next_segment_no(db, project.id) - 1  # = written + 1
-    from app.generation.branch import roll_branch as _roll_branch
-    _new_state, branch_info = _roll_branch(
-        db, project, _load_timeline_state_for_branch(db, project, written),
-        provider, _post_commit_written, last_branch_written=None,
-        chapter_based=chapter_based,
-    )
-
-    tree_stats = _rollup_summary_tree(db, project, provider)
-
-    # 文风告警：percentile 低于阈值时提示用户，不阻断、不自动重写
-    style_warning = _style_warning(text, _style_profile(db, project))
-
-    # v2.6 诊断性 B：检测白名单外"疑似角色"——只告警，不替换
-    from app.generation.guard import detect_unlisted_characters, collect_allowed_names
-    _allowed = collect_allowed_names(
-        ctx_reminders=ctx.get("reminders"),
-        plot_bible=project.plot_bible,
-    )
-    unlisted = detect_unlisted_characters(text, _allowed)
-    if unlisted:
-        logging.getLogger(__name__).warning(
-            "v2.6 诊断性 B：本段检测到 %d 个白名单外疑似角色 %s",
-            len(unlisted), unlisted[:10],
-        )
 
     yield {
         "type": "done",
         "segment_no": segment_no,
         "chars": len(text),
         "summary": summary,
-        "summary_tree": tree_stats,
+        "summary_tree": after["tree_stats"],
         "id": gen.id,
-        "style_warning": style_warning,
-        "unlisted_characters": unlisted,
-        "rewrite_info": rewrite_info,
-        "rewrite_rounds": rewrite_rounds,
+        "style_warning": after["style_warning"],
+        "unlisted_characters": after["unlisted"],
+        "rewrite_info": refined.rewrite_info,
+        "rewrite_rounds": refined.rewrite_rounds,
         "author_research": author_research,
         # 两条护栏的自检摘要（era 默认 report；power 为体系类型 + unknown 计数）。
-        "era": {**era_prompt_meta, **era_meta},
-        "power": power_meta,
+        "era": {**era_prompt_meta, **refined.era_meta},
+        "power": after["power_meta"],
         # 纯新增键：done 的既有字段语义一个都不改。挂簿记统计是为了让
         # 流式路径也能被观测（此前流式完全不做归档，出了问题无从判断）。
-        "kg": kg_stats,
+        "kg": after["kg_stats"],
         # master 侧把流式键统一为 kg_update（与同步路径同键）。两个都发：
         # 老前端读 kg、新消费方读 kg_update，谁都不会静默拿不到。
-        "kg_update": kg_stats,
-        "node_judge": node_judge,
-        "v3_extraction": v3_extraction,
-        "branch_roll": branch_info,
+        "kg_update": after["kg_stats"],
+        "node_judge": after["node_judge"],
+        "v3_extraction": after["v3_extraction"],
+        "branch_roll": after["branch_info"],
         # 复读闸门（D7）：与 200 响应同形的 verdict / 触发线 / 原因 + 提示。
         "repetition": repetition,
         "length": (quality or {}).get("length"),
@@ -7172,24 +6932,11 @@ def regenerate_segment_stream(
         # 状态只在提示块里说明，不抛 409、也不触发自动重规划。
         strict=False,
     )
-    evidence_up_to = chapter if chapter_based else None
-    if chapter is not None:
-        _backfill_character_cards(db, project, up_to_chapter=evidence_up_to)
-    _merge_gender_into_reminders(reminders, project.plot_bible)
-    appeared_names = (
-        _appeared_character_names(db, project, reminders, up_to_chapter=evidence_up_to)
-        if chapter is not None else None
+    appeared_names, eligible_chars, chapter_outline, chapter_context = _character_scope(
+        db, project, reminders,
+        chapter=chapter, chapter_based=chapter_based, node_prompt=node_prompt,
     )
-    chapter_outline = chapter_outline_entry(project.outline, chapter)
-    chapter_context = "\n".join(x for x in (chapter_outline, node_prompt) if x)
-    if chapter is not None:
-        all_chars, _ = merged_constraint_items(reminders, project.plot_bible)
-        eligible_chars, _ = filter_available_characters(
-            all_chars,
-            chapter=chapter,
-            chapter_context=chapter_context or None,
-            appeared_names=appeared_names,
-        )
+    if eligible_chars is not None:
         reminders.setdefault("character_constraints", [])
         allowed = {c.get("name") for c in eligible_chars if c.get("name")}
         reminders["character_constraints"] = [
@@ -7328,7 +7075,6 @@ def regenerate_segment_stream(
         yield {"type": "chunk", "text": text}
     else:
         try:
-            reasoning_chars = 0
             yield {"type": "stage", "stage": "model", "label": "等待模型首字"}
             fn = getattr(provider, "stream_chat_events", None)
             source = (
@@ -7336,20 +7082,12 @@ def regenerate_segment_stream(
                 if callable(fn)
                 else (("content", p) for p in provider.stream_chat(system, user, constraints=constraints))
             )
-            for kind, piece in source:
-                if kind == "reasoning":
-                    if reasoning_chars == 0:
-                        yield {"type": "stage", "stage": "thinking", "label": "模型思考中"}
-                    reasoning_chars += len(piece)
-                    # text 给「作者 Agent」展示思考内容；chars 保留做计数。
-                    yield {"type": "reasoning", "chars": reasoning_chars, "text": piece}
-                    continue
-                if not pieces:
-                    yield {"type": "stage", "stage": "writing", "label": "流式撰写中"}
-                if lease is not None:
-                    lease.touch(db)
-                pieces.append(piece)
-                yield {"type": "chunk", "text": piece}
+            yield from _stream_draft_events(
+                source,
+                pieces,
+                # 每块正文到达时刷新快照租约心跳（SnapshotLease 内部节流，20s 一次）。
+                on_chunk=(lambda: lease.touch(db)) if lease is not None else None,
+            )
             yield {"type": "stage", "stage": "post", "label": "重算摘要与图谱"}
         except BaseException as exc:  # noqa: BLE001 —— 含客户端断开（GeneratorExit）
             # 快照留痕：模型报错/超时/客户端中断都置 failed，正文一行没动。
@@ -7445,6 +7183,8 @@ def regenerate_segment_stream(
         summary = provider.summarize(text)
 
     # 段数下限兜底（局部补丁跳过，避免改动未修改的排版）。
+    # 重生成路径不做最终并段，留痕为 None。
+    merge_final = None
     paragraph_info = None
     if not local_patch:
         min_paras = (
@@ -7462,6 +7202,17 @@ def regenerate_segment_stream(
         if quote_final.get("applied"):
             summary = provider.summarize(text)
 
+    # 最终字数守卫（局部补丁跳过：不能因为超长去改用户只改一句的原文）。
+    final_length_info = None
+    if not local_patch and char_count(text) > int(length_limits(max_chars)["max"]):
+        text, final_length_info = _enforce_length_cap(
+            provider, text, max_chars,
+            dialogue_floor=(
+                (gate_limits_meta.get("chapter_limits") or {}).get("对白字占比") or {}
+            ).get("min"))
+        if final_length_info.get("applied"):
+            summary = provider.summarize(text)
+
     # 复读闸门（P3 · I3）：落库前算好，两条子路径都必须带同一份报告。
     # 重写路径不合并 KG，所以这里没有「跳过 KG」的动作（详见方案稿 §3.2）。
     # 篇幅判据：这是改写既有段落，跌幅归 detect_length_drop，本字段
@@ -7475,6 +7226,8 @@ def regenerate_segment_stream(
     quality["quote_final"] = quote_final
     quality["dialogue_floor"] = dialogue_floor_info
     quality["paragraph_floor"] = paragraph_info
+    quality["merge_final"] = merge_final
+    quality["final_length"] = final_length_info
 
     new_summary = {
         "text": summary,

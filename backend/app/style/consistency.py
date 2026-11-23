@@ -657,16 +657,16 @@ ARCHIVE_BLOCK_PERCENTILES: dict[str, dict[str, float]] = {
 }
 
 
-def _first_positive_pct(row: dict[str, float]) -> float:
-    """分位行里第一个大于 0 的分位。
+def first_positive_percentile(row: dict[str, float]) -> float:
+    """分位行里第一个大于 0 的分位（p10 常为 0 的指标用它当有效下沿）。
 
     v19 起 `短句占比` 在**块级**干净口径下 p10 = 0（>10% 的 1,200 字块没有
     ≤5 字句），直接拿 p10 当下限等于「不许有短句」。改用第一个非零分位。
     v20 把短句字长收到 ≤4 之后 p25 也变成 0（>25% 的块没有任何 ≤4 字句），
     因此现行下限落到 p50 = 2.9%；这条规则本身不变，只是取的档位跟着口径走。
     """
-    for key in ("p10", "p25", "p50", "p75", "p90"):
-        v = row.get(key)
+    for field in ("p10", "p25", "p50", "p75", "p90"):
+        v = row.get(field)
         if isinstance(v, (int, float)) and float(v) > 0:
             return float(v)
     return 0.0
@@ -689,7 +689,7 @@ def limits_from_archive(
         "句长均值": {"min": t["句长均值"]["p10"], "max": t["句长均值"]["p90"]},
         "句长CV": {"min": t["句长CV"]["p10"]},
         "短句占比": {
-            "min": _first_positive_pct(t["短句占比"]),
+            "min": first_positive_percentile(t["短句占比"]),
             "max": t["短句占比"]["p90"],
         },
         "长句占比": {"min": t["长句占比"]["p10"], "max": t["长句占比"]["p90"]},
@@ -764,11 +764,7 @@ ARCHIVE_CHAPTER_PERCENTILES: dict[str, dict[str, float]] = {
 #: 等于不设限，与「不要再往 0 压」相悖。故取**第一个非零分位**：
 #: 感叹句 p25=1.8%，叹词起头 p50=2.6%。这条替代规则写在这里，便于随时改回。
 def _first_positive(key: str) -> float:
-    pct = ARCHIVE_CHAPTER_PERCENTILES[key]
-    for field in ("p10", "p25", "p50", "p75", "p90"):
-        if pct.get(field, 0) > 0:
-            return float(pct[field])
-    return 0.0
+    return first_positive_percentile(ARCHIVE_CHAPTER_PERCENTILES[key])
 
 
 DIALOGUE_GATE_LIMITS: dict[str, dict[str, float]] = {
@@ -932,14 +928,6 @@ def percentile_row(values: Iterable[float]) -> dict[str, float]:
     return out
 
 
-def _row_first_positive(row: dict[str, float]) -> float:
-    for field in ("p10", "p25", "p50", "p75", "p90"):
-        v = row.get(field)
-        if v and v > 0:
-            return float(v)
-    return 0.0
-
-
 def _row_or_default(pct, key: str, field: str, fallback) -> float:
     v = (pct.get(key) or {}).get(field)
     return round(float(v), 4) if v is not None else float(fallback or 0.0)
@@ -1089,11 +1077,11 @@ def limits_from_chapter_percentiles(
             "min": _row_or_default(pct, "对白≥20占比", "p10", d("对白≥20占比", "min")),
         },
         "对白感叹句占比": {
-            "min": round(_row_first_positive(pct.get("对白感叹句占比") or {})
+            "min": round(first_positive_percentile(pct.get("对白感叹句占比") or {})
                          or float(d("对白感叹句占比", "min") or 0.0), 4),
         },
         "对白叹词起头占比": {
-            "min": round(_row_first_positive(pct.get("对白叹词起头占比") or {})
+            "min": round(first_positive_percentile(pct.get("对白叹词起头占比") or {})
                          or float(d("对白叹词起头占比", "min") or 0.0), 4),
         },
     }

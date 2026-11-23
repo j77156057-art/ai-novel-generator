@@ -2,6 +2,7 @@
 """复跑后三项兜底：对白下限、段数下限、声纹改写长度；附带去单一化保数。"""
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 from unittest.mock import patch
@@ -121,6 +122,32 @@ def test_dialogue_floor_compresses_when_paragraph_rewrite_overshoots():
     assert len(got) <= min(4800, int(len(text) * 1.15))
 
 
+def test_final_length_cap_compresses_again():
+    from app.generation.engine import _enforce_length_cap
+    from app.style.consistency import char_count
+
+    text = "字" * 4900
+    compact = "字" * 4700
+    with patch("app.generation.engine._compression_round",
+               return_value=(compact, {"accepted": True})):
+        got, info = _enforce_length_cap(_P(""), text, 4000)
+    assert info["applied"] is True
+    assert char_count(got) <= info["cap"]
+    assert info["still_over"] is False
+
+
+def test_final_length_cap_reports_when_unfixable():
+    from app.generation.engine import _enforce_length_cap
+
+    text = "字" * 4900
+    with patch("app.generation.engine._compression_round",
+               return_value=(text, {"accepted": False})):
+        got, info = _enforce_length_cap(_P(""), text, 4000)
+    assert info["applied"] is False
+    assert info["still_over"] is True
+    assert got == text
+
+
 def test_dialogue_ratio_uses_same_denominator_as_gate():
     from app.generation.engine import _dialogue_ratio_of
     from app.style.consistency import generation_gate
@@ -176,6 +203,51 @@ def test_voice_rewrite_compresses_oversize_output():
 
 
 # ── 去单一化：只换写法，不删归属 ─────────────────────────────────────────
+
+
+def _e2e_item(**over):
+    item = {
+        "text": "他说：“走。”",
+        "quality": {
+            "style_gate": {"passed": True, "metrics": {"对白字占比": 0.30, "段数": 80}},
+            "dialogue_floor": {"floor": 0.17},
+            "paragraph_floor": {"min": 70},
+            "style_corrections": {"attr_info": {
+                "before": {"rate": 0.10}, "after": {"rate": 0.30},
+                "target": {"rate": 0.33}}},
+            "replay_guard": {"check": {"replay": False}, "rewrite": None},
+        },
+    }
+    item.update(over)
+    return item
+
+
+def test_e2e_check_chapter_passes_and_catches_failures():
+    sys.path.insert(0, str(BACKEND / "scripts"))
+    from e2e_five_chapters import check_chapter
+
+    assert check_chapter(_e2e_item(), min_attr=0.2, allow_gate_fail=False) == []
+
+    bad_gate = _e2e_item()
+    bad_gate["quality"] = dict(bad_gate["quality"])
+    bad_gate["quality"]["style_gate"] = {"passed": False, "reasons": ["段数不足"]}
+    assert check_chapter(bad_gate, min_attr=0.2, allow_gate_fail=False)
+
+    low_dialogue = _e2e_item()
+    low_dialogue["quality"] = json.loads(json.dumps(low_dialogue["quality"]))
+    low_dialogue["quality"]["style_gate"]["metrics"]["对白字占比"] = 0.10
+    assert any("对白" in x for x in check_chapter(
+        low_dialogue, min_attr=0.2, allow_gate_fail=False))
+
+    replay = _e2e_item()
+    replay["quality"] = json.loads(json.dumps(replay["quality"]))
+    replay["quality"]["replay_guard"]["check"]["replay"] = True
+    assert any("复述" in x for x in check_chapter(
+        replay, min_attr=0.2, allow_gate_fail=False))
+
+    mixed = _e2e_item(text="他说：“走。”她又说：「好。」")
+    assert any("引号" in x for x in check_chapter(
+        mixed, min_attr=0.2, allow_gate_fail=False))
 
 
 def test_variety_preserves_attribution_count():

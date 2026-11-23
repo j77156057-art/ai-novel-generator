@@ -28,6 +28,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { api, planGateStatus } from "@/api/client";
 import type { PlanGateStatus } from "@/api/client";
+import { errorText as textOf } from "@/utils/errors";
 import type {
   GeneratePlan,
   GenerationOut,
@@ -322,11 +323,6 @@ const currentSegment = computed(
 const dirty = computed(() => draftText.value !== savedText.value);
 const currentChars = computed(() => draftText.value.length);
 const streamChars = computed(() => streamText.value.length);
-
-function textOf(err: unknown): string {
-  if (err instanceof Error && err.message) return err.message;
-  return String(err);
-}
 
 function isAbort(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";

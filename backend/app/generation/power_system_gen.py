@@ -23,6 +23,7 @@ import re
 from typing import Any
 
 from app.generation.cultivation import normalize_tiers
+from app.generation.model_json import safe_json as _safe_json
 from app.generation.power_system import bands_of, normalize_power_system
 
 #: 生成体系时的提示词。
@@ -924,27 +925,3 @@ def filter_tiers_by_bands(tiers: list[dict], system: dict) -> list[dict]:
     if not bands:
         return tiers
     return [t for t in tiers if not t.get("档位") or t["档位"] in bands]
-
-
-def _safe_json(raw: Any) -> Any:
-    if isinstance(raw, (dict, list)):
-        return raw
-    text = str(raw or "").strip()
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except Exception:  # noqa: BLE001
-        pass
-    cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
-    try:
-        return json.loads(cleaned)
-    except Exception:  # noqa: BLE001
-        pass
-    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:  # noqa: BLE001
-            return {}
-    return {}

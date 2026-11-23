@@ -50,6 +50,8 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Mapping
 
+from app.agents.card_collect import collect_pending_cards
+
 # ====================================================================
 # 契约常量
 # ====================================================================
@@ -275,30 +277,14 @@ def collect_text_edit_cards(tool_results: Mapping[str, Any] | None,
                             project_id: int) -> list[dict[str, Any]]:
     """从工具结果里把「改写」卡收进对话流（只收**可信**的那些）。
 
-    与 `collect_body_repair_cards` 同一套口径：只认产出改写卡的工具
-    （`propose_text_edit` / `propose_text_fix` —— 两者都只**构造**卡，不落库）、
-    端点必须是提案创建端点、body 里的 project_id 必须是本项目
-    —— 跨项目的卡一律不收（提一张必然失败的卡 = 骗用户点一次）。
-
-    ## 为什么按「工具名前缀」收而不是写死一个名字
-
-    起草改写的工具有两个（自己起草 / 按规则修标点），它们产出的是**同一种卡**。
-    写死名字的话，agent 换用另一个工具，这张卡就**静默丢了** ——
-    实测踩过：agent 调了 `propose_text_fix`，卡生成了，用户却什么也没看见
-    （对话里说「请在待确认卡中确认」，而界面上没有卡）。
+    只认 `propose_text_edit` / `propose_text_fix` 等 `propose_*` 工具产出、
+    端点为提案创建端点、且 body.project_id 属于本项目的卡。按工具名前缀收
+    而不是写死名字：agent 换用另一个起草工具时卡不会静默丢失。
     """
-    cards: list[dict[str, Any]] = []
-    for key, value in (tool_results or {}).items():
-        name = str(key).split(':', 1)[0]
-        if not name.startswith('propose_') or not isinstance(value, dict):
-            continue
-        action = value.get('pending_action')
-        if (isinstance(action, dict) and action.get('kind') == 'proposal'
-                and action.get('endpoint') == '/api/assistant/proposals'
-                and action.get('method') == 'POST'
-                and (action.get('body') or {}).get('project_id') == project_id):
-            cards.append(action)
-    return cards
+    return collect_pending_cards(
+        tool_results, project_id,
+        kind="proposal", endpoint="/api/assistant/proposals",
+    )
 
 
 def build_text_edit_proposal_action(

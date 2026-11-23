@@ -40,6 +40,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.generation.coerce import as_text as _as_text
+
 #: 体系类型（纵向精细度）。
 #:
 #: - `细分型`：有境界 + 小境界（初期/中期/大圆满、第几重）
@@ -72,13 +74,6 @@ SYSTEM_TYPE_HINTS: dict[str, str] = {
 #: 不能用境界序数 —— 否则会把「修行者」写成比「圣人」强。
 SOFT_TYPES = ("粗放型",)
 
-
-def _as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return "；".join(str(v).strip() for v in value if str(v).strip())
-    return str(value).strip()
 
 
 def normalize_system_type(raw: Any) -> str:

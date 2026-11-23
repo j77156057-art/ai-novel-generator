@@ -387,8 +387,83 @@ export interface GenerationOut {
   segment_no: number;
   chapter_range: string | null;
   text: string | null;
+  /** 真实字符数（preview 模式下 text 被截断，仍可用它显示字数）。 */
+  chars?: number;
   summary: unknown;
 }
+
+/** 章节正文的句子区间（与后端 patch.split_sentences 同口径）。 */
+export interface GenerationSentence {
+  index: number;
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface GenerationSentencesResponse {
+  generation_id: number;
+  segment_no: number;
+  chapter_range: string | null;
+  count: number;
+  items: GenerationSentence[];
+}
+
+/** 章前「这一章怎么开头」的一条建议。 */
+export interface ChapterOpeningOption {
+  id: string;
+  title: string;
+  summary: string;
+  opening: string;
+  why: string;
+}
+
+export interface ChapterOpeningResult {
+  chapter: number;
+  is_first_chapter: boolean;
+  /** model = 模型生成；fallback = 规则兜底。 */
+  source: "model" | "fallback";
+  options: ChapterOpeningOption[];
+  brief: {
+    outline: string;
+    outline_total: number;
+    node: Record<string, unknown>;
+    previous: string;
+    hooks: string[];
+    characters: string[];
+  };
+}
+
+/** 右侧写作进度。 */
+export interface WritingProgress {
+  current_chapter: number;
+  next_chapter: number;
+  generated_chapters: number;
+  outline_total: number;
+  outline_percent: number;
+  to_outline_percent: number;
+  chapters_remaining: number;
+  timeline: {
+    exists: boolean;
+    current_node: {
+      id: string;
+      title: string;
+      chapter_start: number;
+      chapter_end: number;
+      index: number;
+      total: number;
+    } | null;
+    next_node: {
+      id: string;
+      title: string;
+      chapter_start: number;
+      chapter_end: number;
+    } | null;
+    node_progress: number;
+    to_next_node_percent: number;
+    main_progress: number;
+  };
+}
+
 
 /** 手动改正文后的配套重算结果（总结 / 摘要树 / 图谱）。 */
 export interface GenerationEditCascade {
@@ -1388,6 +1463,10 @@ export interface AssistantQaResponse {
   tool_mode?: "model" | "deterministic" | "chat";
   /** 模型自主调用轨迹；确定性路径为空数组，旧后端不返回 → undefined。 */
   tool_trace?: AssistantToolTraceItem[];
+  /** 工具循环实际走了多少步（0/undefined = 没走模型工具路径）。 */
+  tool_steps?: number;
+  /** 收尾是否靠最后一步「不带 tools」强制完成（true = 步数已用满）。 */
+  forced_wrap_up?: boolean;
   /** 回落原因（仅 deterministic 时非空；供诊断，不展示为正文）。 */
   tool_fallback_reason?: string;
   /** 本次问题命中的动作目录项（档 2/3 只会出现在这里）。 */
@@ -2443,6 +2522,7 @@ export interface WizardMessage {
     | "wizard_action"
     | "wizard_result"
     | "notice"
+    | "chapter"
     | "role_chat";
   text: string;
   payload: {
@@ -3097,6 +3177,27 @@ export interface CultivationPlanResponse {
 // KG v3：世界观 / 剧情时间线 / Worker 补抽与恢复
 // ==================================================================
 
+/** KG v3 批抽 worker 的最近一次运行行。 */
+export interface KgV3WorkerRun {
+  id: number;
+  segment_no: number | null;
+  status: string;
+  stuck: boolean;
+  empty: boolean;
+  duration_ms: number | null;
+  batch_stats: Record<string, unknown> | null;
+  error: string | null;
+  started_at: string | null;
+}
+
+/** KG v3 批抽 worker 状态（线程存活 / 队列积压 / 汇总计数 / 最近行）。 */
+export interface KgV3WorkerStatus {
+  worker_alive: boolean;
+  pending: number;
+  summary: { success: number; failed: number; running: number; stuck: number; empty: number };
+  recent_runs: KgV3WorkerRun[];
+}
+
 export interface KgStoryEvidence {
   chapter?: number | null;
   event_type?: string;
@@ -3550,3 +3651,177 @@ export interface StyleRepairPlan {
   };
 }
 
+/** 自动返修前后的关键指标（与闸门同口径）。 */
+export interface AutoRepairSnapshot {
+  chars: number;
+  paras: number;
+  dialogue_chars: number;
+  dialogue_ratio: number;
+  ultra_short_paras: number;
+  ultra_short_ratio: number;
+  attribution: number;
+  gate_passed: boolean;
+  gate_skipped: boolean;
+  gate_violations: string[];
+}
+
+export interface AutoRepairCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface AutoRepairAcceptance {
+  ok: boolean;
+  checks: AutoRepairCheck[];
+  before: AutoRepairSnapshot;
+  after: AutoRepairSnapshot;
+}
+
+/** POST /api/projects/{id}/segments/{n}/auto-repair 的返回。 */
+export interface AutoRepairResult {
+  ok: boolean;
+  project_id: number;
+  segment_no: number;
+  generation_id: number;
+  changed: boolean;
+  deterministic_applied: boolean;
+  before: AutoRepairSnapshot;
+  after: AutoRepairSnapshot;
+  deterministic: {
+    changed: boolean;
+    punctuation: { fixed: number; dropped_tail: number; changed: boolean; samples: string[] };
+    numbers: { fixed: number; changed?: boolean; samples: string[] };
+    multi_speaker: {
+      before_paras: number;
+      split: number;
+      after_paras: number;
+      changed: boolean;
+      samples: string[];
+    };
+    quotes: { target: string; replaced: number; changed: boolean };
+  };
+  plan: {
+    ok: boolean;
+    summary: string;
+    reason: string;
+    issues: StyleRepairIssue[];
+  };
+  model: {
+    used?: boolean;
+    snapshot_id?: number;
+    chars?: number;
+    answer?: string;
+    error?: string;
+    rollback_error?: string;
+  } | null;
+  acceptance: AutoRepairAcceptance | null;
+  rolled_back: boolean;
+  text: string;
+}
+
+// ---------- 每本书专属素材包 ----------
+
+export interface ProjectMaterial {
+  id: number;
+  project_id: number;
+  job_id: number | null;
+  origin: "research" | "manual" | string;
+  title: string;
+  url: string;
+  snippet: string;
+  summary: string;
+  use_case: string;
+  chapter_hint: number | null;
+  category: string;
+  published_year: number | null;
+  published_at: string;
+  provider: string;
+  query: string;
+  tags: string[];
+  status: "raw" | "usable" | "hidden" | string;
+  consolidated_by: string;
+  use_count: number;
+  last_used_at: string | null;
+  created_at: string | null;
+}
+
+export interface ProjectMaterialListResponse {
+  items: ProjectMaterial[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface MaterialTocGroup {
+  key: string;
+  count: number;
+}
+
+export interface MaterialToc {
+  stats: {
+    total: number;
+    usable: number;
+    raw: number;
+    hidden: number;
+    unknown_year: number;
+    used: number;
+  };
+  categories: MaterialTocGroup[];
+  years: MaterialTocGroup[];
+  use_cases: MaterialTocGroup[];
+  directory: MaterialDirectorySection[];
+  recent: { id: number; title: string; category: string }[];
+}
+
+export interface MaterialDirectoryItem {
+  id: number;
+  title: string;
+  published_year: number | null;
+  use_case: string;
+}
+
+export interface MaterialDirectorySection {
+  category: string;
+  count: number;
+  items: MaterialDirectoryItem[];
+}
+
+export interface MaterialResearchJob {
+  id: number;
+  project_id: number;
+  chapter_no: number | null;
+  trigger: string;
+  topics: string[];
+  queries: string[];
+  status: "queued" | "running" | "consolidating" | "done" | "partial" | "failed" | "cancelled" | string;
+  target_raw: number;
+  target_usable: number;
+  raw_count: number;
+  usable_count: number;
+  zero_streak: number;
+  attempts: number;
+  error: string;
+  meta: Record<string, unknown>;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string | null;
+}
+
+export interface MaterialJobListResponse {
+  items: MaterialResearchJob[];
+}
+
+export interface MaterialCreateRequest {
+  title: string;
+  summary?: string;
+  use_case?: string;
+  category?: string;
+  published_year?: number | null;
+  url?: string;
+  snippet?: string;
+  tags?: string[];
+  status?: string;
+}
+
+export type MaterialPatchRequest = Partial<MaterialCreateRequest>;

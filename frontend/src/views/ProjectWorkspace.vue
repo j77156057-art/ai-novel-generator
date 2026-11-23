@@ -4,6 +4,7 @@ import { computed, onActivated, onDeactivated, onMounted, onUnmounted, reactive,
 import { useRoute, useRouter } from "vue-router";
 import { api, ApiError, planGateStatus } from "@/api/client";
 import type { PlanGateStatus } from "@/api/client";
+import { errorText } from "@/utils/errors";
 import ProjectNav from "@/components/ProjectNav.vue";
 import type {
   AlertsResponse,
@@ -64,13 +65,6 @@ const actionNotice = ref<{
 } | null>(null);
 const novels = ref<NovelOut[]>([]);
 const novelsError = ref<string | null>(null);
-
-function errorText(err: unknown) {
-  if (err instanceof TypeError && /fetch/i.test(err.message)) {
-    return "无法连接服务，请检查网络连接或后端启动状态。";
-  }
-  return err instanceof Error ? err.message : String(err);
-}
 
 function showActionError(action: string, err: unknown) {
   const status = planGateStatus(err);
@@ -1904,6 +1898,8 @@ function startDistillPolling(jobId: number) {
 }
 
 async function pollDistill(jobId: number) {
+  // 后台标签页不轮询：省请求，也避免回来时连续补发一串过期状态。
+  if (document.hidden) return;
   try {
     const job = await api.getDistillJob(projectId, jobId);
     distillJob.value = job;
@@ -2574,6 +2570,13 @@ type RepairPanelState = {
 };
 
 const repairPlans = reactive<Record<number, RepairPanelState>>({});
+/** 一键自动返修：确定性修复 + 模型定向重写 + 验收回滚。 */
+const autoRepairs = reactive<Record<number, { busy: boolean }>>({});
+
+function autoRepairState(g: { id: number }): { busy: boolean } {
+  if (!autoRepairs[g.id]) autoRepairs[g.id] = { busy: false };
+  return autoRepairs[g.id];
+}
 
 function repairState(g: { id: number }): RepairPanelState {
   if (!repairPlans[g.id]) {
@@ -2633,6 +2636,55 @@ async function runTargetedRepair(g: SegmentRef): Promise<void> {
     await loadGenerations();
   } catch (err) {
     s.error = errorText(err);
+  } finally {
+    s.busy = false;
+  }
+}
+
+async function runAutoRepair(g: SegmentRef): Promise<void> {
+  const s = autoRepairState(g);
+  if (s.busy) return;
+  s.busy = true;
+  try {
+    const res = await api.autoRepairSegment(projectId, g.segment_no, {
+      apply_deterministic: true,
+      use_model: true,
+    });
+    delete segmentSaved[g.id];
+    const bits: string[] = [];
+    if (res.deterministic?.punctuation?.fixed) {
+      bits.push(`补标点 ${res.deterministic.punctuation.fixed} 处`);
+    }
+    if (res.deterministic?.numbers?.fixed) {
+      bits.push(`校正字数回指 ${res.deterministic.numbers.fixed} 处`);
+    }
+    if (res.deterministic?.multi_speaker?.split) {
+      bits.push(`拆双人同段 ${res.deterministic.multi_speaker.split} 处`);
+    }
+    if (res.model?.used) {
+      if (res.rolled_back) {
+        const failed = (res.acceptance?.checks || [])
+          .filter((c) => !c.ok)
+          .map((c) => c.name)
+          .join("、");
+        bits.push(`模型改写未过验收${failed ? `（${failed}）` : ""}，已回滚`);
+      } else {
+        bits.push("模型定向改写 1 次");
+      }
+    } else if (res.model?.error) {
+      bits.push(`模型未执行：${res.model.error}`);
+    }
+    if (!bits.length) bits.push("未发现需要自动修的问题");
+    actionNotice.value = {
+      kind: res.acceptance && !res.acceptance.ok ? "err" : "ok",
+      text: `第 ${g.segment_no} 段自动返修：${bits.join("，")}。`,
+    };
+    await loadGenerations();
+  } catch (err) {
+    actionNotice.value = {
+      kind: "err",
+      text: `第 ${g.segment_no} 段自动返修失败：${errorText(err)}`,
+    };
   } finally {
     s.busy = false;
   }
@@ -5338,6 +5390,18 @@ onUnmounted(() => {
               @click="toggleRepairPlan(g)"
             >
               {{ repairPlans[g.id]?.open ? "收起返修" : "定向返修" }}
+            </button>
+            <button
+              class="btn sm"
+              title="先做确定性修复（标点/双人同段/字数回指），再让模型定向重写；不达标自动回滚"
+              :disabled="
+                autoRepairs[g.id]?.busy ||
+                regenState[g.id]?.loading ||
+                streaming
+              "
+              @click="runAutoRepair(g)"
+            >
+              {{ autoRepairs[g.id]?.busy ? "自动修中…" : "自动修" }}
             </button>
             <button
               class="btn sm"

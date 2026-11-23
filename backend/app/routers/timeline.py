@@ -26,6 +26,7 @@ from app.generation.timeline import (
     TimelineState,
     assign_chapter_ranges,
     has_chapter_ranges,
+    node_to_dict,
     plan_nodes_with_llm,
     plan_timeline,
     state_from_dict,
@@ -112,24 +113,6 @@ def _save(db: Session, proj: Project, state: TimelineState) -> None:
     db.refresh(proj)
 
 
-def _node_out(node: PlotNode) -> dict:
-    return {
-        "id": node.id,
-        "kind": node.kind,
-        "title": node.title,
-        "emotion": node.emotion,
-        "entry_condition": node.entry_condition,
-        "exit_condition": node.exit_condition,
-        "beats": list(node.beats),
-        "segment_budget": node.segment_budget,
-        "parent": node.parent,
-        "children": list(node.children),
-        "chapter_start": node.chapter_start,
-        "chapter_end": node.chapter_end,
-        "source": node.source,
-    }
-
-
 def _state_out(proj: Project, state: TimelineState | None) -> dict:
     entries = _outline_entries(proj)
     if state is None:
@@ -152,7 +135,7 @@ def _state_out(proj: Project, state: TimelineState | None) -> dict:
         "exists": True,
         "outline_chapters": len(entries),
         "order": list(state.order),
-        "nodes": [_node_out(state.nodes[nid]) for nid in state.order if nid in state.nodes],
+        "nodes": [node_to_dict(state.nodes[nid]) for nid in state.order if nid in state.nodes],
         "current_node": state.current_node,
         "current_beat": state.current_beat,
         "done": sorted(state.done),
@@ -267,7 +250,7 @@ def append_node(
     _save(db, proj, state)
 
     return {
-        "created": _node_out(node),
+        "created": node_to_dict(node),
         "timeline": _state_out(proj, state),
     }
 

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import AppSetting
+from app.text_values import parse_bool
 from app.web_search.base import SearchBundle, SearchProviderError
 from app.web_search.clean import filter_results
 from app.web_search.providers import (
@@ -79,15 +80,6 @@ _CACHE: "OrderedDict[str, tuple[float, SearchBundle]]" = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 
 
-def _parse_bool(value: str | None) -> bool | None:
-    raw = (value or "").strip().lower()
-    if raw in {"on", "true", "1", "yes"}:
-        return True
-    if raw in {"off", "false", "0", "no"}:
-        return False
-    return None
-
-
 def _db_value(db: Session | None, key: str) -> str | None:
     if db is None:
         return None
@@ -123,7 +115,7 @@ def load_config(db: Session | None = None) -> WebSearchConfig:
     max_raw = _pick(db, K_MAX_RESULTS, str(getattr(settings, "web_search_max_results", 30)))
     timeout_raw = _pick(db, K_TIMEOUT, str(getattr(settings, "web_search_timeout", 8)))
     safe_raw = _pick(db, K_SAFE, "on" if getattr(settings, "web_search_safe_search", True) else "off")
-    flag = _parse_bool(_db_value(db, K_ENABLED))
+    flag = parse_bool(_db_value(db, K_ENABLED))
     if flag is None:
         flag = bool(getattr(settings, "web_search_enabled", False)) or bool(provider and api_key)
     try:
@@ -134,7 +126,7 @@ def load_config(db: Session | None = None) -> WebSearchConfig:
         timeout = max(3, min(int(timeout_raw or 8), 20))
     except (TypeError, ValueError):
         timeout = 8
-    safe = _parse_bool(safe_raw)
+    safe = parse_bool(safe_raw)
     return WebSearchConfig(
         enabled=bool(flag),
         provider=provider or "none",

@@ -1104,6 +1104,7 @@ def build_user_prompt(
     story_cards_block: str | None = None,
     foreshadow_block: str | None = None,
     replay_guard_block: str | None = None,
+    chapter_opening_block: str | None = None,
 ) -> str:
     """动态用户提示——置于系统提示之后，随前情/走向/冲突变化；频繁变更不影响系统层缓存。
 
@@ -1430,6 +1431,14 @@ def build_user_prompt(
         ]
     elif outline_text:
         blocks += ["", "【大纲】", outline_text]
+    if chapter_opening_block:
+        # 章前作者选择/确认的开场方式：只约束「怎么进入本章」，不改本章大纲
+        # 要写的事件；缺省时提示词与旧版逐字节一致。
+        blocks += [
+            "",
+            "【本章开场要求（作者选择/确认，开场必须先落地）】",
+            chapter_opening_block,
+        ]
     if kg_slice:
         # v3.0 KG 切片：按当前剧情点动态取的近期实体/状态/伏笔/情报/事件。
         # 只标红不强制——是给模型的「世界观锚点」，让它别写飞。与 plot_bible 区别：

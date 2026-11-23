@@ -688,6 +688,43 @@ ACTIONS: tuple[ActionSpec, ...] = (
         read_tool="check_attachment_cleaning",
         triggers=("检查清洗", "复核", "能不能投放", "质量检查"),
     ),
+    # ---------- 本书素材包（只读）----------
+    ActionSpec(
+        key="material_pack_toc",
+        title="看本书素材包目录",
+        summary="列出素材包的分类、年份、用途与最近入库标题；只读，不触发调研。",
+        category="read",
+        policy="auto_read",
+        read_tool="material_pack_toc",
+        triggers=("素材包", "资料库", "素材目录", "有没有资料", "资料收集"),
+    ),
+    ActionSpec(
+        key="material_pack_search",
+        title="检索本书素材包",
+        summary="按关键词查可用素材，返回年份、分类与适用处；只读。",
+        category="read",
+        policy="auto_read",
+        read_tool="material_pack_search",
+        triggers=("查素材", "找资料", "素材里有没有", "参考资料", "背景资料"),
+    ),
+    ActionSpec(
+        key="material_pack_get",
+        title="读取素材内容",
+        summary="按素材 id 取具体摘要与用途；只读。",
+        category="read",
+        policy="auto_read",
+        read_tool="material_pack_get",
+        triggers=("素材详情", "这条素材", "素材内容", "打开素材"),
+    ),
+    ActionSpec(
+        key="material_pack_by_use",
+        title="按用途找素材",
+        summary="按「可用在什么地方」检索素材；只读。",
+        category="read",
+        policy="auto_read",
+        read_tool="material_pack_by_use",
+        triggers=("用什么素材", "适合什么场景", "章节素材", "用途"),
+    ),
 )
 
 

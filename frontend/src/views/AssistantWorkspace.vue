@@ -32,17 +32,48 @@ defineOptions({ name: "AssistantWorkspace" });
 import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ApiError, api } from "@/api/client";
+import AssistantActionCard from "@/components/AssistantActionCard.vue";
+import AssistantDataChips from "@/components/AssistantDataChips.vue";
+import AssistantDataDetail from "@/components/AssistantDataDetail.vue";
+import AssistantGenerationCard from "@/components/AssistantGenerationCard.vue";
+import type { DataChip, DataChipKind } from "@/components/assistantDataTypes";
+import AssistantComposer from "@/components/AssistantComposer.vue";
+import AssistantContextPanel from "@/components/AssistantContextPanel.vue";
+import AssistantMemoryDrawer from "@/components/AssistantMemoryDrawer.vue";
 import AssistantIssueList from "@/components/AssistantIssueList.vue";
+import AssistantWizardResult from "@/components/AssistantWizardResult.vue";
+import ChapterOpeningPicker from "@/components/ChapterOpeningPicker.vue";
+import InlineChapterCard from "@/components/InlineChapterCard.vue";
+import AssistantDistillProgress from "@/components/AssistantDistillProgress.vue";
 import WizardStepCard from "@/components/WizardStepCard.vue";
-import WorkflowStrip from "@/components/WorkflowStrip.vue";
+import WritingProgressAside from "@/components/WritingProgressAside.vue";
 import WritingPanel from "@/components/WritingPanel.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
+import { useDistillPolling } from "@/composables/useDistillPolling";
+import { useProposalApproval } from "@/composables/useProposalApproval";
 import { createAttachmentDraft } from "@/utils/assistantAttachments";
-import { pendingActionKindLabel, pendingActionRiskMeta, sourceLabel } from "@/utils/assistantDisplay";
+import { errorText as textOf } from "@/utils/errors";
 import { renderMarkdown } from "@/utils/markdown";
 import { stepStateLabel } from "@/utils/workflowDisplay";
 import { useAppTheme } from "@/theme";
 import { useModalResize } from "@/utils/useModalResize";
+import {
+  HISTORY_MAX_TURNS,
+  MAX_SESSIONS,
+  activeSessionKeyFor,
+  historyKeyFor,
+  migrateLegacyHistory,
+  newSessionId,
+  readStoredSessions,
+  sessionPreview,
+  sessionTimeLabel,
+  sessionTitleFromTurns,
+  sessionsKeyFor,
+  trimEvidence,
+  type ChatSession,
+  type StoredCard,
+  type StoredTurn,
+} from "./assistantChatHistory";
 import type {
   AssistantEvidence,
   AssistantIssue,
@@ -54,8 +85,11 @@ import type {
   AssistantWebSearchMeta,
   AssistantWebSource,
   AttachmentCleaningPreview,
-  DistillJob,
+  ChapterOpeningOption,
+  GenerationOut,
+  GenerationSentence,
   ProjectOut,
+  WritingProgress,
   WizardActionEcho,
   WizardCommitResult,
   WizardMessage,
@@ -182,6 +216,10 @@ interface Turn {
   toolMode: "model" | "deterministic" | "chat" | "";
   /** 模型自主调用的工具轨迹（确定性路径为空数组）。 */
   toolTrace: AssistantToolTraceItem[];
+  /** 工具循环实际步数（0 = 旧后端未返回 / 未走模型工具路径）。 */
+  toolSteps: number;
+  /** 收尾是否靠最后一步强制完成（true = 步数用满）。 */
+  forcedWrapUp: boolean;
   /** 工具名 → 结果体（只用来给人看「拿到了什么」，不参与任何请求构造）。 */
   toolResults: Record<string, unknown>;
   /** 回落原因（仅确定性路径非空）。 */
@@ -196,6 +234,11 @@ interface Turn {
   liveEvidenceCount?: number;
   /** 创作引导的一步（卡片）；与普通问答互斥。 */
   wizard?: WizardStepState | null;
+  /**
+   * 系统追加的过程消息（如生成完主动问「哪里要改」）：只承载文字，
+   * 不参与「最新正常回答」的判定（计划卡不应挂到它下面）。
+   */
+  synthetic?: boolean;
   /** 引导里的一次「追问/没听懂」：只有解释文字，没有卡片，也不推进流程。 */
   note?: boolean;
   /** 引导里助理真的改了一次配置（mode=action）：回执前后值 + 可撤销。 */
@@ -217,6 +260,13 @@ interface Turn {
   notice?: WizardNotice | null;
   /** 从本地历史恢复的消息：只读文本，不挂任何可交互卡片。 */
   historical?: boolean;
+  /** 对话内联章节卡：只存生成段引用，正文从 generations 读。 */
+  chapter?: {
+    generationId: number;
+    segmentNo: number;
+    chapterRange: string | null;
+    chars: number;
+  };
 }
 
 interface WizardStepState {
@@ -245,7 +295,7 @@ const streamEl = ref<HTMLElement | null>(null);
  * 真正的「投放」必须由问答返回的待确认卡在用户点确认后触发 —— 本组件
  * 从不直接调投放端点，也不替用户决定「剔除混书」。
  */
-const fileInput = ref<HTMLInputElement | null>(null);
+const composerRef = ref<InstanceType<typeof AssistantComposer> | null>(null);
 const draft = reactive(createAttachmentDraft(api.uploadAssistantAttachment, textOf));
 const canSend = computed(
   () => !sending.value && !badId && draft.request(query.value) !== null,
@@ -267,12 +317,6 @@ function previewOf(attachmentId: string): PreviewState {
 function addFiles(files: File[]): void {
   if (sending.value || badId) return;
   void draft.add(files);
-}
-
-function onFilesSelected(event: Event): void {
-  const input = event.target as HTMLInputElement;
-  addFiles(Array.from(input.files ?? []));
-  input.value = "";
 }
 
 /** 展开 / 收起清洗预览：展开时才请求（避免每次上传都跑一遍扫描）。 */
@@ -316,6 +360,8 @@ function makeUserTurn(text: string): Turn {
     cards: [],
     toolMode: "",
     toolTrace: [],
+    toolSteps: 0,
+    forcedWrapUp: false,
     toolResults: {},
     toolFallbackReason: "",
     error: null,
@@ -340,6 +386,8 @@ function makeAssistantTurn(): Turn {
     cards: [],
     toolMode: "",
     toolTrace: [],
+    toolSteps: 0,
+    forcedWrapUp: false,
     toolResults: {},
     toolFallbackReason: "",
     error: null,
@@ -423,124 +471,27 @@ async function restoreScroll(pos?: number): Promise<void> {
 // 为什么不走后端会话表：普通问答不写库是产品红线（助手可以看，但不能
 // 因为聊天就改项目数据）。本地持久化只解决「刷新别丢」，不引入新的写路径。
 
-/** 最近 30 轮（一问一答算一轮）。 */
-const HISTORY_ROUNDS = 30;
-const HISTORY_MAX_TURNS = HISTORY_ROUNDS * 2;
-/** 每个项目最多保留多少个本机会话（超出丢最旧的）。 */
-const MAX_SESSIONS = 30;
-
-interface StoredTurn {
-  role: "user" | "assistant";
-  /** 用户原话。 */
-  text: string;
-  /** 助手回答（引导/通知类消息的正文也落到这里）。 */
-  answer: string;
-  error: string | null;
-  confidence: number;
-  agentRunId: number;
-  attachments?: { filename: string }[];
-  evidence?: AssistantEvidence[];
-  /** 本轮读取步骤：刷新后仍能看到「读了什么」，不再只剩证据反推。 */
-  steps?: { name: string; meta?: string; detail?: string }[];
-  /** 推理留痕（字数 / 耗时），刷新后保留「思考了 N 秒」。 */
-  thinking?: AssistantThinking | null;
-  /** 联网检索元信息（含清洗掉的低质条数），刷新后仍能解释来源数量。 */
-  webSearch?: AssistantWebSearchMeta | null;
-  /** 联网来源：刷新后「联网来源」小窗口仍能看到，不再只剩一句带 [1] 的回答。 */
-  webSources?: AssistantWebSource[];
-  /**
-   * 写作卡片（只存已完成/失败的生成卡）。
-   *
-   * 不存 pending / running：刷新后那些动作已经不在跑，恢复成可点按钮
-   * 只会制造一个必然失败或重复生成的假按钮。卡片只保留「点开看正文」
-   * 这一件事，正文本身仍在 generations 表里。
-   */
-  cards?: StoredCard[];
-}
-
-/** 刷新后仍保留的写作卡片（无执行轨迹、无实时进度）。 */
-interface StoredCard {
-  action: AssistantPendingAction;
-  state: "confirmed" | "failed";
-  notice: string;
-  segmentNo?: number | null;
-  preview?: string;
-}
-
-/** 一条本机会话：标题 + 时间 + 已落盘的问答轮次。 */
-interface ChatSession {
-  id: string;
-  title: string;
-  createdAt: number;
-  updatedAt: number;
-  turns: StoredTurn[];
-  /** 本会话最后停留的滚动位置（像素）；恢复会话时回到这里而不是强行滚底。 */
-  scrollTop?: number;
-}
-
 const chatSessions = ref<ChatSession[]>([]);
 const activeSessionId = ref("");
 /** 窄屏时会话列表变成抽屉。 */
 const sessionsOpen = ref(false);
 /** 中窄屏时右侧上下文变成抽屉。 */
 const ctxOpen = ref(false);
+/** 右栏面板：卡片确认后要让它重算工序链。 */
+const ctxPanelRef = ref<InstanceType<typeof AssistantContextPanel> | null>(null);
 /** 对话页外观直接跟随全站主题 token，不再自建 surface 状态。 */
 const { theme, toggleInkTheme } = useAppTheme();
 
 function historyKey(): string {
-  return `assistant:chat:v1:${projectId}`;
+  return historyKeyFor(projectId);
 }
 
 function sessionsKey(): string {
-  return `assistant:sessions:v1:${projectId}`;
+  return sessionsKeyFor(projectId);
 }
 
 function activeSessionKey(): string {
-  return `assistant:active-session:v1:${projectId}`;
-}
-
-function newSessionId(): string {
-  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-}
-
-/** 会话标题取第一句用户原话（不做模型总结，避免标题与内容漂移）。 */
-function sessionTitleFromTurns(list: StoredTurn[]): string {
-  const first = list.find((t) => t.role === "user" && t.text.trim());
-  if (!first) return "新对话";
-  const text = first.text.trim().replace(/\s+/g, " ");
-  return text.length > 18 ? text.slice(0, 18) + "…" : text;
-}
-
-function sessionPreview(session: ChatSession): string {
-  const last = [...session.turns]
-    .reverse()
-    .find((t) => t.role === "assistant" && (t.answer || "").trim());
-  if (!last) return "还没有消息";
-  const text = last.answer
-    .replace(/[#>*`|_-]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  return text.length > 36 ? text.slice(0, 36) + "…" : text;
-}
-
-function sessionTimeLabel(session: ChatSession): string {
-  const diff = Date.now() - session.updatedAt;
-  if (diff < 60_000) return "刚刚";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-  const d = new Date(session.updatedAt);
-  if (d.toDateString() === new Date().toDateString()) {
-    return `${d.getHours()}:${String(d.getMinutes()).padStart(2, "0")}`;
-  }
-  return `${d.getMonth() + 1} 月 ${d.getDate()} 日`;
-}
-
-
-/** 证据只留开头几段：足够认出「当时引了什么」，又不至于撑爆 5MB 配额。 */
-function trimEvidence(list: AssistantEvidence[]): AssistantEvidence[] {
-  return list.slice(0, 6).map((ev) => ({
-    ...ev,
-    snippet: (ev.snippet ?? "").slice(0, 400),
-  }));
+  return activeSessionKeyFor(projectId);
 }
 
 function serializeTurn(turn: Turn): StoredTurn | null {
@@ -558,6 +509,9 @@ function serializeTurn(turn: Turn): StoredTurn | null {
     confidence: turn.confidence,
     agentRunId: turn.agentRunId,
   };
+  if (!isUser && turn.synthetic) {
+    item.synthetic = true;
+  }
   if (isUser && turn.attachments?.length) {
     item.attachments = turn.attachments.map((a) => ({ filename: a.filename }));
   }
@@ -624,8 +578,21 @@ function serializeTurn(turn: Turn): StoredTurn | null {
 let historyReady = false;
 let historyTimer: number | null = null;
 
-function saveHistory(): void {
+/**
+ * 是否还有一轮在流式/加载中。
+ *
+ * 流式回答每个 delta 都会触发 turns 的深度 watch；若每次都全量
+ * `JSON.stringify(chatSessions)` 再写 localStorage，长回答期间主线程会被
+ * 反复拖住。流式期间只保持内存，收尾（loading/streaming 变 false）时由
+ * watch 再触发一次落盘；关页时 `flushHistory(force)` 仍会同步写一次。
+ */
+function historyBusy(): boolean {
+  return turns.value.some((t) => Boolean(t.loading || t.streaming));
+}
+
+function saveHistory(force = false): void {
   if (!historyReady || badId) return;
+  if (!force && historyBusy()) return;
   let slice = turns.value.slice(-HISTORY_MAX_TURNS);
   // 截断后如果从一条助手消息开场，往前对齐到用户消息，别留下没头没尾的回答。
   while (slice.length && slice[0].role === "assistant") slice = slice.slice(1);
@@ -682,6 +649,8 @@ function saveHistory(): void {
 
 function scheduleHistorySave(): void {
   if (!historyReady || badId) return;
+  // 流式期间不排定时器：收尾那一次状态变化会重新触发，避免每 delta 重置计时器。
+  if (historyBusy()) return;
   if (historyTimer !== null) window.clearTimeout(historyTimer);
   historyTimer = window.setTimeout(() => {
     historyTimer = null;
@@ -700,7 +669,9 @@ function flushHistory(): void {
     window.clearTimeout(historyTimer);
     historyTimer = null;
   }
-  saveHistory();
+  // 关页/切路由：即使还在流式也强制写一次（进行中的那一轮本身会被
+  // serializeTurn 的 loading 守卫跳过，但用户提问与已完成轮次不会丢）。
+  saveHistory(true);
 }
 
 /** 把落盘的轮次还原成气泡：只还原文字，所有可交互字段保持空值。 */
@@ -715,6 +686,10 @@ function restoreTurnsFromStored(parsed: StoredTurn[]): Turn[] {
     turn.key = `h-${index}`;
     turn.loading = false;
     turn.historical = true;
+    // 兼容加字段前的存档：旧追问没有 synthetic，按固定文案认回来。
+    turn.synthetic =
+      raw.synthetic === true ||
+      (typeof raw.answer === "string" && raw.answer.includes("有哪里需要修改吗？"));
     if (raw.role === "user") {
       const names = Array.isArray(raw.attachments) ? raw.attachments : [];
       const attachments = names
@@ -784,54 +759,12 @@ function restoreTurnsFromStored(parsed: StoredTurn[]): Turn[] {
   return restored;
 }
 
-function readStoredSessions(): ChatSession[] {
-  try {
-    const raw = localStorage.getItem(sessionsKey());
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (s): s is ChatSession =>
-        !!s &&
-        typeof s === "object" &&
-        typeof (s as ChatSession).id === "string" &&
-        Array.isArray((s as ChatSession).turns),
-    );
-  } catch {
-    return [];
-  }
-}
-
-/** 旧版单会话记录 → 一条会话（迁移后仍读旧键，不做破坏性删除）。 */
-function migrateLegacyHistory(): ChatSession | null {
-  try {
-    const raw = localStorage.getItem(historyKey());
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    const turns = parsed.filter(
-      (t): t is StoredTurn => !!t && typeof t === "object",
-    );
-    if (!turns.length) return null;
-    const now = Date.now();
-    return {
-      id: newSessionId(),
-      title: sessionTitleFromTurns(turns),
-      createdAt: now,
-      updatedAt: now,
-      turns,
-    };
-  } catch {
-    return null;
-  }
-}
-
 /** 恢复本机会话列表与当前会话（首次使用会把旧单会话迁移进来）。 */
 function restoreHistory(): void {
   if (badId) return;
-  let sessions = readStoredSessions();
+  let sessions = readStoredSessions(projectId);
   if (!sessions.length) {
-    const migrated = migrateLegacyHistory();
+    const migrated = migrateLegacyHistory(projectId);
     if (migrated) sessions = [migrated];
   }
   if (!sessions.length) {
@@ -906,7 +839,7 @@ function newChatSession(): void {
   } catch {
     /* 写不进去只影响刷新后的恢复 */
   }
-  nextTick(() => queryInput.value?.focus());
+  nextTick(() => composerRef.value?.focus());
 }
 
 const activeSession = computed<ChatSession | null>(
@@ -943,15 +876,7 @@ function statusOf(err: unknown): number | null {
   return err instanceof ApiError ? err.status : null;
 }
 
-function textOf(err: unknown): string {
-  if (err instanceof ApiError) {
-    const d = detailOf(err);
-    if (d && typeof d.message === "string" && d.message) return d.message;
-    if (typeof err.detail === "string" && err.detail) return err.detail;
-    return err.message;
-  }
-  return err instanceof Error ? err.message : String(err);
-}
+// textOf（展示文案）统一走 utils/errors.ts，避免各页面口径分叉。
 
 // ==================================================================
 // 创作引导（对话式一步步生成）
@@ -975,11 +900,7 @@ const {
 const cardDraft = ref<Record<string, string>>({});
 const cardSaving = ref(false);
 const cardEditError = ref<string | null>(null);
-/** 待确认删除的角色名；null = 没有待确认。 */
-const cardDeleteName = ref<string | null>(null);
 const cardDeleting = ref(false);
-/** 待确认「整体移除角色」的角色名。 */
-const characterRemoveName = ref<string | null>(null);
 const characterRemoving = ref(false);
 /** 角色对话模式：进入后 composer 的每句话都发给角色，而不是问答 agent。 */
 const roleMode = ref<{ character: string; scene: string } | null>(null);
@@ -1000,57 +921,28 @@ const wizardActive = computed(() => wizard.value?.status === "active");
 // 这样刷新、断线重连、甚至服务重启后回来，看到的都是同一份 DB 事实：
 // 任务在跑就继续显示实时进度，已经跑完了就把未消费的回执补发出来。
 
-const distillJob = ref<DistillJob | null>(null);
 /** 本页已经展示过的通知 id（ack 失败时下一轮会重试，成功后也不会重复弹）。 */
 const seenNotices = new Set<number>();
-let distillTimer: ReturnType<typeof setTimeout> | null = null;
 let pageAlive = true;
 
-/** 「疑似卡住 / 运行中 / 排队」这三种才需要持续轮询。 */
-const distillActive = computed(() => {
-  const h = distillJob.value?.health;
-  return h === "queued" || h === "running" || h === "stalled";
+// 进度轮询与展示状态由 composable 负责；页面只提供「怎么拉、通知怎么落」。
+const {
+  distillJob,
+  distillActive,
+  distillPercent,
+  distillTag,
+  distillSentence,
+  schedule: scheduleDistillPoll,
+  poll: pollDistill,
+  onVisibilityChange,
+  stop: stopDistillPolling,
+} = useDistillPolling({
+  fetchNotices: () => api.listWizardNotices(projectId),
+  onNotices: async (items) => {
+    for (const n of items) await consumeNotice(n);
+  },
+  isAlive: () => pageAlive,
 });
-
-/**
- * 百分比只在**总数探明**时才显示；total=0 绝不拿 0 当分母编一个数。
- *
- * 运行中上限 99%：块提炼完之后还有「角色声音 / 文风漂移 / 汇总」几段收尾，
- * 那几段不在块进度里。显示 100% 但状态还是「运行中」就是在撒谎，宁可停在 99%。
- */
-const distillPercent = computed<number | null>(() => {
-  const j = distillJob.value;
-  if (!j || !j.progress_total) return null;
-  const raw = Math.floor((j.progress_current / j.progress_total) * 100);
-  return Math.max(0, Math.min(distillActive.value ? 99 : 100, raw));
-});
-
-const DISTILL_TAG: Record<string, string> = {
-  queued: "排队",
-  running: "运行中",
-  stalled: "疑似卡住",
-  success: "已完成",
-  failed: "失败",
-};
-
-function distillTag(job: DistillJob | null): string {
-  if (!job) return "";
-  return DISTILL_TAG[job.health ?? job.status] ?? job.status;
-}
-
-/** 进度条里那句话：优先用后端给的 health_note（带具体分钟数）。 */
-function distillSentence(job: DistillJob | null): string {
-  if (!job) return "";
-  if (job.health_note) return job.health_note;
-  if (job.stage) return job.stage;
-  return job.status;
-}
-
-function scheduleDistillPoll(delay = 3000): void {
-  if (!pageAlive) return;
-  if (distillTimer) clearTimeout(distillTimer);
-  distillTimer = setTimeout(() => void pollDistill(), delay);
-}
 
 /** 把一条通知变成助手气泡（内容由后端渲染好，前端不拼数字）。 */
 async function consumeNotice(n: WizardNotice): Promise<void> {
@@ -1068,18 +960,6 @@ async function consumeNotice(n: WizardNotice): Promise<void> {
     // ack 失败就下一轮重试：宁可重复补一次，也不能让回执静默消失。
     seenNotices.delete(n.id);
   }
-}
-
-async function pollDistill(): Promise<void> {
-  if (!pageAlive) return;
-  try {
-    const res = await api.listWizardNotices(projectId);
-    distillJob.value = res.distill;
-    for (const n of res.items) await consumeNotice(n);
-  } catch {
-    /* 网络闪断：保持上一次的进度，下一轮继续 */
-  }
-  scheduleDistillPoll();
 }
 
 /**
@@ -1122,8 +1002,9 @@ function recordScrollNow(): void {
 
 onUnmounted(() => {
   pageAlive = false;
+  stopProgressPolling();
   recordScrollNow();
-  if (distillTimer) clearTimeout(distillTimer);
+  stopDistillPolling();
   if (traceClock !== null) {
     window.clearInterval(traceClock);
     traceClock = null;
@@ -1133,6 +1014,7 @@ onUnmounted(() => {
   // 组件被 keep-alive 淘汰 / 真正卸载时，把最后一次改动落盘。
   window.removeEventListener("pagehide", flushHistory);
   window.removeEventListener("keydown", onGlobalKeydown);
+  document.removeEventListener("visibilitychange", onVisibilityChange);
   flushHistory();
   draft.reset(0);
 });
@@ -1145,10 +1027,7 @@ onDeactivated(() => {
   recordScrollNow();
   flushHistory();
   railOpen.value = false;
-  if (distillTimer) {
-    clearTimeout(distillTimer);
-    distillTimer = null;
-  }
+  stopDistillPolling();
   if (traceClock !== null) {
     window.clearInterval(traceClock);
     traceClock = null;
@@ -1294,10 +1173,21 @@ function restoreTurns(items: WizardMessage[]): boolean {
       // 这条回执已经在历史里展示过了：顺手标掉，避免它永远以「未消费」的身份
       // 跟着每次历史回放重复出现。标失败无所谓，下次进来还会再标一次。
       if (noticeId) void api.ackWizardNotice(projectId, noticeId).catch(() => {});
+    } else if (m.kind === "chapter") {
+      const p = (m.payload || {}) as Record<string, unknown>;
+      const gid = Number(p.generation_id ?? 0);
+      t.chapter = {
+        generationId: gid,
+        segmentNo: Number(p.segment_no ?? 0),
+        chapterRange: (p.chapter_range as string) || null,
+        chars: Number(p.chars ?? 0),
+      };
+      if (gid) void loadSentencesFor(gid);
     }
     turns.value.push(t);
   }
-  void scrollToBottom();
+  const last = turns.value[turns.value.length - 1];
+  void scrollToBottom(Boolean(last?.chapter));
   return restoredResult;
 }
 
@@ -1306,6 +1196,8 @@ async function loadWizard(): Promise<void> {
   // 历史与当前状态是两次读：历史要「说过什么」，state 要「停在哪一题」。
   // 历史读失败不该挡住当前题——两者互不依赖，失败就只少一段回放。
   let restoredResult = false;
+  // 章节卡只存 generation_id：先取正文，再回放历史，刷新后章节才能直接展开。
+  await loadGenerationsForChat();
   try {
     const hist = await api.listWizardMessages(projectId);
     if (hist.items.length) restoredResult = restoreTurns(hist.items);
@@ -1563,6 +1455,7 @@ async function runGeneration(turn: Turn): Promise<void> {
     const res = await api.runWizard(projectId);
     if (turn.wizardResult) turn.wizardResult = res.result;
     pushResultTurn(res.result, "写好了，下面是本次落笔的段落。");
+    askRevisionForWizardResult(res.result);
   } catch (err) {
     const t = makeAssistantTurn();
     t.loading = false;
@@ -1625,53 +1518,6 @@ function bibleCharacters(result: WizardCommitResult): BibleCharacterView[] {
     });
   }
   return out;
-}
-
-function cardCount(result: WizardCommitResult): number {
-  return bibleCharacters(result).filter((c) => !!c.card).length;
-}
-
-function missingCards(result: WizardCommitResult): string[] {
-  // 以剧情圣经为准算「还没有卡」的角色：单张重生成后仍然准确，
-  // 不会被上一批 stats.missing（只描述那一批）覆盖。
-  return bibleCharacters(result).filter((c) => !c.card).map((c) => c.name);
-}
-
-/** 涉及该角色的关系条数：移除确认里先说清会连带清理多少条。 */
-function relationshipCount(result: WizardCommitResult, name: string): number {
-  const bible = result.bible as Record<string, unknown> | null | undefined;
-  const rels = bible && Array.isArray(bible.relationships) ? bible.relationships : [];
-  return rels.filter((r) => {
-    if (!r || typeof r !== "object") return false;
-    const rel = r as Record<string, unknown>;
-    return rel.a === name || rel.b === name;
-  }).length;
-}
-
-function cardIdentityLine(card: Record<string, unknown>): string {
-  const ident = card["身份"];
-  if (!ident || typeof ident !== "object") return "";
-  const obj = ident as Record<string, unknown>;
-  return ["性别", "年龄", "身份职业"]
-    .map((key) => asText(obj[key]))
-    .filter(Boolean)
-    .join(" · ");
-}
-
-function cardVoiceLine(card: Record<string, unknown>): string {
-  const voice = card["声纹"];
-  if (!voice || typeof voice !== "object") return "";
-  const v = voice as Record<string, unknown>;
-  const tics = Array.isArray(v["口头禅"])
-    ? v["口头禅"].map(asText).filter(Boolean).slice(0, 2)
-    : [];
-  const parts = [
-    v["自称"] ? `自称「${asText(v["自称"])}」` : "",
-    v["句长"] ? `句长${asText(v["句长"])}` : "",
-    asText(v["句末"]),
-    tics.length ? `口头禅：${tics.map((x) => `「${x}」`).join("")}` : "",
-  ];
-  return parts.filter(Boolean).join(" · ");
 }
 
 async function regenerateCards(
@@ -1823,7 +1669,6 @@ async function deleteCard(turn: Turn, name: string): Promise<void> {
     result.character_cards = res.character_cards;
     result.message = [result.message, res.message].filter(Boolean).join("");
     if (cardEditName.value === name) cardEditName.value = null;
-    cardDeleteName.value = null;
   } catch (err) {
     cardEditError.value = textOf(err);
   } finally {
@@ -1841,8 +1686,6 @@ async function removeCharacter(turn: Turn, name: string): Promise<void> {
     result.bible = res.bible;
     result.message = [result.message, res.message].filter(Boolean).join("");
     if (cardEditName.value === name) cardEditName.value = null;
-    if (cardDeleteName.value === name) cardDeleteName.value = null;
-    characterRemoveName.value = null;
   } catch (err) {
     cardEditError.value = textOf(err);
   } finally {
@@ -1857,14 +1700,6 @@ function exitRole(): void {
   t.answer = "已退出角色对话，回到普通问答。想再聊，点输入框上方的「重新开始创作引导」。";
   turns.value.push(t);
   void scrollToBottom();
-}
-
-function prettyJson(value: Record<string, unknown>): string {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
 }
 
 /** 角色对话的历史只带最近 8 句，避免提示词无限膨胀。 */
@@ -1900,6 +1735,8 @@ function applyAssistantResult(turn: Turn, res: AssistantQaResponse): void {
   // 工具调用轨迹：旧后端不返回 tool_mode / tool_trace → 空值 → 整块不渲染。
   turn.toolMode = res.tool_mode ?? "";
   turn.toolTrace = res.tool_trace ?? [];
+  turn.toolSteps = res.tool_steps ?? 0;
+  turn.forcedWrapUp = res.forced_wrap_up ?? false;
   turn.toolResults = res.tool_results ?? {};
   turn.toolFallbackReason = res.tool_fallback_reason ?? "";
   turn.cards = (res.pending_actions ?? []).map((action) => ({
@@ -2031,17 +1868,7 @@ async function send(): Promise<void> {
   }
 }
 
-/** Enter 发送、Shift+Enter 换行（textarea 默认 Enter 是换行，这里反转）。 */
-function onKeydown(e: KeyboardEvent): void {
-  // 中文输入法里 Enter 是「选中候选词」，不是发送。少了这个判断，
-  // 用户按 Enter 选词会把正在组合的半句话提前发出去，输入框还被清空 ——
-  // 表现出来就是「问题没进对话」。
-  if (e.isComposing || e.keyCode === 229) return;
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    void send();
-  }
-}
+/** Enter 发送、Shift+Enter 换行由输入区组件处理（含输入法组合态保护）。 */
 
 // ==================================================================
 // 待确认卡片：确认 / 取消
@@ -2070,19 +1897,14 @@ function anyCardRunning(): boolean {
 function ensureTraceClock(): void {
   if (traceClock !== null) return;
   traceClock = window.setInterval(() => {
+    // 后台标签页只更新一个时间戳也没意义：直接跳过，省掉无谓的渲染触发。
+    if (document.hidden) return;
     if (anyCardRunning()) traceNow.value = Date.now();
   }, 1000);
 }
 
 function pushTrace(card: ActionCard, text: string, tone: TraceStep["tone"] = "info"): void {
   card.trace.push({ at: Date.now(), text, tone });
-}
-
-function clockText(at: number): string {
-  const d = new Date(at);
-  return [d.getHours(), d.getMinutes(), d.getSeconds()]
-    .map((n) => String(n).padStart(2, "0"))
-    .join(":");
 }
 
 /** 已等待时长（「42 秒」/「3 分 05 秒」）。 */
@@ -2120,6 +1942,11 @@ function scheduleTrace(card: ActionCard): void {
  */
 async function pollCardTrace(card: ActionCard): Promise<void> {
   if (card.state !== "running" || !card.traceSupported) return;
+  // 后台标签页不请求进度：保留定时器但跳过 API，回到前台后自然续上。
+  if (document.hidden) {
+    scheduleTrace(card);
+    return;
+  }
   try {
     const st = await api.generationStatus(projectId);
     if (card.state !== "running") return;
@@ -2186,7 +2013,7 @@ async function confirmCard(card: ActionCard): Promise<void> {
     void loadWorkflow();
     // 动作提案确认后要立刻出现在「等着你批准的动作」里，不让用户自己点刷新。
     if (card.action.kind === "action_proposal") {
-      void workflowStripRef.value?.load();
+      void ctxPanelRef.value?.reloadWorkflow();
     }
   } catch (err) {
     const status = statusOf(err);
@@ -2264,49 +2091,6 @@ function primaryLabel(card: ActionCard): string {
   return "确认执行";
 }
 
-/** 写作卡片的状态文案 / 色标（文字与颜色双编码）。 */
-function genStateText(card: ActionCard): string {
-  if (card.restored) return "历史";
-  if (card.state === "running") return "生成中";
-  if (card.state === "confirmed") return "已生成";
-  if (card.state === "failed") return "失败";
-  return "待开始";
-}
-
-function genStateTag(card: ActionCard): string {
-  if (card.restored) return "info";
-  if (card.state === "running") return "info";
-  if (card.state === "confirmed") return "ok";
-  if (card.state === "failed") return "err";
-  return "warn";
-}
-
-/** 卡片预览：只展示开头一段；完整正文永远在写作面板里。 */
-function genPreview(card: ActionCard): string {
-  if (card.preview) return card.preview;
-  if (card.state === "running") return "正在写作面板中流式生成，点开可查看进度。";
-  if (card.state === "failed") return card.notice || "生成失败，点开重试。";
-  if (card.state === "confirmed") return card.notice || "正文已生成。";
-  return card.action.body?.action === "regenerate_segment"
-    ? "点开在写作面板重写这一段。"
-    : "点开在写作面板续写下一段。";
-}
-
-function genFoot(card: ActionCard): string {
-  if (card.restored) return "刷新前记录 · 点开查看最新正文";
-  if (card.state === "running") return "正文只在写作面板里流式输出";
-  if (card.state === "confirmed") return "点开可查看、编辑或重生成";
-  if (card.state === "failed") return "点开重试";
-  return "点开开始生成";
-}
-
-/** 进度百分比：不知道总量时按目标字数估，封顶 99% 等 done。 */
-function genPercent(card: ActionCard): number {
-  const chars = card.progressChars ?? 0;
-  const target = Math.max(1, card.progressTarget ?? 3000);
-  return Math.min(99, Math.round((chars / target) * 100));
-}
-
 /**
  * 打开写作面板并接一张生成卡。
  *
@@ -2379,7 +2163,8 @@ function openCardPanel(card: ActionCard): void {
 /** 卡片预览：只取正文开头，完整正文留在写作面板里。 */
 async function loadCardPreview(card: ActionCard, segmentNo: number): Promise<void> {
   try {
-    const list = await api.listGenerations(projectId);
+    // 只要 150 字预览：服务端截断，长书不必把整本正文拉回前端。
+    const list = await api.listGenerations(projectId, { preview: 300 });
     const seg = list.find((s) => s.segment_no === segmentNo);
     const text = (seg?.text ?? "").trim();
     if (text) card.preview = text.length > 150 ? `${text.slice(0, 150)}…` : text;
@@ -2393,6 +2178,48 @@ function closeWritingPanel(): void {
   writingOpen.value = false;
 }
 
+/**
+ * 每生成完一次都主动问「哪里要改」：把用户从「看完」推进到「提修改」，
+ * 不用他自己组织措辞。这里只追加一条提问气泡，不发任何请求、不改库。
+ */
+function askWhatToRevise(summary: string): void {
+  const turn = makeAssistantTurn();
+  turn.loading = false;
+  turn.streaming = false;
+  turn.synthetic = true;
+  turn.answer =
+    `${summary}\n\n` +
+    "有哪里需要修改吗？直接说就行，例如：\n" +
+    "- 「这段节奏太慢，压缩一下」\n" +
+    "- 「把结尾改得更克制」\n" +
+    "- 「第 3 句的对话不像这个角色」\n\n" +
+    "涉及改正文时，我会先给你确认卡片，点了确认才会动。";
+  turns.value.push(turn);
+  void scrollToBottom();
+}
+
+/** 引导「开始写」一次可能落多段：按段落数给一句准确的提问前缀。 */
+function askRevisionForWizardResult(result: WizardCommitResult): void {
+  const segments = Array.isArray(result.segments) ? result.segments : [];
+  if (!segments.length) return;
+  if (segments.length === 1) {
+    const seg = segments[0];
+    askWhatToRevise(
+      seg.segment_no
+        ? `第 ${seg.segment_no} 段已生成并写入正文（${seg.chars} 字）。`
+        : `本次已生成并写入正文（${seg.chars} 字）。`,
+    );
+    return;
+  }
+  const total = segments.reduce((sum, s) => sum + (Number(s.chars) || 0), 0);
+  const lastNo =
+    [...segments].reverse().find((s) => s.segment_no)?.segment_no ?? null;
+  askWhatToRevise(
+    `本次共生成 ${segments.length} 段（合计 ${total} 字）` +
+      (lastNo ? `，最后落在第 ${lastNo} 段。` : "。"),
+  );
+}
+
 function onWritingGenerated(payload: { segment_no: number; chars: number }): void {
   const card = writingCard.value;
   if (card) {
@@ -2403,6 +2230,10 @@ function onWritingGenerated(payload: { segment_no: number; chars: number }): voi
     stopTrace(card);
     void loadCardPreview(card, payload.segment_no);
   }
+  // 生成完即问「哪里要改」：用户不用先想好怎么开口。
+  askWhatToRevise(
+    `第 ${payload.segment_no} 段已生成并写入正文（${payload.chars} 字）。`,
+  );
   void loadDesk();
   void loadWorkflow();
   refreshProject();
@@ -2454,75 +2285,314 @@ function refreshProject(): void {
     });
 }
 
-/** 「批准并写入」的忙态（按卡片 key，不放到卡片数据里）。 */
-const promoteBusy = reactive<Record<string, boolean>>({});
+// ==================================================================
+// 对话内联写作：章前选择 + 正文进对话 + 右侧进度
+// ==================================================================
 
-/** 卡片结果里是否带着一条「已创建、待批准」的提案。 */
-function proposalIdOf(card: ActionCard): number | null {
-  const proposal = card.result?.proposal;
-  if (!proposal || typeof proposal !== "object") return null;
-  const id = (proposal as Record<string, unknown>).id;
-  return typeof id === "number" ? id : null;
-}
+const inline = reactive({
+  open: false,
+  loading: false,
+  busy: false,
+  error: "",
+  chapter: 0,
+  isFirst: false,
+  source: "" as "" | "model" | "fallback",
+  options: [] as ChapterOpeningOption[],
+  opening: "",
+  label: "",
+  stage: "",
+  chars: 0,
+  target: 0,
+  text: "",
+  segmentNo: null as number | null,
+});
 
-/**
- * 提案卡确认后只创建了一条 pending 提案，业务表还没动。
- *
- * 这里把「批准 → 写入」两步补在同一张卡上：用户不用再跳去项目页找。
- * 仍然保持两次状态转换（不合成一键写库），只是路径更短。
- */
-async function approveAndApplyCard(card: ActionCard): Promise<void> {
-  const id = proposalIdOf(card);
-  if (id === null || promoteBusy[card.key]) return;
-  promoteBusy[card.key] = true;
-  card.notice = "正在批准并写入…";
+const generationMap = ref<Record<number, GenerationOut>>({});
+const sentenceMap = ref<Record<number, GenerationSentence[]>>({});
+const chapterNotes = reactive<Record<number, string>>({});
+const writingProgress = ref<WritingProgress | null>(null);
+const progressLoading = ref(false);
+let progressTimer: number | null = null;
+
+async function loadGenerationsForChat(): Promise<void> {
   try {
-    try {
-      await api.approveProposal(id);
-    } catch (err) {
-      // 已经批准过、状态机不允许重复批准：继续尝试写入；其他错误照常抛。
-      if (!(err instanceof ApiError && err.status === 409)) throw err;
-    }
-    const res = await api.applyProposal(id);
-    card.applied = true;
-    card.notice = `已写入项目（Version #${res.version_id}）。`;
-    pushTrace(card, "已批准并写入项目", "ok");
-    void loadDesk();
-    void loadWorkflow();
-    // 设定可能刚变：刷新项目，右侧上下文/角色卡跟着更新。
-    api
-      .getProject(projectId)
-      .then((p) => {
-        project.value = p;
-      })
-      .catch(() => {
-        /* 刷新失败不影响写入结论 */
-      });
-  } catch (err) {
-    card.notice = `写入失败（HTTP ${statusOf(err) ?? "?"}）：${textOf(err)}`;
-    pushTrace(card, `写入失败：${textOf(err)}`, "err");
-  } finally {
-    promoteBusy[card.key] = false;
+    const list = await api.listGenerations(projectId);
+    const map: Record<number, GenerationOut> = {};
+    for (const g of list) map[g.id] = g;
+    generationMap.value = map;
+  } catch {
+    /* 正文读失败时章节卡显示加载中，不影响对话 */
   }
 }
 
-const RISK_LABEL: Record<string, string> = {
-  low: "低风险 low",
-  medium: "中风险 medium",
-  high: "高风险 high",
-};
-
-function riskLabel(r: string): string {
-  return RISK_LABEL[r] ?? r;
+async function loadSentencesFor(genId: number): Promise<void> {
+  if (!genId || sentenceMap.value[genId]) return;
+  try {
+    const res = await api.listGenerationSentences(projectId, genId);
+    sentenceMap.value = { ...sentenceMap.value, [genId]: res.items };
+  } catch {
+    /* 切句失败时仍可整段显示 */
+  }
 }
 
-function kindLabelOf(card: ActionCard): string {
-  return pendingActionKindLabel(card.action.kind);
+async function loadWritingProgress(): Promise<void> {
+  progressLoading.value = true;
+  try {
+    writingProgress.value = await api.writingProgress(projectId);
+  } catch {
+    /* 进度失败不阻塞写作 */
+  } finally {
+    progressLoading.value = false;
+  }
 }
 
-function riskMetaOf(card: ActionCard): { label: string; tag: string; hint: string } {
-  return pendingActionRiskMeta(card.action);
+function startProgressPolling(): void {
+  stopProgressPolling();
+  void loadWritingProgress();
+  progressTimer = window.setInterval(() => {
+    if (!pageAlive) return;
+    void loadWritingProgress();
+  }, 5000);
 }
+
+function stopProgressPolling(): void {
+  if (progressTimer !== null) {
+    window.clearInterval(progressTimer);
+    progressTimer = null;
+  }
+}
+
+/** 章前「这一章怎么开头」：取建议并展开选择卡。 */
+async function openInlineWriter(): Promise<void> {
+  if (inline.busy) return;
+  inline.open = true;
+  inline.loading = true;
+  inline.error = "";
+  inline.options = [];
+  void scrollToBottom(true);
+  try {
+    const res = await api.chapterOpeningOptions(projectId, {});
+    inline.chapter = res.chapter;
+    inline.isFirst = res.is_first_chapter;
+    inline.source = res.source;
+    inline.options = res.options;
+  } catch (err) {
+    inline.error = textOf(err);
+  } finally {
+    inline.loading = false;
+  }
+}
+
+async function pickOpening(payload: { opening: string; label: string }): Promise<void> {
+  inline.opening = payload.opening;
+  inline.label = payload.label;
+  inline.open = false;
+  await startInlineGeneration();
+}
+
+/** 在对话里直接生成下一章（与写作面板同一条 generate-stream）。 */
+async function startInlineGeneration(): Promise<void> {
+  if (inline.busy) return;
+  inline.busy = true;
+  inline.error = "";
+  inline.text = "";
+  inline.chars = 0;
+  inline.target = 0;
+  inline.stage = "装配上下文";
+  void scrollToBottom(true);
+  let landedRef: { value: { id: number; segment_no: number; chars: number } | null } = {
+    value: null,
+  };
+  try {
+    await api.generateStream(
+      projectId,
+      null,
+      (chunk) => {
+        inline.text += chunk;
+        inline.chars = inline.text.length;
+        void scrollToBottom();
+      },
+      (meta) => {
+        landedRef.value = {
+          id: meta.id,
+          segment_no: meta.segment_no,
+          chars: meta.chars,
+        };
+        inline.target = meta.chars;
+      },
+      undefined,
+      undefined,
+      (stage) => {
+        inline.stage = stage.label || stage.stage || "生成中";
+      },
+      inline.opening || null,
+    );
+  } catch (err) {
+    inline.error = textOf(err);
+  } finally {
+    inline.busy = false;
+  }
+  await loadGenerationsForChat();
+  await loadWritingProgress();
+  const landed = landedRef.value;
+  if (landed) {
+    const gen = generationMap.value[landed.id];
+    if (gen) {
+      await loadSentencesFor(gen.id);
+      addChapterTurn(gen);
+      // 生成完即问「哪里要改」（与写作面板同一条口径）。
+      askWhatToRevise(
+        `第 ${gen.segment_no} 段已生成并写入正文（${(gen.text || "").length} 字）。`,
+      );
+      void api
+        .appendWizardMessage(projectId, {
+          role: "assistant",
+          kind: "chapter",
+          payload: {
+            generation_id: gen.id,
+            segment_no: gen.segment_no,
+            chapter_range: gen.chapter_range,
+            chars: (gen.text || "").length,
+          },
+          dedupe_key: `chapter:${gen.id}`,
+        })
+        .catch(() => {
+          /* 历史落库失败不影响本次正文 */
+        });
+    }
+    inline.text = "";
+    await scrollToBottom();
+  }
+  void loadDesk();
+  void loadWorkflow();
+  refreshProject();
+}
+
+function addChapterTurn(gen: GenerationOut): void {
+  if (turns.value.some((t) => t.chapter?.generationId === gen.id)) return;
+  const turn = makeAssistantTurn();
+  turn.loading = false;
+  turn.answer = "";
+  turn.text = "";
+  turn.chapter = {
+    generationId: gen.id,
+    segmentNo: gen.segment_no,
+    chapterRange: gen.chapter_range,
+    chars: (gen.text || "").length,
+  };
+  turns.value.push(turn);
+}
+
+function chapterText(turn: Turn): string {
+  const id = turn.chapter?.generationId;
+  return id ? generationMap.value[id]?.text || "" : "";
+}
+
+function chapterSentences(turn: Turn): GenerationSentence[] {
+  const id = turn.chapter?.generationId;
+  return id ? sentenceMap.value[id] || [] : [];
+}
+
+function chapterNote(turn: Turn): string {
+  const id = turn.chapter?.generationId;
+  if (!id) return "";
+  if (!generationMap.value[id]) return "正文加载中…";
+  return chapterNotes[id] || "";
+}
+
+function onChapterSave(turn: Turn, text: string): void {
+  if (turn.chapter) void saveChapterText(turn.chapter.generationId, text);
+}
+
+function onChapterRewrite(turn: Turn, payload: { index: number; problem: string }): void {
+  if (turn.chapter) void rewriteChapterSentence(turn.chapter.generationId, payload);
+}
+
+function onChapterPanel(turn: Turn): void {
+  if (turn.chapter) openPanelForChapter(turn.chapter.segmentNo);
+}
+
+/** 直接改一句：拼回整段后走 PATCH，后端重算摘要/图谱。 */
+async function saveChapterText(genId: number, next: string): Promise<void> {
+  const gen = generationMap.value[genId];
+  if (!gen) return;
+  chapterNotes[genId] = "正在保存…";
+  try {
+    await api.updateGenerationText(projectId, genId, next);
+    generationMap.value = {
+      ...generationMap.value,
+      [genId]: { ...gen, text: next },
+    };
+    delete sentenceMap.value[genId];
+    await loadSentencesFor(genId);
+    chapterNotes[genId] = "这一句已保存。";
+    await loadWritingProgress();
+    void loadDesk();
+    void loadWorkflow();
+  } catch (err) {
+    chapterNotes[genId] = `保存失败：${textOf(err)}`;
+  }
+}
+
+/** 指出问题：交回现有局部 patch，只重写选中的那一句。 */
+async function rewriteChapterSentence(
+  genId: number,
+  payload: { index: number; problem: string },
+): Promise<void> {
+  const gen = generationMap.value[genId];
+  if (!gen) return;
+  chapterNotes[genId] = `正在重写第 ${payload.index} 句…`;
+  try {
+    const res = await api.assistantInvokeGeneration({
+      project_id: projectId,
+      action: "regenerate_segment",
+      segment_no: gen.segment_no,
+      instruction: `改写第 ${payload.index} 句：${payload.problem}`,
+    });
+    if ((res as { status?: string }).status === "needs_clarification") {
+      chapterNotes[genId] = "这句没定位准，请把问题说得更具体一点再试。";
+      return;
+    }
+    const list = await api.listGenerations(projectId);
+    const updated = list.find((g) => g.id === genId);
+    if (updated) {
+      generationMap.value = { ...generationMap.value, [genId]: updated };
+    }
+    delete sentenceMap.value[genId];
+    await loadSentencesFor(genId);
+    chapterNotes[genId] = "这一句已重写。";
+    await loadWritingProgress();
+  } catch (err) {
+    chapterNotes[genId] = `重写失败：${textOf(err)}`;
+  }
+}
+
+function openPanelForChapter(segmentNo: number): void {
+  writingMode.value = "view";
+  writingSegmentNo.value = segmentNo;
+  writingCardKey.value = null;
+  writingOpen.value = true;
+}
+
+// 「批准 → 写入」的忙态、两步顺序与失败回执由 composable 负责；
+// 页面只提供「写入成功后刷新什么、失败留什么痕」这两个回调。
+const { promoteBusy, proposalIdOf, approveAndApplyCard } =
+  useProposalApproval<ActionCard>({
+    projectId,
+    setProject: (p) => {
+      project.value = p;
+    },
+    onApplied: (card) => {
+      pushTrace(card, "已批准并写入项目", "ok");
+      void loadDesk();
+      void loadWorkflow();
+    },
+    onFailed: (card, message) => {
+      pushTrace(card, `写入失败：${message}`, "err");
+    },
+    statusOf,
+    textOf,
+  });
 
 /**
  * 把执行结果压成一句话。
@@ -2559,26 +2629,6 @@ function describeResult(
     return `请求已成功送达 ${action.endpoint}，但服务端未返回可读摘要。`;
   }
   return `${parts.join("；")}。`;
-}
-
-/** 结果响应里值得展开看的字段（正文 / diff），其余已在 notice 里说完。 */
-function resultExtras(res: Record<string, unknown> | null): { label: string; text: string }[] {
-  if (!res) return [];
-  const out: { label: string; text: string }[] = [];
-  const proposal = res.proposal;
-  if (proposal && typeof proposal === "object") {
-    const p = proposal as Record<string, unknown>;
-    if (typeof p.diff === "string" && p.diff) out.push({ label: "改动差异 diff", text: p.diff });
-    if (typeof p.after_text === "string" && p.after_text) {
-      out.push({ label: "改后全文 after_text", text: p.after_text });
-    }
-  }
-  const segment = res.segment;
-  if (segment && typeof segment === "object") {
-    const s = segment as Record<string, unknown>;
-    if (typeof s.text === "string" && s.text) out.push({ label: "生成正文", text: s.text });
-  }
-  return out;
 }
 
 // ==================================================================
@@ -2687,13 +2737,6 @@ function confidenceLabel(c: number): string {
   return "低置信 low";
 }
 
-/** 工具调用状态 → 面向用户的文字 + 色标（文字为主，颜色只做辅助）。 */
-function toolStatusMeta(status: string): { label: string; tag: string } {
-  if (status === "ok") return { label: "已执行", tag: "ok" };
-  if (status === "denied") return { label: "已拒绝（未执行）", tag: "err" };
-  return { label: "执行失败", tag: "warn" };
-}
-
 /**
  * 工具结果预览：按工具名从 `tool_results` 取结果体，序列化后截断。
  *
@@ -2759,7 +2802,6 @@ const latestWrittenChapter = computed(() => {
 
 /** 目录里选中的章（再点一次取消）。选中只影响本地展示与提问模板，不写库。 */
 const selectedChapter = ref<number | null>(null);
-const queryInput = ref<HTMLTextAreaElement | null>(null);
 /** 章节目录抽屉：默认收起，避免常驻占掉正文宽度。 */
 const railOpen = ref(false);
 
@@ -2778,7 +2820,7 @@ function askAboutChapter(): void {
   if (!row) return;
   query.value = `第 ${row.chapter} 章《${row.title}》`;
   railOpen.value = false;
-  void nextTick(() => queryInput.value?.focus());
+  void nextTick(() => composerRef.value?.focus());
 }
 
 // ==================================================================
@@ -2792,8 +2834,7 @@ const QUICK_PROMPTS: { label: string; text: string }[] = [
   { label: "给个开头钩子", text: "给下一段的开头一个钩子，先讨论方案，不要写正文。" },
 ];
 
-/** 输入区上面的「@ 引用 / / 指令」弹层。 */
-const quoteMenu = ref<"" | "ref" | "cmd">("");
+/** 输入区上面的「@ 引用 / / 指令」弹层由输入区组件自己管理。 */
 
 const quoteItems = computed<{ label: string; token: string; kind: string }[]>(() => {
   const items: { label: string; token: string; kind: string }[] = [];
@@ -2820,36 +2861,10 @@ const commandItems = QUICK_PROMPTS.map((p) => ({
   kind: "指令",
 }));
 
-function toggleQuoteMenu(kind: "ref" | "cmd"): void {
-  quoteMenu.value = quoteMenu.value === kind ? "" : kind;
-}
-
-function insertComposerToken(token: string): void {
-  query.value = (query.value ? query.value + " " : "") + token + " ";
-  quoteMenu.value = "";
-  nextTick(() => {
-    autoGrowComposer();
-    queryInput.value?.focus();
-  });
-}
-
 function useQuickPrompt(text: string): void {
   query.value = text;
-  nextTick(() => {
-    autoGrowComposer();
-    queryInput.value?.focus();
-  });
+  void nextTick(() => composerRef.value?.focus());
 }
-
-/** 输入框随内容长高（上限 180px），不出现双滚动条。 */
-function autoGrowComposer(): void {
-  const el = queryInput.value;
-  if (!el) return;
-  el.style.height = "auto";
-  el.style.height = Math.min(el.scrollHeight, 180) + "px";
-}
-
-watch(query, () => nextTick(autoGrowComposer));
 
 /* ---- 右栏上下文：全部来自项目真实数据，不编造 ---- */
 const bible = computed(() => project.value?.plot_bible ?? null);
@@ -2891,6 +2906,13 @@ const contextChips = computed<{ label: string; accent?: boolean }[]>(() => {
   }
   return chips;
 });
+
+/** 右栏「模型」卡：三个角色各自生效的模型（兜底单独标出来）。 */
+const modelRows = computed<{ label: string; value: string }[]>(() => [
+  { label: "生成", value: writerCfg.value?.is_fallback ? "本地兜底" : writerCfg.value?.label || "—" },
+  { label: "助手", value: assistantCfg.value?.is_fallback ? "本地兜底" : assistantCfg.value?.label || "—" },
+  { label: "提炼", value: distillerCfg.value?.is_fallback ? "本地兜底" : distillerCfg.value?.label || "—" },
+]);
 
 interface AgentStep {
   name: string;
@@ -2941,13 +2963,7 @@ function isRetrieving(turn: Turn): boolean {
 // 这些块原来全部平铺在正文下面，一条长回答之后要翻很久才能回到输入框。
 // 现在折叠成一行 chip，点开才在自带滚动的小窗口里看明细。
 
-type DetailKind = "steps" | "evidence" | "tools" | "web";
-
-interface DataChip {
-  kind: DetailKind;
-  label: string;
-  live: boolean;
-}
+type DetailKind = DataChipKind;
 
 const detailView = ref<{ turnKey: string; kind: DetailKind } | null>(null);
 
@@ -2974,7 +2990,11 @@ const detailSubtitle = computed(() => {
   if (!view || !turn) return "";
   if (view.kind === "steps") return `${displaySteps(turn).length} 项 · 只读`;
   if (view.kind === "evidence") return `${turn.evidence.length} 条`;
-  if (view.kind === "tools") return `${turn.toolTrace.length} 次调用`;
+  if (view.kind === "tools") {
+    const steps = turn.toolSteps ? `${turn.toolSteps} 步 · ` : "";
+    const wrap = turn.forcedWrapUp ? " · 步数用满（已停止继续检索）" : "";
+    return `${steps}${turn.toolTrace.length} 次调用${wrap}`;
+  }
   const dropped = turn.webSearch?.dropped ?? 0;
   return `${turn.webSources?.length ?? 0} 条${dropped ? ` · 已过滤 ${dropped} 条低质结果` : ""}`;
 });
@@ -3009,7 +3029,13 @@ function turnChips(turn: Turn): DataChip[] {
     chips.push({ kind: "evidence", label: `证据 ${turn.evidence.length} 条`, live: false });
   }
   if (turn.toolTrace.length) {
-    chips.push({ kind: "tools", label: `工具调用 ${turn.toolTrace.length} 次`, live: false });
+    // tool_steps 是后端工具循环的实际步数（旧后端不返回 → 0 → 只显示调用次数）。
+    const steps = turn.toolSteps ? ` · ${turn.toolSteps} 步` : "";
+    chips.push({
+      kind: "tools",
+      label: `工具调用 ${turn.toolTrace.length} 次${steps}`,
+      live: false,
+    });
   }
   if (turn.webSources?.length) {
     chips.push({ kind: "web", label: `联网来源 ${turn.webSources.length} 条`, live: false });
@@ -3150,8 +3176,7 @@ async function loadWorkflow(): Promise<void> {
   }
 }
 
-/** 工序链组件（含「等着你批准的动作」）：卡片确认后要让它一起刷新。 */
-const workflowStripRef = ref<{ load: () => Promise<void> } | null>(null);
+/** 工序链组件（含「等着你批准的动作」）已随右栏拆到 AssistantContextPanel。 */
 
 /**
  * 只看本作品实际用到的工序：`skipped`（未启用/不适用）不算进度，
@@ -3178,7 +3203,11 @@ const planSteps = computed(() => {
 
 const lastAssistantKey = computed(() => {
   for (let i = turns.value.length - 1; i >= 0; i -= 1) {
-    if (turns.value[i].role === "assistant") return turns.value[i].key;
+    // 合成过程消息（生成后追问）不算「最新正常回答」：计划卡仍挂在真正的
+    // 问答/章节消息下面，不会被一条系统提问带偏。
+    if (turns.value[i].role === "assistant" && !turns.value[i].synthetic) {
+      return turns.value[i].key;
+    }
   }
   return "";
 });
@@ -3206,6 +3235,7 @@ onMounted(async () => {
   // 刷新/关页时同步落盘：pagehide 是浏览器保证会跑的最后时机。
   window.addEventListener("pagehide", flushHistory);
   window.addEventListener("keydown", onGlobalKeydown);
+  document.addEventListener("visibilitychange", onVisibilityChange);
   // 三条读取互相独立：任何一条失败都不能把后面的目录/轮询一起带走
   // （旧写法串行 await，后端重启窗口里一次失败会让整页停在空壳状态）。
   await Promise.all([
@@ -3237,6 +3267,7 @@ onMounted(async () => {
   // 引导卡先入列，再开始轮询：回执/卡住提醒是「之后发生的事」，必须排在卡片后面。
   pageAlive = true;
   void pollDistill();
+  startProgressPolling();
 });
 </script>
 
@@ -3443,7 +3474,8 @@ onMounted(async () => {
             <i aria-hidden="true" />
             助手 · {{ assistantCfg?.label || "未配置" }}
           </span>
-          <button class="link-btn" @click="openWritingPanelPlain">写作</button>
+          <button class="link-btn" @click="openInlineWriter">写作</button>
+          <button class="link-btn" @click="openWritingPanelPlain">高级面板</button>
           <button class="link-btn ctx-toggle" @click="ctxOpen = true">上下文</button>
           <button class="link-btn" @click="toggleMemory">记忆 {{ memories.length }}</button>
         </div>
@@ -3451,6 +3483,7 @@ onMounted(async () => {
 
       <div v-if="badId" class="notice err">路由缺少有效的项目 id（/projects/:id/assistant）。</div>
 
+  <div class="chat-row">
   <section class="card assistant chat-card">
     <!-- ==================== 对话流 ==================== -->
     <div ref="streamEl" class="stream" @scroll.passive="onStreamScroll">
@@ -3509,25 +3542,13 @@ onMounted(async () => {
             提炼进度：只一行结论 + 百分比（没有探明总块数就不显示百分比）。
             挂在最后一张引导卡下面，刷新后由 GET /wizard 的 distill 字段恢复。
           -->
-          <div
+          <AssistantDistillProgress
             v-if="turn.key === lastWizardTurnKey && distillJob && distillActive"
-            class="wz-distill"
-            :class="{ stalled: distillJob.health === 'stalled' }"
-          >
-            <div class="wz-distill-head">
-              <span class="tag" :class="distillJob.health === 'stalled' ? 'warn' : 'accent'">
-                {{ distillTag(distillJob) }}
-              </span>
-              <span class="wz-distill-stage">{{ distillJob.stage || "提炼中" }}</span>
-              <span v-if="distillPercent !== null" class="mono wz-distill-pct">
-                {{ distillPercent }}%
-              </span>
-            </div>
-            <div v-if="distillPercent !== null" class="wz-distill-bar">
-              <span :style="{ width: distillPercent + '%' }" />
-            </div>
-            <p class="faint wz-distill-note">{{ distillSentence(distillJob) }}</p>
-          </div>
+            :job="distillJob"
+            :tag="distillTag(distillJob)"
+            :sentence="distillSentence(distillJob)"
+            :percent="distillPercent"
+          />
 
           <!-- 完成回执 / 疑似卡住提醒（持久化通知，ack 后不再重复） -->
           <div v-if="turn.notice" class="wz-notice" :class="turn.notice.kind">
@@ -3606,175 +3627,25 @@ onMounted(async () => {
             </div>
           </div>
 
-          <template v-if="turn.wizardResult">
-            <p v-if="turn.wizardResult.message" class="wz-prose">{{ turn.wizardResult.message }}</p>
-
-            <div
-              v-if="(turn.wizardResult.stage === 'outline' || turn.wizardResult.stage === 'cards') && turn.wizardResult.bible"
-              class="blk"
-            >
-              <button
-                class="link-btn"
-                @click="toggle(`bible-${turn.key}`)"
-              >
-                {{ isOpen(`bible-${turn.key}`) ? "收起大纲" : "查看生成的大纲" }}
-              </button>
-              <pre
-                v-if="isOpen(`bible-${turn.key}`)"
-                class="diffbox snippet expanded mono"
-              >{{ prettyJson(turn.wizardResult.bible) }}</pre>
-            </div>
-
-            <!-- 以剧情圣经为准渲染：历史会话没有 character_cards 字段，也要能看到卡/角色。 -->
-            <div
-              v-if="(turn.wizardResult.stage === 'outline' || turn.wizardResult.stage === 'cards') && bibleCharacters(turn.wizardResult).length"
-              class="wz-cards"
-            >
-              <div class="row tight">
-                <span class="tag mono">角色卡 {{ cardCount(turn.wizardResult) }} 张</span>
-                <span v-if="turn.wizardResult.character_cards?.collisions" class="tag">
-                  声纹撞车 {{ turn.wizardResult.character_cards.collisions }}
-                </span>
-                <button
-                  v-if="missingCards(turn.wizardResult).length"
-                  class="link-btn"
-                  :disabled="!!cardsBusyName"
-                  @click="regenerateCards(turn, missingCards(turn.wizardResult), 'missing')"
-                >
-                  {{ cardsBusyName === "missing"
-                    ? "补齐中…"
-                    : `补齐缺失（${missingCards(turn.wizardResult).length}）` }}
-                </button>
-                <button
-                  class="link-btn"
-                  :disabled="!!cardsBusyName"
-                  @click="regenerateCards(turn, [], 'all')"
-                >
-                  {{ cardsBusyName === "all" ? "生成中…" : "重生成全部" }}
-                </button>
-              </div>
-
-              <ul class="wz-card-list">
-                <li
-                  v-for="c in bibleCharacters(turn.wizardResult)"
-                  :key="c.name"
-                  class="wz-card-item"
-                >
-                  <div class="wz-card-head">
-                    <strong>{{ c.name }}</strong>
-                    <span class="tag" :class="{ mono: !!c.card }">
-                      {{ c.card ? "已生成" : "未生成" }}
-                    </span>
-                    <span v-if="c.card && c.card['来源'] === 'user'" class="tag">手写</span>
-                    <div class="wz-card-actions">
-                      <button
-                        v-if="c.card"
-                        class="link-btn"
-                        :disabled="cardSaving"
-                        @click="beginCardEdit(c, turn)"
-                      >
-                        编辑
-                      </button>
-                      <button
-                        v-if="c.card"
-                        class="link-btn wz-danger"
-                        :disabled="cardDeleting"
-                        @click="cardDeleteName = c.name"
-                      >
-                        删除卡
-                      </button>
-                      <button
-                        class="link-btn wz-danger"
-                        :disabled="characterRemoving"
-                        title="从剧情圣经整体移除，不只是删卡"
-                        @click="characterRemoveName = c.name"
-                      >
-                        移除角色
-                      </button>
-                      <button
-                        class="link-btn"
-                        :disabled="!!cardsBusyName || cardSaving"
-                        @click="regenerateCards(turn, [c.name], c.name)"
-                      >
-                        {{ cardsBusyName === c.name
-                          ? "生成中…"
-                          : c.card ? "重生成" : "生成" }}
-                      </button>
-                    </div>
-                  </div>
-                  <div v-if="c.card" class="wz-card-meta">{{ cardIdentityLine(c.card) }}</div>
-                  <div v-if="c.card" class="wz-card-meta">{{ cardVoiceLine(c.card) }}</div>
-
-                  <div v-if="cardDeleteName === c.name" class="wz-card-confirm">
-                    <span>只删除角色卡，角色仍保留在剧情圣经里。</span>
-                    <button
-                      class="btn ghost sm wz-danger"
-                      :disabled="cardDeleting"
-                      @click="deleteCard(turn, c.name)"
-                    >
-                      {{ cardDeleting ? "删除中…" : "确认删除" }}
-                    </button>
-                    <button class="btn ghost sm" @click="cardDeleteName = null">取消</button>
-                  </div>
-
-                  <div v-if="characterRemoveName === c.name" class="wz-card-confirm">
-                    <span>
-                      会从剧情圣经整体移除「{{ c.name }}」<template
-                        v-if="relationshipCount(turn.wizardResult, c.name)"
-                      >，并清理 {{ relationshipCount(turn.wizardResult, c.name) }} 条相关关系</template>。
-                    </span>
-                    <button
-                      class="btn ghost sm wz-danger"
-                      :disabled="characterRemoving"
-                      @click="removeCharacter(turn, c.name)"
-                    >
-                      {{ characterRemoving ? "移除中…" : "确认移除" }}
-                    </button>
-                    <button class="btn ghost sm" @click="characterRemoveName = null">取消</button>
-                    <span v-if="cardEditError" class="notice err">{{ cardEditError }}</span>
-                    <span class="wz-card-confirm-hint">
-                      正文与已抽好的图谱保留，只是以后写文不再把 TA 当锁定角色；此操作不可撤销。
-                    </span>
-                  </div>
-                </li>
-              </ul>
-            </div>
-
-            <div v-if="turn.wizardResult.segments?.length" class="wz-done">
-              <div
-                v-for="seg in turn.wizardResult.segments"
-                :key="String(seg.segment_no)"
-                class="wz-seg"
-              >
-                <span class="tag mono">第 {{ seg.segment_no }} 段 · {{ seg.chars }} 字</span>
-                <div class="prose snippet expanded">{{ seg.excerpt }}…</div>
-              </div>
-            </div>
-
-            <div class="row tight" style="margin-top: var(--sp-2)">
-              <button
-                v-if="canRun(turn.wizardResult)"
-                class="btn primary sm"
-                :disabled="runBusy"
-                @click="runGeneration(turn)"
-              >
-                {{ runBusy ? "正在写，别关页面…" : "开始写" }}
-              </button>
-              <button
-                v-if="turn.wizardResult.stage === 'role'"
-                class="btn sm"
-                @click="exitRole"
-              >
-                结束角色对话
-              </button>
-              <button
-                class="btn ghost sm"
-                @click="router.push(`/projects/${projectId}`)"
-              >
-                {{ turn.wizardResult.stage === "done" ? "看全文 →" : "去项目工作台 →" }}
-              </button>
-            </div>
-          </template>
+          <AssistantWizardResult
+            v-if="turn.wizardResult"
+            :result="turn.wizardResult"
+            :characters="bibleCharacters(turn.wizardResult)"
+            :busy-name="cardsBusyName"
+            :card-saving="cardSaving"
+            :card-deleting="cardDeleting"
+            :character-removing="characterRemoving"
+            :card-edit-error="cardEditError"
+            :run-busy="runBusy"
+            :can-run="canRun(turn.wizardResult)"
+            @regenerate="(p) => regenerateCards(turn, p.names, p.mode)"
+            @edit="(c) => beginCardEdit(c, turn)"
+            @delete-card="(name) => deleteCard(turn, name)"
+            @remove-character="(name) => removeCharacter(turn, name)"
+            @run="runGeneration(turn)"
+            @exit-role="exitRole"
+            @open-project="router.push(`/projects/${projectId}`)"
+          />
 
           <WizardStepCard
             v-if="turn.wizard"
@@ -3827,33 +3698,10 @@ onMounted(async () => {
             资料 / 证据 / 工具调用 / 联网来源不再整块铺在正文下面 —— 长回答
             会把这些块推到很远，用户得翻很久才能回到输入框。
           -->
-          <div v-if="turnChips(turn).length" class="turn-chips">
-            <button
-              v-for="chip in turnChips(turn)"
-              :key="chip.kind"
-              type="button"
-              class="data-chip"
-              :class="{ live: chip.live }"
-              @click="openDetail(turn, chip.kind)"
-            >
-              <span v-if="chip.live" class="data-chip-dot" aria-hidden="true" />
-              <span v-else class="data-chip-ico" aria-hidden="true">
-                <svg
-                  width="11"
-                  height="11"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2.1"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <path d="m5 12 5 5L20 7" />
-                </svg>
-              </span>
-              {{ chip.label }}
-            </button>
-          </div>
+          <AssistantDataChips
+            :chips="turnChips(turn)"
+            @open="(kind) => openDetail(turn, kind)"
+          />
 
           <div
             v-if="turn.loading && !turn.answer && !displaySteps(turn).length"
@@ -3880,6 +3728,19 @@ onMounted(async () => {
             <span>思考了 {{ thinkingText(turn.thinking) }}</span>
             <span class="think-chars">{{ turn.thinking.chars }} 字推理</span>
           </div>
+
+          <!-- 章节正文直接展开在对话里：选句、改句、指出问题都在这张卡上 -->
+          <InlineChapterCard
+            v-if="turn.chapter"
+            :chapter-range="turn.chapter.chapterRange"
+            :chars="turn.chapter.chars"
+            :text="chapterText(turn)"
+            :sentences="chapterSentences(turn)"
+            :note="chapterNote(turn)"
+            @save="(text) => onChapterSave(turn, text)"
+            @rewrite="(payload) => onChapterRewrite(turn, payload)"
+            @open-panel="onChapterPanel(turn)"
+          />
 
           <!-- 本次推进计划：服务端评估的工序链，只在最新一条回答下展示 -->
           <div v-if="showPlanCard(turn)" class="plan-card">
@@ -3935,174 +3796,24 @@ onMounted(async () => {
                 助手的动作卡片；写作卡片点开即可在右侧查看/修改正文（不会直接改库）：
               </div>
               <template v-for="card in turn.cards" :key="card.key">
-                <!-- 写作卡片：聊天里只留一张小卡，点开去右侧写作面板看/改正文 -->
-                <div
+                <AssistantGenerationCard
                   v-if="isGenerationCard(card)"
-                  class="gen-card"
-                  :class="card.state"
-                  role="button"
-                  tabindex="0"
-                  @click="openCardPanel(card)"
-                  @keydown.enter="openCardPanel(card)"
-                >
-                  <div class="gen-card-head">
-                    <span class="gen-card-kicker">写作卡片</span>
-                    <span class="tag mono">
-                      {{ card.segmentNo ? `第 ${card.segmentNo} 段` : "续写下一段" }}
-                    </span>
-                    <span class="tag" :class="genStateTag(card)">{{ genStateText(card) }}</span>
-                  </div>
-                  <div class="gen-card-title">{{ card.action.title }}</div>
-                  <p class="gen-card-preview">{{ genPreview(card) }}</p>
-                  <div v-if="card.state === 'running'" class="gen-progress">
-                    <div class="gen-progress-head">
-                      <span>
-                        <template v-if="card.progressStage">
-                          作者 Agent · {{ card.progressStage }}
-                          <template v-if="card.progressChars"> · {{ card.progressChars }} 字</template>
-                        </template>
-                        <template v-else-if="card.progressChars">
-                          已生成 {{ card.progressChars }} 字
-                        </template>
-                        <template v-else-if="card.progressReasoning">
-                          模型思考中 · {{ card.progressReasoning }} 字
-                        </template>
-                        <template v-else>等待首字…</template>
-                      </span>
-                      <span>
-                        已等待 {{ card.progressSeconds ?? 0 }} 秒
-                        <template v-if="card.progressTarget">
-                          · 目标约 {{ card.progressTarget }} 字
-                        </template>
-                      </span>
-                    </div>
-                    <div class="gen-progress-track">
-                      <span
-                        class="gen-progress-fill"
-                        :class="{ waiting: !card.progressChars }"
-                        :style="card.progressChars ? { width: genPercent(card) + '%' } : undefined"
-                      />
-                    </div>
-                  </div>
-                  <div class="gen-card-foot">
-                    <span class="faint">{{ genFoot(card) }}</span>
-                    <span class="gen-card-open">打开写作面板 →</span>
-                  </div>
-                </div>
-                <div v-else class="card-pending">
-                <div class="row tight" style="align-items: center">
-                  <span class="tag accent">{{ kindLabelOf(card) }}</span>
-                  <span class="tag mono">kind={{ card.action.kind }}</span>
-                  <span class="tag" :class="riskMetaOf(card).tag">
-                    {{ riskMetaOf(card).label }}
-                  </span>
-                  <span
-                    v-if="card.action.body && typeof card.action.body.risk_level === 'string'"
-                    class="tag mono"
-                  >
-                    {{ riskLabel(card.action.body.risk_level) }}
-                  </span>
-                </div>
-
-                <div class="card-title">{{ card.action.title }}</div>
-                <div class="card-hint">{{ riskMetaOf(card).hint }}</div>
-
-                <div v-if="card.rows.length" class="meta-grid">
-                  <div v-for="row in card.rows" :key="row.key">
-                    <span class="blk-head">{{ row.label }}</span>
-                    <div class="mono" style="font-size: var(--fs-xs)">{{ row.value }}</div>
-                  </div>
-                </div>
-
-                <!-- 待确认时明确告知将调用的端点：用户有权知道按下去会发生什么 -->
-                <div v-if="card.state === 'pending'" class="faint mono endpoint">
-                  将执行 {{ card.action.method }} {{ card.action.endpoint }}（请求体由服务端下发，
-                  前端不参与构造）
-                </div>
-
-                <div v-if="card.state === 'running'" class="notice info">
-                  执行中 · 已等待 {{ elapsedText(card) }}
-                </div>
-
-                <div v-if="card.state === 'confirmed'" class="notice ok confirm-box">
-                  <div>{{ card.notice }}</div>
-                  <div
-                    v-for="(x, i) in resultExtras(card.result)"
-                    :key="`x-${card.key}-${i}`"
-                    class="blk"
-                  >
-                    <span class="blk-head">{{ x.label }}</span>
-                    <pre
-                      class="diffbox snippet"
-                      :class="{ expanded: isOpen(`rx-${card.key}-${i}`) }"
-                    >{{ x.text }}</pre>
-                    <button class="link-btn" @click="toggle(`rx-${card.key}-${i}`)">
-                      {{ isOpen(`rx-${card.key}-${i}`) ? "收起" : "展开完整内容" }}
-                    </button>
-                  </div>
-
-                  <!--
-                    提案类卡片：确认只创建了待批提案，业务表还没动。
-                    在这里补上「批准 → 写入」，用户不必再跳去项目页找。
-                  -->
-                  <!-- 文本提案（kind=proposal）才走 /proposals 的批准+写入；
-                       动作提案（kind=action_proposal）是另一张表、另一组端点，
-                       误用这里会拿错 id 去批文本提案，必须在右侧工序链里处理。 -->
-                  <div
-                    v-if="card.action.kind === 'proposal' && proposalIdOf(card) && !card.applied"
-                    class="promote-row"
-                  >
-                    <span class="faint">提案已创建，项目数据还没改。</span>
-                    <button
-                      class="btn primary sm"
-                      :disabled="!!promoteBusy[card.key]"
-                      @click="approveAndApplyCard(card)"
-                    >
-                      {{ promoteBusy[card.key] ? "写入中…" : "批准并写入" }}
-                    </button>
-                  </div>
-                  <div
-                    v-else-if="card.action.kind === 'action_proposal' && proposalIdOf(card)"
-                    class="faint"
-                  >
-                    动作提案已创建，项目数据还没改；请在右侧「等着你批准的动作」里批准并执行。
-                  </div>
-                  <div v-else-if="card.applied" class="faint">已写入项目。</div>
-                </div>
-
-                <div v-if="card.state === 'failed'" class="notice err confirm-box">
-                  <div>{{ card.notice }}</div>
-                </div>
-
-                <!-- 执行轨迹：确认 / 请求发出 / 落库 / 完成，各行都带本地时刻 -->
-                <ol v-if="card.trace.length" class="trace">
-                  <li
-                    v-for="(s, i) in card.trace"
-                    :key="`t-${card.key}-${i}`"
-                    :class="s.tone"
-                  >
-                    <span class="trace-time mono">{{ clockText(s.at) }}</span>
-                    <span class="trace-text">{{ s.text }}</span>
-                  </li>
-                </ol>
-
-                <div class="row tight">
-                  <button
-                    class="btn primary"
-                    :disabled="card.state !== 'pending' && card.state !== 'failed'"
-                    @click="confirmCard(card)"
-                  >
-                    {{ primaryLabel(card) }}
-                  </button>
-                  <button
-                    class="btn"
-                    :disabled="card.state === 'running' || card.state === 'confirmed'"
-                    @click="cancelCard(turn, card)"
-                  >
-                    取消
-                  </button>
-                </div>
-                </div>
+                  :card="card"
+                  @open="openCardPanel(card)"
+                />
+                <AssistantActionCard
+                  v-else
+                  :card="card"
+                  :elapsed="elapsedText(card)"
+                  :approving="!!promoteBusy[card.key]"
+                  :primary-label="primaryLabel(card)"
+                  :proposal-id="proposalIdOf(card)"
+                  :is-open="isOpen"
+                  @confirm="confirmCard(card)"
+                  @cancel="cancelCard(turn, card)"
+                  @approve="approveAndApplyCard(card)"
+                  @toggle="toggle"
+                />
               </template>
             </div>
           </template>
@@ -4115,299 +3826,104 @@ onMounted(async () => {
       -->
       <div v-if="distillActive && !lastWizardTurnKey" class="turn assistant">
         <div class="bubble assistant wizard-bubble">
-          <div class="wz-distill" :class="{ stalled: distillJob?.health === 'stalled' }">
-            <div class="wz-distill-head">
-              <span class="tag" :class="distillJob?.health === 'stalled' ? 'warn' : 'accent'">
-                {{ distillTag(distillJob) }}
-              </span>
-              <span class="wz-distill-stage">{{ distillJob?.stage || "提炼中" }}</span>
-              <span v-if="distillPercent !== null" class="mono wz-distill-pct">
-                {{ distillPercent }}%
-              </span>
-            </div>
-            <div v-if="distillPercent !== null" class="wz-distill-bar">
-              <span :style="{ width: distillPercent + '%' }" />
-            </div>
-            <p class="faint wz-distill-note">{{ distillSentence(distillJob) }}</p>
+          <AssistantDistillProgress
+            :job="distillJob"
+            :tag="distillTag(distillJob)"
+            :sentence="distillSentence(distillJob)"
+            :percent="distillPercent"
+          />
+        </div>
+      </div>
+
+      <!-- 章前「这一章怎么开头」：模型 3 条 + 规则兜底 -->
+      <ChapterOpeningPicker
+        v-if="inline.open"
+        :chapter="inline.chapter"
+        :is-first="inline.isFirst"
+        :source="inline.source"
+        :options="inline.options"
+        :loading="inline.loading"
+        :busy="inline.busy"
+        :error="inline.error"
+        @pick="pickOpening"
+        @refresh="openInlineWriter"
+        @cancel="inline.open = false"
+      />
+
+      <!-- 正在生成的章节：正文逐字进对话，不再只在写作抽屉里 -->
+      <div v-if="inline.busy" class="turn assistant">
+        <div class="bubble assistant">
+          <div class="row tight">
+            <span class="tag">正在写第 {{ inline.chapter || "下" }} 章</span>
+            <span class="faint">{{ inline.stage }}</span>
+            <span class="faint mono">{{ inline.chars }} 字</span>
+          </div>
+          <div class="inline-stream">
+            {{ inline.text || "等待首字…" }}<span class="stream-cursor">▍</span>
           </div>
         </div>
       </div>
+      <p v-if="inline.error" class="notice err stream-inline-error">{{ inline.error }}</p>
     </div>
 
     <!-- ==================== 输入 ==================== -->
-    <div class="composer-wrap">
-      <div v-if="!wizardActive && !roleMode" class="quick-row">
-        <button
-          v-for="p in QUICK_PROMPTS"
-          :key="p.label"
-          type="button"
-          class="quick-chip"
-          @click="useQuickPrompt(p.text)"
-        >
-          {{ p.label }}
-        </button>
-      </div>
-
-      <form class="composer" @submit.prevent="send">
-      <div v-if="wizardActive" class="composer-hint">
-        引导进行中：直接打字回答，或问「为什么」我就地解释；缺参数就让我改（如「采样改成 200 章」「跳过风格」），改完可撤销。
-        <button type="button" class="link-btn" @click="startWizardFlow('重新开始，先定方向。', true)">
-          重新开始
-        </button>
-      </div>
-      <div v-else-if="roleMode" class="composer-hint">
-        正在与「{{ roleMode.character }}」对话 · 情境：{{ roleMode.scene }}
-        <button type="button" class="link-btn" @click="exitRole">结束对话</button>
-      </div>
-
-      <!-- 附件草稿区：上传只进项目暂存区；投放必须由上方卡片确认后触发。 -->
-      <div v-if="draft.items.length" class="file-list" aria-live="polite">
-        <div
-          v-for="file in draft.items"
-          :key="file.key"
-          class="file-chip"
-          :class="{ failed: file.state === 'failed' }"
-        >
-          <div class="file-row">
-            <span class="file-name">{{ file.file.name }}</span>
-            <span class="faint">{{
-              file.state === "uploading"
-                ? "上传中…"
-                : file.state === "ready"
-                  ? "已就绪（仅暂存，未投放）"
-                  : "上传失败"
-            }}</span>
-            <button
-              v-if="file.state === 'ready' && file.metadata"
-              class="link-btn"
-              type="button"
-              :disabled="sending"
-              @click="togglePreview(file.metadata.attachment_id)"
-            >
-              {{ previewOf(file.metadata.attachment_id).data ? "收起清洗预览" : "清洗预览" }}
-            </button>
-            <button
-              v-if="file.state === 'failed'"
-              class="link-btn"
-              type="button"
-              :disabled="sending"
-              @click="draft.retry(file.key)"
-            >
-              重试
-            </button>
-            <button
-              class="link-btn"
-              type="button"
-              :disabled="sending"
-              :aria-label="`移除 ${file.file.name}`"
-              @click="draft.remove(file.key)"
-            >
-              移除
-            </button>
-          </div>
-          <span v-if="file.error" class="file-error" role="alert">{{ file.error }}</span>
-          <div
-            v-if="file.metadata && (previewOf(file.metadata.attachment_id).loading || previewOf(file.metadata.attachment_id).error || previewOf(file.metadata.attachment_id).data)"
-            class="file-preview"
-          >
-            <span v-if="previewOf(file.metadata.attachment_id).loading" class="faint">
-              正在读取清洗预览…
-            </span>
-            <span
-              v-else-if="previewOf(file.metadata.attachment_id).error"
-              class="file-error"
-              role="alert"
-            >
-              {{ previewOf(file.metadata.attachment_id).error }}
-            </span>
-            <template v-else>
-              <p class="faint">
-                清洗后 {{ previewOf(file.metadata.attachment_id).data?.chapters }} 章 ·
-                待复核残留 {{ previewOf(file.metadata.attachment_id).data?.unresolved_count }} 处
-              </p>
-              <ul v-if="previewOf(file.metadata.attachment_id).data?.changes.length" class="file-changes">
-                <li v-for="(change, i) in previewOf(file.metadata.attachment_id).data?.changes ?? []" :key="i">
-                  <span class="mono">{{ change.kind }}</span> 第 {{ change.chapter_no ?? "?" }} 章 ·
-                  删 {{ change.removed_chars }} 字
-                  <div class="file-diff">
-                    <del>{{ change.before || "（空）" }}</del>
-                    <ins>{{ change.after || "（空）" }}</ins>
-                  </div>
-                </li>
-              </ul>
-              <p v-else class="faint">没有检出需要删除的站点残留。</p>
-            </template>
-          </div>
-        </div>
-      </div>
-      <textarea
-        ref="queryInput"
-        v-model="query"
-        class="composer-input"
-        rows="1"
-        :disabled="badId"
-        :placeholder="
-          roleMode
-            ? `对${roleMode.character}说点什么…`
-            : wizardActive
-              ? '直接回答这一步，或问我「为什么」；也可以让我改：采样改成 200 章 / 跳过风格'
-              : '描述你想推进的剧情，或问一个关于正文的问题…'
-        "
-        @keydown="onKeydown"
-      ></textarea>
-
-      <input
-        ref="fileInput"
-        type="file"
-        accept=".txt,.md,text/plain,text/markdown"
-        multiple
-        hidden
-        :disabled="badId || sending"
-        @change="onFilesSelected"
-      />
-
-      <div class="composer-bar">
-        <button type="button" class="tool-btn" @click.stop="toggleQuoteMenu('ref')">
-          @ 引用
-        </button>
-        <button type="button" class="tool-btn" @click.stop="toggleQuoteMenu('cmd')">
-          / 指令
-        </button>
-        <button
-          type="button"
-          class="tool-btn"
-          title="支持 .txt / .md；点卡片确认后才投放"
-          :disabled="badId || sending"
-          @click="fileInput?.click()"
-        >
-          附件
-        </button>
-        <span class="composer-hint-text">Enter 发送 · Shift+Enter 换行</span>
-        <button class="send-btn" type="submit" :disabled="!canSend" aria-label="发送">
-          {{ sending ? "…" : "↑" }}
-        </button>
-      </div>
-
-      <div v-if="quoteMenu" class="composer-mask" @click="quoteMenu = ''" />
-      <div v-if="quoteMenu" class="composer-pop" @click.stop>
-        <div class="composer-pop-head">
-          {{ quoteMenu === "ref" ? "引用当前上下文" : "快捷指令" }}
-        </div>
-        <button
-          v-for="item in quoteMenu === 'ref' ? quoteItems : commandItems"
-          :key="item.label"
-          type="button"
-          class="composer-pop-item"
-          @click="insertComposerToken(item.token)"
-        >
-          <span>{{ item.label }}</span>
-          <span class="kind">{{ item.kind }}</span>
-        </button>
-      </div>
-      </form>
-
-      <div class="composer-meta">
-        <span class="ok">● 流式输出已开启</span>
-        <span class="dot">·</span>
-        <span v-if="wizardActive">引导进行中，第一处提到「写小说」也会进入引导</span>
-        <span v-else-if="roleMode">角色对话中，回答不会写入正文</span>
-        <span v-else>不会修改正文，写操作需你确认</span>
-      </div>
-    </div>
+    <AssistantComposer
+      ref="composerRef"
+      v-model:query="query"
+      :sending="sending"
+      :can-send="canSend"
+      :bad-id="badId"
+      :wizard-active="wizardActive"
+      :role-mode="roleMode"
+      :draft-items="draft.items"
+      :preview-of="previewOf"
+      :quick-prompts="QUICK_PROMPTS"
+      :quote-items="quoteItems"
+      :command-items="commandItems"
+      @send="send"
+      @files-selected="addFiles"
+      @retry-file="draft.retry"
+      @remove-file="draft.remove"
+      @toggle-preview="togglePreview"
+      @quick-prompt="(text) => { query = text; }"
+      @insert-token="(token) => { query = (query ? query + ' ' : '') + token + ' '; }"
+      @restart-wizard="startWizardFlow('重新开始，先定方向。', true)"
+      @exit-role="exitRole"
+    />
   </section>
+  <WritingProgressAside
+    :progress="writingProgress"
+    :loading="progressLoading"
+    :generating="inline.busy"
+    :stage="inline.stage"
+  />
+  </div>
     </div>
 
     <!-- 右：本轮上下文（全部来自项目真实数据） -->
-    <aside class="ctx-panel" :class="{ open: ctxOpen }" aria-label="本次上下文">
-      <div class="ctx-title">
-        <span>本次上下文</span>
-        <button class="link-btn ctx-close" @click="ctxOpen = false">关闭</button>
-      </div>
-
-      <!-- 工序链：全流程走到哪一步、卡在哪、哪条改动等你批（服务端每次重新评估） -->
-      <WorkflowStrip
-        v-if="!badId"
-        ref="workflowStripRef"
-        class="ctx-workflow"
-        :project-id="projectId"
-      />
-
-      <div class="ctx-card">
-        <h3>
-          {{ project ? project.title : "未命名作品" }}
-          <span class="mini">
-            {{ [project?.genre, project?.style].filter(Boolean).join(" · ") || "题材未定" }}
-          </span>
-        </h3>
-        <div class="ctx-row">
-          <span>已写正文</span>
-          <b>{{ bookSegments ?? "—" }} 段 · {{ bookChars === null ? "—" : bookChars.toLocaleString() }} 字</b>
-        </div>
-        <div class="ctx-row">
-          <span>章纲</span><b>{{ chapterRail.length || "—" }} 章</b>
-        </div>
-        <div class="ctx-row">
-          <span>剧情圣经</span>
-          <b>{{ bibleCharacterList.length }} 角色 · {{ bibleRelations.length }} 关系</b>
-        </div>
-        <div class="ctx-chips">
-          <span
-            v-for="chip in contextChips"
-            :key="chip.label"
-            class="chip"
-            :class="{ accent: chip.accent }"
-          >{{ chip.label }}</span>
-        </div>
-      </div>
-
-      <div class="ctx-card">
-        <h3>证据 <span class="mini">{{ latestEvidence.length }}</span></h3>
-        <p v-if="!latestEvidence.length" class="ctx-empty">
-          这一轮还没有检索证据；问正文或设定类问题时会自动读取。
-        </p>
-        <div v-for="(ev, i) in latestEvidence.slice(0, 6)" :key="i" class="ctx-ev">
-          <div class="ctx-ev-head">
-            <span class="src">{{ sourceLabel(ev.source) }}</span>
-            <span>{{ Number(ev.score).toFixed(2) }}</span>
-          </div>
-          <p>{{ ev.snippet }}</p>
-        </div>
-      </div>
-
-      <div class="ctx-card">
-        <h3>长期记忆 <span class="mini">{{ memories.length }}</span></h3>
-        <div v-for="m in memories.slice(0, 4)" :key="m.id" class="ctx-mem">{{ m.text }}</div>
-        <p v-if="!memories.length" class="ctx-empty">
-          聊几句后，助手会自动记住你的写作偏好。
-        </p>
-        <button class="link-btn" @click="toggleMemory">管理记忆</button>
-      </div>
-
-      <div class="ctx-card">
-        <h3>模型</h3>
-        <div class="ctx-row">
-          <span>生成</span><b>{{ writerCfg?.is_fallback ? "本地兜底" : writerCfg?.label || "—" }}</b>
-        </div>
-        <div class="ctx-row">
-          <span>助手</span><b>{{ assistantCfg?.is_fallback ? "本地兜底" : assistantCfg?.label || "—" }}</b>
-        </div>
-        <div class="ctx-row">
-          <span>提炼</span><b>{{ distillerCfg?.is_fallback ? "本地兜底" : distillerCfg?.label || "—" }}</b>
-        </div>
-        <button class="link-btn" @click="openModelSettings">模型设置</button>
-      </div>
-
-      <div class="ctx-card">
-        <h3>章节进度</h3>
-        <div class="ctx-row">
-          <span>已写</span><b>{{ writtenChapterCount }} / {{ chapterRail.length || "—" }}</b>
-        </div>
-        <div v-if="latestWrittenChapter" class="ctx-row">
-          <span>最新</span><b>第 {{ latestWrittenChapter }} 章</b>
-        </div>
-        <button v-if="chapterRail.length" class="link-btn" @click="railOpen = true">打开目录</button>
-      </div>
-    </aside>
+    <AssistantContextPanel
+      ref="ctxPanelRef"
+      :open="ctxOpen"
+      :project-id="projectId"
+      :bad-id="badId"
+      :project-title="project ? project.title : '未命名作品'"
+      :project-meta="[project?.genre, project?.style].filter(Boolean).join(' · ') || '题材未定'"
+      :book-segments="bookSegments"
+      :book-chars="bookChars"
+      :chapter-count="chapterRail.length"
+      :bible-characters="bibleCharacterList.length"
+      :bible-relations="bibleRelations.length"
+      :chips="contextChips"
+      :evidence="latestEvidence"
+      :memories="memories"
+      :models="modelRows"
+      :written-chapters="writtenChapterCount"
+      :latest-written-chapter="latestWrittenChapter"
+      @close="ctxOpen = false"
+      @manage-memory="toggleMemory"
+      @open-model-settings="openModelSettings"
+      @open-rail="railOpen = true"
+    />
   </div>
 
   <!-- 写作面板：正文生成 / 查看 / 就地修改都在这里，聊天只留一张状态卡。 -->
@@ -4427,32 +3943,16 @@ onMounted(async () => {
 
   <!-- 记忆抽屉：内容由助手自动抽取，这里只做「看见 / 删除」。
        抽错了要能删掉，而不是让用户只能忍着。 -->
-  <aside v-if="memoryOpen" class="memory-drawer" aria-label="助手记忆">
-    <div class="memory-head">
-      <div>
-        <div class="memory-title">助手记忆</div>
-        <div class="memory-sub">
-          {{ memories.length }} / {{ memoryLimit }} 条 · 自动记住，每次问答都会带上
-        </div>
-      </div>
-      <button class="link-btn" @click="memoryOpen = false">关闭</button>
-    </div>
-
-    <div v-if="memoryError" class="notice err">{{ memoryError }}</div>
-    <div v-else-if="memoryLoading" class="faint">读取记忆…</div>
-    <ol v-else-if="memories.length" class="memory-list">
-      <li v-for="m in memories" :key="m.id">
-        <span class="memory-text">{{ m.text }}</span>
-        <button class="link-btn" :disabled="memoryBusy" @click="removeMemory(m)">
-          删除
-        </button>
-      </li>
-    </ol>
-    <p v-else class="faint">
-      还没有记忆。聊几句之后，助手会自动记住你的写作偏好（人称、称呼、禁忌这类），
-      并在这里显示。
-    </p>
-  </aside>
+  <AssistantMemoryDrawer
+    :open="memoryOpen"
+    :memories="memories"
+    :limit="memoryLimit"
+    :loading="memoryLoading"
+    :error="memoryError"
+    :busy="memoryBusy"
+    @close="memoryOpen = false"
+    @remove="removeMemory"
+  />
 
   <!-- 角色卡编辑：居中模态卡片，保存成功后自动关闭。 -->
   <div v-if="cardEditName" class="card-edit-mask" @click.self="cancelCardEdit">
@@ -4493,108 +3993,18 @@ onMounted(async () => {
       />
     </div>
   </div>
-  <!--
-    本轮数据块的明细小窗口：自带滚动，不占对话流的高度。
-    资料 / 证据 / 工具调用 / 联网来源共用这一个窗口，按 kind 换内容。
-  -->
-  <div v-if="detailView && detailTurn" class="detail-mask" @click.self="closeDetail">
-    <section
-      class="detail-window"
-      role="dialog"
-      aria-modal="true"
-      :aria-label="detailTitle"
-    >
-      <header class="detail-head">
-        <div class="detail-head-main">
-          <div class="detail-kicker">{{ detailSubtitle }}</div>
-          <h3>{{ detailTitle }}</h3>
-        </div>
-        <button class="link-btn" type="button" @click="closeDetail">关闭</button>
-      </header>
-
-      <div class="detail-body">
-        <!-- 读取步骤 -->
-        <template v-if="detailView.kind === 'steps'">
-          <div
-            v-for="(step, si) in detailSteps"
-            :key="`ds-${si}`"
-            class="detail-item"
-          >
-            <div class="detail-item-head">
-              <span class="detail-item-name">{{ step.name }}</span>
-              <span v-if="step.meta" class="detail-item-meta">{{ step.meta }}</span>
-            </div>
-            <pre v-if="step.detail" class="detail-pre">{{ step.detail }}</pre>
-          </div>
-          <p v-if="!detailSteps.length" class="faint">本轮没有读取资料。</p>
-        </template>
-
-        <!-- 证据原文 -->
-        <template v-else-if="detailView.kind === 'evidence'">
-          <div
-            v-for="(ev, i) in detailEvidence"
-            :key="`de-${i}`"
-            class="detail-item"
-          >
-            <div class="detail-item-head">
-              <span class="tag accent">{{ sourceLabel(ev.source) }}</span>
-              <span class="detail-item-meta mono">kind={{ ev.kind }}</span>
-              <span class="detail-item-meta mono">score={{ Number(ev.score).toFixed(3) }}</span>
-              <span class="detail-item-meta mono">ref={{ ev.ref_id }}</span>
-            </div>
-            <pre class="detail-pre">{{ ev.snippet }}</pre>
-          </div>
-          <p v-if="!detailEvidence.length" class="faint">本轮没有证据。</p>
-        </template>
-
-        <!-- 工具调用轨迹 -->
-        <template v-else-if="detailView.kind === 'tools'">
-          <div
-            v-for="t in detailTools"
-            :key="`dt-${t.seq}`"
-            class="detail-item"
-          >
-            <div class="detail-item-head">
-              <span class="tag mono">#{{ t.seq }} · 第 {{ t.step }} 轮</span>
-              <span class="tag accent mono">{{ t.name }}</span>
-              <span class="tag" :class="toolStatusMeta(t.status).tag">
-                {{ toolStatusMeta(t.status).label }}
-              </span>
-              <span class="detail-item-meta mono">{{ t.latency_ms }}ms</span>
-            </div>
-            <div class="detail-line mono">参数：{{ t.arguments }}</div>
-            <div
-              v-if="t.status === 'ok' && detailToolResult(t.name)"
-              class="detail-line mono"
-            >
-              结果：{{ detailToolResult(t.name) }}
-            </div>
-          </div>
-          <p v-if="!detailTools.length" class="faint">本轮没有工具调用。</p>
-        </template>
-
-        <!-- 联网检索来源 -->
-        <template v-else>
-          <a
-            v-for="s in detailWeb"
-            :key="`dw-${s.index}`"
-            class="detail-web"
-            :href="s.url"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <span class="detail-web-index">[{{ s.index }}]</span>
-            <span class="detail-web-main">
-              <span class="detail-web-title">{{ s.title }}</span>
-              <span class="detail-web-url">{{ s.url }}</span>
-              <span class="detail-web-snippet">{{ s.snippet }}</span>
-            </span>
-          </a>
-          <p v-if="!detailWeb.length" class="faint">本轮没有联网来源。</p>
-        </template>
-      </div>
-    </section>
-  </div>
+  <AssistantDataDetail
+    v-if="detailView && detailTurn"
+    :kind="detailView.kind"
+    :title="detailTitle"
+    :subtitle="detailSubtitle"
+    :steps="detailSteps"
+    :evidence="detailEvidence"
+    :tools="detailTools"
+    :web="detailWeb"
+    :tool-result-for="detailToolResult"
+    @close="closeDetail"
+  />
   </div>
 </template>
 
@@ -4861,16 +4271,7 @@ onMounted(async () => {
   font-size: var(--fs-sm);
 }
 
-/* ---- 记忆入口与抽屉 ---- */
-.memory-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: var(--fs-sm);
-}
-.memory-toggle.on {
-  color: var(--accent-ink);
-}
+/* ---- 记忆入口（抽屉本体已拆到 AssistantMemoryDrawer.vue） ---- */
 .memory-count {
   display: inline-grid;
   place-items: center;
@@ -4883,76 +4284,7 @@ onMounted(async () => {
   font-size: var(--fs-2xs);
   font-variant-numeric: tabular-nums;
 }
-.memory-toggle.on .memory-count {
-  background: var(--accent-soft);
-  color: var(--accent-ink);
-}
 
-.memory-drawer {
-  position: fixed;
-  top: 76px;
-  right: 24px;
-  width: 340px;
-  max-height: calc(100vh - 108px);
-  overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 16px;
-  background: var(--bg-elev);
-  border: var(--border-w) solid var(--border-strong);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md);
-  z-index: 40;
-}
-.memory-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-}
-.memory-title {
-  font-family: var(--font-display);
-  font-size: var(--fs-lg);
-  font-weight: 700;
-}
-.memory-sub {
-  margin-top: 2px;
-  color: var(--fg-faint);
-  font-size: var(--fs-xs);
-}
-.memory-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.memory-list li {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 8px 10px;
-  border: var(--border-w) solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg);
-  font-size: var(--fs-sm);
-  line-height: 1.6;
-}
-.memory-text {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-@media (max-width: 720px) {
-  .memory-drawer {
-    left: 12px;
-    right: 12px;
-    width: auto;
-  }
-}
 .asst-meta {
   display: flex;
   flex-wrap: wrap;
@@ -5132,7 +4464,7 @@ onMounted(async () => {
   max-height: none;
 }
 
-/* ---- 待确认卡片 ---- */
+/* ---- 待确认卡片：具体卡片样式已拆到 AssistantActionCard 组件 ---- */
 .cards {
   display: flex;
   flex-direction: column;
@@ -5144,180 +4476,10 @@ onMounted(async () => {
   color: var(--fg-faint);
   font-size: var(--fs-xs);
 }
-.card-pending {
-  display: flex;
-  flex-direction: column;
-  gap: var(--gap-sm);
-  padding: 12px 14px;
-  border: var(--border-w) solid var(--border-strong);
-  /* 左侧色条只是辅助：真正的等级判断靠上面的文字标签。 */
-  border-left: 3px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--bg);
-}
-.card-title {
-  font-weight: 700;
-  font-size: var(--fs-md);
-  line-height: 1.6;
-}
 
-/* 写作卡片：聊天里只占一小块，完整正文在右侧写作面板 */
-.gen-card {
-  width: 100%;
-  align-self: stretch;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 10px 12px;
-  border: var(--border-w) solid var(--border);
-  border-left: 3px solid var(--accent);
-  border-radius: var(--radius-md);
-  background: var(--bg);
-  cursor: pointer;
-  transition: border-color 0.15s ease;
-}
-.gen-card:hover { border-color: var(--accent-line); }
-.gen-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.gen-card.running { border-left-color: var(--info); }
-.gen-card.failed { border-left-color: var(--err, #c0392b); }
-.gen-card-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.gen-card-kicker {
-  color: var(--fg-faint);
-  font-size: var(--fs-3xs);
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-.gen-card-title {
-  font-size: var(--fs-md);
-  font-weight: 600;
-  line-height: 1.5;
-}
-.gen-card-preview {
-  margin: 0;
-  color: var(--fg-muted);
-  font-size: var(--fs-sm);
-  line-height: 1.7;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-.gen-progress {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.gen-progress-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  color: var(--fg-faint);
-  font-size: var(--fs-2xs);
-}
-.gen-progress-track {
-  position: relative;
-  height: 4px;
-  border-radius: var(--radius-full);
-  background: var(--bg-sunken);
-  overflow: hidden;
-}
-.gen-progress-fill {
-  display: block;
-  height: 100%;
-  width: 0;
-  border-radius: var(--radius-full);
-  background: var(--accent);
-  transition: width 0.4s ease;
-}
-.gen-progress-fill.waiting {
-  width: 35%;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  animation: gen-wait 1.2s linear infinite;
-}
-@keyframes gen-wait {
-  from { transform: translateX(-100%); }
-  to { transform: translateX(300%); }
-}
-.gen-card-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: var(--fs-2xs);
-}
-.gen-card-open {
-  color: var(--accent-ink);
-  font-weight: 600;
-}
-.card-hint {
-  color: var(--fg-muted);
-  font-size: var(--fs-sm);
-  line-height: 1.6;
-}
-.endpoint {
-  font-size: var(--fs-xs);
-  line-height: 1.6;
-}
-.meta-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 10px 16px;
-  font-size: var(--fs-sm);
-}
-.confirm-box {
-  display: flex;
-  flex-direction: column;
-  gap: var(--gap-md);
-  line-height: 1.7;
-}
+/* ---- 执行轨迹 / 提案行 / 卡片标题：已随卡片拆到 AssistantActionCard ---- */
 
-/* 提案确认后的「批准并写入」行：与上面的回执分开，动作更醒目 */
-.promote-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding-top: var(--gap-md);
-  border-top: 1px dashed var(--border);
-}
-.promote-row .btn { flex: none; }
-
-/* ---- 执行轨迹（确认 → 请求发出 → 落库 → 完成） ---- */
-.trace {
-  list-style: none;
-  margin: 0;
-  padding: 0 0 0 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  border-left: 2px solid var(--border-strong);
-}
-.trace li {
-  display: flex;
-  gap: 8px;
-  align-items: baseline;
-  font-size: var(--fs-xs);
-  line-height: 1.6;
-  color: var(--fg-muted);
-}
-.trace-time {
-  flex: 0 0 auto;
-  color: var(--fg-faint);
-}
-.trace-text {
-  word-break: break-word;
-}
-.trace li.ok .trace-text {
-  color: var(--ok);
-}
-.trace li.err .trace-text {
-  color: var(--danger);
-}
+/* .diffbox / .blk / .snippet 仍被引导结果复用；卡片组件里有同名副本。 */
 .diffbox {
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
@@ -5332,41 +4494,7 @@ onMounted(async () => {
   color: var(--fg);
 }
 
-/* ---- 输入区：底部常驻、圆角输入框、发送靠右 ---- */
-.composer {
-  position: sticky;
-  bottom: 0;
-  z-index: 2;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 0;
-  padding: 12px 0 16px;
-  border-top: 1px solid var(--border);
-  background: var(--bg);
-}
-.composer .input {
-  min-height: 76px;
-  max-height: 200px;
-  padding: 12px 14px;
-  border-color: var(--border-strong);
-  border-radius: 14px;
-  background: var(--bg-elev);
-  line-height: 1.7;
-  resize: vertical;
-}
-.composer .input:focus {
-  outline: 2px solid var(--accent-line);
-  outline-offset: 0;
-  border-color: var(--accent);
-}
-.composer .input::placeholder { color: var(--fg-faint); }
-.composer .btn.primary {
-  border-radius: 999px;
-  padding: 8px 20px;
-}
-
-/* ---- 附件草稿 / 清洗预览 ---- */
+/* ---- 已发送附件（聊天气泡里回显用；草稿区样式在 AssistantComposer） ---- */
 .file-list { display: flex; flex-direction: column; gap: 6px; }
 .file-list.sent { flex-direction: row; flex-wrap: wrap; margin-top: 6px; }
 .file-chip {
@@ -5432,57 +4560,7 @@ onMounted(async () => {
 .wz-prose.note {
   color: var(--fg-muted);
 }
-/* 蒸馏进度：一句话 + 百分比，不占大屏 */
-.wz-distill {
-  margin: var(--gap-sm) 0;
-  padding: 9px 11px;
-  border: var(--border-w) solid var(--border-strong);
-  border-left: 3px solid var(--accent);
-  border-radius: var(--radius-md);
-  background: var(--bg-sunken);
-}
-.wz-distill.stalled {
-  border-left-color: var(--warn, #c98a1b);
-}
-.wz-distill-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-.wz-distill-stage {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--fs-sm);
-  color: var(--fg);
-}
-.wz-distill-pct {
-  flex: none;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  color: var(--fg);
-}
-.wz-distill-bar {
-  margin-top: 6px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--border-strong);
-  overflow: hidden;
-}
-.wz-distill-bar > span {
-  display: block;
-  height: 100%;
-  background: var(--accent);
-  transition: width 0.4s ease;
-}
-.wz-distill-note {
-  margin: 6px 0 0;
-  font-size: var(--fs-xs);
-  line-height: 1.6;
-}
+/* 蒸馏进度块已拆到 DistillProgress 组件 */
 /* 完成回执 / 疑似卡住提醒 */
 .wz-notice {
   margin: var(--gap-sm) 0;
@@ -5538,40 +4616,7 @@ onMounted(async () => {
 .wz-seg .prose {
   margin-top: 4px;
 }
-.wz-cards {
-  margin-top: var(--gap-sm);
-  display: flex;
-  flex-direction: column;
-  gap: var(--gap-sm);
-}
-.wz-card-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.wz-card-item {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
-  background: var(--bg-sunken);
-}
-.wz-card-head {
-  display: flex;
-  align-items: center;
-  gap: var(--gap-sm);
-}
-.wz-card-head strong {
-  font-size: var(--fs-sm);
-}
-.wz-card-actions {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: var(--gap-sm);
-}
+/* 角色卡列表与确认块已拆到 AssistantWizardCards 组件 */
 .wz-card-form {
   margin-top: 8px;
   display: grid;
@@ -5594,41 +4639,7 @@ onMounted(async () => {
     grid-template-columns: 1fr;
   }
 }
-.wz-card-meta {
-  margin-top: 4px;
-  font-size: var(--fs-xs);
-  color: var(--fg-muted);
-  line-height: 1.5;
-}
-.wz-danger {
-  color: var(--danger);
-}
-.wz-card-confirm {
-  margin-top: 8px;
-  display: flex;
-  align-items: center;
-  gap: var(--gap-sm);
-  flex-wrap: wrap;
-  font-size: var(--fs-xs);
-  color: var(--fg-muted);
-}
-/* 确认块的第二行说明：整行铺开，不和按钮挤在一行。 */
-.wz-card-confirm-hint {
-  flex-basis: 100%;
-  line-height: 1.5;
-}
-.composer-hint {
-  display: flex;
-  align-items: center;
-  gap: var(--gap-sm);
-  flex-wrap: wrap;
-  padding: 7px 10px;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-sunken);
-  font-size: var(--fs-xs);
-  color: var(--fg-muted);
-}
+/* .wz-card-meta / .wz-danger / .wz-card-confirm 已随卡片列表拆到 AssistantWizardCards */
 @media (max-width: 720px) {
   .meta-grid {
     grid-template-columns: 1fr;
@@ -5678,15 +4689,6 @@ onMounted(async () => {
     min-height: 0;
     max-height: none;
     padding-bottom: 10px;
-  }
-  .composer {
-    flex: none;
-    gap: 6px;
-    padding: 10px 0 12px;
-  }
-  .composer .input {
-    min-height: 56px;
-    padding: 10px 12px;
   }
   /* 工序卡只留「进度条 + 一句话」，把高度让给对话；摘要单行省略，完整内容在 title 里 */
   .desk-body :deep(.wf-strip:first-of-type) {
@@ -6031,6 +5033,27 @@ onMounted(async () => {
   background: transparent;
   box-shadow: none;
 }
+/* 对话 + 右侧写作进度：宽屏并排，窄屏由进度组件自己隐藏 */
+.chat-row {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+.chat-row > .chat-card {
+  flex: 1;
+  min-width: 0;
+}
+.inline-stream {
+  margin-top: 8px;
+  white-space: pre-wrap;
+  line-height: 1.9;
+  max-height: 420px;
+  overflow: auto;
+}
+.stream-inline-error {
+  margin: 10px 0;
+}
 /* 旧布局给 .card.assistant 限了 860px；对话页要占满中栏，消息本身再用 1000px 居中。 */
 .card.assistant.chat-card {
   max-width: none;
@@ -6155,58 +5178,8 @@ onMounted(async () => {
 .bubble-meta { margin-left: auto; gap: 6px; margin-bottom: 0; }
 .bubble .msg-avatar { width: 18px; height: 18px; font-size: var(--fs-3xs); }
 
-@keyframes tracePulse {
-  0%, 100% { opacity: 0.4; transform: scale(0.9); }
-  50% { opacity: 1; transform: scale(1.12); }
-}
-
 /* ---------- 本轮数据 chip：一行收纳，明细进小窗口 ---------- */
-.turn-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin: 2px 0 10px;
-}
-.data-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 10px 3px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  background: var(--bg-elev);
-  color: var(--fg-muted);
-  font-size: var(--fs-3xs);
-  line-height: 1.6;
-  cursor: pointer;
-  transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease;
-}
-.data-chip:hover {
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-  color: var(--accent-ink);
-}
-.data-chip-ico {
-  display: inline-grid;
-  place-items: center;
-  width: 13px;
-  height: 13px;
-  border-radius: 50%;
-  background: var(--ok-soft);
-  color: var(--ok);
-}
-.data-chip.live {
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-  color: var(--accent-ink);
-}
-.data-chip-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: tracePulse 1.15s ease-in-out infinite;
-}
+/* chip 与明细窗口已拆到 AssistantDataChips / AssistantDataDetail 组件 */
 
 /* ---------- 推理留痕：如实标出「思考了 N 秒」 ---------- */
 .think-line {
@@ -6288,118 +5261,7 @@ onMounted(async () => {
 }
 .plan-state { white-space: nowrap; }
 
-/* ---------- 明细小窗口 ---------- */
-.detail-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: color-mix(in srgb, var(--bg) 55%, transparent);
-  backdrop-filter: blur(3px);
-  animation: detailMaskIn 0.14s ease both;
-}
-.detail-window {
-  width: min(680px, 100%);
-  max-height: min(72vh, 640px);
-  display: flex;
-  flex-direction: column;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--bg-elev);
-  box-shadow: var(--shadow-lg);
-  overflow: hidden;
-  animation: detailWindowIn 0.18s ease both;
-}
-.detail-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 14px 16px 12px;
-  border-bottom: 1px solid var(--border);
-}
-.detail-head-main { min-width: 0; flex: 1; }
-.detail-kicker {
-  color: var(--fg-faint);
-  font-size: var(--fs-3xs);
-  letter-spacing: 0.06em;
-}
-.detail-head h3 {
-  margin: 2px 0 0;
-  font-family: var(--font-display);
-  font-size: var(--fs-lg);
-  font-weight: 600;
-}
-.detail-body {
-  padding: 12px 16px 16px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.detail-item {
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg-sunken);
-}
-.detail-item-head {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.detail-item-name { font-size: var(--fs-xs); font-weight: 600; color: var(--fg); }
-.detail-item-meta { color: var(--fg-faint); font-size: var(--fs-3xs); }
-.detail-pre {
-  margin: 6px 0 0;
-  color: var(--fg-muted);
-  font-family: var(--font-mono);
-  font-size: var(--fs-3xs);
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.detail-line {
-  margin-top: 6px;
-  color: var(--fg-muted);
-  font-size: var(--fs-3xs);
-  word-break: break-word;
-}
-.detail-web {
-  display: flex;
-  gap: 8px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg-sunken);
-  text-decoration: none;
-}
-.detail-web:hover { border-color: var(--accent-line); }
-.detail-web-index {
-  color: var(--accent-ink);
-  font-family: var(--font-mono);
-  font-size: var(--fs-3xs);
-}
-.detail-web-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.detail-web-title { color: var(--fg); font-size: var(--fs-xs); }
-.detail-web-url {
-  color: var(--fg-faint);
-  font-family: var(--font-mono);
-  font-size: var(--fs-3xs);
-  word-break: break-all;
-}
-.detail-web-snippet { color: var(--fg-muted); font-size: var(--fs-3xs); line-height: 1.6; }
-@keyframes detailMaskIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-@keyframes detailWindowIn {
-  from { opacity: 0; transform: translateY(6px) scale(0.99); }
-  to { opacity: 1; transform: none; }
-}
+/* ---------- 明细小窗口：已拆到 AssistantDataDetail 组件 ---------- */
 /* Markdown 正文 */
 .md-body {
   margin: 2px 0 4px;
@@ -6487,281 +5349,16 @@ onMounted(async () => {
 }
 .md-body hr { margin: 16px 0; border: 0; border-top: 1px dashed var(--border); }
 
-/* 输入区：一条细分隔线 + 平铺输入，不做成独立聊天框 */
-.composer-wrap {
-  flex: none;
-  padding: 10px 16px 12px;
-  border-top: 1px solid var(--border);
-  background: transparent;
-}
-.quick-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  max-width: 1000px;
-  margin: 0 auto 7px;
-}
-.quick-chip {
-  padding: 3px 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--fg-faint);
-  font-size: var(--fs-3xs);
-  cursor: pointer;
-  transition: 0.14s;
-}
-.quick-chip:hover {
-  color: var(--fg-muted);
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-}
-.composer {
-  position: relative;
-  display: block;
-  max-width: 1000px;
-  margin: 0 auto;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-}
-.composer:focus-within {
-  box-shadow: none;
-}
-.composer .file-list { padding: 0 0 8px; }
-.composer .composer-input {
-  display: block;
-  width: 100%;
-  min-height: 44px;
-  max-height: 180px;
-  padding: 9px 0 2px;
-  border: 0;
-  border-radius: 0;
-  outline: none;
-  background: transparent;
-  color: var(--fg);
-  font: inherit;
-  font-size: var(--fs-sm);
-  line-height: 1.7;
-  resize: none;
-}
-.composer-input::placeholder { color: var(--fg-faint); }
-.composer-bar {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 0 8px;
-}
-.tool-btn {
-  padding: 4px 8px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--fg-faint);
-  font-size: var(--fs-3xs);
-  cursor: pointer;
-}
-.tool-btn:hover:not(:disabled) { background: var(--bg-sunken); color: var(--fg-muted); }
-.tool-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.composer-hint-text { margin-left: 2px; color: var(--fg-faint); font-size: var(--fs-3xs); }
-.send-btn {
-  margin-left: auto;
-  width: 30px;
-  height: 30px;
-  display: grid;
-  place-items: center;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-  color: var(--accent-fg);
-  font-size: var(--fs-lg);
-  font-weight: 700;
-  cursor: pointer;
-  box-shadow: var(--shadow-sm);
-}
-.send-btn:hover:not(:disabled) { background: var(--accent-hover); }
-.send-btn:disabled { opacity: 0.4; cursor: default; }
-.composer-meta {
-  max-width: 1000px;
-  margin: 5px auto 0;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  color: var(--fg-faint);
-  font-size: var(--fs-3xs);
-}
-.composer-meta .ok { color: var(--ok); }
-.composer-meta .dot { opacity: 0.6; }
-.composer-mask { position: fixed; inset: 0; z-index: 30; }
-.composer-pop {
-  position: absolute;
-  left: 10px;
-  bottom: 54px;
-  z-index: 31;
-  width: 280px;
-  max-height: 260px;
-  overflow: auto;
-  padding: 5px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-elev);
-  box-shadow: var(--shadow-md);
-}
-.composer-pop-head {
-  padding: 5px 7px;
-  color: var(--fg-faint);
-  font-size: var(--fs-3xs);
-  letter-spacing: 0.1em;
-}
-.composer-pop-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 6px 7px;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--fg-muted);
-  font-size: var(--fs-2xs);
-  text-align: left;
-  cursor: pointer;
-}
-.composer-pop-item:hover { background: var(--bg-sunken); color: var(--fg); }
-.composer-pop-item .kind {
-  margin-left: auto;
-  color: var(--fg-faint);
-  font-family: var(--font-mono);
-  font-size: var(--fs-3xs);
-}
+/* 输入区样式已随 composer 拆到 AssistantComposer.vue */
 
 /* ---------- 右：上下文 ---------- */
-.ctx-panel {
-  min-height: 0;
-  overflow-y: auto;
-  padding: 16px 13px 20px;
-  /* 无框：上下文是一列信息，不是一张侧边卡片 */
-  background: transparent;
-}
-.ctx-title {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin: 0 0 9px;
-  color: var(--fg-faint);
-  font-size: var(--fs-3xs);
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-.ctx-toggle,
-.ctx-close { display: none; }
-.ctx-card {
-  margin-bottom: 0;
-  padding: 12px 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-}
-.ctx-card + .ctx-card {
-  border-top: 1px solid var(--border);
-}
-.ctx-card h3 {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 0 0 6px;
-  font-family: var(--font-display);
-  font-size: var(--fs-xs);
-  font-weight: 600;
-}
-.ctx-card h3 .mini {
-  margin-left: auto;
-  color: var(--fg-faint);
-  font-family: var(--font-sans);
-  font-size: var(--fs-3xs);
-  font-weight: 400;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 60%;
-}
-.ctx-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 2px 0;
-  color: var(--fg-faint);
-  font-size: var(--fs-3xs);
-}
-.ctx-row b { color: var(--fg-muted); font-weight: 500; text-align: right; }
-.ctx-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
-.chip {
-  padding: 2px 7px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  background: var(--bg-elev);
-  color: var(--fg-muted);
-  font-size: var(--fs-3xs);
-}
-.chip.accent {
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-  color: var(--accent-ink);
-}
-.ctx-empty { margin: 0 0 6px; color: var(--fg-faint); font-size: var(--fs-3xs); line-height: 1.6; }
-.ctx-ev { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border); }
-.ctx-ev:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
-.ctx-ev-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  color: var(--fg-faint);
-  font-family: var(--font-mono);
-  font-size: var(--fs-3xs);
-}
-.ctx-ev p {
-  margin: 3px 0 0;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  color: var(--fg-muted);
-  font-size: var(--fs-3xs);
-  line-height: 1.6;
-}
-.ctx-mem {
-  position: relative;
-  padding: 3px 0 3px 10px;
-  color: var(--fg-muted);
-  font-size: var(--fs-3xs);
-  line-height: 1.6;
-}
-.ctx-mem::before {
-  content: "·";
-  position: absolute;
-  left: 0;
-  color: var(--accent);
-}
+/* 面板本体已拆到 AssistantContextPanel.vue；这里只留抬头上的「上下文」开关。 */
+.ctx-toggle { display: none; }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 1360px) {
   .desk { grid-template-columns: 220px minmax(0, 1fr); }
   .ctx-toggle { display: inline-flex; }
-  .ctx-close { display: inline-flex; }
-  .ctx-panel {
-    position: fixed;
-    top: 0;
-    bottom: 0;
-    right: 0;
-    z-index: 60;
-    width: 300px;
-    transform: translateX(100%);
-    transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
-    box-shadow: var(--shadow-md);
-  }
-  .ctx-panel.open { transform: none; }
   .ctx-backdrop { z-index: 55; }
 }
 /* 超宽屏：会话栏与上下文栏一起加宽，避免中间正文被拉成长条、两侧挤成细缝 */
@@ -6799,7 +5396,6 @@ onMounted(async () => {
 @media (max-width: 880px) {
   .desk { height: calc(100dvh - 170px); min-height: 380px; border-radius: 0; }
   .chat-card .stream { padding: 18px 14px; }
-  .composer-wrap { padding: 6px 12px 10px; }
   .chat-top-meta .tag { display: none; }
   .stream-prompts { grid-template-columns: 1fr; }
 }
@@ -6830,9 +5426,6 @@ onMounted(async () => {
 }
 :global(html[data-theme="ink"]) .asst-root .rail-backdrop {
   background: rgba(0, 0, 0, 0.55);
-}
-:global(html[data-theme="ink"]) .asst-root .send-btn {
-  box-shadow: 0 6px 18px rgba(224, 101, 74, 0.3);
 }
 
 /* 无论明暗都生效的细节：去掉外层大卡片，让对话更像一块完整工作面 */
@@ -6868,44 +5461,13 @@ onMounted(async () => {
   background: linear-gradient(145deg, var(--accent), var(--accent-hover));
   box-shadow: 0 4px 12px rgba(224, 101, 74, 0.28);
 }
-.asst-root .ctx-panel .ctx-workflow {
-  margin: 0 0 4px;
-  padding: 2px 0 12px;
-  border: 0;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-}
-.asst-root .ctx-panel .ctx-workflow :deep(.card-title) {
-  margin-bottom: 5px;
-  font-size: var(--fs-2xs);
-}
-.asst-root .ctx-panel .ctx-workflow :deep(.wf-progress-note) {
-  margin-top: 5px;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  font-size: var(--fs-3xs);
-  line-height: 1.5;
-}
-.asst-root .ctx-panel .ctx-workflow :deep(.wf-progress-bar) { height: 3px; }
 .asst-root .surface-toggle { opacity: 0.7; }
 .asst-root .surface-toggle:hover { opacity: 1; }
 .asst-root .chat-top { height: 50px; }
 .asst-root .md-body { font-size: var(--fs-lg); line-height: 1.92; }
 .asst-root .md-body p { margin: 9px 0; }
-.asst-root .ctx-card {
-  background: transparent;
-  box-shadow: none;
-}
 .asst-root .stream-empty-mark {
   box-shadow: 0 10px 30px rgba(224, 101, 74, 0.26);
-}
-.asst-root .composer {
-  border-radius: 0;
-  box-shadow: none;
 }
 .asst-root .chat-card .stream::-webkit-scrollbar,
 .asst-root .session-list::-webkit-scrollbar,

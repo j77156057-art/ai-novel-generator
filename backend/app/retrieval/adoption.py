@@ -52,6 +52,7 @@ from sqlalchemy.orm import Session
 
 from app.models import RetrievalLog
 from app.retrieval.catalog_store import load_catalog
+from app.retrieval.rule_text import rule_body
 from app.retrieval.trace import fill_segment_adoption
 
 VERDICT_LITERAL = "adopted_literal"
@@ -96,34 +97,6 @@ REWRITE_MIN_COVERAGE = 0.15
 #: 至少命中几个高 IDF 词才算「成簇」。实测单字`问号`能单独蹭到 0.158，
 #: 一个词的重合无法排除巧合；真实改写（电话+身份）至少两个词。
 MATCHED_TERMS_MIN = 2
-#: 规则正文里的「（证据：……）」。卡表把参考书原句附在规则后面，判定时必须
-#: 剥掉，否则高 IDF 词会被参考书的人名/物件占满。
-_EVIDENCE_BLOCK = re.compile(r"[（(]\s*证据\s*[:：]\s*(.*?)[）)]", re.S)
-
-
-def rule_body(text: str) -> str:
-    """只保留规则正文：去掉「（证据：……）」与单独回传的证据行。
-
-    卡表 `text` 与 `rule` 工具的返回都可能是「规则（证据：参考书原句）」，
-    后面还可能再拼一行 `evidence`。证据是参考书的场景原句，与本项目正文天然
-    低重合，混进判定会让真实改写全部掉到阈值以下。
-    """
-    raw = text or ""
-    evidence = [m.strip() for m in _EVIDENCE_BLOCK.findall(raw)]
-    body = _EVIDENCE_BLOCK.sub("", raw)
-    if evidence:
-        kept = []
-        for line in body.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            # 单独回传的 evidence 行通常就是括号里那一段（可能截断），去掉。
-            if any(ev and (stripped in ev or ev.startswith(stripped[:12]))
-                   for ev in evidence):
-                continue
-            kept.append(line)
-        body = "\n".join(kept)
-    return body.strip()
 
 
 def _bigrams(text: str) -> set[str]:

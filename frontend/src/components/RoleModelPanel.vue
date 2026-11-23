@@ -25,6 +25,7 @@ import type {
   LlmTestResult,
 } from "@/api/types";
 import { needsBaseUrl, roleMeta } from "@/utils/llmRoles";
+import { splitCsv as splitChain } from "@/utils/text";
 
 interface RoleNotice {
   kind: "ok" | "err" | "warn";
@@ -177,13 +178,6 @@ function switchProvider(p: string): void {
   // 本机模型清单属于上一个渠道的探测结果，换渠道即作废。
   localModels.value = [];
   localModelsError.value = null;
-}
-
-function splitChain(text: string): string[] {
-  return text
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
 }
 
 /** 当前渠道是否要求自定义端点（通用 OpenAI 接口 / 本地 Ollama）。 */

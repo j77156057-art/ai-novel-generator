@@ -80,6 +80,7 @@ from app.llm.registry import (
 )
 from app.models import AppSetting
 from app.schemas import StrictRequest
+from app.text_values import parse_bool
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -295,16 +296,6 @@ def _mask(key: str) -> str:
     if len(key) <= 8:
         return "***"
     return f"{key[:4]}***{key[-4:]}"
-
-
-def _parse_bool_setting(raw: str) -> bool | None:
-    """把 AppSetting 里的布尔串解析成 bool；脏值返回 None（调用方跳过）。"""
-    v = (raw or "").strip().lower()
-    if v in {"on", "true", "1", "yes"}:
-        return True
-    if v in {"off", "false", "0", "no"}:
-        return False
-    return None
 
 
 def _legacy_effective_config() -> dict[str, Any]:
@@ -874,6 +865,16 @@ def _put_role(body: LlmConfigIn, provider: str, role: str, db: Session) -> dict:
             if model_field:
                 _set(db, _DB_KEY_MODEL, body.model.strip())
                 overrides[model_field] = body.model.strip()
+            if body.models is None:
+                # 只换模型、没给候选链：把链收敛成这一个模型。否则旧渠道的
+                # 候选链会留在库里（实测 MiniMax 链尾挂着 deepseek/…，在
+                # MiniMax 端点必然 400，把真实错误也盖成 400）。
+                chain_models = body.model.strip()
+                _set(db, _DB_KEY_MODELS, chain_models)
+                overrides["llm_models"] = chain_models
+                if provider in _MODELS_FIELD:
+                    _set(db, f"llm.{_MODELS_FIELD[provider]}", chain_models)
+                    overrides[_MODELS_FIELD[provider]] = chain_models
         if body.api_key:
             key_field = _KEY_FIELD.get(provider)
             if key_field:
@@ -1234,7 +1235,7 @@ def load_persisted_llm_config(db: Session) -> None:
                 except ValueError:
                     continue  # 脏数据不当成配置，保持 yaml/env 默认
             elif field in _ROLE_BOOL_FIELDS:
-                parsed = _parse_bool_setting(raw)
+                parsed = parse_bool(raw)
                 if parsed is not None:
                     overrides[f"{role}_{field}"] = parsed
                 continue  # 脏值跳过（与脏 int 同策略）
@@ -1262,7 +1263,12 @@ def load_persisted_llm_config(db: Session) -> None:
     if stored.get(_DB_KEY_MODEL):
         provider = stored.get(_DB_KEY_PROVIDER, settings.llm_provider)
         overrides[_MODEL_FIELD.get(provider, "llm_model")] = stored[_DB_KEY_MODEL]
-    if stored.get(_DB_KEY_MODELS):
+    # 角色键优先：writer 显式选过模型时，legacy `llm.models` 视为**陈旧链**，
+    # 不能再覆盖该渠道的候选链。否则换渠道后会把上一个渠道的模型 id 带进来
+    #（实测：MiniMax 链里混入 `deepseek/deepseek-v4.1-flash`，在 MiniMax 端点
+    # 必然 400，还会把首个模型的真实错误盖成「最后错误: HTTP 400」）。
+    writer_model_explicit = bool((stored.get("writer.model") or "").strip())
+    if stored.get(_DB_KEY_MODELS) and not writer_model_explicit:
         provider = stored.get(_DB_KEY_PROVIDER, settings.llm_provider)
         if provider in _MODELS_FIELD:
             overrides[_MODELS_FIELD[provider]] = stored[_DB_KEY_MODELS]

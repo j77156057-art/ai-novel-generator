@@ -178,6 +178,16 @@ def test_attach_branch_to_state():
     check("[段] 原 state 不变（纯函数）", st.current_node, "n1")
     check("[段] 原 branch_used 不变", st.branch_used, 0)
 
+    # 回归（2026-11-23）：克隆必须带上 planning 三件套。此前 branch 手抄字段，
+    # 漏了这三个 → roll_branch 落库时会把段契约 / 规划状态写回成空值。
+    st.segment_contracts = {"3": {"beats": ["x"]}}
+    st.planning_status = "planned"
+    st.planning_reason = "test"
+    kept = attach_branch_to_state(st, branch)
+    check("[段] 保留 segment_contracts", kept.segment_contracts, {"3": {"beats": ["x"]}})
+    check("[段] 保留 planning_status", kept.planning_status, "planned")
+    check("[段] 保留 planning_reason", kept.planning_reason, "test")
+
     # 再次 attach 不同支线：current_node 现在是 b-n1-1，段模式**不归一化**，
     # 于是 branch2 嵌套挂在 b-n1-1 之下（而不是同级挂回 n1）。
     branch2 = PlotNode(

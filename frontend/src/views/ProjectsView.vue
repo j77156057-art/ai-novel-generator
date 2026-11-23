@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "@/api/client";
 import type { ProjectOut } from "@/api/types";
+import { errorText } from "@/utils/errors";
 
 const router = useRouter();
 const projects = ref<ProjectOut[]>([]);
@@ -27,13 +28,6 @@ const filteredProjects = computed(() => {
     return [p.title, p.genre, p.style].some((value) => value?.toLocaleLowerCase().includes(keyword));
   });
 });
-
-function errorText(err: unknown) {
-  if (err instanceof TypeError && /fetch/i.test(err.message)) {
-    return "无法连接服务，请检查网络连接或后端启动状态。";
-  }
-  return err instanceof Error ? err.message : String(err);
-}
 
 async function refresh() {
   loading.value = true;

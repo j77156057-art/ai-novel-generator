@@ -130,6 +130,8 @@ class AssistantInvokeGenerationRequest(StrictRequest):
     max_chars: int | None = None
     #: 用户显式指令（非空）。空串/纯空白 → 422。
     instruction: str
+    #: 章前作者选择/确认的开场方式（仅 generate_next 使用）；空 = 不注入。
+    chapter_opening: str | None = None
     #: 仅当上一次 409 返回 ``can_takeover=true`` 后由用户显式要求时传 true。
     #: 服务层仍会用条件 UPDATE 做 CAS：原持有者心跳没超时就不会抢走。
     takeover: bool = False
@@ -792,7 +794,8 @@ def _run_clarification(
 
 
 def _generate_next_with_chapter(db: Session, project: Project,
-                                max_chars: int | None) -> dict:
+                                max_chars: int | None,
+                                chapter_opening: str | None = None) -> dict:
     """助手入口写下一段前先分配章号。
 
     只做「下一章 = 库内最大章号 + 1」的分配，**不做任何段号推断**：
@@ -800,7 +803,8 @@ def _generate_next_with_chapter(db: Session, project: Project,
     """
     plan = chapter_labels.resolve(db, project, None)
     return generate_next_segment(
-        db, project, max_chars=max_chars, chapter_range=plan["label"])
+        db, project, max_chars=max_chars, chapter_range=plan["label"],
+        chapter_opening=chapter_opening)
 
 
 @router.post("/invoke-generation", response_model=None)
@@ -979,7 +983,9 @@ def assistant_invoke_generation(
     writer_model = ""
     try:
         if body.action == "generate_next":
-            result = _generate_next_with_chapter(db, project, body.max_chars)
+            result = _generate_next_with_chapter(
+                db, project, body.max_chars, body.chapter_opening
+            )
             gen = db.scalars(
                 select(Generation)
                 .where(

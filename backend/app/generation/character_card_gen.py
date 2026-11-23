@@ -49,6 +49,7 @@ from app.generation.character_card import (
     normalize_card,
     strict_voice_collisions,
 )
+from app.generation.model_json import safe_json as _safe_json
 
 #: 一批卡最多调用几次模型：1 次生成 + 1 次按反馈重写。
 #: 实测再多轮也没用（模型对「自称重复/套话」不敏感），只会把建卡拖成 5 轮。
@@ -847,30 +848,6 @@ def _collide(a: dict, b: dict) -> list[str]:
             shared.append(f"{label}都是「{a[key]}」")
     return shared
 
-
-def _safe_json(raw: Any) -> Any:
-    """模型输出 → dict（三级兜底：整体 JSON / 剥 think / 抓第一个 {...}）。"""
-    import re
-
-    text = str(raw or "").strip()
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return {}
-    return {}
 
 # ------------------------------------------------------------------ #
 # 从正文抽出角色卡（原创项目用；也用于参考书语料的蒸馏侧）

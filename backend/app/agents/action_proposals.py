@@ -24,6 +24,8 @@ import hashlib
 import json
 from typing import Any, Callable, Mapping
 
+from app.agents.card_collect import collect_pending_cards
+
 #: 动作类别。每一类对应**一个**前提算法与一个可执行的端点。
 ACTION_KINDS: tuple[str, ...] = (
     "start_distill",
@@ -764,24 +766,13 @@ def collect_action_proposal_cards(tool_results: Mapping[str, Any],
                                  project_id: int) -> list[dict[str, Any]]:
     """从工具结果里把「动作提案」卡收进对话流（只收**可信**的那些）。
 
-    与 `collect_body_repair_cards` 同一套口径：只认产出动作卡的工具
-    （`propose_*` 前缀 —— 它们都只**构造**卡，不落库）、端点必须是动作提案
-    自己的创建端点、body 里的 project_id 必须是本项目
-    —— 跨项目的卡一律不收（提一张必然失败的卡 = 骗用户点一次）。
+    只认 `propose_*` 工具产出、端点为动作提案创建端点、且 body.project_id
+    属于本项目的卡 —— 跨项目的卡一律不收（提一张必然失败的卡 = 骗用户点一次）。
     """
-    cards: list[dict[str, Any]] = []
-    for key, value in (tool_results or {}).items():
-        name = str(key).split(':', 1)[0]
-        if not name.startswith('propose_') or not isinstance(value, dict):
-            continue
-        action = value.get('pending_action')
-        if (isinstance(action, dict)
-                and action.get('kind') == 'action_proposal'
-                and action.get('endpoint') == '/api/assistant/action-proposals'
-                and action.get('method') == 'POST'
-                and (action.get('body') or {}).get('project_id') == project_id):
-            cards.append(action)
-    return cards
+    return collect_pending_cards(
+        tool_results, project_id,
+        kind="action_proposal", endpoint="/api/assistant/action-proposals",
+    )
 
 
 def action_proposal_to_dict(proposal: Any) -> dict[str, Any]:

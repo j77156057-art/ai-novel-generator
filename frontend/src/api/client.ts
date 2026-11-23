@@ -99,8 +99,13 @@ import type {
   KgV3ExemptRequest,
   KgV3JudgeFindingsResponse,
   KgV3StyleWarningsResponse,
+  KgV3WorkerStatus,
   KgV3CorpusWindowsResponse,
   KgV3EventsResponse,
+  AutoRepairResult,
+  ChapterOpeningResult,
+  GenerationSentencesResponse,
+  WritingProgress,
   KgV3Relation,
   KgV3Slice,
   LlmConfig,
@@ -108,6 +113,13 @@ import type {
   LlmLocalModelsResponse,
   LlmTestIn,
   LlmTestResult,
+  MaterialCreateRequest,
+  MaterialJobListResponse,
+  MaterialPatchRequest,
+  MaterialResearchJob,
+  MaterialToc,
+  ProjectMaterial,
+  ProjectMaterialListResponse,
   NovelOut,
   NarrativeTiersResponse,
   PlotBible,
@@ -296,6 +308,57 @@ async function streamError(res: Response, fallback: string): Promise<ApiError> {
     raw === undefined ? `${fallback} HTTP ${res.status}` : detailText(raw);
   return new ApiError(res.status, message, raw);
 }
+
+/**
+ * 统一读取 SSE（`data: {json}\n\n` 帧），逐帧交给 `onEvent`。
+ *
+ * 三处流式接口（生成 / 重生成 / 助手讨论）原来各写一份 reader + 帧解析，
+ * 任何一处修复（半帧、错误体、空响应体、error 事件）都要改三遍；这里收成
+ * 唯一实现。`error` 事件在这里直接抛 ApiError，调用方无需各自分支。
+ *
+ * 回调自身抛错仍被吞掉（与原实现一致），避免 UI 回调异常打断整个流。
+ */
+async function streamSse(
+  url: string,
+  init: RequestInit,
+  onEvent: (ev: any) => void,
+  errorLabel: string,
+): Promise<void> {
+  const res = await fetch(url, init);
+  if (!res.ok) throw await streamError(res, errorLabel);
+  if (!res.body) throw new ApiError(500, "响应流没有响应体");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    buf += decoder.decode(value, { stream: true });
+    let idx: number;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const line = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      const payload = line.slice(5).trim();
+      let ev: any;
+      try {
+        ev = JSON.parse(payload);
+      } catch {
+        continue; // 半帧 / 非 JSON：跳过
+      }
+      if (ev?.type === "error") {
+        throw new ApiError(500, String(ev.message || errorLabel));
+      }
+      try {
+        onEvent(ev);
+      } catch {
+        /* 回调异常不阻断读取（与原实现一致） */
+      }
+    }
+  }
+}
+
 
 function jsonInit(method: string, body?: unknown): RequestInit {
   return {
@@ -708,57 +771,26 @@ export const api = {
     signal?: AbortSignal,
     onReasoning?: (chars: number, text?: string) => void,
     onStage?: (stage: GenerationStageEvent) => void,
+    chapterOpening?: string | null,
   ): Promise<void> =>
-    new Promise<void>((resolve, reject) => {
-      fetch(`${BASE}/generate-stream`, {
+    streamSse(
+      `${BASE}/generate-stream`,
+      {
         ...jsonInit("POST", {
           project_id: projectId,
           max_chars: maxChars ?? null,
+          chapter_opening: chapterOpening ?? null,
         }),
         ...(signal ? { signal } : {}),
-      }).then(async (res) => {
-        if (!res.ok) {
-          reject(await streamError(res, "生成失败"));
-          return;
-        }
-        const reader = res.body!.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
-        const pump = (): Promise<void> =>
-          reader.read().then(({ done, value }) => {
-            if (done) {
-              resolve();
-              return;
-            }
-            buf += decoder.decode(value, { stream: true });
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) !== -1) {
-              const frame = buf.slice(0, idx);
-              buf = buf.slice(idx + 2);
-              const line = frame.split("\n").find((l) => l.startsWith("data:"));
-              if (!line) continue;
-              const payload = line.slice(5).trim();
-              try {
-                const ev = JSON.parse(payload) as
-                  | { type: "chunk"; text: string }
-                  | { type: "reasoning"; chars: number; text?: string }
-                  | GenerationStageEvent
-                  | ({ type: "done" } & GenerateStreamDoneMeta)
-                  | { type: "error"; message: string };
-                if (ev.type === "chunk") onChunk(ev.text);
-                else if (ev.type === "reasoning") onReasoning?.(ev.chars, ev.text);
-                else if (ev.type === "stage") onStage?.(ev);
-                else if (ev.type === "done") onDone(ev);
-                else if (ev.type === "error") reject(new ApiError(500, ev.message));
-              } catch {
-                /* 跳过不完整帧 */
-              }
-            }
-            return pump();
-          });
-        pump().catch((e) => reject(e));
-      }).catch((e) => reject(e));
-    }),
+      },
+      (ev) => {
+        if (ev.type === "chunk") onChunk(ev.text);
+        else if (ev.type === "reasoning") onReasoning?.(ev.chars, ev.text);
+        else if (ev.type === "stage") onStage?.(ev as GenerationStageEvent);
+        else if (ev.type === "done") onDone(ev);
+      },
+      "生成失败",
+    ),
 
   // 重生成单段：与 generateStream 同协议，额外带 segment_no
   regenerateStream: (
@@ -771,65 +803,54 @@ export const api = {
     onReasoning?: (chars: number, text?: string) => void,
     onStage?: (stage: GenerationStageEvent) => void,
   ): Promise<void> =>
-    new Promise<void>((resolve, reject) => {
-      fetch(`${BASE}/regenerate-stream`, {
+    streamSse(
+      `${BASE}/regenerate-stream`,
+      {
         ...jsonInit("POST", {
           project_id: projectId,
           segment_no: segmentNo,
           max_chars: maxChars ?? null,
         }),
         ...(signal ? { signal } : {}),
-      }).then(async (res) => {
-        if (!res.ok) {
-          reject(await streamError(res, "重生成失败"));
-          return;
-        }
-        const reader = res.body!.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
-        const pump = (): Promise<void> =>
-          reader.read().then(({ done, value }) => {
-            if (done) {
-              resolve();
-              return;
-            }
-            buf += decoder.decode(value, { stream: true });
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) !== -1) {
-              const frame = buf.slice(0, idx);
-              buf = buf.slice(idx + 2);
-              const line = frame.split("\n").find((l) => l.startsWith("data:"));
-              if (!line) continue;
-              const payload = line.slice(5).trim();
-              try {
-                const ev = JSON.parse(payload) as
-                  | { type: "chunk"; text: string }
-                  | { type: "reasoning"; chars: number; text?: string }
-                  | GenerationStageEvent
-                  | ({ type: "done" } & RegenerateStreamDoneMeta)
-                  | { type: "error"; message: string };
-                if (ev.type === "chunk") onChunk(ev.text);
-                else if (ev.type === "reasoning") onReasoning?.(ev.chars, ev.text);
-                else if (ev.type === "stage") onStage?.(ev);
-                else if (ev.type === "done") onDone(ev);
-                else if (ev.type === "error") reject(new ApiError(500, ev.message));
-              } catch {
-                /* 跳过不完整帧 */
-              }
-            }
-            return pump();
-          });
-        pump().catch((e) => reject(e));
-      }).catch((e) => reject(e));
-    }),
+      },
+      (ev) => {
+        if (ev.type === "chunk") onChunk(ev.text);
+        else if (ev.type === "reasoning") onReasoning?.(ev.chars, ev.text);
+        else if (ev.type === "stage") onStage?.(ev as GenerationStageEvent);
+        else if (ev.type === "done") onDone(ev);
+      },
+      "重生成失败",
+    ),
 
-  listGenerations: (projectId: number) =>
-    request<GenerationOut[]>(`/generations/${projectId}`),
+  /**
+   * 段落列表。`preview=N` 时服务端只回每段前 N 字符（`chars` 仍是真实字数），
+   * 卡片预览不必把整本书的正文拉回前端。
+   */
+  listGenerations: (projectId: number, opts?: { preview?: number }) => {
+    const query = opts?.preview
+      ? `?preview=${encodeURIComponent(String(opts.preview))}`
+      : "";
+    return request<GenerationOut[]>(`/generations/${projectId}${query}`);
+  },
 
   /** 定向返修计划（只读诊断，不调模型）。 */
   styleRepairPlan: (projectId: number, segmentNo: number) =>
     request<StyleRepairPlan>(
       `/projects/${projectId}/segments/${segmentNo}/repair-plan`,
+    ),
+
+  /**
+   * 一键自动返修：确定性修复（标点/双人同段/引号）→ 诊断 → 模型定向重写
+   * → 验收，不达标自动回滚。`apply_deterministic=false` 只诊断不改字。
+   */
+  autoRepairSegment: (
+    projectId: number,
+    segmentNo: number,
+    body: { apply_deterministic?: boolean; use_model?: boolean } = {},
+  ) =>
+    request<AutoRepairResult>(
+      `/projects/${projectId}/segments/${segmentNo}/auto-repair`,
+      jsonInit("POST", body),
     ),
 
   /**
@@ -933,57 +954,23 @@ export const api = {
       confidence?: number;
     }) => void,
     onSteps?: (steps: { name: string; meta?: string; detail?: string }[]) => void,
-  ): Promise<AssistantQaResponse> =>
-    new Promise<AssistantQaResponse>((resolve, reject) => {
-      fetch(`${BASE}/assistant/chat/stream`, jsonInit("POST", body))
-        .then(async (res) => {
-          if (!res.ok) {
-            reject(new ApiError(res.status, `对话失败 HTTP ${res.status}`));
-            return;
-          }
-          if (!res.body) {
-            reject(new ApiError(500, "对话流没有响应体"));
-            return;
-          }
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder();
-          let buf = "";
-          let final: AssistantQaResponse | null = null;
-          const pump = (): Promise<void> =>
-            reader.read().then(({ done, value }) => {
-              if (done) {
-                if (final) resolve(final);
-                else reject(new ApiError(500, "对话流意外结束"));
-                return;
-              }
-              buf += decoder.decode(value, { stream: true });
-              let idx: number;
-              while ((idx = buf.indexOf("\n\n")) !== -1) {
-                const frame = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
-                const line = frame.split("\n").find((l) => l.startsWith("data:"));
-                if (!line) continue;
-                const payload = line.slice(5).trim();
-                try {
-                  const ev = JSON.parse(payload) as AssistantChatStreamEvent;
-                  if (ev.type === "delta") onDelta(ev.text);
-                  else if (ev.type === "meta") onMeta?.(ev);
-                  else if (ev.type === "steps") onSteps?.(ev.steps);
-                  else if (ev.type === "done") final = ev;
-                  else if (ev.type === "error") {
-                    reject(new ApiError(500, ev.message));
-                    return;
-                  }
-                } catch {
-                  /* 跳过不完整帧 */
-                }
-              }
-              return pump();
-            });
-          pump().catch((e) => reject(e));
-        })
-        .catch((e) => reject(e));
-    }),
+  ): Promise<AssistantQaResponse> => {
+    const state: { final: AssistantQaResponse | null } = { final: null };
+    return streamSse(
+      `${BASE}/assistant/chat/stream`,
+      jsonInit("POST", body),
+      (ev) => {
+        if (ev.type === "delta") onDelta(ev.text);
+        else if (ev.type === "meta") onMeta?.(ev);
+        else if (ev.type === "steps") onSteps?.(ev.steps);
+        else if (ev.type === "done") state.final = ev as AssistantQaResponse;
+      },
+      "对话失败",
+    ).then(() => {
+      if (!state.final) throw new ApiError(500, "对话流意外结束");
+      return state.final;
+    });
+  },
 
   // —— 助理长期记忆（项目级；内容由助手在问答后自动抽取，这里只读与删除）——
   listAssistantMemories: (projectId: number) =>
@@ -1231,22 +1218,7 @@ export const api = {
 
   /** 批抽 worker 状态：线程存活/队列积压/汇总计数/最近行。 */
   kgV3WorkerStatus: (projectId: number) =>
-    request<{
-      worker_alive: boolean;
-      pending: number;
-      summary: { success: number; failed: number; running: number; stuck: number; empty: number };
-      recent_runs: {
-        id: number;
-        segment_no: number | null;
-        status: string;
-        stuck: boolean;
-        empty: boolean;
-        duration_ms: number | null;
-        batch_stats: Record<string, unknown> | null;
-        error: string | null;
-        started_at: string | null;
-      }[];
-    }>(`/projects/${projectId}/kg-v3/worker/status`),
+    request<KgV3WorkerStatus>(`/projects/${projectId}/kg-v3/worker/status`),
 
   /** 书维度现状：每表在范围内/被排除的行数，章号未知与区间漂移分开计数。 */
   kgV3BookScope: (projectId: number) =>
@@ -1464,6 +1436,46 @@ export const api = {
   listWizardMessages: (projectId: number, limit = 200) =>
     request<WizardMessageListResponse>(
       `/assistant/wizard/${projectId}/messages?limit=${encodeURIComponent(String(limit))}`,
+    ),
+
+  /** 追加一条对话消息（章节卡 / 只读通知）。 */
+  appendWizardMessage: (
+    projectId: number,
+    body: {
+      role?: "user" | "assistant";
+      kind?: "plain" | "chapter" | "notice";
+      text?: string;
+      payload?: Record<string, unknown>;
+      dedupe_key?: string;
+    },
+  ) =>
+    request<{
+      id: number;
+      role: string;
+      kind: string;
+      text: string;
+      payload: Record<string, unknown>;
+      created_at: string | null;
+    }>(`/assistant/wizard/${projectId}/messages`, jsonInit("POST", body)),
+
+  /** 章前「这一章怎么开头」：模型 3 条 + 规则兜底。 */
+  chapterOpeningOptions: (
+    projectId: number,
+    body: { chapter?: number | null; use_model?: boolean } = {},
+  ) =>
+    request<ChapterOpeningResult>(
+      `/projects/${projectId}/chapter-opening-options`,
+      jsonInit("POST", body),
+    ),
+
+  /** 右侧写作进度：当前章 / 大纲 / 时间线节点。 */
+  writingProgress: (projectId: number) =>
+    request<WritingProgress>(`/projects/${projectId}/writing-progress`),
+
+  /** 章节正文的句子区间（选句/改句用）。 */
+  listGenerationSentences: (projectId: number, generationId: number) =>
+    request<GenerationSentencesResponse>(
+      `/generations/${projectId}/${generationId}/sentences`,
     ),
 
   /** 从汇总卡片跳回已答过的某一步。 */
@@ -1686,6 +1698,92 @@ export const api = {
   importForeshadowsFromKg: (projectId: number) =>
     request<ForeshadowImportResponse>(
       `/projects/${projectId}/foreshadows/import-kg`,
+      { method: "POST" },
+    ),
+
+  // ---------- 每本书专属素材包 ----------
+  listMaterials: (
+    projectId: number,
+    params: {
+      q?: string;
+      status?: string;
+      category?: string;
+      year_from?: number | null;
+      year_to?: number | null;
+      unknown_year?: boolean;
+      page?: number;
+      page_size?: number;
+    } = {},
+  ) => {
+    const search = new URLSearchParams();
+    if (params.q) search.set("q", params.q);
+    if (params.status) search.set("status", params.status);
+    if (params.category) search.set("category", params.category);
+    if (params.year_from != null) search.set("year_from", String(params.year_from));
+    if (params.year_to != null) search.set("year_to", String(params.year_to));
+    if (params.unknown_year) search.set("unknown_year", "true");
+    if (params.page) search.set("page", String(params.page));
+    if (params.page_size) search.set("page_size", String(params.page_size));
+    const suffix = search.toString() ? `?${search.toString()}` : "";
+    return request<ProjectMaterialListResponse>(
+      `/projects/${projectId}/materials${suffix}`,
+    );
+  },
+
+  materialToc: (projectId: number) =>
+    request<MaterialToc>(`/projects/${projectId}/materials/toc`),
+
+  /** 按新的年份规则重算存量素材（跳过手动素材）。 */
+  reparseMaterialYears: (projectId: number) =>
+    request<{ scanned: number; updated: number; cleared: number }>(
+      `/projects/${projectId}/materials/reparse-years`,
+      { method: "POST" },
+    ),
+
+  createMaterial: (projectId: number, body: MaterialCreateRequest) =>
+    request<ProjectMaterial>(
+      `/projects/${projectId}/materials`,
+      jsonInit("POST", body),
+    ),
+
+  patchMaterial: (
+    projectId: number,
+    materialId: number,
+    body: MaterialPatchRequest,
+  ) =>
+    request<ProjectMaterial>(
+      `/projects/${projectId}/materials/${materialId}`,
+      jsonInit("PATCH", body),
+    ),
+
+  deleteMaterial: (projectId: number, materialId: number) =>
+    request<{ ok: boolean }>(
+      `/projects/${projectId}/materials/${materialId}`,
+      { method: "DELETE" },
+    ),
+
+  listMaterialJobs: (projectId: number, limit = 20) =>
+    request<MaterialJobListResponse>(
+      `/projects/${projectId}/materials/jobs?limit=${encodeURIComponent(String(limit))}`,
+    ),
+
+  startMaterialResearch: (
+    projectId: number,
+    body: { chapter_no?: number | null; queries?: string[] } = {},
+  ) =>
+    request<MaterialResearchJob>(
+      `/projects/${projectId}/materials/jobs`,
+      jsonInit("POST", body),
+    ),
+
+  getMaterialJob: (projectId: number, jobId: number) =>
+    request<MaterialResearchJob>(
+      `/projects/${projectId}/materials/jobs/${jobId}`,
+    ),
+
+  cancelMaterialJob: (projectId: number, jobId: number) =>
+    request<MaterialResearchJob>(
+      `/projects/${projectId}/materials/jobs/${jobId}/cancel`,
       { method: "POST" },
     ),
 };

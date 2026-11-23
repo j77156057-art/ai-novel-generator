@@ -35,26 +35,12 @@ from __future__ import annotations
 
 from typing import Any
 
-#: 四层键名。顺序即渲染顺序。
-LAYERS: tuple[str, ...] = ("method", "characters", "world", "timeline")
-
 #: method 层里属于「手法」的维度（与 narrative.NARRATIVE_DIMENSIONS 的差集是
 #: 角色声音/文笔量化审计/文风漂移分析——那三个不进 method）。
-METHOD_KEYS: tuple[str, ...] = (
-    "人物描写手法",
-    "对白风格",
-    "段落编排",
-    "场景构建",
-    "情绪表达",
-    "节奏控制",
-    "世界观呈现",
-    "剧情编排模式",
-    "伏笔与悬念设计",
-    "节拍序列",
-    "高频场景模板",
-    "潜台词模式",
-    "语序编排",
-)
+from app.style_dims import METHOD_KEYS
+
+#: 四层键名。顺序即渲染顺序。
+LAYERS: tuple[str, ...] = ("method", "characters", "world", "timeline")
 
 #: 只给续写用的 method 子集：原创要学「怎么写」，续写额外要「怎么接」。
 #: 目前两层相同——留这个常量是为了将来出现「只对续写有意义」的维度时

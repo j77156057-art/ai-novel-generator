@@ -49,11 +49,10 @@ from app.db import get_db
 from app.models import AgentRun, Evidence, RawNovel
 from app.routers.assistant_shared import (
     _chat_with_assistant,
-    _confidence_from_evidence,
     _now_utc,
     _request_hash,
     _require_project,
-    evidence_rows_to_dicts,
+    finish_rule_run,
     persist_evidence,
 )
 from app.schemas import StrictRequest
@@ -217,23 +216,16 @@ def _run_audit(
         model_label = ""
         answer = no_issue_answer(stats)
 
-    run.status = "success"
-    run.finished_at = _now_utc()
-    run.model = model_label or "(local_fallback)"
-    db.commit()
-
-    return {
-        "answer": answer,
-        "issues": issues,
-        # findings 兼容别名：与 diagnose 响应同构，前端一份渲染逻辑复用
-        "findings": issues,
-        "evidence": evidence_rows_to_dicts(evidence_rows),
-        "confidence": _confidence_from_evidence(evidence_rows),
-        "agent_run_id": run_id,
-        "tool_results": tool_results,
-        "rules_evaluated": list(report.rules_evaluated),
-        "version_id": getattr(body, "version_id", None),
-    }
+    return finish_rule_run(
+        db, run,
+        answer=answer,
+        model_label=model_label,
+        issues=issues,
+        evidence_rows=evidence_rows,
+        tool_results=tool_results,
+        rules_evaluated=report.rules_evaluated,
+        version_id=getattr(body, "version_id", None),
+    )
 
 
 def _explain_audit_issues(

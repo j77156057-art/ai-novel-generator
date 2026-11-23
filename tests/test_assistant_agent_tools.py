@@ -878,11 +878,14 @@ def test_qa_falls_back_to_deterministic_with_explicit_mode(db_session, project_i
 
 
 def test_qa_tool_loop_is_bounded_and_exhaustion_falls_back(db_session, project_id, monkeypatch):
-    """模型每步都硬要调工具：循环最多 3 步，之后回落并如实回传原因。"""
+    """模型每步都硬要调工具：循环最多到配置上限，之后回落并如实回传原因。"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "assistant_qa_max_tool_steps", 4, raising=False)
     provider = _ScriptedProvider([
         {"content": "", "tool_calls": [_tool_call("get_reminders", "{}", f"c{i}")],
          "finish_reason": "tool_calls", "usage": None, "model": "scripted-tool-model"}
-        for i in range(3)
+        for i in range(4)
     ])
     monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
 
@@ -892,22 +895,149 @@ def test_qa_tool_loop_is_bounded_and_exhaustion_falls_back(db_session, project_i
         db=db_session,
     )
 
-    assert len(provider.calls) == assistant_router._QA_MAX_TOOL_STEPS
-    assert assistant_router._QA_MAX_TOOL_STEPS <= 3
+    assert len(provider.calls) == 4
     # 最后一次请求**不带** tools：即便模型还想调，也只剩收尾成文字这条路。
     assert provider.calls[-1]["tools"] is None
     assert result["tool_mode"] == "deterministic"
     assert "工具循环未产出" in result["tool_fallback_reason"]
 
 
+def test_qa_tool_step_limit_defaults_to_eight():
+    """默认步数从 6 提到 8：复杂问题（目录 → 多次检索 → 取详情）需要两轮余量。"""
+    from app.config import settings
+
+    assert settings.assistant_qa_max_tool_steps == 8
+    assert assistant_router._qa_max_tool_steps() == 8
+
+
+def test_qa_reports_tool_steps_and_forced_wrap_up(db_session, project_id, monkeypatch):
+    """最后一步靠「不带 tools」收尾时，响应要能看出用了多少步、是否被强制收尾。"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "assistant_qa_max_tool_steps", 4, raising=False)
+    script = [
+        {"content": "", "tool_calls": [_tool_call("get_reminders", "{}", f"c{i}")],
+         "finish_reason": "tool_calls", "usage": None, "model": "scripted-tool-model"}
+        for i in range(3)
+    ]
+    script.append(_tool_text("基于工具结果的收尾回答。"))
+    provider = _ScriptedProvider(script)
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    result = assistant_router.assistant_qa(
+        body=assistant_router.AssistantQARequest(
+            project_id=project_id, query="有什么提醒"),
+        db=db_session,
+    )
+
+    assert result["tool_mode"] == "model"
+    assert result["tool_steps"] == 4
+    assert result["forced_wrap_up"] is True
+    assert provider.calls[-1]["tools"] is None
+    assert result["answer"] == "基于工具结果的收尾回答。"
+
+
+def test_gather_only_stops_after_tools_and_leaves_answer_empty(db_session, project_id, monkeypatch):
+    """流式聊天先取证：模型调完工具就停，不生成正文（正文由流式那一步负责）。"""
+    _seed_segment(db_session, project_id, 1, "第一段正文：主角在雨夜登场。" * 5)
+    provider = _ScriptedProvider([
+        {"content": "", "tool_calls": [_tool_call("read_generation_segments", '{"limit": 1}')],
+         "finish_reason": "tool_calls", "usage": None, "model": "scripted-tool-model"},
+        _tool_text("这段不该被当成最终回答"),
+    ])
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    project = db_session.get(Project, project_id)
+    outcome = assistant_router._qa_answer_with_tools(
+        db=db_session,
+        project=project,
+        run_id=1,
+        query="第 1 段写了什么？",
+        action_block="",
+        trace_ctx={},
+        gather_only=True,
+    )
+
+    assert outcome["answer"] == "", "取证模式不该产出正文"
+    assert [e["name"] for e in outcome["tool_trace"]] == ["read_generation_segments"]
+    assert outcome["tool_steps"] == 2
+    assert outcome["forced_wrap_up"] is False
+    assert any("[正文 第1段]" in line for line in outcome["evidence_lines"])
+
+
+def test_gather_only_marks_step_limit_exhausted(db_session, project_id, monkeypatch):
+    """取证模式步数用满仍在调工具：停止检索并标记 forced_wrap_up。"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "assistant_qa_max_tool_steps", 4, raising=False)
+    provider = _ScriptedProvider([
+        {"content": "", "tool_calls": [_tool_call("get_reminders", "{}", f"c{i}")],
+         "finish_reason": "tool_calls", "usage": None, "model": "scripted-tool-model"}
+        for i in range(4)
+    ])
+    monkeypatch.setattr(assistant_router, "_ensure_assistant_provider", lambda: provider)
+
+    project = db_session.get(Project, project_id)
+    outcome = assistant_router._qa_answer_with_tools(
+        db=db_session,
+        project=project,
+        run_id=1,
+        query="有什么提醒",
+        action_block="",
+        trace_ctx={},
+        gather_only=True,
+    )
+
+    assert outcome["answer"] == ""
+    assert outcome["tool_steps"] == 4
+    assert outcome["forced_wrap_up"] is True
+    assert len(outcome["tool_trace"]) == 4
+    # 取证模式没有「强制收尾」这一轮：4 步全是带 tools 的请求。
+    assert all(call["tools"] for call in provider.calls)
+
+
+def test_small_talk_skips_tool_round_but_data_questions_do_not():
+    """寒暄跳过工具轮；只要带检索/写作意图（哪怕是「你好，素材…」）就照常跑。"""
+    from app.routers.assistant import _is_small_talk
+
+    for query in ("你好", "您好！", "hi", "谢谢啦", "在吗？", "嗯嗯", "辛苦了"):
+        assert _is_small_talk(query), f"{query!r} 应判定为寒暄"
+    for query in (
+        "你好，素材包里有什么？",
+        "第1段写了什么？",
+        "帮我续写下一段",
+        "你能做什么",
+        "谢谢，顺便看看第2章",
+    ):
+        assert not _is_small_talk(query), f"{query!r} 不应判定为寒暄"
+
+
+def test_needs_tool_round_skips_only_short_casual_messages():
+    """短句且无意图词才跳过工具轮；带人物/段落/关系等意图词一律照查。"""
+    from app.routers.assistant import _needs_tool_round
+
+    for query in ("你好", "谢谢啦", "继续", "好的", "今天天气不错", "就这样吧"):
+        assert not _needs_tool_round(query), f"{query!r} 不应跑工具轮"
+    for query in (
+        "许照是谁",
+        "素材包里有什么",
+        "第1段写了什么",
+        "帮我续写下一段",
+        "这段怎么样",
+        "钱多多和许照什么关系",
+        "今天写得挺顺的，我们接着聊聊后面的安排",
+    ):
+        assert _needs_tool_round(query), f"{query!r} 应跑工具轮"
+
+
 def test_qa_tool_loop_respects_wall_clock_budget(db_session, project_id, monkeypatch):
-    """整轮墙钟预算：第二步开始时已超 60s → 中止并回落，不再发下一次请求。"""
+    """整轮墙钟预算：第二步开始时已超 120s → 中止并回落，不再发下一次请求。"""
     import time as _time
     import types
 
-    ticks = iter([0.0, 0.0, 61.0])
+    ticks = iter([0.0, 0.0, 121.0])
     shim = types.SimpleNamespace(
-        monotonic=lambda: next(ticks, 61.0),
+        monotonic=lambda: next(ticks, 121.0),
         perf_counter=_time.perf_counter,
     )
     monkeypatch.setattr(assistant_router, "time", shim)

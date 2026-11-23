@@ -76,6 +76,13 @@ const routes = [
     meta: { title: "力量体系", idx: "02" },
   },
   {
+    // 每本书专属素材包：后台调研、年份/用途标注、手动增删改与目录浏览。
+    path: "/projects/:id/materials",
+    name: "project-materials",
+    component: () => import("@/views/MaterialPackView.vue"),
+    meta: { title: "素材包", idx: "02" },
+  },
+  {
     // 项目资产：摘要 / 人物模板 / 角色卡 / 力量体系的统一入口，
     // 不再把四个按钮直接堆在项目工作台头部。
     path: "/projects/:id/assets",

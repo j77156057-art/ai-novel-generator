@@ -98,6 +98,61 @@ def _spec_hint_lines(deviations: Sequence[str] | None) -> str:
 DEFAULT_SENTENCE_TARGET = "平均每句 45 到 70 个字"
 
 
+#: 「缩小改写范围」的字数预算：超过它就只改偏离最严重的一段连续区间。
+#: 2026-11-23：整章改写实测约 100s（MiniMax 思考关不掉），只改偏离段落能把
+#: 输入缩到 1/3 左右；对齐仍然安全——区间按段落边界选取，原样拼接回去。
+FOCUS_MAX_CHARS = 1800
+
+
+def _focus_span(text: str, target_range: tuple[float, float] | None) -> tuple[int, int] | None:
+    """挑出最值得改写的一段**连续区间**（按段落句长离目标带的距离）。
+
+    - 文本不超过预算 / 没有目标带 / 段落太少 → 返回 None（整篇改写）；
+    - 否则从偏离最大的一段出发，向左右扩展「仍明显偏离」的邻居，
+      直到再加一段就超预算；邻居都不偏离就停。
+    """
+    if not target_range or len(text) <= FOCUS_MAX_CHARS:
+        return None
+    spans = [(m.start(), m.end()) for m in re.finditer(r"[^\n]+(?:\n|$)", text)]
+    if len(spans) < 3:
+        return None
+    lo, hi = target_range
+    scores: list[float] = []
+    for s, e in spans:
+        try:
+            mean = _stats(text[s:e])[0]
+        except Exception:  # noqa: BLE001 —— 量不出来就当作不偏离
+            scores.append(0.0)
+            continue
+        scores.append(_distance_to_band(mean, lo, hi))
+    if not any(score >= 1.0 for score in scores):
+        return None
+    worst = max(range(len(scores)), key=lambda i: scores[i])
+    left = right = worst
+    total = spans[worst][1] - spans[worst][0]
+    while True:
+        lscore = scores[left - 1] if left > 0 else -1.0
+        rscore = scores[right + 1] if right + 1 < len(spans) else -1.0
+        if lscore < 1.0 and rscore < 1.0:
+            break
+        go_left = lscore >= rscore
+        idx = left - 1 if go_left else right + 1
+        width = spans[idx][1] - spans[idx][0]
+        if total + width > FOCUS_MAX_CHARS:
+            break
+        if go_left:
+            left = idx
+        else:
+            right = idx
+        total += width
+    start = spans[left][0]
+    end = spans[right][1]
+    # 把结尾的换行留在原文里，拼回去时段落分隔不会丢。
+    while end > start and text[end - 1] in "\r\n":
+        end -= 1
+    return start, end
+
+
 def _sentence_target_line(target_range: tuple[float, float] | None) -> str:
     """目标句长那句话 —— 有档案就用档案的带，没有才用兜底。
 
@@ -325,9 +380,12 @@ def rewrite_style(
     if target_sentence_range is None and target_sentence_len:
         target_sentence_range = (target_sentence_len * 0.75, target_sentence_len * 1.25)
 
-    before = _stats(text)
+    # 只改「偏离最严重的一段连续段落」：整章改写太慢，且没必要的段落不该动。
+    span = _focus_span(text, target_sentence_range)
+    segment = text[span[0]:span[1]] if span else text
+    before = _stats(segment)
     user_prompt = _REWRITE_USER.format(
-        text=text,
+        text=segment,
         sentence_target=_sentence_target_line(target_sentence_range),
         spec_hint=_spec_hint_lines(deviations),
     )
@@ -337,10 +395,16 @@ def rewrite_style(
     last_exc: Exception | None = None
     for prov in (_call_provider(provider), provider):
         try:
-            out = prov.chat(
-                _REWRITE_SYSTEM, user_prompt,
-                temperature=REWRITE_TEMPERATURE,
-            ) or ""
+            try:
+                out = prov.chat(
+                    _REWRITE_SYSTEM, user_prompt,
+                    temperature=REWRITE_TEMPERATURE,
+                ) or ""
+            except TypeError:
+                # 老 provider 的 chat 签名不接 temperature（OpenAI 兼容层就是
+                # 这样）——直接抛 TypeError 会让每次文风改写都记成「调用失败」，
+                # 改写永远不发生。不带 temperature 重试一次（用渠道默认温度）。
+                out = prov.chat(_REWRITE_SYSTEM, user_prompt) or ""
             last_exc = None
             break
         except Exception as exc:  # noqa: BLE001 - 改写失败绝不能阻断生成
@@ -356,10 +420,10 @@ def rewrite_style(
     after = _stats(out)
 
     # 判据 1：内容不能大段丢失
-    if len(out) < len(text) * MIN_LEN_RATIO:
+    if len(out) < len(segment) * MIN_LEN_RATIO:
         return text, {
             "applied": False,
-            "reason": f"字数缩水过多 {len(text)}→{len(out)}",
+            "reason": f"字数缩水过多 {len(segment)}→{len(out)}",
             "before": before, "after": after,
         }
 
@@ -372,11 +436,11 @@ def rewrite_style(
         }
 
     # 判据 3：也不能**膨胀**（模型把「每句 45~70 字」当成「多写点」时会凭空扩写）
-    growth_limit = max(MAX_LEN_GROWTH_ABS, int(len(text) * MAX_LEN_GROWTH_RATIO))
-    if len(out) > len(text) + growth_limit:
+    growth_limit = max(MAX_LEN_GROWTH_ABS, int(len(segment) * MAX_LEN_GROWTH_RATIO))
+    if len(out) > len(segment) + growth_limit:
         return text, {
             "applied": False,
-            "reason": f"字数膨胀过多 {len(text)}→{len(out)}（上限 +{growth_limit}）",
+            "reason": f"字数膨胀过多 {len(segment)}→{len(out)}（上限 +{growth_limit}）",
             "before": before, "after": after,
         }
 
@@ -435,7 +499,7 @@ def rewrite_style(
 
     # 判据 6：对白形态不能被改坏（改写只做断句，不该让「一行一句台词」变多）
     try:
-        bare_before = _bare_ratio(text)
+        bare_before = _bare_ratio(segment)
         bare_after = _bare_ratio(out)
     except Exception:  # noqa: BLE001 —— 量不出来就不拦，绝不能阻断生成
         bare_before = bare_after = None
@@ -447,10 +511,14 @@ def rewrite_style(
             "bare_ratio": (bare_before, bare_after),
         }
 
-    return out, {
+    # 区间改写：只替换选中的那一段，前后原文原样保留。
+    final = text if span is None else text[: span[0]] + out + text[span[1]:]
+    return final, {
         "applied": True,
         "before": before,
         "after": after,
-        "chars": (len(text), len(out)),
+        "chars": (len(segment), len(out)),
+        "scope": "window" if span else "full",
+        "span": list(span) if span else None,
         "target": list(target_sentence_range) if target_sentence_range else None,
     }

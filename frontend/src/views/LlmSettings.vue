@@ -12,6 +12,7 @@
  */
 import { computed, onMounted, reactive, ref } from "vue";
 import { ApiError, api } from "@/api/client";
+import { errorText } from "@/utils/errors";
 import KgExtractPanel from "@/components/KgExtractPanel.vue";
 import RoleModelPanel from "@/components/RoleModelPanel.vue";
 import { useLlmConfig } from "@/composables/useLlmConfig";
@@ -226,11 +227,6 @@ async function testWebSearch(): Promise<void> {
 }
 
 onMounted(loadWebSearch);
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 
 /**
  * 保存 KG 抽取配置：只提交 `kg_extract` 字段。

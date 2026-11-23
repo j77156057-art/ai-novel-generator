@@ -267,24 +267,10 @@ def attach_branch_to_state(state, branch: "PlotNode", *, chapter_based: bool = F
     - branch_used += 1（占一段预算）
     - 不动 current_beat（支线无节拍概念，但保留字段以兼容）
     """
-    from app.generation.timeline import TimelineState
+    from app.generation.timeline import _clone_state
 
-    # copy（新增字段必须一起带过去，否则被覆盖丢失）
-    st = TimelineState(
-        nodes=dict(state.nodes),
-        order=list(state.order),
-        done=set(state.done),
-        total_main=state.total_main,
-        current_node=state.current_node,
-        current_beat=state.current_beat,
-        branch_budget=state.branch_budget,
-        branch_used=state.branch_used,
-        seg_counts=dict(state.seg_counts),
-        early_done=set(state.early_done),
-        branch_current=state.branch_current,
-        completion=dict(state.completion),
-        last_judged_segment=state.last_judged_segment,
-    )
+    # 用 timeline 的克隆实现：状态新增字段时这里自动跟进，不再手抄字段清单。
+    st = _clone_state(state)
     # 锚点选择（**按模式区分**，2026-11-15 定稿）：
     # - 章模式（chapter_based=True）：current_node 永远停在主干上，但防御性归一化
     #   ——若它意外指向支线，取父主干（父缺失则回退第一个主干），保证后续支线

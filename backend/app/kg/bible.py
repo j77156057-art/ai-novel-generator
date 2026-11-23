@@ -19,6 +19,8 @@ from typing import Any
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
+from app.text_numbers import cn_number as _cn_number
+
 from app.kg.book_scope import book_for_project
 from app.kg.entity_lookup import resolve_entity_by_name
 from app.models import KgBibleRevision, KgEntity, KgForeshadow, Project
@@ -176,30 +178,6 @@ _GENDER_KEYS: tuple[str, ...] = ("gender", "性别")
 _FIRST_CHAPTER_KEYS: tuple[str, ...] = (
     "first_chapter", "首次出场章节", "首次出场", "first_appearance_chapter",
 )
-
-_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4,
-              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-
-
-def _cn_number(s: str) -> int | None:
-    """中文数字 → int（0~999）。解析不了返回 None。"""
-    if not s:
-        return None
-    if s.isdigit():
-        return int(s)
-    total, section = 0, 0
-    for ch in s:
-        if ch in _CN_DIGITS:
-            section = _CN_DIGITS[ch]
-        elif ch == "十":
-            total += (section or 1) * 10
-            section = 0
-        elif ch == "百":
-            total += (section or 1) * 100
-            section = 0
-        else:
-            return None
-    return total + section
 
 
 def character_gender(card: Any) -> str:

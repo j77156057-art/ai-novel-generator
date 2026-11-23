@@ -49,6 +49,11 @@ class GenerateBody(StrictRequest):
     # 章号/章区间：`"44"` 或 `"44-46"`。缺省由 `chapter_labels.resolve` 推导
     # （库内最大章号 +1），前端不改也能出章。
     chapter_range: str | None = None
+    # 快速模式：写手关思考、重写轮限 1 次、跳过归属/声纹/对白下限等模型校正。
+    # 只保留确定性的并段/段数/引号/字数守卫，质量略粗、单章更快。
+    fast: bool = False
+    # 章前作者选择/确认的开场方式；空串/None 时提示词与旧版逐字节一致。
+    chapter_opening: str | None = None
 
 
 class GenerateLoopBody(StrictRequest):
@@ -169,13 +174,28 @@ def _chapter_plan(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _to_generation_out(gen: Generation) -> dict:
+def _to_generation_out(gen: Generation, preview: int | None = None) -> dict:
+    """段落出参。`preview=N` 时 text 只回前 N 字符（带省略号），chars 仍是真实字数。
+
+    长书（几十万字）每次列表都回全部正文，前端只为拿卡片 150 字预览时尤其浪费；
+    预览是服务端截断，调用方无需再判断长度。
+    """
+    raw_text = gen.text or ""
+    if preview is None:
+        shown_text = gen.text
+    else:
+        limit = max(1, min(int(preview), 2000))
+        shown_text = (
+            raw_text if len(raw_text) <= limit else raw_text[:limit] + "…"
+        )
     return {
         "id": gen.id,
         "project_id": gen.project_id,
         "segment_no": gen.segment_no,
         "chapter_range": gen.chapter_range,
-        "text": gen.text,
+        "text": shown_text,
+        # 真实字符数：预览模式也能正确显示字数，不必依赖被截断的 text。
+        "chars": len(raw_text),
         "summary": gen.summary,
         # 复读闸门结论。`NULL` → verdict="undetected"（未检测），**不是**「正常」。
         "quality": parse_quality(gen.quality_json),
@@ -193,7 +213,8 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
     try:
         result = generate_next_segment(
             db, proj, novel_ids=novel_ids, max_chars=body.max_chars,
-            chapter_range=plan["label"],
+            chapter_range=plan["label"], fast_mode=body.fast,
+            chapter_opening=body.chapter_opening,
         )
     except (LengthBlocked, chapter_labels.ChapterIdentityError) as exc:
         # 两条生成侧硬判据：章身份解析失败 / 压缩后仍超篇幅上限 → 不落正文。
@@ -263,7 +284,8 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
             p = sdb.get(Project, project_id)
             for ev in generate_next_segment_stream(
                 sdb, p, novel_ids=novel_ids, max_chars=body.max_chars,
-                chapter_range=plan["label"],
+                chapter_range=plan["label"], fast_mode=body.fast,
+                chapter_opening=body.chapter_opening,
             ):
                 if ev.get("type") == "done":
                     ev = {**ev, "outline": outline_notice}
@@ -581,7 +603,9 @@ def list_alerts(project_id: int, db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("/generations/{project_id}")
-def list_generations(project_id: int, db: Session = Depends(get_db)) -> list[dict]:
+def list_generations(
+    project_id: int, preview: int | None = None, db: Session = Depends(get_db)
+) -> list[dict]:
     if db.get(Project, project_id) is None:
         raise HTTPException(status_code=404, detail="project 不存在")
     gens = db.scalars(
@@ -589,7 +613,30 @@ def list_generations(project_id: int, db: Session = Depends(get_db)) -> list[dic
         .where(Generation.project_id == project_id)
         .order_by(Generation.segment_no)
     ).all()
-    return [_to_generation_out(g) for g in gens]
+    return [_to_generation_out(g, preview=preview) for g in gens]
+
+
+@router.get("/generations/{project_id}/{generation_id}/sentences")
+def list_generation_sentences(
+    project_id: int, generation_id: int, db: Session = Depends(get_db)
+) -> dict:
+    """章节正文的句子区间：前端选句/改句用它，不自己复制切句规则。"""
+    gen = db.get(Generation, generation_id)
+    if gen is None or gen.project_id != project_id:
+        raise HTTPException(status_code=404, detail="generation 不存在")
+    from app.generation.patch import split_sentences
+
+    spans = split_sentences(gen.text or "")
+    return {
+        "generation_id": gen.id,
+        "segment_no": gen.segment_no,
+        "chapter_range": gen.chapter_range,
+        "count": len(spans),
+        "items": [
+            {"index": index, **span}
+            for index, span in enumerate(spans, 1)
+        ],
+    }
 
 
 @router.patch("/generations/{project_id}/{generation_id}")

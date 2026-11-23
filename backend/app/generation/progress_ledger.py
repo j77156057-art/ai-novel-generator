@@ -46,6 +46,7 @@ from typing import Any, Iterable
 
 from app.coherence import build_roster, parse_relative, split_paragraphs
 from app.generation.structure_check import _bigrams as _content_bigrams
+from app.text_numbers import cn_number as _cn_number
 
 LEDGER_VERSION = "progress-ledger-v1"
 
@@ -117,8 +118,6 @@ _REL_SPAN_RE = re.compile(
     r"(?P<n>[0-9一二三四五六七八九十两]+)\s*(?P<unit>天|日|周|星期|个月|月|年|小时|分钟)(?:以)?后"
     r"|(?P<half>半)\s*(?P<half_unit>天|个月|年)(?:以)?后"
 )
-_CN_DIGIT = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-             "六": 6, "七": 7, "八": 8, "九": 9}
 
 #: 时间跳跃的「交代词」：出现即视为作者写了过渡，而不是硬切。
 _TIME_BRIDGE = (
@@ -343,23 +342,6 @@ def _locations(text: str) -> set[str]:
         if len(loc) >= 2:
             out.add(loc)
     return out
-
-
-def _cn_number(s: str) -> int | None:
-    if not s:
-        return None
-    if s.isdigit():
-        return int(s)
-    total, section = 0, 0
-    for ch in s:
-        if ch in _CN_DIGIT:
-            section = _CN_DIGIT[ch]
-        elif ch == "十":
-            total += (section or 1) * 10
-            section = 0
-        else:
-            return None
-    return total + section
 
 
 def _time_cues(text: str) -> list[dict]:

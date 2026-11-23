@@ -1347,26 +1347,7 @@ def save_character_card(
     card = normalize_card(body.card or {})
     card["来源"] = SOURCE_USER  # 人写的，任何自动流程不覆盖
 
-    bible = _bible_of(proj)
-    chars = bible.get("characters")
-    if not isinstance(chars, list):
-        chars = []
-    found = False
-    for c in chars:
-        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
-            c["card"] = card
-            found = True
-            break
-    if not found:
-        chars.append({"name": name, "role": "", "motivation": "", "card": card})
-    bible["characters"] = chars
-
-    # JSON 列必须显式标脏（2026-10-28 踩过：赋值后 UPDATE 不一定发出）
-    from sqlalchemy.orm.attributes import flag_modified
-
-    proj.plot_bible = bible
-    flag_modified(proj, "plot_bible")
-    db.commit()
+    _upsert_card_field(db, proj, name, lambda _card: card)
     return {"ok": True, "name": name, "card": card}
 
 
@@ -1602,25 +1583,34 @@ class RoutePlanRequest(StrictRequest):
     systems: list = []
 
 
-def _ps_bible(proj) -> dict:
-    import json as _json
-
-    bible = proj.plot_bible
-    if isinstance(bible, str):
-        try:
-            bible = _json.loads(bible)
-        except Exception:  # noqa: BLE001
-            bible = {}
-    return bible if isinstance(bible, dict) else {}
-
-
 def _mark_bible_dirty(proj, bible: dict) -> None:
     """JSON 列必须显式标脏（2026-10-28 踩过：赋值后 UPDATE 不一定发出）。"""
     from sqlalchemy.orm.attributes import flag_modified
 
     proj.plot_bible = bible
     flag_modified(proj, "plot_bible")
-    db = proj  # noqa: F841 —— 仅示意；实际 commit 由调用方做
+
+
+def _upsert_card_field(db: Session, proj, name: str, apply) -> None:
+    """按角色名找到剧情圣经里的角色，把一个字段写进它的 `card` 后落库。
+
+    角色不存在就新建一个空壳（role/motivation 留空，与旧行为一致）。
+    `apply(card) -> card` 只负责算新 card，外层 name/role/motivation 不动。
+    """
+    bible = _bible_of(proj)
+    chars = bible.get("characters")
+    if not isinstance(chars, list):
+        chars = []
+    for c in chars:
+        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
+            card = c.get("card") if isinstance(c.get("card"), dict) else {}
+            c["card"] = apply(card)
+            break
+    else:
+        chars.append({"name": name, "role": "", "motivation": "", "card": apply({})})
+    bible["characters"] = chars
+    _mark_bible_dirty(proj, bible)
+    db.commit()
 
 
 @router.get("/{project_id}/power-system")
@@ -1629,7 +1619,7 @@ def get_power_system(project_id: int, db: Session = Depends(get_db)) -> dict:
     proj = db.get(Project, project_id)
     if proj is None:
         raise HTTPException(status_code=404, detail="project 不存在")
-    bible = _ps_bible(proj)
+    bible = _bible_of(proj)
     from app.generation.cultivation import normalize_tiers
     from app.generation.power_system import systems_of
 
@@ -1655,7 +1645,7 @@ def save_power_system(
     from app.generation.cultivation import normalize_tiers
     from app.generation.power_system import normalize_power_system, systems_of
 
-    bible = _ps_bible(proj)
+    bible = _bible_of(proj)
     if body.power_system:
         bible["power_system"] = normalize_power_system(body.power_system)
     else:
@@ -1760,7 +1750,7 @@ def get_background(project_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=404, detail="project 不存在")
     from app.generation.background import background_of
 
-    return {"background": background_of(_ps_bible(proj))}
+    return {"background": background_of(_bible_of(proj))}
 
 
 @router.post("/{project_id}/background")
@@ -1781,7 +1771,7 @@ def save_background(
     from app.generation.background import normalize_background
     from sqlalchemy.orm.attributes import flag_modified
 
-    bible = _ps_bible(proj)
+    bible = _bible_of(proj)
     normalized = normalize_background(body.background)
     if normalized:
         bible["background"] = normalized
@@ -1812,7 +1802,7 @@ def generate_background(
     from app.generation.background import normalize_background
     from app.generation.persona import _safe_json
 
-    bible = _ps_bible(proj)
+    bible = _bible_of(proj)
     premise = str(proj.premise or "")
     synopsis = str(bible.get("synopsis") or "")
     parts = []
@@ -1868,7 +1858,7 @@ def generate_tiers(
         build_tier_prompt, filter_tiers_by_bands, parse_tiers,
     )
 
-    bible = _ps_bible(proj)
+    bible = _bible_of(proj)
     # 优先用页面传入的草稿：用户刚生成/手写完体系还没保存时，
     # 「生成档位分层」也应该能直接基于它工作，而不是报「还没有修炼体系」。
     systems = normalize_power_system({"体系": body.systems})["体系"] if body.systems else []
@@ -1900,28 +1890,9 @@ def save_cultivation(
         raise HTTPException(status_code=400, detail="name 不能为空")
 
     from app.generation.cultivation import attach_profile, normalize_profile
-    from app.generation.power_system import systems_of
 
-    bible = _ps_bible(proj)
-    chars = bible.get("characters")
-    if not isinstance(chars, list):
-        chars = []
-    found = False
-    for c in chars:
-        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
-            c["card"] = attach_profile(c.get("card") or {}, normalize_profile(body.profile))
-            found = True
-            break
-    if not found:
-        chars.append({"name": name, "role": "", "motivation": "",
-                      "card": attach_profile({}, normalize_profile(body.profile))})
-    bible["characters"] = chars
-
-    from sqlalchemy.orm.attributes import flag_modified
-
-    proj.plot_bible = bible
-    flag_modified(proj, "plot_bible")
-    db.commit()
+    profile = normalize_profile(body.profile)
+    _upsert_card_field(db, proj, name, lambda card: attach_profile(card, profile))
     return {"ok": True, "name": name}
 
 
@@ -1942,7 +1913,7 @@ def plan_cultivation_route(
     )
     from app.generation.power_system import normalize_power_system, systems_of
 
-    bible = _ps_bible(proj)
+    bible = _bible_of(proj)
     # 优先用页面草稿：体系/档案都还没保存时也能规划，不再报「还没有」。
     systems = normalize_power_system({"体系": body.systems})["体系"] if body.systems else []
     if not systems:
@@ -2008,7 +1979,7 @@ def get_scales(project_id: int, db: Session = Depends(get_db)) -> dict:
     proj = db.get(Project, project_id)
     if proj is None:
         raise HTTPException(status_code=404, detail="project 不存在")
-    bible = _ps_bible(proj)
+    bible = _bible_of(proj)
     from app.generation.power_scale import resolve_scale
     from app.generation.power_system import systems_of
 
@@ -2040,28 +2011,8 @@ def save_scale(
 
     from app.generation.power_scale import normalize_scale
 
-    bible = _ps_bible(proj)
-    chars = bible.get("characters")
-    if not isinstance(chars, list):
-        chars = []
-    found = False
-    for c in chars:
-        if isinstance(c, dict) and str(c.get("name") or "").strip() == name:
-            card = c.get("card") if isinstance(c.get("card"), dict) else {}
-            card["量级"] = normalize_scale(body.scale)
-            c["card"] = card
-            found = True
-            break
-    if not found:
-        chars.append({"name": name, "role": "", "motivation": "",
-                      "card": {"量级": normalize_scale(body.scale)}})
-    bible["characters"] = chars
-
-    from sqlalchemy.orm.attributes import flag_modified
-
-    proj.plot_bible = bible
-    flag_modified(proj, "plot_bible")
-    db.commit()
+    scale = normalize_scale(body.scale)
+    _upsert_card_field(db, proj, name, lambda card: {**card, "量级": scale})
     return {"ok": True, "name": name}
 
 
@@ -2082,7 +2033,7 @@ def generate_scale(
 
     from app.generation.power_scale_gen import build_scale_prompt, parse_scale
 
-    bible = _ps_bible(proj)
+    bible = _bible_of(proj)
     name = (body.name or "").strip()
     char = {}
     for c in (bible.get("characters") or []):

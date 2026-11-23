@@ -17,6 +17,7 @@ const items = computed(() => [
   { key: "workspace", label: "工作台", to: base.value, hint: "概览、设定与生成" },
   { key: "outline", label: "章纲", to: `${base.value}/outline`, hint: "逐章大纲与校验" },
   { key: "kg", label: "知识图谱", to: `${base.value}/kg`, hint: "世界观、时间线与抽取状态" },
+  { key: "materials", label: "素材包", to: `${base.value}/materials`, hint: "本书专属素材、年份与用途" },
   { key: "assets", label: "项目资产", to: `${base.value}/assets`, hint: "摘要、模板、角色卡、力量体系" },
   { key: "assistant", label: "助手", to: `${base.value}/assistant`, hint: "对话式创作与续写" },
 ]);
@@ -26,6 +27,7 @@ const activeKey = computed(() => {
   if (path === base.value) return "workspace";
   if (path.startsWith(`${base.value}/outline`)) return "outline";
   if (path.startsWith(`${base.value}/kg`)) return "kg";
+  if (path.startsWith(`${base.value}/materials`)) return "materials";
   if (path.startsWith(`${base.value}/assistant`)) return "assistant";
   // 资产下的四个子页也归到「项目资产」，保证导航有明确归属。
   if (

@@ -46,6 +46,13 @@ const assets = computed(() => [
     to: `/projects/${projectId}/power`,
     action: "打开体系",
   },
+  {
+    key: "materials",
+    title: "素材包",
+    description: "本书专属的外部资料：后台按章纲调研，标注年份与可用处，支持手动增删改。",
+    to: `/projects/${projectId}/materials`,
+    action: "打开素材包",
+  },
 ]);
 
 onMounted(async () => {

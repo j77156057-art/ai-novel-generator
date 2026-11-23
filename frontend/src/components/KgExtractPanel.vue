@@ -15,6 +15,7 @@
  * 表单状态自持；保存 / 错误映射上抛给页面（与 RoleModelPanel 同一套约定）。
  */
 import { computed, reactive, ref, useId, watch } from "vue";
+import { splitCsv as splitChain } from "@/utils/text";
 import type {
   LlmKgExtractConfig,
   LlmKgExtractSavePayload,
@@ -53,13 +54,6 @@ interface KgFormState {
 const form = reactive<KgFormState>({ provider: "", chainText: "" });
 /** 最近一次同步进来的基线，用于「有未保存修改」判定与防误重置。 */
 const synced = ref<LlmKgExtractConfig | null>(null);
-
-function splitChain(text: string): string[] {
-  return text
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
 
 /** 某渠道的默认链：后端 channel_models → providers 元数据兜底。 */
 function channelModels(provider: string): string[] {

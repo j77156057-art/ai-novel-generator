@@ -326,19 +326,23 @@ _生成时间 2026-11-18 23:53:55（自动生成，口径见文件头）_
 <!-- kg-quality:p11:ch1-ch5:start -->
 ## 第 1–5 章（项目 11）
 
-_生成时间 2026-11-22 15:59:06（自动生成，口径见文件头）_
+_生成时间 2026-11-23 18:19:46（自动生成，口径见文件头）_
 
 | 章 | seg | 事件(总/当前) | 版本 | 章归属错 | 角色状态 | 关系 | mentions 本书/当前 | 脏行 | run |
 |---|---|---|---|---|---|---|---|---|---|
-| ch1 | 1 | 12/12 | v1 | 0 | 5/5 | 12/12 | 42/42 | 0 | run347/success |
-| ch2 | 2 | 0/0 | v0 | 0 | 0/0 | 10/10 | 40/40 | 0 | run348/success |
-| ch3 | 3 | 0/0 | v0 | 0 | 0/0 | 0/0 | 26/26 | 0 | run349/failed |
-| ch4 | 4 | 0/0 | v0 | 0 | 0/0 | 0/0 | 27/27 | 0 | run350/failed |
-| ch5 | 5 | 5/5 | v1 | 0 | 1/1 | 10/10 | 40/40 | 0 | run351/success |
+| ch1 | 1 | 18/7 | v1 | 0 | 10/4 | 26/15 | 53/10 | 0 | run363/success |
+| ch2 | 2,3 | 6/6 | v1 | 0 | 2/2 | 3/3 | 37/37 | 0 | run370/success run372/success |
+| ch3 | 4 | 6/6 | v1 | 0 | 4/4 | 6/6 | 38/38 | 0 | run373/success |
+| ch4 | 5 | 4/4 | v1 | 0 | 1/1 | 6/6 | 42/42 | 0 | run374/success |
+| ch5 | 6 | 0/0 | v0 | 0 | 0/0 | 16/16 | 43/43 | 0 | run384/success |
 
-**异常**：ch1: run326 空事件（success 但 events_added=0）；ch1: run342 空事件（success 但 events_added=0）；ch2: 零事件（无当前版）；ch2: run322 空事件（success 但 events_added=0）；ch2: run343 空事件（success 但 events_added=0）；ch2: run348 空事件（success 但 events_added=0）；ch3: 零事件（无当前版）；ch3: run344 空事件（success 但 events_added=0）；ch3: run349 状态 failed；ch4: 零事件（无当前版）；ch4: run324 空事件（success 但 events_added=0）；ch4: run330 空事件（success 但 events_added=0）；ch4: run350 状态 failed
+**异常**：ch1: run326 空事件（success 但 events_added=0）；ch1: run342 空事件（success 但 events_added=0）；ch2: run322 空事件（success 但 events_added=0）；ch2: run343 空事件（success 但 events_added=0）；ch2: run348 空事件（success 但 events_added=0）；ch2: run353 空事件（success 但 events_added=0）；ch2: run344 空事件（success 但 events_added=0）；ch2: run354 空事件（success 但 events_added=0）；ch3: run324 空事件（success 但 events_added=0）；ch3: run330 空事件（success 但 events_added=0）；ch5: 零事件（无当前版）；ch5: run384 空事件（success 但 events_added=0）
 
 <!-- kg-quality:p11:ch1-ch5:end -->
+
+
+
+
 
 
 

@@ -215,14 +215,20 @@ _FORM_USER_BARE_LOW = """下面的正文里，**叙述和台词混在同一段**
 {text}"""
 
 
-def _dialogue_contents(text: str) -> Counter:
-    """引号里的对白内容（归一化后计数）——用来验「对白内容没被改」。"""
-    out: Counter = Counter()
-    for m in re.finditer(r"[“「『]([^”」』]{1,200})[”」』]", text or ""):
+_DIALOGUE_SPAN_RE = re.compile(r"[“「『]([^”」』]{1,200})[”」』]")
+
+
+def _dialogue_spans(text: str):
+    """引号里的对白内容（归一化：去空白、去首尾标点）；空串不产出。"""
+    for m in _DIALOGUE_SPAN_RE.finditer(text or ""):
         s = re.sub(r"\s+", "", m.group(1)).strip("：:，。！？…、；;")
         if s:
-            out[s] += 1
-    return out
+            yield s
+
+
+def _dialogue_contents(text: str) -> Counter:
+    """引号里的对白内容（归一化后计数）——用来验「对白内容没被改」。"""
+    return Counter(_dialogue_spans(text))
 
 
 def _dialogue_chars(text: str) -> Counter:
@@ -241,10 +247,8 @@ def _dialogue_chars(text: str) -> Counter:
     同义改写会让"丢"和"多"同时变大 ⇒ 仍被拦。
     """
     out: Counter = Counter()
-    for m in re.finditer(r"[“「『]([^”」』]{1,200})[”」』]", text or ""):
-        s = re.sub(r"\s+", "", m.group(1)).strip("：:，。！？…、；;")
-        if s:
-            out.update(s)
+    for s in _dialogue_spans(text):
+        out.update(s)
     return out
 
 

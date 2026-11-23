@@ -54,6 +54,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.generation.coerce import as_text as _as_text
+
 #: 量级档（从低到高）。**相对标尺**，跨体系通用。
 #:
 #: 名字用「能造成什么后果」而不是数值 —— 因为叙事需要的是**画面**，
@@ -112,13 +114,6 @@ SCALE_SEQ_BY_LABEL: dict[str, int] = dict(_LADDER_15.get("scale_seq_by_label") o
 #: 但不是一一对应（同一个境界里可以有量级差很远的两种人），
 #: 所以是「默认映射 + 可覆盖」。
 
-
-def _as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return "；".join(str(v).strip() for v in value if str(v).strip())
-    return str(value).strip()
 
 
 def normalize_scale(raw: Any) -> dict:

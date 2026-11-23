@@ -173,16 +173,52 @@ def _is_http_error(exc: Exception, codes: set[int]) -> bool:
     return _http_code(exc) in codes
 
 
+def _read_error_body(exc: Exception) -> str:
+    """读 HTTPError 的响应体（只读一次，结果挂回异常对象复用）。
+
+    `HTTPError` 是类文件对象，body 只能读一次：限流识别与链尾留痕都要用，
+    所以第一次读到就缓存在异常对象上，避免后读的一方拿到空串。
+    """
+    cached = getattr(exc, "_trae_body_text", None)
+    if cached is not None:
+        return cached
+    read = getattr(exc, "read", None)
+    text = ""
+    if callable(read):
+        try:
+            raw = read()
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+        except Exception:  # noqa: BLE001
+            text = ""
+    text = " ".join(text.split())[:2000]
+    try:
+        exc._trae_body_text = text
+    except Exception:  # noqa: BLE001 —— 极少数异常对象禁止加属性
+        pass
+    return text
+
+
+def _http_error_brief(exc: Exception) -> str:
+    """单个候选的失败摘要：状态码 + 响应体（无 body 时退回异常文案）。
+
+    400 这类参数错误的真因全在响应体里，urllib 的 `str(exc)` 只有
+    「HTTP Error 400: Bad Request」——不读 body 等于没留痕。
+    """
+    code = _http_code(exc)
+    body = _read_error_body(exc)
+    text = " ".join(str(exc).split())
+    if code is not None:
+        return f"HTTP {code}" + (f": {body[:300]}" if body else f"（{text}）")
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 def _is_account_daily_limit(exc: Exception) -> bool:
     """OpenRouter 账号级日限额（free-models-per-day，所有 :free 模型共享）。
 
     这种 429 换模型无益——限额按账号计，不按模型计。读 body 识别后应直接失败，
-    避免把整条候选链空跑一遍。HTTPError 是类文件对象，body 只能读一次。
+    避免把整条候选链空跑一遍。body 与链尾留痕共用缓存，不会互相读空。
     """
-    try:
-        body = exc.read().decode("utf-8", "replace")
-    except Exception:  # noqa: BLE001
-        return False
+    body = _read_error_body(exc)
     return "free-models-per-day" in body or "openrouter_free_tier_daily" in body
 
 
@@ -198,6 +234,53 @@ def _backoff(attempt: int) -> float:
     """指数退避 + 抖动，封顶 16s：2→4→8→（封顶）。"""
     base = min(2 ** (attempt + 1), 16)
     return base + (time.time() % 1)
+
+
+def _thinking_row(model: str):
+    """按模型名前缀在实测表里找最具体的一行；找不到返回 None。"""
+    try:
+        from app.llm.thinking_models import TABLE
+    except Exception:  # noqa: BLE001 —— 元数据不可用
+        return None
+    name = str(model or "")
+    best = None
+    for row in TABLE:
+        if row.model_prefix and name.startswith(row.model_prefix):
+            if best is None or len(row.model_prefix) > len(best.model_prefix):
+                best = row
+    return best
+
+
+def _thinking_off_allowed(model: str) -> bool:
+    """该模型能不能用 `thinking: {"type": "disabled"}` 关思考。
+
+    判据只看 `thinking_models.TABLE` 的模型前缀（同名模型在各渠道行为一致）：
+    - `off_capable` / `no_thinking` → 可以发；
+    - `tunable` / `forced` → **不能发**：MiniMax-M3.1 收到 disabled 是硬 400
+      （`requires adaptive thinking ... is not allowed (2013)`），文风/归属
+      校正会整段失败；
+    - 表里没有 → 保持旧行为（发 disabled，由厂商忽略或报错）。
+    """
+    try:
+        from app.llm.thinking_models import NO_THINKING, THINK_OFF_CAPABLE
+    except Exception:  # noqa: BLE001 —— 元数据不可用时不改变旧行为
+        return True
+    row = _thinking_row(model)
+    if row is None:
+        return True
+    return row.thinking in (THINK_OFF_CAPABLE, NO_THINKING)
+
+
+def _lowest_effort(model: str) -> str | None:
+    """关不掉思考时能退到的最低档（MiniMax-M3.1 → `low`）；无档位定义返回 None。"""
+    row = _thinking_row(model)
+    if row is None:
+        return None
+    levels = tuple(row.levels or ())
+    for level in ("low", "medium", "high"):
+        if level in levels:
+            return level
+    return "low" if getattr(row, "thinking", "") == "tunable" else None
 
 
 #: 触发跨渠道兜底的 HTTP 状态。其余 4xx **一律不切换**：400 参数错 / 401 鉴权 /
@@ -577,13 +660,25 @@ class OpenAICompatibleChatProvider(LLMProvider):
 
         关思考的发法：请求体加 `thinking: {"type": "disabled"}`；不认这个字段
         的厂商会静默忽略（最坏是没关上，不会报错）。
+
+        **例外：本来就关不掉思考的模型**（`thinking=THINK_TUNABLE`，
+        如 MiniMax-M3.1）。给它们发 disabled 是**硬 400**
+        （实测响应体：`model "MiniMax-M3.1-Flash" requires adaptive thinking;
+        thinking.type="disabled" ... is not allowed (2013)`），文风/归属校正
+        会整段失败。这类模型不发 disabled，改为把思考压到**最低档**（low）——
+        校正/改写只是机械变换，不需要高思考，降档能明显缩短耗时。
         """
         import copy as _copy
 
         new = _copy.copy(self)
         extra = dict(self.extra_body or {})
         if thinking_off:
-            extra["thinking"] = {"type": "disabled"}
+            if _thinking_off_allowed(self.model):
+                extra["thinking"] = {"type": "disabled"}
+            else:
+                effort = _lowest_effort(self.model)
+                if effort:
+                    extra["reasoning_effort"] = effort
         new.extra_body = extra
         if max_tokens is not None:
             new.max_tokens = max_tokens
@@ -679,6 +774,10 @@ class OpenAICompatibleChatProvider(LLMProvider):
                 raise ToolsUnsupportedError(
                     f"{self.label} 模型链 {self._model_chain()} 均不支持 function calling"
                 )
+        # 逐候选留痕：链尾只报「最后错误」会掩盖真因——例如链上的第二个模型
+        # 是别的渠道的 id（MiniMax 端点上发 deepseek/…），它必然 400，把首个
+        # 模型真正的原因（429/超时/内容非法）盖掉，排查时只剩一句 400。
+        errors: list[tuple[str, str]] = []
         for model in chain:
             # 总时长已用尽：不再换模型/重试，直接按失败返回（调用方走回退路径）。
             if time.monotonic() >= deadline:
@@ -788,6 +887,7 @@ class OpenAICompatibleChatProvider(LLMProvider):
                     }
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
+                    errors.append((model, _http_error_brief(exc)))
                     # 429/403（限流/无权限）：换下一个模型；网络抖动：同模型短退避重试
                     if _is_http_error(exc, _SWITCH_HTTP):
                         if _is_account_daily_limit(exc):
@@ -818,10 +918,11 @@ class OpenAICompatibleChatProvider(LLMProvider):
                     time.sleep(max(0.0, min(_backoff(attempt), deadline - time.monotonic())))
         # 链尾失败必须留痕：模型链上每个模型都失败时，调用方只看到一句
         # RuntimeError 是不够的——这次实测里 404（Text-01 已下线）与 400（max_tokens
-        # 非法）都被压成「HTTP Error」，排查时无法区分。这里把整条链和最后错误打进日志。
+        # 非法）都被压成「HTTP Error」，排查时无法区分。这里把整条链、逐项错误
+        # （含响应体摘要）和最后错误一起打进日志。
         logger.error(
-            "%s 模型链全部失败，候选=%s，最后错误: %s",
-            self.label, self._model_chain(), last_exc,
+            "%s 模型链全部失败，候选=%s，逐项错误=%s，最后错误: %s",
+            self.label, self._model_chain(), errors, last_exc,
         )
         raise RuntimeError(f"{self.label} chat 调用失败: {last_exc}") from last_exc
 

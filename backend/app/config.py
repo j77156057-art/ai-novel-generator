@@ -596,6 +596,10 @@ class Settings(BaseSettings):
     assistant_model: str = _ASSISTANT_DEFAULTS.get("model", "glm-4-flash")
     assistant_max_tokens: int = int(_ASSISTANT_DEFAULTS.get("max_tokens", 1024))
     assistant_timeout: int = int(_ASSISTANT_DEFAULTS.get("timeout", 60))
+    #: 助手问答的工具循环步数上限（含最后一次强制文字收尾）。
+    #: 复杂问题（先查目录、再多次检索/取详情）6 步常常不够；8 步给两轮余量，
+    #: 整轮墙钟预算仍是 120s，不会无限拖长。env: ASSISTANT_QA_MAX_TOOL_STEPS。
+    assistant_qa_max_tool_steps: int = 8
     #: Assistant 角色的思考档位（空 = 走 `effective_thinking()` 解析）。
     assistant_thinking: str = ""
     #: 预算地板开关（默认 on）：不足 FLOOR_FULL(32768/300) 自动抬高；off 严格按用户值。

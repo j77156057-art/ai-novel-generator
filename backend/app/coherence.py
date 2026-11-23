@@ -23,6 +23,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
+from app.text_numbers import cn_number as _cn_number
+
 CHECK_VERSION = "coherence-v1"
 
 #: 段落切分：空行分段（与落库正文的段落口径一致）
@@ -117,9 +119,6 @@ _REF_QUERY = re.compile(r"(?P<noun>[\u4e00-\u9fa5]{2,6})(?:是什么|有什么�
 #: 定指短语：「那张 X / 这个 X」
 _DEFINITE_NP = re.compile(r"(?:那|这)(?:张|个|份|只|盒|包|件|本|部)(?P<noun>[\u4e00-\u9fa5]{2,6})")
 
-_CN_DIGITS = {"〇": 0, "零": 0, "○": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
-              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-
 
 @dataclass
 class Finding:
@@ -161,27 +160,6 @@ def person_markers(s: str) -> set[str]:
     if re.search(r"[你您]", s):
         marks.add("second")
     return marks
-
-
-def _cn_number(s: str) -> int | None:
-    """中文数字 → int，只处理 0~999 的常见写法（时间表达够用）。"""
-    if not s:
-        return None
-    if s.isdigit():
-        return int(s)
-    total, section = 0, 0
-    for ch in s:
-        if ch in _CN_DIGITS:
-            section = _CN_DIGITS[ch]
-        elif ch == "十":
-            total += (section or 1) * 10
-            section = 0
-        elif ch == "百":
-            total += (section or 1) * 100
-            section = 0
-        else:
-            return None
-    return total + section
 
 
 def chapter_index(label: str | None) -> int | None:

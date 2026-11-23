@@ -15,7 +15,8 @@ defineOptions({ name: "CharacterTemplateView" });
  */
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoute } from "vue-router";
-import { ApiError, api } from "@/api/client";
+import { api } from "@/api/client";
+import { errorText as textOf } from "@/utils/errors";
 import ProjectNav from "@/components/ProjectNav.vue";
 import type {
   CharacterTemplateDetail,
@@ -62,11 +63,6 @@ function stopPoll(): void {
     window.clearTimeout(pollTimer);
     pollTimer = null;
   }
-}
-
-function textOf(err: unknown): string {
-  if (err instanceof ApiError) return err.message;
-  return err instanceof Error ? err.message : String(err);
 }
 
 function fmtDate(value: string | null | undefined): string {

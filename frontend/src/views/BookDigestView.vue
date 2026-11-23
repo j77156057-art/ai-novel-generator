@@ -16,6 +16,7 @@ defineOptions({ name: "BookDigestView" });
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { ApiError, api } from "@/api/client";
+import { errorText as textOf } from "@/utils/errors";
 import ProjectNav from "@/components/ProjectNav.vue";
 import type {
   BookDigest,
@@ -84,11 +85,6 @@ function stopPoll(): void {
     window.clearTimeout(pollTimer);
     pollTimer = null;
   }
-}
-
-function textOf(err: unknown): string {
-  if (err instanceof ApiError) return err.message;
-  return err instanceof Error ? err.message : String(err);
 }
 
 /** 只列本项目选过的参考语料；没选过时退回全部语料（并给出提示）。 */

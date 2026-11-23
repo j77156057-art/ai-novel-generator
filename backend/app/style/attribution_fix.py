@@ -86,7 +86,10 @@ EXAMPLE_LIMIT = 3
 MIN_RATE_TO_CORRECT = 0.05
 
 #: 离目标差这么远才值得校正（差得不多就别动）。
-MIN_GAP_TO_CORRECT = 0.20
+#:
+#: 2026-11-22 复跑：0.20 太宽——第 4 章实测 16.1%、目标 32.6%（差 16%）
+#: 被判定「够近」直接跳过，最终归属率只有 16%。收到 0.12 后这类章会触发校正。
+MIN_GAP_TO_CORRECT = 0.12
 
 #: 第一遍改写后，离目标还差这么多就**再跑一遍「去冗余」**。
 #:
@@ -385,6 +388,22 @@ _ADJUST_USER = """下面这段正文里，**对白的说话人归属**需要调�
 {text}"""
 
 
+_HTTP_STATUS_RE = re.compile(r"HTTP (?:Error )?(\d{3})")
+
+
+def _non_retryable(exc: Exception) -> bool:
+    """4xx（429 除外）重试同一条只会重复失败，应当立刻停手。
+
+    provider 把 `HTTPError` 包成 `RuntimeError("…: HTTP Error 400")`，
+    `exc.code` 已经丢了，所以 message 也要认。
+    """
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int):
+        m = _HTTP_STATUS_RE.search(str(exc))
+        code = int(m.group(1)) if m else None
+    return isinstance(code, int) and 400 <= code < 500 and code != 429
+
+
 def _call_once(provider, system: str, user: str, max_tokens: int | None = None) -> str:
     """调一次模型，返回正文（空串 = 没拿到）。"""
     try:
@@ -524,6 +543,9 @@ def correct_attribution(
     # （见 CORRECTION_THINKING_OFF 的说明）
     prov = _correction_provider(provider)
     chunks = _split_chunks(text)
+    # 不可重试错误（4xx）一旦出现，后面每一块都会以同样方式失败 ⇒ 立即停手，
+    # 不再按块 × 重试次数重复请求（实测 400 时白跑 9 次、耗时 22 秒）。
+    fatal: dict[str, str] = {}
 
     def _run(run_chunks, make_user) -> tuple[str, int, int, str]:
         """跑一遍分块改写。返回 (文本, 失败块数, 空调用次数, 最后错误)。
@@ -549,10 +571,17 @@ def correct_attribution(
                 except Exception as exc:  # noqa: BLE001 —— 校正失败绝不能影响正文
                     got = ""
                     last_err = f"{type(exc).__name__}"
+                    if _non_retryable(exc):
+                        fatal["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+                        break
                 if got:
                     break
                 empty += 1
                 time.sleep(2)
+            if fatal:
+                failed += 1
+                outs.append(ch)      # 拿不到就**保留原文**
+                break                # 同一条错误对后续块同样成立，不再试
             if got:
                 outs.append(got)
             else:
@@ -577,6 +606,10 @@ def correct_attribution(
         )
 
     out1, failed, empty_calls, last_err = _run(chunks, _add_prompt)
+    if fatal:
+        return text, {"applied": False, "reason": f"调用失败: {fatal['error']}",
+                      "before": before, "chunks": len(chunks),
+                      "chunks_failed": failed, "last_error": last_err}
     if failed == len(chunks):
         return text, {"applied": False, "reason": "空输出", "before": before,
                       "chunks": len(chunks), "chunks_failed": failed,
@@ -626,7 +659,7 @@ def correct_attribution(
 
         out_r, failed_r, empty_r, _ = _run(_split_chunks(current), _adjust_prompt)
         rounds += 1
-        if failed_r >= len(chunks):
+        if fatal or failed_r >= len(chunks):
             break
         current = out_r
         candidates.append((current, attribution_rate(current)))
@@ -640,7 +673,7 @@ def correct_attribution(
     rc = attribution_rate(current)
     hits = rc["front"] + rc["back"] + rc["mid"]
     dao = rc["front_dao"]
-    if (convention == "mixed" and hits and dao >= VARIETY_MIN_DAO
+    if (not fatal and convention == "mixed" and hits and dao >= VARIETY_MIN_DAO
             and dao / hits >= VARIETY_MAX_DAO_SHARE):
         variety_info = {"before_dao": dao, "before_hits": hits}
 
