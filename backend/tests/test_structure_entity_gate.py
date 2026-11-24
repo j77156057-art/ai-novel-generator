@@ -98,19 +98,27 @@ def test_for_project_fails_closed_without_table(monkeypatch):
     assert "专名表" in note
 
 
-def test_fragment_names_only_takes_judged_proper_nouns(monkeypatch):
-    """残片集只收「判成专名」的词；泛称与「名字+虚词」片段都要排除。"""
-    table = {"dropped_fragments": {
-        "characters": ["九幽主", "师兄", "个道号"],
-        "places": ["九幽"],
+def test_fragment_names_keeps_only_partial_names(monkeypatch):
+    """只收「表内更长实名的子串」：超串、无关词、边界虚词都不进。"""
+    table = {
+        "characters": ["宋书航", "九幽主宰"],
+        "places": ["九幽世界"],
         "factions": [],
         "items": [],
-    }}
+        "dropped_fragments": {
+            "characters": ["宋书航笑", "九幽主", "师兄", "个道号"],
+            "places": ["九幽", "神力"],
+            "factions": [],
+            "items": [],
+        },
+    }
     monkeypatch.setattr(
         entity_store, "load_verdicts",
-        lambda _nid: {"九幽主": "character", "九幽": "place",
-                      "师兄": None, "个道号": "character"},
+        lambda _nid: {"宋书航笑": "character", "九幽主": "character",
+                      "师兄": None, "个道号": "character",
+                      "九幽": "place", "神力": "item"},
     )
+    # 宋书航笑 是超串（脱敏会先换掉里面的宋书航）；神力 无父词；个道号 是虚词边界
     assert entity_store.fragment_names(7, table) == {"九幽主", "九幽"}
 
 

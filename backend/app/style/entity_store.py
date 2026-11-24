@@ -105,26 +105,46 @@ def load_verdicts(novel_id: int) -> dict[str, str | None]:
 
 
 def fragment_names(novel_id: int, table: dict[str, Any] | None = None) -> set[str]:
-    """被残片剔除、但**被判成了专名**的词。
+    """被残片剔除、但**确实只是表内某个更长专名的片段**的词。
 
     它们不在四个实体层里，`Redactor` 不会替换，所以「脱敏后没有占位符」
-    不等于「原文里没有专名」——「九幽龙魔线」这类就是残片名。结构规则的闸门
-    把这批词也算进检测集，才能拦住它们。
+    不等于「原文里没有专名」——「九幽龙魔线」里的「九幽」就是这种。
 
-    用判定结果过滤而不用整个 `dropped_fragments`：后者混着「师兄」「尊者」
-    这类被判成普通词的泛称，全量并入会把含这些虚指的规则大面积误杀。
+    ## 只收「表内实名的子串」
+
+    一个被剔除的片段与表内实名只有三种关系：
+
+    - **子串**（九幽 ⊂ 九幽世界）：Redactor 不覆盖，必须靠检测拦 → 收；
+    - **超串**（宋书航笑 ⊃ 宋书航）：脱敏会把里面的「宋书航」换成占位符，
+      这条串再也不会原样出现 → 收进来纯属噪声，丢弃；
+    - **无关**（神力 / 液态金：父词已被判成泛称并降级）：它不是任何名字的
+      一部分，收进来只会误丢含这些泛词的规则 → 丢弃。
+
+    两条附带收益：降级某个泛称后，它的残片自动退出检测集（不用再改数据）；
+    检测正则从 700+ 条降到 600 出头。
     """
     table = load_table(novel_id) if table is None else table
     verdicts = load_verdicts(novel_id)
-    from app.style.entities import is_particle_edge
+    from app.style.entities import PLACEHOLDER_PREFIX, is_particle_edge
+
+    # **只看四个实体层**：表里还有 candidates（近万个 PMI 候选）等元数据，
+    # 拿它当「实名集合」会让任何候选都成了「别人的子串」，筛子直接失效。
+    names: set[str] = set()
+    for layer in PLACEHOLDER_PREFIX:
+        for name in table.get(layer) or []:
+            if isinstance(name, str) and name:
+                names.add(name)
 
     out: set[str] = set()
-    for names in (table.get("dropped_fragments") or {}).values():
-        for w in names or []:
+    for names_ in (table.get("dropped_fragments") or {}).values():
+        for w in names_ or []:
             # 「名字 + 虚词」的片段不进检测集：判定缓存可能把它记成专名，
             # 但它不是名字（判据与建表侧共用 `is_particle_edge`）。
-            if (isinstance(w, str) and len(w) >= 2
-                    and not is_particle_edge(w) and verdicts.get(w)):
+            if not (isinstance(w, str) and len(w) >= 2 and verdicts.get(w)):
+                continue
+            if is_particle_edge(w):
+                continue
+            if any(len(n) > len(w) and w in n for n in names):
                 out.add(w)
     return out
 
