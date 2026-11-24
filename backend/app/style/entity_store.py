@@ -92,6 +92,43 @@ def save_table(novel_id: int, table: dict[str, Any]) -> Path:
     return p
 
 
+def load_verdicts(novel_id: int) -> dict[str, str | None]:
+    """读**逐词判定缓存**（只含「判出来了」的词；没判出来的不在里面）。
+
+    为什么消费方需要它：表里只有留下的实体，而「被判成专名、后来又当残片
+    剔掉」的词既不在表里、也不在 `dropped_fragments` 的语义之外——
+    只看表无法区分它和「被判成普通词」的虚词。
+    """
+    from app.style.entity_judge import _load_cache
+
+    return _load_cache(verdict_cache_path(novel_id))
+
+
+def fragment_names(novel_id: int, table: dict[str, Any] | None = None) -> set[str]:
+    """被残片剔除、但**被判成了专名**的词。
+
+    它们不在四个实体层里，`Redactor` 不会替换，所以「脱敏后没有占位符」
+    不等于「原文里没有专名」——「九幽龙魔线」这类就是残片名。结构规则的闸门
+    把这批词也算进检测集，才能拦住它们。
+
+    用判定结果过滤而不用整个 `dropped_fragments`：后者混着「师兄」「尊者」
+    这类被判成普通词的泛称，全量并入会把含这些虚指的规则大面积误杀。
+    """
+    table = load_table(novel_id) if table is None else table
+    verdicts = load_verdicts(novel_id)
+    from app.style.entities import is_particle_edge
+
+    out: set[str] = set()
+    for names in (table.get("dropped_fragments") or {}).values():
+        for w in names or []:
+            # 「名字 + 虚词」的片段不进检测集：判定缓存可能把它记成专名，
+            # 但它不是名字（判据与建表侧共用 `is_particle_edge`）。
+            if (isinstance(w, str) and len(w) >= 2
+                    and not is_particle_edge(w) and verdicts.get(w)):
+                out.add(w)
+    return out
+
+
 def is_stale(table: dict[str, Any], *, chunks: int, chars: int) -> bool:
     """表是否该重建。
 

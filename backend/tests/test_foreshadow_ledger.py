@@ -18,6 +18,7 @@ from app.foreshadow_ledger import (
     kg_linkage,
     normalize_entry,
     render_open_block,
+    truth_layer,
 )
 from app.generation.prompts import build_user_prompt
 from app.models import KgNode, Project
@@ -102,6 +103,91 @@ def test_render_open_block_only_open_and_includes_planned_chapter():
     assert render_open_block([]) == ""
 
 
+def test_main_tier_hides_title_and_truth_until_reveal():
+    """主线伏笔：平时只给暗示点；到达计划揭晓章才允许给真相。"""
+    entry = {
+        "title": "主角其实是未来的自己",
+        "status": "open",
+        "tier": "main",
+        "planned_chapter": 80,
+        "truth": "系统是未来主角造的",
+        "hints": "凌晨三点十七分的座机\n口袋里多出的便签",
+    }
+    early = render_open_block([entry], chapter=10)
+    assert "凌晨三点十七分的座机" in early
+    assert "主角其实是未来的自己" not in early
+    assert "系统是未来主角造的" not in early
+
+    late = render_open_block([entry], chapter=80)
+    assert "系统是未来主角造的" in late
+    assert "第 1/3 层" in late
+
+    second = render_open_block([entry], chapter=81)
+    assert "第 2/3 层" in second
+    third = render_open_block([entry], chapter=82)
+    assert "第 3/3 层" in third
+    after = render_open_block([entry], chapter=83)
+    assert "已揭晓完毕" in after
+
+
+def test_main_tier_without_hints_still_hides_title():
+    text = render_open_block([
+        {"title": "终极真相", "status": "open", "tier": "main"},
+    ])
+    assert "终极真相" not in text
+    assert "全书主线暗线" in text
+
+
+def test_truth_layer_only_exposes_current_reversal():
+    truth = (
+        "背景：外婆是守楼人。第一层反转：陈经理只是执行者。"
+        "第二层反转：外婆才是布局者。第三层反转：陈经理是共犯。"
+    )
+    first = truth_layer(truth, 1)
+    assert "第一层反转" in first and "第二层反转" not in first
+    second = truth_layer(truth, 2)
+    assert "第二层反转" in second and "第三层反转" not in second
+    assert "背景" in second
+    assert truth_layer("没有分层", 1) == "没有分层"
+
+
+def test_reveal_span_spaces_layers_instead_of_consecutive():
+    """跨度 10 章时，三层分别从第 1、5、8 章开始，中间是余波章。"""
+    entry = {
+        "title": "主线",
+        "status": "open",
+        "tier": "main",
+        "planned_chapter": 90,
+        "reveal_span": 10,
+        "truth": "背景。第一层反转：A。第二层反转：B。第三层反转：C。",
+        "hints": "暗示一",
+    }
+    assert "第 1/3 层" in render_open_block([entry], chapter=90)
+    assert "进行中" in render_open_block([entry], chapter=93)
+    assert "第 2/3 层" in render_open_block([entry], chapter=94)
+    assert "第 3/3 层" in render_open_block([entry], chapter=97)
+    assert "已揭晓完毕" in render_open_block([entry], chapter=100)
+
+
+def test_reveal_ratio_uses_total_chapters():
+    """百分比窗口：120 章 × 85% 起、15% 跨度 → 102 起，三层在 102/108/114。"""
+    entry = {
+        "title": "主线",
+        "status": "open",
+        "tier": "main",
+        "total_chapters": 120,
+        "reveal_ratio": 0.85,
+        "reveal_span_ratio": 0.15,
+        "truth": "背景。第一层反转：A。第二层反转：B。第三层反转：C。",
+        "hints": "暗示一",
+    }
+    assert "第 1/3 层" in render_open_block([entry], chapter=102)
+    assert "进行中" in render_open_block([entry], chapter=105)
+    assert "第 2/3 层" in render_open_block([entry], chapter=108)
+    assert "第 3/3 层" in render_open_block([entry], chapter=114)
+    assert "已揭晓完毕" in render_open_block([entry], chapter=120)
+
+
 # ── 路由 CRUD ─────────────────────────────────────────────────────────
 
 
@@ -147,6 +233,35 @@ def test_router_rejects_cross_project_entry(db):
     with pytest.raises(HTTPException) as missing:
         update_foreshadow(other.id, created["id"], ForeshadowPatch(title="改名"), db)
     assert missing.value.status_code == 404
+
+
+def test_router_persists_tier_truth_and_hints(db):
+    project = _seed_project(db)
+    created = create_foreshadow(
+        project.id,
+        ForeshadowCreate(
+            title="未来的自己",
+            tier="main",
+            planned_chapter=80,
+            truth="系统是未来主角造的",
+            hints="凌晨三点十七分\n口袋里的便签",
+        ),
+        db,
+    )
+    assert created["tier"] == "main"
+    assert created["truth"] == "系统是未来主角造的"
+    assert created["hints"].startswith("凌晨三点十七分")
+
+    updated = update_foreshadow(
+        project.id, created["id"], ForeshadowPatch(tier="arc", truth=""), db,
+    )
+    assert updated["tier"] == "arc"
+    assert updated["truth"] == ""
+
+
+def test_normalize_rejects_unknown_tier():
+    with pytest.raises(ValueError):
+        normalize_entry("铜镜裂纹", tier="global")
 
 
 def test_import_from_bible_dedupes_and_maps_status(db):

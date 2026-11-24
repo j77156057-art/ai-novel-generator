@@ -511,11 +511,30 @@ class ForeshadowLedger(Base):
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
     title = Column(String(200), nullable=False)
     status = Column(String(16), nullable=False, default="open")
+    #: 伏笔级别：main=贯穿全书的主线暗线 / arc=卷篇级 / chapter=小节级。
+    #: 老库补列即 'chapter'，与加列前「所有伏笔同权」的写法等价。
+    tier = Column(String(16), nullable=False, default="chapter")
     planted_chapter = Column(Integer, nullable=True)
     planned_chapter = Column(Integer, nullable=True)
     resolved_chapter = Column(Integer, nullable=True)
     evidence = Column(String(500), nullable=True)
     resolution = Column(String(500), nullable=True)
+    #: 主线伏笔的**真相**：只在作者侧与到达揭晓窗口时注入写作提示。
+    #: 平时绝不进正文提示——写进去就是提前剧透。
+    truth = Column(Text, nullable=True)
+    #: 主线伏笔的**暗示点**（每行一条）：正文里可以侧面出现的具体细节/意象。
+    hints = Column(Text, nullable=True)
+    #: 主线揭晓跨度（章）：三层反转在这个窗口内均匀分布，
+    #: 避免连续三章各翻一层。NULL = 按 3 章（连续）处理。
+    reveal_span = Column(Integer, nullable=True)
+    #: 全书计划章数（仅主线用）：百分比揭晓窗口的分母。
+    total_chapters = Column(Integer, nullable=True)
+    #: 揭晓起点占全书比例（0–1，如 0.85 = 第 85% 章开始揭晓）。
+    reveal_ratio = Column(Float, nullable=True)
+    #: 揭晓跨度占全书比例（0–1，如 0.15 = 最后 15% 的章节）。
+    reveal_span_ratio = Column(Float, nullable=True)
+    #: 节奏规划（JSON）：[{chapter, kind}]，由伏笔节奏规划器写入。
+    beat_plan = Column(JSON, nullable=True)
     source = Column(String(16), nullable=False, default="manual")
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

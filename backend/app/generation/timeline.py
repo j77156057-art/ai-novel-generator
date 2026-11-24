@@ -719,11 +719,33 @@ _NODE_PLAN_SYSTEM = (
 )
 
 
+def _structure_block(db, project) -> tuple[str, str]:
+    """节点规划用的剧情结构参考（取不到就空串，不阻断规划）。"""
+    try:
+        from app.generation.plot_structure import structure_block
+
+        bible = project.plot_bible if isinstance(project.plot_bible, dict) else {}
+        parts = [
+            str(x)
+            for x in (
+                getattr(project, "premise", "") or "",
+                bible.get("synopsis") or "",
+                bible.get("direction") or "",
+                " ".join(str(x) for x in (project.outline or [])[:5]),
+            )
+            if x
+        ]
+        return structure_block(db, project, "\n".join(parts) or "主线剧情结构")
+    except Exception:  # noqa: BLE001 —— 结构参考是增强，失败不阻断规划
+        return "", "剧情结构参考不可用（已跳过）"
+
+
 def plan_nodes_with_llm(
     provider,
     outline: list[str],
     plot_bible: dict | None,
     n_main: int,
+    structure: str = "",
 ) -> list[PlotNode] | None:
     """调一次 LLM，把 outline 切成 n_main 个填实的剧情点（§7.3）。
 
@@ -740,11 +762,13 @@ def plan_nodes_with_llm(
         f"{i + 1}. 第{a}–{b}章" if a != b else f"{i + 1}. 第{a}章"
         for i, (a, b) in enumerate(ranges)
     ) or "（无章节可分配）"
+    structure_part = f"\n{structure}\n" if structure else ""
     user = (
         f"请把下面这条故事大纲切成 {n_main} 个主干剧情点：\n\n"
         f"【故事梗概】{synopsis or premise or '（无）'}\n\n"
         f"【每个点覆盖的章节（必须按此区间取材，不得越界）】\n{span_lines}\n\n"
-        f"【大纲】\n{outline_text}\n\n"
+        f"【大纲】\n{outline_text}\n"
+        f"{structure_part}\n"
         f"输出 {n_main} 个剧情点的 JSON。"
     )
     try:

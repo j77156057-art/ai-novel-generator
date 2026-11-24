@@ -345,6 +345,22 @@ def _migrate_sqlite_columns(target_engine=None) -> None:  # noqa: ANN001
         ("raw_novels", "source_chapters", "JSON"),
         # 可读档位键（tier:signature:hash8）；老行补 NULL = 未生成过可读键。
         ("style_distills", "product_key", "VARCHAR(96)"),
+        # —— 伏笔分级（2026-11-24）——
+        # 只加列、不回填：老行补 'chapter' = 与「所有伏笔同权」的旧行为等价，
+        # 但从此可以按级别限制注入频率；truth/hints 为 NULL = 作者未提供。
+        # 漏这一项的后果：老库 SELECT foreshadow_ledger.* 直接 no such column: tier。
+        ("foreshadow_ledger", "tier", "VARCHAR(16) NOT NULL DEFAULT 'chapter'"),
+        ("foreshadow_ledger", "truth", "TEXT"),
+        ("foreshadow_ledger", "hints", "TEXT"),
+        # 主线揭晓跨度（章）：NULL = 按 3 章连续揭晓（旧行为）。
+        ("foreshadow_ledger", "reveal_span", "INTEGER"),
+        # 百分比揭晓窗口：全书章数 + 起点比例 + 跨度比例。
+        # 三者都为空时回退到 planned_chapter / reveal_span（绝对章号）。
+        ("foreshadow_ledger", "total_chapters", "INTEGER"),
+        ("foreshadow_ledger", "reveal_ratio", "FLOAT"),
+        ("foreshadow_ledger", "reveal_span_ratio", "FLOAT"),
+        # 节奏规划：[{chapter, kind}]，NULL = 尚未排过。
+        ("foreshadow_ledger", "beat_plan", "JSON"),
     ]
     # v3.0 KG 索引定义（ensure_schema 同步建，_migrate_sqlite_columns 老库补建）
     v30_indexes = [

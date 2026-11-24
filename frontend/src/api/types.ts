@@ -189,13 +189,29 @@ export interface ProjectPatch {
   reference_cutoffs?: ReferenceCutoff[] | null;
 }
 
+/** 剧情圣经里的一条分档伏笔（老项目仍是纯字符串）。 */
+export interface BibleForeshadow {
+  name?: string;
+  title?: string;
+  tier?: "main" | "arc" | "chapter";
+  truth?: string;
+  hints?: string[];
+  reveal_chapter?: number | null;
+  planned_chapter?: number | null;
+  reveal_span?: number | null;
+  total_chapters?: number | null;
+  reveal_ratio?: number | null;
+  reveal_span_ratio?: number | null;
+  status?: string;
+}
+
 export interface PlotBible {
   synopsis?: string | null;
   characters?: { name?: string; role?: string; motivation?: string }[];
   relationships?: { a?: string; b?: string; relation?: string }[];
   direction?: string | null;
   conflicts?: string[];
-  foreshadowing?: string[];
+  foreshadowing?: (string | BibleForeshadow)[];
   note?: string | null;
   [key: string]: unknown;  // 实际是 free-form dict；脚本/runtime 扩展字段自由
 }
@@ -1493,6 +1509,8 @@ export type AssistantChatStreamEvent =
   | {
       type: "steps";
       steps: { name: string; meta?: string; detail?: string }[];
+      /** true = 增量进度（追加到已有步骤）；缺省 = 整轮覆盖。 */
+      append?: boolean;
     }
   | { type: "delta"; text: string }
   | ({ type: "done" } & AssistantQaResponse)
@@ -3532,16 +3550,76 @@ export interface WorldBackgroundGenerateResponse {
 // ---------- 伏笔台账（作者意图层，与 KG 事实层分开） ----------
 export type ForeshadowStatus = "open" | "resolved" | "dropped";
 
+/** 伏笔级别：主线（全书）/ 卷级 / 小节级。 */
+export type ForeshadowTier = "main" | "arc" | "chapter";
+
+/** 节奏规划里的一个升级/呼应点。 */
+export interface ForeshadowPlanBeat {
+  chapter: number;
+  kind: string;
+}
+
+/** 主线揭晓窗口里的一层。 */
+export interface ForeshadowPlanLayer {
+  chapter: number;
+  layer: number;
+}
+
+export interface ForeshadowPlanEntry {
+  id: number;
+  title: string;
+  tier: ForeshadowTier;
+  current: {
+    planted_chapter: number | null;
+    planned_chapter: number | null;
+  };
+  plan: {
+    plant_chapter: number;
+    payoff_chapter: number | null;
+    span: number;
+    beats: ForeshadowPlanBeat[];
+    reveal_layers: ForeshadowPlanLayer[];
+  };
+  issues: string[];
+}
+
+export interface ForeshadowPlanResponse {
+  project_id: number;
+  total_chapters: number;
+  entries: ForeshadowPlanEntry[];
+  summary: {
+    counts: Record<string, number>;
+    issues: string[];
+  };
+  /** apply 端点额外返回实际写入条数。 */
+  applied?: number;
+}
+
 export interface ForeshadowEntry {
   id: number;
   project_id: number;
   title: string;
   status: ForeshadowStatus;
+  tier: ForeshadowTier;
   planted_chapter: number | null;
   planned_chapter: number | null;
   resolved_chapter: number | null;
   evidence: string;
   resolution: string;
+  /** 主线伏笔的真相：只在作者侧与揭晓章使用，平时不进写作提示。 */
+  truth: string;
+  /** 主线伏笔的暗示点（每行一条）。 */
+  hints: string;
+  /** 主线揭晓跨度（章）：三层反转在这个窗口内均匀分布。 */
+  reveal_span: number | null;
+  /** 全书计划章数（百分比揭晓窗口的分母）。 */
+  total_chapters: number | null;
+  /** 揭晓起点占全书比例（0–1）。 */
+  reveal_ratio: number | null;
+  /** 揭晓跨度占全书比例（0–1）。 */
+  reveal_span_ratio: number | null;
+  /** 节奏规划：升级/呼应点。 */
+  beat_plan: ForeshadowPlanBeat[];
   source: "manual" | "bible" | "kg" | string;
   created_at: string | null;
   updated_at: string | null;
@@ -3597,21 +3675,35 @@ export interface ForeshadowImportResponse {
 export interface ForeshadowCreateRequest {
   title: string;
   status?: ForeshadowStatus;
+  tier?: ForeshadowTier;
   planted_chapter?: number | null;
   planned_chapter?: number | null;
   resolved_chapter?: number | null;
   evidence?: string;
   resolution?: string;
+  truth?: string;
+  hints?: string;
+  reveal_span?: number | null;
+  total_chapters?: number | null;
+  reveal_ratio?: number | null;
+  reveal_span_ratio?: number | null;
 }
 
 export interface ForeshadowPatchRequest {
   title?: string;
   status?: ForeshadowStatus;
+  tier?: ForeshadowTier;
   planted_chapter?: number | null;
   planned_chapter?: number | null;
   resolved_chapter?: number | null;
   evidence?: string;
   resolution?: string;
+  truth?: string;
+  hints?: string;
+  reveal_span?: number | null;
+  total_chapters?: number | null;
+  reveal_ratio?: number | null;
+  reveal_span_ratio?: number | null;
 }
 
 // ---------- 定向返修（文风规则 → 可执行返修指令） ----------

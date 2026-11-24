@@ -165,16 +165,46 @@ def _merge_named(bible_items: list, kg_items: list) -> list:
 
 
 def _merge_text(bible_items: list, kg_items: list) -> list:
-    """按文本合并伏笔：去重保序，bible 在前。"""
+    """按文本合并伏笔：去重保序，bible 在前。
+
+    兼容两种 bible 形状（老项目是字符串，新圣经是分档对象）：
+    - `main` 档**只输出「主线暗线存在」这一句**，标题与真相都不进提示词——
+      标题往往就是答案，写进去等于提前剧透；
+    - `arc` / `chapter` 取 `name` / `title`。
+    """
     merged: list = []
     seen: set[str] = set()
     for f in list(bible_items) + list(kg_items):
-        text = str(f).strip()
+        if isinstance(f, dict):
+            if str(f.get("tier") or "").strip() == "main":
+                text = "全书主线暗线（只可侧面暗示，禁止解释 / 提前揭晓）"
+            else:
+                text = str(f.get("name") or f.get("title") or "").strip()
+        else:
+            text = str(f).strip()
         if not text or text in seen:
             continue
         seen.add(text)
         merged.append(text)
     return merged
+
+
+def foreshadow_titles(items: list) -> list[str]:
+    """把剧情圣经的 `foreshadowing`（字符串或分档对象）转成可注入的标题列表。
+
+    `main` 档整条剔除：它由台账的「暗示点」负责注入，标题不能出现在提示词里。
+    """
+    titles: list[str] = []
+    for item in items or []:
+        if isinstance(item, dict):
+            if str(item.get("tier") or "").strip() == "main":
+                continue
+            text = str(item.get("name") or item.get("title") or "").strip()
+        else:
+            text = str(item).strip()
+        if text and text not in titles:
+            titles.append(text)
+    return titles
 
 
 def merged_constraint_items(
@@ -923,6 +953,7 @@ def build_system_prompt(
     chapter: int | None = None,
     chapter_context: str | None = None,
     appeared_names: set[str] | None = None,
+    character_template_block: str = "",
 ) -> str:
     """静态系统提示——整轮生成保持不变，置于最前，保证提示词缓存命中率。
 
@@ -1017,9 +1048,13 @@ def build_system_prompt(
         f"你是一位长篇小说续写助手。当前创作项目：《{project_title}》。\n\n"
         f"{roster_header}"
         f"{char_lines}\n\n"
-        "【未填伏笔（供你知情，不必本轮回收）】以下是已埋下、暂不打烊的悬念，"
-        "**本节最多推进一条，其余留待后续**；不要在本节集中兑现多个伏笔，"
-        "也不要用台词直接说出伏笔本身：\n"
+        f"{character_template_block}"
+        "【未填伏笔（按级别执行）】以下是作者登记的伏笔，不是每一轮都要用：\n"
+        "  · 全书主线暗线只许侧面暗示，禁止解释、推进或提前揭晓；\n"
+        "  · 卷级伏笔近期只呼应，不得回收；\n"
+        "  · 小节级伏笔本轮最多推进或回收一条；\n"
+        "  · 不要为了让章节「有钩子」而给普通对话、反问或情绪停顿套上悬念；"
+        "本轮没有合适的落点就不埋新钩子：\n"
         f"{hole_lines}\n\n"
         f"{_inline_block(era_constraint)}"
         f"{_inline_block(power_constraint)}"
@@ -1048,7 +1083,9 @@ def build_system_prompt(
         f"{_catalog_skeleton_block(catalog_skeleton) if narrative_mode == 'original' else ''}"
         "【续写纪律】只输出正文；保持与上一段的连贯；不要重复已写过的内容；"
         "每一轮都是「连载的一节」，不是一篇独立完整的短篇小说——"
-        "结尾必须停在某个仍未解决的冲突、悬念或动作中途（为下一节留钩子），"
+        "**钩子要克制**：不是每节都要留钩子，只有写到本章收尾、或距上一次钩子已隔"
+        "三四节时，才留一个**具体**的钩子（新出现且未解释的物件 / 人 / 信息 / 威胁）；"
+        "普通对话、反问、情绪停顿都不算钩子，不要为了悬念硬造；"
         "不得在本次续写里收束主线、给出结局，也不要写「从此……／自此……」式的收尾；"
         "每轮**不少于**本节要求的字数：未写够不要写【本节完】，"
         "也不要用总结句、抒情句或「从此……」式收尾提前结束。"
@@ -1214,7 +1251,10 @@ def build_user_prompt(
             direction = plot_bible.get("direction")
             conflicts = plot_bible.get("conflicts") or []
             relationships = plot_bible.get("relationships") or []
-            fores = [] if foreshadow_block else (plot_bible.get("foreshadowing") or [])
+            fores = (
+                [] if foreshadow_block
+                else foreshadow_titles(plot_bible.get("foreshadowing") or [])
+            )
             if synopsis:
                 bible_lines.append(f"整体梗概：{synopsis}")
             if direction:
@@ -1232,8 +1272,8 @@ def build_user_prompt(
                 )
             if fores:
                 bible_lines.append(
-                    "持续伏笔（本节最多推进一条，其余留待后续）："
-                    + "；".join(str(f) for f in fores)
+                    "持续伏笔（本轮最多推进或回收一条，其余留待后续）："
+                    + "；".join(fores)
                 )
     # 作者侧台账（只含未回收项）：与旧 plot_bible.foreshadowing 二选一。
     # 首段与时间线节点模式同样不给，避免模型把整条线一次演完。
@@ -1290,8 +1330,10 @@ def build_user_prompt(
     else:
         directive = (
             f"请续写不少于 {floor_chars} 字（目标 {max_chars} 字）；正文汉字数超过 {hard_max} 字会按不合格处理。"
-            f"并在本节结尾停在某个仍未解决的冲突 / 悬念 / 动作中途，"
-            f"为下一节留钩子——不要在此收束主线或给出结局。"
+            f"**结尾按自然场景收束即可，不要每节都留钩子**：只有本节正好写到本章收尾、"
+            f"或距上一次钩子已隔三四节时，才留一个具体钩子（新出现且未解释的物件 / 人 / "
+            f"信息 / 威胁）；普通对话、反问、情绪停顿都不算钩子。"
+            f"不要在此收束主线或给出结局。"
             f"风格与节奏以系统提示中的【风格】与【文风要求】为准。"
             # v2.6：节点粒度根治——同上
             "**节末信号**：写完本节主要内容后，请在文末单独一行写【本节完】三个字，"

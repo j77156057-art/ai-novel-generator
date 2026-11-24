@@ -112,6 +112,19 @@ const saveError = ref("");
 
 const generating = ref(false);
 const genMode = ref<"continue" | "regenerate" | null>(null);
+
+/** 伏笔节奏开关：off=不注入 / auto=按规划器现算 / manual=按台账作者设置。 */
+type ForeshadowMode = "auto" | "manual" | "off";
+const FORESHADOW_MODE_KEY = "writer.foreshadowMode";
+const foreshadowMode = ref<ForeshadowMode>(
+  (() => {
+    const saved = localStorage.getItem(FORESHADOW_MODE_KEY);
+    return saved === "off" || saved === "manual" || saved === "auto" ? saved : "auto";
+  })(),
+);
+function saveForeshadowMode(): void {
+  localStorage.setItem(FORESHADOW_MODE_KEY, foreshadowMode.value);
+}
 const streamText = ref("");
 /** 模型思考增量：chars 用于解释「为什么还没出字」，text 供作者查看内容。 */
 const reasoningChars = ref(0);
@@ -990,6 +1003,7 @@ async function runContinue(): Promise<void> {
       (ev) => {
         applyAgentStage(ev.stage, ev.label);
       },
+      foreshadowMode.value,
     );
     finishAgentSteps(false, genNote.value || "生成完成");
     const landed = landedRef.value;
@@ -1063,6 +1077,7 @@ async function runRegenerate(): Promise<void> {
       (ev) => {
         applyAgentStage(ev.stage, ev.label);
       },
+      foreshadowMode.value,
     );
     finishAgentSteps(false, genNote.value || "重生成完成");
     const landed = landedRef.value;
@@ -1117,6 +1132,19 @@ const bibleCharacters = computed(() => bible.value?.characters ?? []);
 const bibleRelationships = computed(() => bible.value?.relationships ?? []);
 const bibleConflicts = computed(() => bible.value?.conflicts ?? []);
 const bibleForeshadowing = computed(() => bible.value?.foreshadowing ?? []);
+
+/** 伏笔可能是老字符串，也可能是分档对象；统一成可读的一行。 */
+function bibleForeshadowText(item: unknown): string {
+  if (typeof item === "string") return item;
+  if (item && typeof item === "object") {
+    const row = item as { name?: string; title?: string; tier?: string };
+    const label =
+      row.tier === "main" ? "主线" : row.tier === "arc" ? "卷级" : "小节级";
+    const name = row.name || row.title || "";
+    return name ? `[${label}] ${name}` : "";
+  }
+  return "";
+}
 
 const outlineEntries = computed<string[]>(() => {
   const outline = project.value?.outline;
@@ -1329,6 +1357,19 @@ watch(
             >
               {{ confirmRegen ? `确认覆盖第 ${currentSegmentNo} 段` : "重生成本段" }}
             </button>
+            <label class="faint wp-foreshadow-mode">
+              伏笔
+              <select
+                class="input"
+                v-model="foreshadowMode"
+                :disabled="generating"
+                @change="saveForeshadowMode"
+              >
+                <option value="auto">AI 自动</option>
+                <option value="manual">按我的节奏</option>
+                <option value="off">不需要</option>
+              </select>
+            </label>
             <button
               class="btn sm"
               type="button"
@@ -1481,7 +1522,7 @@ watch(
                 <div v-if="bibleForeshadowing.length" class="wp-block">
                   <h3>伏笔</h3>
                   <ul class="wp-list">
-                    <li v-for="(x, i) in bibleForeshadowing" :key="`fs-${i}`">{{ x }}</li>
+                    <li v-for="(x, i) in bibleForeshadowing" :key="`fs-${i}`">{{ bibleForeshadowText(x) }}</li>
                   </ul>
                 </div>
               </template>
@@ -1889,6 +1930,8 @@ watch(
   color: var(--danger, var(--accent-ink));
 }
 .wp-gen-timer { font-size: var(--fs-2xs); }
+.wp-foreshadow-mode { display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-2xs); }
+.wp-foreshadow-mode select { padding: 2px 6px; font-size: var(--fs-2xs); }
 
 .wp-tabs {
   display: flex;

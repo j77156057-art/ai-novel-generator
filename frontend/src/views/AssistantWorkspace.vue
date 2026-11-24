@@ -1834,12 +1834,24 @@ async function send(): Promise<void> {
             turn.liveEvidenceCount = meta.evidence_count;
           }
         },
-        (steps) => {
-          turn.liveSteps = steps.map((step) => ({
+        (steps, append) => {
+          const mapped = steps.map((step) => ({
             name: step.name,
             meta: step.meta ?? "",
             detail: step.detail ?? "",
           }));
+          if (append) {
+            // 增量进度：第一条到达时先清掉「进行中」占位，再逐条追加。
+            const onlyPlaceholder =
+              turn.liveSteps?.length === 1 && turn.liveSteps[0]?.meta === "进行中";
+            turn.liveSteps = [
+              ...(onlyPlaceholder ? [] : (turn.liveSteps ?? [])),
+              ...mapped,
+            ];
+          } else {
+            // 整轮覆盖：后端最后会发一次完整列表，用于校正增量结果。
+            turn.liveSteps = mapped;
+          }
           void scrollToBottom();
         },
       );

@@ -28,6 +28,7 @@ from app.generation.timeline import (
     has_chapter_ranges,
     node_to_dict,
     plan_nodes_with_llm,
+    _structure_block,
     plan_timeline,
     state_from_dict,
     state_to_dict,
@@ -282,7 +283,11 @@ def replan_timeline(
             branch_ratio=_branch_ratio(proj),
         )
 
-    filled = plan_nodes_with_llm(provider, entries, proj.plot_bible, state.total_main)
+    structure, _structure_note = _structure_block(db, proj)
+    filled = plan_nodes_with_llm(
+        provider, entries, proj.plot_bible, state.total_main,
+        structure=structure,
+    )
     if not filled:
         raise HTTPException(
             status_code=502,

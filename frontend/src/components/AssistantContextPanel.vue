@@ -54,13 +54,12 @@ defineExpose({ reloadWorkflow });
       <button class="link-btn ctx-close" @click="emit('close')">关闭</button>
     </div>
 
-    <!-- 工序链：全流程走到哪一步、卡在哪、哪条改动等你批（服务端每次重新评估） -->
-    <WorkflowStrip
-      v-if="!props.badId"
-      ref="workflowStripRef"
-      class="ctx-workflow"
-      :project-id="props.projectId"
-    />
+    <!-- 工序链：全流程走到哪一步、卡在哪、哪条改动等你批（服务端每次重新评估）。
+         WorkflowStrip 是多根组件（进度 + 提案 + 动作 + 历史），class 无法自动继承，
+         所以外面套一层容器承载右栏的收窄样式。 -->
+    <div v-if="!props.badId" class="ctx-workflow">
+      <WorkflowStrip ref="workflowStripRef" :project-id="props.projectId" />
+    </div>
 
     <div class="ctx-card">
       <h3>
@@ -240,12 +239,18 @@ defineExpose({ reloadWorkflow });
   color: var(--accent);
 }
 
-/* 工序链收进右栏：只留进度条 + 一句摘要，别把侧栏撑高 */
+/* 工序链收进右栏：外层容器只管间距与分隔线，主卡去掉卡片感。 */
 .ctx-workflow {
   margin: 0 0 4px;
   padding: 2px 0 12px;
-  border: 0;
   border-bottom: 1px solid var(--border);
+}
+/* 主进度卡（第一个 .wf-strip）在右栏不收边框，避免侧栏变成卡片堆；
+   提案 / 动作 / 历史三块仍保留各自卡片样式。 */
+.ctx-workflow :deep(.wf-strip:first-of-type) {
+  margin: 0;
+  padding: 0;
+  border: 0;
   border-radius: 0;
   background: transparent;
   box-shadow: none;

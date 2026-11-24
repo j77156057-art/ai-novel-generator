@@ -2,8 +2,8 @@
 
 ## 为什么单独一层
 
-蒸馏产物里有一千多条讲**故事怎么排**的规则（剧情编排模式 / 节拍序列 / 高频场景模板 /
-伏笔与悬念设计，合计 1280 条）。它们以前只进**正文层**（`describe_narrative`），
+蒸馏产物里有一千多条讲**故事怎么排**的规则（剧情编排模式 / 节拍序列 /
+伏笔与悬念设计）。它们以前只进**正文层**（`describe_narrative`），
 当"怎么写"用；**规划层**（剧情圣经 + 因果节点）一份也看不到。
 
 结果就是：模型写大纲时手里只有 premise + 类型套话提示 + 平台调性提示，
@@ -11,10 +11,11 @@
 
 ## 三条纪律
 
-1. **只取结构四维**：句子怎么写（语序/段落/对白/战斗）由正文层负责，这里不重复。
+1. **只取结构维**：句子怎么写（语序/段落/对白/战斗）由正文层负责，这里不重复。
 2. **专名安全**：结构规则里可能有参考书的人名地名。**没有可用专名表就不给**
-   （fail closed）——给了等于把参考书世界观灌进用户的剧情规划。
-3. **按上下文挑，不全塞**：一次规划提示词不能塞 1280 条。按与剧情上下文的字面重合度
+   （fail closed）——给了等于把参考书世界观灌进用户的剧情规划。脱敏后仍带
+   占位符的规则整条丢弃：它绑定了参考书的具体卡司，不是可迁移的结构。
+3. **按上下文挑，不全塞**：一次规划提示词不能塞上千条。按与剧情上下文的字面重合度
    每维取几条（确定性，不需要检索服务）。
 """
 from __future__ import annotations
@@ -22,11 +23,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
-#: 结构四维：只讲「故事怎么排」，不讲「句子怎么写」。
+#: 结构三维：只讲「故事怎么排」，不讲「句子怎么写」。
+#:
+#: **不含「高频场景模板」**：该维度已被 `style/narrative.py` 停用
+#: （`DEPRECATED_DIMENSIONS`）——实测 3,448 条里 97.8% 是逐章剧情摘要，
+#: 没有可复用的结构信号，且专名与具体情节最密（脱敏后仅 70 条不含专名）。
 STRUCTURE_DIMS: tuple[str, ...] = (
     "剧情编排模式",     # 情节怎么组织
     "节拍序列",         # 一场冲突的 5~7 步推进
-    "高频场景模板",     # 某类场景通常怎么展开
     "伏笔与悬念设计",   # 钩子 / 伏笔 / 回收
 )
 
@@ -46,8 +50,27 @@ def _rule_text(item: Any) -> str:
     return raw
 
 
-def structure_rules(profile: dict | None, *, redactor=None) -> dict[str, list[str]]:
-    """从档案里取结构四维的规则正文（剥引文；给了 redactor 就再脱敏一次）。"""
+def structure_rules(
+    profile: dict | None,
+    *,
+    redactors: dict[int, Any] | None = None,
+    fragment_patterns: dict[int, re.Pattern[str]] | None = None,
+) -> dict[str, list[str]]:
+    """从档案里取结构维的规则正文（剥引文；给了 redactors 就按来源书脱敏）。
+
+    每条规则按**自己的 `novel_id`** 选 Redactor：一个项目可以选多本参考书，
+    A 书的表管不住 B 书的人名。来源书没有可用专名表 / 规则没有来源字段 →
+    整条丢弃（fail closed），不拿别的书的表去凑。
+
+    三类规则会被丢弃：
+
+    1. 脱敏后仍带占位符 —— 写的是参考书的具体卡司（"＃N 在 ＃M 留下后手"），
+       属于抄情节而不是学结构；
+    2. 命中「判定为专名、但被当残片剔掉」的词 —— 它们不在表里，Redactor 不会
+       替换，只看占位符会漏掉（"九幽龙魔线"）；
+    3. 来源书缺表 / 无 `novel_id` —— 无法保证脱敏，不给。
+    """
+    from app.style.entities import PLACEHOLDER_MARK
     from app.style.layers import method_rules
 
     method = method_rules(profile)
@@ -58,10 +81,25 @@ def structure_rules(profile: dict | None, *, redactor=None) -> dict[str, list[st
             text = _rule_text(item)
             if not text:
                 continue
-            if redactor is not None:
+            if redactors is not None:
+                nid = item.get("novel_id") if isinstance(item, dict) else None
+                if nid is None:
+                    continue
+                try:
+                    nid = int(nid)
+                except (TypeError, ValueError):
+                    continue
+                redactor = redactors.get(nid)
+                if redactor is None:
+                    continue
                 try:
                     text = redactor.redact(text)
                 except Exception:  # noqa: BLE001 - 脱敏失败就不给这条
+                    continue
+                if PLACEHOLDER_MARK in text:
+                    continue
+                frag = (fragment_patterns or {}).get(nid)
+                if frag is not None and frag.search(text):
                     continue
             if text and text not in items:
                 items.append(text)
@@ -186,7 +224,7 @@ def for_project(db, project, context: str, *,
                 per_dim: int = DEFAULT_PER_DIM) -> tuple[dict[str, list[str]], str]:
     """给规划层取结构参考。返回 (选择结果, 说明)。
 
-    没有已落库档案 / 没有结构四维 / 没有可用专名表 → 一律不给（fail closed），
+    没有已落库档案 / 没有结构维 / 没有可用专名表 → 一律不给（fail closed），
     并在说明里写清原因，让调用方能把它显示出来而不是静默降级。
     """
     profile = getattr(project, "style_narrative", None)
@@ -194,19 +232,58 @@ def for_project(db, project, context: str, *,
         return {}, "无已落库的叙事档案 → 不给剧情结构参考"
     rules = structure_rules(profile)
     if not rules:
-        return {}, "档案里没有结构四维 → 不给剧情结构参考"
+        return {}, "档案里没有结构维 → 不给剧情结构参考"
     novel_ids = list(getattr(project, "reference_novel_ids", None) or [])
-    redactor = None
-    if novel_ids:
-        from app.style.entities import Redactor
-        from app.style.entity_store import entity_entries, load_table
-        table = load_table(int(novel_ids[0]))
-        if entity_entries(table):
-            redactor = Redactor(table)
-    if redactor is None:
+    from app.style.entities import Redactor
+    from app.style.entity_store import entity_entries, fragment_names, load_table
+
+    redactors = {}
+    fragment_patterns = {}
+    for raw_id in novel_ids:
+        try:
+            nid = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        table = load_table(nid)
+        if not entity_entries(table):
+            continue
+        redactors[nid] = Redactor(table)
+        # 残片名（判定为专名但被当残片剔掉）：Redactor 不替换它们，只能靠检测拦。
+        frags = sorted(fragment_names(nid, table), key=len, reverse=True)
+        if frags:
+            fragment_patterns[nid] = re.compile("|".join(re.escape(w) for w in frags))
+    if not redactors:
         return {}, "无可用专名表 → 结构规则可能含参考书专名，不给（fail closed）"
-    rules = structure_rules(profile, redactor=redactor)
+    rules = structure_rules(
+        profile, redactors=redactors, fragment_patterns=fragment_patterns
+    )
+    if not rules:
+        return {}, "结构规则全部绑定了参考书专名（或来源书缺专名表）→ 不给"
     picked = select(rules, context, per_dim=per_dim)
     total = sum(len(v) for v in rules.values())
     given = sum(len(v) for v in picked.values())
     return picked, f"剧情结构参考：{total} 条候选 → 每维取 {per_dim} 条（实际给出 {given} 条）"
+
+
+def structure_block(
+    db, project, context: str, *, per_dim: int = 2
+) -> tuple[str, str]:
+    """给规划层的一段可注入文本 + 说明（取不到就空串 + 原因）。
+
+    与 `for_project` 同一套 fail-closed 口径：无档案 / 无结构维 / 无专名表
+    都不注入，避免把参考书的人物地名带进本书的结构规划。
+    """
+    picked, note = for_project(db, project, context, per_dim=per_dim)
+    lines: list[str] = []
+    for dimension, rules in picked.items():
+        for rule in rules:
+            text = str(rule).strip()
+            if text:
+                lines.append(f"- {dimension}：{text}")
+    if not lines:
+        return "", note
+    block = (
+        "【剧情结构参考（借节拍顺序、情节编排、伏笔钩子；"
+        "不得照搬其中的人物、地名与具体情节）】\n" + "\n".join(lines)
+    )
+    return block, note

@@ -75,6 +75,7 @@ import type {
   ForeshadowEntry,
   ForeshadowImportResponse,
   ForeshadowListResponse,
+  ForeshadowPlanResponse,
   ForeshadowPatchRequest,
   GenerateLoopResult,
   GeneratePlan,
@@ -772,6 +773,7 @@ export const api = {
     onReasoning?: (chars: number, text?: string) => void,
     onStage?: (stage: GenerationStageEvent) => void,
     chapterOpening?: string | null,
+    foreshadowMode?: "auto" | "manual" | "off" | null,
   ): Promise<void> =>
     streamSse(
       `${BASE}/generate-stream`,
@@ -780,6 +782,7 @@ export const api = {
           project_id: projectId,
           max_chars: maxChars ?? null,
           chapter_opening: chapterOpening ?? null,
+          foreshadow_mode: foreshadowMode ?? "auto",
         }),
         ...(signal ? { signal } : {}),
       },
@@ -802,6 +805,7 @@ export const api = {
     signal?: AbortSignal,
     onReasoning?: (chars: number, text?: string) => void,
     onStage?: (stage: GenerationStageEvent) => void,
+    foreshadowMode?: "auto" | "manual" | "off" | null,
   ): Promise<void> =>
     streamSse(
       `${BASE}/regenerate-stream`,
@@ -810,6 +814,7 @@ export const api = {
           project_id: projectId,
           segment_no: segmentNo,
           max_chars: maxChars ?? null,
+          foreshadow_mode: foreshadowMode ?? "auto",
         }),
         ...(signal ? { signal } : {}),
       },
@@ -953,7 +958,10 @@ export const api = {
       evidence_count?: number;
       confidence?: number;
     }) => void,
-    onSteps?: (steps: { name: string; meta?: string; detail?: string }[]) => void,
+    onSteps?: (
+      steps: { name: string; meta?: string; detail?: string }[],
+      append?: boolean,
+    ) => void,
   ): Promise<AssistantQaResponse> => {
     const state: { final: AssistantQaResponse | null } = { final: null };
     return streamSse(
@@ -962,7 +970,7 @@ export const api = {
       (ev) => {
         if (ev.type === "delta") onDelta(ev.text);
         else if (ev.type === "meta") onMeta?.(ev);
-        else if (ev.type === "steps") onSteps?.(ev.steps);
+        else if (ev.type === "steps") onSteps?.(ev.steps, ev.append === true);
         else if (ev.type === "done") state.final = ev as AssistantQaResponse;
       },
       "对话失败",
@@ -1685,6 +1693,17 @@ export const api = {
     request<{ ok: boolean; deleted_id: number }>(
       `/projects/${projectId}/foreshadows/${entryId}`,
       { method: "DELETE" },
+    ),
+
+  /** 伏笔节奏规划（只读）：按章纲与级别排出埋设 / 升级 / 回收章。 */
+  planForeshadows: (projectId: number) =>
+    request<ForeshadowPlanResponse>(`/projects/${projectId}/foreshadows/plan`),
+
+  /** 应用节奏规划：必须 confirm=true 才写库。 */
+  applyForeshadowPlan: (projectId: number) =>
+    request<ForeshadowPlanResponse>(
+      `/projects/${projectId}/foreshadows/plan/apply`,
+      jsonInit("POST", { confirm: true }),
     ),
 
   /** 把剧情圣经旧伏笔导入台账：按标题去重，只新增不覆盖。 */

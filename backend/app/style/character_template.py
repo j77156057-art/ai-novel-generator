@@ -290,7 +290,9 @@ def applied_template_rules(db: Any, project: Any, tier: str) -> list[str]:
 def applied_template_block(db: Any, project: Any, tier: str) -> str:
     """项目当前档位下、已应用的模板 → 可注入的文字（没有就空串）。"""
     return describe_character_template(
-        {CHARACTER_TEMPLATE_KEY: {"rules": applied_template_rules(db, project, tier)}})
+        {CHARACTER_TEMPLATE_KEY: {"rules": applied_template_rules(db, project, tier)}},
+        max_rules=MAX_TEMPLATE_RULES,
+    )
 
 
 def list_templates(db: Any, *, limit: int = 50) -> list[Any]:

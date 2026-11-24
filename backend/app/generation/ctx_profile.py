@@ -22,6 +22,10 @@
 
 ## 还没做的
 
+> 现状（2026-11-24）：本模块**没有任何调用方**。其中「风格样例脱敏」这一条
+> 已在 `engine.build_context` 的 `_style_exemplars_for_profile` 落地；
+> 检索上下文与维度可见性两条仍未接线。
+
 **人物塑造模板**（`include_character_template`）只声明了、**没有消费方**：
 `profiles.py` 写着它为 True，本模块把它塞进 ctx 的 `_include_character_template`，
 但全仓没有任何地方读它（`narrative.describe_narrative` 的注释里说「P0-B 实现」

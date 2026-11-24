@@ -17,10 +17,12 @@ import type {
   AssistantRollbackResult,
   AssistantSnapshot,
   AssistantSnapshotGroup,
+  BibleForeshadow,
   DistillJob,
   ForeshadowEntry,
   ForeshadowKgLinkage,
   ForeshadowKgResolvable,
+  ForeshadowPlanResponse,
   GeneratePlan,
   GenerationEditCascade,
   GenerationOutlineChapter,
@@ -458,6 +460,18 @@ async function saveTitle() {
 
 // 生成
 const generationLength = ref(3000);
+/** 伏笔节奏开关：off=不注入 / auto=按规划器现算 / manual=按台账作者设置。 */
+type ForeshadowMode = "auto" | "manual" | "off";
+const FORESHADOW_MODE_KEY = "writer.foreshadowMode";
+const foreshadowMode = ref<ForeshadowMode>(
+  (() => {
+    const saved = localStorage.getItem(FORESHADOW_MODE_KEY);
+    return saved === "off" || saved === "manual" || saved === "auto" ? saved : "auto";
+  })(),
+);
+function saveForeshadowMode(): void {
+  localStorage.setItem(FORESHADOW_MODE_KEY, foreshadowMode.value);
+}
 const streaming = ref(false);
 const streamedText = ref("");
 const liveBox = ref<HTMLElement | null>(null);
@@ -1081,6 +1095,17 @@ const foreshadowImporting = ref(false);
 const foreshadowImportingKg = ref(false);
 /** KG 联动清单：可登记的未填坑 + 已回收的回收建议（后端只读 KG，不反写）。 */
 const foreshadowKg = ref<ForeshadowKgLinkage>({ importable: [], resolvable: [] });
+/** 节奏规划预览（点「自动排节奏」后出现；应用前不写库）。 */
+const foreshadowPlan = ref<ForeshadowPlanResponse | null>(null);
+const foreshadowPlanning = ref(false);
+const foreshadowPlanApplying = ref(false);
+
+/** 级别下拉的文案（与后端 TIER_LABELS 同口径）。 */
+const FORESHADOW_TIERS = [
+  { value: "main", label: "主线（全书）" },
+  { value: "arc", label: "卷级" },
+  { value: "chapter", label: "小节级" },
+] as const;
 
 function recalcForeshadowSummary() {
   const counts = { open: 0, resolved: 0, dropped: 0 };
@@ -1090,6 +1115,17 @@ function recalcForeshadowSummary() {
     else if (entry.status === "dropped") counts.dropped += 1;
   }
   foreshadowSummary.value = counts;
+}
+
+function foreshadowTierLabel(tier: string | null | undefined): string {
+  return FORESHADOW_TIERS.find((item) => item.value === tier)?.label ?? "小节级";
+}
+
+/** 剧情圣经里的伏笔可能是字符串或分档对象；统一成可显示的一行。 */
+function bibleForeshadowLabel(item: string | BibleForeshadow): string {
+  if (typeof item === "string") return item;
+  const name = item.name || item.title || "（未命名）";
+  return `[${foreshadowTierLabel(item.tier)}] ${name}`;
 }
 
 function applyForeshadowList(resp: {
@@ -1116,6 +1152,37 @@ async function loadForeshadows() {
   }
 }
 
+/** 只读预览：按章纲与级别排出埋设 / 升级 / 回收章。 */
+async function loadForeshadowPlan() {
+  if (foreshadowPlanning.value) return;
+  foreshadowPlanning.value = true;
+  foreshadowError.value = null;
+  try {
+    foreshadowPlan.value = await api.planForeshadows(projectId);
+  } catch (err) {
+    showActionError("排伏笔节奏", err);
+  } finally {
+    foreshadowPlanning.value = false;
+  }
+}
+
+/** 应用节奏规划：写入埋设章、回收章与升级点。 */
+async function applyForeshadowPlan() {
+  if (!foreshadowPlan.value || foreshadowPlanApplying.value) return;
+  foreshadowPlanApplying.value = true;
+  foreshadowError.value = null;
+  try {
+    const res = await api.applyForeshadowPlan(projectId);
+    foreshadowNotice.value = `已应用节奏规划：${res.applied ?? 0} 条。`;
+    foreshadowPlan.value = null;
+    await loadForeshadows();
+  } catch (err) {
+    showActionError("应用伏笔节奏", err);
+  } finally {
+    foreshadowPlanApplying.value = false;
+  }
+}
+
 async function addForeshadow() {
   if (foreshadowAdding.value) return;
   foreshadowAdding.value = true;
@@ -1124,6 +1191,7 @@ async function addForeshadow() {
     const created = await api.createForeshadow(projectId, {
       title: "新伏笔",
       status: "open",
+      tier: "chapter",
     });
     foreshadows.value.push(created);
     recalcForeshadowSummary();
@@ -1142,6 +1210,37 @@ function chapterPayload(value: unknown): number | null {
   return Number.isFinite(number) && number >= 1 ? Math.trunc(number) : null;
 }
 
+/** 比例（0–1）：空串 / 越界统一成 null。 */
+function ratioPayload(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 && number <= 1 ? number : null;
+}
+
+/** 0–1 的比例显示成百分数（0.9 → 90）。 */
+function ratioPercent(value: unknown): number | "" {
+  if (value === null || value === undefined || value === "") return "";
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.round(number * 1000) / 10 : "";
+}
+
+/** 输入框直接填百分数（90），保存时换算回 0–1。 */
+function setRatioPercent(
+  entry: ForeshadowEntry,
+  field: "reveal_ratio" | "reveal_span_ratio",
+  event: Event,
+) {
+  const raw = (event.target as HTMLInputElement).value;
+  if (raw === "") {
+    entry[field] = null;
+  } else {
+    const number = Number(raw);
+    entry[field] =
+      Number.isFinite(number) && number >= 0 && number <= 100 ? number / 100 : null;
+  }
+  void saveForeshadow(entry);
+}
+
 async function saveForeshadow(entry: ForeshadowEntry) {
   if (foreshadowBusy[entry.id]) return;
   foreshadowBusy[entry.id] = true;
@@ -1150,11 +1249,18 @@ async function saveForeshadow(entry: ForeshadowEntry) {
     const updated = await api.patchForeshadow(projectId, entry.id, {
       title: entry.title,
       status: entry.status,
+      tier: entry.tier,
       planted_chapter: chapterPayload(entry.planted_chapter),
       planned_chapter: chapterPayload(entry.planned_chapter),
       resolved_chapter: chapterPayload(entry.resolved_chapter),
       evidence: entry.evidence,
       resolution: entry.resolution,
+      truth: entry.truth,
+      hints: entry.hints,
+      reveal_span: chapterPayload(entry.reveal_span),
+      total_chapters: chapterPayload(entry.total_chapters),
+      reveal_ratio: ratioPayload(entry.reveal_ratio),
+      reveal_span_ratio: ratioPayload(entry.reveal_span_ratio),
     });
     Object.assign(entry, updated);
     recalcForeshadowSummary();
@@ -2290,6 +2396,11 @@ async function runGenerate() {
           await loadGenerations();
           refreshPriorIfOpen(); // 每段生成完前情都变了，面板开着就同步刷新
         },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        foreshadowMode.value,
       );
     }
   } catch (err) {
@@ -2327,6 +2438,10 @@ async function runRegenerate(g: { id: number; segment_no: number }) {
         await loadGenerations();
         refreshPriorIfOpen(); // 重生成会重算受影响的卷摘要与主线，前情报告同步刷新
       },
+      undefined,
+      undefined,
+      undefined,
+      foreshadowMode.value,
     );
   } catch (err) {
     showActionError("段落重新生成失败", err);
@@ -4127,6 +4242,9 @@ onUnmounted(() => {
           <button class="btn sm" :disabled="foreshadowAdding" @click="addForeshadow">
             ＋ 添加伏笔
           </button>
+          <button class="btn sm ghost" :disabled="foreshadowPlanning" @click="loadForeshadowPlan">
+            {{ foreshadowPlanning ? "排节奏中…" : "自动排节奏" }}
+          </button>
           <button
             v-if="foreshadowLegacy.length"
             class="btn sm ghost"
@@ -4144,6 +4262,43 @@ onUnmounted(() => {
       </header>
       <div v-if="foreshadowError" class="notice err">{{ foreshadowError }}</div>
       <div v-else-if="foreshadowNotice" class="notice ok">{{ foreshadowNotice }}</div>
+
+      <!-- 节奏规划预览：应用前不写库。 -->
+      <div v-if="foreshadowPlan" class="foreshadow-plan">
+        <div class="foreshadow-plan-head">
+          <strong>节奏规划</strong>
+          <span class="faint">
+            全书 {{ foreshadowPlan.total_chapters }} 章 ·
+            {{ foreshadowPlan.entries.length }} 条未回收
+          </span>
+          <span style="flex: 1"></span>
+          <button class="btn sm" :disabled="foreshadowPlanApplying" @click="applyForeshadowPlan">
+            {{ foreshadowPlanApplying ? "应用中…" : "应用" }}
+          </button>
+          <button class="btn sm ghost" @click="foreshadowPlan = null">关闭</button>
+        </div>
+        <p v-if="foreshadowPlan.summary.issues.length" class="notice warn">
+          {{ foreshadowPlan.summary.issues.join("；") }}
+        </p>
+        <div v-for="item in foreshadowPlan.entries" :key="item.id" class="foreshadow-plan-row">
+          <span class="tag">{{ foreshadowTierLabel(item.tier) }}</span>
+          <span class="foreshadow-plan-title">{{ item.title }}</span>
+          <span class="faint">
+            埋第 {{ item.plan.plant_chapter }} 章
+            <template v-if="item.plan.reveal_layers.length > 1">
+              · 揭晓
+              {{ item.plan.reveal_layers.map((l) => `第${l.chapter}章`).join(" → ") }}
+            </template>
+            <template v-else>· 收第 {{ item.plan.payoff_chapter }} 章</template>
+            <template v-if="item.plan.beats.length">
+              · 升级 {{ item.plan.beats.map((b) => `第${b.chapter}章`).join(" / ") }}
+            </template>
+          </span>
+          <span v-if="item.issues.length" class="foreshadow-plan-issue">
+            {{ item.issues.join("；") }}
+          </span>
+        </div>
+      </div>
 
       <!-- 回收建议：KG 里同名坑已回收，台账还标着未回收。 -->
       <div v-if="foreshadowKg.resolvable.length" class="foreshadow-kg-suggest">
@@ -4165,6 +4320,7 @@ onUnmounted(() => {
       <div class="foreshadow-table">
         <div class="foreshadow-row foreshadow-row-head">
           <span>伏笔</span>
+          <span>级别</span>
           <span>状态</span>
           <span>埋设章</span>
           <span>计划回收</span>
@@ -4174,6 +4330,11 @@ onUnmounted(() => {
         </div>
         <div v-for="entry in foreshadows" :key="entry.id" class="foreshadow-row">
           <input class="input" v-model="entry.title" maxlength="200" @change="saveForeshadow(entry)" />
+          <select class="input" v-model="entry.tier" @change="saveForeshadow(entry)">
+            <option v-for="tier in FORESHADOW_TIERS" :key="tier.value" :value="tier.value">
+              {{ tier.label }}
+            </option>
+          </select>
           <select class="input" v-model="entry.status" @change="saveForeshadow(entry)">
             <option value="open">未回收</option>
             <option value="resolved">已回收</option>
@@ -4208,6 +4369,51 @@ onUnmounted(() => {
               placeholder="依据 / 出处"
               @change="saveForeshadow(entry)"
             />
+            <template v-if="entry.tier === 'main'">
+              <textarea
+                class="input"
+                v-model="entry.truth"
+                rows="2"
+                placeholder="真相（仅作者可见；到达计划揭晓章才会进写作提示）"
+                @change="saveForeshadow(entry)"
+              ></textarea>
+              <textarea
+                class="input"
+                v-model="entry.hints"
+                rows="2"
+                placeholder="暗示点（每行一条；平时写作只给这些细节，不给真相）"
+                @change="saveForeshadow(entry)"
+              ></textarea>
+              <input
+                class="input"
+                type="number"
+                min="1"
+                max="9999"
+                v-model.number="entry.total_chapters"
+                placeholder="全书章数（如 120）"
+                @change="saveForeshadow(entry)"
+              />
+              <input
+                class="input"
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                :value="ratioPercent(entry.reveal_ratio)"
+                placeholder="揭晓起点（%，如 90）"
+                @change="setRatioPercent(entry, 'reveal_ratio', $event)"
+              />
+              <input
+                class="input"
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                :value="ratioPercent(entry.reveal_span_ratio)"
+                placeholder="揭晓跨度（%，如 10）"
+                @change="setRatioPercent(entry, 'reveal_span_ratio', $event)"
+              />
+            </template>
             <input
               v-if="entry.status === 'resolved'"
               class="input"
@@ -4278,7 +4484,7 @@ onUnmounted(() => {
       <div class="bible-row" v-if="bible.foreshadowing?.length && !foreshadows.length">
         <span class="k">伏笔</span>
         <span class="v">
-          <span v-for="f in bible.foreshadowing" :key="f" class="tag">{{ f }}</span>
+          <span v-for="(f, i) in bible.foreshadowing" :key="i" class="tag">{{ bibleForeshadowLabel(f) }}</span>
           <span v-if="foreshadowLegacy.length" class="faint">（旧字段，可在上方台账导入）</span>
         </span>
       </div>
@@ -4841,6 +5047,20 @@ onUnmounted(() => {
               <option :value="2">2 段</option>
               <option :value="3">3 段</option>
               <option :value="5">5 段</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="foreshadow-mode">伏笔节奏</label>
+            <select
+              id="foreshadow-mode"
+              class="input"
+              v-model="foreshadowMode"
+              :disabled="streaming"
+              @change="saveForeshadowMode"
+            >
+              <option value="auto">AI 自动</option>
+              <option value="manual">按我的节奏</option>
+              <option value="off">不需要</option>
             </select>
           </div>
         </div>
@@ -6579,9 +6799,14 @@ onUnmounted(() => {
 .world-suggestion p { margin: 4px 0; font-size: var(--fs-sm); }
 .world-suggestion .k { margin-right: 8px; color: var(--fg-muted); }
 .foreshadow-table { margin-top: 8px; overflow-x: auto; }
-.foreshadow-row { display: grid; grid-template-columns: minmax(160px, 1.4fr) 96px 76px 84px 84px minmax(200px, 1.6fr) 64px; gap: 8px; align-items: start; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.foreshadow-row { display: grid; grid-template-columns: minmax(160px, 1.4fr) 104px 96px 76px 84px 84px minmax(200px, 1.6fr) 64px; gap: 8px; align-items: start; padding: 6px 0; border-bottom: 1px solid var(--border); }
 .foreshadow-row-head { font-size: var(--fs-xs); color: var(--fg-muted); }
 .foreshadow-notes { display: flex; flex-direction: column; gap: 6px; }
+.foreshadow-plan { margin-top: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.foreshadow-plan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.foreshadow-plan-title { font-weight: 600; }
+.foreshadow-plan-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; padding: 4px 0; border-top: 1px dashed var(--border); font-size: var(--fs-sm); }
+.foreshadow-plan-issue { color: var(--warn, #b45309); }
 .foreshadow-kg-suggest { margin-top: 8px; padding: 8px 10px; border: 1px dashed var(--border); border-radius: 8px; }
 .foreshadow-kg-suggest p { margin: 0 0 4px; }
 .foreshadow-kg-suggest-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 0; }

@@ -28,7 +28,7 @@ from app.generation import (
     generate_loop,
     generate_next_segment,
 )
-from app.generation.engine import _apply_gate_limits, _catalog_skeleton, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt, preflight_timeline_gate, _timeline_progress, _chapter_ordinal
+from app.generation.engine import _apply_gate_limits, _catalog_skeleton, _character_template_block, _style_info, _style_narrative, _style_profile, _style_source_ids, _next_segment_no, current_node_prompt, preflight_timeline_gate, _timeline_progress, _chapter_ordinal
 from app.generation.length_guard import LengthBlocked
 from app.generation.outline_notice import build_notice
 from app.generation.prompts import build_system_prompt, build_user_prompt, chapter_outline_entry
@@ -54,6 +54,8 @@ class GenerateBody(StrictRequest):
     fast: bool = False
     # 章前作者选择/确认的开场方式；空串/None 时提示词与旧版逐字节一致。
     chapter_opening: str | None = None
+    # 伏笔节奏：off=不注入台账 / auto=按规划器现算 / manual=按台账作者设置。
+    foreshadow_mode: str = "auto"
 
 
 class GenerateLoopBody(StrictRequest):
@@ -80,6 +82,8 @@ class RegenerateBody(StrictRequest):
     max_chars: int | None = None
     # 只是「改标签」：重写不改章号，所以这里允许指向已存在的章。
     chapter_range: str | None = None
+    # 伏笔节奏：off=不注入台账 / auto=按规划器现算 / manual=按台账作者设置。
+    foreshadow_mode: str = "auto"
 
 
 class UpdateGenerationTextBody(StrictRequest):
@@ -93,6 +97,17 @@ def _require_project(db: Session, project_id: int) -> Project:
     if proj is None:
         raise HTTPException(status_code=404, detail="project 不存在")
     return proj
+
+
+def _foreshadow_mode(value: str | None) -> str:
+    """伏笔节奏开关：只接受 off / auto / manual，其余 422。"""
+    mode = str(value or "auto").strip().lower()
+    if mode not in ("off", "auto", "manual"):
+        raise HTTPException(
+            status_code=422,
+            detail="foreshadow_mode 必须是 off / auto / manual",
+        )
+    return mode
 
 
 def _begin_generation(project_id: int) -> None:
@@ -215,6 +230,7 @@ def generate(body: GenerateBody, db: Session = Depends(get_db)) -> dict:
             db, proj, novel_ids=novel_ids, max_chars=body.max_chars,
             chapter_range=plan["label"], fast_mode=body.fast,
             chapter_opening=body.chapter_opening,
+            foreshadow_mode=_foreshadow_mode(body.foreshadow_mode),
         )
     except (LengthBlocked, chapter_labels.ChapterIdentityError) as exc:
         # 两条生成侧硬判据：章身份解析失败 / 压缩后仍超篇幅上限 → 不落正文。
@@ -255,6 +271,8 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
     _require_workflow_ready(db, proj)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
     plan = _chapter_plan(db, proj, body.chapter_range)
+    # 开流前校验：非法值要在 200 之前回 422，不能等 SSE 起来才报错。
+    foreshadow_mode = _foreshadow_mode(body.foreshadow_mode)
     # 开流前预检时间线写前闸门：一旦返回 StreamingResponse，生成器里抛的 409
     # 只能被吞成 SSE error 事件，前端拿不到状态码与结构化 detail，三种一键
     # 修复按钮就不会出现（浏览器实测：HTTP 200 + data:{"type":"error",...}）。
@@ -286,6 +304,7 @@ def generate_stream(body: GenerateBody, db: Session = Depends(get_db)):
                 sdb, p, novel_ids=novel_ids, max_chars=body.max_chars,
                 chapter_range=plan["label"], fast_mode=body.fast,
                 chapter_opening=body.chapter_opening,
+                foreshadow_mode=foreshadow_mode,
             ):
                 if ev.get("type") == "done":
                     ev = {**ev, "outline": outline_notice}
@@ -325,6 +344,8 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
     """
     proj = _require_project(db, body.project_id)
     novel_ids = _resolve_novel_ids(proj, body.novel_ids)
+    # 开流前校验：非法值要在 200 之前回 422，不能等 SSE 起来才报错。
+    foreshadow_mode = _foreshadow_mode(body.foreshadow_mode)
     target = _generation_by_no(db, proj.id, body.segment_no)
     if target is None:
         raise HTTPException(status_code=404, detail="段不存在")
@@ -367,6 +388,7 @@ def regenerate_stream(body: RegenerateBody, db: Session = Depends(get_db)):
                 chapter_label=label,
                 snapshot_id=snapshot_id,
                 expected_before=expected_before,
+                foreshadow_mode=foreshadow_mode,
             ):
                 if outline_notice is not None and ev.get("type") == "done":
                     ev = {**ev, "outline": outline_notice}
@@ -460,6 +482,7 @@ def generate_plan(body: GeneratePlanBody, db: Session = Depends(get_db)) -> dict
         is_opening=not ctx["prior_blocks"] and not ctx["prior_summaries"],
         catalog_skeleton=_catalog_skeleton(db, proj),
         max_chars=proj.generation_length or 4000,
+        character_template_block=_character_template_block(db, proj),
     )
     user = build_user_prompt(
         ctx["prior_summaries"], ctx["rag_context"], proj.outline,

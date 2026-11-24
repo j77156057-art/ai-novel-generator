@@ -64,6 +64,26 @@ MIN_COUNT = 100
 #: 残片判据：短名作为独立词出现的比例低于此值，判为更长名的残片。
 MIN_INDEPENDENT_RATIO = 0.15
 
+#: 专名不可能以这些虚词开头或结尾。它们是句法粘着字，出现在边界上说明
+#: 候选是「名字 + 虚词」的片段（羽柔子的 / 着宋书航 / 是九幽 / 的长生 / 个道号）。
+#: 这类 3~4 字串在 PMI 上结合很紧，子串与独立率都抓不到——必须单独判。
+_PARTICLE_EDGE = frozenset("的着是在个这那")
+
+
+def is_particle_edge(word: str) -> bool:
+    """词的首/尾是句法虚词 ⇒ 它是「名字 + 虚词」的片段，不可能是专名。
+
+    建表（`drop_fragments`）与消费侧（`entity_store.fragment_names` 的残片闸门）
+    共用这一条判据，避免「表里摘了、闸门又把它当专名」的两套口径。
+    """
+    return bool(word) and (word[0] in _PARTICLE_EDGE or word[-1] in _PARTICLE_EDGE)
+
+
+#: 占位符正文里的记号（全角井号，宽度与汉字相同）。
+#: 除 `Redactor` 自己拼 `＃N` 外，`generation/plot_structure.py` 也用它判定
+#: 「这条规则脱敏后仍绑定了参考书专名」。
+PLACEHOLDER_MARK = "＃"
+
 #: 占位符前缀（按类别）。类别名会进 prompt，所以要简短、无歧义。
 PLACEHOLDER_PREFIX = {
     "characters": "人名",
@@ -186,9 +206,26 @@ def drop_fragments(
         keep_list: list[str] = []
         drop_list: list[str] = []
         for a in names:
-            # 4 字及以上本身就可能是完整名，不参与残片判定（「赵青锋」含「赵」）
+            # 「名字 + 虚词」的候选直接判残片：它进表后会把「的」「着」也换成
+            # 占位符，还会让下游「含专名即丢」的闸门误杀（见 plot_structure）。
+            if is_particle_edge(a):
+                drop_list.append(a)
+                continue
+            # 4 字及以上**不再一律豁免**：若它只是「更短的名字 + 一两个字」
+            # （宋书航笑 / 书航笑着 / 九幽主），出现次数会远低于那个短名。
+            # 只看**同层**的更短名：跨层的「短名 + 后缀」往往是独立实体
+            # （赤霄剑[物件] → 赤霄剑道[门派]），按前缀删会把真专名摘掉。
+            # 阈值沿用残片判据；没有同层前缀的 4 字名照旧保留（「赵青锋」）。
             if len(a) >= 4:
-                keep_list.append(a)
+                prefixes = [b for b in names if a != b and a.startswith(b)]
+                if not prefixes:
+                    keep_list.append(a)
+                    continue
+                covered = sum(counts.get(b, 0) for b in prefixes)
+                if counts.get(a, 0) / max(covered, 1) < min_independent_ratio:
+                    drop_list.append(a)
+                else:
+                    keep_list.append(a)
                 continue
             longer = [b for b in all_names if a != b and a in b]
             if not longer:
@@ -254,10 +291,10 @@ class Redactor:
             self._ids[name] = self._counters[prefix]
             # 展示用（日志/调试），不参与替换
             self.placeholder_map[name] = f"{prefix}{self._ids[name]}"
-        token = f"＃{self._ids[name]}"
+        token = f"{PLACEHOLDER_MARK}{self._ids[name]}"
         # 等长补足：太短就重复 ID，太长就截断（4 字名配 1 位数 ID）
         if len(token) < len(name):
-            token = (token + "＃" * len(name))[: len(name)]
+            token = (token + PLACEHOLDER_MARK * len(name))[: len(name)]
         return token
 
     def redact(self, text: str) -> str:

@@ -64,6 +64,7 @@ from app.generation.timeline import (
     judge_node_completion_with_evidence,
     node_for_chapter,
     plan_nodes_with_llm,
+    _structure_block,
     plan_timeline,
     state_from_dict,
     state_to_dict,
@@ -1503,9 +1504,14 @@ def _constraints_from(reminders: dict, project: Project) -> dict:
 
 
 def _foreshadow_ledger_block(
-    db, project_id: int
+    db, project_id: int, mode: str = "manual"
 ) -> tuple[str | None, list[str] | None]:
     """作者侧伏笔台账 → (提示词块, constraints 短句)。
+
+    `mode`：
+    - `off`：完全不注入（连旧 `plot_bible.foreshadowing` 也压掉）；
+    - `auto`：用节奏规划器现算一份计划（不写库），按算出的埋设/回收章注入；
+    - `manual`：按台账里作者设置的章号注入（默认，行为与之前一致）。
 
     项目还没有任何台账行时返回 `(None, None)`：调用方据此保留旧
     `plot_bible.foreshadowing` 的回退行为（老项目零迁移）。
@@ -1513,10 +1519,66 @@ def _foreshadow_ledger_block(
     """
     from app.foreshadow_ledger import entries_of, open_lines, render_open_block
 
+    if mode == "off":
+        return "", []
     entries = entries_of(db, project_id)
     if not entries:
         return None, None
-    return render_open_block(entries), open_lines(entries)
+
+    chapter = None
+    try:
+        from app.generation.chapter_labels import next_chapter_number
+
+        chapter = next_chapter_number(db, project_id)
+    except Exception:  # noqa: BLE001 —— 章号算不出就只给暗示点，不阻断生成
+        chapter = None
+
+    if mode == "auto":
+        from app.foreshadow_planner import plan_entry, total_chapters
+
+        project = db.get(Project, project_id)
+        total = total_chapters(project) if project is not None else 100
+        planned = []
+        for entry in entries:
+            item = plan_entry(entry, total)
+            planned.append(
+                {
+                    "title": entry.title,
+                    "status": entry.status,
+                    "tier": entry.tier,
+                    "planted_chapter": item["plan"]["plant_chapter"],
+                    "planned_chapter": item["plan"]["payoff_chapter"],
+                    "resolved_chapter": entry.resolved_chapter,
+                    "truth": entry.truth,
+                    "hints": entry.hints,
+                    "reveal_span": entry.reveal_span,
+                    "total_chapters": entry.total_chapters,
+                    "reveal_ratio": entry.reveal_ratio,
+                    "reveal_span_ratio": entry.reveal_span_ratio,
+                }
+            )
+        entries = planned
+
+    return (
+        render_open_block(entries, chapter=chapter),
+        open_lines(entries, chapter=chapter),
+    )
+
+
+def _character_template_block(db, project: Project) -> str:
+    """已应用的人物塑造模板 → 可注入文本（按项目当前叙事档位取）。
+
+    模板是按档位抽样的；项目切档后旧模板不再注入（见 `applied_template_rules`
+    的档位一致性纪律）。取不到就空串，不阻断生成。
+    """
+    try:
+        from app.style.character_template import applied_template_block
+        from app.style.narrative import resolve_tier
+
+        tier = resolve_tier(getattr(project, "narrative_tier", None)).key
+        return applied_template_block(db, project, tier)
+    except Exception:  # noqa: BLE001 —— 模板是增强，失败不注入
+        return ""
 
 
 def _era_guard_block(project: Project) -> tuple[str, dict]:
@@ -2808,8 +2870,67 @@ def rebuild_summary_tree(db, project: Project, provider) -> dict:
     return stats
 
 
+def _rag_enabled_for_project(project) -> bool:
+    """生成路径下是否该给参考语料检索。
+
+    与 `profiles.PROFILE_RULES` 同源：原创路径 `rag=False`——用「本书剧情」检索
+    「参考书剧情」不成立，命中的是无关章节原文，唯一效果是把参考书的人和地名
+    灌进提示词；续写锚定路径 `rag=True`（写的就是那本书）。
+
+    `apply_profile` 目前没有调用方，所以这条规则在这里落地（与
+    `_style_exemplars_for_profile` 同一处决策）。
+    """
+    from app.generation.profiles import resolve_profile, rules_for
+
+    return rules_for(resolve_profile(project, None))["rag"] is True
+
+
+def _style_exemplars_for_profile(project, exemplars, novel_ids):
+    """按创作路径决定风格样例给原文还是脱敏版。
+
+    - 续写锚定（`story_authority=reference_anchor`）：原文就是用户要接的那本书
+      → 原样返回；
+    - 其它（原创）：专名换成等长占位符，保留句法/节奏/标点。
+      **这本书没有可用专名表就不给它的样例**——给原文等于把参考书的人物地名
+      灌进用户自己的故事，比不给更糟。
+
+    这与 `ctx_profile.apply_profile` 里 `style_exemplars` 那条规则同义。整块
+    `apply_profile` 目前没有调用方，所以只落「样例」这一条，不动 RAG 与维度
+    可见性（那两件事会改变原创模式 87% 的提示词，属于另一个决定）。
+    """
+    if not exemplars:
+        return []
+    from app.generation.profiles import ANCHORED_PATH, resolve_profile
+
+    if resolve_profile(project, None) == ANCHORED_PATH:
+        return exemplars
+    try:
+        from app.style.entities import Redactor
+        from app.style.entity_store import entity_entries, load_table
+
+        redactors = {}
+        for raw_id in novel_ids or []:
+            nid = int(raw_id)
+            table = load_table(nid)
+            if entity_entries(table):
+                redactors[nid] = Redactor(table)
+        out = []
+        for ex in exemplars:
+            redactor = redactors.get(int(ex.get("novel_id") or 0))
+            text = str(ex.get("text") or "")
+            if redactor is None or not text:
+                continue
+            item = dict(ex)
+            item["text"] = redactor.redact(text)
+            item["redacted"] = True
+            out.append(item)
+        return out
+    except Exception:  # noqa: BLE001 - 样例是增强，取不到表就不给（fail closed）
+        return []
+
+
 def build_context(db, project: Project, novel_ids: list[int] | None = None,
-                  fresh_start: bool = False) -> dict:
+                  fresh_start: bool = False, foreshadow_mode: str = "manual") -> dict:
     """组装生成所需的全部上下文（不调用 LLM，供 plan 预览与续写共用）。
 
     `fresh_start=True`：正式开篇。忽略已写段落的摘要链、生成侧图谱提醒与
@@ -2850,7 +2971,10 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None,
         tree = _summary_tree(project)
 
     # 作者侧伏笔台账：存在即接管旧 foreshadowing（口径见 prompts.merged_constraint_items）。
-    foreshadow_block, ledger_lines = _foreshadow_ledger_block(db, project.id)
+    # foreshadow_mode：off=不注入 / auto=按规划器现算 / manual=按台账作者设置。
+    foreshadow_block, ledger_lines = _foreshadow_ledger_block(
+        db, project.id, mode=foreshadow_mode
+    )
     if ledger_lines is not None:
         reminders["foreshadow_ledger"] = ledger_lines
 
@@ -2866,8 +2990,10 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None,
     rag_context: list[str] = []
     # Phase 0.5：查询词由「本段目标 + 衔接侧」拼成（见 _rag_query_targeted）。
     # 未选语料时不检索、也不报非空查询词——可观测字段必须与真实检索一致。
+    # 原创路径整块关掉：参考书原文进 prompt 等于把它的世界观灌进本书
+    # （见 `_rag_enabled_for_project`）。
     rag_query = ""
-    if novel_ids:
+    if novel_ids and _rag_enabled_for_project(project):
         rag_query = _rag_query_targeted(reminders, prior, project)
         for nid in novel_ids:
             try:
@@ -2893,6 +3019,9 @@ def build_context(db, project: Project, novel_ids: list[int] | None = None,
     style_exemplars = sample_style_exemplars(
         db, project, novel_ids, exclude_texts=set(rag_context)
     ) if novel_ids else []
+    # 原创路径把样例里的专名换成等长占位符（续写路径原样给）；没有专名表的书
+    # 不给样例。见 `_style_exemplars_for_profile` 的 docstring。
+    style_exemplars = _style_exemplars_for_profile(project, style_exemplars, novel_ids)
 
     # constraints = 真正下发进 prompt 的锁定名单（口径与 system 提示同源，
     # 详见 _constraints_from 的 docstring）。
@@ -5138,7 +5267,11 @@ def _timeline_state_for(
                 avg_node_segments = v
         st = plan_timeline(total_segments=total_segments, avg_node_segments=avg_node_segments)
         if provider is not None and db is not None:
-            filled = plan_nodes_with_llm(provider, outline_list, project.plot_bible, st.total_main)
+            structure, _structure_note = _structure_block(db, project)
+            filled = plan_nodes_with_llm(
+                provider, outline_list, project.plot_bible, st.total_main,
+                structure=structure,
+            )
             if filled:
                 for node in filled:
                     if node.id in st.nodes:
@@ -5429,8 +5562,10 @@ def _enforce_timeline_gate(
         and status == "needs_planning"
         and st.planning_reason != _AUTO_REPLAN_FAILED_REASON
     ):
+        structure, _structure_note = _structure_block(db, project)
         filled = plan_nodes_with_llm(
-            provider, _outline_entries(project), project.plot_bible, st.total_main
+            provider, _outline_entries(project), project.plot_bible, st.total_main,
+            structure=structure,
         )
         if filled:
             for node in filled:
@@ -5665,6 +5800,7 @@ def _prepare_generation(
     fresh_start: bool = False,
     fast_mode: bool = False,
     chapter_opening: str | None = None,
+    foreshadow_mode: str = "manual",
 ) -> _GenerationPrep:
     """装配续写所需的全部上下文，并把 system / user 提示词一次拼好。
 
@@ -5700,7 +5836,10 @@ def _prepare_generation(
     else:
         _rollup_summary_tree(db, project, provider)
 
-    ctx = build_context(db, project, novel_ids, fresh_start=fresh_start)
+    ctx = build_context(
+        db, project, novel_ids, fresh_start=fresh_start,
+        foreshadow_mode=foreshadow_mode,
+    )
     overrides = _prompt_overrides(db, project.id)
     # 首段判定与 build_user_prompt 同源：没有前情就是开篇。system 侧据此遮蔽
     # 角色底牌、降权压缩趋势，必须与 user 侧同口径，否则两边各说一套。
@@ -5761,6 +5900,7 @@ def _prepare_generation(
         chapter=chapter,
         chapter_context=chapter_context or None,
         appeared_names=appeared_names,
+        character_template_block=_character_template_block(db, project),
     )
     user = build_user_prompt(
         ctx["prior_summaries"],
@@ -6280,6 +6420,7 @@ def generate_next_segment(
     fresh_start: bool = False,
     fast_mode: bool = False,
     chapter_opening: str | None = None,
+    foreshadow_mode: str = "manual",
 ) -> dict:
     """续写下一段（长文单段）：组装上下文 → 调用 LLM → 段级总结 → 落库 → 更新主线摘要链。
 
@@ -6291,7 +6432,7 @@ def generate_next_segment(
     prep = _prepare_generation(
         db, project, novel_ids=novel_ids, provider=provider, max_chars=max_chars,
         chapter_range=chapter_range, fresh_start=fresh_start, fast_mode=fast_mode,
-        chapter_opening=chapter_opening,
+        chapter_opening=chapter_opening, foreshadow_mode=foreshadow_mode,
     )
     provider = prep.provider
     max_chars = prep.max_chars
@@ -6511,6 +6652,7 @@ def generate_next_segment_stream(
     chapter_range: str | None = None,
     fast_mode: bool = False,
     chapter_opening: str | None = None,
+    foreshadow_mode: str = "manual",
 ):
     """流式续写生成器：逐 delta 产出 {type:chunk} 事件，完成后落库并返回 {type:done}。
 
@@ -6527,7 +6669,7 @@ def generate_next_segment_stream(
     prep = _prepare_generation(
         db, project, novel_ids=novel_ids, provider=provider, max_chars=max_chars,
         chapter_range=chapter_range, fast_mode=fast_mode,
-        chapter_opening=chapter_opening,
+        chapter_opening=chapter_opening, foreshadow_mode=foreshadow_mode,
     )
     provider = prep.provider
     max_chars = prep.max_chars
@@ -6745,6 +6887,7 @@ def _build_generation_prompts(
     chapter_context: str | None = None,
     appeared_names: set[str] | None = None,
     chapter_outline: str | None = None,
+    foreshadow_mode: str = "manual",
 ):
     """组装提示词；`before_segment` 给定时的前情**只取该段之前**（重生成用）。
 
@@ -6774,7 +6917,10 @@ def _build_generation_prompts(
         reminders = get_reminders(db, project.id, source="generated")
 
     # 与续写同口径：台账存在即接管旧 foreshadowing（重生成也不该漏掉未回收线）。
-    foreshadow_block, ledger_lines = _foreshadow_ledger_block(db, project.id)
+    # foreshadow_mode 与续写开关一致：off / auto / manual。
+    foreshadow_block, ledger_lines = _foreshadow_ledger_block(
+        db, project.id, mode=foreshadow_mode
+    )
     if ledger_lines is not None:
         reminders["foreshadow_ledger"] = ledger_lines
 
@@ -6809,6 +6955,7 @@ def _build_generation_prompts(
         chapter=chapter,
         chapter_context=chapter_context,
         appeared_names=appeared_names,
+        character_template_block=_character_template_block(db, project),
     )
     user = build_user_prompt(
         l1_chain(tree),
@@ -6856,6 +7003,7 @@ def regenerate_segment_stream(
     expected_before: str | None = None,
     selected_scope: dict | None = None,
     chapter_label: str | None = None,
+    foreshadow_mode: str = "manual",
 ):
     """重生成单段（流式）：删除目标段旧内容、依前文摘要链重生成插回、重建摘要链。
 
@@ -6956,6 +7104,7 @@ def regenerate_segment_stream(
         chapter_context=chapter_context or None,
         appeared_names=appeared_names,
         chapter_outline=chapter_outline,
+        foreshadow_mode=foreshadow_mode,
     )
     # 指令是否**真的**出现在发出的 user prompt 里（只看渲染后的文本，不看入参）。
     # 空/纯空白指令一律 False，与改动前「不注入」行为一致。

@@ -154,7 +154,9 @@ class PlotBibleOut(BaseModel):
     relationships: list[dict] = []
     direction: Optional[str] = None  # 后续走向
     conflicts: list[str] = []  # 剧情冲突
-    foreshadowing: list[str] = []  # 伏笔
+    #: 伏笔：老项目是字符串；2026-11-24 起按 tiers 分档为对象
+    #: `{name, tier, truth, hints, reveal_chapter}`，两种形状都要允许。
+    foreshadowing: list[dict | str] = []  # 伏笔
     synopsis: Optional[str] = None  # 完整剧情梗概（quick/expert 构思结果）
     # 世界背景（作者手写）。**必须显式声明**：PlotBibleOut 走 pydantic，
     # 未声明的字段会被 model_dump() 静默丢弃 —— 模型给了 background 也会

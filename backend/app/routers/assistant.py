@@ -879,6 +879,26 @@ def _attachment_prompt_block(attachment_plan: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+def _qa_tool_cache_key(name: str, kwargs: dict[str, Any]) -> tuple[str, str]:
+    """同参数工具调用的缓存键：工具名 + 规范化后的参数 JSON。"""
+    return name, json.dumps(kwargs, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _qa_invoke_tool_isolated(
+    name: str, kwargs: dict[str, Any], trace: dict[str, Any], project_id: int
+) -> Any:
+    """并发执行单个只读工具：独立 session（SQLAlchemy Session 不能跨线程共享）。
+
+    工具本身只读；`trace` 里的检索日志由各自 session 独立提交（WAL + busy_timeout
+    已开），失败只 warn，不影响工具返回。
+    """
+    from app.agents.registry import invoke_tool
+    from app.db import SessionLocal
+
+    with SessionLocal() as sdb:
+        return invoke_tool(name, sdb, project_id=project_id, trace=trace, **kwargs)
+
+
 def _qa_answer_with_tools(
     *,
     db: Session,
@@ -891,11 +911,46 @@ def _qa_answer_with_tools(
     memory_block: str = "",
     gather_only: bool = False,
 ) -> dict[str, Any]:
+    """工具轮结果（同步调用方入口）：丢弃进度事件，只返回最终结果。
+
+    流式聊天用 `_qa_answer_with_tools_iter` 以便边跑边把进度推给前端。
+    """
+    for kind, payload in _qa_answer_with_tools_iter(
+        db=db,
+        project=project,
+        run_id=run_id,
+        query=query,
+        action_block=action_block,
+        trace_ctx=trace_ctx,
+        attachment_plan=attachment_plan,
+        memory_block=memory_block,
+        gather_only=gather_only,
+    ):
+        if kind == "result":
+            return payload
+    raise RuntimeError("工具循环未产出结果")
+
+
+def _qa_answer_with_tools_iter(
+    *,
+    db: Session,
+    project: Project,
+    run_id: int,
+    query: str,
+    action_block: str,
+    trace_ctx: dict[str, Any],
+    attachment_plan: dict[str, Any] | None = None,
+    memory_block: str = "",
+    gather_only: bool = False,
+) -> Any:
     """模型自主选工具：有界循环（步数见 `_qa_max_tool_steps`），只允许只读白名单工具。
 
-    `gather_only=True` 时只取证、不答题：模型不再被强制收尾成文字，循环在
-    「模型不再调工具」或「步数用满」时返回，最终正文由调用方（流式聊天）
-    生成。这样流式链路也能按需检索，而不会多出一次完整回答的模型调用。
+    生成器形态：每完成一个工具就 yield 一条 `("event", 进度)`，最后 yield
+    `("result", outcome)`。这样流式聊天能在工具轮运行期间就更新前端进度，
+    而不是等整轮结束才一次性给（此前只有一条「进行中」要干等十几秒）。
+
+    同一步内的多个工具**并发执行**（每个线程独立 session）；同样参数的重复调用
+    命中本次问答内的缓存，不再执行。主线程按原顺序收拢结果，trace 顺序可预测。
 
     判定「模型是否调了工具」只看 `tool_calls` 是否非空——`finish_reason`
     在 `glm-z1-flash` 上会撒谎（返回 tool_calls 但数组为空）。
@@ -954,6 +1009,9 @@ def _qa_answer_with_tools(
         for k, v in ((attachment_plan or {}).get("tool_results") or {}).items()
     ]
     tool_trace: list[dict[str, Any]] = []
+    #: 本次问答内的同参数结果缓存：模型常把同一个工具用同样参数调两次，
+    #: 命中后直接复用（不跨请求，避免拿到过期数据）。
+    tool_cache: dict[tuple[str, str], Any] = {}
     seq_no = 0
 
     started_at = time.monotonic()
@@ -977,7 +1035,7 @@ def _qa_answer_with_tools(
             if gather_only:
                 # 只取证：模型认为不需要再调工具（或已拿到足够证据），
                 # 把正文留给流式调用方，避免同一次问答跑两遍完整回答。
-                return {
+                yield ("result", {
                     "answer": "",
                     "evidence_rows": evidence_rows,
                     "evidence_lines": evidence_lines,
@@ -988,8 +1046,9 @@ def _qa_answer_with_tools(
                     "model": str(message.get("model") or ""),
                     "tool_steps": step,
                     "forced_wrap_up": False,
-                }
-            return {
+                })
+                return
+            yield ("result", {
                 # 模型复述工具结果 = 把只读数据原样搬进回答；按原文剥掉，
                 # 剩下的才是它自己的话。
                 "answer": strip_observation_echo(
@@ -1006,13 +1065,16 @@ def _qa_answer_with_tools(
                 # 是「步数不够」还是「模型没继续调工具」）。
                 "tool_steps": step,
                 "forced_wrap_up": last_step,
-            }
+            })
+            return
 
         messages.append({
             "role": "assistant",
             "content": str(message.get("content") or ""),
             "tool_calls": calls,
         })
+        # —— 同一步内：先分类（拒绝 / 缓存命中 / 待执行），再把待执行项并发跑 ——
+        prepared: list[dict[str, Any]] = []
         for call in calls:
             seq_no += 1
             function = call.get("function") or {}
@@ -1026,68 +1088,119 @@ def _qa_answer_with_tools(
                 "status": "ok",
                 "latency_ms": 0,
             }
-            started = time.perf_counter()
-            kwargs: dict[str, Any] = {}
+            item: dict[str, Any] = {
+                "entry": entry, "call": call, "kwargs": {}, "key": None, "payload": None,
+            }
             if name not in allowed:
                 # 未知 / 档 2 / 档 3 工具名：**不执行**，回一条工具错误让模型改道。
                 entry["status"] = "denied"
-                payload: Any = {"error": f"工具 {name!r} 不在只读白名单，未执行"}
-            else:
-                kwargs, error = _qa_parse_arguments(arguments_text)
-                # 参数本身也是渲染进提示词的字符：先压成有界形状再进 trace。
-                if not error:
-                    entry["arguments"] = _clip_with_mark(
-                        _result_to_text(clip_arguments(kwargs)), 300
+                item["payload"] = {"error": f"工具 {name!r} 不在只读白名单，未执行"}
+                prepared.append(item)
+                continue
+            kwargs, error = _qa_parse_arguments(arguments_text)
+            # 参数本身也是渲染进提示词的字符：先压成有界形状再进 trace。
+            if not error:
+                entry["arguments"] = _clip_with_mark(
+                    _result_to_text(clip_arguments(kwargs)), 300
+                )
+            oversized = oversized_argument(kwargs) if not error else ""
+            if error:
+                entry["status"] = "error"
+                item["payload"] = {"error": error}
+                prepared.append(item)
+                continue
+            if oversized:
+                # 超限参数**不执行**：一个 200KB 的 query 会把整轮检索拖死。
+                entry["status"] = "error"
+                item["payload"] = {"error": oversized}
+                prepared.append(item)
+                continue
+            item["kwargs"] = kwargs
+            item["key"] = _qa_tool_cache_key(name, kwargs)
+            if item["key"] in tool_cache:
+                # 同样参数已经读过：直接复用结果，省一次工具执行。
+                entry["cached"] = True
+                item["payload"] = tool_cache[item["key"]]
+            prepared.append(item)
+
+        pending = [it for it in prepared if it["payload"] is None]
+        if len(pending) > 1:
+            # 多个互不依赖的只读工具并发跑：每个线程独立 session；
+            # 主线程按原顺序收拢，trace / messages 顺序与串行执行一致。
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            for it in pending:
+                it["started"] = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+                futures = {
+                    pool.submit(
+                        _qa_invoke_tool_isolated,
+                        it["entry"]["name"],
+                        it["kwargs"],
+                        {**trace_ctx, "seq": it["entry"]["seq"]},
+                        project.id,
+                    ): it
+                    for it in pending
+                }
+                for future in as_completed(futures):
+                    it = futures[future]
+                    it["entry"]["latency_ms"] = int(
+                        (time.perf_counter() - it["started"]) * 1000
                     )
-                oversized = oversized_argument(kwargs) if not error else ""
-                if error:
-                    entry["status"] = "error"
-                    payload = {"error": error}
-                elif oversized:
-                    # 超限参数**不执行**：一个 200KB 的 query 会把整轮检索拖死。
-                    entry["status"] = "error"
-                    payload = {"error": oversized}
-                else:
                     try:
-                        result = invoke_tool(
-                            name, db, project_id=project.id,
-                            trace={**trace_ctx, "seq": seq_no}, **kwargs
-                        )
+                        it["payload"] = future.result()
                     except PermissionError:
                         raise
                     except Exception as exc:  # noqa: BLE001 - 单工具失败不让整轮 500
-                        entry["status"] = "error"
-                        payload = {"error": str(exc)}
-                    else:
-                        payload = result
-                        # 素材包工具只读；使用次数在编排层用独立会话回填，
-                        # 避免把当前问答事务里尚未提交的证据行一起提交。
-                        if isinstance(result, dict) and result.get("used_ids"):
-                            try:
-                                from app.db import SessionLocal
-                                from app.materials import store as material_store
+                        it["entry"]["status"] = "error"
+                        it["payload"] = {"error": str(exc)}
+        else:
+            for it in pending:
+                started = time.perf_counter()
+                try:
+                    it["payload"] = invoke_tool(
+                        it["entry"]["name"], db, project_id=project.id,
+                        trace={**trace_ctx, "seq": it["entry"]["seq"]}, **it["kwargs"]
+                    )
+                except PermissionError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 单工具失败不让整轮 500
+                    it["entry"]["status"] = "error"
+                    it["payload"] = {"error": str(exc)}
+                it["entry"]["latency_ms"] = int((time.perf_counter() - started) * 1000)
 
-                                with SessionLocal() as _mdb:
-                                    material_store.mark_used(
-                                        _mdb,
-                                        result["used_ids"],
-                                        project_id=project.id,
-                                    )
-                            except Exception:  # noqa: BLE001 —— 计数失败不影响回答
-                                pass
-                        tool_results[name] = result
-                        rows, lines, segnos = _qa_evidence_from_tool(
-                            name, result, run_id
-                        )
-                        evidence_rows.extend(rows)
-                        evidence_lines.extend(lines)
-                        generation_segment_nos.extend(segnos)
-            entry["latency_ms"] = int((time.perf_counter() - started) * 1000)
+        for it in prepared:
+            entry = it["entry"]
+            name = entry["name"]
+            payload = it["payload"]
+            if entry["status"] == "ok":
+                tool_cache[it["key"]] = payload
+                tool_results[name] = payload
+                # 素材包工具只读；使用次数在编排层用独立会话回填，
+                # 避免把当前问答事务里尚未提交的证据行一起提交。
+                if (isinstance(payload, dict) and payload.get("used_ids")
+                        and not entry.get("cached")):
+                    try:
+                        from app.db import SessionLocal
+                        from app.materials import store as material_store
+
+                        with SessionLocal() as _mdb:
+                            material_store.mark_used(
+                                _mdb, payload["used_ids"], project_id=project.id,
+                            )
+                    except Exception:  # noqa: BLE001 —— 计数失败不影响回答
+                        pass
+                # 缓存命中的结果上一步已经进过 evidence，不重复计数。
+                if not entry.get("cached"):
+                    rows, lines, segnos = _qa_evidence_from_tool(name, payload, run_id)
+                    evidence_rows.extend(rows)
+                    evidence_lines.extend(lines)
+                    generation_segment_nos.extend(segnos)
             tool_trace.append(entry)
             tool_message = _qa_tool_message(name, payload)
             observations.append({
                 "tool": name,
-                "arguments": clip_arguments(kwargs),
+                "arguments": clip_arguments(it["kwargs"]),
                 "ok": entry["status"] == "ok",
                 "error": (
                     payload.get("error")
@@ -1098,13 +1211,24 @@ def _qa_answer_with_tools(
             })
             messages.append({
                 "role": "tool",
-                "tool_call_id": str(call.get("id") or f"call-{step}-{seq_no}"),
+                "tool_call_id": str(
+                    it["call"].get("id") or f"call-{step}-{entry['seq']}"
+                ),
                 "content": tool_message,
+            })
+            # 实时进度：每完成一个工具就推一条，前端增量追加，
+            # 不必等整轮结束（此前只有一条「进行中」要干等十几秒）。
+            yield ("event", {
+                "name": name,
+                "meta": f"第 {entry['step']} 步 · " + (
+                    "缓存" if entry.get("cached") else entry["status"]
+                ),
+                "detail": str(entry.get("arguments") or "")[:300],
             })
 
     if gather_only:
         # 步数用满仍在调工具：停止检索，交给调用方基于已有证据流式作答。
-        return {
+        yield ("result", {
             "answer": "",
             "evidence_rows": evidence_rows,
             "evidence_lines": evidence_lines,
@@ -1115,7 +1239,8 @@ def _qa_answer_with_tools(
             "model": "",
             "tool_steps": max_steps,
             "forced_wrap_up": True,
-        }
+        })
+        return
     raise RuntimeError("工具循环未产出文字回答")
 
 
@@ -1997,7 +2122,8 @@ def assistant_chat_stream(
                     }],
                 })
                 try:
-                    gather = _qa_answer_with_tools(
+                    gather = None
+                    for kind, payload in _qa_answer_with_tools_iter(
                         db=sdb,
                         project=project_row,
                         run_id=run.id,
@@ -2013,7 +2139,19 @@ def assistant_chat_stream(
                         attachment_plan=attachment_plan,
                         memory_block=memory_block,
                         gather_only=True,
-                    )
+                    ):
+                        if kind == "event":
+                            # 增量进度：每完成一个工具就推一条，前端实时追加，
+                            # 不用等整轮结束（此前只有一条「进行中」要干等）。
+                            yield _sse_event({
+                                "type": "steps",
+                                "steps": [payload],
+                                "append": True,
+                            })
+                        elif kind == "result":
+                            gather = payload
+                    if gather is None:
+                        raise RuntimeError("工具轮没有产出结果")
                     gather_trace = list(gather.get("tool_trace") or [])
                     gather_steps = (
                         int(gather.get("tool_steps") or 0) if gather_trace else 0
